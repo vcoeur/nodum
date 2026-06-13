@@ -49,6 +49,10 @@ make frontend-install   # npm ci
 make frontend-dev       # Vite dev server on http://127.0.0.1:5700 (proxies the API)
 # …or build it and serve through FastAPI on 8600:
 make dev-web
+
+# run the API and the Vite frontend together, stopping both when either exits
+# (checks the DB is up first; needs `make frontend-install` once beforehand):
+make dev
 ```
 
 Configuration is environment variables, chiefly `NODUM_DATABASE_URL` (default
