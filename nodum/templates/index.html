@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>nodum — read view</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <header>
+    <h1>nodum</h1>
+    <p class="tagline">Atomic-notes graph — search, open a node, expand its subgraph.</p>
+  </header>
+
+  <main>
+    <section id="search-section">
+      <form id="search-form">
+        <input
+          id="search-input"
+          type="search"
+          name="q"
+          placeholder="Search node text…"
+          autocomplete="off"
+          autofocus
+        />
+        <label class="inline">
+          limit
+          <input id="search-limit" type="number" name="limit" value="20" min="1" max="200" />
+        </label>
+        <button type="submit">Search</button>
+      </form>
+      <div id="search-status" class="status" aria-live="polite"></div>
+      <ul id="search-results" class="results"></ul>
+    </section>
+
+    <section id="node-section" hidden>
+      <h2>Node</h2>
+      <div id="node-status" class="status" aria-live="polite"></div>
+      <div id="node-detail"></div>
+
+      <div id="expand-controls" hidden>
+        <label class="inline">
+          depth
+          <input id="expand-depth" type="number" value="1" min="1" max="10" />
+        </label>
+        <button id="expand-button" type="button">Expand</button>
+      </div>
+      <div id="expand-status" class="status" aria-live="polite"></div>
+      <div id="expand-detail"></div>
+    </section>
+  </main>
+
+  <script src="/static/app.js" defer></script>
+</body>
+</html>

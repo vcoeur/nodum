@@ -1,0 +1,81 @@
+[project]
+name = "nodum"
+dynamic = ["version"]
+description = "Minimal atomic-notes knowledge system: a mutable PostgreSQL graph of typed, UUID-keyed nodes and edges with full-text search and recursive subgraph expansion, behind one data-service layer fronted by a CLI, an HTTP API, and a minimal web view"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Alice Voland" }]
+requires-python = ">=3.12"
+dependencies = [
+    "environs>=14.6.0",
+    "fastapi>=0.115",
+    "jinja2>=3.1",
+    "psycopg[binary]>=3.2",
+    "pydantic>=2.9",
+    "typer>=0.16",
+    "uvicorn>=0.30",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Environment :: Web Environment",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Database",
+    "Topic :: Text Processing :: Indexing",
+]
+
+[project.urls]
+Repository = "https://github.com/vcoeur/nodum"
+Issues = "https://github.com/vcoeur/nodum/issues"
+
+[project.scripts]
+nodum = "nodum.cli:app"
+
+[build-system]
+requires = ["hatchling", "hatch-vcs"]
+build-backend = "hatchling.build"
+
+# Version is derived from the git tag (vX.Y.Z) at build time — never committed.
+[tool.hatch.version]
+source = "vcs"
+
+[tool.hatch.build.targets.wheel]
+packages = ["nodum"]
+
+# Non-Python package data the runtime reads via importlib.resources: the DDL,
+# and the web view's templates + static assets.
+[tool.hatch.build]
+artifacts = [
+    "nodum/schema.sql",
+    "nodum/templates/**/*",
+    "nodum/static/**/*",
+]
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28",
+    "pytest>=9.0.2",
+    "pytest-cov>=6.0",
+    "ruff>=0.15.2",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+addopts = "-q"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["SIM105", "SIM117"]
+
+[tool.ruff.lint.per-file-ignores]
+# Typer's Option(...) / Argument(...) default-arg pattern is idiomatic; B008 flags it.
+"nodum/cli.py" = ["B008"]
