@@ -10,6 +10,9 @@ __pycache__/
 build/
 dist/
 
+# MkDocs build output (the docs site is built in CI and deployed to Pages)
+site/
+
 # Test / coverage artefacts
 .pytest_cache/
 .coverage

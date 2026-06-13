@@ -361,6 +361,22 @@ Make targets (run `make help` for the live list):
   boot (see `auth ensure-password`). A local `.env` is read if present; copy
   `.env.example` to start.
 
+## Documentation
+
+The public docs site is **MkDocs Material** — sources under `docs/` plus `mkdocs.yml` at the repo
+root, deployed to **<https://nodum.vcoeur.com>** by `.github/workflows/docs.yml` on every push to
+`main` that touches `docs/**` or `mkdocs.yml`.
+
+- **Edit `docs/`, never the generated `site/`** (the build output is gitignored).
+- The build must pass **`mkdocs build --strict`** (it fails on broken links and bad nav refs) — the
+  Pages workflow runs exactly that. Preview/build locally with
+  `uv run --with "mkdocs-material==9.5.49" mkdocs serve` (or `… mkdocs build --strict`).
+- `docs/CNAME` pins the custom domain. `docs/legal.md` is the GitHub-Pages mentions-légales page,
+  kept aligned with the knoten/quelle/condash docs-site legal pages — and it publishes **no
+  retention durations**.
+- When CLI verbs, API routes, kinds, or the distribution model change, update the matching page in
+  `docs/` in the same PR so the site stays in step with `schema()` and this file.
+
 ## Conventions
 
 - **Ruff** is the linter and formatter: line length 100, rule sets

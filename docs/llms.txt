@@ -1,0 +1,23 @@
+# nodum
+
+> Atomic-notes knowledge system: a mutable PostgreSQL graph of typed, UUID-keyed nodes and edges, with full-text search and recursive subgraph expansion. One data-service layer is fronted by a CLI, an HTTP API, and a React single-page web UI. Built to be driven by LLM agents: the CLI and the API emit byte-identical JSON, and `nodum schema` (or `GET /schema`) dumps the whole machine-readable metamodel contract. The full app ships as a Docker image; the PyPI wheel is the CLI/library (no UI). Retrieval is full-text + graph only — no embeddings.
+
+## Docs
+
+- [Overview](https://nodum.vcoeur.com/): what nodum is, what it does, and who it is for.
+- [Quick start](https://nodum.vcoeur.com/quick-start/): run the full app with Docker (or install the CLI), sign in, then create a typed node, link a typed edge, search, and expand a subgraph.
+- [Concepts](https://nodum.vcoeur.com/concepts/): the typed metamodel — nodes, edges, the code-registry of kinds, the from→to edge signatures, soft service validation vs cheap-hard DB constraints, and the open-process-closed-format principle.
+- [Install & run](https://nodum.vcoeur.com/install/): the Docker (full app) and PyPI (CLI/library) tracks, all environment variables, authentication, and migrating an older database.
+- [Commands](https://nodum.vcoeur.com/commands/): full CLI verb + HTTP API route reference, the `--set` field syntax, the byte-identical JSON envelopes, and the error contract.
+
+## For agents
+
+- Run `nodum schema` (CLI) or `GET /schema` (API) for the contract: every node kind with its field schema, every edge kind with its `from → to` signature. One call self-orients an agent without reading these docs.
+- The CLI and the API call the same service and emit byte-identical JSON; prototype with the CLI, ship against the API. The CLI prints one JSON object to stdout; messages and errors go to stderr.
+- Kinds are a closed, code-defined set (7 node kinds, 12 edge kinds). Every node carries a universal natural-language `text` (full-text indexed) plus its typed fields. Edge endpoints are checked against the kind's signature at create time.
+- Data routes require auth (single main password): send the token from `POST /auth/login` as `Authorization: Bearer <token>`. A 503 means no password is set yet; a 401 means unauthenticated. The local CLI is trusted and talks to the database directly.
+
+## Optional
+
+- [Source on GitHub](https://github.com/vcoeur/nodum)
+- [nodum on PyPI](https://pypi.org/project/nodum/)
