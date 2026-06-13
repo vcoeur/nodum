@@ -46,13 +46,13 @@ export function NodeDetail({ uuid, reloadToken, onOpen, onReload, onDeleted }: N
           edge.from_uuid === uuid ? edge.to_uuid : edge.from_uuid,
         );
         const resolved: EndpointLabels = {
-          [result.node.uuid]: { text: nodeText(result.node.data), kind: result.node.kind },
+          [result.node.uuid]: { text: nodeText(result.node.content), kind: result.node.kind },
         };
         await Promise.allSettled(
           [...new Set(others)].map(async (other) => {
             try {
               const neighbour = await apiGet<NodeWithEdges>(`/nodes/${encodeURIComponent(other)}`);
-              resolved[other] = { text: nodeText(neighbour.node.data), kind: neighbour.node.kind };
+              resolved[other] = { text: nodeText(neighbour.node.content), kind: neighbour.node.kind };
             } catch {
               resolved[other] = { text: shortUuid(other), kind: "?" };
             }
@@ -142,7 +142,7 @@ export function NodeDetail({ uuid, reloadToken, onOpen, onReload, onDeleted }: N
         />
       )}
 
-      <p className="node-text">{nodeText(node.data)}</p>
+      <p className="node-text">{nodeText(node.content)}</p>
       <p className="node-ids">
         <span className="tag">{node.kind}</span>
         <span className="uuid">{node.uuid}</span>
@@ -234,7 +234,7 @@ interface EditNodeFormProps {
 function EditNodeForm({ node, onCancel, onSaved }: EditNodeFormProps) {
   const { nodeKind } = useSchema();
   const kind = nodeKind(node.kind);
-  const [text, setText] = useState(nodeText(node.data));
+  const [content, setContent] = useState(node.content);
   const [raw, setRaw] = useState<Record<string, RawValue>>(() =>
     initialRawValues(kind?.fields ?? {}, node.data),
   );
@@ -242,15 +242,15 @@ function EditNodeForm({ node, onCancel, onSaved }: EditNodeFormProps) {
 
   async function submit(event: FormEvent) {
     event.preventDefault();
-    const body = text.trim();
+    const body = content.trim();
     if (!body) {
-      setStatus("Text is required.");
+      setStatus("Content is required.");
       return;
     }
     setStatus("Saving…");
     try {
       await apiSend<NodeOut>("PATCH", `/nodes/${encodeURIComponent(node.uuid)}`, {
-        text: body,
+        content: body,
         data: collectData(kind?.fields ?? {}, raw, true),
       });
       onSaved();
@@ -263,8 +263,8 @@ function EditNodeForm({ node, onCancel, onSaved }: EditNodeFormProps) {
     <form className="edit-form" onSubmit={submit}>
       <h3>Edit {node.kind}</h3>
       <label className="block">
-        {kind?.text_label ?? "text"}
-        <textarea rows={2} value={text} onChange={(event) => setText(event.target.value)} />
+        {kind?.content_label ?? "content"}
+        <textarea rows={2} value={content} onChange={(event) => setContent(event.target.value)} />
       </label>
       {kind && (
         <FieldSet

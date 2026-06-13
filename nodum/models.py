@@ -3,8 +3,11 @@
 The CLI, the HTTP API, and the web view all serialise through these models, so
 one canonical JSON envelope is produced regardless of entry point. UUID and
 datetime fields render as strings under ``model_dump(mode="json")``, which is
-what every adapter emits. A node/edge carries its ``kind`` (a metamodel name);
-kind-specific fields live in ``data`` and are validated by ``nodum.metamodel``.
+what every adapter emits. A node/edge carries its ``kind`` (a kind name); a
+node's universal text lives in the top-level ``content`` field (the embeddable
+body), and kind-specific metadata in ``data``. Kinds themselves are editable at
+runtime — the kind-definition models below carry the field shape / endpoint
+signature in and out of the kind-CRUD surfaces.
 """
 
 from __future__ import annotations
@@ -12,16 +15,17 @@ from __future__ import annotations
 from datetime import datetime
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 # ── Output models ───────────────────────────────────────────────────────────
 
 
 class NodeOut(BaseModel):
-    """A node: its kind, its self-describing JSON payload, and timestamps."""
+    """A node: its kind, its plain-text content, its metadata, and timestamps."""
 
     uuid: UUID
     kind: str
+    content: str
     data: dict
     created_at: datetime
     updated_at: datetime
@@ -49,10 +53,10 @@ class SearchHit(NodeOut):
 
 
 class AddNodeIn(BaseModel):
-    """Input for ``add_node``: the kind, the node text, and extra payload keys."""
+    """Input for ``add_node``: the kind, the node content, and extra payload keys."""
 
     kind: str
-    text: str
+    content: str
     data: dict = Field(default_factory=dict)
 
 
@@ -66,9 +70,9 @@ class AddEdgeIn(BaseModel):
 
 
 class UpdateNodeIn(BaseModel):
-    """Input for ``update_node``: an optional new text and/or payload keys to merge."""
+    """Input for ``update_node``: an optional new content and/or payload keys to merge."""
 
-    text: str | None = None
+    content: str | None = None
     data: dict | None = None
 
 
@@ -82,6 +86,53 @@ class LoginIn(BaseModel):
     """Input for ``POST /auth/login``: the candidate main password."""
 
     password: str
+
+
+# ── Kind-definition inputs (the evolvable schema) ─────────────────────────────
+
+
+class NodeKindIn(BaseModel):
+    """Input for creating a node kind: name, group, content label, field schema."""
+
+    name: str
+    group: str = ""
+    content_label: str = "text"
+    fields: dict = Field(default_factory=dict)
+
+
+class NodeKindPatch(BaseModel):
+    """Input for editing a node kind; only the provided attributes change."""
+
+    group: str | None = None
+    content_label: str | None = None
+    fields: dict | None = None
+
+
+class EdgeKindIn(BaseModel):
+    """Input for creating an edge kind: name, endpoint signature, fields.
+
+    The endpoint lists are accepted as ``from`` / ``to`` (the schema wire names)
+    or as ``from_kinds`` / ``to_kinds``.
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    name: str
+    from_kinds: list[str] = Field(default_factory=list, alias="from")
+    to_kinds: list[str] = Field(default_factory=list, alias="to")
+    symmetric: bool = False
+    fields: dict = Field(default_factory=dict)
+
+
+class EdgeKindPatch(BaseModel):
+    """Input for editing an edge kind; only the provided attributes change."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    from_kinds: list[str] | None = Field(default=None, alias="from")
+    to_kinds: list[str] | None = Field(default=None, alias="to")
+    symmetric: bool | None = None
+    fields: dict | None = None
 
 
 # ── Composite results ───────────────────────────────────────────────────────
@@ -116,3 +167,11 @@ class Deleted(BaseModel):
 
     uuid: UUID
     deleted: int
+
+
+class KindDeleted(BaseModel):
+    """Result of deleting a kind: its name, rows reassigned, and that it was deleted."""
+
+    name: str
+    reassigned: int
+    deleted: bool

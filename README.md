@@ -6,18 +6,19 @@ expansion — all behind a single data-service layer fronted by a CLI, an HTTP
 API, and a React single-page web UI. The full app ships as a **Docker image**;
 the **PyPI wheel** is the CLI/library (see [Distribution](#distribution)).
 
-nodum is a **typed graph**: kinds live in a code registry (`nodum.metamodel`),
-not as free strings. Each node has a kind with a field schema; each edge has a
-kind whose `from → to` signature constrains its endpoints. The guiding
-principle is **open process, closed format** — every node carries a universal
-natural-language `text` (so authoring stays prose-first and the content is
-LLM-readable) alongside its typed fields.
+nodum is a **typed graph** with a **runtime-evolvable schema**: kinds are stored
+in the database (not frozen in code), so you create, edit, and delete node and
+edge kinds at runtime through the CLI and API. Each node has a kind with a field
+schema; each edge has a kind whose `from → to` signature constrains its
+endpoints. The guiding principle is **open process, closed format** — every node
+carries a plain-text `content` field (so authoring stays prose-first and the body
+is LLM-readable, and ready to embed later) alongside its typed `data`.
 
 > **Scope.** Retrieval is Postgres full-text plus graph traversal — no
-> embeddings. Access is gated by a single main password (see
-> [Authentication](#authentication)). Vector / hybrid retrieval, an LLM gardener,
-> contradiction reasoning, reranking, multi-user accounts, and runtime-editable
-> kinds are deferred.
+> embeddings yet (`content` is stored ready for them). Access is gated by a single
+> main password (see [Authentication](#authentication)). Vector / hybrid
+> retrieval, an LLM gardener, contradiction reasoning, reranking, and multi-user
+> accounts are deferred.
 
 **Documentation:** <https://nodum.vcoeur.com>
 
@@ -38,9 +39,10 @@ docker compose -f docker-compose.example.yml up     # nodum + Postgres
 ### Local development
 
 ```bash
+make install-all   # install all deps at once (Python dev + frontend npm)
 make db-up         # start local PostgreSQL (docker-compose, host port 5436)
-make dev-install   # uv sync --all-groups (Python)
-make init-db       # create the schema + seed the kind lookup tables
+make dev-install   # uv sync --all-groups (Python) — subset of install-all above
+make init-db       # create the schema + seed the default kind catalog
 uv run nodum auth set-password   # set the main password (gates the API + UI)
 make test          # run the Python suite (needs the database up)
 
@@ -49,6 +51,10 @@ make frontend-install   # npm ci
 make frontend-dev       # Vite dev server on http://127.0.0.1:5700 (proxies the API)
 # …or build it and serve through FastAPI on 8600:
 make dev-web
+
+# run the API and the Vite frontend together, stopping both when either exits
+# (checks the DB is up first; run `make install-all` once beforehand):
+make dev
 ```
 
 Configuration is environment variables, chiefly `NODUM_DATABASE_URL` (default
@@ -56,18 +62,28 @@ Configuration is environment variables, chiefly `NODUM_DATABASE_URL` (default
 `.env.example` to `.env` to override. The API serves on `127.0.0.1:8600`; the
 Vite dev server on `5700`.
 
-## The metamodel
+## The schema (runtime-evolvable)
 
-Kinds are defined in code, in `nodum.metamodel`. Adding a kind is a registry
-edit there — there is no per-kind table or model class; every instance lives in
-the one `nodes` table and the one `edges` table, with a `kind` column referencing
-the metamodel. A node/edge is validated softly in the service against its kind;
-the database enforces only the cheap universals (the `kind` foreign key, a
-`text` field on every node, valid endpoints, no self-edges).
+Kinds are **stored in the database**, in the `node_kinds` / `edge_kinds` tables —
+each row a kind name plus a `spec` (its field shape, or its `from → to`
+signature). They are seeded with the defaults below on `init-db`, and editable at
+runtime thereafter: `nodum node-kind add/edit/rm` and `nodum edge-kind add/edit/rm`
+(and the matching `/node-kinds` / `/edge-kinds` API routes). There is no per-kind
+table or model class; every instance lives in the one `nodes` table and the one
+`edges` table, with a `kind` column referencing the catalog. A node/edge is
+validated softly in the service against its (DB-resolved) kind; the database
+enforces only the cheap universals (the `kind` foreign key, valid endpoints, no
+self-edges).
+
+Deleting a kind that is still in use is **refused** (the error reports the usage);
+`--into <kind>` (CLI) / `?into=<kind>` (API) reassigns the using rows — and, for a
+node kind, rewrites the edge signatures that named it — then deletes.
+
+The tables below are the **seeded defaults**, not a fixed set.
 
 ### Node kinds
 
-| Kind | `text` is | Typed fields |
+| Kind | `content` is | Typed fields |
 |---|---|---|
 | `Person` | name | `aliases`, `born` |
 | `Organization` | name | `aliases` |
@@ -121,9 +137,18 @@ uv run nodum search "analytical engine" --kind Reference
 
 # expand a seed node into its connected subgraph, two hops out
 uv run nodum expand <uuid> --depth 2 --edge-kind AuthorOf
+
+# evolve the schema: add a node kind, then an edge kind that uses it
+uv run nodum node-kind add Dataset --group entity --content-label name \
+  --fields '{"rows": {"type": "int"}, "license": {"type": "str"}}'
+uv run nodum edge-kind add DerivedFrom --from Dataset --to Reference
+
+# delete a kind; refused while in use, then reassigned with --into
+uv run nodum node-kind rm Dataset --into Entity
 ```
 
-Also: `get <uuid>`, `edit-node` / `edit-edge`, `rm-node` / `rm-edge`, `schema`,
+Also: `get <uuid>`, `edit-node` (`--content`) / `edit-edge`, `rm-node` / `rm-edge`,
+`schema`, `node-kind add/edit/rm` and `edge-kind add/edit/rm`,
 `auth set-password` / `auth status`, `init-db`, `migrate`, and `serve`.
 
 ### HTTP API
@@ -134,29 +159,36 @@ FastAPI; every response is the same JSON envelope the CLI prints.
 # POST /nodes — create a typed node
 curl -s -X POST http://127.0.0.1:8600/nodes \
   -H 'content-type: application/json' \
-  -d '{"kind": "Note", "text": "Spaced repetition improves long-term retention",
+  -d '{"kind": "Note", "content": "Spaced repetition improves long-term retention",
        "data": {"role": "claim"}}'
 
-# GET /schema — the metamodel contract (node kinds + edge kinds + signatures)
+# GET /schema — the live schema (node kinds + edge kinds + signatures)
 curl -s http://127.0.0.1:8600/schema
+
+# POST /node-kinds — evolve the schema at runtime
+curl -s -X POST http://127.0.0.1:8600/node-kinds \
+  -H 'content-type: application/json' \
+  -d '{"name": "Dataset", "group": "entity", "content_label": "name"}'
 
 # GET /expand — seed node → connected subgraph
 curl -s 'http://127.0.0.1:8600/expand?seed=<uuid>&depth=2&edge_kind=cites'
 ```
 
 Full route set: `POST /nodes`, `GET|PATCH|DELETE /nodes/{uuid}`, `POST /edges`,
-`PATCH|DELETE /edges/{uuid}`, `GET /search`, `GET /expand`, `GET /schema` — all
-behind auth — plus `POST /auth/login`, `POST /auth/logout`, `GET /auth/session`,
-and `GET /healthz`. A missing node/edge returns 404; invalid input returns 422; an
-unauthenticated request returns 401 (or 503 until a password is set). Pass the
-token from `POST /auth/login` as `Authorization: Bearer <token>` (see
-[Authentication](#authentication)).
+`PATCH|DELETE /edges/{uuid}`, `GET /search`, `GET /expand`, `GET /schema`,
+`POST /node-kinds`, `PATCH|DELETE /node-kinds/{name}`, `POST /edge-kinds`, and
+`PATCH|DELETE /edge-kinds/{name}` — all behind auth — plus `POST /auth/login`,
+`POST /auth/logout`, `GET /auth/session`, and `GET /healthz`. A missing
+node/edge/kind returns 404; deleting an in-use kind without `into` returns 409;
+invalid input returns 422; an unauthenticated request returns 401 (or 503 until a
+password is set). Pass the token from `POST /auth/login` as `Authorization: Bearer
+<token>` (see [Authentication](#authentication)).
 
 ### Web UI
 
 A **React + Vite (TypeScript) single-page app** (in `frontend/`), a schema-driven
 client of the JSON API. It fetches `GET /schema` and drives its forms from the
-metamodel: create/edit a node by kind, create an edge by type (endpoint pickers
+live schema: create/edit a node by kind, create an edge by type (endpoint pickers
 filtered to the signature), delete (with a cascade-aware confirm), search (with a
 kind filter), open a node, and render its subgraph as a node-link **SVG diagram**.
 Sign-in is in-app (the SPA reads `GET /auth/session` to know its state), with a
@@ -201,28 +233,31 @@ Two artifacts from one codebase:
 
 ## Data model
 
-A mutable JSONB graph, one `nodes` table and one `edges` table:
+A mutable graph, one `nodes` table and one `edges` table:
 
-- **Node** — a UUID, a `kind` (referencing the metamodel), and a JSON `data`
-  payload that always carries a universal `text` field plus the kind's typed
-  fields. The `text` is full-text indexed.
+- **Node** — a UUID, a `kind` (referencing the catalog), a plain-text `content`
+  column (the embeddable body, full-text indexed), and a JSON `data` payload for
+  the kind's typed fields.
 - **Edge** — a UUID, a `kind`, and a directed link `from_uuid → to_uuid` between
   two distinct nodes, with a JSON `data` payload. The edge kind's signature
   constrains which node kinds the endpoints may be. Deleting a node cascades to
   its edges.
-- **Typed, not open.** Kinds come from `nodum.metamodel`; the `node_kinds` /
-  `edge_kinds` lookup tables back the `kind` foreign keys. Validation is soft in
-  the service and cheap-hard in the database.
+- **Typed, and evolvable.** Kinds live in the `node_kinds` / `edge_kinds` tables
+  (name + `spec`), which also back the `kind` foreign keys. Editing a kind never
+  retro-invalidates stored rows — validation is a write-time gate. Validation is
+  soft in the service and cheap-hard in the database.
 
-Retrieval is Postgres full-text (`tsvector` / `ts_rank`) for search and a
-recursive CTE for subgraph expansion — **no embeddings**.
+Retrieval is Postgres full-text (`tsvector` / `ts_rank`) over `content` for search
+and a recursive CTE for subgraph expansion — **no embeddings yet**.
 
-### Migrating an MVP database
+### Migrating an older database
 
-`uv run nodum migrate` upgrades an earlier (open-type) MVP database in place,
-idempotently: it adds the `kind` columns, seeds the lookup tables, drops the old
-type-as-node rows, backfills kinds (content nodes become `Note`, carrying their
-old `data.type` into `role`), and enforces the new constraints.
+`uv run nodum migrate` upgrades an earlier database in place, idempotently. It
+runs the full chain: the MVP (open-type) upgrade if needed (adds `kind` columns,
+drops type-as-node rows, backfills `Note` kinds from `data.type` into `role`);
+adds the kind `spec` columns and backfills them from the defaults; and promotes
+each node's `data.text` into the new `content` column (moving the full-text index
+with it). Safe to re-run.
 
 ## License
 

@@ -24,8 +24,18 @@ from fastapi.responses import JSONResponse
 
 import nodum
 from nodum import auth, service, web
-from nodum.models import AddEdgeIn, AddNodeIn, LoginIn, UpdateEdgeIn, UpdateNodeIn
-from nodum.service import EdgeNotFound, NodeNotFound
+from nodum.models import (
+    AddEdgeIn,
+    AddNodeIn,
+    EdgeKindIn,
+    EdgeKindPatch,
+    LoginIn,
+    NodeKindIn,
+    NodeKindPatch,
+    UpdateEdgeIn,
+    UpdateNodeIn,
+)
+from nodum.service import EdgeNotFound, KindInUse, KindNotFound, NodeNotFound
 from nodum.settings import load_settings
 
 app = FastAPI(title="nodum", version=nodum.__version__)
@@ -55,9 +65,16 @@ async def _security_headers(request: Request, call_next):
 
 @app.exception_handler(NodeNotFound)
 @app.exception_handler(EdgeNotFound)
+@app.exception_handler(KindNotFound)
 async def _handle_not_found(request: Request, exc: Exception) -> JSONResponse:
-    """Map a missing node/edge error to a 404 with a clean JSON detail body."""
+    """Map a missing node/edge/kind error to a 404 with a clean JSON detail body."""
     return JSONResponse(status_code=404, content={"detail": str(exc)})
+
+
+@app.exception_handler(KindInUse)
+async def _handle_kind_in_use(request: Request, exc: KindInUse) -> JSONResponse:
+    """Map a still-referenced kind (delete refused without ``into``) to a 409."""
+    return JSONResponse(status_code=409, content={"detail": str(exc)})
 
 
 @app.exception_handler(ValueError)
@@ -170,7 +187,7 @@ router = APIRouter(dependencies=[Depends(require_auth)])
 @router.post("/nodes")
 def create_node(body: AddNodeIn) -> JSONResponse:
     """Create a typed node and return it, serialised exactly as the CLI emits it."""
-    node = service.add_node(body.kind, body.text, body.data)
+    node = service.add_node(body.kind, body.content, body.data)
     return JSONResponse(content=node.model_dump(mode="json"))
 
 
@@ -183,8 +200,8 @@ def get_node(uuid: UUID) -> JSONResponse:
 
 @router.patch("/nodes/{uuid}")
 def patch_node(uuid: UUID, body: UpdateNodeIn) -> JSONResponse:
-    """Merge new text/payload into a node, re-validate, and return it."""
-    node = service.update_node(str(uuid), text=body.text, data=body.data)
+    """Merge new content/payload into a node, re-validate, and return it."""
+    node = service.update_node(str(uuid), content=body.content, data=body.data)
     return JSONResponse(content=node.model_dump(mode="json"))
 
 
@@ -248,8 +265,65 @@ def expand(
 
 @router.get("/schema")
 def schema() -> JSONResponse:
-    """Return the metamodel contract (node kinds + edge kinds + signatures)."""
+    """Return the live schema (node kinds + edge kinds + signatures)."""
     return JSONResponse(content=service.schema())
+
+
+# ── Kind administration (the evolvable schema) ────────────────────────────────
+
+
+@router.post("/node-kinds")
+def create_node_kind(body: NodeKindIn) -> JSONResponse:
+    """Register a new node kind and return its schema entry."""
+    result = service.add_node_kind(
+        body.name, group=body.group, content_label=body.content_label, fields=body.fields
+    )
+    return JSONResponse(content=result)
+
+
+@router.patch("/node-kinds/{name}")
+def patch_node_kind(name: str, body: NodeKindPatch) -> JSONResponse:
+    """Edit a node kind (only the provided attributes change) and return its entry."""
+    result = service.update_node_kind(
+        name, group=body.group, content_label=body.content_label, fields=body.fields
+    )
+    return JSONResponse(content=result)
+
+
+@router.delete("/node-kinds/{name}")
+def delete_node_kind(name: str, into: str | None = None) -> JSONResponse:
+    """Delete a node kind; refuses (409) when in use unless ``into`` reassigns it."""
+    result = service.delete_node_kind(name, into=into)
+    return JSONResponse(content=result.model_dump(mode="json"))
+
+
+@router.post("/edge-kinds")
+def create_edge_kind(body: EdgeKindIn) -> JSONResponse:
+    """Register a new edge kind (its from→to signature) and return its schema entry."""
+    result = service.add_edge_kind(
+        body.name, body.from_kinds, body.to_kinds, symmetric=body.symmetric, fields=body.fields
+    )
+    return JSONResponse(content=result)
+
+
+@router.patch("/edge-kinds/{name}")
+def patch_edge_kind(name: str, body: EdgeKindPatch) -> JSONResponse:
+    """Edit an edge kind (only the provided attributes change) and return its entry."""
+    result = service.update_edge_kind(
+        name,
+        from_kinds=body.from_kinds,
+        to_kinds=body.to_kinds,
+        symmetric=body.symmetric,
+        fields=body.fields,
+    )
+    return JSONResponse(content=result)
+
+
+@router.delete("/edge-kinds/{name}")
+def delete_edge_kind(name: str, into: str | None = None) -> JSONResponse:
+    """Delete an edge kind; refuses (409) when edges use it unless ``into`` reassigns them."""
+    result = service.delete_edge_kind(name, into=into)
+    return JSONResponse(content=result.model_dump(mode="json"))
 
 
 app.include_router(router)

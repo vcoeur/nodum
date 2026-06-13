@@ -72,7 +72,7 @@ Point it at a Postgres and initialise:
 
 ```bash
 export NODUM_DATABASE_URL=postgresql://nodum:nodum@localhost:5436/nodum
-nodum init-db                # create the schema + seed the kind lookup tables (idempotent)
+nodum init-db                # create the schema + seed the default kind catalog (idempotent)
 nodum auth set-password      # set the main password that gates the API + web
 ```
 
@@ -126,15 +126,23 @@ How it works:
 
 ## Migrating an older database
 
-If you have a pre-typed (MVP) database from before the metamodel, upgrade it in place — idempotently:
+Upgrade any earlier database in place — idempotently — with one command:
 
 ```bash
 nodum migrate
 ```
 
-It adds the `kind` columns, seeds the lookup tables, drops the old type-as-node rows (their edges
-cascade), backfills kinds (content nodes become `Note`, carrying their old `data.type` into `role`),
-then enforces the new constraints. Safe to re-run.
+It runs the full chain, each step a no-op when already applied:
+
+- **MVP → typed** (only if needed): adds the `kind` columns, drops the old type-as-node rows (their
+  edges cascade), backfills kinds (content nodes become `Note`, carrying their old `data.type` into
+  `role`), and enforces the kind foreign keys.
+- **Kind specs**: adds the `spec` column to the `node_kinds` / `edge_kinds` tables and backfills it —
+  the step that turns the old name-only kind tables into the runtime-evolvable schema.
+- **Content column**: promotes each node's `data.text` into the new top-level `content` column, drops
+  the old `data ? 'text'` check, and moves the full-text index onto `content`.
+
+Safe to re-run.
 
 ## Development from a source checkout
 
@@ -143,7 +151,7 @@ git clone https://github.com/vcoeur/nodum.git
 cd nodum
 make db-up               # start the local Postgres (docker-compose, host port 5436)
 make dev-install         # uv sync --all-groups
-make init-db             # create the schema + seed kind tables
+make init-db             # create the schema + seed the default kind catalog
 uv run nodum auth set-password
 make test                # pytest (needs the database up)
 ```

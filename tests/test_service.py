@@ -8,7 +8,7 @@ import pytest
 
 from nodum import metamodel, service
 from nodum.models import EdgeOut, NodeOut
-from nodum.service import EdgeNotFound, NodeNotFound
+from nodum.service import EdgeNotFound, KindInUse, KindNotFound, NodeNotFound
 
 
 def _person_and_reference() -> tuple[NodeOut, NodeOut]:
@@ -22,7 +22,8 @@ def test_add_typed_nodes() -> None:
     """Typed create stores the kind and validated payload (Person.born, Reference)."""
     person, reference = _person_and_reference()
     assert person.kind == "Person"
-    assert person.data["text"] == "Ada Lovelace"
+    assert person.content == "Ada Lovelace"
+    assert "text" not in person.data  # the universal text lives in `content`, not `data`
     assert person.data["born"] == 1815
     assert reference.kind == "Reference"
 
@@ -137,10 +138,110 @@ def test_unknown_uuids_raise_not_found() -> None:
     with pytest.raises(NodeNotFound):
         service.get(missing)
     with pytest.raises(NodeNotFound):
-        service.update_node(missing, text="nope")
+        service.update_node(missing, content="nope")
     with pytest.raises(NodeNotFound):
         service.delete_node(missing)
     with pytest.raises(EdgeNotFound):
         service.update_edge(missing, data={"x": 1})
     with pytest.raises(EdgeNotFound):
         service.delete_edge(missing)
+
+
+def test_update_node_changes_content() -> None:
+    """``update_node`` replaces the node's content while preserving its payload."""
+    note = service.add_node("Note", "first draft", data={"role": "claim"})
+    updated = service.update_node(note.uuid, content="second draft")
+    assert updated.content == "second draft"
+    assert updated.data["role"] == "claim"
+
+
+# ── Evolvable schema: kind CRUD ───────────────────────────────────────────────
+
+
+def test_add_and_use_node_kind(restore_kinds: None) -> None:
+    """A runtime-added node kind is usable for create and visible in the schema."""
+    entry = service.add_node_kind(
+        "Dataset", group="entity", content_label="name", fields={"rows": {"type": "int"}}
+    )
+    assert entry["name"] == "Dataset"
+    assert entry["content_label"] == "name"
+
+    node = service.add_node("Dataset", "MNIST", data={"rows": 70000})
+    assert node.kind == "Dataset"
+    assert node.data["rows"] == 70000
+    assert "Dataset" in {nk["name"] for nk in service.schema()["node_kinds"]}
+
+
+def test_add_node_kind_rejects_duplicate(restore_kinds: None) -> None:
+    """Registering an existing node kind name is rejected."""
+    with pytest.raises(metamodel.ValidationError):
+        service.add_node_kind("Person")
+
+
+def test_update_node_kind_edits_spec(restore_kinds: None) -> None:
+    """Editing a node kind replaces only the given attributes."""
+    updated = service.update_node_kind("Topic", content_label="subject")
+    assert updated["content_label"] == "subject"
+    # The fields were not passed, so they are preserved.
+    assert "aliases" in updated["fields"]
+
+
+def test_delete_node_kind_blocks_when_used_then_reassigns(restore_kinds: None) -> None:
+    """Deleting an in-use node kind is refused; ``into`` reassigns then deletes."""
+    service.add_node_kind("Draft", group="note", content_label="text")
+    drafted = service.add_node("Draft", "a rough note")
+
+    with pytest.raises(KindInUse):
+        service.delete_node_kind("Draft")
+
+    result = service.delete_node_kind("Draft", into="Note")
+    assert result.reassigned == 1
+    assert result.deleted is True
+    assert "Draft" not in {nk["name"] for nk in service.schema()["node_kinds"]}
+    # The node now carries the reassigned kind.
+    assert service.get(drafted.uuid).node.kind == "Note"
+
+
+def test_delete_node_kind_blocked_by_edge_signature(restore_kinds: None) -> None:
+    """A node kind named in an edge signature blocks deletion even with no nodes."""
+    # Topic has no nodes here, but `IsAbout` / `BroaderThan` / `mentions` name it.
+    with pytest.raises(KindInUse):
+        service.delete_node_kind("Topic")
+
+
+def test_delete_node_kind_into_rewrites_signatures(restore_kinds: None) -> None:
+    """Reassigning a node kind rewrites the edge signatures that referenced it."""
+    service.delete_node_kind("Topic", into="Entity")
+    is_about = next(ek for ek in service.schema()["edge_kinds"] if ek["name"] == "IsAbout")
+    assert "Topic" not in is_about["to"]
+    assert "Entity" in is_about["to"]
+
+
+def test_add_edge_kind_and_delete_reassign(restore_kinds: None) -> None:
+    """A runtime-added edge kind is usable, and ``into`` reassigns its edges on delete."""
+    service.add_edge_kind("Rebuts", from_kinds=["Note"], to_kinds=["Note"])
+    one = service.add_node("Note", "claim one", data={"role": "claim"})
+    two = service.add_node("Note", "claim two", data={"role": "claim"})
+    edge = service.add_edge("Rebuts", one.uuid, two.uuid)
+    assert edge.kind == "Rebuts"
+
+    with pytest.raises(KindInUse):
+        service.delete_edge_kind("Rebuts")
+
+    result = service.delete_edge_kind("Rebuts", into="contradicts")
+    assert result.reassigned == 1
+    assert service.get(one.uuid).edges[0].kind == "contradicts"
+
+
+def test_add_edge_kind_rejects_unknown_endpoint(restore_kinds: None) -> None:
+    """An edge kind naming an unknown node kind is rejected."""
+    with pytest.raises(metamodel.ValidationError):
+        service.add_edge_kind("Uses", from_kinds=["Note"], to_kinds=["Ghost"])
+
+
+def test_delete_missing_kind_raises_not_found(restore_kinds: None) -> None:
+    """Deleting an absent kind raises ``KindNotFound``."""
+    with pytest.raises(KindNotFound):
+        service.delete_node_kind("Nonexistent")
+    with pytest.raises(KindNotFound):
+        service.delete_edge_kind("Nonexistent")

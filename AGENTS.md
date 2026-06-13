@@ -11,27 +11,37 @@ subgraph expansion. All logic lives in one data-service layer; a CLI, an HTTP
 API, and a React single-page web UI are thin adapters over it. The full app ships
 as a Docker image; the PyPI wheel is the CLI/library (no UI). See **Distribution**.
 
-It is a **typed graph**. Earlier the graph was open — a node carried a free
-`data.type` string and types were themselves nodes. That is gone. Kinds now live
-in a code registry, `nodum.metamodel`: a curated set of node kinds (each with a
-field schema) and edge kinds (each with a `from_kinds → to_kinds` signature).
-Every node and edge row carries a `kind` column that references that registry.
+It is a **typed graph with a runtime-evolvable schema**. Earlier the graph was
+open — a node carried a free `data.type` string and types were themselves nodes;
+then kinds moved to a frozen code registry. Now kinds live **in the database**:
+the `node_kinds` / `edge_kinds` tables store each kind's name plus a `spec` (its
+field schema, or its `from_kinds → to_kinds` signature) as JSONB. Every node and
+edge row carries a `kind` column referencing that catalog, and the catalog is
+**editable at runtime** through the service / CLI / API. Every node also carries a
+plain-text `content` column (the embeddable body) alongside its JSON `data`.
 
-Retrieval is Postgres full-text plus graph traversal — no embeddings.
+Retrieval is Postgres full-text plus graph traversal — no embeddings yet
+(`content` is stored ready for them).
 
-## The metamodel is the typed layer
+## The schema is the typed, evolvable layer
 
-`nodum.metamodel` is the single source of truth for kinds. It is plain code: two
-dicts, `NODE_KINDS` and `EDGE_KINDS`, built from frozen dataclasses (`NodeKind`,
-`EdgeKind`, `FieldSpec`). There is **no per-kind table and no per-kind model
-class** — instances all live in the one generic `nodes` table and the one
-generic `edges` table, and the metamodel is the typed contract laid over them.
+Kinds are **data**, stored in `node_kinds` / `edge_kinds` (name + `spec` JSONB).
+`nodum.metamodel` holds the value types (`NodeKind`, `EdgeKind`, `FieldSpec`), the
+validation logic, the spec (de)serialisation, and the **default seed catalog**
+(`DEFAULT_NODE_KINDS` / `DEFAULT_EDGE_KINDS`) — but it is no longer the runtime
+source of truth: the service loads a kind from the DB and hands the resolved
+object to `metamodel.validate_*`. There is still **no per-kind table and no
+per-kind model class** — instances all live in the one generic `nodes` table and
+the one generic `edges` table.
 
-**Adding a kind is a registry edit.** To introduce a node or edge kind you edit
-`NODE_KINDS` / `EDGE_KINDS` in `metamodel.py` — nothing else structural changes.
-`nodum.db` seeds the new name into the `node_kinds` / `edge_kinds` lookup tables
-(run `init-db`, or `migrate` on an existing database) so the DB-level FK on
-`kind` stays in step with the registry.
+**Adding a kind is a runtime operation**, not a code edit: `nodum node-kind add`
+/ `edge-kind add` (or `POST /node-kinds` / `/edge-kinds`) insert a row into the
+catalog; `init-db` seeds the defaults into an **empty** catalog only (it never
+resurrects a deleted kind). Editing a kind (`… edit` / `PATCH`) replaces only the
+attributes given; deleting (`… rm` / `DELETE`) is refused while the kind is in
+use unless `--into <kind>` / `?into=<kind>` reassigns the using rows first.
+**Validation is a write-time gate, never retroactive** — editing or reassigning a
+kind never re-validates stored rows.
 
 The rule for **when a new kind is warranted:** it must unlock a typed edge or a
 typed field. If a distinction only labels or groups nodes, model it as a `role`
@@ -48,8 +58,8 @@ flowchart LR
     cli["nodum.cli (Typer)"] --> svc["nodum.service"]
     api["nodum.api (FastAPI)"] --> svc
     web["nodum.web (browser)"] --> api
-    svc --> mm["nodum.metamodel (typed registry)"]
-    svc --> pg[("PostgreSQL")]
+    svc --> mm["nodum.metamodel (value types + validation)"]
+    svc --> pg[("PostgreSQL (kinds + instances)")]
     cli --> auth["nodum.auth (main password)"]
     api --> auth
     web --> auth
@@ -63,17 +73,22 @@ flowchart LR
     style pg fill:#d9f2d9,color:#000
 ```
 
-- **`nodum.metamodel`** — the typed registry: node-kind field schemas, edge-kind
-  endpoint signatures, the `validate_node` / `validate_edge` checks, and
-  `schema()`, which serialises the whole thing as the machine-readable contract.
+- **`nodum.metamodel`** — the value types (`NodeKind` / `EdgeKind` / `FieldSpec`),
+  the `validate_node` / `validate_edge` checks (against a *resolved* kind),
+  spec (de)serialisation (`node_kind_from_spec` / `…_to_spec`, etc.),
+  `schema_from(...)`, and the `DEFAULT_*_KINDS` seed catalog. No DB access — the
+  service loads kinds and passes them in.
 - **`nodum.service`** — the data-service layer. The only place that talks to the
-  database and the only place that calls the metamodel to validate input.
+  database; it loads the kind from the DB (`db.load_node_kind` / …) and calls the
+  metamodel to validate input. Also owns **kind CRUD** (`add_node_kind`,
+  `update_node_kind`, `delete_node_kind`, and the edge equivalents) and `schema()`.
 - **`nodum.models`** — the single pydantic I/O schema shared by every surface
-  (`NodeOut`, `EdgeOut`, `SearchHit`, `NodeWithEdges`, `SearchResult`,
-  `Subgraph`, `Deleted`, plus the `AddNodeIn` / `AddEdgeIn` / `UpdateNodeIn` /
-  `UpdateEdgeIn` inputs). A node/edge carries its `kind`; kind-specific fields
-  live in `data`. UUID and datetime fields render as strings under
-  `model_dump(mode="json")`.
+  (`NodeOut` — now with a top-level `content` — `EdgeOut`, `SearchHit`,
+  `NodeWithEdges`, `SearchResult`, `Subgraph`, `Deleted`, `KindDeleted`, plus the
+  `AddNodeIn` / `AddEdgeIn` / `UpdateNodeIn` / `UpdateEdgeIn` and the kind-definition
+  inputs `NodeKindIn` / `NodeKindPatch` / `EdgeKindIn` / `EdgeKindPatch`). A node
+  carries its `kind` + `content`; kind-specific metadata lives in `data`. UUID and
+  datetime fields render as strings under `model_dump(mode="json")`.
 - **`nodum.cli`** (Typer) — each command calls one service function and prints
   the result as a single JSON object on **stdout**; human and error messages go
   to **stderr**.
@@ -89,15 +104,17 @@ flowchart LR
   hashing, signed session tokens, and the `auth_secret` reads/writes. The CLI,
   API, and web call it; it imports no FastAPI. See **Authentication** below.
 - **`nodum.db`** / **`nodum.settings`** — connection management (`dict_row`),
-  idempotent schema init + kind seeding from `schema.sql`, the MVP + auth
-  migrations, and environment-loaded config.
+  idempotent schema init, kind seeding (`_seed_kind_specs` — empty tables only)
+  and loading (`load_node_kind(s)` / `load_edge_kind(s)`), the migration chain
+  (`migrate` = auth + MVP + kind-specs + content), and environment-loaded config.
 
-## Node kinds
+## Node kinds (seeded defaults)
 
-Seven kinds, grouped (`entity` / `literature` / `note`). Every kind defines what
-its universal `text` means (`text_label`) and an optional field schema.
+Seven seeded kinds, grouped (`entity` / `literature` / `note`) — the catalog is
+runtime-evolvable, so these are the defaults, not a fixed set. Every kind defines
+what its `content` means (`content_label`) and an optional field schema.
 
-| Kind | Group | `text` is | Typed fields |
+| Kind | Group | `content` is | Typed fields |
 |---|---|---|---|
 | `Person` | entity | name | `aliases` (list[str]), `born` (int) |
 | `Organization` | entity | name | `aliases` (list[str]) |
@@ -111,10 +128,10 @@ its universal `text` means (`text_label`) and an optional field schema.
 set stays small. `Reference` is a bibliographic record; `Literature` is a note
 *on* a source.
 
-## Edge kinds (signatures)
+## Edge kinds (seeded defaults — signatures)
 
 Each edge kind constrains its endpoints to specific node kinds — the
-`from_kinds → to_kinds` signature, checked at create time.
+`from_kinds → to_kinds` signature, checked at create time. (Also runtime-evolvable.)
 
 | Edge kind | From | To |
 |---|---|---|
@@ -136,14 +153,15 @@ Each edge kind constrains its endpoints to specific node kinds — the
 Validation is split deliberately:
 
 - **Soft, in the service.** `metamodel.validate_node` / `validate_edge` enforce
-  the full typed shape — known kind, non-empty `text`, required fields present,
-  declared fields matching their type, enum choices, and edge endpoint kinds
-  inside the signature. A violation raises `metamodel.ValidationError` (a
-  `ValueError`). Undeclared payload keys are allowed (forward-compatible).
+  the full typed shape — non-empty `content`, required fields present, declared
+  fields matching their type, enum choices, and edge endpoint kinds inside the
+  signature (the kind itself is resolved from the DB first; an unknown kind is
+  rejected there). A violation raises `metamodel.ValidationError` (a `ValueError`).
+  Undeclared payload keys are allowed (forward-compatible).
 - **Cheap-hard, in the database.** `schema.sql` enforces only the universal
   invariants that are free to check: the `kind` FK into the `node_kinds` /
-  `edge_kinds` lookup tables, `CHECK (data ? 'text')` on every node, the
-  `from_uuid` / `to_uuid` FKs into `nodes` with `ON DELETE CASCADE`, and
+  `edge_kinds` tables, `content NOT NULL` on every node, the `from_uuid` /
+  `to_uuid` FKs into `nodes` with `ON DELETE CASCADE`, and
   `CHECK (from_uuid <> to_uuid)` (no self-edges). The endpoint-kind *signatures*
   are not enforced in SQL — that stays in the service.
 
@@ -152,56 +170,64 @@ a `kind` column plus the registry, never a table per kind. This is what lets
 `expand` stay a single uniform recursive CTE over `edges` regardless of kind —
 do not shard the graph into per-kind tables.
 
-**Open process, closed format.** Every node carries a universal natural-language
-`text` (the FTS-indexed, LLM-readable surface) *in addition to* its typed
-fields. Authoring stays open — you write prose first — while the format stays
-closed enough that machines can traverse and validate it.
+**Open process, closed format.** Every node carries a plain-text `content` body
+(the FTS-indexed, LLM-readable surface, ready to embed later) *in addition to* its
+typed fields. Authoring stays open — you write prose first — while the format
+stays closed enough that machines can traverse and validate it (and the format
+itself can evolve via kind CRUD).
 
-Error contract: the service raises `NodeNotFound` / `EdgeNotFound` (missing
-rows) and `ValueError` (bad input, including `ValidationError`). The CLI maps all
-three to a stderr line plus exit code 1. The API maps `NodeNotFound` /
-`EdgeNotFound` → 404 and `ValueError` → 422, each as a clean `{"detail": ...}`
-body.
+Error contract: the service raises `NodeNotFound` / `EdgeNotFound` / `KindNotFound`
+(missing rows), `KindInUse` (deleting a still-referenced kind without `into`), and
+`ValueError` (bad input, including `ValidationError`). The CLI maps all of these to
+a stderr line plus exit code 1. The API maps the not-found errors → 404,
+`KindInUse` → 409, and `ValueError` → 422, each as a clean `{"detail": ...}` body.
 
 ## CRUD surfaces — `schema` is the contract
 
 The service offers full CRUD plus query: `add_node` / `add_edge`, `get`,
 `search` (optional `kind` filter), `expand` (optional `edge_kinds` filter),
-`update_node` / `update_edge`, `delete_node` / `delete_edge`, and `schema()`.
-The CLI and API expose all of it; any client can self-orient by reading
-`schema()` first, which is why it is the contract every surface ships.
+`update_node` / `update_edge`, `delete_node` / `delete_edge`, `schema()`, and the
+**kind CRUD** ops (`add_node_kind` / `update_node_kind` / `delete_node_kind` and
+the edge equivalents). The CLI and API expose all of it; any client self-orients
+by reading `schema()` first, which is why it is the contract every surface ships.
 
 **CLI commands** (`uv run nodum <cmd>`):
 
 | Command | Does |
 |---|---|
-| `add KIND TEXT [--set k=v …]` | create a typed node |
+| `add KIND CONTENT [--set k=v …]` | create a typed node |
 | `link FROM TO EDGE_KIND [--set k=v …]` | create a typed directed edge |
 | `get UUID` | a node plus its incident edges |
 | `search QUERY [--kind K] [--limit N]` | ranked full-text search |
 | `expand UUID [--depth N] [--edge-kind K …]` | seed → connected subgraph |
-| `edit-node UUID [--text …] [--set k=v …]` | merge + re-validate a node |
+| `edit-node UUID [--content …] [--set k=v …]` | merge + re-validate a node |
 | `edit-edge UUID [--set k=v …]` | merge an edge's payload |
 | `rm-node UUID` | delete a node (edges cascade) |
 | `rm-edge UUID` | delete one edge |
-| `schema` | print the metamodel contract |
+| `schema` | print the live schema |
+| `node-kind add/edit/rm NAME [--group/--content-label/--fields] [--into KIND]` | manage node kinds |
+| `edge-kind add/edit/rm NAME [--from/--to/--symmetric/--fields] [--into KIND]` | manage edge kinds |
 | `auth set-password` | set/replace the main password (prompt or piped stdin) |
 | `auth status` | report whether a password is configured (+ timestamp) |
 | `auth ensure-password` | set the password from `NODUM_ADMIN_PASSWORD[_FILE]` if unconfigured (entrypoint bootstrap) |
-| `init-db` | create schema + seed kind tables |
-| `migrate` | upgrade a pre-typed (MVP) database |
+| `init-db` | create schema + seed the default kind catalog |
+| `migrate` | upgrade an older database in place (kinds, content, auth) |
 | `serve` | run the HTTP API (serves the SPA when `NODUM_WEB_DIST` is set) |
 
-`--set key=value` is repeatable; each value is parsed as JSON, falling back to
-the raw string (so `--set born=1815` is an int, `--set venue=Nature` a string).
+`--set key=value` is repeatable (node/edge payload); each value is parsed as JSON,
+falling back to the raw string (so `--set born=1815` is an int, `--set venue=Nature`
+a string). `--fields` (kind CRUD) takes a JSON object mirroring `schema`'s `fields`
+shape: `name → {type, required, choices, description}`.
 
 **API routes:** `POST /nodes`, `GET /nodes/{uuid}`, `PATCH /nodes/{uuid}`,
 `DELETE /nodes/{uuid}`, `POST /edges`, `PATCH /edges/{uuid}`,
-`DELETE /edges/{uuid}`, `GET /search`, `GET /expand`, `GET /schema` — all
-**gated by `require_auth`** — plus the open `POST /auth/login`,
-`POST /auth/logout`, `GET /auth/session` (the SPA's auth probe), `GET /healthz`,
-and (only when `NODUM_WEB_DIST` is set) the open `GET /` + `/assets` that serve
-the SPA shell.
+`DELETE /edges/{uuid}`, `GET /search`, `GET /expand`, `GET /schema`,
+`POST /node-kinds`, `PATCH|DELETE /node-kinds/{name}` (delete takes `?into=`),
+`POST /edge-kinds`, `PATCH|DELETE /edge-kinds/{name}` — all **gated by
+`require_auth`** — plus the open `POST /auth/login`, `POST /auth/logout`,
+`GET /auth/session` (the SPA's auth probe), `GET /healthz`, and (only when
+`NODUM_WEB_DIST` is set) the open `GET /` + `/assets` that serve the SPA shell.
+Edge-kind bodies accept the signature as `from` / `to` (the schema wire names).
 
 **Keep the adapters mirrored.** The CLI and the API serialise the *same*
 `model_dump(mode="json")` envelope, so identical data yields byte-identical JSON
@@ -213,11 +239,13 @@ API route in lockstep — never let one surface drift ahead of the other.
 
 The UI is a **React + Vite (TypeScript) SPA** in `frontend/`, a pure client of the
 JSON API. It is schema-driven: it fetches `GET /schema` and renders its forms from
-the metamodel (create/edit a node by kind, create an edge by type with endpoint
-pickers filtered to the signature, delete with a cascade-aware confirm, search,
-open a node, and render its subgraph as a dependency-free node-link **SVG
-diagram**). It holds no logic — every mutation goes through the API — so it stays
-in lockstep with the CLI. Keep it driven by `GET /schema` (never hardcode kinds).
+the live schema (create/edit a node by kind — with a `content` body and the kind's
+typed fields — create an edge by type with endpoint pickers filtered to the
+signature, delete with a cascade-aware confirm, search, open a node, and render its
+subgraph as a dependency-free node-link **SVG diagram**). It holds no logic — every
+mutation goes through the API — so it stays in lockstep with the CLI. Keep it driven
+by `GET /schema` (never hardcode kinds). Kind administration is API + CLI only — the
+SPA's schema view stays read-only.
 
 - **Build:** `npm run build` (in `frontend/`) typechecks with `tsc` then emits
   `frontend/dist/` (hashed, same-origin assets); `nodum.web` serves that bundle
@@ -288,36 +316,43 @@ the install is **locked**: protected routes return `503` pointing at the CLI.
 A mutable JSONB graph. The schema (`nodum/schema.sql`) is idempotent — safe to
 re-run on every start-up.
 
-- **node_kinds / edge_kinds** — `TEXT PRIMARY KEY` lookup tables, seeded from the
-  metamodel; the `kind` FKs point here.
+- **node_kinds / edge_kinds** — the kind catalog: `name TEXT PRIMARY KEY` + a
+  `spec JSONB NOT NULL` (node: `{group, content_label, fields}`; edge:
+  `{from, to, symmetric, fields}`). Seeded with the defaults into an empty table;
+  editable at runtime via kind CRUD. The `kind` FKs point at `name`.
 - **auth_secret** — single-row table (`id BOOLEAN PK CHECK (id)`) holding the
   argon2 `password_hash` + random `signing_key` + `updated_at`. Empty until
   `nodum auth set-password` writes it. `nodum.db.migrate_auth` creates it on an
   already-initialised database (idempotent). See **Authentication**.
 - **nodes** — `uuid` (PK, `gen_random_uuid()`), `kind` (FK → `node_kinds`),
-  `data` JSONB (`CHECK (data ? 'text')`), `created_at`, `updated_at`. Indexed
-  with a GIN index on `data`, a GIN full-text index on
-  `to_tsvector('english', data ->> 'text')`, and a btree index on `kind`.
+  `content TEXT NOT NULL` (the embeddable body), `data` JSONB (kind metadata,
+  default `{}`), `created_at`, `updated_at`. Indexed with a GIN index on `data`, a
+  GIN full-text index on `to_tsvector('english', content)`, and a btree on `kind`.
 - **edges** — `uuid` (PK), `kind` (FK → `edge_kinds`), `from_uuid` / `to_uuid`
   (FK → `nodes`, `ON DELETE CASCADE`), `data` JSONB, `created_at`,
   `updated_at`. `CHECK (from_uuid <> to_uuid)`. Indexed on `kind`, `from_uuid`,
   `to_uuid`, and `data`.
 - **Retrieval.** `search` is Postgres full-text (`plainto_tsquery('english')`,
-  AND of terms) over `data ->> 'text'`, ranked by `ts_rank`, with an optional
-  `kind` filter. `expand` walks directed edges (`from_uuid → to_uuid`) outward
-  from a seed set up to `depth` hops via a recursive CTE — optionally restricted
-  to given edge kinds — then loads every node touched; serialised, that
-  `Subgraph` is the context payload. `get` returns a node plus every edge
-  incident on it in either direction.
-- **No embeddings** — no vector column, no embeddings table.
+  AND of terms) over `content`, ranked by `ts_rank`, with an optional `kind`
+  filter. `expand` walks directed edges (`from_uuid → to_uuid`) outward from a
+  seed set up to `depth` hops via a recursive CTE — optionally restricted to given
+  edge kinds — then loads every node touched; serialised, that `Subgraph` is the
+  context payload. `get` returns a node plus every edge incident on it in either
+  direction.
+- **No embeddings yet** — no vector column; `content` is the column they will
+  target.
 
-### Migration from the MVP
+### Migration of older databases
 
-`nodum.db.migrate_mvp` (CLI `migrate`) upgrades a pre-typed MVP database in
-place, idempotently: it adds the `kind` columns, seeds the lookup tables, drops
-the MVP type-as-node rows (their `is` edges cascade), backfills `kind` (content
-nodes → `Note` with their old `data.type` carried into `role`; edges from their
-old `data.type`, else `mentions`), then enforces NOT NULL and the lookup FKs.
+`nodum.db.migrate` (CLI `migrate`) upgrades any older database in place,
+idempotently, as a chain: `migrate_auth` (the `auth_secret` table); `migrate_mvp`
+(only on a pre-typed MVP DB — adds `kind` columns, drops type-as-node rows whose
+`is` edges cascade, backfills `Note` kinds from `data.type` into `role`, enforces
+the kind FKs); `migrate_kind_specs` (adds the `spec` column to the kind tables and
+backfills it from the defaults — the name-only → evolvable upgrade); and
+`migrate_content` (promotes `data.text` into the `content` column, drops the old
+`data ? 'text'` check, moves the FTS index onto `content`). Each step is a no-op
+once applied.
 
 ## Dev workflow
 
@@ -383,14 +418,15 @@ root, deployed to **<https://nodum.vcoeur.com>** by `.github/workflows/docs.yml`
   `E, F, I, UP, B, SIM`. Run `make format` before committing; CI runs
   `make lint`.
 - **Docstrings on public APIs.** Document every public function, route, model,
-  and metamodel entry with a one-line summary plus args/returns where
+  and metamodel helper with a one-line summary plus args/returns where
   applicable. Don't annotate or document code you didn't change.
-- **Metamodel first, service next, adapters in lockstep.** A new kind is a
-  `metamodel.py` registry edit; new behaviour and validation go in
+- **Service first, adapters in lockstep.** New behaviour and validation go in
   `nodum.service`; expose it through the CLI and the API together so the parity
-  tests stay green. Adapters must not add behaviour the service lacks.
-- **Deferred — do not build here:** embeddings (pgvector / hybrid retrieval), an
-  LLM "gardener", contradiction reasoning, reranking, multi-user accounts / roles
-  (auth is a single shared main password — see **Authentication**), and
-  runtime-editable kinds (the metamodel stays a code registry). Keep changes
-  inside the typed full-text + graph feature set.
+  tests stay green. Adapters must not add behaviour the service lacks. A new
+  *default* kind is a `DEFAULT_*_KINDS` edit in `metamodel.py` (it seeds fresh
+  installs); kinds are otherwise created at runtime through kind CRUD.
+- **Deferred — do not build here:** embeddings (pgvector / hybrid retrieval —
+  `content` is the column they will target), an LLM "gardener", contradiction
+  reasoning, reranking, and multi-user accounts / roles (auth is a single shared
+  main password — see **Authentication**). Keep changes inside the typed
+  full-text + graph feature set.

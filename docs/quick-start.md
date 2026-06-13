@@ -48,7 +48,7 @@ host port 5436:
 
 ```bash
 export NODUM_DATABASE_URL=postgresql://nodum:nodum@localhost:5436/nodum
-nodum init-db                     # create the schema + seed the kind lookup tables
+nodum init-db                     # create the schema + seed the default kind catalog
 nodum auth set-password           # set the main password (gates the API + web; prompts twice)
 ```
 
@@ -64,8 +64,8 @@ CLI is shown here because it copy-pastes.
 
 ### Create two typed nodes
 
-`add KIND TEXT` creates a node; `--set key=value` carries the kind's typed fields (each value is
-parsed as JSON, falling back to the raw string):
+`add KIND CONTENT` creates a node; `CONTENT` is the node's plain-text body, and `--set key=value`
+carries the kind's typed fields (each value is parsed as JSON, falling back to the raw string):
 
 ```bash
 nodum add Person "Ada Lovelace" --set born=1815
@@ -103,13 +103,23 @@ nodum expand <ada-uuid> --depth 2 --edge-kind AuthorOf
 
 ### Read the live contract
 
-One call returns the whole metamodel — every node kind, edge kind, and signature. This is how an
-agent self-orients before its first write:
+One call returns the whole schema — every node kind, edge kind, and signature. This is how an agent
+self-orients before its first write:
 
 ```bash
 nodum schema            # CLI
 # or, against a running server:
 curl -s http://127.0.0.1:8600/schema
+```
+
+### Evolve the schema
+
+Kinds are stored in the database, so you can add, edit, and delete them at runtime — no code change:
+
+```bash
+nodum node-kind add Dataset --group entity --content-label name \
+  --fields '{"rows": {"type": "int"}}'
+nodum edge-kind add DerivedFrom --from Dataset --to Reference
 ```
 
 ## Where to go from here

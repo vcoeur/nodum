@@ -83,7 +83,7 @@ export function Search({ onOpen }: SearchProps) {
         {result?.hits.map((hit) => (
           <li key={hit.uuid}>
             <button type="button" className="hit" onClick={() => onOpen(hit.uuid)}>
-              <span className="hit-text">{nodeText(hit.data)}</span>
+              <span className="hit-text">{nodeText(hit.content)}</span>
               <span className="hit-meta">
                 <span className="tag">{hit.kind}</span>
                 <span className="score">score {hit.score.toFixed(4)}</span>

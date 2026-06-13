@@ -20,7 +20,7 @@ from typer.testing import CliRunner
 
 from nodum import api, auth
 from nodum.cli import app as cli_app
-from nodum.db import connect, init_schema
+from nodum.db import connect, init_schema, seed_kinds
 
 # A fixed main password + signing key so the whole suite runs authenticated and
 # the minted tokens stay valid across tests. set_password preserves the signing
@@ -87,6 +87,25 @@ def clean_graph(schema: None) -> None:
     with connect() as conn:
         conn.cursor().execute("TRUNCATE nodes CASCADE")
         conn.commit()
+
+
+@pytest.fixture
+def restore_kinds() -> None:
+    """Reset the kind catalog to the seeded defaults after a kind-mutating test.
+
+    The kind tables persist across tests (only the graph is truncated), so any
+    test that adds/edits/deletes a kind must take this fixture to keep the suite
+    order-independent. Truncating nodes first lets the kind rows be deleted (the
+    FK no longer has referencing rows), then the defaults are re-seeded.
+    """
+    yield
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("TRUNCATE nodes CASCADE")
+            cur.execute("DELETE FROM edge_kinds")
+            cur.execute("DELETE FROM node_kinds")
+        conn.commit()
+        seed_kinds(conn)
 
 
 @pytest.fixture(scope="session")

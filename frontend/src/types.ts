@@ -13,7 +13,7 @@ export interface FieldSpec {
 export interface NodeKind {
   name: string;
   group: string;
-  text_label: string;
+  content_label: string;
   fields: Record<string, FieldSpec>;
 }
 
@@ -30,11 +30,12 @@ export interface Schema {
   edge_kinds: EdgeKind[];
 }
 
-export type NodeData = Record<string, unknown> & { text?: string };
+export type NodeData = Record<string, unknown>;
 
 export interface NodeOut {
   uuid: string;
   kind: string;
+  content: string;
   data: NodeData;
   created_at: string;
   updated_at: string;
