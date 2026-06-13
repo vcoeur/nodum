@@ -19,6 +19,8 @@ LLM-readable) alongside its typed fields.
 > contradiction reasoning, reranking, multi-user accounts, and runtime-editable
 > kinds are deferred.
 
+**Documentation:** <https://nodum.vcoeur.com>
+
 ## Quick start
 
 ### Run the full app with Docker

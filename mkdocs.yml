@@ -1,0 +1,82 @@
+site_name: nodum
+site_url: https://nodum.vcoeur.com/
+site_description: Atomic-notes knowledge system — a mutable PostgreSQL graph of typed, UUID-keyed nodes and edges with full-text search and recursive subgraph expansion, behind one data-service layer fronted by a CLI, an HTTP API, and a React SPA.
+site_author: Alice Voland
+copyright: 'Developed by Alice Voland &middot; <a href="https://vcoeur.com">vcoeur.com</a> &middot; <a href="/legal/">Legal</a>'
+
+repo_url: https://github.com/vcoeur/nodum
+repo_name: vcoeur/nodum
+edit_uri: edit/main/docs/
+
+theme:
+  name: material
+  font: false
+  favicon: assets/favicon.svg
+  logo: assets/favicon.svg
+  icon:
+    repo: fontawesome/brands/github
+  features:
+    - navigation.instant
+    - navigation.tracking
+    - navigation.sections
+    - navigation.top
+    - content.code.copy
+    - content.tabs.link
+    - search.highlight
+    - search.suggest
+    - toc.follow
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: custom
+      accent: custom
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: custom
+      accent: custom
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+
+extra_css:
+  - assets/stylesheets/extra.css
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/vcoeur/nodum
+    - icon: fontawesome/brands/python
+      link: https://pypi.org/project/nodum/
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - def_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.tasklist:
+      custom_checkbox: true
+
+nav:
+  - Overview: index.md
+  - Quick start: quick-start.md
+  - Concepts: concepts.md
+  - Reference:
+      - Install & run: install.md
+      - Commands: commands.md
+  - Legal: legal.md
