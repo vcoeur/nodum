@@ -1,0 +1,20 @@
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: nodum
+      POSTGRES_PASSWORD: nodum
+      POSTGRES_DB: nodum
+    ports:
+      # Host 5436 → container 5432 (5432–5435 are used by sibling apps).
+      - "5436:5432"
+    volumes:
+      - nodum-pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nodum"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  nodum-pg:

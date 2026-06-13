@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0   # hatch-vcs needs full history + tags to derive the version
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+      - name: Ruff check
+        run: uv run --locked ruff check .
+      - name: Ruff format check
+        run: uv run --locked ruff format --check .
+
+  test:
+    name: Tests (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.12", "3.13"]
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: nodum
+          POSTGRES_PASSWORD: nodum
+          POSTGRES_DB: nodum
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U nodum"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 20
+    env:
+      NODUM_DATABASE_URL: postgresql://nodum:nodum@localhost:5432/nodum
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0   # hatch-vcs needs full history + tags to derive the version
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Run test suite
+        run: uv run --locked pytest -q

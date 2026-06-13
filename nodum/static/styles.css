@@ -1,0 +1,285 @@
+:root {
+  --bg: #f7f7f5;
+  --surface: #ffffff;
+  --border: #e0e0dc;
+  --text: #1c1c1c;
+  --muted: #6b6b6b;
+  --accent: #2f5d8a;
+  --tag-bg: #eef2f7;
+  --tag-text: #2f5d8a;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  line-height: 1.5;
+}
+
+header {
+  padding: 1.5rem 1.5rem 0.5rem;
+  border-bottom: 1px solid var(--border);
+}
+
+header h1 {
+  margin: 0;
+  font-size: 1.6rem;
+}
+
+.tagline {
+  margin: 0.25rem 0 0;
+  color: var(--muted);
+  font-size: 0.95rem;
+}
+
+main {
+  max-width: 60rem;
+  margin: 0 auto;
+  padding: 1.5rem;
+}
+
+section {
+  margin-bottom: 2rem;
+}
+
+/* ── Forms ── */
+
+form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+input[type="search"] {
+  flex: 1 1 18rem;
+  padding: 0.5rem 0.7rem;
+  font-size: 1rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--text);
+}
+
+input[type="number"] {
+  width: 4.5rem;
+  padding: 0.4rem 0.5rem;
+  font-size: 0.95rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--text);
+}
+
+label.inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.9rem;
+  color: var(--muted);
+}
+
+button {
+  padding: 0.5rem 1rem;
+  font-size: 0.95rem;
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  background: var(--accent);
+  color: #fff;
+  cursor: pointer;
+}
+
+button:hover {
+  filter: brightness(1.08);
+}
+
+/* ── Status lines ── */
+
+.status {
+  margin: 0.7rem 0;
+  color: var(--muted);
+  font-size: 0.9rem;
+  min-height: 1.2em;
+}
+
+.muted {
+  color: var(--muted);
+}
+
+/* ── Result + node lists ── */
+
+.results {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.hit {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  padding: 0.7rem 0.8rem;
+  margin-bottom: 0.5rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.hit:hover,
+.hit:focus {
+  border-color: var(--accent);
+  outline: none;
+}
+
+.hit-text {
+  font-weight: 600;
+}
+
+.hit-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.82rem;
+  color: var(--muted);
+}
+
+.tag {
+  display: inline-block;
+  padding: 0.05rem 0.45rem;
+  background: var(--tag-bg);
+  color: var(--tag-text);
+  border-radius: 999px;
+  font-size: 0.78rem;
+  font-weight: 600;
+}
+
+.score {
+  font-variant-numeric: tabular-nums;
+}
+
+.uuid {
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.8rem;
+}
+
+.uuid.clickable {
+  cursor: pointer;
+  color: var(--accent);
+}
+
+.uuid.clickable:hover {
+  text-decoration: underline;
+}
+
+/* ── Node detail ── */
+
+#node-detail h3,
+#expand-detail h3 {
+  margin: 1.2rem 0 0.5rem;
+  font-size: 1rem;
+}
+
+.node-text {
+  font-size: 1.15rem;
+  font-weight: 600;
+  margin: 0.2rem 0;
+}
+
+.node-ids {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.6rem;
+  margin: 0.2rem 0 0.6rem;
+  color: var(--muted);
+}
+
+.payload {
+  margin: 0;
+  padding: 0.8rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow-x: auto;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.85rem;
+}
+
+/* ── Edge table ── */
+
+table.edges {
+  width: 100%;
+  border-collapse: collapse;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  font-size: 0.9rem;
+}
+
+table.edges th,
+table.edges td {
+  text-align: left;
+  padding: 0.45rem 0.7rem;
+  border-bottom: 1px solid var(--border);
+}
+
+table.edges th {
+  background: var(--tag-bg);
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--muted);
+}
+
+table.edges tr:last-child td {
+  border-bottom: none;
+}
+
+.dir {
+  white-space: nowrap;
+  color: var(--muted);
+}
+
+.tag-cell {
+  font-weight: 600;
+}
+
+/* ── Expand controls + edge list ── */
+
+#expand-controls {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  margin-top: 1.2rem;
+}
+
+.edge-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.edge-line {
+  padding: 0.4rem 0.6rem;
+  margin-bottom: 0.35rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.endpoint {
+  font-weight: 600;
+}
+
+.arrow {
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  color: var(--accent);
+}
