@@ -68,6 +68,11 @@ async function request(method, url, body) {
     options.body = JSON.stringify(body);
   }
   const response = await fetch(url, options);
+  if (response.status === 401) {
+    // Session missing or expired — bounce to the sign-in page.
+    window.location = "/login";
+    throw new Error("Session expired — redirecting to sign in.");
+  }
   const raw = await response.text();
   let payload = null;
   if (raw) {
@@ -887,6 +892,19 @@ function renderGraph(subgraph) {
 
   graphDetail.hidden = false;
   setChildren(graphDetail, [svg]);
+}
+
+// ── Logout ───────────────────────────────────────────────────────────────────
+
+const logoutButton = document.getElementById("logout-button");
+if (logoutButton) {
+  logoutButton.addEventListener("click", async () => {
+    try {
+      await fetch("/auth/logout", { method: "POST", headers: { Accept: "application/json" } });
+    } finally {
+      window.location = "/login";
+    }
+  });
 }
 
 // ── Bootstrap ────────────────────────────────────────────────────────────────

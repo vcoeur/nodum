@@ -15,13 +15,14 @@ so ``--set born=1815`` yields an int, ``--set 'aliases=["a","b"]'`` a list, and
 from __future__ import annotations
 
 import json
+import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
 
 import typer
 from pydantic import BaseModel
 
-from nodum import service
+from nodum import auth, service
 from nodum.db import connect, init_schema, migrate_mvp
 from nodum.service import EdgeNotFound, NodeNotFound
 from nodum.settings import load_settings
@@ -219,6 +220,54 @@ def migrate() -> None:
     with connect() as conn:
         migrate_mvp(conn)
     _print_json({"ok": True, "message": "migrated"})
+
+
+auth_app = typer.Typer(
+    no_args_is_help=True,
+    help="Manage the single main password that gates the API and web view.",
+)
+app.add_typer(auth_app, name="auth")
+
+
+@auth_app.command("set-password")
+def auth_set_password(
+    password: str | None = typer.Option(
+        None, "--password", help="Set non-interactively (discouraged; prefer the prompt)."
+    ),
+) -> None:
+    """Set or replace the main password; prints a status JSON object (never the hash).
+
+    With no ``--password`` and an interactive terminal, prompts twice with no echo.
+    When stdin is piped, reads the password from the first line (for automation).
+    """
+    if password is None:
+        if sys.stdin.isatty():
+            password = typer.prompt("New main password", hide_input=True, confirmation_prompt=True)
+        else:
+            password = sys.stdin.readline().rstrip("\n")
+    if not password:
+        typer.echo("password must not be empty", err=True)
+        raise typer.Exit(1)
+    result = auth.set_password(password)
+    _print_json(
+        {
+            "ok": True,
+            "configured": result.configured,
+            "updated_at": result.updated_at.isoformat() if result.updated_at else None,
+        }
+    )
+
+
+@auth_app.command("status")
+def auth_status() -> None:
+    """Print whether a main password is configured and when it was last set."""
+    result = auth.status()
+    _print_json(
+        {
+            "configured": result.configured,
+            "updated_at": result.updated_at.isoformat() if result.updated_at else None,
+        }
+    )
 
 
 @app.command("serve")

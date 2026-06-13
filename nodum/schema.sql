@@ -32,3 +32,14 @@ CREATE INDEX IF NOT EXISTS idx_edges_kind     ON edges (kind);
 CREATE INDEX IF NOT EXISTS idx_edges_from     ON edges (from_uuid);
 CREATE INDEX IF NOT EXISTS idx_edges_to       ON edges (to_uuid);
 CREATE INDEX IF NOT EXISTS idx_edges_data_gin ON edges USING gin (data);
+
+-- Single-row table holding the one "main password" (argon2 hash) and the random
+-- signing_key used to sign session tokens. The `id` CHECK pins it to one row.
+-- Empty until `nodum auth set-password` writes it; the install stays locked
+-- until then. See nodum.auth.
+CREATE TABLE IF NOT EXISTS auth_secret (
+    id            BOOLEAN PRIMARY KEY DEFAULT true CHECK (id),
+    password_hash TEXT NOT NULL,
+    signing_key   TEXT NOT NULL,
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);

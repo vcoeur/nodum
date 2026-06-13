@@ -13,8 +13,10 @@ natural-language `text` (so authoring stays prose-first and the content is
 LLM-readable) alongside its typed fields.
 
 > **Scope.** Retrieval is Postgres full-text plus graph traversal — no
-> embeddings. Vector / hybrid retrieval, an LLM gardener, contradiction
-> reasoning, reranking, auth, and runtime-editable kinds are deferred.
+> embeddings. Access is gated by a single main password (see
+> [Authentication](#authentication)). Vector / hybrid retrieval, an LLM gardener,
+> contradiction reasoning, reranking, multi-user accounts, and runtime-editable
+> kinds are deferred.
 
 ## Quick start
 
@@ -22,6 +24,7 @@ LLM-readable) alongside its typed fields.
 make db-up        # start local PostgreSQL (docker-compose, host port 5436)
 make dev-install  # uv sync --all-groups
 make init-db      # create the schema + seed the kind lookup tables
+uv run nodum auth set-password   # set the main password (gates the API + web)
 make test         # run the suite (needs the database up)
 make serve        # run the HTTP API + web view on http://127.0.0.1:8600
 ```
@@ -99,7 +102,7 @@ uv run nodum expand <uuid> --depth 2 --edge-kind AuthorOf
 ```
 
 Also: `get <uuid>`, `edit-node` / `edit-edge`, `rm-node` / `rm-edge`, `schema`,
-`init-db`, `migrate`, and `serve`.
+`auth set-password` / `auth status`, `init-db`, `migrate`, and `serve`.
 
 ### HTTP API
 
@@ -120,8 +123,12 @@ curl -s 'http://127.0.0.1:8600/expand?seed=<uuid>&depth=2&edge_kind=cites'
 ```
 
 Full route set: `POST /nodes`, `GET|PATCH|DELETE /nodes/{uuid}`, `POST /edges`,
-`PATCH|DELETE /edges/{uuid}`, `GET /search`, `GET /expand`, `GET /schema`,
-`GET /healthz`. A missing node/edge returns 404; invalid input returns 422.
+`PATCH|DELETE /edges/{uuid}`, `GET /search`, `GET /expand`, `GET /schema` — all
+behind auth — plus `POST /auth/login`, `POST /auth/logout`, and `GET /healthz`.
+A missing node/edge returns 404; invalid input returns 422; an unauthenticated
+request returns 401 (or 503 until a password is set). Pass the token from
+`POST /auth/login` as `Authorization: Bearer <token>` (see
+[Authentication](#authentication)).
 
 ### Web view
 
@@ -131,7 +138,28 @@ its forms from the metamodel: create/edit a node by kind (fields rendered per
 the kind's schema), create an edge by type (endpoint pickers filtered to the
 signature, with validation feedback), delete (with a cascade-aware confirm),
 search (with a kind filter), open a node, and render its subgraph as a visual
-node-link **SVG diagram**. Dependency-free — no CDNs.
+node-link **SVG diagram**. Dependency-free — no CDNs. Visiting it unauthenticated
+redirects to a sign-in page; a `Logout` control clears the session.
+
+## Authentication
+
+The API and web view are gated by a **single main password**, set from the CLI on
+the machine where nodum runs:
+
+```bash
+uv run nodum auth set-password   # prompts twice (or reads a piped stdin line)
+uv run nodum auth status         # is a password set? (never prints the hash)
+```
+
+Until a password is set the install is **locked** (protected routes return 503).
+The password is stored as an argon2 hash (with a random signing key) in a
+single-row table; logging in mints a session token signed with that key
+(`itsdangerous`, 7-day expiry). Browsers carry it in an **HttpOnly, SameSite=
+Strict cookie** set by `POST /auth/login`; API/CLI clients send it as an
+`Authorization: Bearer <token>`. The per-request check verifies only the token
+signature — argon2 runs at login only. Set `NODUM_COOKIE_SECURE=1` to mark the
+cookie Secure behind a TLS-terminating proxy. Multi-user accounts are out of
+scope — this is one shared password.
 
 ## Data model
 

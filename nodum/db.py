@@ -53,6 +53,25 @@ def init_schema(conn: psycopg.Connection) -> None:
     conn.commit()
 
 
+# DDL for the single-row auth table; mirrors the auth_secret block in schema.sql
+# so an already-initialised database can gain the table without a full re-init.
+_AUTH_SECRET_DDL = """
+CREATE TABLE IF NOT EXISTS auth_secret (
+    id            BOOLEAN PRIMARY KEY DEFAULT true CHECK (id),
+    password_hash TEXT NOT NULL,
+    signing_key   TEXT NOT NULL,
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+)
+"""
+
+
+def migrate_auth(conn: psycopg.Connection) -> None:
+    """Create the ``auth_secret`` table if absent — idempotent, a no-op once present."""
+    with conn.cursor() as cur:
+        cur.execute(_AUTH_SECRET_DDL)
+    conn.commit()
+
+
 def migrate_mvp(conn: psycopg.Connection) -> None:
     """Upgrade a pre-typed (MVP) database in place — idempotent, a no-op when fresh.
 

@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>nodum — sign in</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <main class="login">
+    <div class="login-card">
+      <h1>nodum</h1>
+      {% if configured %}
+      <p class="tagline">Sign in with the main password.</p>
+      <form id="login-form">
+        <label class="block">
+          password
+          <input id="login-password" type="password" autocomplete="current-password" autofocus />
+        </label>
+        <button type="submit">Sign in</button>
+      </form>
+      <div id="login-status" class="status" aria-live="polite"></div>
+      <script src="/static/login.js" defer></script>
+      {% else %}
+      <p class="tagline">No main password is set yet.</p>
+      <p class="status">
+        On the machine where nodum is installed, run
+        <code>nodum auth set-password</code> to initialise it, then reload this page.
+      </p>
+      {% endif %}
+    </div>
+  </main>
+</body>
+</html>

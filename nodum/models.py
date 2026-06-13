@@ -78,6 +78,12 @@ class UpdateEdgeIn(BaseModel):
     data: dict | None = None
 
 
+class LoginIn(BaseModel):
+    """Input for ``POST /auth/login``: the candidate main password."""
+
+    password: str
+
+
 # ── Composite results ───────────────────────────────────────────────────────
 
 
