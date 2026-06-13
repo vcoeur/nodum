@@ -1,6 +1,7 @@
-// The authenticated app shell: header (with logout) plus the search / create /
-// detail panels. Owns the currently-open node and a reload token that lets child
-// mutations trigger a refresh of the detail view.
+// The authenticated app shell: header (with logout + a Graph/Schema view switch)
+// plus the search / create / detail panels or the schema-administration view.
+// Owns the currently-open node and a reload token that lets child mutations
+// trigger a refresh of the detail view.
 
 import { useState } from "react";
 
@@ -9,7 +10,10 @@ import { useSchema } from "../schema";
 import { CreateEdge } from "./CreateEdge";
 import { CreateNode } from "./CreateNode";
 import { NodeDetail } from "./NodeDetail";
+import { SchemaAdmin } from "./SchemaAdmin";
 import { Search } from "./Search";
+
+type View = "graph" | "schema";
 
 interface WorkspaceProps {
   onSignedOut: () => void;
@@ -17,6 +21,7 @@ interface WorkspaceProps {
 
 export function Workspace({ onSignedOut }: WorkspaceProps) {
   const { schema } = useSchema();
+  const [view, setView] = useState<View>("graph");
   const [current, setCurrent] = useState<string | null>(null);
   const [reloadToken, setReloadToken] = useState(0);
 
@@ -47,20 +52,42 @@ export function Workspace({ onSignedOut }: WorkspaceProps) {
         <div className="status">
           Loaded {schema.node_kinds.length} node kinds, {schema.edge_kinds.length} edge kinds.
         </div>
+        <nav className="view-nav">
+          <button
+            type="button"
+            className={view === "graph" ? "active" : ""}
+            onClick={() => setView("graph")}
+          >
+            Graph
+          </button>
+          <button
+            type="button"
+            className={view === "schema" ? "active" : ""}
+            onClick={() => setView("schema")}
+          >
+            Schema
+          </button>
+        </nav>
       </header>
       <main>
-        <Search onOpen={openNode} />
-        <CreateNode onCreated={openNode} />
-        <CreateEdge onCreated={openNode} />
-        {current && (
-          <NodeDetail
-            key={current}
-            uuid={current}
-            reloadToken={reloadToken}
-            onOpen={openNode}
-            onReload={reload}
-            onDeleted={() => setCurrent(null)}
-          />
+        {view === "graph" ? (
+          <>
+            <Search onOpen={openNode} />
+            <CreateNode onCreated={openNode} />
+            <CreateEdge onCreated={openNode} />
+            {current && (
+              <NodeDetail
+                key={current}
+                uuid={current}
+                reloadToken={reloadToken}
+                onOpen={openNode}
+                onReload={reload}
+                onDeleted={() => setCurrent(null)}
+              />
+            )}
+          </>
+        ) : (
+          <SchemaAdmin />
         )}
       </main>
     </>

@@ -21,6 +21,14 @@ type Phase =
 export function App() {
   const [phase, setPhase] = useState<Phase>({ state: "loading" });
 
+  // Re-fetch the schema in place (after a kind mutation) without dropping the
+  // workspace back to the loading screen. Updating `phase` rebuilds the context
+  // value, so every schema-driven picker refreshes.
+  const reloadSchema = useCallback(async () => {
+    const schema = await apiGet<Schema>("/schema");
+    setPhase((current) => (current.state === "ready" ? { state: "ready", schema } : current));
+  }, []);
+
   const checkSession = useCallback(async () => {
     setPhase({ state: "loading" });
     try {
@@ -63,7 +71,7 @@ export function App() {
   }
 
   return (
-    <SchemaContext.Provider value={indexSchema(phase.schema)}>
+    <SchemaContext.Provider value={{ ...indexSchema(phase.schema), reload: reloadSchema }}>
       <Workspace onSignedOut={checkSession} />
     </SchemaContext.Provider>
   );
