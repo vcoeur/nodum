@@ -168,9 +168,9 @@ function GraphSvg({ subgraph, groupColor, onOpen }: GraphSvgProps) {
               onKeyDown={(event) => onKeyDown(event, node.uuid)}
             >
               <circle cx={x} cy={y} r={r} fill={groupColor(node.kind)} stroke="#5a5a5a" strokeWidth={1} />
-              <title>{`${node.kind}: ${nodeText(node.data)}`}</title>
+              <title>{`${node.kind}: ${nodeText(node.content)}`}</title>
               <text x={x} y={y + 4} className="graph-node-label" textAnchor="middle">
-                {truncate(nodeText(node.data), 18)}
+                {truncate(nodeText(node.content), 18)}
               </text>
             </g>
           ))}

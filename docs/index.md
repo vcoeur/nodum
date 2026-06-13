@@ -8,17 +8,18 @@ description: nodum is an atomic-notes knowledge system — a mutable PostgreSQL 
 <p class="tagline">Atomic notes, typed and knotted together.</p>
 
 `nodum` is an **atomic-notes knowledge system**: a mutable graph of small, typed notes (nodes)
-joined by typed, directed edges. It is built to be driven by LLM agents — every note carries a
-universal natural-language `text`, every operation returns the same JSON whether you call it from the
-CLI or the HTTP API, and one `schema` call hands a machine the whole contract.
+joined by typed, directed edges, over a **runtime-evolvable schema**. It is built to be driven by LLM
+agents — every note carries a plain-text `content` body, every operation returns the same JSON whether
+you call it from the CLI or the HTTP API, and one `schema` call hands a machine the whole contract.
 
 ## What it is
 
-- A **mutable PostgreSQL graph** — one `nodes` table and one `edges` table, each row carrying a
-  `kind` and a JSON `data` payload. No table-per-type; the graph stays uniform.
-- A **typed metamodel** — kinds live in a code registry (`nodum.metamodel`), not as free strings.
-  Each node kind has a field schema; each edge kind has a `from → to` signature that constrains its
-  endpoints.
+- A **mutable PostgreSQL graph** — one `nodes` table and one `edges` table; each node carries a
+  `kind`, a plain-text `content` body, and a JSON `data` payload. No table-per-type; the graph stays
+  uniform.
+- A **runtime-evolvable schema** — kinds live in the database (the `node_kinds` / `edge_kinds` tables),
+  not as frozen code or free strings, so you add/edit/delete them at runtime. Each node kind has a
+  field schema; each edge kind has a `from → to` signature that constrains its endpoints.
 - A **single data-service spine** with three thin adapters over it: a **CLI**, an **HTTP API**, and a
   **React single-page web UI**. The CLI and API emit byte-identical JSON for the same data.
 - **Full-text + graph retrieval** — Postgres full-text search plus recursive-CTE subgraph expansion.
@@ -26,16 +27,20 @@ CLI or the HTTP API, and one `schema` call hands a machine the whole contract.
 
 ## What it does
 
-- **Stores typed atomic notes.** Seven node kinds (Person, Organization, Topic, Entity, Reference,
-  Literature, Note) and twelve edge kinds with checked endpoint signatures. A node/edge is validated
-  softly in the service; the database enforces the cheap universals (the `kind` foreign key, a `text`
-  field on every node, valid endpoints, no self-edges).
-- **Keeps authoring prose-first.** *Open process, closed format*: every node has a universal
-  natural-language `text` — the full-text-indexed, LLM-readable surface — alongside its typed fields.
+- **Stores typed atomic notes.** Seven seeded node kinds (Person, Organization, Topic, Entity,
+  Reference, Literature, Note) and twelve edge kinds with checked endpoint signatures — all editable
+  at runtime. A node/edge is validated softly in the service; the database enforces the cheap
+  universals (the `kind` foreign key, non-null `content`, valid endpoints, no self-edges).
+- **Lets the schema evolve.** Create, edit, and delete node and edge kinds at runtime through the CLI
+  and API — no code change or redeploy. Deleting an in-use kind is refused unless you reassign its
+  rows (`--into`).
+- **Keeps authoring prose-first.** *Open process, closed format*: every node has a plain-text
+  `content` body — the full-text-indexed, LLM-readable surface, ready to embed later — alongside its
+  typed fields.
 - **Searches and expands.** Ranked full-text search with a kind filter, and `expand` walks a seed
   node's connected subgraph out to N hops via a single recursive CTE — the context payload an agent
   reads back.
-- **Stays self-describing.** `nodum schema` (CLI) and `GET /schema` (API) return the live metamodel —
+- **Stays self-describing.** `nodum schema` (CLI) and `GET /schema` (API) return the live schema —
   node kinds, edge kinds, and signatures — so any client can self-orient before its first write.
 - **Gates the network surfaces.** A single main password protects the API and web UI; the local CLI
   is trusted and sets the secret. See [Authentication](install.md#authentication).
@@ -74,8 +79,8 @@ The pages are written to be read top-to-bottom the first time:
 
 1. **[Quick start](quick-start.md)** — run the full app (or the CLI), sign in, then create a typed
    node, link a typed edge, search, and expand a subgraph.
-2. **[Concepts](concepts.md)** — the typed metamodel: nodes, edges, kinds, the `from → to`
-   signatures, and the *open process, closed format* principle that shapes everything else.
+2. **[Concepts](concepts.md)** — the typed graph: nodes, edges, the runtime-evolvable schema of
+   DB-stored kinds, the `from → to` signatures, and the *open process, closed format* principle.
 3. **Reference** — the long form: [Install &amp; run](install.md) (both distribution tracks,
    configuration, auth, migration) and [Commands](commands.md) (every CLI verb and API route, with
    the JSON contract).

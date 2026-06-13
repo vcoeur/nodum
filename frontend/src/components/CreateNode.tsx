@@ -19,7 +19,7 @@ interface CreateNodeProps {
 export function CreateNode({ onCreated }: CreateNodeProps) {
   const { schema, nodeKind } = useSchema();
   const [kindName, setKindName] = useState(schema.node_kinds[0]?.name ?? "");
-  const [text, setText] = useState("");
+  const [content, setContent] = useState("");
   const [raw, setRaw] = useState<Record<string, RawValue>>({});
   const [status, setStatus] = useState("");
 
@@ -33,17 +33,17 @@ export function CreateNode({ onCreated }: CreateNodeProps) {
 
   async function submit(event: FormEvent) {
     event.preventDefault();
-    const body = text.trim();
+    const body = content.trim();
     if (!body) {
-      setStatus("Text is required.");
+      setStatus("Content is required.");
       return;
     }
     const data = collectData(kind?.fields ?? {}, raw);
     setStatus("Creating…");
     try {
-      const node = await apiSend<NodeOut>("POST", "/nodes", { kind: kindName, text: body, data });
+      const node = await apiSend<NodeOut>("POST", "/nodes", { kind: kindName, content: body, data });
       setStatus(`Created ${node.kind} ${shortUuid(node.uuid)}.`);
-      setText("");
+      setContent("");
       setRaw(kind ? initialRawValues(kind.fields) : {});
       onCreated(node.uuid);
     } catch (error) {
@@ -66,12 +66,12 @@ export function CreateNode({ onCreated }: CreateNodeProps) {
           </select>
         </label>
         <label className="block">
-          {kind?.text_label ?? "text"}
+          {kind?.content_label ?? "content"}
           <textarea
             rows={2}
-            placeholder="The node's text…"
-            value={text}
-            onChange={(event) => setText(event.target.value)}
+            placeholder="The node's content…"
+            value={content}
+            onChange={(event) => setContent(event.target.value)}
           />
         </label>
         {kind && (

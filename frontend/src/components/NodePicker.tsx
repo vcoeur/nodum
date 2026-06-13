@@ -68,7 +68,7 @@ export function NodePicker({ allowedKinds, selected, onSelect }: NodePickerProps
               }}
             >
               <span className="tag">{hit.kind}</span>
-              <span className="hit-text">{nodeText(hit.data)}</span>
+              <span className="hit-text">{nodeText(hit.content)}</span>
               <span className="uuid">{shortUuid(hit.uuid)}</span>
             </button>
           </li>
@@ -78,7 +78,7 @@ export function NodePicker({ allowedKinds, selected, onSelect }: NodePickerProps
         {selected ? (
           <>
             <span className="tag">{selected.kind}</span>
-            <span className="hit-text">{nodeText(selected.data)}</span>
+            <span className="hit-text">{nodeText(selected.content)}</span>
             <span className="uuid">{shortUuid(selected.uuid)}</span>
           </>
         ) : (

@@ -7,9 +7,9 @@ import uuid
 from fastapi.testclient import TestClient
 
 
-def _create_node(client: TestClient, kind: str, text: str, data: dict | None = None) -> dict:
+def _create_node(client: TestClient, kind: str, content: str, data: dict | None = None) -> dict:
     """POST a typed node and return its NodeOut JSON (asserting a 200)."""
-    response = client.post("/nodes", json={"kind": kind, "text": text, "data": data or {}})
+    response = client.post("/nodes", json={"kind": kind, "content": content, "data": data or {}})
     assert response.status_code == 200, response.text
     return response.json()
 
@@ -22,12 +22,14 @@ def test_healthz(client: TestClient) -> None:
 
 
 def test_create_node_and_get(client: TestClient) -> None:
-    """A created node is fetchable with its typed payload; a random UUID is 404."""
+    """A created node is fetchable with its content + typed payload; random UUID is 404."""
     node = _create_node(client, "Person", "API Ada", {"born": 1815})
+    assert node["content"] == "API Ada"
     fetched = client.get(f"/nodes/{node['uuid']}")
     assert fetched.status_code == 200
     body = fetched.json()
     assert body["node"]["uuid"] == node["uuid"]
+    assert body["node"]["content"] == "API Ada"
     assert body["node"]["data"]["born"] == 1815
 
     assert client.get(f"/nodes/{uuid.uuid4()}").status_code == 404
@@ -110,6 +112,61 @@ def test_bad_field_returns_422(client: TestClient) -> None:
     """A payload field of the wrong type (Person.born) is rejected with 422."""
     response = client.post(
         "/nodes",
-        json={"kind": "Person", "text": "bad field", "data": {"born": "not-an-int"}},
+        json={"kind": "Person", "content": "bad field", "data": {"born": "not-an-int"}},
     )
     assert response.status_code == 422
+
+
+# ── Kind administration (the evolvable schema) ────────────────────────────────
+
+
+def test_node_kind_crud(client: TestClient, restore_kinds: None) -> None:
+    """POST/PATCH/DELETE a node kind round-trips through the API and the schema."""
+    created = client.post(
+        "/node-kinds",
+        json={"name": "Dataset", "group": "entity", "content_label": "name"},
+    )
+    assert created.status_code == 200, created.text
+    assert created.json()["name"] == "Dataset"
+
+    patched = client.patch("/node-kinds/Dataset", json={"content_label": "title"})
+    assert patched.status_code == 200
+    assert patched.json()["content_label"] == "title"
+
+    deleted = client.delete("/node-kinds/Dataset")
+    assert deleted.status_code == 200
+    assert deleted.json()["deleted"] is True
+    assert "Dataset" not in {nk["name"] for nk in client.get("/schema").json()["node_kinds"]}
+
+
+def test_delete_node_kind_in_use_returns_409(client: TestClient, restore_kinds: None) -> None:
+    """Deleting an in-use node kind without ``into`` is a 409; with it, a 200."""
+    client.post("/node-kinds", json={"name": "Draft", "group": "note", "content_label": "text"})
+    _create_node(client, "Draft", "a rough note")
+
+    refused = client.delete("/node-kinds/Draft")
+    assert refused.status_code == 409
+
+    reassigned = client.delete("/node-kinds/Draft", params={"into": "Note"})
+    assert reassigned.status_code == 200
+    assert reassigned.json()["reassigned"] == 1
+
+
+def test_edge_kind_crud_with_alias_signature(client: TestClient, restore_kinds: None) -> None:
+    """An edge kind is created via the ``from``/``to`` wire names and is deletable."""
+    created = client.post(
+        "/edge-kinds",
+        json={"name": "Rebuts", "from": ["Note"], "to": ["Note"]},
+    )
+    assert created.status_code == 200, created.text
+    assert created.json()["from"] == ["Note"] and created.json()["to"] == ["Note"]
+
+    deleted = client.delete("/edge-kinds/Rebuts")
+    assert deleted.status_code == 200
+    assert "Rebuts" not in {ek["name"] for ek in client.get("/schema").json()["edge_kinds"]}
+
+
+def test_patch_missing_kind_returns_404(client: TestClient, restore_kinds: None) -> None:
+    """Editing an absent kind is a 404."""
+    response = client.patch("/node-kinds/Nonexistent", json={"group": "x"})
+    assert response.status_code == 404
