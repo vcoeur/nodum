@@ -239,13 +239,23 @@ API route in lockstep — never let one surface drift ahead of the other.
 
 The UI is a **React + Vite (TypeScript) SPA** in `frontend/`, a pure client of the
 JSON API. It is schema-driven: it fetches `GET /schema` and renders its forms from
-the live schema (create/edit a node by kind — with a `content` body and the kind's
-typed fields — create an edge by type with endpoint pickers filtered to the
-signature, delete with a cascade-aware confirm, search, open a node, and render its
-subgraph as a dependency-free node-link **SVG diagram**). It holds no logic — every
-mutation goes through the API — so it stays in lockstep with the CLI. Keep it driven
-by `GET /schema` (never hardcode kinds). Kind administration is API + CLI only — the
-SPA's schema view stays read-only.
+the live schema. A header switch toggles two views:
+
+- **Graph** — create/edit a node by kind (a `content` body plus the kind's typed
+  fields), create an edge by type with endpoint pickers filtered to the signature,
+  delete with a cascade-aware confirm, search, open a node, and render its subgraph
+  as a dependency-free node-link **SVG diagram**.
+- **Schema** — full CRUD over the runtime-evolvable schema itself: list the live
+  node + edge kinds and create / edit / delete them (`POST`/`PATCH`/`DELETE` on
+  `/node-kinds` and `/edge-kinds`). A reusable field-schema editor builds each
+  kind's `FieldSpec` map (the enum `choices` input appears only for `enum`); an
+  edge kind's `from`/`to` are checkbox groups over the node kinds. Deleting an
+  in-use kind surfaces the **409** and offers an `into` reassignment target,
+  mirroring the CLI's `--into`. Every kind mutation reloads `GET /schema`, so the
+  Graph view's pickers and the header counts update immediately.
+
+It holds no logic — every mutation goes through the API — so it stays in lockstep
+with the CLI. Keep it driven by `GET /schema` (never hardcode kinds).
 
 - **Build:** `npm run build` (in `frontend/`) typechecks with `tsc` then emits
   `frontend/dist/` (hashed, same-origin assets); `nodum.web` serves that bundle

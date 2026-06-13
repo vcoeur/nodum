@@ -580,3 +580,141 @@ main.login {
   margin: 4rem auto;
   text-align: center;
 }
+
+/* ── View switch (header) ── */
+
+.view-nav {
+  display: flex;
+  gap: 0.4rem;
+  margin-top: 0.6rem;
+}
+
+.view-nav button {
+  padding: 0.3rem 0.9rem;
+  font-size: 0.85rem;
+  background: var(--surface);
+  color: var(--accent);
+}
+
+.view-nav button.active {
+  background: var(--accent);
+  color: #fff;
+}
+
+/* ── Schema administration ── */
+
+.kind-admin .muted {
+  margin: 0 0 0.8rem;
+  font-size: 0.88rem;
+}
+
+.kind-admin code {
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.85rem;
+}
+
+.kind-list {
+  list-style: none;
+  margin: 0 0 1rem;
+  padding: 0;
+}
+
+.kind-item {
+  padding: 0.6rem 0.8rem;
+  margin-bottom: 0.5rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.kind-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+.kind-name {
+  font-weight: 600;
+}
+
+.kind-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem;
+  margin-left: auto;
+}
+
+.signature-inline {
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+.tag.sym {
+  margin-left: 0.4rem;
+  background: #eaf2ea;
+  color: #3b6b3b;
+}
+
+.reassign {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+/* ── Field-schema editor ── */
+
+.field-editor {
+  flex: 1 1 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  padding: 0.6rem 0.7rem;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.field-editor-head {
+  font-weight: 600;
+  font-size: 0.85rem;
+}
+
+.field-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.field-row-name {
+  flex: 1 1 8rem;
+}
+
+.field-row input[type="text"] {
+  flex: 1 1 8rem;
+}
+
+/* ── Edge-kind endpoint pickers ── */
+
+.endpoint-set {
+  flex: 1 1 100%;
+  margin: 0;
+  padding: 0.5rem 0.7rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.endpoint-set legend {
+  font-size: 0.85rem;
+  font-weight: 600;
+  padding: 0 0.3rem;
+}
+
+.checkbox-group {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem 1rem;
+}

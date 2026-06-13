@@ -188,9 +188,17 @@ password is set). Pass the token from `POST /auth/login` as `Authorization: Bear
 
 A **React + Vite (TypeScript) single-page app** (in `frontend/`), a schema-driven
 client of the JSON API. It fetches `GET /schema` and drives its forms from the
-live schema: create/edit a node by kind, create an edge by type (endpoint pickers
-filtered to the signature), delete (with a cascade-aware confirm), search (with a
-kind filter), open a node, and render its subgraph as a node-link **SVG diagram**.
+live schema, behind a `Graph` / `Schema` view switch:
+
+- **Graph** — create/edit a node by kind, create an edge by type (endpoint pickers
+  filtered to the signature), delete (with a cascade-aware confirm), search (with a
+  kind filter), open a node, and render its subgraph as a node-link **SVG diagram**.
+- **Schema** — manage the runtime-evolvable schema itself: list, create, edit, and
+  delete node kinds and edge kinds (a field-schema editor builds each kind's typed
+  fields; an edge kind's `from`/`to` are picked as checkbox groups). Deleting a
+  kind that is still in use offers an `into` reassignment, just like the CLI's
+  `--into`. Mutations reload the schema so the Graph view stays in sync.
+
 Sign-in is in-app (the SPA reads `GET /auth/session` to know its state), with a
 `Logout` control. The UI ships in the Docker image — see
 [Distribution](#distribution).

@@ -10,10 +10,12 @@ export interface SchemaIndex {
   nodeKind: (name: string) => NodeKind | undefined;
   edgeKind: (name: string) => EdgeKind | undefined;
   groupOf: (kindName: string) => string | undefined;
+  /** Re-fetch `GET /schema` so callers reflect a runtime schema change. */
+  reload: () => Promise<void>;
 }
 
-/** Build the indexed lookups from a freshly fetched schema. */
-export function indexSchema(schema: Schema): SchemaIndex {
+/** Build the indexed lookups from a freshly fetched schema (the parent supplies `reload`). */
+export function indexSchema(schema: Schema): Omit<SchemaIndex, "reload"> {
   const nodeKinds = new Map(schema.node_kinds.map((nk) => [nk.name, nk]));
   const edgeKinds = new Map(schema.edge_kinds.map((ek) => [ek.name, ek]));
   return {
