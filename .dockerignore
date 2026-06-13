@@ -1,0 +1,13 @@
+.git
+.gitignore
+**/__pycache__
+*.pyc
+.pytest_cache
+.ruff_cache
+.venv
+*.egg-info
+frontend/node_modules
+frontend/dist
+nodum/web-dist
+projects
+resources

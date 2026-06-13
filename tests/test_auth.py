@@ -97,3 +97,39 @@ def test_cli_auth_set_password_and_status(restore_auth: None) -> None:
     assert json.loads(status.stdout)["configured"] is True
 
     assert auth.verify_token(auth.login("cli-pass")) is True
+
+
+def test_cli_auth_ensure_password_from_env(restore_auth: None, monkeypatch) -> None:
+    """ensure-password sets from the env only when unconfigured, then is idempotent."""
+    _clear_auth()
+    runner = CliRunner()
+    monkeypatch.delenv("NODUM_ADMIN_PASSWORD_FILE", raising=False)
+    monkeypatch.delenv("NODUM_ADMIN_PASSWORD", raising=False)
+
+    locked = runner.invoke(cli_app, ["auth", "ensure-password"])
+    assert json.loads(locked.stdout) == {"configured": False, "action": "no-secret"}
+
+    monkeypatch.setenv("NODUM_ADMIN_PASSWORD", "boot-pass")
+    first = runner.invoke(cli_app, ["auth", "ensure-password"])
+    assert json.loads(first.stdout)["action"] == "set"
+    assert auth.verify_token(auth.login("boot-pass")) is True
+
+    # Already configured: a different secret must NOT clobber the existing password.
+    monkeypatch.setenv("NODUM_ADMIN_PASSWORD", "other-pass")
+    again = runner.invoke(cli_app, ["auth", "ensure-password"])
+    assert json.loads(again.stdout)["action"] == "unchanged"
+    with pytest.raises(auth.BadPassword):
+        auth.login("other-pass")
+
+
+def test_cli_auth_ensure_password_from_file(restore_auth: None, monkeypatch, tmp_path) -> None:
+    """ensure-password reads NODUM_ADMIN_PASSWORD_FILE (preferred over the env value)."""
+    _clear_auth()
+    secret = tmp_path / "admin-password"
+    secret.write_text("file-pass\n", encoding="utf-8")
+    monkeypatch.setenv("NODUM_ADMIN_PASSWORD_FILE", str(secret))
+    monkeypatch.setenv("NODUM_ADMIN_PASSWORD", "ignored")
+
+    result = CliRunner().invoke(cli_app, ["auth", "ensure-password"])
+    assert json.loads(result.stdout)["action"] == "set"
+    assert auth.verify_token(auth.login("file-pass")) is True

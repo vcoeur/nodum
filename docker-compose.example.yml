@@ -1,0 +1,42 @@
+# Turnkey deployment example: the nodum image + a Postgres + an admin-password
+# secret. Copy this, drop your password into ./nodum_admin_password.txt, and run
+# `docker compose -f docker-compose.example.yml up`. nodum self-initialises the
+# schema and sets the main password from the secret on first boot.
+services:
+  nodum:
+    image: ghcr.io/vcoeur/nodum:latest
+    # To build from this checkout instead of pulling the image, comment the line
+    # above and uncomment: build: .
+    # build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      NODUM_DATABASE_URL: postgresql://nodum:nodum@db:5432/nodum
+      NODUM_ADMIN_PASSWORD_FILE: /run/secrets/nodum_admin_password
+      # NODUM_COOKIE_SECURE: "1"   # set when terminating TLS in front of nodum
+    secrets:
+      - nodum_admin_password
+    ports:
+      - "8600:8600"
+
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: nodum
+      POSTGRES_PASSWORD: nodum
+      POSTGRES_DB: nodum
+    volumes:
+      - nodum-pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nodum"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+secrets:
+  nodum_admin_password:
+    file: ./nodum_admin_password.txt
+
+volumes:
+  nodum-pg:

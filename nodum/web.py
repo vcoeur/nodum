@@ -1,67 +1,50 @@
-"""The schema-driven web view — a full-CRUD browser client of the HTTP API.
+"""Serve the built React SPA (the full-app UI) from the filesystem.
 
-This module holds no business logic: it serves a single HTML page plus its
-JS/CSS, which drive every operation (search, create, read, update, delete,
-subgraph expansion) by calling the API's JSON endpoints from the browser via
-``fetch()``. The page is metamodel-driven — it fetches ``/schema`` on load and
-builds its forms from the returned kinds. Mount it onto the API's FastAPI app
-with :func:`register`.
+This module holds no business logic: it mounts the compiled single-page app — the
+React bundle built from ``frontend/`` — and the browser drives every operation by
+calling the API's JSON endpoints. The SPA is **not** part of the Python wheel: it
+is built into the Docker image, which sets ``NODUM_WEB_DIST`` to the bundle path.
+When that setting is unset or missing (a bare ``pip install`` — the CLI/library
+distribution), no UI is mounted and the API still serves normally.
 
-Authentication: ``GET /`` redirects to ``/login`` unless the request carries a
-valid session cookie (the browser side of :mod:`nodum.auth`); ``GET /login``
-serves the sign-in page (and an "initialise the password" hint when the install
-is still locked). The API's JSON routes are gated separately in
-:mod:`nodum.api`; the static assets stay open.
+Auth: the SPA shell (``index.html`` + ``/assets``) is served openly — it is just
+code, the data stays gated by :func:`nodum.api.require_auth`. Because the session
+cookie is HttpOnly (unreadable by JS), the SPA detects auth state via the open
+``GET /auth/session`` endpoint in :mod:`nodum.api`.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 
-from fastapi import Request
-from fastapi.responses import RedirectResponse
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
 
-from nodum import auth
-
-_TEMPLATES_DIR = Path(__file__).parent / "templates"
-_STATIC_DIR = Path(__file__).parent / "static"
-
-
-def _request_authed(request: Request) -> bool:
-    """Return whether the request carries a valid session cookie."""
-    token = request.cookies.get(auth.COOKIE_NAME)
-    if not token:
-        return False
-    try:
-        return auth.verify_token(token)
-    except auth.AuthNotConfigured:
-        return False
+from nodum.settings import load_settings
 
 
 def register(app) -> None:
-    """Mount the web view on a FastAPI app: ``/`` (gated), ``/login``, ``/static``.
+    """Mount the built SPA when ``NODUM_WEB_DIST`` names a real bundle; else no-op.
 
     Args:
-        app: The FastAPI application to extend in place. Adds a ``/static`` mount
-            for the JS/CSS, a ``GET /login`` sign-in page, and a ``GET /`` route
-            that serves the single page or redirects unauthenticated visitors to
-            ``/login``.
+        app: The FastAPI application to extend in place. When a bundle is present,
+            mounts ``/assets`` (the hashed JS/CSS) and serves ``index.html`` at
+            ``GET /``. When absent (no UI shipped — the PyPI install), adds nothing
+            and the API is served without a web view.
     """
-    templates = Jinja2Templates(directory=str(_TEMPLATES_DIR))
-    app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
+    web_dist = load_settings().web_dist
+    if not web_dist:
+        return
+    dist = Path(web_dist)
+    index = dist / "index.html"
+    if not index.is_file():
+        return
 
-    @app.get("/login")
-    def login_page(request: Request):
-        """Serve the sign-in page; shows a setup hint when no password is set yet."""
-        return templates.TemplateResponse(
-            request, "login.html", {"configured": auth.is_configured()}
-        )
+    assets = dist / "assets"
+    if assets.is_dir():
+        app.mount("/assets", StaticFiles(directory=str(assets)), name="assets")
 
     @app.get("/")
-    def index(request: Request):
-        """Serve the single-page CRUD view, or redirect to /login when unauthenticated."""
-        if not _request_authed(request):
-            return RedirectResponse("/login", status_code=303)
-        return templates.TemplateResponse(request, "index.html")
+    def spa_index() -> FileResponse:
+        """Serve the SPA shell; the app handles auth + routing client-side."""
+        return FileResponse(index)

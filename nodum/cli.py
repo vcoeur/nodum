@@ -15,9 +15,11 @@ so ``--set born=1815`` yields an int, ``--set 'aliases=["a","b"]'`` a list, and
 from __future__ import annotations
 
 import json
+import os
 import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
+from pathlib import Path
 
 import typer
 from pydantic import BaseModel
@@ -268,6 +270,43 @@ def auth_status() -> None:
             "updated_at": result.updated_at.isoformat() if result.updated_at else None,
         }
     )
+
+
+def _admin_password_from_env() -> str | None:
+    """Read the bootstrap admin password from the env (file first, then value).
+
+    ``NODUM_ADMIN_PASSWORD_FILE`` (a path, e.g. a Docker secret) takes precedence
+    over ``NODUM_ADMIN_PASSWORD``. Returns ``None`` when neither is set or the
+    file cannot be read.
+    """
+    path = os.environ.get("NODUM_ADMIN_PASSWORD_FILE")
+    if path:
+        try:
+            return Path(path).read_text(encoding="utf-8").strip()
+        except OSError:
+            return None
+    value = os.environ.get("NODUM_ADMIN_PASSWORD")
+    return value.strip() if value else None
+
+
+@auth_app.command("ensure-password")
+def auth_ensure_password() -> None:
+    """Set the main password from a secret on first boot; no-op if already set.
+
+    Reads ``NODUM_ADMIN_PASSWORD_FILE`` (preferred) or ``NODUM_ADMIN_PASSWORD``.
+    Used by the Docker entrypoint so a fresh deploy is hands-off. An already
+    configured password is left untouched, so a later manual change survives a
+    restart; with no secret and no password set, the install stays locked.
+    """
+    if auth.is_configured():
+        _print_json({"configured": True, "action": "unchanged"})
+        return
+    password = _admin_password_from_env()
+    if not password:
+        _print_json({"configured": False, "action": "no-secret"})
+        return
+    auth.set_password(password)
+    _print_json({"configured": True, "action": "set"})
 
 
 @app.command("serve")

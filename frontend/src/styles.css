@@ -28,15 +28,15 @@ header {
   border-bottom: 1px solid var(--border);
 }
 
+header h1 {
+  margin: 0;
+  font-size: 1.6rem;
+}
+
 #logout-button {
   position: absolute;
   top: 1.5rem;
   right: 1.5rem;
-}
-
-header h1 {
-  margin: 0;
-  font-size: 1.6rem;
 }
 
 .tagline {
@@ -83,6 +83,7 @@ form {
 input[type="search"],
 input[type="number"],
 input[type="text"],
+input[type="password"],
 select,
 textarea {
   padding: 0.45rem 0.6rem;
@@ -137,6 +138,11 @@ button {
 
 button:hover {
   filter: brightness(1.08);
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: default;
 }
 
 button.ghost {
@@ -197,6 +203,10 @@ button.small {
   min-height: 1.2em;
 }
 
+.status.error {
+  color: var(--danger);
+}
+
 .status.inline-status {
   margin: 0;
   display: inline;
@@ -224,6 +234,10 @@ button.small {
   border: 1px solid var(--border);
   border-radius: 8px;
   cursor: pointer;
+  text-align: left;
+  width: 100%;
+  font: inherit;
+  color: inherit;
 }
 
 .hit:hover,
@@ -268,6 +282,10 @@ button.small {
 .clickable {
   cursor: pointer;
   color: var(--accent);
+  background: none;
+  border: none;
+  font: inherit;
+  padding: 0;
 }
 
 .clickable:hover {
@@ -342,6 +360,10 @@ button.small {
   border: 1px solid var(--border);
   border-radius: 6px;
   cursor: pointer;
+  width: 100%;
+  text-align: left;
+  font: inherit;
+  color: inherit;
 }
 
 .picker-hit:hover,
@@ -467,7 +489,7 @@ table.edges tr:last-child td {
 
 /* ── Graph view ── */
 
-#graph-controls {
+.graph-controls {
   margin-top: 1.2rem;
 }
 
@@ -551,4 +573,10 @@ main.login {
 .login-card code {
   font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
   font-size: 0.85rem;
+}
+
+.center-note {
+  max-width: 30rem;
+  margin: 4rem auto;
+  text-align: center;
 }

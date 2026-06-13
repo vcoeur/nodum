@@ -28,6 +28,10 @@ class Settings:
     # Mark the session cookie Secure (HTTPS-only). Off by default for local HTTP
     # dev; set NODUM_COOKIE_SECURE=1 behind a TLS-terminating reverse proxy.
     cookie_secure: bool = False
+    # Filesystem path to the built SPA (the React bundle). Set in the Docker image
+    # (the full-app distribution); unset for a bare `pip install` (CLI/library),
+    # where no UI is served. See nodum.web.
+    web_dist: str | None = None
 
 
 def load_settings() -> Settings:
@@ -39,4 +43,5 @@ def load_settings() -> Settings:
         api_host=env.str("NODUM_API_HOST", DEFAULT_API_HOST),
         api_port=env.int("NODUM_API_PORT", DEFAULT_API_PORT),
         cookie_secure=env.bool("NODUM_COOKIE_SECURE", False),
+        web_dist=env.str("NODUM_WEB_DIST", None),
     )
