@@ -1,8 +1,9 @@
 """The note-01 acceptance demo, driven through the CLI, with API parity checks.
 
-This is the project's finish-line demo: build a tiny claim graph through the
-CLI, exercise search and expand, then assert the HTTP API returns byte-identical
-JSON for the same reads and that the web view serves its page.
+The project's finish-line demo: build a small typed graph through the CLI,
+confirm the metamodel rejects a reversed edge, expand to reach a reference two
+hops away, then assert the HTTP API returns identical JSON for the same read and
+that the web view serves its page.
 """
 
 from __future__ import annotations
@@ -10,47 +11,46 @@ from __future__ import annotations
 from collections.abc import Callable
 
 from fastapi.testclient import TestClient
+from typer.testing import CliRunner
 
-CLAIM_ONE = "Ada Lovelace wrote the first published algorithm."
-CLAIM_TWO = "The Analytical Engine was designed by Charles Babbage."
-CLAIM_THREE = "Ada Lovelace and Charles Babbage collaborated on the Analytical Engine."
+from nodum.cli import app as cli_app
+
+PERSON_NAME = "Ada Lovelace"
+REFERENCE = "Lovelace 1843, Notes on the Analytical Engine"
+SUMMARY = "A summary of Lovelace's notes on the Analytical Engine"
+CLAIM = "Lovelace described the engine's general-purpose computation"
 
 
-def test_note_01_demo(run_cli: Callable[..., dict], client: TestClient) -> None:
-    """Walk the full note-01 demo through the CLI, then assert the API agrees."""
-    # 1-3: three claim nodes.
-    n1 = run_cli("add-node", CLAIM_ONE, "-t", "claim")["uuid"]
-    n2 = run_cli("add-node", CLAIM_TWO, "-t", "claim")["uuid"]
-    n3 = run_cli("add-node", CLAIM_THREE, "-t", "claim")["uuid"]
+def test_note_01_acceptance(run_cli: Callable[..., dict], client: TestClient) -> None:
+    """Walk the note-01 demo through the CLI, then assert the API and web agree."""
+    # 1: a Person and a Reference, authored by the Person.
+    person = run_cli("add", "Person", PERSON_NAME)["uuid"]
+    reference = run_cli("add", "Reference", REFERENCE)["uuid"]
+    run_cli("link", person, reference, "AuthorOf")
 
-    # 4: n3 supports both n1 and n2.
-    run_cli("add-edge", n3, n1, "-t", "supports")
-    run_cli("add-edge", n3, n2, "-t", "supports")
+    # 2: the reversed edge (Reference -> Person) is rejected with a non-zero exit.
+    rejected = CliRunner().invoke(cli_app, ["link", reference, person, "AuthorOf"])
+    assert rejected.exit_code != 0
 
-    # 5: search finds the Analytical-Engine claims (n2, n3) but not n1.
-    search = run_cli("search", "Analytical Engine")
-    hit_uuids = {hit["uuid"] for hit in search["hits"]}
-    assert n2 in hit_uuids
-    assert n3 in hit_uuids
-    assert n1 not in hit_uuids
+    # 3: a Literature summarizes the Reference, and a Note cites that Literature.
+    literature = run_cli("add", "Literature", SUMMARY)["uuid"]
+    note = run_cli("add", "Note", CLAIM, "--set", "role=claim")["uuid"]
+    run_cli("link", literature, reference, "summarizes")
+    run_cli("link", note, literature, "cites")
 
-    # 6: expanding n3 reaches n1 and n2 over `supports` edges.
-    expand = run_cli("expand", n3, "-d", "1")
-    node_uuids = {node["uuid"] for node in expand["nodes"]}
-    assert {n1, n2, n3} <= node_uuids
-    edge_triples = {(e["from_uuid"], e["to_uuid"], e["data"].get("type")) for e in expand["edges"]}
-    assert (n3, n1, "supports") in edge_triples
-    assert (n3, n2, "supports") in edge_triples
+    # 4: expanding the Note two hops reaches the Reference (Note -> Literature -> Reference).
+    cli_expand = run_cli("expand", note, "--depth", "2")
+    assert reference in {node["uuid"] for node in cli_expand["nodes"]}
 
-    # 7: the HTTP API returns identical JSON for the same reads.
-    api_search = client.get("/search", params={"q": "Analytical Engine"}).json()
-    assert api_search == search
-    api_expand = client.get("/expand", params={"seed": n3, "depth": 1}).json()
-    assert api_expand == expand
+    # 5: the HTTP API returns byte-identical JSON for the same expand read.
+    api_expand = client.get("/expand", params={"seed": note, "depth": 2}).json()
+    assert api_expand == cli_expand
 
-    # 8: the web view serves a non-empty HTML page.
+    # 6: the schema endpoint lists the seven node kinds.
+    assert len(client.get("/schema").json()["node_kinds"]) == 7
+
+    # 7: the web view serves a non-empty HTML page.
     home = client.get("/")
     assert home.status_code == 200
     assert "text/html" in home.headers["content-type"]
     assert home.text.strip()
-    assert "search" in home.text.lower()

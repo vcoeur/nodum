@@ -6,85 +6,231 @@ editing anything here.
 ## What this repo is
 
 `nodum` is a minimal **atomic-notes knowledge system**: a mutable PostgreSQL
-graph of typed, UUID-keyed nodes and edges, with full-text search and
-recursive subgraph expansion. All logic lives in one data-service layer; a
-CLI, an HTTP API, and a minimal read-first web view are thin adapters over it.
-This is an MVP — retrieval is Postgres full-text plus graph traversal, with no
-embeddings yet.
+graph of typed, UUID-keyed nodes and edges, with full-text search and recursive
+subgraph expansion. All logic lives in one data-service layer; a CLI, an HTTP
+API, and a small web view are thin adapters over it.
 
-## Architecture — the service layer is the spine
+It is a **typed graph**. Earlier the graph was open — a node carried a free
+`data.type` string and types were themselves nodes. That is gone. Kinds now live
+in a code registry, `nodum.metamodel`: a curated set of node kinds (each with a
+field schema) and edge kinds (each with a `from_kinds → to_kinds` signature).
+Every node and edge row carries a `kind` column that references that registry.
 
-`nodum.service` is the single source of truth. Every operation (`add_node`,
-`add_edge`, `get`, `search`, `expand`) and **all** validation live there. Each
-function opens its own short-lived connection and commits, so the adapters stay
-stateless and hold no logic of their own.
+Retrieval is Postgres full-text plus graph traversal — no embeddings.
+
+## The metamodel is the typed layer
+
+`nodum.metamodel` is the single source of truth for kinds. It is plain code: two
+dicts, `NODE_KINDS` and `EDGE_KINDS`, built from frozen dataclasses (`NodeKind`,
+`EdgeKind`, `FieldSpec`). There is **no per-kind table and no per-kind model
+class** — instances all live in the one generic `nodes` table and the one
+generic `edges` table, and the metamodel is the typed contract laid over them.
+
+**Adding a kind is a registry edit.** To introduce a node or edge kind you edit
+`NODE_KINDS` / `EDGE_KINDS` in `metamodel.py` — nothing else structural changes.
+`nodum.db` seeds the new name into the `node_kinds` / `edge_kinds` lookup tables
+(run `init-db`, or `migrate` on an existing database) so the DB-level FK on
+`kind` stays in step with the registry.
+
+The rule for **when a new kind is warranted:** it must unlock a typed edge or a
+typed field. If a distinction only labels or groups nodes, model it as a `role`
+(the `Note.role` enum) or a tag, not a new kind.
+
+### Architecture — service is the spine, metamodel is the contract
+
+`nodum.service` is the single source of truth for every operation and all
+validation. Each function opens its own short-lived connection and commits, so
+the adapters stay stateless and hold no logic of their own.
 
 ```mermaid
 flowchart LR
     cli["nodum.cli (Typer)"] --> svc["nodum.service"]
     api["nodum.api (FastAPI)"] --> svc
     web["nodum.web (browser)"] --> api
+    svc --> mm["nodum.metamodel (typed registry)"]
     svc --> pg[("PostgreSQL")]
     style cli fill:#e6f0ff,color:#000
     style api fill:#e6f0ff,color:#000
     style web fill:#e6f0ff,color:#000
     style svc fill:#fff3cd,color:#000
+    style mm fill:#ffe6cc,color:#000
     style pg fill:#d9f2d9,color:#000
 ```
 
+- **`nodum.metamodel`** — the typed registry: node-kind field schemas, edge-kind
+  endpoint signatures, the `validate_node` / `validate_edge` checks, and
+  `schema()`, which serialises the whole thing as the machine-readable contract.
 - **`nodum.service`** — the data-service layer. The only place that talks to the
-  database and the only place that validates input.
+  database and the only place that calls the metamodel to validate input.
 - **`nodum.models`** — the single pydantic I/O schema shared by every surface
   (`NodeOut`, `EdgeOut`, `SearchHit`, `NodeWithEdges`, `SearchResult`,
-  `Subgraph`, plus the `AddNodeIn` / `AddEdgeIn` inputs). UUID and datetime
-  fields render as strings under `model_dump(mode="json")`.
+  `Subgraph`, `Deleted`, plus the `AddNodeIn` / `AddEdgeIn` / `UpdateNodeIn` /
+  `UpdateEdgeIn` inputs). A node/edge carries its `kind`; kind-specific fields
+  live in `data`. UUID and datetime fields render as strings under
+  `model_dump(mode="json")`.
 - **`nodum.cli`** (Typer) — each command calls one service function and prints
   the result as a single JSON object on **stdout**; human and error messages go
   to **stderr**.
 - **`nodum.api`** (FastAPI) — each route calls one service function and returns
   the model via `model_dump(mode="json")` wrapped in a `JSONResponse`, with no
-  `response_model` so keys are neither added nor reordered.
-- **`nodum.web`** — a read-first single-page browser client of the API
-  (`web.register(app)` mounts `GET /` and `/static`); it holds no logic and
-  fetches the API's JSON read endpoints from the browser.
+  `response_model` so keys are neither added, dropped, nor reordered.
+- **`nodum.web`** — a small browser client of the API (`web.register(app)`
+  mounts `GET /` and `/static`); it holds no logic and fetches the API's JSON
+  endpoints from the browser.
 - **`nodum.db`** / **`nodum.settings`** — connection management (`dict_row`),
-  idempotent schema init from `schema.sql`, and environment-loaded config.
+  idempotent schema init + kind seeding from `schema.sql`, the MVP migration,
+  and environment-loaded config.
+
+## Node kinds
+
+Seven kinds, grouped (`entity` / `literature` / `note`). Every kind defines what
+its universal `text` means (`text_label`) and an optional field schema.
+
+| Kind | Group | `text` is | Typed fields |
+|---|---|---|---|
+| `Person` | entity | name | `aliases` (list[str]), `born` (int) |
+| `Organization` | entity | name | `aliases` (list[str]) |
+| `Topic` | entity | label | `aliases` (list[str]) |
+| `Entity` | entity | label | `entity_type` (str: place / concept / event / …), `aliases` (list[str]) |
+| `Reference` | literature | citation | `citekey`, `authors` (list[str]), `year` (int), `venue`, `doi`, `url`, `ref_type` |
+| `Literature` | literature | summary | `key_points` (list[str]) |
+| `Note` | note | text | `role` (enum: claim / question / hypothesis / observation / synthesis / definition), `confidence` (float) |
+
+`Entity` is the deliberate catch-all (place / concept / event / …) so the kind
+set stays small. `Reference` is a bibliographic record; `Literature` is a note
+*on* a source.
+
+## Edge kinds (signatures)
+
+Each edge kind constrains its endpoints to specific node kinds — the
+`from_kinds → to_kinds` signature, checked at create time.
+
+| Edge kind | From | To |
+|---|---|---|
+| `AuthorOf` | Person | Reference |
+| `AffiliatedWith` | Person | Organization |
+| `Publishes` | Organization | Reference |
+| `summarizes` | Literature | Reference |
+| `cites` | Note | Literature, Reference |
+| `IsAbout` | Note, Literature, Reference | Topic |
+| `BroaderThan` | Topic | Topic |
+| `mentions` | any node kind | Person, Organization, Topic, Entity |
+| `supports` | Note | Note |
+| `contradicts` | Note | Note |
+| `refines` | Note | Note |
+| `answers` | Note | Note |
+
+## Enforcement — soft in the service, cheap-hard in the DB
+
+Validation is split deliberately:
+
+- **Soft, in the service.** `metamodel.validate_node` / `validate_edge` enforce
+  the full typed shape — known kind, non-empty `text`, required fields present,
+  declared fields matching their type, enum choices, and edge endpoint kinds
+  inside the signature. A violation raises `metamodel.ValidationError` (a
+  `ValueError`). Undeclared payload keys are allowed (forward-compatible).
+- **Cheap-hard, in the database.** `schema.sql` enforces only the universal
+  invariants that are free to check: the `kind` FK into the `node_kinds` /
+  `edge_kinds` lookup tables, `CHECK (data ? 'text')` on every node, the
+  `from_uuid` / `to_uuid` FKs into `nodes` with `ON DELETE CASCADE`, and
+  `CHECK (from_uuid <> to_uuid)` (no self-edges). The endpoint-kind *signatures*
+  are not enforced in SQL — that stays in the service.
+
+**One-table invariant.** Keep one `nodes` table and one `edges` table. Typing is
+a `kind` column plus the registry, never a table per kind. This is what lets
+`expand` stay a single uniform recursive CTE over `edges` regardless of kind —
+do not shard the graph into per-kind tables.
+
+**Open process, closed format.** Every node carries a universal natural-language
+`text` (the FTS-indexed, LLM-readable surface) *in addition to* its typed
+fields. Authoring stays open — you write prose first — while the format stays
+closed enough that machines can traverse and validate it.
+
+Error contract: the service raises `NodeNotFound` / `EdgeNotFound` (missing
+rows) and `ValueError` (bad input, including `ValidationError`). The CLI maps all
+three to a stderr line plus exit code 1. The API maps `NodeNotFound` /
+`EdgeNotFound` → 404 and `ValueError` → 422, each as a clean `{"detail": ...}`
+body.
+
+## CRUD surfaces — `schema` is the contract
+
+The service offers full CRUD plus query: `add_node` / `add_edge`, `get`,
+`search` (optional `kind` filter), `expand` (optional `edge_kinds` filter),
+`update_node` / `update_edge`, `delete_node` / `delete_edge`, and `schema()`.
+The CLI and API expose all of it; any client can self-orient by reading
+`schema()` first, which is why it is the contract every surface ships.
+
+**CLI commands** (`uv run nodum <cmd>`):
+
+| Command | Does |
+|---|---|
+| `add KIND TEXT [--set k=v …]` | create a typed node |
+| `link FROM TO EDGE_KIND [--set k=v …]` | create a typed directed edge |
+| `get UUID` | a node plus its incident edges |
+| `search QUERY [--kind K] [--limit N]` | ranked full-text search |
+| `expand UUID [--depth N] [--edge-kind K …]` | seed → connected subgraph |
+| `edit-node UUID [--text …] [--set k=v …]` | merge + re-validate a node |
+| `edit-edge UUID [--set k=v …]` | merge an edge's payload |
+| `rm-node UUID` | delete a node (edges cascade) |
+| `rm-edge UUID` | delete one edge |
+| `schema` | print the metamodel contract |
+| `init-db` | create schema + seed kind tables |
+| `migrate` | upgrade a pre-typed (MVP) database |
+| `serve` | run the HTTP API + web view |
+
+`--set key=value` is repeatable; each value is parsed as JSON, falling back to
+the raw string (so `--set born=1815` is an int, `--set venue=Nature` a string).
+
+**API routes:** `POST /nodes`, `GET /nodes/{uuid}`, `PATCH /nodes/{uuid}`,
+`DELETE /nodes/{uuid}`, `POST /edges`, `PATCH /edges/{uuid}`,
+`DELETE /edges/{uuid}`, `GET /search`, `GET /expand`, `GET /schema`,
+`GET /healthz`, and `GET /` (the web view).
+
+**Web view (`nodum.web`):** a schema-driven, full-CRUD browser client of the
+JSON API. It fetches `GET /schema` and renders its forms from the metamodel —
+create/edit a node by kind, create an edge by type (endpoint pickers filtered to
+the signature), delete with a cascade-aware confirm, search (kind filter), open
+a node, and render its subgraph as a dependency-free node-link **SVG diagram**.
+It holds no logic of its own — every mutation goes through the API, so it stays
+in lockstep with the CLI. Keep it driven by `GET /schema` (never hardcode kinds).
 
 **Keep the adapters mirrored.** The CLI and the API serialise the *same*
 `model_dump(mode="json")` envelope, so identical data yields byte-identical JSON
-across both surfaces; tests assert this CLI ↔ API parity. When you add or change
-an operation, update the service first, then update **both** the CLI command and
-the API route in lockstep — never let one surface drift ahead of the other.
-
-Error contract: the service raises `NodeNotFound` (missing node) and
-`ValueError` (bad input). The CLI maps both to a stderr line plus exit code 1;
-the API maps `NodeNotFound` → 404 and `ValueError` → 422, each as a clean
-`{"detail": ...}` body.
+across both surfaces; the parity tests assert this. When you add or change an
+operation: update the service first, then update **both** the CLI command and the
+API route in lockstep — never let one surface drift ahead of the other.
 
 ## Data model
 
 A mutable JSONB graph. The schema (`nodum/schema.sql`) is idempotent — safe to
 re-run on every start-up.
 
-- **nodes** — `uuid` (PK, `gen_random_uuid()`), `data` JSONB (`CHECK (data ?
-  'text')` — every node carries a primary `text`), `created_at`, `updated_at`.
-  Indexed with a GIN index on `data` and a GIN full-text index on
-  `to_tsvector('english', data ->> 'text')`.
-- **edges** — `uuid` (PK), `from_uuid` / `to_uuid` (FK to `nodes`,
-  `ON DELETE CASCADE`), `data` JSONB carrying the edge `type` (and any extra
-  keys), `created_at`, `updated_at`. `CHECK (from_uuid <> to_uuid)` — no
-  self-edges. Indexed on `from_uuid`, `to_uuid`, and `data`.
-- **Type-as-node.** Types are not a separate concept: `add_node(text, type=...)`
-  resolves-or-creates a type node (payload `{"text": <type>, "kind": "type"}`)
-  and links the new node to it with an `is` edge. The type string is also kept
-  on the node payload as `data.type` for convenience.
+- **node_kinds / edge_kinds** — `TEXT PRIMARY KEY` lookup tables, seeded from the
+  metamodel; the `kind` FKs point here.
+- **nodes** — `uuid` (PK, `gen_random_uuid()`), `kind` (FK → `node_kinds`),
+  `data` JSONB (`CHECK (data ? 'text')`), `created_at`, `updated_at`. Indexed
+  with a GIN index on `data`, a GIN full-text index on
+  `to_tsvector('english', data ->> 'text')`, and a btree index on `kind`.
+- **edges** — `uuid` (PK), `kind` (FK → `edge_kinds`), `from_uuid` / `to_uuid`
+  (FK → `nodes`, `ON DELETE CASCADE`), `data` JSONB, `created_at`,
+  `updated_at`. `CHECK (from_uuid <> to_uuid)`. Indexed on `kind`, `from_uuid`,
+  `to_uuid`, and `data`.
 - **Retrieval.** `search` is Postgres full-text (`plainto_tsquery('english')`,
-  AND of terms) ranked by `ts_rank`, best first. `expand` walks directed edges
-  (`from_uuid → to_uuid`) outward from a seed set up to `depth` hops via a
-  recursive CTE, then loads every node touched — serialised, that `Subgraph` is
-  the context payload. `get` returns a node plus every edge incident on it in
-  either direction.
-- **No embeddings in this MVP** — no vector column, no embeddings table.
+  AND of terms) over `data ->> 'text'`, ranked by `ts_rank`, with an optional
+  `kind` filter. `expand` walks directed edges (`from_uuid → to_uuid`) outward
+  from a seed set up to `depth` hops via a recursive CTE — optionally restricted
+  to given edge kinds — then loads every node touched; serialised, that
+  `Subgraph` is the context payload. `get` returns a node plus every edge
+  incident on it in either direction.
+- **No embeddings** — no vector column, no embeddings table.
+
+### Migration from the MVP
+
+`nodum.db.migrate_mvp` (CLI `migrate`) upgrades a pre-typed MVP database in
+place, idempotently: it adds the `kind` columns, seeds the lookup tables, drops
+the MVP type-as-node rows (their `is` edges cascade), backfills `kind` (content
+nodes → `Note` with their old `data.type` carried into `role`; edges from their
+old `data.type`, else `mentions`), then enforces NOT NULL and the lookup FKs.
 
 ## Dev workflow
 
@@ -99,7 +245,7 @@ Make targets (run `make help` for the live list):
 | `make install` | `uv sync` (runtime deps) |
 | `make dev-install` | `uv sync --all-groups` (adds dev deps) |
 | `make db-up` / `make db-down` | start / stop the local Postgres container |
-| `make init-db` | create the schema (`uv run nodum init-db`) |
+| `make init-db` | create the schema + seed kind tables (`uv run nodum init-db`) |
 | `make run` | run the CLI (`make run -- search foo`) |
 | `make serve` | run the HTTP API + web view (uvicorn) |
 | `make test` | run pytest |
@@ -108,8 +254,9 @@ Make targets (run `make help` for the live list):
 | `make format` | `ruff check --fix` + `ruff format` |
 
 - **Tests need a running Postgres.** The suite exercises the service against a
-  live database, so `make db-up` (and `make init-db` on a fresh volume) must be
-  up before `make test`. Test discovery is rooted at `tests/`.
+  live database (schema created once per session; the graph truncated before
+  each test), so `make db-up` must be up before `make test`. Test discovery is
+  rooted at `tests/`.
 - **Dev ports.** The HTTP API and web view serve on `127.0.0.1:8600`; the local
   Postgres is published on host port `5436` (→ container `5432`).
 - **Config via environment.** The only required value is `NODUM_DATABASE_URL`
@@ -122,12 +269,14 @@ Make targets (run `make help` for the live list):
 - **Ruff** is the linter and formatter: line length 100, rule sets
   `E, F, I, UP, B, SIM`. Run `make format` before committing; CI runs
   `make lint`.
-- **Docstrings on public APIs.** Document every public function, route, and
-  model with a one-line summary plus args/returns where applicable. Don't
-  annotate or document code you didn't change.
-- **Service first, adapters in lockstep.** Put new logic and validation in
-  `nodum.service`; expose it through the CLI and the API together so the
-  parity tests stay green. Adapters must not add behaviour the service lacks.
-- **MVP scope — deferred, do not build here:** embeddings (pgvector / hybrid
-  retrieval), an LLM "gardener", contradiction reasoning, reranking, and auth.
-  Keep changes inside the full-text + graph feature set.
+- **Docstrings on public APIs.** Document every public function, route, model,
+  and metamodel entry with a one-line summary plus args/returns where
+  applicable. Don't annotate or document code you didn't change.
+- **Metamodel first, service next, adapters in lockstep.** A new kind is a
+  `metamodel.py` registry edit; new behaviour and validation go in
+  `nodum.service`; expose it through the CLI and the API together so the parity
+  tests stay green. Adapters must not add behaviour the service lacks.
+- **Deferred — do not build here:** embeddings (pgvector / hybrid retrieval), an
+  LLM "gardener", contradiction reasoning, reranking, auth, and runtime-editable
+  kinds (the metamodel stays a code registry). Keep changes inside the typed
+  full-text + graph feature set.

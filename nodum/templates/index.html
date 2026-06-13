@@ -3,29 +3,35 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>nodum — read view</title>
+  <title>nodum — typed graph</title>
   <link rel="stylesheet" href="/static/styles.css" />
 </head>
 <body>
   <header>
     <h1>nodum</h1>
-    <p class="tagline">Atomic-notes graph — search, open a node, expand its subgraph.</p>
+    <p class="tagline">Typed knowledge graph — search, create, edit, delete, and explore the subgraph.</p>
+    <div id="schema-status" class="status" aria-live="polite">Loading schema…</div>
   </header>
 
   <main>
+    <!-- ── Search ───────────────────────────────────────────────── -->
     <section id="search-section">
+      <h2>Search</h2>
       <form id="search-form">
         <input
           id="search-input"
           type="search"
-          name="q"
           placeholder="Search node text…"
           autocomplete="off"
           autofocus
         />
         <label class="inline">
+          kind
+          <select id="search-kind"></select>
+        </label>
+        <label class="inline">
           limit
-          <input id="search-limit" type="number" name="limit" value="20" min="1" max="200" />
+          <input id="search-limit" type="number" value="20" min="1" max="200" />
         </label>
         <button type="submit">Search</button>
       </form>
@@ -33,20 +39,69 @@
       <ul id="search-results" class="results"></ul>
     </section>
 
+    <!-- ── Create node ──────────────────────────────────────────── -->
+    <section id="create-node-section">
+      <h2>Create node</h2>
+      <form id="create-node-form">
+        <label class="block">
+          kind
+          <select id="create-node-kind"></select>
+        </label>
+        <label class="block">
+          <span id="create-node-text-name">text</span>
+          <textarea id="create-node-text" rows="2" placeholder="The node's text…"></textarea>
+        </label>
+        <div id="create-node-fields" class="fields"></div>
+        <button type="submit">Create node</button>
+      </form>
+      <div id="create-node-status" class="status" aria-live="polite"></div>
+    </section>
+
+    <!-- ── Create edge ──────────────────────────────────────────── -->
+    <section id="create-edge-section">
+      <h2>Create edge</h2>
+      <form id="create-edge-form">
+        <label class="block">
+          edge kind
+          <select id="create-edge-kind"></select>
+        </label>
+        <div id="create-edge-signature" class="signature"></div>
+        <div class="picker-row">
+          <div class="picker-col">
+            <span class="picker-label">from</span>
+            <div id="create-edge-from"></div>
+          </div>
+          <div class="picker-col">
+            <span class="picker-label">to</span>
+            <div id="create-edge-to"></div>
+          </div>
+        </div>
+        <div id="create-edge-fields" class="fields"></div>
+        <button type="submit">Create edge</button>
+      </form>
+      <div id="create-edge-status" class="status" aria-live="polite"></div>
+    </section>
+
+    <!-- ── Node detail ──────────────────────────────────────────── -->
     <section id="node-section" hidden>
       <h2>Node</h2>
       <div id="node-status" class="status" aria-live="polite"></div>
+      <div id="node-actions" class="actions"></div>
+      <div id="node-edit"></div>
       <div id="node-detail"></div>
 
-      <div id="expand-controls" hidden>
-        <label class="inline">
-          depth
-          <input id="expand-depth" type="number" value="1" min="1" max="10" />
-        </label>
-        <button id="expand-button" type="button">Expand</button>
+      <div id="graph-controls" hidden>
+        <h3>Subgraph</h3>
+        <div class="graph-controls-row">
+          <label class="inline">
+            depth
+            <input id="graph-depth" type="number" value="1" min="1" max="6" />
+          </label>
+          <button id="graph-button" type="button">Show graph</button>
+          <span id="graph-status" class="status inline-status" aria-live="polite"></span>
+        </div>
       </div>
-      <div id="expand-status" class="status" aria-live="polite"></div>
-      <div id="expand-detail"></div>
+      <div id="graph-detail" class="graph-panel" hidden></div>
     </section>
   </main>
 

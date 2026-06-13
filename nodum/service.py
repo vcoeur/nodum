@@ -1,15 +1,14 @@
-"""The unified data-service layer — the single source of truth.
+"""The unified data-service layer — kind-aware CRUD over the typed metamodel.
 
-Every operation (`add_node`, `add_edge`, `get`, `search`, `expand`) and all
-validation live here. The CLI, the HTTP API, and the web view are thin
-adapters that call these functions and serialise the returned pydantic models;
-they hold no logic of their own. Each function opens its own short-lived
-connection and commits, so adapters stay stateless.
+The single source of truth for every operation and all validation. Nodes and
+edges live in one generic table each; a row's ``kind`` references the metamodel
+(:mod:`nodum.metamodel`), which defines field shapes and edge endpoint
+signatures. The CLI, HTTP API, and web view are thin adapters over these
+functions. Each function opens a short-lived connection and commits.
 
-Type-as-node: when ``add_node`` is given a ``type``, it resolves-or-creates a
-type node (a node whose payload is ``{"text": <type>, "kind": "type"}``) and
-links the new node to it with an ``is`` edge. Edge types are stored as a
-``data.type`` string on the edge.
+Validation is soft (raised from here as ``metamodel.ValidationError``, a
+``ValueError``); the database enforces only the cheap universals (FKs,
+``from≠to``, ``data ? 'text'``, ``kind ∈`` the lookup tables).
 """
 
 from __future__ import annotations
@@ -20,8 +19,10 @@ from uuid import UUID
 from psycopg import Cursor
 from psycopg.types.json import Json
 
+from nodum import metamodel
 from nodum.db import connect
 from nodum.models import (
+    Deleted,
     EdgeOut,
     NodeOut,
     NodeWithEdges,
@@ -30,8 +31,8 @@ from nodum.models import (
     Subgraph,
 )
 
-_NODE_COLS = "uuid, data, created_at, updated_at"
-_EDGE_COLS = "uuid, from_uuid, to_uuid, data, created_at, updated_at"
+_NODE_COLS = "uuid, kind, data, created_at, updated_at"
+_EDGE_COLS = "uuid, kind, from_uuid, to_uuid, data, created_at, updated_at"
 
 
 class NodeNotFound(Exception):
@@ -42,112 +43,83 @@ class NodeNotFound(Exception):
         super().__init__(f"node {self.uuid} not found")
 
 
-# ── Writes ──────────────────────────────────────────────────────────────────
+class EdgeNotFound(Exception):
+    """Raised when an operation references an edge UUID that does not exist."""
+
+    def __init__(self, uuid: str | UUID) -> None:
+        self.uuid = str(uuid)
+        super().__init__(f"edge {self.uuid} not found")
 
 
-def add_node(text: str, type: str | None = None, data: dict | None = None) -> NodeOut:
-    """Insert a node and return it.
+def _kind_of(cur: Cursor, uuid: str | UUID) -> str:
+    """Return a node's kind, raising NodeNotFound if it does not exist."""
+    cur.execute("SELECT kind FROM nodes WHERE uuid = %s", (str(uuid),))
+    row = cur.fetchone()
+    if row is None:
+        raise NodeNotFound(uuid)
+    return row["kind"]
 
-    When ``type`` is given, its type node is resolved-or-created and linked
-    with an ``is`` edge (type-as-node). The type string is also kept on the
-    node payload as ``data.type`` for convenience.
+
+# ── Create ──────────────────────────────────────────────────────────────────
+
+
+def add_node(kind: str, text: str, data: dict | None = None) -> NodeOut:
+    """Create a typed node and return it.
 
     Args:
-        text: The node's primary text. Required and non-empty.
-        type: Optional type name; drives the type node + ``is`` edge.
-        data: Optional extra payload keys merged into the node.
+        kind: A node kind from the metamodel.
+        text: The node's universal text. Required and non-empty.
+        data: Optional kind-specific payload keys, validated against the kind.
 
-    Returns:
-        The newly created node.
+    Raises:
+        metamodel.ValidationError: Unknown kind, empty text, or a bad field.
     """
-    if not text or not text.strip():
-        raise ValueError("node text must be a non-empty string")
     payload: dict = {"text": text, **(data or {})}
-    if type is not None:
-        payload["type"] = type
+    metamodel.validate_node(kind, payload)
     with connect() as conn, conn.cursor() as cur:
         cur.execute(
-            f"INSERT INTO nodes (data) VALUES (%s) RETURNING {_NODE_COLS}",
-            (Json(payload),),
+            f"INSERT INTO nodes (kind, data) VALUES (%s, %s) RETURNING {_NODE_COLS}",
+            (kind, Json(payload)),
         )
-        node_row = cur.fetchone()
-        if type is not None:
-            type_node = _resolve_or_create_type(cur, type)
-            cur.execute(
-                "INSERT INTO edges (from_uuid, to_uuid, data) VALUES (%s, %s, %s)",
-                (node_row["uuid"], type_node["uuid"], Json({"type": "is"})),
-            )
+        row = cur.fetchone()
         conn.commit()
-    return NodeOut(**node_row)
+    return NodeOut(**row)
 
 
 def add_edge(
-    from_uuid: str | UUID,
-    to_uuid: str | UUID,
-    type: str | None = None,
-    data: dict | None = None,
+    kind: str, from_uuid: str | UUID, to_uuid: str | UUID, data: dict | None = None
 ) -> EdgeOut:
-    """Insert a directed edge ``from_uuid → to_uuid`` and return it.
+    """Create a typed, directed edge and return it.
 
-    Args:
-        from_uuid: Source node UUID. Must exist.
-        to_uuid: Target node UUID. Must exist and differ from the source.
-        type: Optional edge type, stored as ``data.type``.
-        data: Optional extra payload keys merged into the edge.
-
-    Returns:
-        The newly created edge.
+    The endpoints' kinds are checked against the edge kind's signature.
 
     Raises:
         NodeNotFound: If either endpoint does not exist.
-        ValueError: If the two endpoints are identical.
+        metamodel.ValidationError: Unknown edge kind, endpoint kind outside the
+            signature, identical endpoints, or a bad field.
     """
     if str(from_uuid) == str(to_uuid):
-        raise ValueError("an edge must connect two distinct nodes")
+        raise metamodel.ValidationError("an edge must connect two distinct nodes")
     payload: dict = dict(data or {})
-    if type is not None:
-        payload["type"] = type
     with connect() as conn, conn.cursor() as cur:
-        for endpoint in (from_uuid, to_uuid):
-            cur.execute("SELECT 1 FROM nodes WHERE uuid = %s", (str(endpoint),))
-            if cur.fetchone() is None:
-                raise NodeNotFound(endpoint)
+        from_kind = _kind_of(cur, from_uuid)
+        to_kind = _kind_of(cur, to_uuid)
+        metamodel.validate_edge(kind, from_kind, to_kind, payload)
         cur.execute(
-            f"INSERT INTO edges (from_uuid, to_uuid, data) VALUES (%s, %s, %s) "
+            f"INSERT INTO edges (kind, from_uuid, to_uuid, data) VALUES (%s, %s, %s, %s) "
             f"RETURNING {_EDGE_COLS}",
-            (str(from_uuid), str(to_uuid), Json(payload)),
+            (kind, str(from_uuid), str(to_uuid), Json(payload)),
         )
         row = cur.fetchone()
         conn.commit()
     return EdgeOut(**row)
 
 
-def _resolve_or_create_type(cur: Cursor, type_name: str) -> dict:
-    """Find the type node named ``type_name``, creating it if absent.
-
-    A type node is a plain node with payload ``{"text": name, "kind": "type"}``.
-    Returns the row mapping (``uuid``/``data``/timestamps).
-    """
-    cur.execute(
-        f"SELECT {_NODE_COLS} FROM nodes "
-        "WHERE data ->> 'text' = %s AND data ->> 'kind' = 'type' LIMIT 1",
-        (type_name,),
-    )
-    row = cur.fetchone()
-    if row is not None:
-        return row
-    cur.execute(
-        f"INSERT INTO nodes (data) VALUES (%s) RETURNING {_NODE_COLS}",
-        (Json({"text": type_name, "kind": "type"}),),
-    )
-    return cur.fetchone()
-
-
-# ── Reads ───────────────────────────────────────────────────────────────────
+# ── Read ────────────────────────────────────────────────────────────────────
 
 
 def get(uuid: str | UUID) -> NodeWithEdges:
-    """Return a node together with every edge incident on it (either direction).
+    """Return a node plus every edge incident on it (either direction).
 
     Raises:
         NodeNotFound: If no node has the given UUID.
@@ -163,19 +135,18 @@ def get(uuid: str | UUID) -> NodeWithEdges:
             (str(uuid), str(uuid)),
         )
         edges = cur.fetchall()
-    return NodeWithEdges(node=NodeOut(**node), edges=[EdgeOut(**e) for e in edges])
+    return NodeWithEdges(node=NodeOut(**node), edges=[EdgeOut(**edge) for edge in edges])
 
 
-def search(query: str, limit: int = 20) -> SearchResult:
-    """Full-text search over node text, ranked by ``ts_rank`` (best first).
+def search(query: str, kind: str | None = None, limit: int = 20) -> SearchResult:
+    """Full-text search over node text, ranked best-first, optionally by kind.
 
     Args:
-        query: The free-text query (``plainto_tsquery`` semantics — AND of terms).
-        limit: Maximum number of hits to return.
-
-    Returns:
-        The query, the number of hits returned, and the ranked hits.
+        query: Free-text query (``plainto_tsquery`` — AND of terms).
+        kind: Optional node-kind filter.
+        limit: Maximum number of hits.
     """
+    clause = "AND kind = %(kind)s" if kind else ""
     with connect() as conn, conn.cursor() as cur:
         cur.execute(
             f"SELECT {_NODE_COLS}, "
@@ -183,51 +154,55 @@ def search(query: str, limit: int = 20) -> SearchResult:
             "        plainto_tsquery('english', %(q)s)) AS score "
             "FROM nodes "
             "WHERE to_tsvector('english', data ->> 'text') "
-            "      @@ plainto_tsquery('english', %(q)s) "
+            f"      @@ plainto_tsquery('english', %(q)s) {clause} "
             "ORDER BY score DESC, created_at, uuid "
             "LIMIT %(limit)s",
-            {"q": query, "limit": limit},
+            {"q": query, "kind": kind, "limit": limit},
         )
         rows = cur.fetchall()
     hits = [SearchHit(score=float(row.pop("score")), **row) for row in rows]
     return SearchResult(query=query, total=len(hits), hits=hits)
 
 
-def expand(seed: str | UUID | Sequence[str | UUID], depth: int = 1) -> Subgraph:
+def expand(
+    seed: str | UUID | Sequence[str | UUID],
+    depth: int = 1,
+    edge_kinds: Sequence[str] | None = None,
+) -> Subgraph:
     """Expand a seed set into its connected subgraph, following edges outward.
 
-    Walks directed edges (``from_uuid → to_uuid``) up to ``depth`` hops via a
-    recursive CTE, then loads every node touched. Serialised to JSON, this is
-    the LLM context payload.
-
     Args:
-        seed: One UUID or a sequence of UUIDs to start from.
-        depth: Maximum number of hops (>= 1).
+        seed: One UUID or a sequence of UUIDs.
+        depth: Maximum hops (>= 1).
+        edge_kinds: Optional list of edge kinds to traverse (others are skipped).
 
-    Returns:
-        The seed list, the depth, and the reachable nodes + edges.
+    Raises:
+        metamodel.ValidationError: If ``depth < 1``.
     """
     if depth < 1:
-        raise ValueError("depth must be at least 1")
-    seeds = [str(seed)] if isinstance(seed, str | UUID) else [str(s) for s in seed]
+        raise metamodel.ValidationError("depth must be at least 1")
+    seeds = [str(seed)] if isinstance(seed, str | UUID) else [str(item) for item in seed]
+    kinds = list(edge_kinds) if edge_kinds else None
+    edge_filter = "AND e.kind = ANY(%(ek)s)" if kinds else ""
+    anchor_filter = "AND kind = ANY(%(ek)s)" if kinds else ""
     with connect() as conn, conn.cursor() as cur:
         cur.execute(
             f"""
             WITH RECURSIVE sub AS (
                 SELECT {_EDGE_COLS}, 1 AS hop
                 FROM edges
-                WHERE from_uuid = ANY(%(seeds)s::uuid[])
+                WHERE from_uuid = ANY(%(seeds)s::uuid[]) {anchor_filter}
               UNION ALL
-                SELECT e.uuid, e.from_uuid, e.to_uuid, e.data,
+                SELECT e.uuid, e.kind, e.from_uuid, e.to_uuid, e.data,
                        e.created_at, e.updated_at, s.hop + 1
                 FROM edges e
                 JOIN sub s ON e.from_uuid = s.to_uuid
-                WHERE s.hop < %(depth)s
+                WHERE s.hop < %(depth)s {edge_filter}
             )
             SELECT DISTINCT {_EDGE_COLS} FROM sub
             ORDER BY created_at, uuid
             """,
-            {"seeds": seeds, "depth": depth},
+            {"seeds": seeds, "depth": depth, "ek": kinds},
         )
         edge_rows = cur.fetchall()
         node_ids = set(seeds)
@@ -241,8 +216,109 @@ def expand(seed: str | UUID | Sequence[str | UUID], depth: int = 1) -> Subgraph:
         )
         node_rows = cur.fetchall()
     return Subgraph(
-        seed=[UUID(s) for s in seeds],
+        seed=[UUID(item) for item in seeds],
         depth=depth,
-        nodes=[NodeOut(**n) for n in node_rows],
-        edges=[EdgeOut(**e) for e in edge_rows],
+        nodes=[NodeOut(**node) for node in node_rows],
+        edges=[EdgeOut(**edge) for edge in edge_rows],
     )
+
+
+def schema() -> dict:
+    """Return the metamodel contract (node kinds + edge kinds + signatures)."""
+    return metamodel.schema()
+
+
+# ── Update ──────────────────────────────────────────────────────────────────
+
+
+def update_node(uuid: str | UUID, text: str | None = None, data: dict | None = None) -> NodeOut:
+    """Merge new text/payload into a node, re-validate against its kind, return it.
+
+    Raises:
+        NodeNotFound: If the node does not exist.
+        metamodel.ValidationError: If the result violates the kind's shape.
+    """
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(f"SELECT {_NODE_COLS} FROM nodes WHERE uuid = %s", (str(uuid),))
+        row = cur.fetchone()
+        if row is None:
+            raise NodeNotFound(uuid)
+        payload = dict(row["data"])
+        if data:
+            payload.update(data)
+        if text is not None:
+            payload["text"] = text
+        metamodel.validate_node(row["kind"], payload)
+        cur.execute(
+            f"UPDATE nodes SET data = %s, updated_at = now() WHERE uuid = %s "
+            f"RETURNING {_NODE_COLS}",
+            (Json(payload), str(uuid)),
+        )
+        out = cur.fetchone()
+        conn.commit()
+    return NodeOut(**out)
+
+
+def update_edge(uuid: str | UUID, data: dict | None = None) -> EdgeOut:
+    """Merge new payload into an edge (kind and endpoints fixed), return it.
+
+    Raises:
+        EdgeNotFound: If the edge does not exist.
+        metamodel.ValidationError: If the result violates the edge kind's fields.
+    """
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(f"SELECT {_EDGE_COLS} FROM edges WHERE uuid = %s", (str(uuid),))
+        row = cur.fetchone()
+        if row is None:
+            raise EdgeNotFound(uuid)
+        payload = dict(row["data"])
+        if data:
+            payload.update(data)
+        from_kind = _kind_of(cur, row["from_uuid"])
+        to_kind = _kind_of(cur, row["to_uuid"])
+        metamodel.validate_edge(row["kind"], from_kind, to_kind, payload)
+        cur.execute(
+            f"UPDATE edges SET data = %s, updated_at = now() WHERE uuid = %s "
+            f"RETURNING {_EDGE_COLS}",
+            (Json(payload), str(uuid)),
+        )
+        out = cur.fetchone()
+        conn.commit()
+    return EdgeOut(**out)
+
+
+# ── Delete ──────────────────────────────────────────────────────────────────
+
+
+def delete_node(uuid: str | UUID) -> Deleted:
+    """Delete a node; its incident edges cascade. Returns the cascade count.
+
+    Raises:
+        NodeNotFound: If the node does not exist.
+    """
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT count(*) AS n FROM edges WHERE from_uuid = %s OR to_uuid = %s",
+            (str(uuid), str(uuid)),
+        )
+        edge_count = cur.fetchone()["n"]
+        cur.execute("DELETE FROM nodes WHERE uuid = %s", (str(uuid),))
+        if cur.rowcount == 0:
+            raise NodeNotFound(uuid)
+        conn.commit()
+    # The node itself plus the edges that cascaded with it.
+    return Deleted(uuid=UUID(str(uuid)), deleted=1 + edge_count)
+
+
+def delete_edge(uuid: str | UUID) -> Deleted:
+    """Delete a single edge.
+
+    Raises:
+        EdgeNotFound: If the edge does not exist.
+    """
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute("DELETE FROM edges WHERE uuid = %s", (str(uuid),))
+        if cur.rowcount == 0:
+            raise EdgeNotFound(uuid)
+        conn.commit()
+    return Deleted(uuid=UUID(str(uuid)), deleted=1)
