@@ -10,6 +10,8 @@ install: ## Install dependencies into a uv-managed venv
 dev-install: ## Install dev dependencies too
 	uv sync --all-groups
 
+install-all: dev-install frontend-install ## Install everything (Python dev deps + frontend npm deps)
+
 db-up: ## Start the local PostgreSQL container
 	docker compose up -d
 
@@ -42,11 +44,16 @@ dev-web: frontend-build ## Build the SPA then serve it via FastAPI on 8600
 	NODUM_WEB_DIST=$(shell pwd)/frontend/dist uv run nodum serve
 
 dev: db-check ## Run the API (:8600) + Vite frontend (:5700); stop both when either exits
+	@test -e frontend/node_modules/.bin/vite \
+	  || { echo "frontend deps missing — run 'make install-all' (or 'make frontend-install')." >&2; exit 1; }
 	@echo "→ API on :8600 · frontend on :5700  (Ctrl-C stops both)"
-	@trap 'kill 0' EXIT INT TERM; \
-	  uv run nodum serve & \
-	  ( cd frontend && npm run dev ) & \
-	  wait -n
+	@set -m; \
+	  uv run nodum serve & api=$$!; \
+	  ( cd frontend && npm run dev ) & web=$$!; \
+	  trap 'kill -- -$$api -$$web 2>/dev/null' INT TERM; \
+	  wait -n; \
+	  kill -- -$$api -$$web 2>/dev/null; \
+	  wait 2>/dev/null
 
 docker-build: ## Build the full-app Docker image (API + built UI)
 	docker build -t nodum .
@@ -65,4 +72,4 @@ format: ## Ruff auto-fix + format
 	uv run ruff check --fix .
 	uv run ruff format .
 
-.PHONY: help install dev-install db-up db-down db-check init-db run serve frontend-install frontend-dev frontend-build dev-web dev docker-build test coverage lint format
+.PHONY: help install dev-install install-all db-up db-down db-check init-db run serve frontend-install frontend-dev frontend-build dev-web dev docker-build test coverage lint format

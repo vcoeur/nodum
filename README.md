@@ -38,8 +38,9 @@ docker compose -f docker-compose.example.yml up     # nodum + Postgres
 ### Local development
 
 ```bash
+make install-all   # install all deps at once (Python dev + frontend npm)
 make db-up         # start local PostgreSQL (docker-compose, host port 5436)
-make dev-install   # uv sync --all-groups (Python)
+make dev-install   # uv sync --all-groups (Python) — subset of install-all above
 make init-db       # create the schema + seed the kind lookup tables
 uv run nodum auth set-password   # set the main password (gates the API + UI)
 make test          # run the Python suite (needs the database up)
@@ -51,7 +52,7 @@ make frontend-dev       # Vite dev server on http://127.0.0.1:5700 (proxies the 
 make dev-web
 
 # run the API and the Vite frontend together, stopping both when either exits
-# (checks the DB is up first; needs `make frontend-install` once beforehand):
+# (checks the DB is up first; run `make install-all` once beforehand):
 make dev
 ```
 
