@@ -23,8 +23,15 @@ body {
 }
 
 header {
+  position: relative;
   padding: 1.5rem 1.5rem 0.75rem;
   border-bottom: 1px solid var(--border);
+}
+
+#logout-button {
+  position: absolute;
+  top: 1.5rem;
+  right: 1.5rem;
 }
 
 header h1 {
@@ -517,4 +524,31 @@ table.edges tr:last-child td {
   font-size: 11px;
   fill: #1c1c1c;
   pointer-events: none;
+}
+
+/* ── Login ── */
+
+main.login {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.login-card {
+  width: 100%;
+  max-width: 22rem;
+  padding: 1.5rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+
+.login-card h1 {
+  margin: 0 0 0.25rem;
+}
+
+.login-card code {
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.85rem;
 }

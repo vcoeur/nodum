@@ -49,11 +49,16 @@ flowchart LR
     web["nodum.web (browser)"] --> api
     svc --> mm["nodum.metamodel (typed registry)"]
     svc --> pg[("PostgreSQL")]
+    cli --> auth["nodum.auth (main password)"]
+    api --> auth
+    web --> auth
+    auth --> pg
     style cli fill:#e6f0ff,color:#000
     style api fill:#e6f0ff,color:#000
     style web fill:#e6f0ff,color:#000
     style svc fill:#fff3cd,color:#000
     style mm fill:#ffe6cc,color:#000
+    style auth fill:#ffd9d9,color:#000
     style pg fill:#d9f2d9,color:#000
 ```
 
@@ -75,11 +80,14 @@ flowchart LR
   the model via `model_dump(mode="json")` wrapped in a `JSONResponse`, with no
   `response_model` so keys are neither added, dropped, nor reordered.
 - **`nodum.web`** — a small browser client of the API (`web.register(app)`
-  mounts `GET /` and `/static`); it holds no logic and fetches the API's JSON
-  endpoints from the browser.
+  mounts `GET /` (session-gated), `GET /login`, and `/static`); it holds no logic
+  and fetches the API's JSON endpoints from the browser.
+- **`nodum.auth`** — the single-main-password gate (transport-agnostic): argon2
+  hashing, signed session tokens, and the `auth_secret` reads/writes. The CLI,
+  API, and web call it; it imports no FastAPI. See **Authentication** below.
 - **`nodum.db`** / **`nodum.settings`** — connection management (`dict_row`),
-  idempotent schema init + kind seeding from `schema.sql`, the MVP migration,
-  and environment-loaded config.
+  idempotent schema init + kind seeding from `schema.sql`, the MVP + auth
+  migrations, and environment-loaded config.
 
 ## Node kinds
 
@@ -174,6 +182,8 @@ The CLI and API expose all of it; any client can self-orient by reading
 | `rm-node UUID` | delete a node (edges cascade) |
 | `rm-edge UUID` | delete one edge |
 | `schema` | print the metamodel contract |
+| `auth set-password` | set/replace the main password (prompt or piped stdin) |
+| `auth status` | report whether a password is configured (+ timestamp) |
 | `init-db` | create schema + seed kind tables |
 | `migrate` | upgrade a pre-typed (MVP) database |
 | `serve` | run the HTTP API + web view |
@@ -183,8 +193,10 @@ the raw string (so `--set born=1815` is an int, `--set venue=Nature` a string).
 
 **API routes:** `POST /nodes`, `GET /nodes/{uuid}`, `PATCH /nodes/{uuid}`,
 `DELETE /nodes/{uuid}`, `POST /edges`, `PATCH /edges/{uuid}`,
-`DELETE /edges/{uuid}`, `GET /search`, `GET /expand`, `GET /schema`,
-`GET /healthz`, and `GET /` (the web view).
+`DELETE /edges/{uuid}`, `GET /search`, `GET /expand`, `GET /schema` — all
+**gated by `require_auth`** — plus the open `POST /auth/login`,
+`POST /auth/logout`, `GET /healthz`, `GET /login`, and the session-gated
+`GET /` (the web view).
 
 **Web view (`nodum.web`):** a schema-driven, full-CRUD browser client of the
 JSON API. It fetches `GET /schema` and renders its forms from the metamodel —
@@ -200,6 +212,32 @@ across both surfaces; the parity tests assert this. When you add or change an
 operation: update the service first, then update **both** the CLI command and the
 API route in lockstep — never let one surface drift ahead of the other.
 
+## Authentication — one main password
+
+The network surfaces (HTTP API + web view) are gated by a **single main
+password**, initialised from the CLI on the machine where nodum runs. The local
+CLI is trusted and never logs in — it *sets* the secret. Until a password is set
+the install is **locked**: protected routes return `503` pointing at the CLI.
+
+- **Storage.** A single-row `auth_secret` table holds an argon2 hash
+  (`argon2-cffi`) of the password plus a random `signing_key`. argon2 runs only
+  at login and at `set-password` — never on the per-request path.
+- **Tokens (dual auth).** Login verifies the password, then mints a session token
+  signed with the `signing_key` (`itsdangerous`, 7-day expiry). Browsers carry it
+  in an **HttpOnly, Secure, SameSite=Strict cookie**; API/CLI clients carry it as
+  an `Authorization: Bearer` token. `require_auth` checks the **cookie first,
+  then the Bearer header**, verifying only the cheap HMAC signature.
+- **Rotation.** `set-password` recomputes the hash but **preserves the signing
+  key**, so changing the password does not invalidate live sessions.
+- **Defence in depth.** Every response carries `Content-Security-Policy:
+  default-src 'self'`, `X-Content-Type-Options: nosniff`, and
+  `X-Frame-Options: DENY` (all web assets are same-origin, so the CSP needs no
+  inline exceptions).
+- **Open routes:** `GET /healthz`, `POST /auth/login`, `POST /auth/logout`,
+  `GET /login`, and `/static`. Everything else requires a valid session.
+- **Config.** `NODUM_COOKIE_SECURE=1` marks the cookie Secure (set it behind a
+  TLS-terminating reverse proxy; off by default for local HTTP dev).
+
 ## Data model
 
 A mutable JSONB graph. The schema (`nodum/schema.sql`) is idempotent — safe to
@@ -207,6 +245,10 @@ re-run on every start-up.
 
 - **node_kinds / edge_kinds** — `TEXT PRIMARY KEY` lookup tables, seeded from the
   metamodel; the `kind` FKs point here.
+- **auth_secret** — single-row table (`id BOOLEAN PK CHECK (id)`) holding the
+  argon2 `password_hash` + random `signing_key` + `updated_at`. Empty until
+  `nodum auth set-password` writes it. `nodum.db.migrate_auth` creates it on an
+  already-initialised database (idempotent). See **Authentication**.
 - **nodes** — `uuid` (PK, `gen_random_uuid()`), `kind` (FK → `node_kinds`),
   `data` JSONB (`CHECK (data ? 'text')`), `created_at`, `updated_at`. Indexed
   with a GIN index on `data`, a GIN full-text index on
@@ -261,8 +303,9 @@ Make targets (run `make help` for the live list):
   Postgres is published on host port `5436` (→ container `5432`).
 - **Config via environment.** The only required value is `NODUM_DATABASE_URL`
   (default `postgresql://nodum:nodum@localhost:5436/nodum`, matching
-  docker-compose). `NODUM_API_HOST` / `NODUM_API_PORT` override the bind
-  address. A local `.env` is read if present; copy `.env.example` to start.
+  docker-compose). `NODUM_API_HOST` / `NODUM_API_PORT` override the bind address;
+  `NODUM_COOKIE_SECURE=1` marks the session cookie Secure (set behind TLS). A
+  local `.env` is read if present; copy `.env.example` to start.
 
 ## Conventions
 
@@ -277,6 +320,7 @@ Make targets (run `make help` for the live list):
   `nodum.service`; expose it through the CLI and the API together so the parity
   tests stay green. Adapters must not add behaviour the service lacks.
 - **Deferred — do not build here:** embeddings (pgvector / hybrid retrieval), an
-  LLM "gardener", contradiction reasoning, reranking, auth, and runtime-editable
-  kinds (the metamodel stays a code registry). Keep changes inside the typed
-  full-text + graph feature set.
+  LLM "gardener", contradiction reasoning, reranking, multi-user accounts / roles
+  (auth is a single shared main password — see **Authentication**), and
+  runtime-editable kinds (the metamodel stays a code registry). Keep changes
+  inside the typed full-text + graph feature set.

@@ -25,6 +25,9 @@ class Settings:
     database_url: str
     api_host: str = DEFAULT_API_HOST
     api_port: int = DEFAULT_API_PORT
+    # Mark the session cookie Secure (HTTPS-only). Off by default for local HTTP
+    # dev; set NODUM_COOKIE_SECURE=1 behind a TLS-terminating reverse proxy.
+    cookie_secure: bool = False
 
 
 def load_settings() -> Settings:
@@ -35,4 +38,5 @@ def load_settings() -> Settings:
         database_url=env.str("NODUM_DATABASE_URL", DEFAULT_DATABASE_URL),
         api_host=env.str("NODUM_API_HOST", DEFAULT_API_HOST),
         api_port=env.int("NODUM_API_PORT", DEFAULT_API_PORT),
+        cookie_secure=env.bool("NODUM_COOKIE_SECURE", False),
     )

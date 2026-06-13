@@ -7,8 +7,10 @@ license = { text = "MIT" }
 authors = [{ name = "Alice Voland" }]
 requires-python = ">=3.12"
 dependencies = [
+    "argon2-cffi>=23.1",
     "environs>=14.6.0",
     "fastapi>=0.115",
+    "itsdangerous>=2.2",
     "jinja2>=3.1",
     "psycopg[binary]>=3.2",
     "pydantic>=2.9",
