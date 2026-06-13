@@ -21,8 +21,23 @@ init-db: ## Create the schema in the configured database
 run: ## Run the nodum CLI (pass args after --, e.g. make run -- search foo)
 	uv run nodum
 
-serve: ## Run the HTTP API + web view (uvicorn)
+serve: ## Run the HTTP API (uvicorn); serves the SPA when NODUM_WEB_DIST is set
 	uv run nodum serve
+
+frontend-install: ## Install the React frontend's npm deps (npm ci)
+	cd frontend && npm ci
+
+frontend-dev: ## Run the Vite dev server (5700), proxying the API to 8600
+	cd frontend && npm run dev
+
+frontend-build: ## Build the React SPA into frontend/dist
+	cd frontend && npm run build
+
+dev-web: frontend-build ## Build the SPA then serve it via FastAPI on 8600
+	NODUM_WEB_DIST=$(shell pwd)/frontend/dist uv run nodum serve
+
+docker-build: ## Build the full-app Docker image (API + built UI)
+	docker build -t nodum .
 
 test: ## Run pytest
 	uv run pytest
@@ -38,4 +53,4 @@ format: ## Ruff auto-fix + format
 	uv run ruff check --fix .
 	uv run ruff format .
 
-.PHONY: help install dev-install db-up db-down init-db run serve test coverage lint format
+.PHONY: help install dev-install db-up db-down init-db run serve frontend-install frontend-dev frontend-build dev-web docker-build test coverage lint format

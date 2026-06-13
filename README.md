@@ -1,9 +1,10 @@
 # nodum
 
-A minimal **atomic-notes knowledge system**: a mutable PostgreSQL graph of
-typed, UUID-keyed nodes and edges, with full-text search and recursive subgraph
+An **atomic-notes knowledge system**: a mutable PostgreSQL graph of typed,
+UUID-keyed nodes and edges, with full-text search and recursive subgraph
 expansion — all behind a single data-service layer fronted by a CLI, an HTTP
-API, and a web view.
+API, and a React single-page web UI. The full app ships as a **Docker image**;
+the **PyPI wheel** is the CLI/library (see [Distribution](#distribution)).
 
 nodum is a **typed graph**: kinds live in a code registry (`nodum.metamodel`),
 not as free strings. Each node has a kind with a field schema; each edge has a
@@ -20,19 +21,38 @@ LLM-readable) alongside its typed fields.
 
 ## Quick start
 
+### Run the full app with Docker
+
+The image bundles the API + the built web UI. Point it at a Postgres and give it
+a password secret; it self-initialises the schema and sets the main password on
+first boot:
+
 ```bash
-make db-up        # start local PostgreSQL (docker-compose, host port 5436)
-make dev-install  # uv sync --all-groups
-make init-db      # create the schema + seed the kind lookup tables
-uv run nodum auth set-password   # set the main password (gates the API + web)
-make test         # run the suite (needs the database up)
-make serve        # run the HTTP API + web view on http://127.0.0.1:8600
+echo 'change-me' > nodum_admin_password.txt        # the initial main password
+docker compose -f docker-compose.example.yml up     # nodum + Postgres
+# → open http://127.0.0.1:8600 and sign in
 ```
 
-Configuration is a single environment variable, `NODUM_DATABASE_URL` (default
+### Local development
+
+```bash
+make db-up         # start local PostgreSQL (docker-compose, host port 5436)
+make dev-install   # uv sync --all-groups (Python)
+make init-db       # create the schema + seed the kind lookup tables
+uv run nodum auth set-password   # set the main password (gates the API + UI)
+make test          # run the Python suite (needs the database up)
+
+# the web UI (React + Vite, in frontend/):
+make frontend-install   # npm ci
+make frontend-dev       # Vite dev server on http://127.0.0.1:5700 (proxies the API)
+# …or build it and serve through FastAPI on 8600:
+make dev-web
+```
+
+Configuration is environment variables, chiefly `NODUM_DATABASE_URL` (default
 `postgresql://nodum:nodum@localhost:5436/nodum`, matching docker-compose). Copy
-`.env.example` to `.env` to override it. The API and web view bind to
-`127.0.0.1:8600`.
+`.env.example` to `.env` to override. The API serves on `127.0.0.1:8600`; the
+Vite dev server on `5700`.
 
 ## The metamodel
 
@@ -124,22 +144,22 @@ curl -s 'http://127.0.0.1:8600/expand?seed=<uuid>&depth=2&edge_kind=cites'
 
 Full route set: `POST /nodes`, `GET|PATCH|DELETE /nodes/{uuid}`, `POST /edges`,
 `PATCH|DELETE /edges/{uuid}`, `GET /search`, `GET /expand`, `GET /schema` — all
-behind auth — plus `POST /auth/login`, `POST /auth/logout`, and `GET /healthz`.
-A missing node/edge returns 404; invalid input returns 422; an unauthenticated
-request returns 401 (or 503 until a password is set). Pass the token from
-`POST /auth/login` as `Authorization: Bearer <token>` (see
+behind auth — plus `POST /auth/login`, `POST /auth/logout`, `GET /auth/session`,
+and `GET /healthz`. A missing node/edge returns 404; invalid input returns 422; an
+unauthenticated request returns 401 (or 503 until a password is set). Pass the
+token from `POST /auth/login` as `Authorization: Bearer <token>` (see
 [Authentication](#authentication)).
 
-### Web view
+### Web UI
 
-A schema-driven, full-CRUD browser UI served by the same app — open
-<http://127.0.0.1:8600/> after `make serve`. It fetches `GET /schema` and drives
-its forms from the metamodel: create/edit a node by kind (fields rendered per
-the kind's schema), create an edge by type (endpoint pickers filtered to the
-signature, with validation feedback), delete (with a cascade-aware confirm),
-search (with a kind filter), open a node, and render its subgraph as a visual
-node-link **SVG diagram**. Dependency-free — no CDNs. Visiting it unauthenticated
-redirects to a sign-in page; a `Logout` control clears the session.
+A **React + Vite (TypeScript) single-page app** (in `frontend/`), a schema-driven
+client of the JSON API. It fetches `GET /schema` and drives its forms from the
+metamodel: create/edit a node by kind, create an edge by type (endpoint pickers
+filtered to the signature), delete (with a cascade-aware confirm), search (with a
+kind filter), open a node, and render its subgraph as a node-link **SVG diagram**.
+Sign-in is in-app (the SPA reads `GET /auth/session` to know its state), with a
+`Logout` control. The UI ships in the Docker image — see
+[Distribution](#distribution).
 
 ## Authentication
 
@@ -160,6 +180,22 @@ Strict cookie** set by `POST /auth/login`; API/CLI clients send it as an
 signature — argon2 runs at login only. Set `NODUM_COOKIE_SECURE=1` to mark the
 cookie Secure behind a TLS-terminating proxy. Multi-user accounts are out of
 scope — this is one shared password.
+
+## Distribution
+
+Two artifacts from one codebase:
+
+- **Docker image — the full app.** A multi-stage build compiles the React SPA and
+  bundles it with the API. The entrypoint waits for Postgres, runs `init-db`, sets
+  the main password from `NODUM_ADMIN_PASSWORD_FILE` / `NODUM_ADMIN_PASSWORD` (only
+  if unconfigured), and serves on `0.0.0.0:8600`. So a deploy is: declare the
+  image, point `NODUM_DATABASE_URL` at your Postgres, provide a password secret —
+  that's all. `docker-compose.example.yml` is a turnkey starting point; the image
+  does not bundle Postgres.
+- **PyPI wheel — the CLI / library.** `pip install nodum` gives the `nodum`
+  command and the HTTP API, but **no web UI** (the bundle is image-only). Useful
+  for scripting, automation, or embedding the service. `nodum serve` without
+  `NODUM_WEB_DIST` serves the API alone.
 
 ## Data model
 

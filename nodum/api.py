@@ -135,6 +135,24 @@ def auth_logout() -> JSONResponse:
     return response
 
 
+@app.get("/auth/session")
+def auth_session(
+    authorization: str | None = Header(default=None),  # noqa: B008 — FastAPI param sentinel
+    nodum_session: str | None = Cookie(default=None),  # noqa: B008 — FastAPI param sentinel
+) -> JSONResponse:
+    """Report ``{configured, authenticated}`` for the SPA (open route).
+
+    The session cookie is HttpOnly, so the browser cannot read it; the SPA calls
+    this to decide between the setup hint, the sign-in view, and the app.
+    """
+    configured = auth.is_configured()
+    authenticated = False
+    if configured:
+        token = _token_from(authorization, nodum_session)
+        authenticated = token is not None and auth.verify_token(token)
+    return JSONResponse(content={"configured": configured, "authenticated": authenticated})
+
+
 @app.get("/healthz")
 def healthz() -> JSONResponse:
     """Liveness probe returning a static ``{"status": "ok"}`` payload (open)."""

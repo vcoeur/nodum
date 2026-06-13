@@ -66,18 +66,23 @@ def test_unconfigured_returns_503(auth_configured: None, monkeypatch) -> None:
     assert _anon().get("/schema").status_code == 503
 
 
-def test_web_root_redirects_to_login_when_anonymous(auth_configured: None) -> None:
-    """An unauthenticated browser hitting / is redirected to /login."""
-    response = _anon().get("/", follow_redirects=False)
-    assert response.status_code == 303
-    assert response.headers["location"] == "/login"
+def test_auth_session_unauthenticated(auth_configured: None) -> None:
+    """The open session probe reports configured-but-not-authenticated for an anon caller."""
+    body = _anon().get("/auth/session").json()
+    assert body == {"configured": True, "authenticated": False}
 
 
-def test_login_page_is_open(auth_configured: None) -> None:
-    """The sign-in page itself is reachable without auth."""
-    response = _anon().get("/login")
-    assert response.status_code == 200
-    assert "text/html" in response.headers["content-type"]
+def test_auth_session_authenticated(auth_configured: None, session_token: str) -> None:
+    """A valid token makes the session probe report authenticated."""
+    body = _anon().get("/auth/session", headers={"Authorization": f"Bearer {session_token}"}).json()
+    assert body == {"configured": True, "authenticated": True}
+
+
+def test_auth_session_unconfigured(auth_configured: None, monkeypatch) -> None:
+    """With no password set, the probe reports unconfigured (and not authenticated)."""
+    monkeypatch.setattr(auth, "is_configured", lambda: False)
+    body = _anon().get("/auth/session").json()
+    assert body == {"configured": False, "authenticated": False}
 
 
 def test_security_headers_present(client: TestClient) -> None:

@@ -1,7 +1,7 @@
 [project]
 name = "nodum"
 dynamic = ["version"]
-description = "Minimal atomic-notes knowledge system: a mutable PostgreSQL graph of typed, UUID-keyed nodes and edges with full-text search and recursive subgraph expansion, behind one data-service layer fronted by a CLI, an HTTP API, and a minimal web view"
+description = "Atomic-notes knowledge system: a mutable PostgreSQL graph of typed, UUID-keyed nodes and edges with full-text search and recursive subgraph expansion, behind one data-service layer fronted by a CLI and an HTTP API. This wheel is the CLI/library; the full web UI ships in the Docker image."
 readme = "README.md"
 license = { text = "MIT" }
 authors = [{ name = "Alice Voland" }]
@@ -11,7 +11,6 @@ dependencies = [
     "environs>=14.6.0",
     "fastapi>=0.115",
     "itsdangerous>=2.2",
-    "jinja2>=3.1",
     "psycopg[binary]>=3.2",
     "pydantic>=2.9",
     "typer>=0.16",
@@ -49,13 +48,12 @@ source = "vcs"
 [tool.hatch.build.targets.wheel]
 packages = ["nodum"]
 
-# Non-Python package data the runtime reads via importlib.resources: the DDL,
-# and the web view's templates + static assets.
+# Non-Python package data the runtime reads via importlib.resources: the DDL.
+# The web UI (the React bundle) is NOT in the wheel — it is built into the Docker
+# image and served from NODUM_WEB_DIST (see nodum.web).
 [tool.hatch.build]
 artifacts = [
     "nodum/schema.sql",
-    "nodum/templates/**/*",
-    "nodum/static/**/*",
 ]
 
 [dependency-groups]

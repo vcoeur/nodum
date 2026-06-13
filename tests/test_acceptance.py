@@ -48,9 +48,3 @@ def test_note_01_acceptance(run_cli: Callable[..., dict], client: TestClient) ->
 
     # 6: the schema endpoint lists the seven node kinds.
     assert len(client.get("/schema").json()["node_kinds"]) == 7
-
-    # 7: the web view serves a non-empty HTML page.
-    home = client.get("/")
-    assert home.status_code == 200
-    assert "text/html" in home.headers["content-type"]
-    assert home.text.strip()

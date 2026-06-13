@@ -18,7 +18,7 @@ from fastapi.testclient import TestClient
 from itsdangerous import URLSafeTimedSerializer
 from typer.testing import CliRunner
 
-from nodum import api, auth, web
+from nodum import api, auth
 from nodum.cli import app as cli_app
 from nodum.db import connect, init_schema
 
@@ -89,26 +89,15 @@ def clean_graph(schema: None) -> None:
         conn.commit()
 
 
-def _ensure_web_view() -> None:
-    """Mount the web view onto ``nodum.api.app`` once, unless already wired.
-
-    The maintainer normally mounts the web view before running the suite; this
-    keeps the acceptance test's ``GET /`` check robust either way.
-    """
-    mounted = any(getattr(route, "path", None) == "/" for route in api.app.routes)
-    if not mounted:
-        web.register(api.app)
-
-
 @pytest.fixture(scope="session")
 def client(auth_configured: None) -> TestClient:
-    """An authenticated ``TestClient`` bound to the real API app, web view mounted.
+    """An authenticated ``TestClient`` bound to the real API app.
 
-    Carries the session cookie (so ``GET /`` renders instead of redirecting) and a
-    Bearer header (so the gated JSON routes pass) — both signed with the seeded
-    test key, so every existing endpoint test runs as an authenticated caller.
+    Carries the session cookie and a Bearer header — both signed with the seeded
+    test key — so every endpoint test runs as an authenticated caller. The SPA is
+    not mounted in tests (no ``NODUM_WEB_DIST``); SPA serving is covered in
+    ``test_web.py`` against a fresh app with a temporary bundle.
     """
-    _ensure_web_view()
     test_client = TestClient(api.app)
     token = _session_token()
     test_client.cookies.set(auth.COOKIE_NAME, token)

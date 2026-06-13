@@ -8,7 +8,8 @@ editing anything here.
 `nodum` is a minimal **atomic-notes knowledge system**: a mutable PostgreSQL
 graph of typed, UUID-keyed nodes and edges, with full-text search and recursive
 subgraph expansion. All logic lives in one data-service layer; a CLI, an HTTP
-API, and a small web view are thin adapters over it.
+API, and a React single-page web UI are thin adapters over it. The full app ships
+as a Docker image; the PyPI wheel is the CLI/library (no UI). See **Distribution**.
 
 It is a **typed graph**. Earlier the graph was open — a node carried a free
 `data.type` string and types were themselves nodes. That is gone. Kinds now live
@@ -79,9 +80,11 @@ flowchart LR
 - **`nodum.api`** (FastAPI) — each route calls one service function and returns
   the model via `model_dump(mode="json")` wrapped in a `JSONResponse`, with no
   `response_model` so keys are neither added, dropped, nor reordered.
-- **`nodum.web`** — a small browser client of the API (`web.register(app)`
-  mounts `GET /` (session-gated), `GET /login`, and `/static`); it holds no logic
-  and fetches the API's JSON endpoints from the browser.
+- **`nodum.web`** — serves the **built React SPA** (from `frontend/`) when
+  `NODUM_WEB_DIST` points at a bundle: it mounts `/assets` and serves `index.html`
+  at `GET /`. The SPA itself (in `frontend/`, TypeScript) is the browser client of
+  the API. The bundle is **not in the wheel** — it ships in the Docker image. See
+  **Web frontend** and **Distribution** below.
 - **`nodum.auth`** — the single-main-password gate (transport-agnostic): argon2
   hashing, signed session tokens, and the `auth_secret` reads/writes. The CLI,
   API, and web call it; it imports no FastAPI. See **Authentication** below.
@@ -184,9 +187,10 @@ The CLI and API expose all of it; any client can self-orient by reading
 | `schema` | print the metamodel contract |
 | `auth set-password` | set/replace the main password (prompt or piped stdin) |
 | `auth status` | report whether a password is configured (+ timestamp) |
+| `auth ensure-password` | set the password from `NODUM_ADMIN_PASSWORD[_FILE]` if unconfigured (entrypoint bootstrap) |
 | `init-db` | create schema + seed kind tables |
 | `migrate` | upgrade a pre-typed (MVP) database |
-| `serve` | run the HTTP API + web view |
+| `serve` | run the HTTP API (serves the SPA when `NODUM_WEB_DIST` is set) |
 
 `--set key=value` is repeatable; each value is parsed as JSON, falling back to
 the raw string (so `--set born=1815` is an int, `--set venue=Nature` a string).
@@ -195,22 +199,56 @@ the raw string (so `--set born=1815` is an int, `--set venue=Nature` a string).
 `DELETE /nodes/{uuid}`, `POST /edges`, `PATCH /edges/{uuid}`,
 `DELETE /edges/{uuid}`, `GET /search`, `GET /expand`, `GET /schema` — all
 **gated by `require_auth`** — plus the open `POST /auth/login`,
-`POST /auth/logout`, `GET /healthz`, `GET /login`, and the session-gated
-`GET /` (the web view).
-
-**Web view (`nodum.web`):** a schema-driven, full-CRUD browser client of the
-JSON API. It fetches `GET /schema` and renders its forms from the metamodel —
-create/edit a node by kind, create an edge by type (endpoint pickers filtered to
-the signature), delete with a cascade-aware confirm, search (kind filter), open
-a node, and render its subgraph as a dependency-free node-link **SVG diagram**.
-It holds no logic of its own — every mutation goes through the API, so it stays
-in lockstep with the CLI. Keep it driven by `GET /schema` (never hardcode kinds).
+`POST /auth/logout`, `GET /auth/session` (the SPA's auth probe), `GET /healthz`,
+and (only when `NODUM_WEB_DIST` is set) the open `GET /` + `/assets` that serve
+the SPA shell.
 
 **Keep the adapters mirrored.** The CLI and the API serialise the *same*
 `model_dump(mode="json")` envelope, so identical data yields byte-identical JSON
 across both surfaces; the parity tests assert this. When you add or change an
 operation: update the service first, then update **both** the CLI command and the
 API route in lockstep — never let one surface drift ahead of the other.
+
+## Web frontend — the React SPA
+
+The UI is a **React + Vite (TypeScript) SPA** in `frontend/`, a pure client of the
+JSON API. It is schema-driven: it fetches `GET /schema` and renders its forms from
+the metamodel (create/edit a node by kind, create an edge by type with endpoint
+pickers filtered to the signature, delete with a cascade-aware confirm, search,
+open a node, and render its subgraph as a dependency-free node-link **SVG
+diagram**). It holds no logic — every mutation goes through the API — so it stays
+in lockstep with the CLI. Keep it driven by `GET /schema` (never hardcode kinds).
+
+- **Build:** `npm run build` (in `frontend/`) typechecks with `tsc` then emits
+  `frontend/dist/` (hashed, same-origin assets); `nodum.web` serves that bundle
+  from `NODUM_WEB_DIST`.
+- **Dev:** `npm run dev` runs Vite on **5700**, proxying the API routes to FastAPI
+  on 8600 (one origin, so the session cookie flows). Or `make dev-web` builds the
+  bundle and serves it through FastAPI on 8600.
+- **Auth in the SPA:** the session cookie is HttpOnly (JS can't read it), so the
+  app calls the open `GET /auth/session` → `{configured, authenticated}` to choose
+  between the setup hint, the sign-in view, and the app; a 401 from any data call
+  drops it back to sign-in.
+- **CSP:** the production build emits only external same-origin scripts/styles, so
+  `Content-Security-Policy: default-src 'self'` holds with no inline exceptions.
+  Keep it so — no inline `<script>`, no inline `style=` props, no CSS-in-JS (use
+  the `.css` files); the Vite config disables inline asset/preload emission.
+
+## Distribution — Docker is the full app, PyPI is the CLI/library
+
+Two artifacts, one codebase:
+
+- **Docker image (full app).** A multi-stage `Dockerfile`: the node stage builds
+  the SPA; the python stage `pip install`s the package and copies the bundle to
+  `/app/web-dist` (`NODUM_WEB_DIST`). The entrypoint (`docker/entrypoint.sh`)
+  waits for Postgres, runs `init-db`, then `auth ensure-password`, then `serve` on
+  `0.0.0.0`. A deploy is: declare the image, point `NODUM_DATABASE_URL` at a
+  Postgres, provide a password secret — done. `docker-compose.example.yml` is a
+  turnkey start. The image does **not** bundle Postgres. The build passes the
+  version as `SETUPTOOLS_SCM_PRETEND_VERSION` (no `.git` in the build context).
+- **PyPI wheel (CLI / library).** Ships the service + CLI + API + `schema.sql`
+  only — **no UI**. `pip install nodum` gives the `nodum` command and the API;
+  `nodum serve` without `NODUM_WEB_DIST` serves the API with no web view.
 
 ## Authentication — one main password
 
@@ -234,7 +272,14 @@ the install is **locked**: protected routes return `503` pointing at the CLI.
   `X-Frame-Options: DENY` (all web assets are same-origin, so the CSP needs no
   inline exceptions).
 - **Open routes:** `GET /healthz`, `POST /auth/login`, `POST /auth/logout`,
-  `GET /login`, and `/static`. Everything else requires a valid session.
+  `GET /auth/session`, and (when the SPA is mounted) `GET /` + `/assets`.
+  Everything else requires a valid session. The SPA reads `GET /auth/session`
+  (`{configured, authenticated}`) to drive its login state — there is no
+  server-rendered login page.
+- **Bootstrap.** `auth ensure-password` sets the password from
+  `NODUM_ADMIN_PASSWORD_FILE` / `NODUM_ADMIN_PASSWORD` only when unconfigured —
+  used by the Docker entrypoint so a deploy is hands-off (a later manual change is
+  not clobbered on restart).
 - **Config.** `NODUM_COOKIE_SECURE=1` marks the cookie Secure (set it behind a
   TLS-terminating reverse proxy; off by default for local HTTP dev).
 
@@ -276,9 +321,9 @@ old `data.type`, else `mentions`), then enforces NOT NULL and the lookup FKs.
 
 ## Dev workflow
 
-Prerequisites: Python ≥ 3.12, `uv`, and Docker (for the local Postgres). The
-package version is derived from the git tag (`vX.Y.Z`) at build time by
-hatch-vcs and is never committed.
+Prerequisites: Python ≥ 3.12, `uv`, Node ≥ 24 + npm (for the frontend), and
+Docker (for the local Postgres and the image). The package version is derived
+from the git tag (`vX.Y.Z`) at build time by hatch-vcs and is never committed.
 
 Make targets (run `make help` for the live list):
 
@@ -289,7 +334,12 @@ Make targets (run `make help` for the live list):
 | `make db-up` / `make db-down` | start / stop the local Postgres container |
 | `make init-db` | create the schema + seed kind tables (`uv run nodum init-db`) |
 | `make run` | run the CLI (`make run -- search foo`) |
-| `make serve` | run the HTTP API + web view (uvicorn) |
+| `make serve` | run the HTTP API (uvicorn; SPA when `NODUM_WEB_DIST` is set) |
+| `make frontend-install` | `npm ci` in `frontend/` |
+| `make frontend-dev` | Vite dev server on 5700 (proxies the API to 8600) |
+| `make frontend-build` | build the SPA into `frontend/dist` |
+| `make dev-web` | build the SPA and serve it via FastAPI on 8600 |
+| `make docker-build` | build the full-app Docker image |
 | `make test` | run pytest |
 | `make coverage` | pytest with line-coverage report |
 | `make lint` | `ruff check` + `ruff format --check` |
@@ -298,14 +348,18 @@ Make targets (run `make help` for the live list):
 - **Tests need a running Postgres.** The suite exercises the service against a
   live database (schema created once per session; the graph truncated before
   each test), so `make db-up` must be up before `make test`. Test discovery is
-  rooted at `tests/`.
-- **Dev ports.** The HTTP API and web view serve on `127.0.0.1:8600`; the local
-  Postgres is published on host port `5436` (→ container `5432`).
+  rooted at `tests/`. The Python suite does not build or need the SPA.
+- **Dev ports.** The HTTP API serves on `127.0.0.1:8600`; the Vite dev server on
+  `5700` (preview `5701`); the local Postgres is published on host port `5436`
+  (→ container `5432`).
 - **Config via environment.** The only required value is `NODUM_DATABASE_URL`
   (default `postgresql://nodum:nodum@localhost:5436/nodum`, matching
-  docker-compose). `NODUM_API_HOST` / `NODUM_API_PORT` override the bind address;
-  `NODUM_COOKIE_SECURE=1` marks the session cookie Secure (set behind TLS). A
-  local `.env` is read if present; copy `.env.example` to start.
+  docker-compose). `NODUM_API_HOST` / `NODUM_API_PORT` override the bind address
+  (the image sets host `0.0.0.0`); `NODUM_COOKIE_SECURE=1` marks the cookie Secure
+  (behind TLS); `NODUM_WEB_DIST` points at the built SPA (set in the image);
+  `NODUM_ADMIN_PASSWORD_FILE` / `NODUM_ADMIN_PASSWORD` seed the password on first
+  boot (see `auth ensure-password`). A local `.env` is read if present; copy
+  `.env.example` to start.
 
 ## Conventions
 
