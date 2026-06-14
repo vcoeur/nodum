@@ -94,10 +94,11 @@ Because the catalog is data, you evolve it without a code change or redeploy —
 fields. Editing replaces only the attributes you pass.
 
 **Deleting is guarded.** A node kind in use by nodes — or named in an edge kind's signature — cannot
-be deleted outright; the error reports what blocks it. Pass `--into <kind>` (CLI) / `?into=<kind>`
-(API) to **reassign** the using nodes to another kind (and rewrite the signatures that named the old
-kind) before deleting. An edge kind in use by edges is deleted the same way: `--into` reassigns its
-edges first.
+be deleted outright; the error reports what blocks it (and `schema` exposes a `usage` count per kind).
+Pass `--into <kind>` (CLI) / `?into=<kind>` (API) to **reassign** the using nodes to another kind (and
+rewrite the signatures that named the old kind) before deleting. An edge kind in use by edges resolves
+the same way — `--into` reassigns its edges — or with `--purge` (CLI) / `?purge=true` (API), which
+**removes** its edges before deleting. `into` and `purge` are mutually exclusive.
 
 One invariant holds the whole thing together: **validation is a write-time gate, never retroactive.**
 Editing a kind to be narrower, or reassigning rows to a different kind, never re-validates stored data

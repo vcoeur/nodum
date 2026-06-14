@@ -267,11 +267,23 @@ def expand(
 
 
 def schema() -> dict:
-    """Return the live kind catalog (node kinds + edge kinds + signatures)."""
+    """Return the live kind catalog (node + edge kinds, signatures, usage counts).
+
+    Each kind entry carries ``usage`` — how many nodes/edges currently use that
+    kind — so a client can show what a deletion would affect before attempting it.
+    The metamodel serialiser stays DB-agnostic; usage is annotated here.
+    """
     with connect() as conn, conn.cursor() as cur:
         node_kinds = db.load_node_kinds(cur)
         edge_kinds = db.load_edge_kinds(cur)
-    return metamodel.schema_from(node_kinds, edge_kinds)
+        node_usage = db.node_kind_counts(cur)
+        edge_usage = db.edge_kind_counts(cur)
+    result = metamodel.schema_from(node_kinds, edge_kinds)
+    for entry in result["node_kinds"]:
+        entry["usage"] = node_usage.get(entry["name"], 0)
+    for entry in result["edge_kinds"]:
+        entry["usage"] = edge_usage.get(entry["name"], 0)
+    return result
 
 
 # ── Update ──────────────────────────────────────────────────────────────────
@@ -551,22 +563,29 @@ def update_edge_kind(
     return _edge_kind_entry(edge_kind)
 
 
-def delete_edge_kind(name: str, into: str | None = None) -> KindDeleted:
-    """Delete an edge kind. Blocks when edges still use it unless ``into`` is given.
+def delete_edge_kind(name: str, into: str | None = None, purge: bool = False) -> KindDeleted:
+    """Delete an edge kind. Blocks when edges still use it unless told what to do.
 
-    With ``into``, every edge of this kind is reassigned to ``into`` before deleting.
+    Two ways resolve an in-use kind (mutually exclusive):
+
+    - ``into`` — **replace**: reassign every edge of this kind to ``into``, then delete.
+    - ``purge`` — **remove**: delete every edge of this kind, then delete the kind.
 
     Raises:
         KindNotFound: If the kind (or ``into``) does not exist.
-        KindInUse: If edges use it and no ``into`` was given.
-        metamodel.ValidationError: If ``into`` equals ``name``.
+        KindInUse: If edges use it and neither ``into`` nor ``purge`` was given.
+        metamodel.ValidationError: If ``into`` equals ``name``, or both ``into`` and
+            ``purge`` are given.
     """
+    if into is not None and purge:
+        raise metamodel.ValidationError("pass either into or purge, not both")
     with connect() as conn, conn.cursor() as cur:
         if db.load_edge_kind(cur, name) is None:
             raise KindNotFound(name)
         cur.execute("SELECT count(*) AS n FROM edges WHERE kind = %s", (name,))
         edge_count = cur.fetchone()["n"]
         reassigned = 0
+        removed = 0
         if into is not None:
             if into == name:
                 raise metamodel.ValidationError("cannot reassign a kind into itself")
@@ -576,14 +595,18 @@ def delete_edge_kind(name: str, into: str | None = None) -> KindDeleted:
                 "UPDATE edges SET kind = %s, updated_at = now() WHERE kind = %s", (into, name)
             )
             reassigned = cur.rowcount
+        elif purge:
+            cur.execute("DELETE FROM edges WHERE kind = %s", (name,))
+            removed = cur.rowcount
         elif edge_count:
             raise KindInUse(
-                f"{name!r} is used by {edge_count} edge(s); reassign first "
-                f"(CLI '--into <kind>', API '?into=<kind>') to delete"
+                f"{name!r} is used by {edge_count} edge(s); reassign (CLI '--into <kind>', "
+                f"API '?into=<kind>') or remove its edges (CLI '--purge', API '?purge=true') "
+                f"to delete"
             )
         cur.execute("DELETE FROM edge_kinds WHERE name = %s", (name,))
         conn.commit()
-    return KindDeleted(name=name, reassigned=reassigned, deleted=True)
+    return KindDeleted(name=name, reassigned=reassigned, removed=removed, deleted=True)
 
 
 def _edge_kinds_referencing(cur: Cursor, node_kind_name: str) -> list[str]:

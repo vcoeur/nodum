@@ -33,7 +33,7 @@ you call it from the CLI or the HTTP API, and one `schema` call hands a machine 
   universals (the `kind` foreign key, non-null `content`, valid endpoints, no self-edges).
 - **Lets the schema evolve.** Create, edit, and delete node and edge kinds at runtime through the CLI,
   the API, and the web UI's **Schema** view — no code change or redeploy. Deleting an in-use kind is
-  refused unless you reassign its rows (`--into`).
+  refused unless you reassign its rows (`--into`) or, for an edge kind, remove its edges (`--purge`).
 - **Keeps authoring prose-first.** *Open process, closed format*: every node has a plain-text
   `content` body — the full-text-indexed, LLM-readable surface, ready to embed later — alongside its
   typed fields.

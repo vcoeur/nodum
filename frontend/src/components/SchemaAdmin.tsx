@@ -51,6 +51,7 @@ export function SchemaAdmin() {
               <div className="kind-head">
                 {nodeKind.group && <span className="kind-group">{nodeKind.group}</span>}
                 <span className="kind-name">{nodeKind.name}</span>
+                <UsageBadge count={nodeKind.usage} noun="node" />
                 <div className="kind-actions">
                   <button
                     type="button"
@@ -65,6 +66,7 @@ export function SchemaAdmin() {
                   <DeleteKindControl
                     scope="node"
                     name={nodeKind.name}
+                    usage={nodeKind.usage}
                     candidates={nodeKindNames.filter((name) => name !== nodeKind.name)}
                     onDeleted={() => afterMutation(`Deleted node kind ${nodeKind.name}.`)}
                   />
@@ -116,6 +118,7 @@ export function SchemaAdmin() {
             <li key={edgeKind.name} className="kind-item edge">
               <div className="kind-head">
                 <span className="kind-name">{edgeKind.name}</span>
+                <UsageBadge count={edgeKind.usage} noun="edge" />
                 <div className="kind-actions">
                   <button
                     type="button"
@@ -130,6 +133,7 @@ export function SchemaAdmin() {
                   <DeleteKindControl
                     scope="edge"
                     name={edgeKind.name}
+                    usage={edgeKind.usage}
                     candidates={schema.edge_kinds
                       .map((each) => each.name)
                       .filter((name) => name !== edgeKind.name)}
@@ -219,32 +223,50 @@ function FieldChips({ fields }: { fields: Record<string, FieldSpec> }) {
   );
 }
 
+/** A small pill showing how many nodes/edges currently use a kind. */
+function UsageBadge({ count, noun }: { count: number; noun: string }) {
+  const label = `${count} ${count === 1 ? noun : `${noun}s`}`;
+  return (
+    <span className={count ? "kind-usage" : "kind-usage zero"} title={`Used by ${label}`}>
+      {label}
+    </span>
+  );
+}
+
 interface DeleteKindControlProps {
   scope: "node" | "edge";
   name: string;
+  usage: number;
   candidates: string[];
   onDeleted: () => void;
 }
 
-/** A delete button that, on a 409 (kind in use), offers an `into` reassignment. */
-function DeleteKindControl({ scope, name, candidates, onDeleted }: DeleteKindControlProps) {
-  const [phase, setPhase] = useState<"idle" | "reassign" | "busy">("idle");
+/** A delete button that, on a 409 (kind in use), offers a replacement or removal.
+ *
+ * Replacement reassigns the using rows into another kind (`into`); removal — edge
+ * kinds only — deletes this kind's edges (`purge`). Either then deletes the kind.
+ */
+function DeleteKindControl({ scope, name, usage, candidates, onDeleted }: DeleteKindControlProps) {
+  const [phase, setPhase] = useState<"idle" | "resolve" | "busy">("idle");
   const [into, setInto] = useState(candidates[0] ?? "");
   const [error, setError] = useState("");
   const base = scope === "node" ? "/node-kinds" : "/edge-kinds";
+  const noun = scope === "edge" ? "edge" : "node";
 
-  async function attempt(target?: string) {
+  async function attempt(options?: { into?: string; purge?: boolean }) {
     setPhase("busy");
     setError("");
-    const url = `${base}/${encodeURIComponent(name)}${
-      target ? `?into=${encodeURIComponent(target)}` : ""
-    }`;
+    const params = new URLSearchParams();
+    if (options?.into) params.set("into", options.into);
+    if (options?.purge) params.set("purge", "true");
+    const query = params.toString();
+    const url = `${base}/${encodeURIComponent(name)}${query ? `?${query}` : ""}`;
     try {
       await apiSend("DELETE", url);
       onDeleted();
     } catch (caught) {
       if (caught instanceof ApiError && caught.status === 409) {
-        setPhase("reassign");
+        setPhase("resolve");
         setError(caught.message);
       } else {
         setPhase("idle");
@@ -253,7 +275,7 @@ function DeleteKindControl({ scope, name, candidates, onDeleted }: DeleteKindCon
     }
   }
 
-  if (phase === "reassign") {
+  if (phase === "resolve") {
     return (
       <div className="reassign">
         <span className="status error inline-status">{error}</span>
@@ -271,10 +293,27 @@ function DeleteKindControl({ scope, name, candidates, onDeleted }: DeleteKindCon
                 ))}
               </select>
             </label>
-            <button type="button" className="small danger" onClick={() => attempt(into)}>
+            <button type="button" className="small" onClick={() => attempt({ into })}>
               reassign &amp; delete
             </button>
           </>
+        )}
+        {scope === "edge" && (
+          <button
+            type="button"
+            className="small danger"
+            onClick={() => {
+              if (
+                window.confirm(
+                  `Permanently delete this kind's ${usage} edge(s), then remove it? ` +
+                    `This cannot be undone.`,
+                )
+              )
+                attempt({ purge: true });
+            }}
+          >
+            delete {usage} edge{usage === 1 ? "" : "s"} &amp; remove
+          </button>
         )}
         <button type="button" className="small ghost" onClick={() => setPhase("idle")}>
           cancel
@@ -290,7 +329,12 @@ function DeleteKindControl({ scope, name, candidates, onDeleted }: DeleteKindCon
         className="small danger"
         disabled={phase === "busy"}
         onClick={() => {
-          if (window.confirm(`Delete ${scope} kind "${name}"?`)) attempt();
+          const warning = usage
+            ? `Delete ${scope} kind "${name}"? It is used by ${usage} ${noun}${
+                usage === 1 ? "" : "s"
+              }.`
+            : `Delete ${scope} kind "${name}"?`;
+          if (window.confirm(warning)) attempt();
         }}
       >
         delete

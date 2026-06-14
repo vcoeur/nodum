@@ -170,8 +170,13 @@ class Deleted(BaseModel):
 
 
 class KindDeleted(BaseModel):
-    """Result of deleting a kind: its name, rows reassigned, and that it was deleted."""
+    """Result of deleting a kind: name, rows reassigned, rows removed, and that it went.
+
+    ``reassigned`` counts rows moved to another kind (``into``); ``removed`` counts rows
+    deleted outright (edge-kind ``purge``). At most one is non-zero.
+    """
 
     name: str
     reassigned: int
+    removed: int = 0
     deleted: bool

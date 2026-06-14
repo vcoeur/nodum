@@ -15,6 +15,8 @@ export interface NodeKind {
   group: string;
   content_label: string;
   fields: Record<string, FieldSpec>;
+  /** How many nodes currently use this kind (from `GET /schema`). */
+  usage: number;
 }
 
 export interface EdgeKind {
@@ -23,6 +25,8 @@ export interface EdgeKind {
   to: string[];
   symmetric: boolean;
   fields: Record<string, FieldSpec>;
+  /** How many edges currently use this kind (from `GET /schema`). */
+  usage: number;
 }
 
 export interface Schema {

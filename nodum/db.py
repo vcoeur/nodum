@@ -115,6 +115,18 @@ def load_edge_kind(cur: Cursor, name: str) -> EdgeKind | None:
     return metamodel.edge_kind_from_spec(row["name"], row["spec"]) if row else None
 
 
+def node_kind_counts(cur: Cursor) -> dict[str, int]:
+    """Count nodes per node kind. Kinds with no nodes are absent from the map."""
+    cur.execute("SELECT kind, count(*) AS n FROM nodes GROUP BY kind")
+    return {row["kind"]: row["n"] for row in cur.fetchall()}
+
+
+def edge_kind_counts(cur: Cursor) -> dict[str, int]:
+    """Count edges per edge kind. Kinds with no edges are absent from the map."""
+    cur.execute("SELECT kind, count(*) AS n FROM edges GROUP BY kind")
+    return {row["kind"]: row["n"] for row in cur.fetchall()}
+
+
 def init_schema(conn: psycopg.Connection) -> None:
     """Create the typed schema and seed the default kind catalog, if absent."""
     with conn.cursor() as cur:

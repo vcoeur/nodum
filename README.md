@@ -72,9 +72,13 @@ validated softly in the service against its (DB-resolved) kind; the database
 enforces only the cheap universals (the `kind` foreign key, valid endpoints, no
 self-edges).
 
-Deleting a kind that is still in use is **refused** (the error reports the usage);
-`--into <kind>` (CLI) / `?into=<kind>` (API) reassigns the using rows — and, for a
-node kind, rewrites the edge signatures that named it — then deletes.
+Deleting a kind that is still in use is **refused** (the error reports the usage,
+which `schema` also exposes as a `usage` count per kind); resolve the using rows
+first. `--into <kind>` (CLI) / `?into=<kind>` (API) reassigns them into another
+kind — and, for a node kind, rewrites the edge signatures that named it — then
+deletes. For an **edge** kind you can instead `--purge` (CLI) / `?purge=true`
+(API) to delete its edges, then the kind; `into` and `purge` are mutually
+exclusive.
 
 The tables below are the **seeded defaults**, not a fixed set.
 
@@ -140,8 +144,9 @@ uv run nodum node-kind add Dataset --group entity --content-label name \
   --fields '{"rows": {"type": "int"}, "license": {"type": "str"}}'
 uv run nodum edge-kind add DerivedFrom --from Dataset --to Reference
 
-# delete a kind; refused while in use, then reassigned with --into
+# delete a kind; refused while in use — reassign with --into, or (edge kinds) --purge
 uv run nodum node-kind rm Dataset --into Entity
+uv run nodum edge-kind rm DerivedFrom --purge   # delete its edges too, then the kind
 ```
 
 Also: `get <uuid>`, `edit-node` (`--content`) / `edit-edge`, `rm-node` / `rm-edge`,
@@ -174,9 +179,10 @@ curl -s 'http://127.0.0.1:8600/expand?seed=<uuid>&depth=2&edge_kind=cites'
 Full route set: `POST /nodes`, `GET|PATCH|DELETE /nodes/{uuid}`, `POST /edges`,
 `PATCH|DELETE /edges/{uuid}`, `GET /search`, `GET /expand`, `GET /schema`,
 `POST /node-kinds`, `PATCH|DELETE /node-kinds/{name}`, `POST /edge-kinds`, and
-`PATCH|DELETE /edge-kinds/{name}` — all behind auth — plus `POST /auth/login`,
+`PATCH|DELETE /edge-kinds/{name}` (delete takes `?into=` or, for edge kinds,
+`?purge=true`) — all behind auth — plus `POST /auth/login`,
 `POST /auth/logout`, `GET /auth/session`, and `GET /healthz`. A missing
-node/edge/kind returns 404; deleting an in-use kind without `into` returns 409;
+node/edge/kind returns 404; deleting an in-use kind without `into`/`purge` returns 409;
 invalid input returns 422; an unauthenticated request returns 401 (or 503 until a
 password is set). Pass the token from `POST /auth/login` as `Authorization: Bearer
 <token>` (see [Authentication](#authentication)).
@@ -190,11 +196,12 @@ live schema, behind a `Graph` / `Schema` view switch:
 - **Graph** — create/edit a node by kind, create an edge by type (endpoint pickers
   filtered to the signature), delete (with a cascade-aware confirm), search (with a
   kind filter), open a node, and render its subgraph as a node-link **SVG diagram**.
-- **Schema** — manage the runtime-evolvable schema itself: list, create, edit, and
-  delete node kinds and edge kinds (a field-schema editor builds each kind's typed
-  fields; an edge kind's `from`/`to` are picked as checkbox groups). Deleting a
-  kind that is still in use offers an `into` reassignment, just like the CLI's
-  `--into`. Mutations reload the schema so the Graph view stays in sync.
+- **Schema** — manage the runtime-evolvable schema itself: list (with a usage badge
+  per kind), create, edit, and delete node kinds and edge kinds (a field-schema
+  editor builds each kind's typed fields; an edge kind's `from`/`to` are picked as
+  checkbox groups). Deleting a kind that is still in use offers a choice — reassign
+  into another kind (`--into`) or, for an edge kind, remove its edges (`--purge`).
+  Mutations reload the schema so the Graph view stays in sync.
 
 Sign-in is in-app (the SPA reads `GET /auth/session` to know its state), with a
 `Logout` control. The UI ships in the Docker image — see
