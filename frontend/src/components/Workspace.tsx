@@ -45,12 +45,21 @@ export function Workspace({ onSignedOut }: WorkspaceProps) {
         <button id="logout-button" className="ghost" type="button" onClick={doLogout}>
           Logout
         </button>
-        <h1>nodum</h1>
+        <h1 className="wordmark">
+          nodum<span className="dot">.</span>
+        </h1>
         <p className="tagline">
-          Typed knowledge graph — search, create, edit, delete, and explore the subgraph.
+          A typed knowledge graph — search, create, edit, delete, and explore the subgraph.
         </p>
-        <div className="status">
-          Loaded {schema.node_kinds.length} node kinds, {schema.edge_kinds.length} edge kinds.
+        <div className="stat-strip">
+          <div className="stat">
+            <span className="stat-num">{schema.node_kinds.length}</span>
+            <span className="stat-label">node kinds</span>
+          </div>
+          <div className="stat">
+            <span className="stat-num">{schema.edge_kinds.length}</span>
+            <span className="stat-label">edge kinds</span>
+          </div>
         </div>
         <nav className="view-nav">
           <button
