@@ -4,11 +4,13 @@ SHELL := /usr/bin/bash
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "}; {printf "%-16s %s\n", $$1, $$2}'
 
-# ── Deployed: install runtime deps, then serve the app ────────────────────────
+# ── Deployed (bare host): install runtime deps, then run the API server ───────
+# The real deployed unit is the Docker image (see docker-build) — it bakes the
+# built SPA in, sets NODUM_WEB_DIST, and self-bootstraps via its entrypoint.
 install: ## Install runtime dependencies (uv sync)
 	uv sync
 
-run: ## Serve the HTTP API + bundled SPA (the deployed entrypoint)
+run: ## Serve the HTTP API (also serves the SPA when NODUM_WEB_DIST is set)
 	uv run nodum serve
 
 # ── Dev: install everything, then run the API + frontend together ─────────────
@@ -58,8 +60,8 @@ frontend-build: ## Build the React SPA into frontend/dist
 serve-spa: frontend-build ## Build the SPA, then serve it through FastAPI on 8600
 	NODUM_WEB_DIST=$(shell pwd)/frontend/dist uv run nodum serve
 
-# ── Docker image (full app: API + built UI) ───────────────────────────────────
-docker-build: ## Build the full-app Docker image (API + built UI)
+# ── Docker image (the deployed unit: API + baked-in UI) ───────────────────────
+docker-build: ## Build the full-app Docker image — the deployed unit (API + UI, self-bootstrapping)
 	docker build -t nodum .
 
 # ── Quality (tests, lint, format) ─────────────────────────────────────────────

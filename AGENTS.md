@@ -378,15 +378,17 @@ Prerequisites: Python ≥ 3.12, `uv`, Node ≥ 24 + npm (for the frontend), and
 Docker (for the local Postgres and the image). The package version is derived
 from the git tag (`vX.Y.Z`) at build time by hatch-vcs and is never committed.
 
-Make targets — `make help` lists them live. There is one install + one run
-target per environment: **deployed** (`make install` then `make run`) and **dev**
-(`make dev-install` then `make dev-run`); everything else is an explicit building
-block.
+Make targets — `make help` lists them live. Two install/run pairs: **dev**
+(`make dev-install` then `make dev-run`) and a bare-host **deploy** (`make install`
+then `make run`). The real deployed unit is the **Docker image**
+(`make docker-build`) — it bakes the built SPA in, sets `NODUM_WEB_DIST`, and
+self-bootstraps the DB + admin password via its entrypoint. Everything else is an
+explicit building block.
 
 | Target | Does |
 |---|---|
-| `make install` | install runtime deps (`uv sync`) — deployed |
-| `make run` | serve the HTTP API + bundled SPA (`uv run nodum serve`) — deployed |
+| `make install` | install runtime deps (`uv sync`) — bare-host deploy |
+| `make run` | serve the HTTP API; also serves the SPA when `NODUM_WEB_DIST` points at a built bundle (`uv run nodum serve`) |
 | `make dev-install` | install everything for dev: `uv sync --all-groups` + frontend `npm ci` |
 | `make dev-run` | bring up the DB, then run the API (:8600) + Vite frontend (:5700) together; stops both when either exits |
 | `make cli` | run the nodum CLI (`make cli -- search foo`) |
@@ -397,7 +399,7 @@ block.
 | `make frontend-dev` | Vite dev server on 5700 (proxies the API to 8600) |
 | `make frontend-build` | build the SPA into `frontend/dist` |
 | `make serve-spa` | build the SPA and serve it via FastAPI on 8600 |
-| `make docker-build` | build the full-app Docker image |
+| `make docker-build` | build the full-app Docker image — the real deployed unit (API + baked-in UI, self-bootstrapping) |
 | `make test` | run pytest |
 | `make coverage` | pytest with line-coverage report |
 | `make lint` | `ruff check` + `ruff format --check` |
