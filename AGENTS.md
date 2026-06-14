@@ -220,7 +220,12 @@ by reading `schema()` first, which is why it is the contract every surface ships
 `--set key=value` is repeatable (node/edge payload); each value is parsed as JSON,
 falling back to the raw string (so `--set born=1815` is an int, `--set venue=Nature`
 a string). `--fields` (kind CRUD) takes a JSON object mirroring `schema`'s `fields`
-shape: `name → {type, required, choices, description}`.
+shape: `name → {type, required, choices, description}`. A field `type` is one of
+`str`, `int`, `float`, `bool`, `list[str]`, `enum` (with `choices`), `date`
+(a plain calendar date `YYYY-MM-DD`), or `datetime`. **`datetime` is canonical
+UTC**: it is validated and stored as ISO-8601 with a `Z` suffix (an offset is
+converted to UTC, a naive value is assumed UTC), and the SPA alone shows/enters it
+in the browser's local time. `date` carries no timezone.
 
 **API routes:** `POST /nodes`, `GET /nodes/{uuid}`, `PATCH /nodes/{uuid}`,
 `DELETE /nodes/{uuid}`, `POST /edges`, `PATCH /edges/{uuid}`,
@@ -246,9 +251,11 @@ JSON API. It is schema-driven: it fetches `GET /schema` and renders its forms fr
 the live schema. A header switch toggles two views:
 
 - **Graph** — create/edit a node by kind (a `content` body plus the kind's typed
-  fields), create an edge by type with endpoint pickers filtered to the signature,
-  delete with a cascade-aware confirm, search, open a node, and render its subgraph
-  as a dependency-free node-link **SVG diagram**.
+  fields, rendered per type — incl. a date picker for `date` and a
+  `datetime-local` control for `datetime`, which converts the stored UTC instant
+  to/from the browser's local time), create an edge by type with endpoint pickers
+  filtered to the signature, delete with a cascade-aware confirm, search, open a
+  node, and render its subgraph as a dependency-free node-link **SVG diagram**.
 - **Schema** — full CRUD over the runtime-evolvable schema itself: list the live
   node + edge kinds (each with a **usage** badge from `GET /schema`) and create /
   edit / delete them (`POST`/`PATCH`/`DELETE` on `/node-kinds` and `/edge-kinds`).

@@ -51,6 +51,24 @@ function Control({ spec, value, onChange }: Omit<FieldProps, "name">) {
           onChange={(event) => onChange(event.target.value)}
         />
       );
+    case "date":
+      return (
+        <input
+          type="date"
+          value={String(value)}
+          onChange={(event) => onChange(event.target.value)}
+        />
+      );
+    case "datetime":
+      // The control value is local wall-clock (fields.ts converts to/from the
+      // UTC instant the API stores); the input shows the browser's timezone.
+      return (
+        <input
+          type="datetime-local"
+          value={String(value)}
+          onChange={(event) => onChange(event.target.value)}
+        />
+      );
     default:
       return (
         <input

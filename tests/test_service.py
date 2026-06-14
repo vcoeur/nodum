@@ -172,6 +172,24 @@ def test_add_and_use_node_kind(restore_kinds: None) -> None:
     assert "Dataset" in {nk["name"] for nk in service.schema()["node_kinds"]}
 
 
+def test_date_and_datetime_fields_store_canonical(restore_kinds: None) -> None:
+    """date stays YYYY-MM-DD; datetime is stored + returned as UTC whatever offset went in."""
+    service.add_node_kind(
+        "Event",
+        group="entity",
+        content_label="label",
+        fields={"on": {"type": "date"}, "at": {"type": "datetime"}},
+    )
+    node = service.add_node(
+        "Event", "Launch", data={"on": "2026-06-14", "at": "2026-06-14T11:30:00+02:00"}
+    )
+    assert node.data["on"] == "2026-06-14"
+    assert node.data["at"] == "2026-06-14T09:30:00Z"
+    # The canonical form is what was persisted, not just what add_node returned.
+    persisted = service.get(node.uuid).node
+    assert persisted.data == {"on": "2026-06-14", "at": "2026-06-14T09:30:00Z"}
+
+
 def test_add_node_kind_rejects_duplicate(restore_kinds: None) -> None:
     """Registering an existing node kind name is rejected."""
     with pytest.raises(metamodel.ValidationError):

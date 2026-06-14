@@ -140,8 +140,10 @@ uv run nodum search "analytical engine" --kind Reference
 uv run nodum expand <uuid> --depth 2 --edge-kind AuthorOf
 
 # evolve the schema: add a node kind, then an edge kind that uses it
+# field types: str / int / float / bool / list[str] / enum / date / datetime
+# (datetime is stored UTC and shown/entered local in the web UI; date is timezone-free)
 uv run nodum node-kind add Dataset --group entity --content-label name \
-  --fields '{"rows": {"type": "int"}, "license": {"type": "str"}}'
+  --fields '{"rows": {"type": "int"}, "license": {"type": "str"}, "released": {"type": "date"}}'
 uv run nodum edge-kind add DerivedFrom --from Dataset --to Reference
 
 # delete a kind; refused while in use — reassign with --into, or (edge kinds) --purge

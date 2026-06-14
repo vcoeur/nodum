@@ -65,6 +65,62 @@ def test_validate_edge_rejects_reversed_endpoints() -> None:
         metamodel.validate_edge(DEFAULT_EDGE_KINDS["AuthorOf"], "Reference", "Person", {})
 
 
+# ── date / datetime fields ────────────────────────────────────────────────────
+
+
+def _node_kind_with(field_type: str) -> metamodel.NodeKind:
+    """A throwaway node kind carrying a single field of the given type."""
+    return metamodel.NodeKind("X", "entity", "label", {"f": metamodel.FieldSpec(field_type)})
+
+
+def test_date_field_canonicalises_to_iso_date() -> None:
+    """A valid ISO date is accepted and re-emitted as YYYY-MM-DD."""
+    data = {"f": "2026-06-14"}
+    metamodel.validate_node(_node_kind_with("date"), "x", data)
+    assert data["f"] == "2026-06-14"
+
+
+def test_date_field_rejects_non_date() -> None:
+    """A non-ISO date (or a datetime in a date field) is rejected."""
+    with pytest.raises(metamodel.ValidationError):
+        metamodel.validate_node(_node_kind_with("date"), "x", {"f": "14/06/2026"})
+    with pytest.raises(metamodel.ValidationError):
+        metamodel.validate_node(_node_kind_with("date"), "x", {"f": "2026-06-14T09:00:00Z"})
+
+
+def test_datetime_field_converts_offset_to_utc() -> None:
+    """An offset datetime is converted to UTC and stored with a Z suffix."""
+    data = {"f": "2026-06-14T11:30:00+02:00"}
+    metamodel.validate_node(_node_kind_with("datetime"), "x", data)
+    assert data["f"] == "2026-06-14T09:30:00Z"
+
+
+def test_datetime_field_assumes_utc_when_naive() -> None:
+    """A naive datetime (no offset) is assumed to be UTC."""
+    data = {"f": "2026-06-14T09:30:00"}
+    metamodel.validate_node(_node_kind_with("datetime"), "x", data)
+    assert data["f"] == "2026-06-14T09:30:00Z"
+
+
+def test_datetime_field_keeps_utc_z() -> None:
+    """A UTC datetime already carrying Z round-trips unchanged."""
+    data = {"f": "2026-06-14T09:30:00Z"}
+    metamodel.validate_node(_node_kind_with("datetime"), "x", data)
+    assert data["f"] == "2026-06-14T09:30:00Z"
+
+
+def test_datetime_field_rejects_non_datetime() -> None:
+    """A value that is not an ISO 8601 datetime is rejected."""
+    with pytest.raises(metamodel.ValidationError):
+        metamodel.validate_node(_node_kind_with("datetime"), "x", {"f": "not-a-time"})
+
+
+def test_field_spec_accepts_date_and_datetime() -> None:
+    """The new value types are accepted by the spec deserialiser."""
+    assert metamodel.field_spec_from_json("on", {"type": "date"}).type == "date"
+    assert metamodel.field_spec_from_json("at", {"type": "datetime"}).type == "datetime"
+
+
 # ── Spec (de)serialisation ────────────────────────────────────────────────────
 
 

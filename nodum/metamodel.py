@@ -18,8 +18,14 @@ starting point.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import UTC
+from datetime import date as _date
+from datetime import datetime as _datetime
 
-FIELD_TYPES = ("str", "int", "float", "bool", "list[str]", "enum")
+# ``date`` is a plain calendar date (YYYY-MM-DD, no timezone); ``datetime`` is an
+# instant stored canonically as UTC ISO-8601 with a 'Z' suffix (the SPA shows and
+# enters it in the browser's local time, converting on the edges).
+FIELD_TYPES = ("str", "int", "float", "bool", "list[str]", "enum", "date", "datetime")
 
 
 class ValidationError(ValueError):
@@ -190,16 +196,23 @@ def _validate_fields(specs: dict[str, FieldSpec], data: dict, *, context: str) -
     for name, spec in specs.items():
         if spec.required and name not in data:
             raise ValidationError(f"{context}: missing required field {name!r}")
-    for name, value in data.items():
+    # ``list(...)`` because date/datetime values are normalised back into ``data``
+    # in place (the stored payload becomes canonical) while we iterate.
+    for name, value in list(data.items()):
         spec = specs.get(name)
         if spec is not None:
-            _check_type(spec, name, value, context)
+            data[name] = _check_type(spec, name, value, context)
 
 
-def _check_type(spec: FieldSpec, name: str, value: object, context: str) -> None:
-    """Validate one field value against its FieldSpec."""
+def _check_type(spec: FieldSpec, name: str, value: object, context: str) -> object:
+    """Validate one field value against its FieldSpec; return the value to store.
+
+    For every type but date/datetime the value is returned unchanged. A ``date`` is
+    re-emitted as ``YYYY-MM-DD`` and a ``datetime`` is normalised to UTC ISO-8601
+    (``…Z``), so the stored payload is always canonical.
+    """
     if value is None:
-        return
+        return None
     if spec.type == "str" and not isinstance(value, str):
         raise ValidationError(f"{context}: field {name!r} must be a string")
     if spec.type == "int" and (isinstance(value, bool) or not isinstance(value, int)):
@@ -216,6 +229,42 @@ def _check_type(spec: FieldSpec, name: str, value: object, context: str) -> None
         raise ValidationError(
             f"{context}: field {name!r} must be one of {list(spec.choices or ())}, got {value!r}"
         )
+    if spec.type == "date":
+        return _normalise_date(name, value, context)
+    if spec.type == "datetime":
+        return _normalise_datetime(name, value, context)
+    return value
+
+
+def _normalise_date(name: str, value: object, context: str) -> str:
+    """Validate an ISO calendar date and return it canonicalised as ``YYYY-MM-DD``."""
+    if not isinstance(value, str):
+        raise ValidationError(f"{context}: field {name!r} must be an ISO date string (YYYY-MM-DD)")
+    try:
+        return _date.fromisoformat(value.strip()).isoformat()
+    except ValueError as exc:
+        raise ValidationError(
+            f"{context}: field {name!r} is not a valid ISO date (YYYY-MM-DD): {value!r}"
+        ) from exc
+
+
+def _normalise_datetime(name: str, value: object, context: str) -> str:
+    """Validate an ISO-8601 datetime and return it as UTC ISO-8601 with a ``Z`` suffix.
+
+    A value carrying an explicit offset is converted to UTC; a naive value (no
+    offset, no ``Z``) is assumed to already be UTC.
+    """
+    if not isinstance(value, str):
+        raise ValidationError(f"{context}: field {name!r} must be an ISO 8601 datetime string")
+    try:
+        parsed = _datetime.fromisoformat(value.strip())
+    except ValueError as exc:
+        raise ValidationError(
+            f"{context}: field {name!r} is not a valid ISO 8601 datetime: {value!r}"
+        ) from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC).isoformat().replace("+00:00", "Z")
 
 
 # ── Spec (de)serialisation — the on-disk / on-the-wire JSON form ──────────────

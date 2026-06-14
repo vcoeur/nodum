@@ -7,7 +7,16 @@
 import type { FieldSpec, FieldType } from "../types";
 
 /** The field types the metamodel accepts, in the order the picker lists them. */
-export const FIELD_TYPES: FieldType[] = ["str", "int", "float", "bool", "enum", "list[str]"];
+export const FIELD_TYPES: FieldType[] = [
+  "str",
+  "int",
+  "float",
+  "bool",
+  "enum",
+  "list[str]",
+  "date",
+  "datetime",
+];
 
 /** One editable field row. `id` is a stable React key; `choices` is comma-separated. */
 export interface FieldRow {
