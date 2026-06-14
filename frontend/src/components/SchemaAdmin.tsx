@@ -10,7 +10,7 @@ import type { FormEvent } from "react";
 
 import { ApiError, apiSend } from "../api";
 import { useSchema } from "../schema";
-import type { EdgeKind, NodeKind } from "../types";
+import type { EdgeKind, FieldSpec, NodeKind } from "../types";
 import { errorMessage } from "../util";
 import { FieldSchemaEditor, fieldsToRows, rowsToFields } from "./FieldSchemaEditor";
 import type { FieldRow } from "./FieldSchemaEditor";
@@ -40,24 +40,21 @@ export function SchemaAdmin() {
     <>
       <section className="kind-admin">
         <h2>Node kinds ({schema.node_kinds.length})</h2>
-        <p className="muted">
+        <p className="lede">
           A kind defines a node's field schema and what its <code>content</code> means. Editing
           replaces the whole field set; deleting is refused while the kind is in use unless you
           reassign its nodes into another kind first.
         </p>
         <ul className="kind-list">
           {schema.node_kinds.map((nodeKind) => (
-            <li key={nodeKind.name} className="kind-item">
+            <li key={nodeKind.name} className="kind-item" data-group={nodeKind.group}>
               <div className="kind-head">
-                <span className="tag">{nodeKind.group || "—"}</span>
+                {nodeKind.group && <span className="kind-group">{nodeKind.group}</span>}
                 <span className="kind-name">{nodeKind.name}</span>
-                <span className="muted">
-                  content: {nodeKind.content_label} · {Object.keys(nodeKind.fields).length} field(s)
-                </span>
                 <div className="kind-actions">
                   <button
                     type="button"
-                    className="small"
+                    className="small ghost"
                     onClick={() => {
                       closeForms();
                       setEditingNode(nodeKind.name);
@@ -73,6 +70,10 @@ export function SchemaAdmin() {
                   />
                 </div>
               </div>
+              <p className="kind-meta">
+                content → <b>{nodeKind.content_label}</b>
+              </p>
+              <FieldChips fields={nodeKind.fields} />
               {editingNode === nodeKind.name && (
                 <NodeKindForm
                   mode="edit"
@@ -105,26 +106,20 @@ export function SchemaAdmin() {
 
       <section className="kind-admin">
         <h2>Edge kinds ({schema.edge_kinds.length})</h2>
-        <p className="muted">
+        <p className="lede">
           An edge kind constrains which node kinds an edge may join (its <code>from → to</code>{" "}
           signature) and carries its own optional fields. Deleting is refused while edges use it
           unless you reassign them into another edge kind first.
         </p>
         <ul className="kind-list">
           {schema.edge_kinds.map((edgeKind) => (
-            <li key={edgeKind.name} className="kind-item">
+            <li key={edgeKind.name} className="kind-item edge">
               <div className="kind-head">
                 <span className="kind-name">{edgeKind.name}</span>
-                <span className="signature-inline">
-                  {edgeKind.from.join(", ")} <span className="sig-arrow">→</span>{" "}
-                  {edgeKind.to.join(", ")}
-                  {edgeKind.symmetric && <span className="tag sym">symmetric</span>}
-                </span>
-                <span className="muted">{Object.keys(edgeKind.fields).length} field(s)</span>
                 <div className="kind-actions">
                   <button
                     type="button"
-                    className="small"
+                    className="small ghost"
                     onClick={() => {
                       closeForms();
                       setEditingEdge(edgeKind.name);
@@ -142,6 +137,25 @@ export function SchemaAdmin() {
                   />
                 </div>
               </div>
+              <div className="sig">
+                <span className="sig-set">
+                  {edgeKind.from.map((endpoint) => (
+                    <span key={endpoint} className="sig-node">
+                      {endpoint}
+                    </span>
+                  ))}
+                </span>
+                <span className="arrow">→</span>
+                <span className="sig-set">
+                  {edgeKind.to.map((endpoint) => (
+                    <span key={endpoint} className="sig-node">
+                      {endpoint}
+                    </span>
+                  ))}
+                </span>
+                {edgeKind.symmetric && <span className="sig-sym">symmetric</span>}
+              </div>
+              <FieldChips fields={edgeKind.fields} />
               {editingEdge === edgeKind.name && (
                 <EdgeKindForm
                   mode="edit"
@@ -177,6 +191,31 @@ export function SchemaAdmin() {
         </div>
       </section>
     </>
+  );
+}
+
+/** A kind's typed fields shown as chips (required fields are gold-accented). */
+function FieldChips({ fields }: { fields: Record<string, FieldSpec> }) {
+  const entries = Object.entries(fields);
+  if (entries.length === 0) {
+    return (
+      <div className="chips">
+        <span className="chip empty">no fields</span>
+      </div>
+    );
+  }
+  return (
+    <div className="chips">
+      {entries.map(([name, spec]) => (
+        <span key={name} className={spec.required ? "chip req" : "chip"}>
+          {name}
+          <span className="chip-type">
+            {spec.type}
+            {spec.required ? " · req" : ""}
+          </span>
+        </span>
+      ))}
+    </div>
   );
 }
 

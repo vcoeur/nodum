@@ -1,6 +1,8 @@
 // The subgraph explorer: expands a seed node and draws the result as a
-// circular-layout SVG node-link diagram (dependency-free). Nodes are clickable
-// to navigate; colours come from each kind's display group.
+// circular-layout SVG node-link diagram (dependency-free) — a glowing
+// constellation. Nodes are clickable to navigate; colours come from each kind's
+// display group, and an SVG blur filter gives every node a halo in its own
+// colour (no inline styles, so the strict CSP holds).
 
 import { useState } from "react";
 import type { KeyboardEvent } from "react";
@@ -10,11 +12,13 @@ import { useSchema } from "../schema";
 import type { NodeOut, Subgraph } from "../types";
 import { errorMessage, nodeText, truncate } from "../util";
 
+// Matches the per-group hues in styles.css (--group-*).
 const GROUP_COLORS: Record<string, string> = {
-  entity: "#dbe7f3",
-  literature: "#dfe6d4",
-  note: "#f6e6c4",
+  entity: "#6fb3e0",
+  literature: "#e0b15e",
+  note: "#b08ce8",
 };
+const DEFAULT_COLOR = "#8a93a3";
 
 interface GraphViewProps {
   seedUuid: string;
@@ -65,7 +69,12 @@ export function GraphView({ seedUuid, onOpen }: GraphViewProps) {
         </span>
       </div>
       {subgraph && (
-        <GraphSvg subgraph={subgraph} groupColor={(kind) => GROUP_COLORS[groupOf(kind) ?? ""] ?? "#e8e8e6"} onOpen={onOpen} />
+        <GraphSvg
+          subgraph={subgraph}
+          groupName={(kind) => groupOf(kind) ?? "other"}
+          groupColor={(kind) => GROUP_COLORS[groupOf(kind) ?? ""] ?? DEFAULT_COLOR}
+          onOpen={onOpen}
+        />
       )}
     </div>
   );
@@ -73,11 +82,12 @@ export function GraphView({ seedUuid, onOpen }: GraphViewProps) {
 
 interface GraphSvgProps {
   subgraph: Subgraph;
+  groupName: (kind: string) => string;
   groupColor: (kind: string) => string;
   onOpen: (uuid: string) => void;
 }
 
-function GraphSvg({ subgraph, groupColor, onOpen }: GraphSvgProps) {
+function GraphSvg({ subgraph, groupName, groupColor, onOpen }: GraphSvgProps) {
   const width = 640;
   const height = 420;
   const cx = width / 2;
@@ -97,6 +107,9 @@ function GraphSvg({ subgraph, groupColor, onOpen }: GraphSvgProps) {
     }
     positions.set(node.uuid, { x, y, node });
   });
+
+  // Distinct groups present, for the legend.
+  const legend = [...new Set(subgraph.nodes.map((node) => groupName(node.kind)))];
 
   function onKeyDown(event: KeyboardEvent, uuid: string) {
     if (event.key === "Enter" || event.key === " ") {
@@ -118,8 +131,15 @@ function GraphSvg({ subgraph, groupColor, onOpen }: GraphSvgProps) {
             markerHeight="7"
             orient="auto-start-reverse"
           >
-            <path d="M0,0 L10,5 L0,10 z" fill="#7a7a7a" />
+            <path d="M0,0 L10,5 L0,10 z" fill="#6cc6c0" />
           </marker>
+          <filter id="node-glow" x="-60%" y="-60%" width="220%" height="220%">
+            <feGaussianBlur stdDeviation="3.5" result="blur" />
+            <feMerge>
+              <feMergeNode in="blur" />
+              <feMergeNode in="SourceGraphic" />
+            </feMerge>
+          </filter>
         </defs>
         <g className="edge-layer">
           {subgraph.edges.map((edge) => {
@@ -167,7 +187,7 @@ function GraphSvg({ subgraph, groupColor, onOpen }: GraphSvgProps) {
               onClick={() => onOpen(node.uuid)}
               onKeyDown={(event) => onKeyDown(event, node.uuid)}
             >
-              <circle cx={x} cy={y} r={r} fill={groupColor(node.kind)} stroke="#5a5a5a" strokeWidth={1} />
+              <circle cx={x} cy={y} r={r} fill={groupColor(node.kind)} filter="url(#node-glow)" />
               <title>{`${node.kind}: ${nodeText(node.content)}`}</title>
               <text x={x} y={y + 4} className="graph-node-label" textAnchor="middle">
                 {truncate(nodeText(node.content), 18)}
@@ -176,6 +196,14 @@ function GraphSvg({ subgraph, groupColor, onOpen }: GraphSvgProps) {
           ))}
         </g>
       </svg>
+      <div className="graph-legend">
+        {legend.map((group) => (
+          <span key={group}>
+            <i data-group={group} />
+            {group}
+          </span>
+        ))}
+      </div>
     </div>
   );
 }

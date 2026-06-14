@@ -271,6 +271,14 @@ with the CLI. Keep it driven by `GET /schema` (never hardcode kinds).
   `Content-Security-Policy: default-src 'self'` holds with no inline exceptions.
   Keep it so — no inline `<script>`, no inline `style=` props, no CSS-in-JS (use
   the `.css` files); the Vite config disables inline asset/preload emission.
+- **Look & fonts:** a dark, editorial-cartographic theme lives entirely in
+  `styles.css` (CSS variables; atmosphere is pure CSS gradients, never images or
+  `data:` URIs). Fonts are **self-hosted via `@fontsource-variable/*`** (Fraunces
+  display, Hanken Grotesk body, JetBrains Mono data), bundled same-origin by Vite
+  — **never link a webfont CDN**, that would break the strict CSP. Per-group
+  colours (graph nodes + schema cards) use a `data-group` attribute keyed to the
+  `--group-*` variables; SVG node colours are presentation attributes, never
+  `style=`.
 
 ## Distribution — Docker is the full app, PyPI is the CLI/library
 
