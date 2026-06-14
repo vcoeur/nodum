@@ -371,10 +371,13 @@ def edge_kind_rm(
     into: str | None = typer.Option(
         None, "--into", help="Reassign edges of this kind to this kind, then delete."
     ),
+    purge: bool = typer.Option(
+        False, "--purge", help="Delete this kind's edges too, then delete the kind."
+    ),
 ) -> None:
-    """Delete an edge kind; refuses when edges use it unless --into reassigns them first."""
+    """Delete an edge kind; refuses when edges use it unless --into or --purge resolves them."""
     with _service_errors():
-        result = service.delete_edge_kind(name, into=into)
+        result = service.delete_edge_kind(name, into=into, purge=purge)
     _emit(result)
 
 

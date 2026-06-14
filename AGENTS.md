@@ -39,9 +39,12 @@ the one generic `edges` table.
 catalog; `init-db` seeds the defaults into an **empty** catalog only (it never
 resurrects a deleted kind). Editing a kind (`… edit` / `PATCH`) replaces only the
 attributes given; deleting (`… rm` / `DELETE`) is refused while the kind is in
-use unless `--into <kind>` / `?into=<kind>` reassigns the using rows first.
-**Validation is a write-time gate, never retroactive** — editing or reassigning a
-kind never re-validates stored rows.
+use unless you resolve the using rows first — `--into <kind>` / `?into=<kind>`
+reassigns them into another kind, or (edge kinds only) `--purge` / `?purge=true`
+deletes the kind's edges. `into` and `purge` are mutually exclusive. `schema()`
+annotates every kind with a `usage` count, so a client can show the impact before
+deleting. **Validation is a write-time gate, never retroactive** — editing or
+reassigning a kind never re-validates stored rows.
 
 The rule for **when a new kind is warranted:** it must unlock a typed edge or a
 typed field. If a distinction only labels or groups nodes, model it as a `role`
@@ -204,9 +207,9 @@ by reading `schema()` first, which is why it is the contract every surface ships
 | `edit-edge UUID [--set k=v …]` | merge an edge's payload |
 | `rm-node UUID` | delete a node (edges cascade) |
 | `rm-edge UUID` | delete one edge |
-| `schema` | print the live schema |
+| `schema` | print the live schema (each kind carries a `usage` count) |
 | `node-kind add/edit/rm NAME [--group/--content-label/--fields] [--into KIND]` | manage node kinds |
-| `edge-kind add/edit/rm NAME [--from/--to/--symmetric/--fields] [--into KIND]` | manage edge kinds |
+| `edge-kind add/edit/rm NAME [--from/--to/--symmetric/--fields] [--into KIND] [--purge]` | manage edge kinds (`rm --purge` deletes its edges too) |
 | `auth set-password` | set/replace the main password (prompt or piped stdin) |
 | `auth status` | report whether a password is configured (+ timestamp) |
 | `auth ensure-password` | set the password from `NODUM_ADMIN_PASSWORD[_FILE]` if unconfigured (entrypoint bootstrap) |
@@ -223,7 +226,8 @@ shape: `name → {type, required, choices, description}`.
 `DELETE /nodes/{uuid}`, `POST /edges`, `PATCH /edges/{uuid}`,
 `DELETE /edges/{uuid}`, `GET /search`, `GET /expand`, `GET /schema`,
 `POST /node-kinds`, `PATCH|DELETE /node-kinds/{name}` (delete takes `?into=`),
-`POST /edge-kinds`, `PATCH|DELETE /edge-kinds/{name}` — all **gated by
+`POST /edge-kinds`, `PATCH|DELETE /edge-kinds/{name}` (delete takes `?into=` or
+`?purge=true`) — all **gated by
 `require_auth`** — plus the open `POST /auth/login`, `POST /auth/logout`,
 `GET /auth/session` (the SPA's auth probe), `GET /healthz`, and (only when
 `NODUM_WEB_DIST` is set) the open `GET /` + `/assets` that serve the SPA shell.
@@ -246,16 +250,22 @@ the live schema. A header switch toggles two views:
   delete with a cascade-aware confirm, search, open a node, and render its subgraph
   as a dependency-free node-link **SVG diagram**.
 - **Schema** — full CRUD over the runtime-evolvable schema itself: list the live
-  node + edge kinds and create / edit / delete them (`POST`/`PATCH`/`DELETE` on
-  `/node-kinds` and `/edge-kinds`). A reusable field-schema editor builds each
-  kind's `FieldSpec` map (the enum `choices` input appears only for `enum`); an
-  edge kind's `from`/`to` are checkbox groups over the node kinds. Deleting an
-  in-use kind surfaces the **409** and offers an `into` reassignment target,
-  mirroring the CLI's `--into`. Every kind mutation reloads `GET /schema`, so the
-  Graph view's pickers and the header counts update immediately.
+  node + edge kinds (each with a **usage** badge from `GET /schema`) and create /
+  edit / delete them (`POST`/`PATCH`/`DELETE` on `/node-kinds` and `/edge-kinds`).
+  A reusable field-schema editor builds each kind's `FieldSpec` map (the enum
+  `choices` input appears only for `enum`); an edge kind's `from`/`to` are checkbox
+  groups over the node kinds. Deleting an in-use kind surfaces the **409** and
+  offers a choice: reassign the using rows into another kind (`into`, mirroring the
+  CLI's `--into`) or — for an edge kind — remove its edges (`purge`, the `--purge`
+  flag). Every kind mutation reloads `GET /schema`, so the Graph view's pickers and
+  the header counts update immediately.
 
 It holds no logic — every mutation goes through the API — so it stays in lockstep
-with the CLI. Keep it driven by `GET /schema` (never hardcode kinds).
+with the CLI. Keep it driven by `GET /schema` (never hardcode kinds). In dev
+(`npm run dev`) the SPA runs on Vite (5700) and **proxies the API to 8600**: the
+proxied-prefix list in `frontend/vite.config.ts` must name **every** API prefix
+(`/nodes`, `/edges`, `/node-kinds`, `/edge-kinds`, …) — a missing prefix 404s only
+in dev, since production serves the SPA same-origin from FastAPI (no proxy).
 
 - **Build:** `npm run build` (in `frontend/`) typechecks with `tsc` then emits
   `frontend/dist/` (hashed, same-origin assets); `nodum.web` serves that bundle

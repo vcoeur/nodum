@@ -940,6 +940,23 @@ table.edges tbody tr:hover td {
   border: 1px solid color-mix(in srgb, var(--g) 38%, transparent);
 }
 
+/* Usage badge — how many nodes/edges currently use a kind. */
+.kind-usage {
+  padding: 0.08rem 0.5rem;
+  border-radius: 999px;
+  font-family: var(--font-mono);
+  font-size: 0.66rem;
+  letter-spacing: 0.04em;
+  color: var(--text-dim);
+  background: var(--ink-2);
+  border: var(--hairline);
+}
+
+.kind-usage.zero {
+  color: var(--text-faint);
+  opacity: 0.75;
+}
+
 .kind-actions {
   display: flex;
   flex-wrap: wrap;

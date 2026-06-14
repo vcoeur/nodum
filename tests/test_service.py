@@ -233,6 +233,46 @@ def test_add_edge_kind_and_delete_reassign(restore_kinds: None) -> None:
     assert service.get(one.uuid).edges[0].kind == "contradicts"
 
 
+def test_schema_reports_usage_counts() -> None:
+    """``schema()`` annotates each kind with how many nodes/edges currently use it."""
+    one = service.add_node("Note", "claim one", data={"role": "claim"})
+    two = service.add_node("Note", "claim two", data={"role": "claim"})
+    service.add_node("Person", "Ada Lovelace")
+    service.add_edge("supports", one.uuid, two.uuid)
+
+    catalog = service.schema()
+    usage = {nk["name"]: nk["usage"] for nk in catalog["node_kinds"]}
+    edge_usage = {ek["name"]: ek["usage"] for ek in catalog["edge_kinds"]}
+    assert usage["Note"] == 2
+    assert usage["Person"] == 1
+    assert usage["Topic"] == 0  # an unused kind reports zero, not absent
+    assert edge_usage["supports"] == 1
+    assert edge_usage["cites"] == 0
+
+
+def test_delete_edge_kind_purge_removes_its_edges(restore_kinds: None) -> None:
+    """``purge`` deletes an in-use edge kind's edges, then the kind itself."""
+    service.add_edge_kind("Rebuts", from_kinds=["Note"], to_kinds=["Note"])
+    one = service.add_node("Note", "claim one", data={"role": "claim"})
+    two = service.add_node("Note", "claim two", data={"role": "claim"})
+    service.add_edge("Rebuts", one.uuid, two.uuid)
+
+    with pytest.raises(KindInUse):
+        service.delete_edge_kind("Rebuts")
+
+    result = service.delete_edge_kind("Rebuts", purge=True)
+    assert result.removed == 1
+    assert result.reassigned == 0
+    assert "Rebuts" not in {ek["name"] for ek in service.schema()["edge_kinds"]}
+    assert service.get(one.uuid).edges == []  # the edge was removed, not reassigned
+
+
+def test_delete_edge_kind_into_and_purge_are_mutually_exclusive() -> None:
+    """Passing both ``into`` and ``purge`` is a validation error."""
+    with pytest.raises(metamodel.ValidationError):
+        service.delete_edge_kind("contradicts", into="cites", purge=True)
+
+
 def test_add_edge_kind_rejects_unknown_endpoint(restore_kinds: None) -> None:
     """An edge kind naming an unknown node kind is rejected."""
     with pytest.raises(metamodel.ValidationError):

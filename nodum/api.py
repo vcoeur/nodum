@@ -320,9 +320,13 @@ def patch_edge_kind(name: str, body: EdgeKindPatch) -> JSONResponse:
 
 
 @router.delete("/edge-kinds/{name}")
-def delete_edge_kind(name: str, into: str | None = None) -> JSONResponse:
-    """Delete an edge kind; refuses (409) when edges use it unless ``into`` reassigns them."""
-    result = service.delete_edge_kind(name, into=into)
+def delete_edge_kind(name: str, into: str | None = None, purge: bool = False) -> JSONResponse:
+    """Delete an edge kind.
+
+    Refuses (409) when edges use it unless ``into`` reassigns them to another kind or
+    ``purge=true`` deletes them. ``into`` and ``purge`` are mutually exclusive.
+    """
+    result = service.delete_edge_kind(name, into=into, purge=purge)
     return JSONResponse(content=result.model_dump(mode="json"))
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from collections.abc import Callable
 
 from fastapi.testclient import TestClient
 
@@ -164,6 +165,55 @@ def test_edge_kind_crud_with_alias_signature(client: TestClient, restore_kinds: 
     deleted = client.delete("/edge-kinds/Rebuts")
     assert deleted.status_code == 200
     assert "Rebuts" not in {ek["name"] for ek in client.get("/schema").json()["edge_kinds"]}
+
+
+def test_schema_entries_carry_usage_counts(client: TestClient) -> None:
+    """Every node/edge kind entry reports how many rows currently use the kind."""
+    one = _create_node(client, "Note", "claim one", {"role": "claim"})
+    two = _create_node(client, "Note", "claim two", {"role": "claim"})
+    edge = client.post(
+        "/edges",
+        json={"kind": "supports", "from_uuid": one["uuid"], "to_uuid": two["uuid"]},
+    )
+    assert edge.status_code == 200, edge.text
+
+    catalog = client.get("/schema").json()
+    note = next(nk for nk in catalog["node_kinds"] if nk["name"] == "Note")
+    supports = next(ek for ek in catalog["edge_kinds"] if ek["name"] == "supports")
+    assert note["usage"] == 2
+    assert supports["usage"] == 1
+
+
+def test_delete_edge_kind_purge_via_api(client: TestClient, restore_kinds: None) -> None:
+    """DELETE /edge-kinds/{name}?purge=true removes its edges, then the kind (200)."""
+    client.post("/edge-kinds", json={"name": "Rebuts", "from": ["Note"], "to": ["Note"]})
+    one = _create_node(client, "Note", "claim one", {"role": "claim"})
+    two = _create_node(client, "Note", "claim two", {"role": "claim"})
+    edge = client.post(
+        "/edges",
+        json={"kind": "Rebuts", "from_uuid": one["uuid"], "to_uuid": two["uuid"]},
+    )
+    assert edge.status_code == 200, edge.text
+
+    refused = client.delete("/edge-kinds/Rebuts")
+    assert refused.status_code == 409
+
+    purged = client.delete("/edge-kinds/Rebuts", params={"purge": "true"})
+    assert purged.status_code == 200, purged.text
+    assert purged.json()["removed"] == 1
+    assert "Rebuts" not in {ek["name"] for ek in client.get("/schema").json()["edge_kinds"]}
+
+
+def test_edge_kind_rm_purge_via_cli(run_cli: Callable[..., dict], restore_kinds: None) -> None:
+    """`edge-kind rm --purge` removes the kind's edges, then the kind (CLI surface)."""
+    run_cli("edge-kind", "add", "Rebuts", "--from", "Note", "--to", "Note")
+    one = run_cli("add", "Note", "claim one", "--set", "role=claim")["uuid"]
+    two = run_cli("add", "Note", "claim two", "--set", "role=claim")["uuid"]
+    run_cli("link", one, two, "Rebuts")
+
+    result = run_cli("edge-kind", "rm", "Rebuts", "--purge")
+    assert result["removed"] == 1
+    assert result["deleted"] is True
 
 
 def test_patch_missing_kind_returns_404(client: TestClient, restore_kinds: None) -> None:

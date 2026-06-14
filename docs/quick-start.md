@@ -122,8 +122,9 @@ nodum node-kind add Dataset --group entity --content-label name \
 nodum edge-kind add DerivedFrom --from Dataset --to Reference
 ```
 
-The web UI's **Schema** view does the same through forms — including reassigning an in-use kind's rows
-to another kind before deleting it.
+The web UI's **Schema** view does the same through forms — showing each kind's usage, and, when you
+delete an in-use kind, offering to reassign its rows to another kind (or, for an edge kind, remove its
+edges) first.
 
 ## Where to go from here
 
