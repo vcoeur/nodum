@@ -149,20 +149,25 @@ Safe to re-run.
 ```bash
 git clone https://github.com/vcoeur/nodum.git
 cd nodum
+make dev-install         # install everything for dev: uv sync --all-groups + frontend npm ci
 make db-up               # start the local Postgres (docker-compose, host port 5436)
-make dev-install         # uv sync --all-groups
 make init-db             # create the schema + seed the default kind catalog
 uv run nodum auth set-password
 make test                # pytest (needs the database up)
 ```
 
-For the web UI (React + Vite, in `frontend/`):
+Run the API (`:8600`) and the Vite frontend (`:5700`) together — `make dev-run` brings up the
+database first and stops both when either exits:
 
 ```bash
-make frontend-install    # npm ci
+make dev-run
+```
+
+Or drive the web UI (React + Vite, in `frontend/`) on its own:
+
+```bash
 make frontend-dev        # Vite dev server on http://127.0.0.1:5700 (proxies the API to 8600)
-# …or build it and serve through FastAPI on 8600:
-make dev-web
+make serve-spa           # …or build the SPA and serve it through FastAPI on 8600
 ```
 
 Dev ports: the HTTP API serves on `127.0.0.1:8600`, the Vite dev server on `5700` (preview `5701`),

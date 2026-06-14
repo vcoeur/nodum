@@ -11,7 +11,7 @@ prototype with the CLI and ship against the API without surprises.
 
 ## CLI
 
-Run a command with `nodum <cmd>` (installed) or `uv run nodum <cmd>` / `make run -- <cmd>` (from a
+Run a command with `nodum <cmd>` (installed) or `uv run nodum <cmd>` / `make cli -- <cmd>` (from a
 checkout). Every command prints a **single JSON object to stdout**; human messages and errors go to
 **stderr**, so `nodum … > out.json` captures clean JSON.
 
