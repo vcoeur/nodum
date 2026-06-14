@@ -1,7 +1,15 @@
 // Mirrors the JSON the nodum API emits: the metamodel contract (`GET /schema`)
 // and the model envelopes shared by the CLI and API.
 
-export type FieldType = "str" | "int" | "float" | "bool" | "enum" | "list[str]";
+export type FieldType =
+  | "str"
+  | "int"
+  | "float"
+  | "bool"
+  | "enum"
+  | "list[str]"
+  | "date"
+  | "datetime";
 
 export interface FieldSpec {
   type: FieldType;

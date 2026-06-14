@@ -39,7 +39,10 @@ instance against it.
 ## Node kinds
 
 Seven **seeded** kinds, in three groups (the catalog is evolvable — these are the defaults, not a
-fixed set). Every kind defines what its `content` means and an optional typed-field schema.
+fixed set). Every kind defines what its `content` means and an optional typed-field schema. A field's
+`type` is one of `str`, `int`, `float`, `bool`, `list[str]`, `enum` (with `choices`), `date` (a plain
+calendar date, no timezone), or `datetime`. A `datetime` is stored canonically as **UTC** (ISO-8601
+with a `Z` suffix); the web UI shows and accepts it in your local time, converting on the edges.
 
 | Kind | Group | `content` is | Typed fields |
 |---|---|---|---|

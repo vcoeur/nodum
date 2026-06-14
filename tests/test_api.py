@@ -220,3 +220,45 @@ def test_patch_missing_kind_returns_404(client: TestClient, restore_kinds: None)
     """Editing an absent kind is a 404."""
     response = client.patch("/node-kinds/Nonexistent", json={"group": "x"})
     assert response.status_code == 404
+
+
+def test_date_datetime_fields_via_cli(run_cli: Callable[..., dict], restore_kinds: None) -> None:
+    """date/datetime fields round-trip through the CLI; datetime canonicalises to UTC."""
+    run_cli(
+        "node-kind",
+        "add",
+        "Event",
+        "--group",
+        "entity",
+        "--content-label",
+        "label",
+        "--fields",
+        '{"on": {"type": "date"}, "at": {"type": "datetime"}}',
+    )
+    node = run_cli(
+        "add",
+        "Event",
+        "Launch",
+        "--set",
+        "on=2026-06-14",
+        "--set",
+        "at=2026-06-14T11:30:00+02:00",
+    )
+    assert node["data"]["on"] == "2026-06-14"
+    assert node["data"]["at"] == "2026-06-14T09:30:00Z"
+
+
+def test_date_datetime_in_schema_field_types(client: TestClient, restore_kinds: None) -> None:
+    """A kind created with date/datetime fields reports those types back in the schema."""
+    client.post(
+        "/node-kinds",
+        json={
+            "name": "Event",
+            "group": "entity",
+            "content_label": "label",
+            "fields": {"on": {"type": "date"}, "at": {"type": "datetime"}},
+        },
+    )
+    event = next(nk for nk in client.get("/schema").json()["node_kinds"] if nk["name"] == "Event")
+    assert event["fields"]["on"]["type"] == "date"
+    assert event["fields"]["at"]["type"] == "datetime"

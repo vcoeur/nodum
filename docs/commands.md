@@ -70,13 +70,23 @@ nodum schema                                            # the whole live schema
 ### Evolving the schema
 
 Kinds are data, so the catalog is editable at runtime. The `--fields` JSON mirrors the `fields` shape
-that `schema` emits (`name → {type, required, choices, description}`):
+that `schema` emits (`name → {type, required, choices, description}`). A field `type` is one of
+`str`, `int`, `float`, `bool`, `list[str]`, `enum` (which needs `choices`), `date` (a plain calendar
+date `YYYY-MM-DD`), or `datetime`. A `datetime` is stored canonically as **UTC ISO-8601** with a `Z`
+suffix — an explicit offset is converted to UTC, a naive value is assumed UTC — and only the web UI
+shows/enters it in local time; `date` has no timezone.
 
 ```bash
 # a new node kind, then an edge kind that uses it
 nodum node-kind add Dataset --group entity --content-label name \
   --fields '{"rows": {"type": "int", "description": "row count"}, "license": {"type": "str"}}'
 nodum edge-kind add DerivedFrom --from Dataset --to Reference
+
+# date / datetime fields — datetime is normalised to UTC on write
+nodum node-kind add Event --group entity --content-label label \
+  --fields '{"on": {"type": "date"}, "at": {"type": "datetime"}}'
+nodum add Event "Launch" --set on=2026-06-14 --set at=2026-06-14T11:30:00+02:00
+#   stored: {"on": "2026-06-14", "at": "2026-06-14T09:30:00Z"}
 
 # delete is refused while in use; resolve the using rows first, then it deletes
 nodum node-kind rm Dataset                              # error: refused, reports usage
