@@ -39,22 +39,19 @@ docker compose -f docker-compose.example.yml up     # nodum + Postgres
 ### Local development
 
 ```bash
-make install-all   # install all deps at once (Python dev + frontend npm)
+make dev-install   # install everything for dev: uv sync --all-groups + frontend npm ci
 make db-up         # start local PostgreSQL (docker-compose, host port 5436)
-make dev-install   # uv sync --all-groups (Python) — subset of install-all above
 make init-db       # create the schema + seed the default kind catalog
 uv run nodum auth set-password   # set the main password (gates the API + UI)
 make test          # run the Python suite (needs the database up)
 
-# the web UI (React + Vite, in frontend/):
-make frontend-install   # npm ci
-make frontend-dev       # Vite dev server on http://127.0.0.1:5700 (proxies the API)
-# …or build it and serve through FastAPI on 8600:
-make dev-web
+# run the API (:8600) and the Vite frontend (:5700) together — brings up the DB
+# first, stops both when either exits:
+make dev-run
 
-# run the API and the Vite frontend together, stopping both when either exits
-# (checks the DB is up first; run `make install-all` once beforehand):
-make dev
+# …or the web UI on its own (React + Vite, in frontend/):
+make frontend-dev   # Vite dev server on http://127.0.0.1:5700 (proxies the API)
+make serve-spa      # build the SPA and serve it through FastAPI on 8600
 ```
 
 Configuration is environment variables, chiefly `NODUM_DATABASE_URL` (default
@@ -121,7 +118,7 @@ CRUD plus query.
 ### CLI
 
 JSON goes to stdout, messages and errors to stderr. Run a command with
-`uv run nodum …` (or `make run -- …`).
+`uv run nodum …` (or `make cli -- …`).
 
 ```bash
 # create a typed node; --set carries kind-specific fields (parsed as JSON, else raw)

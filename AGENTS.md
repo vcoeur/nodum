@@ -261,8 +261,8 @@ with the CLI. Keep it driven by `GET /schema` (never hardcode kinds).
   `frontend/dist/` (hashed, same-origin assets); `nodum.web` serves that bundle
   from `NODUM_WEB_DIST`.
 - **Dev:** `npm run dev` runs Vite on **5700**, proxying the API routes to FastAPI
-  on 8600 (one origin, so the session cookie flows). Or `make dev-web` builds the
-  bundle and serves it through FastAPI on 8600.
+  on 8600 (one origin, so the session cookie flows). Or `make serve-spa` builds
+  the bundle and serves it through FastAPI on 8600.
 - **Auth in the SPA:** the session cookie is HttpOnly (JS can't read it), so the
   app calls the open `GET /auth/session` → `{configured, authenticated}` to choose
   between the setup hint, the sign-in view, and the app; a 401 from any data call
@@ -378,21 +378,28 @@ Prerequisites: Python ≥ 3.12, `uv`, Node ≥ 24 + npm (for the frontend), and
 Docker (for the local Postgres and the image). The package version is derived
 from the git tag (`vX.Y.Z`) at build time by hatch-vcs and is never committed.
 
-Make targets (run `make help` for the live list):
+Make targets — `make help` lists them live. Two install/run pairs: **dev**
+(`make dev-install` then `make dev-run`) and a bare-host **deploy** (`make install`
+then `make run`). The real deployed unit is the **Docker image**
+(`make docker-build`) — it bakes the built SPA in, sets `NODUM_WEB_DIST`, and
+self-bootstraps the DB + admin password via its entrypoint. Everything else is an
+explicit building block.
 
 | Target | Does |
 |---|---|
-| `make install` | `uv sync` (runtime deps) |
-| `make dev-install` | `uv sync --all-groups` (adds dev deps) |
-| `make db-up` / `make db-down` | start / stop the local Postgres container |
+| `make install` | install runtime deps (`uv sync`) — bare-host deploy |
+| `make run` | serve the HTTP API; also serves the SPA when `NODUM_WEB_DIST` points at a built bundle (`uv run nodum serve`) |
+| `make dev-install` | install everything for dev: `uv sync --all-groups` + frontend `npm ci` |
+| `make dev-run` | bring up the DB, then run the API (:8600) + Vite frontend (:5700) together; stops both when either exits |
+| `make cli` | run the nodum CLI (`make cli -- search foo`) |
+| `make db-up` / `make db-down` | start / stop the local Postgres container (`db-up` waits until healthy) |
+| `make db-check` | fail fast unless the Postgres container is running |
 | `make init-db` | create the schema + seed kind tables (`uv run nodum init-db`) |
-| `make run` | run the CLI (`make run -- search foo`) |
-| `make serve` | run the HTTP API (uvicorn; SPA when `NODUM_WEB_DIST` is set) |
 | `make frontend-install` | `npm ci` in `frontend/` |
 | `make frontend-dev` | Vite dev server on 5700 (proxies the API to 8600) |
 | `make frontend-build` | build the SPA into `frontend/dist` |
-| `make dev-web` | build the SPA and serve it via FastAPI on 8600 |
-| `make docker-build` | build the full-app Docker image |
+| `make serve-spa` | build the SPA and serve it via FastAPI on 8600 |
+| `make docker-build` | build the full-app Docker image — the real deployed unit (API + baked-in UI, self-bootstrapping) |
 | `make test` | run pytest |
 | `make coverage` | pytest with line-coverage report |
 | `make lint` | `ruff check` + `ruff format --check` |
