@@ -219,6 +219,8 @@ by reading `schema()` first, which is why it is the contract every surface ships
 | `schema` | print the live schema (each kind carries a `usage` count) |
 | `node-kind add/edit/rm NAME [--group/--content-label/--fields] [--into KIND]` | manage node kinds |
 | `edge-kind add/edit/rm NAME [--from/--to/--symmetric/--fields] [--into KIND] [--purge]` | manage edge kinds (`rm --purge` deletes its edges too) |
+| `skill install [--user\|--project\|--dest DIR] [--force]` | install the bundled agent skill (SKILL.md) into a skills directory |
+| `skill status` | report where the skill is installed and whether it matches the bundled copy |
 | `auth set-password` | set/replace the main password (prompt or piped stdin) |
 | `auth status` | report whether a password is configured (+ timestamp) |
 | `auth ensure-password` | set the password from `NODUM_ADMIN_PASSWORD[_FILE]` if unconfigured (entrypoint bootstrap) |
@@ -343,9 +345,14 @@ Two artifacts, one codebase:
   Postgres, provide a password secret — done. `docker-compose.example.yml` is a
   turnkey start. The image does **not** bundle Postgres. The build passes the
   version as `SETUPTOOLS_SCM_PRETEND_VERSION` (no `.git` in the build context).
-- **PyPI wheel (CLI / library).** Ships the service + CLI + API + `schema.sql`
-  only — **no UI**. `pip install nodum` gives the `nodum` command and the API;
-  `nodum serve` without `NODUM_WEB_DIST` serves the API with no web view.
+- **PyPI wheel (CLI / library).** Ships the service + CLI + API + `schema.sql` +
+  the bundled agent skill (`nodum/skill/SKILL.md`, both force-included as
+  package data) — **no UI**. `pip install nodum` gives the `nodum` command and
+  the API; `nodum serve` without `NODUM_WEB_DIST` serves the API with no web
+  view. `nodum skill install [--user|--project|--dest DIR]` copies the bundled
+  SKILL.md (a convention-free CLI contract for LLM agents) into a skills
+  directory; `nodum skill status` reports whether installed copies match the
+  bundled one.
 
 ## Authentication — one main password
 

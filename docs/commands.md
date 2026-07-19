@@ -35,6 +35,8 @@ checkout). Every command prints a **single JSON object to stdout**; human messag
 | `edge-kind add NAME [--from K …] [--to K …] [--symmetric] [--fields JSON]` | register an edge kind |
 | `edge-kind edit NAME [--from …] [--to …] [--symmetric/--asymmetric] [--fields …]` | edit an edge kind |
 | `edge-kind rm NAME [--into KIND] [--purge]` | delete an edge kind (refused if in use; `--into` reassigns, `--purge` deletes its edges) |
+| `skill install [--user\|--project\|--dest DIR] [--force]` | install the bundled agent skill (SKILL.md) |
+| `skill status` | show where the skill is installed and whether it matches the bundled copy |
 | `auth set-password` | set/replace the main password (prompt or piped stdin) |
 | `auth status` | report whether a password is configured (+ timestamp) |
 | `auth ensure-password` | set the password from `NODUM_ADMIN_PASSWORD[_FILE]` if unconfigured (entrypoint bootstrap) |

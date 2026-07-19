@@ -19,6 +19,7 @@ import os
 import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
+from importlib import resources
 from pathlib import Path
 
 import typer
@@ -653,6 +654,81 @@ def auth_ensure_password() -> None:
         return
     auth.set_password(password)
     _print_json({"configured": True, "action": "set"})
+
+
+# ── Bundled agent skill ───────────────────────────────────────────────────────
+
+skill_app = typer.Typer(
+    no_args_is_help=True,
+    help="Install the bundled nodum agent skill (SKILL.md) for LLM agent harnesses.",
+)
+app.add_typer(skill_app, name="skill")
+
+# Default install targets, by scope.
+USER_SKILL_DIR = Path.home() / ".config" / "agents" / "skills" / "nodum"
+PROJECT_SKILL_DIR = Path(".agents") / "skills" / "nodum"
+
+
+def _bundled_skill_text() -> str:
+    """Read the SKILL.md shipped inside the package (``nodum/skill/SKILL.md``)."""
+    return (resources.files("nodum") / "skill" / "SKILL.md").read_text(encoding="utf-8")
+
+
+@skill_app.command("install")
+def skill_install(
+    user: bool = typer.Option(
+        False, "--user", help="Install to ~/.config/agents/skills/nodum/ (default)."
+    ),
+    project: bool = typer.Option(
+        False, "--project", help="Install to ./.agents/skills/nodum/ (project-local)."
+    ),
+    dest: Path | None = typer.Option(None, "--dest", help="Install to an explicit directory."),
+    force: bool = typer.Option(False, "--force", help="Overwrite an existing SKILL.md."),
+) -> None:
+    """Copy the bundled SKILL.md into a skills directory and print a status object."""
+    scopes = [name for name, flag in (("--user", user), ("--project", project)) if flag]
+    if dest is not None and scopes:
+        typer.echo(f"--dest is mutually exclusive with {scopes[0]}", err=True)
+        raise typer.Exit(1)
+    if dest is not None:
+        target_dir = dest
+    elif project:
+        target_dir = Path.cwd() / PROJECT_SKILL_DIR
+    else:
+        target_dir = USER_SKILL_DIR
+    target = target_dir / "SKILL.md"
+    existed = target.exists()
+    if existed and not force:
+        typer.echo(f"{target} already exists — pass --force to overwrite", err=True)
+        raise typer.Exit(1)
+    text = _bundled_skill_text()
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target.write_text(text, encoding="utf-8")
+    _print_json(
+        {"installed": str(target), "bytes": len(text.encode("utf-8")), "overwritten": existed}
+    )
+
+
+@skill_app.command("status")
+def skill_status() -> None:
+    """Report where the skill is installed and whether it matches the bundled copy."""
+    bundled = _bundled_skill_text()
+    targets = {
+        "user": USER_SKILL_DIR / "SKILL.md",
+        "project": Path.cwd() / PROJECT_SKILL_DIR / "SKILL.md",
+    }
+    rows = []
+    for scope, path in targets.items():
+        installed = path.exists()
+        rows.append(
+            {
+                "scope": scope,
+                "path": str(path),
+                "installed": installed,
+                "current": installed and path.read_text(encoding="utf-8") == bundled,
+            }
+        )
+    _print_json({"bundled_bytes": len(bundled.encode("utf-8")), "targets": rows})
 
 
 @app.command("serve")

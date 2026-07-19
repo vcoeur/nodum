@@ -318,6 +318,29 @@ def test_cli_edit_node_batch() -> None:
     assert json.loads(fetched.stdout)["node"]["content"] == "final"
 
 
+# ── CLI: bundled skill (gap 5) ────────────────────────────────────────────────
+
+
+def test_cli_skill_install_and_status(run_cli: Callable[..., dict], tmp_path: Path) -> None:
+    """skill install --dest copies the bundled SKILL.md; status reports targets."""
+    dest = tmp_path / "skills"
+    installed = run_cli("skill", "install", "--dest", str(dest))
+    target = dest / "SKILL.md"
+    assert installed["installed"] == str(target)
+    assert installed["overwritten"] is False
+    assert target.read_text(encoding="utf-8").startswith("---\nname: nodum")
+
+    again = run_cli("skill", "install", "--dest", str(dest), "--force")
+    assert again["overwritten"] is True
+
+    refused = CliRunner().invoke(cli_app, ["skill", "install", "--dest", str(dest)])
+    assert refused.exit_code == 1
+
+    status = run_cli("skill", "status")
+    assert status["bundled_bytes"] > 0
+    assert {row["scope"] for row in status["targets"]} == {"user", "project"}
+
+
 # ── API: matching query params (gaps 3 + 4) ───────────────────────────────────
 
 
