@@ -15,13 +15,36 @@ from __future__ import annotations
 from datetime import datetime
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, computed_field
+
+# Maximum length of the derived display title (the first line of content).
+TITLE_MAX_CHARS = 80
+
+
+def derive_title(content: str) -> str:
+    """Derive a node's display title from its content's first non-blank line.
+
+    Titles are derived at read time (never stored), so they track edits for
+    free and no migration is needed. The title is the first non-blank line,
+    stripped, capped at ``TITLE_MAX_CHARS`` characters.
+    """
+    for line in content.splitlines():
+        stripped = line.strip()
+        if stripped:
+            return stripped[:TITLE_MAX_CHARS]
+    return ""
+
 
 # ── Output models ───────────────────────────────────────────────────────────
 
 
 class NodeOut(BaseModel):
-    """A node: its kind, its plain-text content, its metadata, and timestamps."""
+    """A node: its kind, its plain-text content, its metadata, and timestamps.
+
+    The serialised payload also carries ``title`` — a computed display title
+    derived from the first non-blank line of ``content`` (see
+    :func:`derive_title`). It is additive and identical across every surface.
+    """
 
     uuid: UUID
     kind: str
@@ -29,6 +52,12 @@ class NodeOut(BaseModel):
     data: dict
     created_at: datetime
     updated_at: datetime
+
+    @computed_field
+    @property
+    def title(self) -> str:
+        """Display title derived from the first non-blank line of content."""
+        return derive_title(self.content)
 
 
 class EdgeOut(BaseModel):
@@ -143,6 +172,50 @@ class NodeWithEdges(BaseModel):
 
     node: NodeOut
     edges: list[EdgeOut]
+
+
+class FailedTarget(BaseModel):
+    """A target that could not be resolved in a multi-target read."""
+
+    uuid: str
+    error: str
+
+
+class NodesWithEdges(BaseModel):
+    """A multi-target ``get``: the resolved nodes (with edges) and the misses.
+
+    ``targets`` echoes the requested identifiers in order; ``nodes`` holds one
+    :class:`NodeWithEdges` per resolved target; ``failed`` holds one entry per
+    unresolved target, so a single bad UUID never aborts the read.
+    """
+
+    targets: list[str]
+    nodes: list[NodeWithEdges]
+    failed: list[FailedTarget]
+
+
+class BatchItemResult(BaseModel):
+    """One item's outcome in a batch write: its index, and the uuid or the error."""
+
+    index: int
+    ok: bool
+    uuid: UUID | None = None
+    error: str | None = None
+
+
+class BatchResult(BaseModel):
+    """Summary of a batch write: per-item outcomes plus tallies.
+
+    A batch is one connection pass with a savepoint per item, so one bad item
+    never aborts the rest; ``dry_run`` validates every item and rolls back.
+    """
+
+    operation: str
+    count: int
+    succeeded: int
+    failed: int
+    dry_run: bool = False
+    results: list[BatchItemResult]
 
 
 class SearchResult(BaseModel):

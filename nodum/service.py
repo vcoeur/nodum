@@ -26,10 +26,14 @@ from psycopg.types.json import Json
 from nodum import db, metamodel
 from nodum.db import connect
 from nodum.models import (
+    BatchItemResult,
+    BatchResult,
     Deleted,
     EdgeOut,
+    FailedTarget,
     KindDeleted,
     NodeOut,
+    NodesWithEdges,
     NodeWithEdges,
     SearchHit,
     SearchResult,
@@ -158,38 +162,179 @@ def add_edge(
     return EdgeOut(**row)
 
 
+def add_nodes_batch(items: Sequence[dict], dry_run: bool = False) -> BatchResult:
+    """Create several nodes in one connection pass, tolerating per-item failures.
+
+    Each item is ``{"kind", "content", "data"?}`` — the same shape as
+    :func:`add_node`. A savepoint per item means one bad item is recorded in
+    the result's ``results`` (with its error) and never aborts the rest.
+    With ``dry_run`` the whole pass is validated and then rolled back, so
+    nothing is written.
+
+    Args:
+        items: The node drafts to create.
+        dry_run: Validate every item without persisting anything.
+    """
+    results: list[BatchItemResult] = []
+    with connect() as conn, conn.cursor() as cur:
+        for index, item in enumerate(items):
+            cur.execute("SAVEPOINT batch_item")
+            try:
+                if not isinstance(item, dict):
+                    raise metamodel.ValidationError(f"item {index} is not a JSON object")
+                kind = item.get("kind")
+                content = item.get("content")
+                if not isinstance(kind, str) or not kind:
+                    raise metamodel.ValidationError(f"item {index} needs a 'kind' string")
+                if not isinstance(content, str):
+                    raise metamodel.ValidationError(f"item {index} needs a 'content' string")
+                payload = item.get("data") or {}
+                if not isinstance(payload, dict):
+                    raise metamodel.ValidationError(f"item {index} 'data' must be an object")
+                node_kind = _require_node_kind(cur, kind)
+                metamodel.validate_node(node_kind, content, payload)
+                cur.execute(
+                    f"INSERT INTO nodes (kind, content, data) VALUES (%s, %s, %s) "
+                    f"RETURNING {_NODE_COLS}",
+                    (kind, content, Json(payload)),
+                )
+                row = cur.fetchone()
+                results.append(BatchItemResult(index=index, ok=True, uuid=row["uuid"]))
+            except (metamodel.ValidationError, ValueError) as exc:
+                cur.execute("ROLLBACK TO SAVEPOINT batch_item")
+                results.append(BatchItemResult(index=index, ok=False, error=str(exc)))
+        if dry_run:
+            conn.rollback()
+        else:
+            conn.commit()
+    succeeded = sum(1 for result in results if result.ok)
+    return BatchResult(
+        operation="add-batch",
+        count=len(results),
+        succeeded=succeeded,
+        failed=len(results) - succeeded,
+        dry_run=dry_run,
+        results=results,
+    )
+
+
 # ── Read ────────────────────────────────────────────────────────────────────
 
+#: Valid values for the ``direction`` filter on :func:`get` / :func:`get_many`.
+_DIRECTIONS = ("in", "out", "both")
 
-def get(uuid: str | UUID) -> NodeWithEdges:
-    """Return a node plus every edge incident on it (either direction).
+
+def _validate_direction(direction: str) -> None:
+    """Reject an unknown incident-edge direction filter."""
+    if direction not in _DIRECTIONS:
+        raise metamodel.ValidationError(
+            f"unknown direction {direction!r} (expected one of {_DIRECTIONS})"
+        )
+
+
+def _incident_edges(
+    cur: Cursor,
+    uuid: str | UUID,
+    edge_kinds: Sequence[str] | None,
+    direction: str,
+) -> list[EdgeOut]:
+    """Load the edges incident on a node, honouring the kind/direction filters."""
+    where = {
+        "in": "to_uuid = %(uuid)s",
+        "out": "from_uuid = %(uuid)s",
+        "both": "(from_uuid = %(uuid)s OR to_uuid = %(uuid)s)",
+    }[direction]
+    kind_filter = "AND kind = ANY(%(kinds)s)" if edge_kinds else ""
+    cur.execute(
+        f"SELECT {_EDGE_COLS} FROM edges WHERE {where} {kind_filter} ORDER BY created_at, uuid",
+        {"uuid": str(uuid), "kinds": list(edge_kinds) if edge_kinds else None},
+    )
+    return [EdgeOut(**row) for row in cur.fetchall()]
+
+
+def get(
+    uuid: str | UUID,
+    edge_kinds: Sequence[str] | None = None,
+    direction: str = "both",
+) -> NodeWithEdges:
+    """Return a node plus its incident edges, optionally filtered.
+
+    Args:
+        uuid: The node to fetch.
+        edge_kinds: Optional list of edge kinds to include (others are dropped).
+        direction: Which incident edges to return — ``in`` (pointing at the
+            node), ``out`` (leaving it), or ``both`` (the default).
 
     Raises:
         NodeNotFound: If no node has the given UUID.
+        metamodel.ValidationError: If ``direction`` is not in/out/both.
     """
+    _validate_direction(direction)
     with connect() as conn, conn.cursor() as cur:
         cur.execute(f"SELECT {_NODE_COLS} FROM nodes WHERE uuid = %s", (str(uuid),))
         node = cur.fetchone()
         if node is None:
             raise NodeNotFound(uuid)
-        cur.execute(
-            f"SELECT {_EDGE_COLS} FROM edges "
-            "WHERE from_uuid = %s OR to_uuid = %s ORDER BY created_at, uuid",
-            (str(uuid), str(uuid)),
-        )
-        edges = cur.fetchall()
-    return NodeWithEdges(node=NodeOut(**node), edges=[EdgeOut(**edge) for edge in edges])
+        edges = _incident_edges(cur, uuid, edge_kinds, direction)
+    return NodeWithEdges(node=NodeOut(**node), edges=edges)
 
 
-def search(query: str, kind: str | None = None, limit: int = 20) -> SearchResult:
-    """Full-text search over node content, ranked best-first, optionally by kind.
+def get_many(
+    uuids: Sequence[str | UUID],
+    edge_kinds: Sequence[str] | None = None,
+    direction: str = "both",
+) -> NodesWithEdges:
+    """Fetch several nodes (with incident edges) in one call, tolerating misses.
+
+    Each target resolves independently: a missing or malformed UUID lands in
+    ``failed`` with its error and never aborts the other targets.
+
+    Raises:
+        metamodel.ValidationError: If ``direction`` is not in/out/both, or no
+            targets were given.
+    """
+    _validate_direction(direction)
+    targets = [str(uuid) for uuid in uuids]
+    if not targets:
+        raise metamodel.ValidationError("get_many needs at least one target UUID")
+    nodes: list[NodeWithEdges] = []
+    failed: list[FailedTarget] = []
+    with connect() as conn, conn.cursor() as cur:
+        for target in targets:
+            try:
+                UUID(target)
+            except ValueError:
+                failed.append(FailedTarget(uuid=target, error=f"invalid UUID {target!r}"))
+                continue
+            cur.execute(f"SELECT {_NODE_COLS} FROM nodes WHERE uuid = %s", (target,))
+            row = cur.fetchone()
+            if row is None:
+                failed.append(FailedTarget(uuid=target, error=f"node {target} not found"))
+                continue
+            edges = _incident_edges(cur, target, edge_kinds, direction)
+            nodes.append(NodeWithEdges(node=NodeOut(**row), edges=edges))
+    return NodesWithEdges(targets=targets, nodes=nodes, failed=failed)
+
+
+def search(
+    query: str,
+    kind: str | None = None,
+    limit: int = 20,
+    tags: Sequence[str] | None = None,
+) -> SearchResult:
+    """Full-text search over node content, ranked best-first, with filters.
 
     Args:
         query: Free-text query (``plainto_tsquery`` — AND of terms).
         kind: Optional node-kind filter.
         limit: Maximum number of hits.
+        tags: Optional tag filter (AND semantics): a hit's ``data.tags`` array
+            must contain every given tag. Tags are a convention — any node may
+            carry a ``tags`` list of strings in its ``data`` payload; the
+            filter is a JSONB containment check against the GIN index.
     """
     clause = "AND kind = %(kind)s" if kind else ""
+    tag_filter = "AND data->'tags' @> %(tags)s::jsonb" if tags else ""
     with connect() as conn, conn.cursor() as cur:
         cur.execute(
             f"SELECT {_NODE_COLS}, "
@@ -197,10 +342,15 @@ def search(query: str, kind: str | None = None, limit: int = 20) -> SearchResult
             "        plainto_tsquery('english', %(q)s)) AS score "
             "FROM nodes "
             "WHERE to_tsvector('english', content) "
-            f"      @@ plainto_tsquery('english', %(q)s) {clause} "
+            f"      @@ plainto_tsquery('english', %(q)s) {clause} {tag_filter} "
             "ORDER BY score DESC, created_at, uuid "
             "LIMIT %(limit)s",
-            {"q": query, "kind": kind, "limit": limit},
+            {
+                "q": query,
+                "kind": kind,
+                "limit": limit,
+                "tags": Json(list(tags)) if tags else None,
+            },
         )
         rows = cur.fetchall()
     hits = [SearchHit(score=float(row.pop("score")), **row) for row in rows]
@@ -344,6 +494,76 @@ def update_edge(uuid: str | UUID, data: dict | None = None) -> EdgeOut:
         out = cur.fetchone()
         conn.commit()
     return EdgeOut(**out)
+
+
+def update_nodes_batch(items: Sequence[dict], dry_run: bool = False) -> BatchResult:
+    """Merge content/payload into several nodes in one pass, per-item failures.
+
+    Each item is ``{"uuid", "content"?, "data"?}`` — the same merge semantics
+    as :func:`update_node` (content replaced, ``data`` merged, result
+    re-validated). A savepoint per item means one bad item (missing node,
+    invalid payload) is recorded with its error and never aborts the rest.
+    With ``dry_run`` the whole pass is validated and then rolled back.
+
+    Args:
+        items: The node edits to apply.
+        dry_run: Validate every item without persisting anything.
+    """
+    results: list[BatchItemResult] = []
+    with connect() as conn, conn.cursor() as cur:
+        for index, item in enumerate(items):
+            cur.execute("SAVEPOINT batch_item")
+            try:
+                if not isinstance(item, dict):
+                    raise metamodel.ValidationError(f"item {index} is not a JSON object")
+                uuid = item.get("uuid")
+                if not isinstance(uuid, str) or not uuid:
+                    raise metamodel.ValidationError(f"item {index} needs a 'uuid' string")
+                try:
+                    UUID(uuid)
+                except ValueError:
+                    raise metamodel.ValidationError(
+                        f"item {index} has an invalid UUID {uuid!r}"
+                    ) from None
+                cur.execute(f"SELECT {_NODE_COLS} FROM nodes WHERE uuid = %s", (uuid,))
+                row = cur.fetchone()
+                if row is None:
+                    raise NodeNotFound(uuid)
+                content = item.get("content")
+                data = item.get("data")
+                if content is not None and not isinstance(content, str):
+                    raise metamodel.ValidationError(f"item {index} 'content' must be a string")
+                if data is not None and not isinstance(data, dict):
+                    raise metamodel.ValidationError(f"item {index} 'data' must be an object")
+                node_kind = _require_node_kind(cur, row["kind"])
+                new_content = row["content"] if content is None else content
+                payload = dict(row["data"])
+                if data:
+                    payload.update(data)
+                metamodel.validate_node(node_kind, new_content, payload)
+                cur.execute(
+                    f"UPDATE nodes SET content = %s, data = %s, updated_at = now() "
+                    f"WHERE uuid = %s RETURNING {_NODE_COLS}",
+                    (new_content, Json(payload), uuid),
+                )
+                cur.fetchone()
+                results.append(BatchItemResult(index=index, ok=True, uuid=row["uuid"]))
+            except (NodeNotFound, metamodel.ValidationError, ValueError) as exc:
+                cur.execute("ROLLBACK TO SAVEPOINT batch_item")
+                results.append(BatchItemResult(index=index, ok=False, error=str(exc)))
+        if dry_run:
+            conn.rollback()
+        else:
+            conn.commit()
+    succeeded = sum(1 for result in results if result.ok)
+    return BatchResult(
+        operation="edit-batch",
+        count=len(results),
+        succeeded=succeeded,
+        failed=len(results) - succeeded,
+        dry_run=dry_run,
+        results=results,
+    )
 
 
 # ── Delete ──────────────────────────────────────────────────────────────────

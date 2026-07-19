@@ -86,8 +86,11 @@ flowchart LR
   metamodel to validate input. Also owns **kind CRUD** (`add_node_kind`,
   `update_node_kind`, `delete_node_kind`, and the edge equivalents) and `schema()`.
 - **`nodum.models`** — the single pydantic I/O schema shared by every surface
-  (`NodeOut` — now with a top-level `content` — `EdgeOut`, `SearchHit`,
-  `NodeWithEdges`, `SearchResult`, `Subgraph`, `Deleted`, `KindDeleted`, plus the
+  (`NodeOut` — now with a top-level `content` plus a computed `title` derived
+  from its first line — `EdgeOut`, `SearchHit`,
+  `NodeWithEdges`, `NodesWithEdges` / `FailedTarget` (multi-target get),
+  `BatchResult` / `BatchItemResult` (batch writes), `SearchResult`, `Subgraph`,
+  `Deleted`, `KindDeleted`, plus the
   `AddNodeIn` / `AddEdgeIn` / `UpdateNodeIn` / `UpdateEdgeIn` and the kind-definition
   inputs `NodeKindIn` / `NodeKindPatch` / `EdgeKindIn` / `EdgeKindPatch`). A node
   carries its `kind` + `content`; kind-specific metadata lives in `data`. UUID and
@@ -187,9 +190,13 @@ a stderr line plus exit code 1. The API maps the not-found errors → 404,
 
 ## CRUD surfaces — `schema` is the contract
 
-The service offers full CRUD plus query: `add_node` / `add_edge`, `get`,
-`search` (optional `kind` filter), `expand` (optional `edge_kinds` filter),
-`update_node` / `update_edge`, `delete_node` / `delete_edge`, `schema()`, and the
+The service offers full CRUD plus query: `add_node` / `add_edge`,
+`add_nodes_batch` / `update_nodes_batch` (one pass, per-item savepoints,
+optional dry-run), `get` (optional `edge_kinds` / `direction` incident-edge
+filters), `get_many` (multi-target, tolerant of misses), `search` (optional
+`kind` filter and `tags` JSONB-containment filter), `expand` (optional
+`edge_kinds` filter), `update_node` / `update_edge`, `delete_node` /
+`delete_edge`, `schema()`, and the
 **kind CRUD** ops (`add_node_kind` / `update_node_kind` / `delete_node_kind` and
 the edge equivalents). The CLI and API expose all of it; any client self-orients
 by reading `schema()` first, which is why it is the contract every surface ships.
@@ -199,11 +206,13 @@ by reading `schema()` first, which is why it is the contract every surface ships
 | Command | Does |
 |---|---|
 | `add KIND CONTENT [--set k=v …]` | create a typed node |
+| `add --batch FILE\|- [--dry-run]` | bulk create from a JSON array of `{kind, content, data?}` (per-item partial success) |
 | `link FROM TO EDGE_KIND [--set k=v …]` | create a typed directed edge |
-| `get UUID` | a node plus its incident edges |
-| `search QUERY [--kind K] [--limit N]` | ranked full-text search |
+| `get UUID [UUID …] [--edge-kind K …] [--direction in\|out\|both] [--fields minimal\|full] [--max-body-chars N]` | a node plus its incident edges; several UUIDs → `{targets, nodes, failed}` |
+| `search QUERY [--kind K] [--tag T …] [--limit N] [--fields minimal\|full] [--max-body-chars N]` | ranked full-text search (200-char snippets by default; `--fields full` restores full content) |
 | `expand UUID [--depth N] [--edge-kind K …]` | seed → connected subgraph |
 | `edit-node UUID [--content …] [--set k=v …]` | merge + re-validate a node |
+| `edit-node --batch FILE\|- [--dry-run]` | bulk edit from a JSON array of `{uuid, content?, data?}` (same merge semantics) |
 | `edit-edge UUID [--set k=v …]` | merge an edge's payload |
 | `rm-node UUID` | delete a node (edges cascade) |
 | `rm-edge UUID` | delete one edge |
@@ -226,6 +235,31 @@ shape: `name → {type, required, choices, description}`. A field `type` is one 
 UTC**: it is validated and stored as ISO-8601 with a `Z` suffix (an offset is
 converted to UTC, a naive value is assumed UTC), and the SPA alone shows/enters it
 in the browser's local time. `date` carries no timezone.
+
+**Agent ergonomics (CLI).** Every node's JSON payload carries a derived `title`
+(the first non-blank line of `content`, capped at 80 chars — computed at read
+time by `NodeOut`, never stored). **Tags** are a convention, not a schema
+feature: any node may carry `"tags": ["…"]` in `data`, and `search --tag`
+(repeatable, AND semantics) filters by JSONB containment on `data.tags` (the GIN
+index on `data` serves it). The CLI-only agent conveniences are:
+
+- **Output shaping** (`get` / `search`): `search` returns a 200-char content
+  **snippet** per hit by default (adding `content_truncated` /
+  `content_total_chars` only when a cut happens); `--fields full` restores the
+  untruncated payload, `--max-body-chars N` sets the cut, and `--fields minimal`
+  projects a hit to `{uuid, kind, title, score}` (a `get` node to
+  `{uuid, kind, title}`). Shaping is presentation-only — it lives in the CLI
+  adapter; the API always returns the full payload.
+- **Multi-target `get`** and **batch writes** (`add --batch`, `edit-node
+  --batch`): service-side (`get_many`, `add_nodes_batch`, `update_nodes_batch`)
+  but exposed on the CLI only, for agent round-trip economy — an API client
+  loops the single-item routes instead. A batch is one connection pass with a
+  savepoint per item, so one bad item never aborts the rest; the result is a
+  `BatchResult` (`{operation, count, succeeded, failed, dry_run, results}`) and
+  the exit code is 1 when any item failed. `--dry-run` validates and rolls back.
+- **`get` neighbourhood filters**: `--edge-kind` (repeatable) and `--direction
+  in|out|both` filter the incident edges; these are also on the API
+  (`GET /nodes/{uuid}?edge_kind=&direction=`).
 
 **API routes:** `POST /nodes`, `GET /nodes/{uuid}`, `PATCH /nodes/{uuid}`,
 `DELETE /nodes/{uuid}`, `POST /edges`, `PATCH /edges/{uuid}`,
@@ -369,7 +403,7 @@ re-run on every start-up.
   `to_uuid`, and `data`.
 - **Retrieval.** `search` is Postgres full-text (`plainto_tsquery('english')`,
   AND of terms) over `content`, ranked by `ts_rank`, with an optional `kind`
-  filter. `expand` walks directed edges (`from_uuid → to_uuid`) outward from a
+  filter and an optional `tags` filter (JSONB containment on `data.tags`). `expand` walks directed edges (`from_uuid → to_uuid`) outward from a
   seed set up to `depth` hops via a recursive CTE — optionally restricted to given
   edge kinds — then loads every node touched; serialised, that `Subgraph` is the
   context payload. `get` returns a node plus every edge incident on it in either

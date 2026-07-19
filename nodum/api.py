@@ -192,9 +192,19 @@ def create_node(body: AddNodeIn) -> JSONResponse:
 
 
 @router.get("/nodes/{uuid}")
-def get_node(uuid: UUID) -> JSONResponse:
-    """Fetch a node with every edge incident on it (either direction)."""
-    result = service.get(str(uuid))
+def get_node(
+    uuid: UUID,
+    edge_kind: list[str] | None = Query(None),  # noqa: B008 — FastAPI query-param sentinel
+    direction: str = "both",
+) -> JSONResponse:
+    """Fetch a node with its incident edges, optionally filtered.
+
+    Args:
+        uuid: The node to fetch.
+        edge_kind: Repeatable query param; only include incident edges of these kinds.
+        direction: Which incident edges to return — ``in``, ``out``, or ``both``.
+    """
+    result = service.get(str(uuid), edge_kinds=edge_kind, direction=direction)
     return JSONResponse(content=result.model_dump(mode="json"))
 
 
@@ -240,9 +250,21 @@ def delete_edge(uuid: UUID) -> JSONResponse:
 
 
 @router.get("/search")
-def search(q: str, kind: str | None = None, limit: int = 20) -> JSONResponse:
-    """Full-text search over node text, ranked best-first, optionally by kind."""
-    result = service.search(q, kind=kind, limit=limit)
+def search(
+    q: str,
+    kind: str | None = None,
+    limit: int = 20,
+    tag: list[str] | None = Query(None),  # noqa: B008 — FastAPI query-param sentinel
+) -> JSONResponse:
+    """Full-text search over node text, ranked best-first, with filters.
+
+    Args:
+        q: Free-text query (AND of terms).
+        kind: Optional node-kind filter.
+        limit: Maximum number of hits.
+        tag: Repeatable query param; a hit's ``data.tags`` must contain every given tag.
+    """
+    result = service.search(q, kind=kind, limit=limit, tags=tag)
     return JSONResponse(content=result.model_dump(mode="json"))
 
 
