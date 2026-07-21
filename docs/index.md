@@ -81,7 +81,9 @@ The pages are written to be read top-to-bottom the first time:
    node, link a typed edge, search, and expand a subgraph.
 2. **[Concepts](concepts.md)** — the typed graph: nodes, edges, the runtime-evolvable schema of
    DB-stored kinds, the `from → to` signatures, and the *open process, closed format* principle.
-3. **Reference** — the long form: [Install &amp; run](install.md) (both distribution tracks,
+3. **[Data model](model.md)** — the same model in diagrams: the tables, the seeded kind catalog,
+   how `get` / `expand` walk the graph, and the `title` / `tags` conventions.
+4. **Reference** — the long form: [Install &amp; run](install.md) (both distribution tracks,
    configuration, auth, migration) and [Commands](commands.md) (every CLI verb and API route, with
    the JSON contract).
 

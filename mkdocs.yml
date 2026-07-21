@@ -60,7 +60,11 @@ markdown_extensions:
   - toc:
       permalink: true
   - pymdownx.details
-  - pymdownx.superfences
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
   - pymdownx.highlight:
       anchor_linenums: true
       line_spans: __span
@@ -76,6 +80,7 @@ nav:
   - Overview: index.md
   - Quick start: quick-start.md
   - Concepts: concepts.md
+  - Data model: model.md
   - Reference:
       - Install & run: install.md
       - Commands: commands.md
