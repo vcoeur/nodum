@@ -48,12 +48,14 @@ source = "vcs"
 [tool.hatch.build.targets.wheel]
 packages = ["nodum"]
 
-# Non-Python package data the runtime reads via importlib.resources: the DDL.
+# Non-Python package data the runtime reads via importlib.resources: the DDL and
+# the bundled agent skill (installed by `nodum skill install`).
 # The web UI (the React bundle) is NOT in the wheel — it is built into the Docker
 # image and served from NODUM_WEB_DIST (see nodum.web).
 [tool.hatch.build]
 artifacts = [
     "nodum/schema.sql",
+    "nodum/skill/SKILL.md",
 ]
 
 [dependency-groups]

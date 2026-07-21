@@ -18,11 +18,13 @@ checkout). Every command prints a **single JSON object to stdout**; human messag
 | Command | Does |
 |---|---|
 | `add KIND CONTENT [--set k=v …]` | create a typed node |
+| `add --batch FILE\|- [--dry-run]` | bulk create from a JSON array of `{kind, content, data?}` |
 | `link FROM TO EDGE_KIND [--set k=v …]` | create a typed directed edge |
-| `get UUID` | a node plus its incident edges |
-| `search QUERY [--kind K] [--limit N]` | ranked full-text search |
+| `get UUID [UUID …] [--edge-kind K …] [--direction in\|out\|both] [--fields …] [--max-body-chars N]` | a node plus its incident edges; several UUIDs → `{targets, nodes, failed}` |
+| `search QUERY [--kind K] [--tag T …] [--limit N] [--fields …] [--max-body-chars N]` | ranked full-text search (snippets by default) |
 | `expand UUID [--depth N] [--edge-kind K …]` | seed → connected subgraph |
 | `edit-node UUID [--content …] [--set k=v …]` | merge + re-validate a node |
+| `edit-node --batch FILE\|- [--dry-run]` | bulk edit from a JSON array of `{uuid, content?, data?}` |
 | `edit-edge UUID [--set k=v …]` | merge an edge's payload |
 | `rm-node UUID` | delete a node (edges cascade) |
 | `rm-edge UUID` | delete one edge |
@@ -33,6 +35,8 @@ checkout). Every command prints a **single JSON object to stdout**; human messag
 | `edge-kind add NAME [--from K …] [--to K …] [--symmetric] [--fields JSON]` | register an edge kind |
 | `edge-kind edit NAME [--from …] [--to …] [--symmetric/--asymmetric] [--fields …]` | edit an edge kind |
 | `edge-kind rm NAME [--into KIND] [--purge]` | delete an edge kind (refused if in use; `--into` reassigns, `--purge` deletes its edges) |
+| `skill install [--user\|--project\|--dest DIR] [--force]` | install the bundled agent skill (SKILL.md) |
+| `skill status` | show where the skill is installed and whether it matches the bundled copy |
 | `auth set-password` | set/replace the main password (prompt or piped stdin) |
 | `auth status` | report whether a password is configured (+ timestamp) |
 | `auth ensure-password` | set the password from `NODUM_ADMIN_PASSWORD[_FILE]` if unconfigured (entrypoint bootstrap) |
@@ -62,10 +66,50 @@ and the result is re-validated against the kind.
 ```bash
 nodum link <person-uuid> <reference-uuid> AuthorOf      # Person → Reference (signature-checked)
 nodum get <uuid>                                        # node + every incident edge
+nodum get <uuid1> <uuid2> <uuid3>                       # one call → {targets, nodes, failed}
 nodum search "analytical engine" --kind Reference --limit 10
+nodum search "retention" --tag learning --fields minimal
 nodum expand <uuid> --depth 2 --edge-kind AuthorOf --edge-kind cites
 nodum schema                                            # the whole live schema
 ```
+
+### Agent ergonomics — titles, tags, snippets, filters, batch
+
+Every node payload carries a derived **`title`**: the first non-blank line of `content`, capped at 80
+characters, computed at read time (never stored — it tracks edits for free). Write a strong first line.
+
+**Tags** are a convention, not a schema feature: any node may carry `"tags": ["…"]` in its `data`
+payload (set with `--set 'tags=["learning"]'` or a batch `data` object). `search --tag` is repeatable
+with AND semantics — a hit's `data.tags` must contain every given tag (JSONB containment, served by
+the GIN index on `data`).
+
+`get` and `search` have **token-budget controls** (CLI only — the API always returns full payloads):
+
+- `search` returns a 200-character **snippet** per hit by default; when the content was cut, the hit
+  also carries `content_truncated: true` and `content_total_chars`. `--fields full` restores the
+  untruncated payload, `--max-body-chars N` sets an explicit cut (also on `get`), and
+  `--fields minimal` projects a search hit to `{uuid, kind, title, score}` and a `get` node to
+  `{uuid, kind, title}`.
+- `get` accepts **several UUIDs** in one call and prints `{targets, nodes, failed}` — a missing or
+  malformed UUID lands in `failed` without aborting the rest (exit 1 only when *every* target
+  failed). Its incident edges can be filtered with `--edge-kind K` (repeatable) and
+  `--direction in|out|both` — these two filters are also on the API
+  (`GET /nodes/{uuid}?edge_kind=&direction=`).
+
+For **3+ writes**, use the batch forms instead of looping single calls — one connection pass with a
+savepoint per item, so one bad item never aborts the rest:
+
+```bash
+echo '[
+  {"kind": "Note", "content": "Spaced repetition beats cramming.", "data": {"role": "claim", "tags": ["learning"]}},
+  {"kind": "Note", "content": "Retrieval practice is the active ingredient.", "data": {"role": "hypothesis"}}
+]' | nodum add --batch -
+# → {operation, count, succeeded, failed, dry_run, results: [{index, ok, uuid|error}]}
+```
+
+`edit-node --batch` mirrors it with `{uuid, content?, data?}` items (same merge semantics as the
+single form). Both support `--dry-run` (validate everything, write nothing), are mutually exclusive
+with the positional form, and exit 1 when any item failed — the full JSON summary is still on stdout.
 
 ### Evolving the schema
 
@@ -104,13 +148,13 @@ with no `response_model`, so keys are neither added, dropped, nor reordered.
 | Method & path | Does |
 |---|---|
 | `POST /nodes` | create a typed node (`{"kind","content","data"}`) |
-| `GET /nodes/{uuid}` | a node plus its incident edges |
+| `GET /nodes/{uuid}` | a node plus its incident edges (`?edge_kind=` repeatable, `?direction=in\|out\|both`) |
 | `PATCH /nodes/{uuid}` | merge `{"content","data"}` into a node, re-validate |
 | `DELETE /nodes/{uuid}` | delete a node; edges cascade (returns the count) |
 | `POST /edges` | create an edge (`{"kind","from_uuid","to_uuid","data"}`) |
 | `PATCH /edges/{uuid}` | merge `{"data"}` into an edge (kind + endpoints fixed) |
 | `DELETE /edges/{uuid}` | delete one edge (returns the count) |
-| `GET /search?q=&kind=&limit=` | ranked full-text search (`limit` default 20) |
+| `GET /search?q=&kind=&limit=&tag=` | ranked full-text search (`limit` default 20; `tag` repeatable, AND on `data.tags`) |
 | `GET /expand?seed=&depth=&edge_kind=` | seed → subgraph (`depth` default 1; `edge_kind` repeatable) |
 | `GET /schema` | the live schema (node + edge kinds; each kind carries a `usage` count) |
 | `POST /node-kinds` | register a node kind (`{"name","group","content_label","fields"}`) |

@@ -19,6 +19,7 @@ import os
 import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
+from importlib import resources
 from pathlib import Path
 
 import typer
@@ -96,6 +97,58 @@ def _parse_fields(raw: str | None) -> dict:
     return value
 
 
+# ── Agent-ergonomics output shaping (presentation only, CLI-side) ─────────────
+
+#: Default snippet length for search hits — the CLI returns a short snippet per
+#: hit unless ``--fields full`` or an explicit ``--max-body-chars`` is given.
+SNIPPET_CHARS = 200
+
+#: Keys kept by ``--fields minimal`` on search hits (uuid, kind, title, rank).
+_SEARCH_MINIMAL_KEYS = ("uuid", "kind", "title", "score")
+
+#: Keys kept by ``--fields minimal`` on a ``get`` node payload.
+_NODE_MINIMAL_KEYS = ("uuid", "kind", "title")
+
+
+def _truncate_content(node: dict, max_chars: int) -> None:
+    """Truncate a node payload's ``content`` in place, recording the cut.
+
+    Adds the additive ``content_truncated`` / ``content_total_chars`` fields
+    only when a cut actually happened, so a short payload is unchanged.
+    """
+    content = node.get("content")
+    if isinstance(content, str) and len(content) > max_chars:
+        node["content"] = content[:max_chars]
+        node["content_truncated"] = True
+        node["content_total_chars"] = len(content)
+
+
+def _project(payload: dict, keys: tuple[str, ...]) -> dict:
+    """Project a payload dict down to ``keys``, dropping everything else."""
+    return {key: payload[key] for key in keys if key in payload}
+
+
+def _check_fields_option(fields: str | None, allowed: tuple[str, ...]) -> None:
+    """Reject an unknown ``--fields`` value."""
+    if fields is not None and fields not in allowed:
+        typer.echo(f"--fields must be one of {', '.join(allowed)}, got {fields!r}", err=True)
+        raise typer.Exit(1)
+
+
+def _read_batch_items(batch: Path) -> list:
+    """Read a ``--batch`` JSON array from a file (``-`` reads stdin)."""
+    raw = sys.stdin.read() if str(batch) == "-" else batch.read_text(encoding="utf-8")
+    try:
+        items = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        typer.echo(f"--batch input is not valid JSON: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    if not isinstance(items, list):
+        typer.echo("--batch input must be a JSON array of items", err=True)
+        raise typer.Exit(1)
+    return items
+
+
 @contextmanager
 def _service_errors() -> Iterator[None]:
     """Translate expected service failures into a stderr message and exit code 1.
@@ -115,13 +168,46 @@ def _service_errors() -> Iterator[None]:
 
 @app.command("add")
 def add(
-    kind: str = typer.Argument(..., help="The node kind from the schema."),
-    content: str = typer.Argument(..., help="The node's plain-text content (embeddable body)."),
+    kind: str | None = typer.Argument(None, help="The node kind from the schema."),
+    content: str | None = typer.Argument(
+        None, help="The node's plain-text content (embeddable body)."
+    ),
     set_: list[str] | None = typer.Option(
         None, "--set", help="Payload key=value (repeatable); value parsed as JSON, else raw string."
     ),
+    batch: Path | None = typer.Option(
+        None,
+        "--batch",
+        help="Bulk create from a JSON array of {kind, content, data?} items ('-' reads stdin).",
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Validate every batch item without writing anything."
+    ),
 ) -> None:
-    """Create a typed node and print it as a NodeOut JSON object."""
+    """Create a typed node (or a batch of them) and print the result as JSON.
+
+    Single form: ``add KIND CONTENT [--set k=v …]`` prints a NodeOut object.
+    Batch form: ``add --batch FILE|-`` prints a BatchResult with one outcome
+    per item — one bad item never aborts the rest; exit code is 1 when any
+    item failed.
+    """
+    if batch is not None:
+        if kind is not None or content is not None or set_:
+            typer.echo("--batch is mutually exclusive with KIND, CONTENT and --set", err=True)
+            raise typer.Exit(1)
+        items = _read_batch_items(batch)
+        with _service_errors():
+            result = service.add_nodes_batch(items, dry_run=dry_run)
+        _emit(result)
+        if result.failed:
+            raise typer.Exit(1)
+        return
+    if dry_run:
+        typer.echo("--dry-run only applies to --batch", err=True)
+        raise typer.Exit(1)
+    if kind is None or content is None:
+        typer.echo("missing KIND and CONTENT (or pass --batch FILE)", err=True)
+        raise typer.Exit(1)
     data = _parse_set(set_)
     with _service_errors():
         node = service.add_node(kind, content, data=data)
@@ -145,11 +231,52 @@ def link(
 
 
 @app.command("get")
-def get(uuid: str = typer.Argument(..., help="The node UUID to fetch.")) -> None:
-    """Fetch a node and its incident edges, printed as a NodeWithEdges JSON object."""
+def get(
+    uuids: list[str] = typer.Argument(..., help="One or more node UUIDs to fetch."),
+    edge_kind: list[str] | None = typer.Option(
+        None, "--edge-kind", help="Only include incident edges of these kinds (repeatable)."
+    ),
+    direction: str = typer.Option(
+        "both", "--direction", help="Incident edges to include: in, out, or both (default)."
+    ),
+    fields: str | None = typer.Option(
+        None, "--fields", help="Payload projection: minimal (uuid, kind, title) or full (default)."
+    ),
+    max_body_chars: int | None = typer.Option(
+        None,
+        "--max-body-chars",
+        help="Truncate content to N characters; adds content_truncated / content_total_chars.",
+    ),
+) -> None:
+    """Fetch node(s) and their incident edges, printed as JSON.
+
+    One UUID prints the NodeWithEdges object (unchanged shape). Several UUIDs
+    print ``{targets, nodes, failed}`` — a missing UUID lands in ``failed``
+    without aborting the rest (exit 0 when at least one target resolved).
+    """
+    _check_fields_option(fields, ("minimal", "full"))
+
+    def _shape(node_payload: dict) -> dict:
+        if fields == "minimal":
+            return _project(node_payload, _NODE_MINIMAL_KEYS)
+        if max_body_chars is not None:
+            _truncate_content(node_payload, max_body_chars)
+        return node_payload
+
     with _service_errors():
-        result = service.get(uuid)
-    _emit(result)
+        if len(uuids) == 1:
+            result = service.get(uuids[0], edge_kinds=edge_kind or None, direction=direction)
+            payload = result.model_dump(mode="json")
+            payload["node"] = _shape(payload["node"])
+            _print_json(payload)
+            return
+        result = service.get_many(uuids, edge_kinds=edge_kind or None, direction=direction)
+    payload = result.model_dump(mode="json")
+    for entry in payload["nodes"]:
+        entry["node"] = _shape(entry["node"])
+    _print_json(payload)
+    if len(payload["failed"]) == len(uuids):
+        raise typer.Exit(1)
 
 
 @app.command("search")
@@ -157,11 +284,43 @@ def search(
     query: str = typer.Argument(..., help="Free-text query (AND of terms)."),
     kind: str | None = typer.Option(None, "--kind", "-k", help="Optional node-kind filter."),
     limit: int = typer.Option(20, "--limit", "-l", help="Maximum number of hits."),
+    tag: list[str] | None = typer.Option(
+        None, "--tag", help="Require this tag (repeatable; AND semantics, matches data.tags)."
+    ),
+    fields: str | None = typer.Option(
+        None,
+        "--fields",
+        help="Hit projection: minimal (uuid, kind, title, score) or full (untruncated content).",
+    ),
+    max_body_chars: int | None = typer.Option(
+        None,
+        "--max-body-chars",
+        help="Truncate each hit's content to N characters (default: a 200-char snippet).",
+    ),
 ) -> None:
-    """Full-text search node text and print the ranked SearchResult JSON object."""
+    """Full-text search node text and print the ranked SearchResult JSON object.
+
+    By default each hit's ``content`` is a short snippet (200 chars max, with
+    ``content_truncated`` / ``content_total_chars`` added when cut); pass
+    ``--fields full`` for the untruncated payload or ``--fields minimal`` for
+    uuid/kind/title/score only.
+    """
+    _check_fields_option(fields, ("minimal", "full"))
     with _service_errors():
-        result = service.search(query, kind=kind, limit=limit)
-    _emit(result)
+        result = service.search(query, kind=kind, limit=limit, tags=tag or None)
+    payload = result.model_dump(mode="json")
+    if fields == "minimal":
+        payload["hits"] = [_project(hit, _SEARCH_MINIMAL_KEYS) for hit in payload["hits"]]
+    else:
+        budget = (
+            max_body_chars
+            if max_body_chars is not None
+            else (None if fields == "full" else SNIPPET_CHARS)
+        )
+        if budget is not None:
+            for hit in payload["hits"]:
+                _truncate_content(hit, budget)
+    _print_json(payload)
 
 
 @app.command("expand")
@@ -180,13 +339,44 @@ def expand(
 
 @app.command("edit-node")
 def edit_node(
-    uuid: str = typer.Argument(..., help="The node UUID to update."),
+    uuid: str | None = typer.Argument(None, help="The node UUID to update."),
     content: str | None = typer.Option(None, "--content", help="Replacement node content."),
     set_: list[str] | None = typer.Option(
         None, "--set", help="Payload key=value (repeatable); value parsed as JSON, else raw string."
     ),
+    batch: Path | None = typer.Option(
+        None,
+        "--batch",
+        help="Bulk edit from a JSON array of {uuid, content?, data?} items ('-' reads stdin).",
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Validate every batch item without writing anything."
+    ),
 ) -> None:
-    """Merge new content/payload into a node and print the updated NodeOut JSON object."""
+    """Merge new content/payload into node(s) and print the result as JSON.
+
+    Single form: ``edit-node UUID [--content …] [--set k=v …]`` prints the
+    updated NodeOut object. Batch form: ``edit-node --batch FILE|-`` prints a
+    BatchResult with one outcome per item — one bad item never aborts the
+    rest; exit code is 1 when any item failed.
+    """
+    if batch is not None:
+        if uuid is not None or content is not None or set_:
+            typer.echo("--batch is mutually exclusive with UUID, --content and --set", err=True)
+            raise typer.Exit(1)
+        items = _read_batch_items(batch)
+        with _service_errors():
+            result = service.update_nodes_batch(items, dry_run=dry_run)
+        _emit(result)
+        if result.failed:
+            raise typer.Exit(1)
+        return
+    if dry_run:
+        typer.echo("--dry-run only applies to --batch", err=True)
+        raise typer.Exit(1)
+    if uuid is None:
+        typer.echo("missing UUID (or pass --batch FILE)", err=True)
+        raise typer.Exit(1)
     data = _parse_set(set_)
     with _service_errors():
         node = service.update_node(uuid, content=content, data=data)
@@ -464,6 +654,81 @@ def auth_ensure_password() -> None:
         return
     auth.set_password(password)
     _print_json({"configured": True, "action": "set"})
+
+
+# ── Bundled agent skill ───────────────────────────────────────────────────────
+
+skill_app = typer.Typer(
+    no_args_is_help=True,
+    help="Install the bundled nodum agent skill (SKILL.md) for LLM agent harnesses.",
+)
+app.add_typer(skill_app, name="skill")
+
+# Default install targets, by scope.
+USER_SKILL_DIR = Path.home() / ".config" / "agents" / "skills" / "nodum"
+PROJECT_SKILL_DIR = Path(".agents") / "skills" / "nodum"
+
+
+def _bundled_skill_text() -> str:
+    """Read the SKILL.md shipped inside the package (``nodum/skill/SKILL.md``)."""
+    return (resources.files("nodum") / "skill" / "SKILL.md").read_text(encoding="utf-8")
+
+
+@skill_app.command("install")
+def skill_install(
+    user: bool = typer.Option(
+        False, "--user", help="Install to ~/.config/agents/skills/nodum/ (default)."
+    ),
+    project: bool = typer.Option(
+        False, "--project", help="Install to ./.agents/skills/nodum/ (project-local)."
+    ),
+    dest: Path | None = typer.Option(None, "--dest", help="Install to an explicit directory."),
+    force: bool = typer.Option(False, "--force", help="Overwrite an existing SKILL.md."),
+) -> None:
+    """Copy the bundled SKILL.md into a skills directory and print a status object."""
+    scopes = [name for name, flag in (("--user", user), ("--project", project)) if flag]
+    if dest is not None and scopes:
+        typer.echo(f"--dest is mutually exclusive with {scopes[0]}", err=True)
+        raise typer.Exit(1)
+    if dest is not None:
+        target_dir = dest
+    elif project:
+        target_dir = Path.cwd() / PROJECT_SKILL_DIR
+    else:
+        target_dir = USER_SKILL_DIR
+    target = target_dir / "SKILL.md"
+    existed = target.exists()
+    if existed and not force:
+        typer.echo(f"{target} already exists — pass --force to overwrite", err=True)
+        raise typer.Exit(1)
+    text = _bundled_skill_text()
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target.write_text(text, encoding="utf-8")
+    _print_json(
+        {"installed": str(target), "bytes": len(text.encode("utf-8")), "overwritten": existed}
+    )
+
+
+@skill_app.command("status")
+def skill_status() -> None:
+    """Report where the skill is installed and whether it matches the bundled copy."""
+    bundled = _bundled_skill_text()
+    targets = {
+        "user": USER_SKILL_DIR / "SKILL.md",
+        "project": Path.cwd() / PROJECT_SKILL_DIR / "SKILL.md",
+    }
+    rows = []
+    for scope, path in targets.items():
+        installed = path.exists()
+        rows.append(
+            {
+                "scope": scope,
+                "path": str(path),
+                "installed": installed,
+                "current": installed and path.read_text(encoding="utf-8") == bundled,
+            }
+        )
+    _print_json({"bundled_bytes": len(bundled.encode("utf-8")), "targets": rows})
 
 
 @app.command("serve")
