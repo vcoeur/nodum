@@ -7,6 +7,7 @@
 - [Overview](https://nodum.vcoeur.com/): what nodum is, what it does, and who it is for.
 - [Quick start](https://nodum.vcoeur.com/quick-start/): run the full app with Docker (or install the CLI), sign in, then create a typed node, link a typed edge, search, and expand a subgraph.
 - [Concepts](https://nodum.vcoeur.com/concepts/): the typed graph — nodes, edges, the runtime-evolvable schema of DB-stored kinds, the from→to edge signatures, soft service validation vs cheap-hard DB constraints, and the open-process-closed-format principle.
+- [Data model](https://nodum.vcoeur.com/model/): the model in diagrams — the tables (nodes/edges + the kind catalog), the seeded node kinds and edge-kind signatures, how get/expand walk the graph, and the title/tags conventions.
 - [Install & run](https://nodum.vcoeur.com/install/): the Docker (full app) and PyPI (CLI/library) tracks, all environment variables, authentication, and migrating an older database.
 - [Commands](https://nodum.vcoeur.com/commands/): full CLI verb + HTTP API route reference, the `--set` field syntax, the byte-identical JSON envelopes, and the error contract.
 
