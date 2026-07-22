@@ -169,9 +169,25 @@ CREATE VIRTUAL TABLE node_fts USING fts5(
 """
 
 
+POLICIES_DDL = """
+-- Per-agent policy rulesets (design §8.3). `rules` is a JSON array of rule
+-- objects keyed by `job` (internal-agent jobs, evaluated by the Phase-5
+-- runtime) or `edge_type` (evaluated on the write path today), each with an
+-- `action` (`auto_accept` / `auto_apply` / `always_propose`) and an optional
+-- `min_confidence` gate. Policy edits are themselves events (`policy.set`).
+CREATE TABLE policies (
+    agent      TEXT PRIMARY KEY,             -- actor string, e.g. 'agent:researcher'
+    rules      TEXT NOT NULL DEFAULT '[]',   -- JSON array of rule objects
+    updated_by TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+"""
+
+
 #: Ordered (name, SQL) migrations. Append-only — never edit a shipped entry.
 MIGRATIONS: list[tuple[str, str]] = [
     ("0001_core", CORE_DDL),
     ("0002_seed_builtin_types", _seed_sql()),
     ("0003_projector_checkpoints_and_fts", PROJECTORS_DDL),
+    ("0004_policies", POLICIES_DDL),
 ]

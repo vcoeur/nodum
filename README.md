@@ -11,9 +11,10 @@ reversible.
 versions + undo, Markdown-as-truth content, wikilink materialization, and a
 JSON-emitting CLI. **Phase 2 (agent-native)** is underway: event-log
 projectors with checkpoint/rebuild mechanics and the first derived index —
-an FTS5 full-text index feeding BM25 keyword search. Still to come: vector
-search + hybrid fusion, the MCP server, the web UI, assets, and the
-consolidation cycle.
+an FTS5 full-text index feeding BM25 keyword search — plus DB-stored **agent
+policies** with auto-accept on the write path and the **review/accept API**
+for the proposal queue. Still to come: vector search + hybrid fusion, the MCP
+server, the web UI, assets, and the consolidation cycle.
 
 ## Quick start
 
@@ -39,6 +40,17 @@ uv run nodum node list --type note
 uv run nodum history <node-id>                # version snapshots
 uv run nodum undo                             # reverse the latest event
 uv run nodum types                            # the seeded type catalog
+
+# Agent writes land in `proposed` and wait in the review queue…
+uv run nodum node create --type note --title "Bot draft" --actor agent:researcher
+uv run nodum review queue --created-by agent:researcher
+uv run nodum review accept-all --created-by agent:researcher
+uv run nodum review reject <id> --reason "not convinced"
+
+# …unless a stored policy auto-accepts them (still the agent's own event)
+uv run nodum policy set agent:researcher --rule \
+    '{"edge_type":"mentions","min_confidence":0.9,"action":"auto_accept"}'
+uv run nodum policy list
 ```
 
 Run `uv run nodum --help` (or any subcommand with `--help`) for the full
@@ -55,7 +67,12 @@ surface.
   archives the edge. Unresolvable targets are skipped silently.
 - **State machine.** Nodes and edges are `proposed`, `active`, or `archived`.
   Human (CLI) writes land `active`; any other actor's writes land `proposed`
-  and are accepted/rejected explicitly.
+  and are accepted/rejected explicitly — individually, in batches, or by
+  filter through the review queue (`nodum review …`).
+- **Agent policies.** Per-agent rulesets stored in the DB (`nodum policy …`)
+  can auto-accept an agent's writes — e.g. "accept `mentions` edges from
+  `agent:researcher` with confidence ≥ 0.9". An auto-accepted write is still
+  the agent's own event, with the matched rule recorded in the payload.
 - **Event log + versions.** Every mutation appends an event (actor, op, full
   before/after JSON payload) and — for nodes — a version snapshot. `undo`
   reverses an event by restoring its `before` state.

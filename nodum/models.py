@@ -169,3 +169,60 @@ class SearchResult(BaseModel):
     query: str
     k: int
     hits: list[SearchHit]
+
+
+class PolicyOut(BaseModel):
+    """One agent's policy ruleset (design §8.3).
+
+    ``rules`` is the stored JSON ruleset verbatim: rule objects keyed by
+    ``job`` (internal-agent jobs, evaluated by the Phase-5 runtime) or
+    ``edge_type`` (evaluated on the write path), each with an ``action``
+    (``auto_accept`` / ``auto_apply`` / ``always_propose``) and an optional
+    ``min_confidence`` gate. Rules are validated on write; unknown extra keys
+    are preserved for forward compatibility.
+    """
+
+    agent: str
+    rules: list[dict[str, Any]]
+    updated_by: str
+    updated_at: str
+
+
+class ProposalOut(BaseModel):
+    """One pending proposal in the review queue: a proposed node or edge.
+
+    ``context`` carries what a reviewer needs beyond the row itself — for an
+    edge, the source/target node ids and titles; for a node, its parent's
+    id/title when it has one.
+    """
+
+    kind: str
+    id: str
+    type: str
+    created_by: str
+    created_at: str
+    node: NodeOut | None = None
+    edge: EdgeOut | None = None
+    context: dict[str, Any] = {}
+
+
+class TransitionFailure(BaseModel):
+    """One id a batch transition could not process, with the reason."""
+
+    id: str
+    error: str
+
+
+class BatchTransitionOut(BaseModel):
+    """The outcome of a batch accept/reject.
+
+    ``transitioned`` lists the ids that moved state (each emitted its own
+    event); ``failed`` lists ids skipped because they were unknown or not in
+    the required state — a batch never aborts on a single bad id.
+    """
+
+    action: str
+    actor: str
+    reason: str | None = None
+    transitioned: list[str]
+    failed: list[TransitionFailure]

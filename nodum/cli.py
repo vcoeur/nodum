@@ -25,6 +25,7 @@ from nodum.service import (
     EventNotFound,
     InvalidTransition,
     NodeNotFound,
+    PolicyNotFound,
     TypeNotFound,
 )
 
@@ -38,9 +39,13 @@ edge_app = typer.Typer(no_args_is_help=True, help="Edge operations.")
 projector_app = typer.Typer(
     no_args_is_help=True, help="Derived-index projectors over the event log."
 )
+policy_app = typer.Typer(no_args_is_help=True, help="Per-agent policy rulesets (auto-accept).")
+review_app = typer.Typer(no_args_is_help=True, help="The review queue: pending proposals.")
 app.add_typer(node_app, name="node")
 app.add_typer(edge_app, name="edge")
 app.add_typer(projector_app, name="projector")
+app.add_typer(policy_app, name="policy")
+app.add_typer(review_app, name="review")
 
 
 @app.callback()
@@ -107,6 +112,7 @@ def _run(func, *args, **kwargs):
         EdgeNotFound,
         TypeNotFound,
         EventNotFound,
+        PolicyNotFound,
         InvalidTransition,
         ValueError,
     ) as exc:
@@ -333,3 +339,155 @@ def projector_status() -> None:
     """Show every projector's checkpoint, backlog, and derived-store size."""
     statuses = _run(projectors.projector_status)
     _print_json({"projectors": [status.model_dump(mode="json") for status in statuses]})
+
+
+# ── Policies ──────────────────────────────────────────────────────────────────
+
+
+@policy_app.command("set")
+def policy_set(
+    agent: str = typer.Argument(..., help="Actor the policy governs, e.g. 'agent:researcher'."),
+    rule: list[str] = typer.Option(
+        ...,
+        "--rule",
+        help="Repeatable JSON rule object, e.g. "
+        '\'{"edge_type":"mentions","min_confidence":0.9,"action":"auto_accept"}\'.',
+    ),
+    actor: str = ACTOR_OPTION,
+) -> None:
+    """Create or replace an agent's policy ruleset (audited as policy.set)."""
+    rules = []
+    for raw in rule:
+        try:
+            rules.append(json.loads(raw))
+        except json.JSONDecodeError:
+            typer.echo(f"--rule expects a JSON object, got {raw!r}", err=True)
+            raise typer.Exit(1) from None
+    _emit(_run(service.set_policy, agent, rules, actor=actor))
+
+
+@policy_app.command("get")
+def policy_get(
+    agent: str = typer.Argument(..., help="Actor string, e.g. 'agent:researcher'."),
+) -> None:
+    """Show one agent's policy."""
+    _emit(_run(service.get_policy, agent))
+
+
+@policy_app.command("list")
+def policy_list() -> None:
+    """List every stored policy."""
+    policies = _run(service.list_policies)
+    _print_json(
+        {
+            "policies": [policy.model_dump(mode="json") for policy in policies],
+            "count": len(policies),
+        }
+    )
+
+
+# ── Review queue ──────────────────────────────────────────────────────────────
+
+KIND_OPTION = typer.Option(None, "--kind", help="Limit to 'node' or 'edge' proposals.")
+CREATED_BY_OPTION = typer.Option(None, "--created-by", help="Filter by proposing actor.")
+CREATED_BEFORE_OPTION = typer.Option(
+    None, "--created-before", help="Only proposals created before this timestamp."
+)
+CREATED_AFTER_OPTION = typer.Option(
+    None, "--created-after", help="Only proposals created after this timestamp."
+)
+REVIEW_TYPE_OPTION = typer.Option(None, "--type", "-t", help="Filter by node/edge type.")
+
+
+@review_app.command("queue")
+def review_queue(
+    created_by: str | None = CREATED_BY_OPTION,
+    type: str | None = REVIEW_TYPE_OPTION,
+    kind: str | None = KIND_OPTION,
+    created_before: str | None = CREATED_BEFORE_OPTION,
+    created_after: str | None = CREATED_AFTER_OPTION,
+    limit: int = typer.Option(500, "--limit", help="Maximum proposals."),
+) -> None:
+    """List pending proposals (proposed nodes/edges) with reviewer context."""
+    proposals = _run(
+        service.list_proposals,
+        created_by=created_by,
+        type=type,
+        kind=kind,
+        created_before=created_before,
+        created_after=created_after,
+        limit=limit,
+    )
+    _print_json(
+        {
+            "proposals": [proposal.model_dump(mode="json") for proposal in proposals],
+            "count": len(proposals),
+        }
+    )
+
+
+@review_app.command("accept")
+def review_accept(
+    ids: list[str] = typer.Argument(..., help="Node/edge ids to accept."),
+    actor: str = ACTOR_OPTION,
+) -> None:
+    """Accept proposals by id (proposed → active); bad ids are reported, not fatal."""
+    _emit(_run(service.accept_proposals, ids, actor=actor))
+
+
+@review_app.command("reject")
+def review_reject(
+    ids: list[str] = typer.Argument(..., help="Node/edge ids to reject."),
+    reason: str = typer.Option(..., "--reason", help="Recorded in every reject event."),
+    actor: str = ACTOR_OPTION,
+) -> None:
+    """Reject proposals by id (proposed → archived); bad ids are reported, not fatal."""
+    _emit(_run(service.reject_proposals, ids, reason=reason, actor=actor))
+
+
+@review_app.command("accept-all")
+def review_accept_all(
+    created_by: str | None = CREATED_BY_OPTION,
+    type: str | None = REVIEW_TYPE_OPTION,
+    kind: str | None = KIND_OPTION,
+    created_before: str | None = CREATED_BEFORE_OPTION,
+    created_after: str | None = CREATED_AFTER_OPTION,
+    actor: str = ACTOR_OPTION,
+) -> None:
+    """Accept every proposal matching the filters (e.g. one agent's whole run)."""
+    _emit(
+        _run(
+            service.accept_matching,
+            created_by=created_by,
+            type=type,
+            kind=kind,
+            created_before=created_before,
+            created_after=created_after,
+            actor=actor,
+        )
+    )
+
+
+@review_app.command("reject-all")
+def review_reject_all(
+    reason: str = typer.Option(..., "--reason", help="Recorded in every reject event."),
+    created_by: str | None = CREATED_BY_OPTION,
+    type: str | None = REVIEW_TYPE_OPTION,
+    kind: str | None = KIND_OPTION,
+    created_before: str | None = CREATED_BEFORE_OPTION,
+    created_after: str | None = CREATED_AFTER_OPTION,
+    actor: str = ACTOR_OPTION,
+) -> None:
+    """Reject every proposal matching the filters, recording the reason."""
+    _emit(
+        _run(
+            service.reject_matching,
+            reason=reason,
+            created_by=created_by,
+            type=type,
+            kind=kind,
+            created_before=created_before,
+            created_after=created_after,
+            actor=actor,
+        )
+    )

@@ -16,21 +16,27 @@ one JSON object per command.
 Phase 1 (core) landed; Phase 2 (agent-native) is underway. Built so far in
 Phase 2: **event-log projectors** (`nodum.projectors`) with per-projector
 checkpoints and rebuild mechanics, the **`fts` projector** (FTS5 over node
-title + content), and **BM25 keyword search** (`nodum.search`, CLI `search`).
-**Deliberately not built yet** (later phases — do not add): sqlite-vec /
-hybrid fusion, the MCP server, the web UI, assets/CAS/renditions/ingestion,
-the internal agent runtime and consolidation cycle, Markdown Mirror / JSON
-export. The schema reserves room for them (`graph_id`, `merge_redirects`,
-`cycle_id`); each lands as its own append-only migration.
+title + content), **BM25 keyword search** (`nodum.search`, CLI `search`),
+**agent policies** (DB-stored per-agent rulesets, design §8.3, with
+auto-accept evaluation on the edge write path), and the **review/accept API**
+(proposal listing with reviewer context, batch accept/reject by id or
+filter). **Deliberately not built yet** (later phases — do not add):
+sqlite-vec / hybrid fusion, the MCP server, the web UI,
+assets/CAS/renditions/ingestion, the internal agent runtime and consolidation
+cycle, Markdown Mirror / JSON export. The schema reserves room for them
+(`graph_id`, `merge_redirects`, `cycle_id`); each lands as its own
+append-only migration.
 
 ## Architecture
 
 - **`nodum.service`** is the spine and the only writer — validation, the
   `proposed → active → archived` state machine, the event log, versions, undo,
-  wikilink materialization. Each public function opens its own short-lived
-  connection (applying pending migrations idempotently) and commits. New
-  behaviour and validation go here first; adapters must not add behaviour the
-  service lacks.
+  wikilink materialization, agent policies (CRUD + auto-accept evaluation on
+  the write path), and the review queue (proposal listing, batch
+  accept/reject). Each public function opens its own short-lived connection
+  (applying pending migrations idempotently) and commits. New behaviour and
+  validation go here first; adapters must not add behaviour the service
+  lacks.
 - **`nodum.projectors`** — derived-index consumers of the event log. A
   projector registry (`REGISTRY`), per-projector checkpoints in
   `projector_checkpoints`, incremental `run_projectors`, and
@@ -79,9 +85,11 @@ Phase-1 decision log.
 - DB path resolution: `--db` flag → `NODUM_DB` env var →
   `~/.local/share/nodum/nodum.db`.
 - Writes default to actor `human` (state `active`); pass `--actor agent:<name>`
-  to land writes in `proposed` instead.
+  to land writes in `proposed` instead — unless the agent's stored policy
+  auto-accepts the write (`policy set`).
 - `--set key=value` is repeatable; values are parsed as JSON with a raw-string
   fallback.
 - Surface: `init`, `node create/get/update/list/children`, `edge create/list`,
   `accept`/`reject`/`archive <id>`, `undo [seq]`, `history <node-id>`,
-  `events`, `types`, `search <query>`, `projector run/status/rebuild`.
+  `events`, `types`, `search <query>`, `projector run/status/rebuild`,
+  `policy set/get/list`, `review queue/accept/reject/accept-all/reject-all`.
