@@ -1,0 +1,290 @@
+"""The Typer CLI adapter — a thin, JSON-emitting front end over the service layer.
+
+Every command calls one :mod:`nodum.service` function and prints the result as
+a single JSON object on **stdout**; human-facing and error messages go to
+**stderr**. There is no ``--json`` flag — JSON is the only output format.
+
+The database path comes from ``--db`` or the ``NODUM_DB`` environment variable,
+falling back to ``~/.local/share/nodum/nodum.db``.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+
+import typer
+from pydantic import BaseModel
+
+from nodum import service
+from nodum.db import ENV_DB_VAR
+from nodum.service import (
+    EdgeNotFound,
+    EventNotFound,
+    InvalidTransition,
+    NodeNotFound,
+    TypeNotFound,
+)
+
+app = typer.Typer(
+    no_args_is_help=True,
+    add_completion=False,
+    help="JSON-emitting CLI over the nodum knowledge graph; each command prints one JSON object.",
+)
+node_app = typer.Typer(no_args_is_help=True, help="Node operations.")
+edge_app = typer.Typer(no_args_is_help=True, help="Edge operations.")
+app.add_typer(node_app, name="node")
+app.add_typer(edge_app, name="edge")
+
+
+@app.callback()
+def _main(
+    db_path: str | None = typer.Option(
+        None, "--db", help=f"Database path (overrides ${ENV_DB_VAR})."
+    ),
+) -> None:
+    """Resolve the database path for this invocation."""
+    if db_path is not None:
+        os.environ[ENV_DB_VAR] = db_path
+
+
+def _print_json(payload: dict) -> None:
+    """Write a single JSON object to stdout (the only thing on the success path)."""
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+
+
+def _emit(result: BaseModel) -> None:
+    """Print a pydantic result as the single JSON object on stdout."""
+    _print_json(result.model_dump(mode="json"))
+
+
+def _parse_set(pairs: list[str] | None) -> dict:
+    """Parse repeatable ``--set key=value`` options into a props dict.
+
+    Each value is decoded with :func:`json.loads`, falling back to the raw
+    string, so ``--set year=1815`` yields an int and ``--set venue=Nature`` a
+    string. Exits cleanly when a pair lacks ``=``.
+    """
+    props: dict = {}
+    for pair in pairs or []:
+        key, sep, raw = pair.partition("=")
+        if not sep:
+            typer.echo(f"--set expects key=value, got {pair!r}", err=True)
+            raise typer.Exit(1)
+        try:
+            value: object = json.loads(raw)
+        except json.JSONDecodeError:
+            value = raw
+        props[key] = value
+    return props
+
+
+def _read_content(content: str | None, content_file: str | None) -> str | None:
+    """Resolve node content from ``--content`` or ``--content-file`` (``-`` = stdin)."""
+    if content is not None and content_file is not None:
+        typer.echo("use either --content or --content-file, not both", err=True)
+        raise typer.Exit(1)
+    if content_file is not None:
+        if content_file == "-":
+            return sys.stdin.read()
+        with open(content_file) as handle:
+            return handle.read()
+    return content
+
+
+def _run(func, *args, **kwargs):
+    """Call a service function, mapping expected errors to stderr + exit 1."""
+    try:
+        return func(*args, **kwargs)
+    except (
+        NodeNotFound,
+        EdgeNotFound,
+        TypeNotFound,
+        EventNotFound,
+        InvalidTransition,
+        ValueError,
+    ) as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1) from exc
+
+
+ACTOR_OPTION = typer.Option("human", "--actor", help="Write actor: 'human' or 'agent:<name>'.")
+SET_OPTION = typer.Option(None, "--set", help="Repeatable key=value props (values parsed as JSON).")
+
+
+@app.command()
+def init() -> None:
+    """Create the database (if needed) and apply pending migrations."""
+    _emit(_run(service.init))
+
+
+@node_app.command("create")
+def node_create(
+    type: str = typer.Option(..., "--type", "-t", help="Node type id or name."),
+    title: str | None = typer.Option(None, "--title", help="Display title (wikilink target)."),
+    content: str | None = typer.Option(None, "--content", "-c", help="Markdown body."),
+    content_file: str | None = typer.Option(
+        None, "--content-file", help="Read the Markdown body from a file ('-' = stdin)."
+    ),
+    parent: str | None = typer.Option(None, "--parent", help="Parent node id."),
+    set_props: list[str] | None = SET_OPTION,
+    actor: str = ACTOR_OPTION,
+) -> None:
+    """Create a node (active for actor 'human', proposed otherwise)."""
+    node = _run(
+        service.create_node,
+        type=type,
+        title=title,
+        content=_read_content(content, content_file) or "",
+        parent_id=parent,
+        props=_parse_set(set_props),
+        actor=actor,
+    )
+    _emit(node)
+
+
+@node_app.command("get")
+def node_get(node_id: str = typer.Argument(..., help="Node id.")) -> None:
+    """Fetch one node by id."""
+    _emit(_run(service.get_node, node_id))
+
+
+@node_app.command("update")
+def node_update(
+    node_id: str = typer.Argument(..., help="Node id."),
+    title: str | None = typer.Option(None, "--title", help="New title."),
+    content: str | None = typer.Option(None, "--content", "-c", help="New Markdown body."),
+    content_file: str | None = typer.Option(
+        None, "--content-file", help="Read the new Markdown body from a file ('-' = stdin)."
+    ),
+    set_props: list[str] | None = SET_OPTION,
+    actor: str = ACTOR_OPTION,
+) -> None:
+    """Update a node's title, content, and/or props (only given fields change)."""
+    kwargs: dict = {"actor": actor}
+    resolved = _read_content(content, content_file)
+    if title is not None:
+        kwargs["title"] = title
+    if resolved is not None:
+        kwargs["content"] = resolved
+    if set_props:
+        kwargs["props"] = _parse_set(set_props)
+    if len(kwargs) == 1:
+        typer.echo("nothing to update: pass --title, --content/--content-file, or --set", err=True)
+        raise typer.Exit(1)
+    _emit(_run(service.update_node, node_id, **kwargs))
+
+
+@node_app.command("list")
+def node_list(
+    type: str | None = typer.Option(None, "--type", "-t", help="Filter by node type."),
+    state: str | None = typer.Option(None, "--state", help="Filter by state."),
+    parent: str | None = typer.Option(None, "--parent", help="Filter by parent node id."),
+    limit: int = typer.Option(500, "--limit", help="Maximum rows."),
+) -> None:
+    """List nodes in creation order, optionally filtered."""
+    nodes = _run(service.list_nodes, type=type, state=state, parent_id=parent, limit=limit)
+    _print_json({"nodes": [node.model_dump(mode="json") for node in nodes], "count": len(nodes)})
+
+
+@node_app.command("children")
+def node_children(node_id: str = typer.Argument(..., help="Parent node id.")) -> None:
+    """List a node's children in position order."""
+    nodes = _run(service.list_children, node_id)
+    _print_json({"nodes": [node.model_dump(mode="json") for node in nodes], "count": len(nodes)})
+
+
+@edge_app.command("create")
+def edge_create(
+    src_id: str = typer.Argument(..., help="Source node id."),
+    dst_id: str = typer.Argument(..., help="Target node id."),
+    type: str = typer.Option(..., "--type", "-t", help="Edge type id or name."),
+    confidence: float | None = typer.Option(None, "--confidence", help="Confidence in [0, 1]."),
+    set_props: list[str] | None = SET_OPTION,
+    actor: str = ACTOR_OPTION,
+) -> None:
+    """Create a typed, directed edge between two nodes."""
+    edge = _run(
+        service.create_edge,
+        src_id,
+        dst_id,
+        type,
+        props=_parse_set(set_props),
+        confidence=confidence,
+        actor=actor,
+    )
+    _emit(edge)
+
+
+@edge_app.command("list")
+def edge_list(
+    node: str | None = typer.Option(None, "--node", help="Filter by incident node id."),
+    type: str | None = typer.Option(None, "--type", "-t", help="Filter by edge type."),
+    state: str | None = typer.Option(None, "--state", help="Filter by state."),
+    limit: int = typer.Option(500, "--limit", help="Maximum rows."),
+) -> None:
+    """List edges, optionally filtered by incident node, type, or state."""
+    edges = _run(service.list_edges, node_id=node, type=type, state=state, limit=limit)
+    _print_json({"edges": [edge.model_dump(mode="json") for edge in edges], "count": len(edges)})
+
+
+@app.command()
+def accept(
+    record_id: str = typer.Argument(..., help="Node or edge id."),
+    actor: str = ACTOR_OPTION,
+) -> None:
+    """Accept a proposed node or edge (proposed → active)."""
+    _emit(_run(service.transition, record_id, "accept", actor=actor))
+
+
+@app.command()
+def reject(
+    record_id: str = typer.Argument(..., help="Node or edge id."),
+    actor: str = ACTOR_OPTION,
+) -> None:
+    """Reject a proposed node or edge (proposed → archived)."""
+    _emit(_run(service.transition, record_id, "reject", actor=actor))
+
+
+@app.command()
+def archive(
+    record_id: str = typer.Argument(..., help="Node or edge id."),
+    actor: str = ACTOR_OPTION,
+) -> None:
+    """Archive an active node or edge (active → archived)."""
+    _emit(_run(service.transition, record_id, "archive", actor=actor))
+
+
+@app.command()
+def undo(
+    seq: int | None = typer.Argument(None, help="Event seq to reverse (default: latest)."),
+    actor: str = ACTOR_OPTION,
+) -> None:
+    """Reverse an event, restoring the prior state from its payload."""
+    _emit(_run(service.undo, seq, actor=actor))
+
+
+@app.command()
+def history(node_id: str = typer.Argument(..., help="Node id.")) -> None:
+    """Show a node's version history (chronological)."""
+    versions = _run(service.history, node_id)
+    _print_json(
+        {
+            "versions": [version.model_dump(mode="json") for version in versions],
+            "count": len(versions),
+        }
+    )
+
+
+@app.command()
+def events(limit: int = typer.Option(50, "--limit", help="Maximum rows.")) -> None:
+    """Show the most recent event-log entries (newest first)."""
+    rows = _run(service.list_events, limit=limit)
+    _print_json({"events": [row.model_dump(mode="json") for row in rows], "count": len(rows)})
+
+
+@app.command(name="types")
+def list_types() -> None:
+    """Show the full type catalog (node types and edge types)."""
+    _emit(_run(service.list_types))
