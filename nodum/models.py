@@ -118,3 +118,54 @@ class InitResult(BaseModel):
     db_path: str
     applied: list[str]
     already_applied: list[str]
+
+
+class ProjectorStatus(BaseModel):
+    """One projector's checkpoint state and backlog.
+
+    ``last_event_seq`` is the highest event the projector has applied;
+    ``pending_events`` counts newer events it has not seen yet; ``rows`` is
+    the size of its derived store (index rows for the FTS projector).
+    """
+
+    name: str
+    last_event_seq: int
+    pending_events: int
+    rows: int
+
+
+class ProjectorRun(BaseModel):
+    """The outcome of running (or rebuilding) one projector.
+
+    ``applied`` counts the events consumed in this call; ``from_seq`` /
+    ``to_seq`` are the checkpoint before and after.
+    """
+
+    name: str
+    applied: int
+    from_seq: int
+    to_seq: int
+
+
+class SearchHit(BaseModel):
+    """One search result: a node plus its fused score and per-signal breakdown.
+
+    ``score`` is the fused ranking score (higher is better); ``signals``
+    carries each retrieval signal's contribution (``bm25`` only today, with
+    vector and graph-expansion signals slotting in alongside it later).
+    """
+
+    node_id: str
+    type: str
+    title: str | None
+    snippet: str
+    score: float
+    signals: dict[str, float]
+
+
+class SearchResult(BaseModel):
+    """A ranked result list for one query."""
+
+    query: str
+    k: int
+    hits: list[SearchHit]

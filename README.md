@@ -7,10 +7,13 @@ deterministic, LLM-free service layer that validates, enforces a
 full before/after payloads — so every change is versioned, auditable, and
 reversible.
 
-This is **Phase 1 (core)**: schema + migrations, service layer, event log +
+**Phase 1 (core)** landed: schema + migrations, service layer, event log +
 versions + undo, Markdown-as-truth content, wikilink materialization, and a
-JSON-emitting CLI. Search (FTS/vectors), the MCP server, the web UI, assets,
-and the consolidation cycle land in later phases.
+JSON-emitting CLI. **Phase 2 (agent-native)** is underway: event-log
+projectors with checkpoint/rebuild mechanics and the first derived index —
+an FTS5 full-text index feeding BM25 keyword search. Still to come: vector
+search + hybrid fusion, the MCP server, the web UI, assets, and the
+consolidation cycle.
 
 ## Quick start
 
@@ -27,6 +30,10 @@ uv run nodum node create --type concept --title "Graph Theory"
 uv run nodum node create --type note --title "My note" \
     --content "Notes on [[Graph Theory]] and its applications."
 uv run nodum edge list --type mentions        # the wikilink became an edge
+
+uv run nodum search "graph theory"            # BM25 keyword search (FTS5)
+uv run nodum projector status                 # derived-index checkpoints
+uv run nodum projector rebuild fts            # drop + replay from event 0
 
 uv run nodum node list --type note
 uv run nodum history <node-id>                # version snapshots
@@ -52,6 +59,12 @@ surface.
 - **Event log + versions.** Every mutation appends an event (actor, op, full
   before/after JSON payload) and — for nodes — a version snapshot. `undo`
   reverses an event by restoring its `before` state.
+- **Derived indexes are projectors.** The event log feeds checkpointed,
+  independently rebuildable projectors (`nodum projector run/status/rebuild`).
+  The first one, `fts`, maintains an FTS5 index over node title + content (+
+  extracted asset text once assets land); `nodum search` serves BM25-ranked
+  keyword results from it. Vector and graph-expansion signals slot into the
+  same hit shape later.
 
 See [docs/architecture.md](docs/architecture.md) for the module map and
 [AGENTS.md](AGENTS.md) for contributor/agent workflow rules.

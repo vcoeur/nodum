@@ -131,3 +131,42 @@ def test_bad_set_pair_exits_1(fresh_db):
     result = runner.invoke(app, ["node", "create", "--type", "note", "--set", "nokey"])
     assert result.exit_code == 1
     assert "--set expects key=value" in result.stderr
+
+
+def test_search(fresh_db):
+    node = _run_json(
+        "node", "create", "--type", "note", "--title", "Sap", "--content", "xylem carries sap"
+    )
+    result = _run_json("search", "xylem")
+    assert result["query"] == "xylem"
+    assert [hit["node_id"] for hit in result["hits"]] == [node["id"]]
+    assert result["hits"][0]["signals"]["bm25"] > 0
+
+    result = _run_json("search", "xylem", "--type", "concept")
+    assert result["hits"] == []
+
+
+def test_projector_run_status_rebuild(fresh_db):
+    _run_json("node", "create", "--type", "note", "--title", "T", "--content", "body")
+
+    status = _run_json("projector", "status")
+    (fts,) = status["projectors"]
+    assert fts["name"] == "fts"
+    assert fts["pending_events"] == 1
+
+    runs = _run_json("projector", "run")
+    assert runs["projectors"] == [{"name": "fts", "applied": 1, "from_seq": 0, "to_seq": 1}]
+
+    status = _run_json("projector", "status")
+    assert status["projectors"][0]["pending_events"] == 0
+    assert status["projectors"][0]["rows"] == 1
+
+    rebuilt = _run_json("projector", "rebuild", "fts")
+    assert rebuilt["from_seq"] == 0
+    assert rebuilt["applied"] == 1
+
+
+def test_projector_rebuild_unknown_exits_1(fresh_db):
+    result = runner.invoke(app, ["projector", "rebuild", "nope"])
+    assert result.exit_code == 1
+    assert "unknown projector" in result.stderr

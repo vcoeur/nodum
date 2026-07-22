@@ -17,7 +17,8 @@ import sys
 import typer
 from pydantic import BaseModel
 
-from nodum import service
+from nodum import projectors, service
+from nodum import search as search_module
 from nodum.db import ENV_DB_VAR
 from nodum.service import (
     EdgeNotFound,
@@ -34,8 +35,12 @@ app = typer.Typer(
 )
 node_app = typer.Typer(no_args_is_help=True, help="Node operations.")
 edge_app = typer.Typer(no_args_is_help=True, help="Edge operations.")
+projector_app = typer.Typer(
+    no_args_is_help=True, help="Derived-index projectors over the event log."
+)
 app.add_typer(node_app, name="node")
 app.add_typer(edge_app, name="edge")
+app.add_typer(projector_app, name="projector")
 
 
 @app.callback()
@@ -288,3 +293,43 @@ def events(limit: int = typer.Option(50, "--limit", help="Maximum rows.")) -> No
 def list_types() -> None:
     """Show the full type catalog (node types and edge types)."""
     _emit(_run(service.list_types))
+
+
+@app.command()
+def search(
+    query: str = typer.Argument(..., help="Free-text query; terms are ANDed."),
+    k: int = typer.Option(10, "--k", help="Maximum hits."),
+    state: str = typer.Option(
+        "active", "--state", help="Node-state filter ('any' searches all states)."
+    ),
+    type: str | None = typer.Option(None, "--type", "-t", help="Filter by node type."),
+) -> None:
+    """Keyword-search node title + content (BM25-ranked, from the FTS index)."""
+    result = _run(
+        search_module.search, query, k=k, state=None if state == "any" else state, type=type
+    )
+    _emit(result)
+
+
+@projector_app.command("run")
+def projector_run(
+    names: list[str] | None = typer.Argument(
+        None, help="Projectors to run (default: all registered)."
+    ),
+) -> None:
+    """Apply pending event-log entries to the derived indexes."""
+    runs = _run(projectors.run_projectors, names=names)
+    _print_json({"projectors": [run.model_dump(mode="json") for run in runs]})
+
+
+@projector_app.command("rebuild")
+def projector_rebuild(name: str = typer.Argument(..., help="Projector to rebuild.")) -> None:
+    """Drop one projector's derived state and replay the full event log."""
+    _emit(_run(projectors.rebuild_projector, name))
+
+
+@projector_app.command("status")
+def projector_status() -> None:
+    """Show every projector's checkpoint, backlog, and derived-store size."""
+    statuses = _run(projectors.projector_status)
+    _print_json({"projectors": [status.model_dump(mode="json") for status in statuses]})

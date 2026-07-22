@@ -145,8 +145,33 @@ INSERT INTO edge_types (id, name, inverse_name, is_builtin) VALUES
 """
 
 
+PROJECTORS_DDL = """
+-- Per-projector checkpoints: the last event-log seq each projector applied.
+-- Derived state + this table are all a projector owns; a rebuild resets both
+-- and replays from event 0.
+CREATE TABLE projector_checkpoints (
+    name           TEXT PRIMARY KEY,
+    last_event_seq INTEGER NOT NULL DEFAULT 0,
+    updated_at     TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Derived FTS index over node text, maintained by the `fts` projector from
+-- the event log — never written by the service layer. The `extracted_text`
+-- column matches the design schema and stays empty until the asset store
+-- (and its extracted text) lands in Phase 4.
+CREATE VIRTUAL TABLE node_fts USING fts5(
+    node_id UNINDEXED,
+    title,
+    content,
+    extracted_text,
+    tokenize = 'porter unicode61'
+);
+"""
+
+
 #: Ordered (name, SQL) migrations. Append-only — never edit a shipped entry.
 MIGRATIONS: list[tuple[str, str]] = [
     ("0001_core", CORE_DDL),
     ("0002_seed_builtin_types", _seed_sql()),
+    ("0003_projector_checkpoints_and_fts", PROJECTORS_DDL),
 ]

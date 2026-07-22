@@ -13,11 +13,15 @@ logged in an append-only event log with full before/after payloads, versioned
 as `mentions` edges on write. The Typer CLI is a thin adapter emitting exactly
 one JSON object per command.
 
-This is Phase 1 (core). **Deliberately not built here** (later phases — do not
-add): FTS5/sqlite-vec search, the MCP server, the web UI, assets/CAS/
-renditions/ingestion, the internal agent runtime and consolidation cycle,
-Markdown Mirror / JSON export. The schema reserves room for them (`graph_id`,
-`merge_redirects`, `cycle_id`); each lands as its own append-only migration.
+Phase 1 (core) landed; Phase 2 (agent-native) is underway. Built so far in
+Phase 2: **event-log projectors** (`nodum.projectors`) with per-projector
+checkpoints and rebuild mechanics, the **`fts` projector** (FTS5 over node
+title + content), and **BM25 keyword search** (`nodum.search`, CLI `search`).
+**Deliberately not built yet** (later phases — do not add): sqlite-vec /
+hybrid fusion, the MCP server, the web UI, assets/CAS/renditions/ingestion,
+the internal agent runtime and consolidation cycle, Markdown Mirror / JSON
+export. The schema reserves room for them (`graph_id`, `merge_redirects`,
+`cycle_id`); each lands as its own append-only migration.
 
 ## Architecture
 
@@ -27,6 +31,16 @@ Markdown Mirror / JSON export. The schema reserves room for them (`graph_id`,
   connection (applying pending migrations idempotently) and commits. New
   behaviour and validation go here first; adapters must not add behaviour the
   service lacks.
+- **`nodum.projectors`** — derived-index consumers of the event log. A
+  projector registry (`REGISTRY`), per-projector checkpoints in
+  `projector_checkpoints`, incremental `run_projectors`, and
+  `rebuild_projector` (reset derived state, replay from event 0). The service
+  layer never calls projectors — the event log is the only coupling, and no
+  LLM exists anywhere in this path (design Constraint 4).
+- **`nodum.search`** — the query path. BM25 keyword search over the `fts`
+  projector's index (catching the projector up first), returning hits with a
+  fused `score` plus a per-signal `signals` breakdown so vector + graph
+  expansion (design §7 RRF fusion) slot in without reshaping the API.
 - **`nodum.db`** — connection management (WAL, foreign keys), `NODUM_DB`
   resolution, the migration runner.
 - **`nodum.migrations`** — the append-only migration list. Never edit a shipped
@@ -70,4 +84,4 @@ Phase-1 decision log.
   fallback.
 - Surface: `init`, `node create/get/update/list/children`, `edge create/list`,
   `accept`/`reject`/`archive <id>`, `undo [seq]`, `history <node-id>`,
-  `events`, `types`.
+  `events`, `types`, `search <query>`, `projector run/status/rebuild`.
