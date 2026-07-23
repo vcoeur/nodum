@@ -18,8 +18,9 @@ from pathlib import Path
 import typer
 from pydantic import BaseModel
 
-from nodum import projectors, service
+from nodum import assets, projectors, service
 from nodum import search as search_module
+from nodum.assets import AssetNotFound, UnsupportedRendition
 from nodum.db import ENV_DB_VAR
 from nodum.service import (
     EdgeNotFound,
@@ -44,12 +45,16 @@ projector_app = typer.Typer(
 policy_app = typer.Typer(no_args_is_help=True, help="Per-agent policy rulesets (auto-accept).")
 review_app = typer.Typer(no_args_is_help=True, help="The review queue: pending proposals.")
 mcp_app = typer.Typer(no_args_is_help=True, help="MCP server (read + additive tiers, design §8).")
+asset_app = typer.Typer(
+    no_args_is_help=True, help="Content-addressed assets and derived image renditions."
+)
 app.add_typer(node_app, name="node")
 app.add_typer(edge_app, name="edge")
 app.add_typer(projector_app, name="projector")
 app.add_typer(policy_app, name="policy")
 app.add_typer(review_app, name="review")
 app.add_typer(mcp_app, name="mcp")
+app.add_typer(asset_app, name="asset")
 
 
 @app.callback()
@@ -118,6 +123,8 @@ def _run(func, *args, **kwargs):
         EventNotFound,
         PolicyNotFound,
         VersionNotFound,
+        AssetNotFound,
+        UnsupportedRendition,
         InvalidTransition,
         ValueError,
     ) as exc:
@@ -440,6 +447,64 @@ def projector_status() -> None:
     """Show every projector's checkpoint, backlog, and derived-store size."""
     statuses = _run(projectors.projector_status)
     _print_json({"projectors": [status.model_dump(mode="json") for status in statuses]})
+
+
+# ── Assets and renditions ─────────────────────────────────────────────────────
+
+
+@asset_app.command("register")
+def asset_register(
+    file: str = typer.Argument(..., help="Local file to register into the CAS."),
+    name: str | None = typer.Option(
+        None, "--name", help="Original name to record (default: the file's name)."
+    ),
+) -> None:
+    """Register a file as a content-addressed asset (idempotent dedup by sha256)."""
+    _emit(_run(assets.register_asset, file, name=name))
+
+
+@asset_app.command("get")
+def asset_get(
+    id_or_hash: str = typer.Argument(..., help="Asset hash or asset-reference node id."),
+) -> None:
+    """Show one asset's metadata (never its bytes)."""
+    _emit(_run(assets.get_asset, id_or_hash))
+
+
+@asset_app.command("list")
+def asset_list() -> None:
+    """List every registered asset."""
+    rows = _run(assets.list_assets)
+    _print_json({"assets": [row.model_dump(mode="json") for row in rows], "count": len(rows)})
+
+
+@asset_app.command("rendition")
+def asset_rendition(
+    id_or_hash: str = typer.Argument(..., help="Asset hash or asset-reference node id."),
+    profile: str = typer.Option("preview", "--profile", "-p", help="'thumb' or 'preview'."),
+    out: str | None = typer.Option(
+        None, "--out", "-o", help="Also copy the cached WebP file to this path."
+    ),
+) -> None:
+    """Fetch an image rendition, generating and caching it on first request.
+
+    Prints the rendition metadata (the cache ``path`` always points at the
+    WebP file); image bytes are never inlined into the JSON output.
+    """
+    rendition = _run(assets.get_rendition, id_or_hash, profile=profile)
+    if out is not None:
+        assets.copy_rendition(rendition, out)
+    _emit(rendition)
+
+
+@asset_app.command("purge")
+def asset_purge(
+    asset: str | None = typer.Option(
+        None, "--asset", help="Limit the purge to one asset's renditions (hash)."
+    ),
+) -> None:
+    """Evict cached renditions (regenerable — they rebuild on next request)."""
+    _emit(_run(assets.purge_renditions, asset_hash=asset))
 
 
 # ── MCP server ────────────────────────────────────────────────────────────────

@@ -226,6 +226,42 @@ CREATE INDEX idx_chunks_node ON chunks(node_id);
 """
 
 
+ASSETS_DDL = """
+-- Content-addressed binary assets (design §5.2). The row is the metadata;
+-- the bytes live in the CAS directory next to the database file at
+-- `assets/<hash[:2]>/<hash>` (see nodum.assets). `extracted_text` stays NULL
+-- until the Phase-4 ingestion pipeline fills it. Registration is idempotent
+-- content-addressed dedup — no event-log entry (nothing to undo: the same
+-- bytes always resolve to the same row; asset events land with ingestion in
+-- Phase 4 and must never inline blob bytes into payloads).
+CREATE TABLE assets (
+    hash           TEXT PRIMARY KEY,
+    mime           TEXT NOT NULL,
+    size_bytes     INTEGER NOT NULL,
+    original_name  TEXT,
+    extracted_text TEXT,
+    created_at     TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Derived image renditions (design §5.7): lazily generated from the original,
+-- cached on disk at `renditions/<id[:2]>/<id>.webp`, and evictable
+-- (`asset purge`) — the DB row + file are both regenerable from the original.
+-- `id` is sha256(asset_hash + ':' + profile); `path` is relative to the
+-- database's data directory so the file stays portable.
+CREATE TABLE renditions (
+    id          TEXT PRIMARY KEY,
+    asset_hash  TEXT NOT NULL REFERENCES assets(hash),
+    profile     TEXT NOT NULL,
+    path        TEXT NOT NULL,
+    width       INTEGER NOT NULL,
+    height      INTEGER NOT NULL,
+    size_bytes  INTEGER NOT NULL,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX idx_renditions_asset ON renditions(asset_hash);
+"""
+
+
 #: Ordered (name, SQL) migrations. Append-only — never edit a shipped entry.
 MIGRATIONS: list[tuple[str, str]] = [
     ("0001_core", CORE_DDL),
@@ -234,4 +270,5 @@ MIGRATIONS: list[tuple[str, str]] = [
     ("0004_policies", POLICIES_DDL),
     ("0005_proposed_versions", PROPOSED_VERSIONS_DDL),
     ("0006_vectors", VECTORS_DDL),
+    ("0007_assets_and_renditions", ASSETS_DDL),
 ]

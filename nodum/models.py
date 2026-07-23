@@ -304,3 +304,48 @@ class ProposeEdgesOut(BaseModel):
 
     created: list[EdgeOut]
     failed: list[ItemFailure]
+
+
+class AssetOut(BaseModel):
+    """A registered content-addressed binary asset (design §5.2).
+
+    Metadata only — the bytes live in the CAS directory at
+    ``assets/<hash[:2]>/<hash>`` next to the database file. ``extracted_text``
+    is NULL until the Phase-4 ingestion pipeline fills it.
+    """
+
+    hash: str
+    mime: str
+    size_bytes: int
+    original_name: str | None
+    extracted_text: str | None
+    created_at: str
+
+
+class RenditionOut(BaseModel):
+    """A derived image rendition of an asset (design §5.7).
+
+    Renditions are lazily generated, cached on disk, and evictable — all
+    regenerable from the original. ``cached`` is false on the call that
+    generated (or regenerated) the rendition and true on cache hits.
+    ``path`` is the absolute cache file; ``data_base64`` carries the WebP
+    bytes only when requested (``include_data``) — the MCP path.
+    """
+
+    id: str
+    asset_hash: str
+    profile: str
+    mime: str
+    width: int
+    height: int
+    size_bytes: int
+    path: str
+    cached: bool
+    data_base64: str | None = None
+
+
+class PurgeResult(BaseModel):
+    """The outcome of evicting cached renditions (rows deleted, files removed)."""
+
+    purged: int
+    bytes_freed: int

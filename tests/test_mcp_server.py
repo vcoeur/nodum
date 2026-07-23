@@ -8,10 +8,14 @@ clients reach, no subprocess needed.
 from __future__ import annotations
 
 import asyncio
+import base64
+import io
+import json
 
 from mcp.shared.memory import create_connected_server_and_client_session
+from PIL import Image
 
-from nodum import service
+from nodum import assets, service
 from nodum.mcp_server import ADDITIVE_TOOLS, CURATIVE_TOOLS, READ_TOOLS, REVIEW_TOOLS, create_server
 
 AGENT = "agent:tester"
@@ -244,6 +248,73 @@ def test_proposed_update_accept_reject_lifecycle_over_mcp(fresh_db):
     assert service.get_node(note.id).content == "accepted body"
     states = [v.state for v in service.history(note.id)]
     assert states == ["applied", "applied", "archived"]
+
+
+# ── get_asset: the §5.7 binary policy (renditions only, never originals) ──────
+
+
+def _register_png(tmp_path, size=(2000, 1000)):
+    source = tmp_path / "picture.png"
+    Image.new("RGB", size, (30, 120, 200)).save(source)
+    return assets.register_asset(source), source
+
+
+def test_get_asset_returns_metadata_and_a_preview_image_block(fresh_db, tmp_path):
+    asset, source = _register_png(tmp_path)
+
+    result = _run(lambda session: _call(session, "get_asset", {"id_or_hash": asset.hash}))
+    assert not result.isError
+    text_block, image_block = result.content
+    assert text_block.type == "text"
+    assert image_block.type == "image"
+    assert image_block.mimeType == "image/webp"
+
+    metadata = json.loads(text_block.text)
+    assert metadata["asset"]["hash"] == asset.hash
+    assert metadata["rendition"]["profile"] == "preview"
+
+    # The image block is the derived preview, never the original binary.
+    payload = base64.b64decode(image_block.data)
+    assert payload != source.read_bytes()
+    with Image.open(io.BytesIO(payload)) as decoded:
+        assert decoded.format == "WEBP"
+        assert decoded.size == (1024, 512)
+
+
+def test_get_asset_thumb_profile(fresh_db, tmp_path):
+    asset, _ = _register_png(tmp_path)
+    result = _run(
+        lambda session: _call(
+            session, "get_asset", {"id_or_hash": asset.hash, "rendition": "thumb"}
+        )
+    )
+    image_block = result.content[1]
+    with Image.open(io.BytesIO(base64.b64decode(image_block.data))) as decoded:
+        assert decoded.size == (256, 128)
+
+
+def test_get_asset_non_image_returns_metadata_only(fresh_db, tmp_path):
+    text_file = tmp_path / "notes.txt"
+    text_file.write_text("plain text")
+    asset = assets.register_asset(text_file)
+
+    result = _run(lambda session: _call(session, "get_asset", {"id_or_hash": asset.hash}))
+    assert not result.isError
+    assert len(result.content) == 1
+    metadata = json.loads(result.content[0].text)
+    assert metadata["asset"]["mime"] == "text/plain"
+    assert metadata["rendition"] is None
+
+
+def test_get_asset_never_serves_the_original(fresh_db, tmp_path):
+    asset, _ = _register_png(tmp_path)
+    for profile in ("full", "page:1", "original"):
+        result = _run(
+            lambda session, profile=profile: _call(
+                session, "get_asset", {"id_or_hash": asset.hash, "rendition": profile}
+            )
+        )
+        assert result.isError
 
 
 # ── Error surfacing ───────────────────────────────────────────────────────────

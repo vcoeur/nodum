@@ -24,14 +24,20 @@ breakdown, **agent policies** (DB-stored per-agent rulesets, design §8.3,
 with auto-accept evaluation on the edge write path), the **review/accept
 API** (proposal listing with reviewer context, batch accept/reject by id or
 filter), **proposed updates** (agent `update_node` stages a `proposed`
-version; accept applies it, reject archives it — migration 0005), and the
+version; accept applies it, reject archives it — migration 0005), the
 **MCP server** (`nodum.mcp_server`, stdio, read + additive tiers +
-`accept`/`reject`; curative tools are never registered).
-**Deliberately not built yet** (later phases — do not add): the web UI,
-assets/CAS/renditions/ingestion, the internal agent runtime and consolidation
-cycle, Markdown Mirror / JSON export. The schema reserves room for them
-(`graph_id`, `merge_redirects`, `cycle_id`); each lands as its own
-append-only migration.
+`accept`/`reject`; curative tools are never registered), and **assets +
+image renditions** (`nodum.assets` — migration 0007): thin content-addressed
+asset registration (a row + CAS file + sha256) and lazily generated, cached,
+evictable `thumb`/`preview` WebP renditions (design §5.7), exposed over MCP
+as `get_asset` (metadata + rendition image block — never the original).
+**Deliberately not built yet** (later phases — do not add): the web UI, the
+Phase-4 ingestion pipeline (text extraction, chunking, source/claim
+proposals, `ingest_file`/`ingest_url`), `page:<n>` PDF rasters,
+`get_download_url`/`request_upload_url`, the internal agent runtime and
+consolidation cycle, Markdown Mirror / JSON export. The schema reserves room
+for them (`graph_id`, `merge_redirects`, `cycle_id`,
+`assets.extracted_text`); each lands as its own append-only migration.
 
 ## Architecture
 
@@ -74,6 +80,16 @@ append-only migration.
   `NODUM_EMBED_MODEL` overrides the model name (a different dimensionality
   needs a new migration — the vec0 table is fixed at 384). Tests inject a
   deterministic hashing fake via `embeddings.set_provider`.
+- **`nodum.assets`** — content-addressed binaries and their derived
+  renditions (design §5.5/§5.7). Original bytes live in a CAS directory next
+  to the DB file (`assets/<hash[:2]>/<hash>`); the `assets` table holds
+  metadata (registration is idempotent sha256 dedup, no event-log entry —
+  there is nothing to undo). Renditions (`thumb` ≤256px WebP q75, `preview`
+  ≤1024px WebP q80 with a 300 KB quality-stepping target) are keyed by
+  `sha256(asset_hash + ':' + profile)`, generated lazily with Pillow on
+  first request, cached under `renditions/`, and evicted by
+  `purge_renditions` (CLI `asset purge`) — fully regenerable. Non-image
+  assets are rejected cleanly; `page:<n>` rasters are Phase 4.
 - **`nodum.search`** — the query path (design §7). BM25 over the `fts`
   projector's index and vector ANN over the `vec` projector's chunks
   (closest chunk per node wins), fused by reciprocal rank fusion (K=60) with
@@ -133,4 +149,8 @@ Phase-1 decision log.
   `history <node-id>`, `events`, `types`, `schema <type>`, `search <query>`,
   `traverse`, `find-path`, `diff`, `projector run/status/rebuild`,
   `policy set/get/list`, `review queue/accept/reject/accept-all/reject-all`,
-  `mcp serve`.
+  `asset register/get/list/rendition/purge`, `mcp serve`.
+- Asset images reach agents only as renditions: `asset rendition` prints
+  metadata + the cache path (never inlines bytes into JSON); the MCP
+  `get_asset` tool returns metadata + a WebP image block of the requested
+  rendition — originals are never served over MCP (design §5.7).

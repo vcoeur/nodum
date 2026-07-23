@@ -673,6 +673,7 @@ name = "nodum"
 source = { editable = "." }
 dependencies = [
     { name = "mcp" },
+    { name = "pillow" },
     { name = "pydantic" },
     { name = "sqlite-vec" },
     { name = "typer" },
@@ -694,6 +695,7 @@ dev = [
 requires-dist = [
     { name = "fastembed", marker = "extra == 'embeddings'", specifier = ">=0.8.0" },
     { name = "mcp", specifier = ">=1.28.1" },
+    { name = "pillow", specifier = ">=11" },
     { name = "pydantic", specifier = ">=2.9" },
     { name = "sqlite-vec", specifier = ">=0.1.9" },
     { name = "typer", specifier = ">=0.16" },

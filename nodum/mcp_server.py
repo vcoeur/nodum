@@ -2,10 +2,14 @@
 
 Exposes the design §8.1 v1 tool contract's **read tier** (``get_node``,
 ``get_children``, ``search``, ``traverse``, ``list_types``, ``get_schema``,
-``find_path``, ``history``, ``diff``), **additive tier** (``create_node``,
-``update_node``, ``link``, ``propose_edges``), and the ``accept``/``reject``
-review tools (the §8.1 "write" tier — they cost nothing on top of the review
-API and let a human-driven MCP client work the queue).
+``find_path``, ``history``, ``diff``, ``get_asset``), **additive tier**
+(``create_node``, ``update_node``, ``link``, ``propose_edges``), and the
+``accept``/``reject`` review tools (the §8.1 "write" tier — they cost nothing
+on top of the review API and let a human-driven MCP client work the queue).
+
+``get_asset`` enforces the §5.7 binary policy structurally: agents receive
+metadata plus a small derived rendition (``preview``/``thumb`` WebP image
+block); original binaries are never served over MCP.
 
 **Curative tools are never registered** (``merge_nodes``, ``retype``,
 ``supersede_edge``, ``bulk_relink``, ``consolidate``) — structural
@@ -26,11 +30,12 @@ from pathlib import Path
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.utilities.types import Image
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel
 
+from nodum import assets, service
 from nodum import search as search_module
-from nodum import service
 
 #: Tool annotations per tier (design §8): reads are read-only; additive
 #: writes are non-destructive (they only ever *propose* new state — even an
@@ -52,6 +57,7 @@ READ_TOOLS = (
     "find_path",
     "history",
     "diff",
+    "get_asset",
 )
 ADDITIVE_TOOLS = ("create_node", "update_node", "link", "propose_edges")
 REVIEW_TOOLS = ("accept", "reject")
@@ -81,10 +87,12 @@ def create_server(*, actor: str = "agent:mcp", db_path: str | Path | None = None
         "nodum",
         instructions=(
             "nodum knowledge graph — read tier (get_node/get_children/search/traverse/"
-            "list_types/get_schema/find_path/history/diff), additive tier (create_node/"
-            "update_node/link/propose_edges), and review tools (accept/reject). Every "
-            "write lands as a proposal for human review unless your stored policy "
-            "auto-accepts it. Curative operations are not available over MCP."
+            "list_types/get_schema/find_path/history/diff/get_asset), additive tier "
+            "(create_node/update_node/link/propose_edges), and review tools "
+            "(accept/reject). Every write lands as a proposal for human review unless "
+            "your stored policy auto-accepts it. Curative operations are not available "
+            "over MCP. Assets are served as small derived renditions — never the "
+            "original binary (design §5.7)."
         ),
     )
 
@@ -178,6 +186,33 @@ def create_server(*, actor: str = "agent:mcp", db_path: str | Path | None = None
     def diff(a: int, b: int) -> dict[str, Any]:
         """Unified diff between two versions of one node (ids from `history`)."""
         return _dump(service.diff_versions(a, b, path=db_path))
+
+    @server.tool(annotations=_READ, structured_output=False)
+    def get_asset(id_or_hash: str, rendition: str = "preview") -> list[Any]:
+        """Fetch asset metadata plus a small derived rendition — NEVER the original.
+
+        Design §5.7 binary policy: LLMs receive derived representations only.
+        For images the result is a metadata text block followed by a WebP
+        image block of the requested rendition (`preview` ≤1024px, the MCP
+        default for vision models; `thumb` ≤256px). For non-image assets only
+        the metadata block is returned (extracted text lands with the Phase-4
+        ingestion pipeline). `full` originals are never served over MCP.
+        """
+        if rendition not in assets.PROFILES:
+            raise ValueError(
+                f"unsupported rendition {rendition!r}: MCP serves "
+                f"{', '.join(sorted(assets.PROFILES))} only — originals never"
+            )
+        asset = assets.get_asset(id_or_hash, path=db_path)
+        metadata: dict[str, Any] = {"asset": asset.model_dump(mode="json")}
+        try:
+            rend = assets.get_rendition(id_or_hash, profile=rendition, path=db_path)
+        except assets.UnsupportedRendition:
+            # Not a renderable image: metadata (+ extracted text) only, per §5.7.
+            metadata["rendition"] = None
+            return [metadata]
+        metadata["rendition"] = rend.model_dump(mode="json", exclude={"data_base64"})
+        return [metadata, Image(data=assets.read_rendition_bytes(rend), format="webp")]
 
     # ── Additive tier ─────────────────────────────────────────────────────
 

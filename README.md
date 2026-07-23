@@ -16,8 +16,10 @@ in-process fastembed model, no daemon, no API key) — feeding **hybrid
 search** (BM25 + vector fused by reciprocal rank fusion, then graph-expansion
 re-ranking), DB-stored **agent policies** with auto-accept on the write path,
 the **review/accept API** for the proposal queue, **proposed updates** (agent
-edits stage as `proposed` versions), and an **MCP server** (stdio) exposing
-the read + additive tool tiers. Still to come: the web UI, assets, and the
+edits stage as `proposed` versions), an **MCP server** (stdio) exposing the
+read + additive tool tiers, and **content-addressed assets** with lazily
+generated `thumb`/`preview` image renditions (agents get renditions, never
+originals). Still to come: the web UI, the ingestion pipeline, and the
 consolidation cycle.
 
 ## Quick start
@@ -62,6 +64,11 @@ uv run nodum policy list
 uv run nodum traverse <id> --edge-type supports --depth 2
 uv run nodum find-path <a> <b>
 uv run nodum diff <version-a> <version-b>
+
+# Assets: register a file into the CAS, derive cached WebP renditions
+uv run nodum asset register ./photo.jpg
+uv run nodum asset rendition <hash> --profile preview --out preview.webp
+uv run nodum asset purge                      # evict the rendition cache
 
 # MCP server (stdio) for external agents — read + additive tiers only,
 # every write attributed to --actor and proposed unless policy auto-accepts
@@ -111,11 +118,19 @@ degrades to BM25 + graph expansion. `NODUM_EMBED_MODEL` switches the model
 - **MCP server.** `nodum mcp serve` runs a stdio MCP server (the official
   Python SDK's FastMCP) exposing the design §8.1 read tier (`get_node`,
   `get_children`, `search`, `traverse`, `list_types`, `get_schema`,
-  `find_path`, `history`, `diff`), additive tier (`create_node`,
+  `find_path`, `history`, `diff`, `get_asset`), additive tier (`create_node`,
   `update_node`, `link`, `propose_edges`), and `accept`/`reject`. One
   configured `--actor` per server attributes every write. Curative tools
   (`merge_nodes`, `retype`, …) are **never registered** — structural
   enforcement of §8.2.
+- **Assets and renditions.** `asset register` copies a file into a
+  content-addressed store (`assets/<sha256[:2]>/<sha256>` next to the DB;
+  dedup is free) and records its metadata row. `asset rendition` derives
+  small WebP images from it — `thumb` (≤256px) and `preview` (≤1024px,
+  ≤300 KB) — lazily on first request, cached on disk, evictable with
+  `asset purge` (everything regenerates). Over MCP, `get_asset` returns
+  metadata plus a rendition image block: **LLMs never receive original
+  binaries** (design §5.7).
 - **Event log + versions.** Every mutation appends an event (actor, op, full
   before/after JSON payload) and — for nodes — a version snapshot. `undo`
   reverses an event by restoring its `before` state.

@@ -8,6 +8,7 @@ authors = [{ name = "Alice Voland" }]
 requires-python = ">=3.12"
 dependencies = [
     "mcp>=1.28.1",
+    "pillow>=11",
     "pydantic>=2.9",
     "sqlite-vec>=0.1.9",
     "typer>=0.16",

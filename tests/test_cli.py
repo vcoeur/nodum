@@ -275,3 +275,57 @@ def test_agent_update_proposes_and_review_accepts(fresh_db):
     accepted = _run_json("accept", str(version["id"]))
     assert accepted["state"] == "applied"
     assert _run_json("node", "get", note["id"])["content"] == "bot rewrite"
+
+
+# ── Assets and renditions ─────────────────────────────────────────────────────
+
+
+def _register_png(tmp_path, size=(800, 400), name="cli.png"):
+    from PIL import Image
+
+    source = tmp_path / name
+    Image.new("RGB", size, (10, 200, 90)).save(source)
+    return _run_json("asset", "register", str(source))
+
+
+def test_asset_register_get_list(fresh_db, tmp_path):
+    asset = _register_png(tmp_path)
+    assert asset["mime"] == "image/png"
+
+    fetched = _run_json("asset", "get", asset["hash"])
+    assert fetched["hash"] == asset["hash"]
+
+    listing = _run_json("asset", "list")
+    assert listing["count"] == 1
+
+
+def test_asset_rendition_out_and_purge(fresh_db, tmp_path):
+    asset = _register_png(tmp_path, size=(800, 400))
+    out_file = tmp_path / "preview.webp"
+
+    rendition = _run_json(
+        "asset", "rendition", asset["hash"], "--profile", "preview", "--out", str(out_file)
+    )
+    assert rendition["mime"] == "image/webp"
+    assert rendition["cached"] is False
+    assert (rendition["width"], rendition["height"]) == (800, 400)
+    assert out_file.read_bytes()[:4] == b"RIFF"
+    assert "data_base64" not in rendition or rendition["data_base64"] is None
+
+    cached = _run_json("asset", "rendition", asset["hash"], "--profile", "preview")
+    assert cached["cached"] is True
+
+    purged = _run_json("asset", "purge")
+    assert purged["purged"] == 1
+    regenerated = _run_json("asset", "rendition", asset["hash"], "--profile", "preview")
+    assert regenerated["cached"] is False
+
+
+def test_asset_rendition_rejects_non_images(fresh_db, tmp_path):
+    text_file = tmp_path / "doc.txt"
+    text_file.write_text("not an image")
+    asset = _run_json("asset", "register", str(text_file))
+
+    result = runner.invoke(app, ["asset", "rendition", asset["hash"]])
+    assert result.exit_code == 1
+    assert "only supported for image assets" in result.stderr
