@@ -46,7 +46,12 @@ class EdgeOut(BaseModel):
 
 
 class VersionOut(BaseModel):
-    """One snapshot of a node's title/content/props after a mutation."""
+    """One snapshot of a node's title/content/props after a mutation.
+
+    ``state`` is ``applied`` for snapshots of applied node state, ``proposed``
+    for an agent's pending update (design §8.1), and ``archived`` for a
+    rejected one.
+    """
 
     id: int
     node_id: str
@@ -55,6 +60,7 @@ class VersionOut(BaseModel):
     props: dict[str, Any]
     actor: str
     event_seq: int
+    state: str
     created_at: str
 
 
@@ -189,11 +195,13 @@ class PolicyOut(BaseModel):
 
 
 class ProposalOut(BaseModel):
-    """One pending proposal in the review queue: a proposed node or edge.
+    """One pending proposal in the review queue.
 
-    ``context`` carries what a reviewer needs beyond the row itself — for an
-    edge, the source/target node ids and titles; for a node, its parent's
-    id/title when it has one.
+    ``kind`` is ``node`` (a proposed node), ``edge`` (a proposed edge), or
+    ``update`` (a proposed new version of an existing node). ``context``
+    carries what a reviewer needs beyond the row itself — for an edge, the
+    source/target node ids and titles; for a node, its parent's id/title when
+    it has one; for an update, the current node's id/title/content.
     """
 
     kind: str
@@ -203,6 +211,7 @@ class ProposalOut(BaseModel):
     created_at: str
     node: NodeOut | None = None
     edge: EdgeOut | None = None
+    version: VersionOut | None = None
     context: dict[str, Any] = {}
 
 
@@ -226,3 +235,63 @@ class BatchTransitionOut(BaseModel):
     reason: str | None = None
     transitioned: list[str]
     failed: list[TransitionFailure]
+
+
+class SubgraphOut(BaseModel):
+    """A rooted subgraph: the nodes and edges reached by a traversal.
+
+    ``nodes`` always includes the root (first); ``edges`` are the active
+    edges the walk followed (empty at depth 0).
+    """
+
+    root: str
+    depth: int
+    nodes: list[NodeOut]
+    edges: list[EdgeOut]
+
+
+class PathOut(BaseModel):
+    """The shortest active-edge path between two nodes.
+
+    When ``found`` is true, ``edges[i]`` connects ``nodes[i]`` to
+    ``nodes[i+1]`` (in either stored direction).
+    """
+
+    found: bool
+    hops: int
+    nodes: list[NodeOut]
+    edges: list[EdgeOut]
+
+
+class DiffOut(BaseModel):
+    """A unified diff between two versions of a node.
+
+    ``diff`` is a ``difflib`` unified diff over a stable text rendering
+    (title line, props JSON, then content); ``changed_fields`` names the
+    fields that differ.
+    """
+
+    node_id: str
+    a: VersionOut
+    b: VersionOut
+    changed_fields: list[str]
+    diff: str
+
+
+class ItemFailure(BaseModel):
+    """One item a batch create could not process, with the reason."""
+
+    index: int
+    error: str
+
+
+class ProposeEdgesOut(BaseModel):
+    """The outcome of a batch edge proposal.
+
+    ``created`` lists the edges that were written (each its own event, in
+    input order); ``failed`` lists the suggestions that raised — a batch
+    never aborts on a single bad suggestion.
+    """
+
+    created: list[EdgeOut]
+    failed: list[ItemFailure]

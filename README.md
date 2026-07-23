@@ -11,10 +11,12 @@ reversible.
 versions + undo, Markdown-as-truth content, wikilink materialization, and a
 JSON-emitting CLI. **Phase 2 (agent-native)** is underway: event-log
 projectors with checkpoint/rebuild mechanics and the first derived index —
-an FTS5 full-text index feeding BM25 keyword search — plus DB-stored **agent
-policies** with auto-accept on the write path and the **review/accept API**
-for the proposal queue. Still to come: vector search + hybrid fusion, the MCP
-server, the web UI, assets, and the consolidation cycle.
+an FTS5 full-text index feeding BM25 keyword search — DB-stored **agent
+policies** with auto-accept on the write path, the **review/accept API** for
+the proposal queue, **proposed updates** (agent edits stage as `proposed`
+versions), and an **MCP server** (stdio) exposing the read + additive tool
+tiers. Still to come: vector search + hybrid fusion, the web UI, assets, and
+the consolidation cycle.
 
 ## Quick start
 
@@ -43,7 +45,8 @@ uv run nodum types                            # the seeded type catalog
 
 # Agent writes land in `proposed` and wait in the review queue…
 uv run nodum node create --type note --title "Bot draft" --actor agent:researcher
-uv run nodum review queue --created-by agent:researcher
+uv run nodum node update <id> --content "bot rewrite" --actor agent:researcher
+uv run nodum review queue --created-by agent:researcher   # nodes, edges, updates
 uv run nodum review accept-all --created-by agent:researcher
 uv run nodum review reject <id> --reason "not convinced"
 
@@ -51,6 +54,15 @@ uv run nodum review reject <id> --reason "not convinced"
 uv run nodum policy set agent:researcher --rule \
     '{"edge_type":"mentions","min_confidence":0.9,"action":"auto_accept"}'
 uv run nodum policy list
+
+# Curated graph reads (the MCP read tier's service functions)
+uv run nodum traverse <id> --edge-type supports --depth 2
+uv run nodum find-path <a> <b>
+uv run nodum diff <version-a> <version-b>
+
+# MCP server (stdio) for external agents — read + additive tiers only,
+# every write attributed to --actor and proposed unless policy auto-accepts
+uv run nodum mcp serve --actor agent:researcher
 ```
 
 Run `uv run nodum --help` (or any subcommand with `--help`) for the full
@@ -68,11 +80,21 @@ surface.
 - **State machine.** Nodes and edges are `proposed`, `active`, or `archived`.
   Human (CLI) writes land `active`; any other actor's writes land `proposed`
   and are accepted/rejected explicitly — individually, in batches, or by
-  filter through the review queue (`nodum review …`).
+  filter through the review queue (`nodum review …`). Agent *updates* stage
+  as `proposed` versions: accepting applies the staged fields to the node
+  (an ordinary, undoable `node.update`), rejecting archives the version.
 - **Agent policies.** Per-agent rulesets stored in the DB (`nodum policy …`)
   can auto-accept an agent's writes — e.g. "accept `mentions` edges from
   `agent:researcher` with confidence ≥ 0.9". An auto-accepted write is still
   the agent's own event, with the matched rule recorded in the payload.
+- **MCP server.** `nodum mcp serve` runs a stdio MCP server (the official
+  Python SDK's FastMCP) exposing the design §8.1 read tier (`get_node`,
+  `get_children`, `search`, `traverse`, `list_types`, `get_schema`,
+  `find_path`, `history`, `diff`), additive tier (`create_node`,
+  `update_node`, `link`, `propose_edges`), and `accept`/`reject`. One
+  configured `--actor` per server attributes every write. Curative tools
+  (`merge_nodes`, `retype`, …) are **never registered** — structural
+  enforcement of §8.2.
 - **Event log + versions.** Every mutation appends an event (actor, op, full
   before/after JSON payload) and — for nodes — a version snapshot. `undo`
   reverses an event by restoring its `before` state.

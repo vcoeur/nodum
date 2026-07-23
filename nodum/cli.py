@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from pathlib import Path
 
 import typer
 from pydantic import BaseModel
@@ -27,6 +28,7 @@ from nodum.service import (
     NodeNotFound,
     PolicyNotFound,
     TypeNotFound,
+    VersionNotFound,
 )
 
 app = typer.Typer(
@@ -41,11 +43,13 @@ projector_app = typer.Typer(
 )
 policy_app = typer.Typer(no_args_is_help=True, help="Per-agent policy rulesets (auto-accept).")
 review_app = typer.Typer(no_args_is_help=True, help="The review queue: pending proposals.")
+mcp_app = typer.Typer(no_args_is_help=True, help="MCP server (read + additive tiers, design §8).")
 app.add_typer(node_app, name="node")
 app.add_typer(edge_app, name="edge")
 app.add_typer(projector_app, name="projector")
 app.add_typer(policy_app, name="policy")
 app.add_typer(review_app, name="review")
+app.add_typer(mcp_app, name="mcp")
 
 
 @app.callback()
@@ -113,6 +117,7 @@ def _run(func, *args, **kwargs):
         TypeNotFound,
         EventNotFound,
         PolicyNotFound,
+        VersionNotFound,
         InvalidTransition,
         ValueError,
     ) as exc:
@@ -156,9 +161,17 @@ def node_create(
 
 
 @node_app.command("get")
-def node_get(node_id: str = typer.Argument(..., help="Node id.")) -> None:
-    """Fetch one node by id."""
-    _emit(_run(service.get_node, node_id))
+def node_get(
+    node_id: str = typer.Argument(..., help="Node id."),
+    depth: int = typer.Option(
+        0, "--depth", help="Include the active-edge neighborhood out to this many hops."
+    ),
+) -> None:
+    """Fetch one node by id (plus its neighborhood when --depth > 0)."""
+    if depth > 0:
+        _emit(_run(service.get_neighborhood, node_id, depth=depth))
+    else:
+        _emit(_run(service.get_node, node_id))
 
 
 @node_app.command("update")
@@ -172,7 +185,7 @@ def node_update(
     set_props: list[str] | None = SET_OPTION,
     actor: str = ACTOR_OPTION,
 ) -> None:
-    """Update a node's title, content, and/or props (only given fields change)."""
+    """Update a node (applies for actor 'human', stages a proposed version otherwise)."""
     kwargs: dict = {"actor": actor}
     resolved = _read_content(content, content_file)
     if title is not None:
@@ -238,6 +251,26 @@ def edge_list(
     """List edges, optionally filtered by incident node, type, or state."""
     edges = _run(service.list_edges, node_id=node, type=type, state=state, limit=limit)
     _print_json({"edges": [edge.model_dump(mode="json") for edge in edges], "count": len(edges)})
+
+
+@edge_app.command("create-batch")
+def edge_create_batch(
+    suggestions_file: str = typer.Argument(
+        ..., help="JSON array of {src, dst, edge_type, props?, confidence?} ('-' = stdin)."
+    ),
+    actor: str = ACTOR_OPTION,
+) -> None:
+    """Propose a batch of edges; bad suggestions are reported, not fatal."""
+    raw = sys.stdin.read() if suggestions_file == "-" else Path(suggestions_file).read_text()
+    try:
+        suggestions = json.loads(raw)
+    except json.JSONDecodeError:
+        typer.echo("expected a JSON array of edge suggestions", err=True)
+        raise typer.Exit(1) from None
+    if not isinstance(suggestions, list):
+        typer.echo("expected a JSON array of edge suggestions", err=True)
+        raise typer.Exit(1)
+    _emit(_run(service.propose_edges, suggestions, actor=actor))
 
 
 @app.command()
@@ -309,12 +342,75 @@ def search(
         "active", "--state", help="Node-state filter ('any' searches all states)."
     ),
     type: str | None = typer.Option(None, "--type", "-t", help="Filter by node type."),
+    created_by: str | None = typer.Option(None, "--created-by", help="Filter by writer."),
+    created_after: str | None = typer.Option(
+        None, "--created-after", help="Only nodes created after this timestamp."
+    ),
+    created_before: str | None = typer.Option(
+        None, "--created-before", help="Only nodes created before this timestamp."
+    ),
+    expand: bool = typer.Option(
+        False, "--expand", help="Append one-hop active-edge neighbors of the hits."
+    ),
 ) -> None:
     """Keyword-search node title + content (BM25-ranked, from the FTS index)."""
     result = _run(
-        search_module.search, query, k=k, state=None if state == "any" else state, type=type
+        search_module.search,
+        query,
+        k=k,
+        state=None if state == "any" else state,
+        type=type,
+        created_by=created_by,
+        created_after=created_after,
+        created_before=created_before,
+        expand=expand,
     )
     _emit(result)
+
+
+@app.command()
+def traverse(
+    start_id: str = typer.Argument(..., help="Node id to start from."),
+    edge_type: list[str] | None = typer.Option(
+        None, "--edge-type", help="Restrict to these edge types (repeatable)."
+    ),
+    depth: int = typer.Option(2, "--depth", help="Maximum hops."),
+    direction: str = typer.Option("both", "--direction", help="'out', 'in', or 'both'."),
+) -> None:
+    """Walk the subgraph reachable from a node over active edges."""
+    _emit(
+        _run(
+            service.traverse,
+            start_id,
+            edge_types=edge_type,
+            depth=depth,
+            direction=direction,
+        )
+    )
+
+
+@app.command(name="find-path")
+def find_path(
+    a: str = typer.Argument(..., help="Start node id."),
+    b: str = typer.Argument(..., help="Target node id."),
+) -> None:
+    """Find the shortest path between two nodes over active edges."""
+    _emit(_run(service.find_path, a, b))
+
+
+@app.command()
+def diff(
+    a: int = typer.Argument(..., help="First version id (see `history`)."),
+    b: int = typer.Argument(..., help="Second version id."),
+) -> None:
+    """Unified diff between two versions of one node."""
+    _emit(_run(service.diff_versions, a, b))
+
+
+@app.command()
+def schema(type: str = typer.Argument(..., help="Node or edge type id/name.")) -> None:
+    """Show one type's catalog entry, including its JSON schema."""
+    _emit(_run(service.get_schema, type))
 
 
 @projector_app.command("run")
@@ -339,6 +435,21 @@ def projector_status() -> None:
     """Show every projector's checkpoint, backlog, and derived-store size."""
     statuses = _run(projectors.projector_status)
     _print_json({"projectors": [status.model_dump(mode="json") for status in statuses]})
+
+
+# ── MCP server ────────────────────────────────────────────────────────────────
+
+
+@mcp_app.command("serve")
+def mcp_serve(
+    actor: str = typer.Option(
+        "agent:mcp", "--actor", help="Actor every write is attributed to (the agent identity)."
+    ),
+) -> None:
+    """Launch the MCP server on stdio (read + additive tiers, design §8)."""
+    from nodum import mcp_server
+
+    mcp_server.serve(actor=actor)
 
 
 # ── Policies ──────────────────────────────────────────────────────────────────
@@ -388,7 +499,7 @@ def policy_list() -> None:
 
 # ── Review queue ──────────────────────────────────────────────────────────────
 
-KIND_OPTION = typer.Option(None, "--kind", help="Limit to 'node' or 'edge' proposals.")
+KIND_OPTION = typer.Option(None, "--kind", help="Limit to 'node', 'edge', or 'update' proposals.")
 CREATED_BY_OPTION = typer.Option(None, "--created-by", help="Filter by proposing actor.")
 CREATED_BEFORE_OPTION = typer.Option(
     None, "--created-before", help="Only proposals created before this timestamp."
@@ -408,7 +519,7 @@ def review_queue(
     created_after: str | None = CREATED_AFTER_OPTION,
     limit: int = typer.Option(500, "--limit", help="Maximum proposals."),
 ) -> None:
-    """List pending proposals (proposed nodes/edges) with reviewer context."""
+    """List pending proposals (proposed nodes/edges/updates) with reviewer context."""
     proposals = _run(
         service.list_proposals,
         created_by=created_by,

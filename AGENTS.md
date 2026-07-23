@@ -16,12 +16,16 @@ one JSON object per command.
 Phase 1 (core) landed; Phase 2 (agent-native) is underway. Built so far in
 Phase 2: **event-log projectors** (`nodum.projectors`) with per-projector
 checkpoints and rebuild mechanics, the **`fts` projector** (FTS5 over node
-title + content), **BM25 keyword search** (`nodum.search`, CLI `search`),
-**agent policies** (DB-stored per-agent rulesets, design §8.3, with
-auto-accept evaluation on the edge write path), and the **review/accept API**
-(proposal listing with reviewer context, batch accept/reject by id or
-filter). **Deliberately not built yet** (later phases — do not add):
-sqlite-vec / hybrid fusion, the MCP server, the web UI,
+title + content), **BM25 keyword search** (`nodum.search`, CLI `search`)
+with one-hop graph expansion, **agent policies** (DB-stored per-agent
+rulesets, design §8.3, with auto-accept evaluation on the edge write path),
+the **review/accept API** (proposal listing with reviewer context, batch
+accept/reject by id or filter), **proposed updates** (agent `update_node`
+stages a `proposed` version; accept applies it, reject archives it —
+migration 0005), and the **MCP server** (`nodum.mcp_server`, stdio, read +
+additive tiers + `accept`/`reject`; curative tools are never registered).
+**Deliberately not built yet** (later phases — do not add):
+sqlite-vec / hybrid fusion, the web UI,
 assets/CAS/renditions/ingestion, the internal agent runtime and consolidation
 cycle, Markdown Mirror / JSON export. The schema reserves room for them
 (`graph_id`, `merge_redirects`, `cycle_id`); each lands as its own
@@ -30,13 +34,23 @@ append-only migration.
 ## Architecture
 
 - **`nodum.service`** is the spine and the only writer — validation, the
-  `proposed → active → archived` state machine, the event log, versions, undo,
-  wikilink materialization, agent policies (CRUD + auto-accept evaluation on
-  the write path), and the review queue (proposal listing, batch
-  accept/reject). Each public function opens its own short-lived connection
-  (applying pending migrations idempotently) and commits. New behaviour and
-  validation go here first; adapters must not add behaviour the service
-  lacks.
+  `proposed → active → archived` state machine, the event log, versions
+  (including `proposed` version updates: agent edits stage, accept applies,
+  reject archives), undo, wikilink materialization, agent policies (CRUD +
+  auto-accept evaluation on the write path), the review queue (proposal
+  listing, batch accept/reject), and the curated graph reads
+  (`get_neighborhood`, `traverse`, `find_path`, `get_schema`,
+  `diff_versions`, `propose_edges`). Each public function opens its own
+  short-lived connection (applying pending migrations idempotently) and
+  commits. New behaviour and validation go here first; adapters must not add
+  behaviour the service lacks.
+- **`nodum.mcp_server`** — the MCP adapter (stdio, official Python SDK
+  FastMCP). Registers the design §8.1 read + additive tiers plus
+  `accept`/`reject`, each tool a thin delegate to a service/search function;
+  one configured `--actor` per server attributes every write. Curative tools
+  (`merge_nodes`, `retype`, `supersede_edge`, `bulk_relink`, `consolidate`)
+  are **never registered** (§8.2 structural enforcement). Launched by
+  `nodum mcp serve`.
 - **`nodum.projectors`** — derived-index consumers of the event log. A
   projector registry (`REGISTRY`), per-projector checkpoints in
   `projector_checkpoints`, incremental `run_projectors`, and
@@ -44,9 +58,11 @@ append-only migration.
   layer never calls projectors — the event log is the only coupling, and no
   LLM exists anywhere in this path (design Constraint 4).
 - **`nodum.search`** — the query path. BM25 keyword search over the `fts`
-  projector's index (catching the projector up first), returning hits with a
-  fused `score` plus a per-signal `signals` breakdown so vector + graph
-  expansion (design §7 RRF fusion) slot in without reshaping the API.
+  projector's index (catching the projector up first) with `type`/`state`/
+  `created_by`/date filters, returning hits with a fused `score` plus a
+  per-signal `signals` breakdown, and optional one-hop graph expansion over
+  `active` edges (`--expand`) so vector + graph fusion (design §7 RRF) slots
+  in without reshaping the API.
 - **`nodum.db`** — connection management (WAL, foreign keys), `NODUM_DB`
   resolution, the migration runner.
 - **`nodum.migrations`** — the append-only migration list. Never edit a shipped
@@ -86,10 +102,13 @@ Phase-1 decision log.
   `~/.local/share/nodum/nodum.db`.
 - Writes default to actor `human` (state `active`); pass `--actor agent:<name>`
   to land writes in `proposed` instead — unless the agent's stored policy
-  auto-accepts the write (`policy set`).
+  auto-accepts the write (`policy set`). An agent `node update` stages a
+  `proposed` *version*; `accept <version-id>` applies it, `reject` archives it.
 - `--set key=value` is repeatable; values are parsed as JSON with a raw-string
   fallback.
-- Surface: `init`, `node create/get/update/list/children`, `edge create/list`,
-  `accept`/`reject`/`archive <id>`, `undo [seq]`, `history <node-id>`,
-  `events`, `types`, `search <query>`, `projector run/status/rebuild`,
-  `policy set/get/list`, `review queue/accept/reject/accept-all/reject-all`.
+- Surface: `init`, `node create/get/update/list/children`, `edge
+  create/list/create-batch`, `accept`/`reject`/`archive <id>`, `undo [seq]`,
+  `history <node-id>`, `events`, `types`, `schema <type>`, `search <query>`,
+  `traverse`, `find-path`, `diff`, `projector run/status/rebuild`,
+  `policy set/get/list`, `review queue/accept/reject/accept-all/reject-all`,
+  `mcp serve`.

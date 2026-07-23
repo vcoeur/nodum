@@ -170,3 +170,84 @@ def test_projector_rebuild_unknown_exits_1(fresh_db):
     result = runner.invoke(app, ["projector", "rebuild", "nope"])
     assert result.exit_code == 1
     assert "unknown projector" in result.stderr
+
+
+def test_node_get_with_depth(fresh_db):
+    a = _run_json("node", "create", "--type", "concept", "--title", "A")
+    b = _run_json("node", "create", "--type", "concept", "--title", "B")
+    _run_json("edge", "create", a["id"], b["id"], "--type", "relates_to")
+
+    subgraph = _run_json("node", "get", a["id"], "--depth", "1")
+    assert {node["id"] for node in subgraph["nodes"]} == {a["id"], b["id"]}
+    assert len(subgraph["edges"]) == 1
+
+
+def test_traverse_and_find_path(fresh_db):
+    a = _run_json("node", "create", "--type", "concept", "--title", "A")
+    b = _run_json("node", "create", "--type", "concept", "--title", "B")
+    _run_json("edge", "create", a["id"], b["id"], "--type", "supports")
+
+    walked = _run_json("traverse", a["id"], "--edge-type", "supports")
+    assert {node["id"] for node in walked["nodes"]} == {a["id"], b["id"]}
+
+    path = _run_json("find-path", a["id"], b["id"])
+    assert path["found"] is True
+    assert path["hops"] == 1
+
+
+def test_diff_and_schema(fresh_db):
+    note = _run_json("node", "create", "--type", "note", "--title", "Draft", "--content", "v1")
+    _run_json("node", "update", note["id"], "--content", "v2")
+    versions = _run_json("history", note["id"])["versions"]
+
+    diffed = _run_json("diff", str(versions[0]["id"]), str(versions[1]["id"]))
+    assert diffed["changed_fields"] == ["content"]
+
+    schema = _run_json("schema", "supports")
+    assert schema["inverse_name"] == "supported_by"
+
+
+def test_edge_create_batch_from_stdin(fresh_db):
+    a = _run_json("node", "create", "--type", "concept", "--title", "A")
+    b = _run_json("node", "create", "--type", "concept", "--title", "B")
+    suggestions = json.dumps(
+        [
+            {"src": a["id"], "dst": b["id"], "edge_type": "relates_to"},
+            {"src": a["id"], "dst": "missing", "edge_type": "supports"},
+        ]
+    )
+    result = runner.invoke(
+        app, ["edge", "create-batch", "-", "--actor", "agent:researcher"], input=suggestions
+    )
+    assert result.exit_code == 0, result.output
+    outcome = json.loads(result.stdout)
+    assert outcome["created"][0]["state"] == "proposed"
+    assert outcome["failed"][0]["index"] == 1
+
+
+def test_search_filters_and_expand(fresh_db):
+    a = _run_json("node", "create", "--type", "concept", "--title", "xylem alpha")
+    b = _run_json("node", "create", "--type", "note", "--title", "xylem beta")
+    _run_json("edge", "create", a["id"], b["id"], "--type", "supports", "--confidence", "0.9")
+
+    filtered = _run_json("search", "xylem", "--created-by", "agent:nobody")
+    assert filtered["hits"] == []
+
+    expanded = _run_json("search", "xylem alpha", "--expand")
+    assert [hit["node_id"] for hit in expanded["hits"]] == [a["id"], b["id"]]
+    assert expanded["hits"][1]["signals"]["graph"] > 0
+
+
+def test_agent_update_proposes_and_review_accepts(fresh_db):
+    note = _run_json("node", "create", "--type", "note", "--title", "N", "--content", "original")
+    version = _run_json(
+        "node", "update", note["id"], "--content", "bot rewrite", "--actor", "agent:researcher"
+    )
+    assert version["state"] == "proposed"
+
+    queue = _run_json("review", "queue", "--kind", "update")
+    assert queue["proposals"][0]["id"] == str(version["id"])
+
+    accepted = _run_json("accept", str(version["id"]))
+    assert accepted["state"] == "applied"
+    assert _run_json("node", "get", note["id"])["content"] == "bot rewrite"

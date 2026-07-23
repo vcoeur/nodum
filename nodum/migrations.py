@@ -184,10 +184,24 @@ CREATE TABLE policies (
 """
 
 
+PROPOSED_VERSIONS_DDL = """
+-- Proposed updates (design §8.1: agent `update_node` → new version →
+-- `proposed`). A version row is the storage for an agent's proposed edit:
+-- `proposed` until a reviewer accepts (the version's content is applied to
+-- the node and the row flips to `applied`) or rejects (→ `archived`).
+-- Pre-existing snapshots are human/system records of applied state, hence
+-- the `applied` default.
+ALTER TABLE versions ADD COLUMN state TEXT NOT NULL DEFAULT 'applied'
+    CHECK (state IN ('applied','proposed','archived'));
+CREATE INDEX idx_versions_state ON versions(state);
+"""
+
+
 #: Ordered (name, SQL) migrations. Append-only — never edit a shipped entry.
 MIGRATIONS: list[tuple[str, str]] = [
     ("0001_core", CORE_DDL),
     ("0002_seed_builtin_types", _seed_sql()),
     ("0003_projector_checkpoints_and_fts", PROJECTORS_DDL),
     ("0004_policies", POLICIES_DDL),
+    ("0005_proposed_versions", PROPOSED_VERSIONS_DDL),
 ]

@@ -12,6 +12,7 @@ adapters (CLI today, HTTP/MCP later) stay stateless and hold no logic.
 
 from __future__ import annotations
 
+import difflib
 import json
 import re
 import sqlite3
@@ -22,13 +23,18 @@ from typing import Any
 from nodum import db
 from nodum.models import (
     BatchTransitionOut,
+    DiffOut,
     EdgeOut,
     EdgeTypeOut,
     EventOut,
     InitResult,
+    ItemFailure,
     NodeOut,
+    PathOut,
     PolicyOut,
     ProposalOut,
+    ProposeEdgesOut,
+    SubgraphOut,
     TransitionFailure,
     TypeOut,
     TypesOut,
@@ -80,6 +86,10 @@ class EventNotFound(LookupError):
 
 class PolicyNotFound(LookupError):
     """Raised when no policy is stored for an agent."""
+
+
+class VersionNotFound(LookupError):
+    """Raised when a version id does not resolve."""
 
 
 class InvalidTransition(ValueError):
@@ -153,6 +163,30 @@ def _get_edge_row(conn: sqlite3.Connection, edge_id: str) -> sqlite3.Row:
     if row is None:
         raise EdgeNotFound(f"edge not found: {edge_id}")
     return row
+
+
+def _get_version_row(conn: sqlite3.Connection, version_id: int) -> sqlite3.Row:
+    """Fetch a version row or raise :class:`VersionNotFound`."""
+    row = conn.execute("SELECT * FROM versions WHERE id = ?", (version_id,)).fetchone()
+    if row is None:
+        raise VersionNotFound(f"version not found: {version_id}")
+    return row
+
+
+def _version_out(row: sqlite3.Row | dict[str, Any]) -> VersionOut:
+    """Build the public version model from a versions row (props decoded)."""
+    data = dict(row)
+    return VersionOut(
+        id=data["id"],
+        node_id=data["node_id"],
+        title=data["title"],
+        content=data["content"],
+        props=json.loads(data["props"]),
+        actor=data["actor"],
+        event_seq=data["event_seq"],
+        state=data["state"],
+        created_at=data["created_at"],
+    )
 
 
 def _resolve_node_type(conn: sqlite3.Connection, type_ref: str) -> str:
@@ -572,11 +606,19 @@ def update_node(
     props: Any = _UNSET,
     actor: str = ACTOR_HUMAN,
     path: str | Path | None = None,
-) -> NodeOut:
-    """Update a node's title/content/props, emit ``node.update``, version it.
+) -> NodeOut | VersionOut:
+    """Update a node's title/content/props — or propose the update.
 
-    Only the given fields change. A content change re-runs wikilink
-    materialisation (new links create edges, removed text archives them).
+    For the ``human`` actor the update applies in place: emit ``node.update``,
+    snapshot an ``applied`` version, and re-run wikilink materialisation when
+    the content changed. For any other actor (design §8.1) the edit is staged
+    as a ``proposed`` version — the node itself is untouched — and waits in
+    the review queue; accepting it applies the staged fields (emitting
+    ``node.update`` then), rejecting it archives the version. Only the given
+    fields change.
+
+    Returns:
+        The updated node (human path) or the proposed version (agent path).
 
     Raises:
         NodeNotFound: If the id does not resolve.
@@ -587,6 +629,33 @@ def update_node(
         new_title = before["title"] if title is _UNSET else title
         new_content = before["content"] if content is _UNSET else content
         new_props = before["props"] if props is _UNSET else json.dumps(props, ensure_ascii=False)
+        if actor != ACTOR_HUMAN:
+            # Agent path: stage the edit as a proposed version (design §8.1).
+            # The event precedes the insert so the version can point at it.
+            seq = _emit(
+                conn,
+                actor,
+                "version.propose",
+                {
+                    "node_id": node_id,
+                    "before": before,
+                    "proposed": {
+                        "title": new_title,
+                        "content": new_content,
+                        "props": json.loads(new_props),
+                    },
+                },
+            )
+            cur = conn.execute(
+                """
+                INSERT INTO versions (node_id, title, content, props, actor, event_seq, state)
+                VALUES (?, ?, ?, ?, ?, ?, 'proposed')
+                """,
+                (node_id, new_title, new_content, new_props, actor, seq),
+            )
+            version = _row_dict(_get_version_row(conn, int(cur.lastrowid)))
+            conn.commit()
+            return _version_out(version)
         conn.execute(
             """
             UPDATE nodes
@@ -660,6 +729,46 @@ def list_children(node_id: str, *, path: str | Path | None = None) -> list[NodeO
         conn.close()
 
 
+def _create_edge_in_conn(
+    conn: sqlite3.Connection,
+    src_id: str,
+    dst_id: str,
+    type: str,
+    *,
+    props: dict[str, Any] | None,
+    confidence: float | None,
+    actor: str,
+) -> dict[str, Any]:
+    """Validate and write one edge inside an open connection (no commit).
+
+    Shared by :func:`create_edge` and :func:`propose_edges`. The landing
+    state follows the actor rule unless the actor's policy auto-accepts the
+    write (design §8.3).
+    """
+    _get_node_row(conn, src_id)
+    _get_node_row(conn, dst_id)
+    type_id = _resolve_edge_type(conn, type)
+    if confidence is not None and not 0 <= confidence <= 1:
+        raise ValueError(f"confidence must be between 0 and 1, got {confidence}")
+    state = _default_state(actor)
+    policy_rule = None
+    if state == "proposed":
+        policy_rule = _auto_accept_rule(conn, actor, type_id, confidence)
+        if policy_rule is not None:
+            state = "active"
+    return _insert_edge(
+        conn,
+        src_id=src_id,
+        dst_id=dst_id,
+        type_id=type_id,
+        props=props or {},
+        confidence=confidence,
+        actor=actor,
+        state=state,
+        policy_rule=policy_rule,
+    )
+
+
 def create_edge(
     src_id: str,
     dst_id: str,
@@ -686,30 +795,57 @@ def create_edge(
     """
     conn = _connect(path)
     try:
-        _get_node_row(conn, src_id)
-        _get_node_row(conn, dst_id)
-        type_id = _resolve_edge_type(conn, type)
-        if confidence is not None and not 0 <= confidence <= 1:
-            raise ValueError(f"confidence must be between 0 and 1, got {confidence}")
-        state = _default_state(actor)
-        policy_rule = None
-        if state == "proposed":
-            policy_rule = _auto_accept_rule(conn, actor, type_id, confidence)
-            if policy_rule is not None:
-                state = "active"
-        row = _insert_edge(
-            conn,
-            src_id=src_id,
-            dst_id=dst_id,
-            type_id=type_id,
-            props=props or {},
-            confidence=confidence,
-            actor=actor,
-            state=state,
-            policy_rule=policy_rule,
+        row = _create_edge_in_conn(
+            conn, src_id, dst_id, type, props=props, confidence=confidence, actor=actor
         )
         conn.commit()
         return _edge_out(row)
+    finally:
+        conn.close()
+
+
+def propose_edges(
+    suggestions: list[dict[str, Any]],
+    *,
+    actor: str = ACTOR_HUMAN,
+    path: str | Path | None = None,
+) -> ProposeEdgesOut:
+    """Write a batch of edge suggestions, one event per edge (design §8.1).
+
+    Each suggestion names ``src``, ``dst``, and ``edge_type``, plus optional
+    ``props`` and ``confidence`` — the same inputs as :func:`create_edge`,
+    including policy auto-accept. A malformed suggestion (missing key,
+    unknown endpoint/type, bad confidence) lands in ``failed`` with its
+    input index; the rest still write. One commit for the whole batch.
+
+    Raises:
+        ValueError: If ``suggestions`` is not a list of objects.
+    """
+    conn = _connect(path)
+    try:
+        created: list[EdgeOut] = []
+        failed: list[ItemFailure] = []
+        for index, suggestion in enumerate(suggestions):
+            if not isinstance(suggestion, dict):
+                failed.append(ItemFailure(index=index, error="suggestion must be an object"))
+                continue
+            try:
+                row = _create_edge_in_conn(
+                    conn,
+                    str(suggestion["src"]),
+                    str(suggestion["dst"]),
+                    str(suggestion["edge_type"]),
+                    props=suggestion.get("props"),
+                    confidence=suggestion.get("confidence"),
+                    actor=actor,
+                )
+                created.append(_edge_out(row))
+            except KeyError as exc:
+                failed.append(ItemFailure(index=index, error=f"missing key: {exc.args[0]}"))
+            except (NodeNotFound, TypeNotFound, ValueError) as exc:
+                failed.append(ItemFailure(index=index, error=str(exc)))
+        conn.commit()
+        return ProposeEdgesOut(created=created, failed=failed)
     finally:
         conn.close()
 
@@ -751,6 +887,56 @@ def list_edges(
         conn.close()
 
 
+def _transition_version(
+    conn: sqlite3.Connection,
+    before: dict[str, Any],
+    action: str,
+    actor: str,
+    reason: str | None = None,
+) -> dict[str, Any]:
+    """Accept or reject a proposed version inside an open connection.
+
+    Accepting *applies* the staged title/content/props to the node (emitting
+    ``node.update`` — undoable, and picked up by the FTS projector — with the
+    applied version id in the payload), flips the version to ``applied``, and
+    re-runs wikilink materialisation with the version's original actor.
+    Rejecting flips it to ``archived`` and emits ``version.reject``.
+    """
+    version_id = before["id"]
+    if action == "accept":
+        node_before = _row_dict(_get_node_row(conn, before["node_id"]))
+        conn.execute(
+            """
+            UPDATE nodes
+            SET title = ?, content = ?, props = ?, updated_at = datetime('now')
+            WHERE id = ?
+            """,
+            (before["title"], before["content"], before["props"], before["node_id"]),
+        )
+        node_after = _row_dict(_get_node_row(conn, before["node_id"]))
+        conn.execute("UPDATE versions SET state = 'applied' WHERE id = ?", (version_id,))
+        _emit(
+            conn,
+            actor,
+            "node.update",
+            {
+                "before": node_before,
+                "after": node_after,
+                "applied_version_id": version_id,
+                "proposed_event_seq": before["event_seq"],
+            },
+        )
+        _materialize_mentions(conn, node_after, before["actor"])
+    else:  # reject
+        conn.execute("UPDATE versions SET state = 'archived' WHERE id = ?", (version_id,))
+        archived = _row_dict(_get_version_row(conn, version_id))
+        payload: dict[str, Any] = {"before": before, "after": archived}
+        if reason is not None:
+            payload["reason"] = reason
+        _emit(conn, actor, "version.reject", payload)
+    return _row_dict(_get_version_row(conn, version_id))
+
+
 def _transition_row(
     conn: sqlite3.Connection,
     record_id: str,
@@ -761,10 +947,12 @@ def _transition_row(
     """Apply one state transition inside an open connection (no commit).
 
     Returns:
-        A ``(kind, after_row)`` pair where kind is ``"node"`` or ``"edge"``.
+        A ``(kind, after_row)`` pair where kind is ``"node"``, ``"edge"``, or
+        ``"version"``.
 
     Raises:
-        NodeNotFound: If the id resolves to neither a node nor an edge.
+        NodeNotFound: If the id resolves to neither a node, an edge, nor a
+            version.
         InvalidTransition: If the transition is not allowed from the current
             state.
     """
@@ -774,13 +962,19 @@ def _transition_row(
     if row is None:
         row = conn.execute("SELECT * FROM edges WHERE id = ?", (record_id,)).fetchone()
         kind = "edge"
+    if row is None and record_id.isdigit():
+        row = conn.execute("SELECT * FROM versions WHERE id = ?", (int(record_id),)).fetchone()
+        kind = "version"
     if row is None:
-        raise NodeNotFound(f"no node or edge with id: {record_id}")
+        raise NodeNotFound(f"no node, edge, or version with id: {record_id}")
     before = _row_dict(row)
     if before["state"] != from_state:
         raise InvalidTransition(
             f"cannot {action} a {kind} in state {before['state']!r} (requires state {from_state!r})"
         )
+    if kind == "version":
+        # Versions only ever sit in `proposed`; accept applies, reject archives.
+        return kind, _transition_version(conn, before, action, actor, reason=reason)
     if kind == "node":
         conn.execute(
             "UPDATE nodes SET state = ?, updated_at = datetime('now') WHERE id = ?",
@@ -798,21 +992,23 @@ def _transition_row(
 
 def transition(
     record_id: str, action: str, *, actor: str = ACTOR_HUMAN, path: str | Path | None = None
-) -> NodeOut | EdgeOut:
-    """Apply a state-machine transition to a node or edge.
+) -> NodeOut | EdgeOut | VersionOut:
+    """Apply a state-machine transition to a node, edge, or proposed version.
 
     Args:
-        record_id: A node or edge id (nodes are checked first).
-        action: One of ``accept`` (proposed→active), ``reject``
-            (proposed→archived), ``archive`` (active→archived).
+        record_id: A node or edge id, or a version id (proposed update).
+            Nodes are checked first, then edges, then versions.
+        action: One of ``accept`` (proposed→active, or applies a proposed
+            update), ``reject`` (proposed→archived), ``archive``
+            (active→archived; nodes/edges only).
         actor: Who performs the transition.
         path: Explicit database path.
 
     Returns:
-        The updated node or edge.
+        The updated node, edge, or version.
 
     Raises:
-        NodeNotFound: If the id resolves to neither a node nor an edge.
+        NodeNotFound: If the id resolves to no node, edge, or version.
         InvalidTransition: If the transition is not allowed from the current
             state.
     """
@@ -822,7 +1018,11 @@ def transition(
     try:
         kind, after = _transition_row(conn, record_id, action, actor)
         conn.commit()
-        return _node_out(after) if kind == "node" else _edge_out(after)
+        if kind == "node":
+            return _node_out(after)
+        if kind == "version":
+            return _version_out(after)
+        return _edge_out(after)
     finally:
         conn.close()
 
@@ -837,15 +1037,17 @@ def _proposal_filters(
     type: str | None,
     created_before: str | None,
     created_after: str | None,
-) -> tuple[tuple[str, list[Any]] | None, tuple[str, list[Any]] | None]:
+) -> tuple[tuple[str, list[Any]] | None, tuple[str, list[Any]] | None, str | None]:
     """Build WHERE clauses/params for proposed nodes and proposed edges.
 
-    Returns ``(node_filter, edge_filter)`` pairs of ``(where_sql, params)``;
-    a ``None`` filter excludes that kind entirely. A ``type`` filter resolves
-    against both catalogs: a name known only as a node type excludes edges
-    (and vice versa) — filtering by a type shows that type, never unfiltered
-    rows of the other kind. ``created_before`` / ``created_after`` compare
-    lexicographically against the SQLite ``datetime('now')`` format
+    Returns ``(node_filter, edge_filter, node_type_id)``: each filter is a
+    ``(where_sql, params)`` pair, a ``None`` filter excludes that kind
+    entirely, and ``node_type_id`` is the resolved node-type id (used by the
+    proposed-update query, which types through the node). A ``type`` filter
+    resolves against both catalogs: a name known only as a node type excludes
+    edges (and vice versa) — filtering by a type shows that type, never
+    unfiltered rows of the other kind. ``created_before`` / ``created_after``
+    compare lexicographically against the SQLite ``datetime('now')`` format
     (``YYYY-MM-DD HH:MM:SS``).
 
     Raises:
@@ -880,7 +1082,35 @@ def _proposal_filters(
 
     node_filter = build(node_type_id) if type is None or node_type_id is not None else None
     edge_filter = build(edge_type_id) if type is None or edge_type_id is not None else None
-    return node_filter, edge_filter
+    return node_filter, edge_filter, node_type_id
+
+
+def _update_proposal_filter(
+    node_type_id: str | None,
+    *,
+    created_by: str | None,
+    created_before: str | None,
+    created_after: str | None,
+) -> tuple[str, list[Any]]:
+    """Build the WHERE clause for proposed versions (kind ``update``).
+
+    Column names differ from nodes/edges: the proposing actor is
+    ``versions.actor`` and the type filter joins through the node.
+    """
+    clauses, params = ["v.state = 'proposed'"], []
+    if created_by is not None:
+        clauses.append("v.actor = ?")
+        params.append(created_by)
+    if created_before is not None:
+        clauses.append("v.created_at < ?")
+        params.append(created_before)
+    if created_after is not None:
+        clauses.append("v.created_at > ?")
+        params.append(created_after)
+    if node_type_id is not None:
+        clauses.append("n.type_id = ?")
+        params.append(node_type_id)
+    return " AND ".join(clauses), params
 
 
 def _proposal_rows(
@@ -889,13 +1119,13 @@ def _proposal_rows(
     kind: str | None = None,
     **filters: Any,
 ) -> list[tuple[str, sqlite3.Row]]:
-    """Fetch proposed node/edge rows matching the filters, oldest first.
+    """Fetch proposed node/edge/version rows matching the filters, oldest first.
 
     Within one kind the order is creation order (``created_at``, then
     ``rowid``); timestamps have one-second resolution, so same-second rows of
     different kinds may interleave.
     """
-    node_filter, edge_filter = _proposal_filters(conn, **filters)
+    node_filter, edge_filter, node_type_id = _proposal_filters(conn, **filters)
     results: list[tuple[str, sqlite3.Row]] = []
     if kind in (None, "node") and node_filter is not None:
         where, params = node_filter
@@ -912,6 +1142,22 @@ def _proposal_rows(
             ("edge", row)
             for row in conn.execute(
                 f"SELECT rowid AS _rowid, * FROM edges WHERE {where} ORDER BY created_at, rowid",
+                params,
+            ).fetchall()
+        ]
+    if kind in (None, "update") and (filters.get("type") is None or node_type_id is not None):
+        where, params = _update_proposal_filter(
+            node_type_id,
+            created_by=filters.get("created_by"),
+            created_before=filters.get("created_before"),
+            created_after=filters.get("created_after"),
+        )
+        results += [
+            ("update", row)
+            for row in conn.execute(
+                "SELECT v.rowid AS _rowid, v.*, n.type_id AS node_type_id FROM versions v "
+                "JOIN nodes n ON n.id = v.node_id "
+                f"WHERE {where} ORDER BY v.created_at, v.rowid",
                 params,
             ).fetchall()
         ]
@@ -937,6 +1183,13 @@ def _edge_context(conn: sqlite3.Connection, edge: dict[str, Any]) -> dict[str, A
     return context
 
 
+def _update_context(conn: sqlite3.Connection, version: dict[str, Any]) -> dict[str, Any]:
+    """Reviewer context for a proposed update: the current node's id/title."""
+    row = conn.execute("SELECT id, title FROM nodes WHERE id = ?", (version["node_id"],)).fetchone()
+    node = {"id": row["id"], "title": row["title"]} if row else {"id": version["node_id"]}
+    return {"node": node}
+
+
 def list_proposals(
     *,
     created_by: str | None = None,
@@ -947,22 +1200,24 @@ def list_proposals(
     limit: int = 500,
     path: str | Path | None = None,
 ) -> list[ProposalOut]:
-    """List pending proposals (proposed nodes and edges), oldest first.
+    """List pending proposals (proposed nodes, edges, and updates), oldest first.
 
     Args:
         created_by: Filter by proposing actor (e.g. ``agent:researcher``).
         type: Filter by node/edge type id or name (applies within each kind).
-        kind: ``"node"`` or ``"edge"`` to list one kind only (default: both).
+        kind: ``"node"``, ``"edge"``, or ``"update"`` to list one kind only
+            (default: all three).
         created_before: Only proposals created before this timestamp.
         created_after: Only proposals created after this timestamp.
         limit: Maximum proposals returned.
         path: Explicit database path.
 
     Returns:
-        Proposals with reviewer context (edge endpoints, node parent).
+        Proposals with reviewer context (edge endpoints, node parent, or the
+        node an update targets).
     """
-    if kind not in (None, "node", "edge"):
-        raise ValueError(f"kind must be 'node' or 'edge', got {kind!r}")
+    if kind not in (None, "node", "edge", "update"):
+        raise ValueError(f"kind must be 'node', 'edge', or 'update', got {kind!r}")
     conn = _connect(path)
     try:
         rows = _proposal_rows(
@@ -988,7 +1243,7 @@ def list_proposals(
                         context=_node_context(conn, data),
                     )
                 )
-            else:
+            elif row_kind == "edge":
                 proposals.append(
                     ProposalOut(
                         kind="edge",
@@ -998,6 +1253,18 @@ def list_proposals(
                         created_at=data["created_at"],
                         edge=_edge_out(data),
                         context=_edge_context(conn, data),
+                    )
+                )
+            else:
+                proposals.append(
+                    ProposalOut(
+                        kind="update",
+                        id=str(data["id"]),
+                        type=data["node_type_id"],
+                        created_by=data["actor"],
+                        created_at=data["created_at"],
+                        version=_version_out(data),
+                        context=_update_context(conn, data),
                     )
                 )
         return proposals
@@ -1035,10 +1302,11 @@ def _transition_many(
 def accept_proposals(
     ids: list[str], *, actor: str = ACTOR_HUMAN, path: str | Path | None = None
 ) -> BatchTransitionOut:
-    """Accept proposed nodes/edges by id (proposed → active), one event each.
+    """Accept proposed nodes/edges/updates by id, one event each.
 
-    Ids that are unknown or not ``proposed`` are collected in ``failed``; the
-    rest still transition.
+    Accepting an update (a proposed version id, given as a string) applies
+    its staged fields to the node. Ids that are unknown or not ``proposed``
+    are collected in ``failed``; the rest still transition.
     """
     return _transition_many(ids, "accept", actor=actor, reason=None, path=path)
 
@@ -1050,7 +1318,7 @@ def reject_proposals(
     actor: str = ACTOR_HUMAN,
     path: str | Path | None = None,
 ) -> BatchTransitionOut:
-    """Reject proposed nodes/edges by id (proposed → archived), one event each.
+    """Reject proposed nodes/edges/updates by id, one event each.
 
     The ``reason`` is recorded in every reject event's payload (design §8.1).
     Ids that are unknown or not ``proposed`` are collected in ``failed``.
@@ -1060,7 +1328,7 @@ def reject_proposals(
 
 def _matching_ids(conn: sqlite3.Connection, *, kind: str | None, **filters: Any) -> list[str]:
     """Resolve a proposal filter to concrete ids (the batch-by-filter input)."""
-    return [row["id"] for _, row in _proposal_rows(conn, kind=kind, **filters)]
+    return [str(row["id"]) for _, row in _proposal_rows(conn, kind=kind, **filters)]
 
 
 def accept_matching(
@@ -1078,8 +1346,8 @@ def accept_matching(
     The filter resolves to concrete ids first, then each id transitions with
     its own event — the batch is a convenience, never a silent bulk update.
     """
-    if kind not in (None, "node", "edge"):
-        raise ValueError(f"kind must be 'node' or 'edge', got {kind!r}")
+    if kind not in (None, "node", "edge", "update"):
+        raise ValueError(f"kind must be 'node', 'edge', or 'update', got {kind!r}")
     conn = _connect(path)
     try:
         ids = _matching_ids(
@@ -1111,8 +1379,8 @@ def reject_matching(
     The filter resolves to concrete ids first, then each id transitions with
     its own event carrying the reason.
     """
-    if kind not in (None, "node", "edge"):
-        raise ValueError(f"kind must be 'node' or 'edge', got {kind!r}")
+    if kind not in (None, "node", "edge", "update"):
+        raise ValueError(f"kind must be 'node', 'edge', or 'update', got {kind!r}")
     conn = _connect(path)
     try:
         ids = _matching_ids(
@@ -1321,6 +1589,9 @@ def undo(
 def history(node_id: str, *, path: str | Path | None = None) -> list[VersionOut]:
     """Return a node's version snapshots in chronological order.
 
+    Proposed and rejected updates appear alongside applied snapshots, marked
+    by their ``state``.
+
     Raises:
         NodeNotFound: If the id does not resolve.
     """
@@ -1330,19 +1601,7 @@ def history(node_id: str, *, path: str | Path | None = None) -> list[VersionOut]
         rows = conn.execute(
             "SELECT * FROM versions WHERE node_id = ? ORDER BY id", (node_id,)
         ).fetchall()
-        return [
-            VersionOut(
-                id=row["id"],
-                node_id=row["node_id"],
-                title=row["title"],
-                content=row["content"],
-                props=json.loads(row["props"]),
-                actor=row["actor"],
-                event_seq=row["event_seq"],
-                created_at=row["created_at"],
-            )
-            for row in rows
-        ]
+        return [_version_out(row) for row in rows]
     finally:
         conn.close()
 
@@ -1394,6 +1653,276 @@ def list_types(*, path: str | Path | None = None) -> TypesOut:
                 )
                 for row in edge_rows
             ],
+        )
+    finally:
+        conn.close()
+
+
+# ── Curated graph reads (design §8.1 read tier — no query DSL, per T2) ───────
+
+
+def get_schema(type: str, *, path: str | Path | None = None) -> TypeOut | EdgeTypeOut:
+    """Fetch one type's catalog entry (node types checked first, then edges).
+
+    Raises:
+        TypeNotFound: If the id/name resolves in neither catalog.
+    """
+    conn = _connect(path)
+    try:
+        row = conn.execute("SELECT * FROM types WHERE id = ? OR name = ?", (type, type)).fetchone()
+        if row is not None:
+            return TypeOut(
+                id=row["id"],
+                name=row["name"],
+                parent_type_id=row["parent_type_id"],
+                json_schema=json.loads(row["schema_json"]),
+                is_builtin=bool(row["is_builtin"]),
+            )
+        row = conn.execute(
+            "SELECT * FROM edge_types WHERE id = ? OR name = ?", (type, type)
+        ).fetchone()
+        if row is None:
+            raise TypeNotFound(f"unknown node or edge type: {type}")
+        return EdgeTypeOut(
+            id=row["id"],
+            name=row["name"],
+            inverse_name=row["inverse_name"],
+            json_schema=json.loads(row["schema_json"]),
+            is_builtin=bool(row["is_builtin"]),
+        )
+    finally:
+        conn.close()
+
+
+#: Valid traversal directions: follow edges out of, into, or through a node.
+DIRECTIONS = ("out", "in", "both")
+
+
+def _walk(
+    conn: sqlite3.Connection,
+    start_id: str,
+    *,
+    type_ids: list[str] | None,
+    depth: int,
+    direction: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Breadth-first walk over ``active`` edges; returns (node rows, edge rows).
+
+    The root comes first in the node list; every edge the walk crossed is
+    returned once (including edges between two visited nodes). Proposed and
+    archived edges are never followed — reads default to the live graph.
+    """
+    nodes: dict[str, dict[str, Any]] = {start_id: _row_dict(_get_node_row(conn, start_id))}
+    order = [start_id]
+    edges: list[dict[str, Any]] = []
+    seen_edges: set[str] = set()
+    frontier = {start_id}
+    for _level in range(depth):
+        if not frontier:
+            break
+        next_frontier: set[str] = set()
+        placeholders = ",".join("?" * len(frontier))
+        params: list[Any] = sorted(frontier)
+        if direction == "both":
+            where = f"(src_id IN ({placeholders}) OR dst_id IN ({placeholders}))"
+            params = params * 2
+        else:
+            column = "src_id" if direction == "out" else "dst_id"
+            where = f"{column} IN ({placeholders})"
+        sql = f"SELECT * FROM edges WHERE state = 'active' AND {where}"
+        if type_ids:
+            sql += f" AND type_id IN ({','.join('?' * len(type_ids))})"
+            params += type_ids
+        for edge_row in conn.execute(f"{sql} ORDER BY created_at, rowid", params).fetchall():
+            edge = _row_dict(edge_row)
+            if edge["id"] in seen_edges:
+                continue
+            seen_edges.add(edge["id"])
+            edges.append(edge)
+            for endpoint in (edge["src_id"], edge["dst_id"]):
+                if endpoint not in nodes:
+                    nodes[endpoint] = _row_dict(_get_node_row(conn, endpoint))
+                    order.append(endpoint)
+                    next_frontier.add(endpoint)
+        frontier = next_frontier
+    return [nodes[node_id] for node_id in order], edges
+
+
+def get_neighborhood(
+    node_id: str, *, depth: int = 1, path: str | Path | None = None
+) -> SubgraphOut:
+    """Return a node plus its active-edge neighborhood out to ``depth`` hops.
+
+    Depth 0 returns the node alone. Design §8.1 ``get_node(id, depth)``.
+
+    Raises:
+        NodeNotFound: If the id does not resolve.
+        ValueError: If ``depth`` is negative.
+    """
+    if depth < 0:
+        raise ValueError(f"depth must be >= 0, got {depth}")
+    conn = _connect(path)
+    try:
+        nodes, edges = _walk(conn, node_id, type_ids=None, depth=depth, direction="both")
+        return SubgraphOut(
+            root=node_id,
+            depth=depth,
+            nodes=[_node_out(row) for row in nodes],
+            edges=[_edge_out(row) for row in edges],
+        )
+    finally:
+        conn.close()
+
+
+def traverse(
+    start_id: str,
+    *,
+    edge_types: list[str] | None = None,
+    depth: int = 2,
+    direction: str = "both",
+    path: str | Path | None = None,
+) -> SubgraphOut:
+    """Walk the subgraph reachable from ``start_id`` over active edges.
+
+    The pattern parameters (design §8.1 / T2): ``edge_types`` restricts the
+    walk to those edge types (ids or names), ``depth`` caps the hops, and
+    ``direction`` (``out`` / ``in`` / ``both``) orients it.
+
+    Raises:
+        NodeNotFound: If ``start_id`` does not resolve.
+        TypeNotFound: If an edge type does not resolve.
+        ValueError: If ``direction`` is unknown or ``depth`` is negative.
+    """
+    if direction not in DIRECTIONS:
+        raise ValueError(f"direction must be one of {DIRECTIONS}, got {direction!r}")
+    if depth < 0:
+        raise ValueError(f"depth must be >= 0, got {depth}")
+    conn = _connect(path)
+    try:
+        type_ids = (
+            [_resolve_edge_type(conn, edge_type) for edge_type in edge_types]
+            if edge_types
+            else None
+        )
+        nodes, edges = _walk(conn, start_id, type_ids=type_ids, depth=depth, direction=direction)
+        return SubgraphOut(
+            root=start_id,
+            depth=depth,
+            nodes=[_node_out(row) for row in nodes],
+            edges=[_edge_out(row) for row in edges],
+        )
+    finally:
+        conn.close()
+
+
+def find_path(a_id: str, b_id: str, *, path: str | Path | None = None) -> PathOut:
+    """Find the shortest path between two nodes over active edges (any type).
+
+    Breadth-first, direction-agnostic. When no path exists, ``found`` is
+    false and both lists are empty.
+
+    Raises:
+        NodeNotFound: If either id does not resolve.
+    """
+    conn = _connect(path)
+    try:
+        _get_node_row(conn, a_id)
+        _get_node_row(conn, b_id)
+        if a_id == b_id:
+            node = _node_out(_get_node_row(conn, a_id))
+            return PathOut(found=True, hops=0, nodes=[node], edges=[])
+        # parent[child] = (parent node id, edge row connecting them)
+        parent: dict[str, tuple[str, dict[str, Any]]] = {}
+        visited = {a_id}
+        frontier = [a_id]
+        found = False
+        while frontier and not found:
+            frontier_set = set(frontier)
+            next_frontier: list[str] = []
+            placeholders = ",".join("?" * len(frontier_set))
+            rows = conn.execute(
+                "SELECT * FROM edges WHERE state = 'active' "
+                f"AND (src_id IN ({placeholders}) OR dst_id IN ({placeholders})) "
+                "ORDER BY created_at, rowid",
+                sorted(frontier_set) * 2,
+            ).fetchall()
+            for edge_row in rows:
+                edge = _row_dict(edge_row)
+                for current in (edge["src_id"], edge["dst_id"]):
+                    if current not in frontier_set:
+                        continue
+                    other = edge["dst_id"] if current == edge["src_id"] else edge["src_id"]
+                    if other in visited:
+                        continue
+                    visited.add(other)
+                    parent[other] = (current, edge)
+                    next_frontier.append(other)
+                    if other == b_id:
+                        found = True
+                        break
+                if found:
+                    break
+            frontier = next_frontier
+        if not found:
+            return PathOut(found=False, hops=0, nodes=[], edges=[])
+        node_ids = [b_id]
+        path_edges: list[dict[str, Any]] = []
+        while node_ids[-1] != a_id:
+            previous, edge = parent[node_ids[-1]]
+            path_edges.append(edge)
+            node_ids.append(previous)
+        node_ids.reverse()
+        path_edges.reverse()
+        return PathOut(
+            found=True,
+            hops=len(path_edges),
+            nodes=[_node_out(_get_node_row(conn, node_id)) for node_id in node_ids],
+            edges=[_edge_out(edge) for edge in path_edges],
+        )
+    finally:
+        conn.close()
+
+
+def _render_version(version: dict[str, Any]) -> str:
+    """Render a version as stable diffable text (title, props, then content)."""
+    props = json.dumps(json.loads(version["props"]), sort_keys=True, ensure_ascii=False)
+    return f"title: {version['title'] or ''}\nprops: {props}\n\n{version['content']}"
+
+
+def diff_versions(a: int, b: int, *, path: str | Path | None = None) -> DiffOut:
+    """Diff two versions of one node (design §8.1 ``diff(a, b)``).
+
+    Raises:
+        VersionNotFound: If either version id does not resolve.
+        ValueError: If the versions belong to different nodes.
+    """
+    conn = _connect(path)
+    try:
+        version_a = _row_dict(_get_version_row(conn, a))
+        version_b = _row_dict(_get_version_row(conn, b))
+        if version_a["node_id"] != version_b["node_id"]:
+            raise ValueError(
+                f"versions {a} and {b} belong to different nodes "
+                f"({version_a['node_id']} vs {version_b['node_id']})"
+            )
+        changed = [
+            field for field in ("title", "content", "props") if version_a[field] != version_b[field]
+        ]
+        diff = "\n".join(
+            difflib.unified_diff(
+                _render_version(version_a).splitlines(),
+                _render_version(version_b).splitlines(),
+                fromfile=f"version {a}",
+                tofile=f"version {b}",
+                lineterm="",
+            )
+        )
+        return DiffOut(
+            node_id=version_a["node_id"],
+            a=_version_out(version_a),
+            b=_version_out(version_b),
+            changed_fields=changed,
+            diff=diff,
         )
     finally:
         conn.close()

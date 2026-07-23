@@ -130,7 +130,7 @@ def test_batch_collects_failures_without_aborting(fresh_db):
     assert result.transitioned == [note.id]
     assert {f.id for f in result.failed} == {active.id, "missing-id"}
     assert any("cannot accept" in f.error for f in result.failed)
-    assert any("no node or edge" in f.error for f in result.failed)
+    assert any("no node, edge, or version" in f.error for f in result.failed)
 
 
 # ── Batch by filter ───────────────────────────────────────────────────────────
