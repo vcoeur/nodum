@@ -353,7 +353,12 @@ def search(
         False, "--expand", help="Append one-hop active-edge neighbors of the hits."
     ),
 ) -> None:
-    """Keyword-search node title + content (BM25-ranked, from the FTS index)."""
+    """Hybrid-search node title + content (BM25 + vector, RRF-fused).
+
+    The vector signal participates when an embedding provider is available
+    (fastembed installed and the model cached; otherwise search silently
+    degrades to BM25). `signals` on each hit names what contributed.
+    """
     result = _run(
         search_module.search,
         query,

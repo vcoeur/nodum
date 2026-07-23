@@ -131,34 +131,43 @@ class ProjectorStatus(BaseModel):
 
     ``last_event_seq`` is the highest event the projector has applied;
     ``pending_events`` counts newer events it has not seen yet; ``rows`` is
-    the size of its derived store (index rows for the FTS projector).
+    the size of its derived store (index rows for the FTS projector, chunks
+    for the vector projector). ``available`` is false when the projector
+    cannot make progress (e.g. no embedding provider for ``vec``); ``detail``
+    then carries the reason.
     """
 
     name: str
     last_event_seq: int
     pending_events: int
     rows: int
+    available: bool = True
+    detail: str | None = None
 
 
 class ProjectorRun(BaseModel):
     """The outcome of running (or rebuilding) one projector.
 
     ``applied`` counts the events consumed in this call; ``from_seq`` /
-    ``to_seq`` are the checkpoint before and after.
+    ``to_seq`` are the checkpoint before and after. When a projector is
+    unavailable the run is a no-op (``applied`` 0, checkpoint unmoved) and
+    ``detail`` carries the reason.
     """
 
     name: str
     applied: int
     from_seq: int
     to_seq: int
+    detail: str | None = None
 
 
 class SearchHit(BaseModel):
     """One search result: a node plus its fused score and per-signal breakdown.
 
     ``score`` is the fused ranking score (higher is better); ``signals``
-    carries each retrieval signal's contribution (``bm25`` only today, with
-    vector and graph-expansion signals slotting in alongside it later).
+    carries each retrieval signal's contribution: RRF contributions for
+    ``bm25`` and ``vector`` (they sum to ``score``), and the edge weight for
+    ``graph`` expansion hits.
     """
 
     node_id: str

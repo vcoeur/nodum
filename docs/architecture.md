@@ -2,21 +2,25 @@
 
 One SQLite file is the only source of truth and the only write path goes
 through the service layer. The CLI and the MCP server are thin adapters;
-derived stores (FTS today, vectors/renditions later) are projectors fed by
-the event log, and later phases add more adapters (HTTP) without touching
-the core.
+derived stores (FTS, chunk embeddings today; renditions later) are
+projectors fed by the event log, and later phases add more adapters (HTTP)
+without touching the core.
 
 ```mermaid
 flowchart LR
     cli["nodum.cli (Typer)"] --> svc["nodum.service (deterministic, LLM-free)"]
     mcp["nodum.mcp_server (FastMCP, stdio)"] --> svc
-    cli --> qry["nodum.search (BM25 keyword search)"]
+    cli --> qry["nodum.search (hybrid: BM25 + vector, RRF)"]
     mcp --> qry
     svc --> db[("SQLite (WAL): types · nodes · edge_types · edges · versions · events · merge_redirects")]
     svc --> mig["nodum.migrations (append-only)"]
     db -- "events (append-only)" --> prj["nodum.projectors (checkpoints · run · rebuild)"]
     prj --> fts[("node_fts (FTS5, derived)")]
+    prj --> vec[("chunks + node_vec (sqlite-vec, derived)")]
+    emb["nodum.embeddings (provider seam, fastembed local)"] --> prj
     qry --> fts
+    qry --> vec
+    qry --> emb
     qry --> prj
     style cli fill:#e6f0ff,color:#000
     style mcp fill:#e6f0ff,color:#000
@@ -25,6 +29,8 @@ flowchart LR
     style mig fill:#ffe6cc,color:#000
     style prj fill:#f3e6ff,color:#000
     style fts fill:#d9f2d9,color:#000
+    style vec fill:#d9f2d9,color:#000
+    style emb fill:#ffe6cc,color:#000
     style qry fill:#e6f0ff,color:#000
 ```
 
@@ -33,10 +39,11 @@ flowchart LR
 | Module | Role |
 |---|---|
 | `nodum.db` | Connection management (WAL, foreign keys), `NODUM_DB` resolution, the migration runner over `schema_migrations`. |
-| `nodum.migrations` | The append-only migration list: `0001_core` (core DDL), `0002_seed_builtin_types` (the built-in type catalog), `0003_projector_checkpoints_and_fts` (`projector_checkpoints` + the derived `node_fts` FTS5 table), `0004_policies` (per-agent policy rulesets), `0005_proposed_versions` (`versions.state` — `applied`/`proposed`/`archived`). Shipped entries are never edited; later phases append their own (vectors, assets, renditions). |
+| `nodum.migrations` | The append-only migration list: `0001_core` (core DDL), `0002_seed_builtin_types` (the built-in type catalog), `0003_projector_checkpoints_and_fts` (`projector_checkpoints` + the derived `node_fts` FTS5 table), `0004_policies` (per-agent policy rulesets), `0005_proposed_versions` (`versions.state` — `applied`/`proposed`/`archived`), `0006_vectors` (the derived `chunks` + `node_vec` sqlite-vec tables). Shipped entries are never edited; later phases append their own (assets, renditions). |
 | `nodum.service` | The only writer. Validation, the `proposed → active → archived` state machine, the event log, versions (incl. `proposed` updates: agent edits stage a version; accept applies it as an ordinary `node.update`, reject archives it), undo, wikilink materialization, agent policies (CRUD + auto-accept evaluation on the edge write path), the review queue (proposal listing with reviewer context over nodes/edges/updates, batch accept/reject by id or filter), and the curated graph reads behind the MCP read tier (`get_neighborhood`, `traverse`, `find_path`, `get_schema`, `diff_versions`) plus `propose_edges` batch writes. Each public function opens a short-lived connection, applies pending migrations idempotently, and commits — adapters stay stateless. |
-| `nodum.projectors` | Derived-index consumers of the event log. The `Projector` base class (`reset`/`apply`/`count`), the `REGISTRY`, per-projector checkpoints (`projector_checkpoints.last_event_seq`), incremental `run_projectors`, `rebuild_projector` (reset + replay from event 0), and `projector_status`. The first projector, `fts`, maintains `node_fts` purely from event payloads. Deterministic and LLM-free; the service layer never calls in — the event log is the only coupling. |
-| `nodum.search` | The query path. `search()` catches the `fts` projector up with the log, then runs a BM25-ranked FTS5 query (title boosted 5× over content) joined to `nodes` for state/type/writer/date filters. Optional one-hop graph expansion (`expand`) appends active-edge neighbors scored by type weight × confidence. Hits carry a fused `score` plus a per-signal `signals` breakdown so vector + graph-expansion fusion (RRF) slots in without reshaping the API. |
+| `nodum.projectors` | Derived-index consumers of the event log. The `Projector` base class (`reset`/`apply`/`count`/`availability`), the `REGISTRY`, per-projector checkpoints (`projector_checkpoints.last_event_seq`), incremental `run_projectors`, `rebuild_projector` (reset + replay from event 0), and `projector_status` (with availability + reason). The `fts` projector maintains `node_fts`; the `vec` projector maintains `chunks` + `node_vec` — re-chunking and re-embedding nodes from event payloads, recording `model_id` per chunk. Deterministic and LLM-free; the service layer never calls in — the event log is the only coupling. An unavailable projector (`vec` without a provider) no-ops and keeps its backlog. |
+| `nodum.embeddings` | The embedding provider seam (design D10) + chunking (design D6). Provider interface: `model_id`, `dimensions`, `embed(texts)`. The default `FastembedProvider` runs `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` (384-dim, multilingual) in-process via ONNX — behind the optional `embeddings` extra, resolved from the local HF cache only (downloads need `NODUM_EMBED_DOWNLOAD=1`; model override via `NODUM_EMBED_MODEL`). Chunking is a fixed 512-word window with ~15% overlap (words approximate tokens — dependency-free). `set_provider`/`reset_provider` are the test seam (a deterministic hashing fake lives in `tests/conftest.py`). |
+| `nodum.search` | The query path (design §7). `search()` catches the `fts` and `vec` projectors up with the log, runs BM25 (title boosted 5×) and — when a provider is available — a sqlite-vec KNN over chunk embeddings (closest chunk per node wins), fuses both lists by reciprocal rank fusion (K=60), then optionally expands the fused hits one hop along `active` edges (type weight × confidence). Hits carry the fused `score` plus a per-signal `signals` breakdown (`bm25`/`vector` RRF contributions summing to `score`, `graph` edge weight). Without a provider the vector signal is skipped — graceful degradation to BM25 + graph. |
 | `nodum.mcp_server` | The MCP adapter: a FastMCP (official Python SDK) server over stdio, launched by `nodum mcp serve`. Registers the design §8.1 read tier (`get_node`, `get_children`, `search`, `traverse`, `list_types`, `get_schema`, `find_path`, `history`, `diff`), additive tier (`create_node`, `update_node`, `link`, `propose_edges`), and the `accept`/`reject` review tools — every tool a thin delegate to one service/search function with `readOnlyHint`/`destructiveHint` annotations. One configured `--actor` per server attributes every write. Curative tools (§8.2) are never registered. |
 | `nodum.models` | The pydantic I/O schema shared by every surface (`NodeOut`, `EdgeOut`, `VersionOut`, `EventOut`, `TypeOut`/`EdgeTypeOut`/`TypesOut`, `UndoResult`, `InitResult`, `ProjectorStatus`/`ProjectorRun`, `SearchHit`/`SearchResult`, `PolicyOut`, `ProposalOut`, `BatchTransitionOut`/`TransitionFailure`, `SubgraphOut`, `PathOut`, `DiffOut`, `ProposeEdgesOut`/`ItemFailure`). Every adapter serialises `model_dump(mode="json")`. |
 | `nodum.cli` | Typer adapter. Each command calls one service function and prints exactly one JSON object on stdout; errors go to stderr with exit code 1. No `--json` flag — JSON is the only format. Adds `search`, `traverse`, `find-path`, `diff`, `schema`, `edge create-batch`, the `projector run/status/rebuild` group, the `policy set/get/list` group, the `review queue/accept/reject/accept-all/reject-all` group, and `mcp serve`. |
@@ -51,11 +58,13 @@ sections to the code:
 | §2.3 constraints (single write path, Markdown truth, LLM-free core) | `nodum.service` is the only mutation entry point; `content` is canonical Markdown; no LLM calls anywhere in the package — projectors included (Constraint 4). |
 | §4 architecture (service layer, event log, projectors) | `nodum.service` + the `events` table; `nodum.projectors` implements the derived-index consumers with checkpoint/rebuild mechanics. Internal agents are a later phase. |
 | §5.1 everything-is-a-node, structure vs. meaning | One `nodes` table with `parent_id` + fractional `position`; typed `edges` for meaning. |
-| §5.2 schema | `nodum.migrations` `0001_core` — Phase-1 subset (`types`, `nodes`, `edge_types`, `edges`, `versions`, `events`, `merge_redirects`), all with reserved `graph_id DEFAULT 'main'`; `0003_projector_checkpoints_and_fts` adds `projector_checkpoints` and `node_fts` (with the design's `extracted_text` column, empty until assets land). Still absent: `node_vec`, `chunks`, `assets`, `renditions` — later migrations. |
+| §5.2 schema | `nodum.migrations` `0001_core` — Phase-1 subset (`types`, `nodes`, `edge_types`, `edges`, `versions`, `events`, `merge_redirects`), all with reserved `graph_id DEFAULT 'main'`; `0003_projector_checkpoints_and_fts` adds `projector_checkpoints` and `node_fts` (with the design's `extracted_text` column, empty until assets land); `0006_vectors` adds `chunks` + `node_vec` (`chunks.id` is an integer rowid for vec0 keying, and deliberately carries no FK to `nodes` — replaying the log must tolerate nodes whose create was undone). Still absent: `assets`, `renditions` — later migrations. |
 | §5.3 built-in types | `nodum.migrations` `0002_seed_builtin_types` (11 node types, 17 edge types with inverses). |
 | §5.4 wikilink sugar | `service._materialize_mentions` — parse on write, resolve by id or exact title, create/archive `mentions` edges, skip unresolvable targets. |
 | §6 state machine + provenance | `service.transition` (`accept`/`reject`/`archive` over nodes, edges, and proposed versions), actor column on every row, event per transition. Versions carry their own `state` (migration `0005`): `applied` snapshots, `proposed` agent updates, `archived` rejects. |
-| §7 retrieval (keyword signal) | `nodum.search` — BM25 via FTS5, hits shaped for RRF fusion (`score` + `signals`); optional one-hop graph expansion over `active` edges (type weight × confidence) already lands as the `graph` signal. The vector signal lands with the sqlite-vec projector. |
+| §7 retrieval (hybrid fusion) | `nodum.search` — BM25 via FTS5 and vector ANN via sqlite-vec (the `vec` projector, migration `0006`), fused by reciprocal rank fusion (K=60) with per-signal `signals`; one-hop graph expansion over `active` edges (type weight × confidence) applies post-fusion as the `graph` signal. The vector signal degrades gracefully when no embedding provider is available. |
+| §15.1 D6 embedding lifecycle | `nodum.embeddings` chunking (512-word window, ~15% overlap — words approximate tokens) + `chunks.model_id` per embedding (migration `0006`) + `projector rebuild vec` as the full-rebuild-on-model-change path (reset + replay re-embeds everything with the new model). |
+| §15.1 D10 provider abstraction | `nodum.embeddings.EmbeddingProvider` — `model_id` / `dimensions` / `embed(texts)`. The default is local in-process fastembed (no daemon, no API key, no `agedum` dependency); an API-key provider slots in behind the same interface. |
 | §8.1 review/accept API | `service.list_proposals` (filterable by actor, type, kind, age; reviewer context: edge endpoints, node parent, update target) + `accept_proposals`/`reject_proposals` (by id, reject carries a `reason` into each event payload) + `accept_matching`/`reject_matching` (batch by filter — resolves to concrete ids, then one event per id). CLI: the `review` group. |
 | §8.1 tool contract (read + additive tiers) | `nodum.mcp_server` over stdio: read tier `get_node`/`get_children`/`search`/`traverse`/`list_types`/`get_schema`/`find_path`/`history`/`diff`, additive tier `create_node`/`update_node`/`link`/`propose_edges`, plus the `accept`/`reject` "write"-tier tools. All delegate to `nodum.service` / `nodum.search` with tool annotations (`readOnlyHint`, `destructiveHint`). Not yet: `ingest_*`, `get_asset`, `get_context`, `export`, `schema_propose` (later phases). |
 | §8.2 additive vs. curative | Structural: `nodum.mcp_server` never registers the curative tools (`merge_nodes`, `retype`, `supersede_edge`, `bulk_relink`, `consolidate`) — they don't exist on the MCP surface at all; a test asserts the registry stays disjoint. |
@@ -97,9 +106,11 @@ sections to the code:
 - **Free-text queries are compiled to safe MATCH expressions**: each
   whitespace-separated token becomes one double-quoted term, ANDed — FTS5
   operators in user input can never break or hijack the query.
-- **Scores are higher-is-better.** `bm25()` returns more-negative-is-better;
-  the search layer negates it so `score` (and every entry in `signals`)
-  follows the convention RRF fusion expects.
+- **Scores are higher-is-better RRF contributions.** Raw signal scores
+  (`bm25()`'s more-negative-is-better rank, sqlite-vec distances) only order
+  their lists; the fused `score` and every `signals` entry are RRF
+  contributions (`1/(60 + rank)`), which are comparable across signals by
+  construction.
 - **Search catches the projector up** before querying, so results always
   reflect the latest committed writes without a manual `projector run`. The
   write path stays free of projector work.
@@ -164,3 +175,39 @@ sections to the code:
   1.0, `relates_to` 0.5, others 0.5; design §7), deduped against direct hits
   and capped at `k`. It ships as the `graph` entry in `signals` so RRF
   fusion replaces it without reshaping the API.
+- **Embeddings are local and in-process** (fastembed, ONNX Runtime on CPU):
+  no Ollama, no daemon, no API key. The default model is
+  `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` — 384
+  dimensions, multilingual, ~0.22 GB, Apache-2.0, and in fastembed's
+  built-in registry (no custom registration). It lives behind the optional
+  `embeddings` extra so the core install stays lean, and behind the
+  `EmbeddingProvider` interface (`model_id` / `dimensions` / `embed`) so an
+  API-key provider can replace it per design D10.
+- **Downloads are never implicit.** The default provider resolves only from
+  the local Hugging Face cache (`HF_HUB_OFFLINE` during construction);
+  fetching the model needs `NODUM_EMBED_DOWNLOAD=1` once. Anything less
+  gives a clean *unavailable* state with the reason in `projector status`,
+  and search silently falls back to BM25 + graph — CI and fresh machines
+  never touch the network.
+- **Chunking approximates tokens with words** (design D6's 512-token window,
+  ~15% overlap): whitespace-splitting needs no tokenizer download and is
+  close enough for ranking at personal-KM scale. Chunks are cut from
+  `title + content`; `chunks.model_id` records the producing model per
+  chunk, and `projector rebuild vec` (reset + replay) is the
+  full-rebuild-on-model-change path.
+- **`chunks` has an integer rowid and no FK to `nodes`.** vec0 rows key on
+  integer rowids, so each vector shares its chunk's rowid (the design's TEXT
+  chunk id doesn't apply); and the projector replays the *event log*, which
+  still contains events for nodes whose create was later undone — a foreign
+  key to the live `nodes` table would make that replay fail.
+- **Fusion is plain RRF (K=60) over ranked lists.** Each signal contributes
+  `1/(60 + rank)`; `signals` carries the per-signal contributions and they
+  sum to `score` exactly, so the breakdown explains the ranking. The vector
+  ANN list is k-deep with no similarity threshold (RRF wants ranks, not
+  cutoffs); chunks aggregate to nodes by closest chunk. Graph expansion runs
+  on the fused list, after fusion.
+- **Projector availability is first-class.** `Projector.availability()`
+  gates runs (an unavailable projector no-ops and keeps its checkpoint — the
+  backlog waits) and surfaces in `projector status` as
+  `available`/`detail`. Rebuilding an unavailable projector is refused —
+  it would empty the store without being able to refill it.

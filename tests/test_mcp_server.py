@@ -165,6 +165,17 @@ def test_search_with_filters_and_expand(fresh_db):
     assert "graph" in hits[1]["signals"]
 
 
+def test_search_includes_the_vector_signal_when_a_provider_exists(fresh_db, fake_embedder):
+    _, b, _ = _seed()
+    # "Beta note" matches b's title (BM25) and b's chunk vocabulary (vector).
+    result = _run(lambda session: _call(session, "search", {"query": "Beta note"}))
+    hits = result.structuredContent["hits"]
+    assert [hit["node_id"] for hit in hits][:1] == [b.id]
+    assert "bm25" in hits[0]["signals"]
+    assert "vector" in hits[0]["signals"]
+    assert hits[0]["score"] == sum(hits[0]["signals"].values())
+
+
 def test_traverse_and_find_path(fresh_db):
     a, b, _ = _seed()
     traversed = _run(

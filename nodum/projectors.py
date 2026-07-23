@@ -1,15 +1,17 @@
 """Projectors — derived-index consumers of the append-only event log.
 
-A projector maintains *derived* state (today: the ``node_fts`` full-text
-index; later: embeddings, renditions, the Markdown mirror) by replaying
-events from the log. Each projector owns a checkpoint row in
+A projector maintains *derived* state (the ``node_fts`` full-text index and
+the ``node_vec`` chunk embeddings; later: renditions, the Markdown mirror)
+by replaying events from the log. Each projector owns a checkpoint row in
 ``projector_checkpoints`` — the highest event ``seq`` it has applied — so
 runs are incremental and every projector can be reset and rebuilt from event
 0 independently.
 
 Everything here is deterministic and LLM-free (design Constraint 4): the
 service layer never calls into this module on the write path — the event log
-is the only coupling.
+is the only coupling. Embedding models are deterministic transformers, not
+agents; a projector with no usable embedding provider simply reports itself
+unavailable and makes no progress (its backlog waits).
 """
 
 from __future__ import annotations
@@ -19,7 +21,9 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
-from nodum import db
+import sqlite_vec
+
+from nodum import db, embeddings
 from nodum.models import ProjectorRun, ProjectorStatus
 
 
@@ -45,6 +49,16 @@ class Projector:
     def count(self, conn: sqlite3.Connection) -> int:
         """Return the number of rows in the derived store (for status)."""
         raise NotImplementedError
+
+    def availability(self) -> tuple[bool, str | None]:
+        """Return whether the projector can make progress, and why not.
+
+        The base projector always can; subclasses with external requirements
+        (the ``vec`` projector needs an embedding provider) override this. An
+        unavailable projector's runs are no-ops — its checkpoint stays put so
+        the backlog is picked up once the blocker clears.
+        """
+        return (True, None)
 
 
 class FtsProjector(Projector):
@@ -111,8 +125,96 @@ class FtsProjector(Projector):
         return ""
 
 
+class VecProjector(Projector):
+    """Maintain chunk embeddings (``chunks`` + ``node_vec``) from node events.
+
+    Follows the FTS projector's event handling exactly: node creates,
+    updates, and transitions re-chunk and re-embed the ``after`` (or
+    restored) node; an undone create drops the node's chunks and vectors.
+    Chunking and the embedding model come from :mod:`nodum.embeddings`
+    (design D6); every chunk records the provider's ``model_id``. A full
+    rebuild (``reset`` + replay from event 0) re-embeds everything, which is
+    the model-change path.
+
+    When no embedding provider is usable the projector is *unavailable*:
+    runs are no-ops and the reason surfaces in ``projector status`` — the
+    backlog waits, and search falls back to BM25 + graph expansion.
+    """
+
+    name = "vec"
+
+    def availability(self) -> tuple[bool, str | None]:
+        """Available exactly when an embedding provider resolves."""
+        if embeddings.get_provider() is None:
+            return (False, embeddings.unavailable_reason())
+        return (True, None)
+
+    def reset(self, conn: sqlite3.Connection) -> None:
+        """Empty the chunk and vector stores (rebuild replays to refill them)."""
+        conn.execute("DELETE FROM node_vec")
+        conn.execute("DELETE FROM chunks")
+
+    def count(self, conn: sqlite3.Connection) -> int:
+        """Return the number of embedded chunks."""
+        row = conn.execute("SELECT COUNT(*) AS n FROM chunks").fetchone()
+        return int(row["n"])
+
+    def apply(self, conn: sqlite3.Connection, event: sqlite3.Row) -> None:
+        """Re-embed the node affected by one event, if any."""
+        op = event["op"]
+        payload = json.loads(event["payload"])
+        if op == "undo":
+            self._apply_undo(conn, payload)
+        elif op.startswith("node."):
+            after = payload.get("after")
+            if after is not None:
+                self._upsert(conn, after)
+
+    def _apply_undo(self, conn: sqlite3.Connection, payload: dict[str, Any]) -> None:
+        """Mirror an undo: re-embed the restored node or drop a reverted create."""
+        if not str(payload.get("reversed_op", "")).startswith("node."):
+            return
+        restored = payload.get("restored")
+        if restored is not None:
+            self._upsert(conn, restored)
+            return
+        for entry in payload.get("deleted", []):
+            if entry.get("table") == "nodes":
+                self._delete(conn, entry["row"]["id"])
+
+    def _upsert(self, conn: sqlite3.Connection, node: dict[str, Any]) -> None:
+        """Replace a node's chunks with fresh embeddings of its current text."""
+        provider = embeddings.get_provider()
+        if provider is None:  # availability is checked per run; this is a guard
+            reason = embeddings.unavailable_reason()
+            raise RuntimeError(f"vec projector lost its provider: {reason}")
+        self._delete(conn, node["id"])
+        texts = embeddings.chunk_text(embeddings.node_text(node))
+        if not texts:
+            return
+        for seq, (text, vector) in enumerate(zip(texts, provider.embed(texts), strict=True)):
+            cursor = conn.execute(
+                "INSERT INTO chunks (node_id, seq, text, model_id) VALUES (?, ?, ?, ?)",
+                (node["id"], seq, text, provider.model_id),
+            )
+            conn.execute(
+                "INSERT INTO node_vec (rowid, embedding) VALUES (?, ?)",
+                (cursor.lastrowid, sqlite_vec.serialize_float32(vector)),
+            )
+
+    def _delete(self, conn: sqlite3.Connection, node_id: str) -> None:
+        """Drop a node's chunks and their vectors (vec0 rows delete by rowid)."""
+        conn.execute(
+            "DELETE FROM node_vec WHERE rowid IN (SELECT id FROM chunks WHERE node_id = ?)",
+            (node_id,),
+        )
+        conn.execute("DELETE FROM chunks WHERE node_id = ?", (node_id,))
+
+
 #: The projector registry, keyed by name. New derived stores register here.
-REGISTRY: dict[str, Projector] = {projector.name: projector for projector in (FtsProjector(),)}
+REGISTRY: dict[str, Projector] = {
+    projector.name: projector for projector in (FtsProjector(), VecProjector())
+}
 
 
 # ── Connection and checkpoint helpers ─────────────────────────────────────────
@@ -165,8 +267,15 @@ def _run_one(conn: sqlite3.Connection, projector: Projector) -> ProjectorRun:
 
     The whole batch applies in one transaction: a failure rolls back to the
     last committed checkpoint, and replaying the same events is deterministic.
+    An unavailable projector is a no-op — the checkpoint stays put so the
+    backlog is picked up once the blocker clears.
     """
     from_seq = _checkpoint(conn, projector.name)
+    available, reason = projector.availability()
+    if not available:
+        return ProjectorRun(
+            name=projector.name, applied=0, from_seq=from_seq, to_seq=from_seq, detail=reason
+        )
     rows = conn.execute("SELECT * FROM events WHERE seq > ? ORDER BY seq", (from_seq,)).fetchall()
     for event in rows:
         projector.apply(conn, event)
@@ -214,9 +323,14 @@ def rebuild_projector(name: str, *, path: str | Path | None = None) -> Projector
         The run result of the full replay (``from_seq`` is always 0).
 
     Raises:
-        ValueError: If the name is not in the registry.
+        ValueError: If the name is not in the registry, or the projector is
+            unavailable (rebuilding would empty the store without being able
+            to refill it).
     """
     (projector,) = _resolve([name])
+    available, reason = projector.availability()
+    if not available:
+        raise ValueError(f"cannot rebuild projector {name!r}: {reason}")
     conn = _connect(path)
     try:
         projector.reset(conn)
@@ -229,19 +343,25 @@ def rebuild_projector(name: str, *, path: str | Path | None = None) -> Projector
 
 
 def projector_status(*, path: str | Path | None = None) -> list[ProjectorStatus]:
-    """Report every registered projector's checkpoint, backlog, and store size."""
+    """Report every projector's checkpoint, backlog, store size, and availability."""
     conn = _connect(path)
     try:
         max_seq_row = conn.execute("SELECT COALESCE(MAX(seq), 0) AS m FROM events").fetchone()
         max_seq = int(max_seq_row["m"])
-        return [
-            ProjectorStatus(
-                name=projector.name,
-                last_event_seq=(checkpoint := _checkpoint(conn, projector.name)),
-                pending_events=max_seq - checkpoint,
-                rows=projector.count(conn),
+        statuses = []
+        for projector in REGISTRY.values():
+            available, reason = projector.availability()
+            checkpoint = _checkpoint(conn, projector.name)
+            statuses.append(
+                ProjectorStatus(
+                    name=projector.name,
+                    last_event_seq=checkpoint,
+                    pending_events=max_seq - checkpoint,
+                    rows=projector.count(conn),
+                    available=available,
+                    detail=reason,
+                )
             )
-            for projector in REGISTRY.values()
-        ]
+        return statuses
     finally:
         conn.close()

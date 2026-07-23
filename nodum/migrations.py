@@ -197,6 +197,35 @@ CREATE INDEX idx_versions_state ON versions(state);
 """
 
 
+VECTORS_DDL = """
+-- Derived vector index (design §5.2 + D6), maintained by the `vec` projector
+-- from the event log — never written by the service layer. `chunks` holds
+-- one fixed-window text chunk per row (512 words, ~15% overlap); `node_vec`
+-- (sqlite-vec) holds each chunk's embedding, keyed by the chunk's rowid —
+-- which is why `chunks.id` is an integer rowid rather than the design's TEXT
+-- id (vec0 keys on integer rowids). `model_id` records the producing
+-- embedding model per chunk, so mixed-model states are detectable and a
+-- model change is a `projector rebuild vec`. The vec0 dimension must match
+-- nodum.embeddings.EMBEDDING_DIMS (the default model's size); a dimension
+-- change needs a new migration. `chunks.node_id` deliberately carries no FK:
+-- the projector replays the event log (not the live tables), and the log
+-- still contains events for nodes whose create was later undone — a FK to
+-- `nodes` would make that replay fail.
+CREATE VIRTUAL TABLE node_vec USING vec0(
+    embedding float[384] distance_metric=cosine
+);
+
+CREATE TABLE chunks (
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    node_id  TEXT NOT NULL,
+    seq      INTEGER NOT NULL,
+    text     TEXT NOT NULL,
+    model_id TEXT NOT NULL
+);
+CREATE INDEX idx_chunks_node ON chunks(node_id);
+"""
+
+
 #: Ordered (name, SQL) migrations. Append-only — never edit a shipped entry.
 MIGRATIONS: list[tuple[str, str]] = [
     ("0001_core", CORE_DDL),
@@ -204,4 +233,5 @@ MIGRATIONS: list[tuple[str, str]] = [
     ("0003_projector_checkpoints_and_fts", PROJECTORS_DDL),
     ("0004_policies", POLICIES_DDL),
     ("0005_proposed_versions", PROPOSED_VERSIONS_DDL),
+    ("0006_vectors", VECTORS_DDL),
 ]

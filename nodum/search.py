@@ -1,13 +1,21 @@
-"""Keyword search over the graph — BM25 ranking via the FTS5 projector.
+"""Hybrid search over the graph — BM25 + vector ANN fused, then graph expansion.
 
-This is the first of the three retrieval signals (design §7). The query path
-is shaped for the later hybrid fusion: every hit carries a fused ``score``
-plus a per-signal ``signals`` breakdown, so reciprocal-rank fusion with the
-vector signal and graph-expansion re-ranking slot in without reshaping the
-API.
+The three retrieval signals of design §7:
 
-The ``fts`` projector is caught up before querying, so search always reflects
-the latest committed events without a manual projector run.
+1. **Keyword (BM25)** — FTS5 over node title + content (the ``fts`` projector).
+2. **Semantic (vector)** — sqlite-vec ANN over chunk embeddings (the ``vec``
+   projector); skipped entirely when no embedding provider is available, so
+   search degrades to BM25 + graph without crashing.
+3. **Graph expansion** — optional one-hop expansion of the fused hits along
+   ``active`` edges, weighted by edge type × confidence.
+
+BM25 and vector lists are fused by **reciprocal rank fusion**: each signal
+contributes ``1 / (RRF_K + rank)`` per hit, the fused ``score`` is the sum,
+and ``signals`` carries each contribution, so the breakdown explains the
+score exactly. Graph expansion runs on the fused list (post-fusion).
+
+Both projectors are caught up before querying, so search always reflects the
+latest committed events without a manual projector run.
 """
 
 from __future__ import annotations
@@ -15,12 +23,22 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-from nodum import db, projectors
+import sqlite_vec
+
+from nodum import db, embeddings, projectors
 from nodum.models import SearchHit, SearchResult
 
 #: bm25() column weights for (node_id, title, content, extracted_text): node_id
 #: is unindexed (weight ignored); a title hit outranks a body hit.
 _BM25_WEIGHTS = (0.0, 5.0, 1.0, 1.0)
+
+#: Reciprocal-rank-fusion damping constant (design §7): the standard 60 —
+#: top ranks dominate, deep ranks contribute little but still break ties.
+_RRF_K = 60
+
+#: ANN candidates fetched per query before aggregating chunks to nodes —
+#: several chunks can belong to the same node, so the raw list is wider.
+_VECTOR_CANDIDATES = 32
 
 #: One-hop graph-expansion weights by edge type (design §7); unlisted types
 #: default to 0.5. The edge's confidence (default 1.0) multiplies the weight.
@@ -52,20 +70,16 @@ def _match_query(query: str) -> str:
     return " AND ".join(terms)
 
 
-def _search_bm25(
-    conn: sqlite3.Connection,
-    match: str,
-    *,
-    k: int,
+def _node_filters(
     state: str | None,
     type_id: str | None,
     created_by: str | None,
     created_after: str | None,
     created_before: str | None,
-) -> list[SearchHit]:
-    """Run the BM25-ranked FTS query and shape rows into search hits."""
-    clauses = ["node_fts MATCH ?"]
-    params: list = [match]
+) -> tuple[list[str], list]:
+    """Build the shared ``nodes``-table WHERE clauses (alias ``n``) and params."""
+    clauses: list[str] = []
+    params: list = []
     if state is not None:
         clauses.append("n.state = ?")
         params.append(state)
@@ -81,33 +95,155 @@ def _search_bm25(
     if created_before is not None:
         clauses.append("n.created_at < ?")
         params.append(created_before)
+    return clauses, params
+
+
+class _RankedRow:
+    """One signal's ranked candidate: a node plus its display shape."""
+
+    __slots__ = ("node_id", "type", "title", "snippet")
+
+    def __init__(self, node_id: str, type: str, title: str | None, snippet: str) -> None:
+        self.node_id = node_id
+        self.type = type
+        self.title = title
+        self.snippet = snippet
+
+
+def _search_bm25(
+    conn: sqlite3.Connection,
+    match: str,
+    *,
+    k: int,
+    state: str | None,
+    type_id: str | None,
+    created_by: str | None,
+    created_after: str | None,
+    created_before: str | None,
+) -> list[_RankedRow]:
+    """Run the BM25-ranked FTS query, best (most-negative bm25) first."""
+    filters, params = _node_filters(state, type_id, created_by, created_after, created_before)
+    clauses = ["node_fts MATCH ?", *filters]
     weights = ", ".join(str(w) for w in _BM25_WEIGHTS)
     rows = conn.execute(
         f"""
         SELECT n.id, n.type_id, n.title,
-               bm25(node_fts, {weights}) AS rank,
                snippet(node_fts, 2, ?, ?, '…', 40) AS snippet
         FROM node_fts
         JOIN nodes n ON n.id = node_fts.node_id
         WHERE {" AND ".join(clauses)}
-        ORDER BY rank
+        ORDER BY bm25(node_fts, {weights})
         LIMIT ?
         """,
-        (_SNIPPET_PRE, _SNIPPET_POST, *params, k),
+        (_SNIPPET_PRE, _SNIPPET_POST, match, *params, k),
     ).fetchall()
+    return [
+        _RankedRow(
+            node_id=row["id"],
+            type=row["type_id"],
+            title=row["title"],
+            snippet=row["snippet"] or (row["title"] or ""),
+        )
+        for row in rows
+    ]
+
+
+def _search_vector(
+    conn: sqlite3.Connection,
+    query_vector: list[float],
+    *,
+    k: int,
+    state: str | None,
+    type_id: str | None,
+    created_by: str | None,
+    created_after: str | None,
+    created_before: str | None,
+) -> list[_RankedRow]:
+    """Run the sqlite-vec ANN query, aggregating chunks to nodes (best chunk wins).
+
+    The raw KNN pulls :data:`_VECTOR_CANDIDATES` chunks (a node can own
+    several), then each node keeps its closest chunk's distance and text.
+    There is no similarity threshold — the ANN list is always ``k`` deep,
+    which is exactly what RRF expects: a weak vector hit still fuses, just
+    with a small contribution.
+    """
+    filters, params = _node_filters(state, type_id, created_by, created_after, created_before)
+    clauses = filters or ["1=1"]
+    rows = conn.execute(
+        f"""
+        SELECT n.id, n.type_id, n.title, c.text AS chunk_text, MIN(knn.distance) AS distance
+        FROM (
+            SELECT rowid AS chunk_id, distance
+            FROM node_vec
+            WHERE embedding MATCH ? AND k = ?
+        ) AS knn
+        JOIN chunks c ON c.id = knn.chunk_id
+        JOIN nodes n ON n.id = c.node_id
+        WHERE {" AND ".join(clauses)}
+        GROUP BY n.id
+        ORDER BY distance
+        LIMIT ?
+        """,
+        (
+            sqlite_vec.serialize_float32(query_vector),
+            max(k * 4, _VECTOR_CANDIDATES),
+            *params,
+            k,
+        ),
+    ).fetchall()
+    return [
+        _RankedRow(
+            node_id=row["id"],
+            type=row["type_id"],
+            title=row["title"],
+            snippet=_chunk_snippet(row["chunk_text"]) or (row["title"] or ""),
+        )
+        for row in rows
+    ]
+
+
+def _chunk_snippet(text: str, *, length: int = 200) -> str:
+    """Collapse a chunk to a single-line snippet of at most ``length`` chars."""
+    collapsed = " ".join(text.split())
+    if len(collapsed) <= length:
+        return collapsed
+    return collapsed[: length - 1].rstrip() + "…"
+
+
+def _fuse(
+    bm25_rows: list[_RankedRow],
+    vector_rows: list[_RankedRow],
+    *,
+    k: int,
+) -> list[SearchHit]:
+    """Reciprocal-rank fusion of the BM25 and vector lists (design §7).
+
+    Each signal contributes ``1 / (RRF_K + rank)`` (1-based rank); a hit's
+    fused ``score`` is the sum of its contributions and ``signals`` carries
+    them per signal, so the breakdown sums to the score exactly. Hits in only
+    one list fuse with their single contribution. Ties break by node id for
+    determinism.
+    """
+    signals: dict[str, dict[str, float]] = {}
+    shapes: dict[str, _RankedRow] = {}
+    for rank, row in enumerate(bm25_rows, start=1):
+        signals.setdefault(row.node_id, {})["bm25"] = 1.0 / (_RRF_K + rank)
+        shapes[row.node_id] = row
+    for rank, row in enumerate(vector_rows, start=1):
+        signals.setdefault(row.node_id, {})["vector"] = 1.0 / (_RRF_K + rank)
+        shapes.setdefault(row.node_id, row)
+    ordered = sorted(signals, key=lambda node_id: (-sum(signals[node_id].values()), node_id))
     hits = []
-    for row in rows:
-        # bm25() ranks more-negative-is-better; negate so a higher fused score
-        # is better — the convention the later RRF fusion expects.
-        score = -float(row["rank"])
+    for node_id in ordered[:k]:
+        shape = shapes[node_id]
         hits.append(
             SearchHit(
-                node_id=row["id"],
-                type=row["type_id"],
-                title=row["title"],
-                snippet=row["snippet"] or (row["title"] or ""),
-                score=score,
-                signals={"bm25": score},
+                node_id=node_id,
+                type=shape.type,
+                title=shape.title,
+                snippet=shape.snippet,
+                score=sum(signals[node_id].values()),
+                signals=signals[node_id],
             )
         )
     return hits
@@ -121,12 +257,12 @@ def _expand_hits(
     state: str | None,
     type_id: str | None,
 ) -> list[SearchHit]:
-    """One-hop graph expansion: active-edge neighbors of the BM25 hits.
+    """One-hop graph expansion: active-edge neighbors of the fused hits.
 
     Each neighbor's score is the strongest edge weight reaching it (type
     weight × confidence, design §7) and its ``signals`` carries only the
     ``graph`` signal, so expansion hits are distinguishable from direct
-    matches. BM25 hits are never re-emitted. Capped at ``k`` extra hits.
+    matches. Fused hits are never re-emitted. Capped at ``k`` extra hits.
     """
     seen = {hit.node_id for hit in hits}
     weights: dict[str, float] = {}
@@ -176,13 +312,16 @@ def search(
     expand: bool = False,
     path: str | Path | None = None,
 ) -> SearchResult:
-    """Keyword-search node title + content (+ extracted asset text, later).
+    """Hybrid-search node title + content: BM25 and vector signals, RRF-fused.
 
-    Catches the ``fts`` projector up with the event log first, so results
-    reflect the latest committed writes.
+    Catches the ``fts`` and ``vec`` projectors up with the event log first,
+    so results reflect the latest committed writes. The vector signal is
+    skipped when no embedding provider is available — search then degrades
+    to BM25 (+ graph expansion) without failing.
 
     Args:
-        query: Free-text query; whitespace-separated terms are ANDed.
+        query: Free-text query; whitespace-separated terms are ANDed for
+            BM25 and embedded whole for the vector signal.
         k: Maximum hits.
         state: Node-state filter (default ``active``); ``None`` searches all
             states.
@@ -190,19 +329,22 @@ def search(
         created_by: Optional writer filter (e.g. ``agent:researcher``).
         created_after: Only nodes created after this timestamp.
         created_before: Only nodes created before this timestamp.
-        expand: Append one-hop active-edge neighbors of the hits (design §7
-            graph expansion), scored by edge type weight × confidence.
+        expand: Append one-hop active-edge neighbors of the fused hits
+            (design §7 graph expansion), scored by edge type weight ×
+            confidence.
         path: Explicit database path.
 
     Returns:
-        BM25-ranked hits, best first, then expansion hits when ``expand``.
+        RRF-fused hits, best first, then expansion hits when ``expand``.
+        ``signals`` on each hit names the contributing signals (``bm25``,
+        ``vector``, ``graph``).
 
     Raises:
         ValueError: If the query has no terms or the type does not resolve.
     """
     match = _match_query(query)
-    # Derived index first: the projector is incremental, so this is cheap.
-    projectors.run_projectors(names=["fts"], path=path)
+    # Derived indexes first: the projectors are incremental, so this is cheap.
+    projectors.run_projectors(names=["fts", "vec"], path=path)
     conn = _connect(path)
     try:
         type_id = None
@@ -213,7 +355,7 @@ def search(
             if row is None:
                 raise ValueError(f"unknown node type: {type}")
             type_id = row["id"]
-        hits = _search_bm25(
+        bm25_rows = _search_bm25(
             conn,
             match,
             k=k,
@@ -223,6 +365,21 @@ def search(
             created_after=created_after,
             created_before=created_before,
         )
+        vector_rows: list[_RankedRow] = []
+        provider = embeddings.get_provider()
+        if provider is not None:
+            (query_vector,) = provider.embed([query])
+            vector_rows = _search_vector(
+                conn,
+                query_vector,
+                k=k,
+                state=state,
+                type_id=type_id,
+                created_by=created_by,
+                created_after=created_after,
+                created_before=created_before,
+            )
+        hits = _fuse(bm25_rows, vector_rows, k=k)
         if expand and hits:
             hits += _expand_hits(conn, hits, k=k, state=state, type_id=type_id)
         return SearchResult(query=query, k=k, hits=hits)

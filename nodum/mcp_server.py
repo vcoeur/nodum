@@ -107,7 +107,11 @@ def create_server(*, actor: str = "agent:mcp", db_path: str | Path | None = None
         filters: dict[str, Any] | None = None,
         expand: bool = False,
     ) -> dict[str, Any]:
-        """BM25 keyword search over node title + content.
+        """Hybrid search over node title + content: BM25 + vector, RRF-fused.
+
+        The `vector` signal participates when an embedding provider is
+        available on the server; otherwise results are BM25-only (no error).
+        `signals` on each hit names the contributing signals.
 
         `filters` keys: `type`, `state` (default "active"; "any" for all),
         `created_by`, `created_after`, `created_before`. `expand` appends

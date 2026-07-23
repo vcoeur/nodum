@@ -16,16 +16,18 @@ one JSON object per command.
 Phase 1 (core) landed; Phase 2 (agent-native) is underway. Built so far in
 Phase 2: **event-log projectors** (`nodum.projectors`) with per-projector
 checkpoints and rebuild mechanics, the **`fts` projector** (FTS5 over node
-title + content), **BM25 keyword search** (`nodum.search`, CLI `search`)
-with one-hop graph expansion, **agent policies** (DB-stored per-agent
-rulesets, design §8.3, with auto-accept evaluation on the edge write path),
-the **review/accept API** (proposal listing with reviewer context, batch
-accept/reject by id or filter), **proposed updates** (agent `update_node`
-stages a `proposed` version; accept applies it, reject archives it —
-migration 0005), and the **MCP server** (`nodum.mcp_server`, stdio, read +
-additive tiers + `accept`/`reject`; curative tools are never registered).
-**Deliberately not built yet** (later phases — do not add):
-sqlite-vec / hybrid fusion, the web UI,
+title + content), the **`vec` projector** (sqlite-vec chunk embeddings,
+local in-process fastembed model — migration 0006), **hybrid search**
+(`nodum.search`, CLI `search`): BM25 + vector lists fused by reciprocal rank
+fusion, then one-hop graph-expansion re-ranking, with a per-signal `signals`
+breakdown, **agent policies** (DB-stored per-agent rulesets, design §8.3,
+with auto-accept evaluation on the edge write path), the **review/accept
+API** (proposal listing with reviewer context, batch accept/reject by id or
+filter), **proposed updates** (agent `update_node` stages a `proposed`
+version; accept applies it, reject archives it — migration 0005), and the
+**MCP server** (`nodum.mcp_server`, stdio, read + additive tiers +
+`accept`/`reject`; curative tools are never registered).
+**Deliberately not built yet** (later phases — do not add): the web UI,
 assets/CAS/renditions/ingestion, the internal agent runtime and consolidation
 cycle, Markdown Mirror / JSON export. The schema reserves room for them
 (`graph_id`, `merge_redirects`, `cycle_id`); each lands as its own
@@ -54,15 +56,32 @@ append-only migration.
 - **`nodum.projectors`** — derived-index consumers of the event log. A
   projector registry (`REGISTRY`), per-projector checkpoints in
   `projector_checkpoints`, incremental `run_projectors`, and
-  `rebuild_projector` (reset derived state, replay from event 0). The service
-  layer never calls projectors — the event log is the only coupling, and no
-  LLM exists anywhere in this path (design Constraint 4).
-- **`nodum.search`** — the query path. BM25 keyword search over the `fts`
-  projector's index (catching the projector up first) with `type`/`state`/
-  `created_by`/date filters, returning hits with a fused `score` plus a
-  per-signal `signals` breakdown, and optional one-hop graph expansion over
-  `active` edges (`--expand`) so vector + graph fusion (design §7 RRF) slots
-  in without reshaping the API.
+  `rebuild_projector` (reset derived state, replay from event 0). The `fts`
+  projector maintains `node_fts`; the `vec` projector maintains `chunks` +
+  `node_vec` (rebuild = the model-change re-embed path, design D6). The
+  service layer never calls projectors — the event log is the only coupling.
+  A projector whose requirements are unmet (`vec` without a usable embedding
+  provider) reports itself unavailable in `projector status` and its runs
+  are no-ops — the backlog waits, nothing crashes.
+- **`nodum.embeddings`** — the embedding provider seam (design D10) and
+  chunking (design D6). The provider interface is `model_id` + `dimensions`
+  + `embed(texts) -> vectors`; the default is a local in-process fastembed
+  model (`sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`,
+  384-dim, multilingual, ONNX/CPU — no daemon, no API key) behind the
+  optional `embeddings` extra. A model is never downloaded implicitly: the
+  provider resolves only from the local HF cache unless
+  `NODUM_EMBED_DOWNLOAD=1` is set (first run fetches it).
+  `NODUM_EMBED_MODEL` overrides the model name (a different dimensionality
+  needs a new migration — the vec0 table is fixed at 384). Tests inject a
+  deterministic hashing fake via `embeddings.set_provider`.
+- **`nodum.search`** — the query path (design §7). BM25 over the `fts`
+  projector's index and vector ANN over the `vec` projector's chunks
+  (closest chunk per node wins), fused by reciprocal rank fusion (K=60) with
+  `type`/`state`/`created_by`/date filters; optional one-hop graph expansion
+  over `active` edges (`--expand`) applies after fusion. Hits carry the
+  fused `score` plus a per-signal `signals` breakdown (`bm25` / `vector` /
+  `graph`). With no embedding provider the vector signal is skipped —
+  search silently degrades to BM25 + graph.
 - **`nodum.db`** — connection management (WAL, foreign keys), `NODUM_DB`
   resolution, the migration runner.
 - **`nodum.migrations`** — the append-only migration list. Never edit a shipped
@@ -79,7 +98,10 @@ Phase-1 decision log.
 
 - **uv for everything.** `uv sync --all-groups` (or `make dev-install`), `uv
   run nodum …`, `uv run pytest`. Never raw `pip`/`venv`. Commit `uv.lock`;
-  `.venv/` stays gitignored. Python ≥ 3.12.
+  `.venv/` stays gitignored. Python ≥ 3.12. The local embedding model lives
+  behind the optional `embeddings` extra (`uv sync --extra embeddings`) —
+  tests never need it (they inject a fake provider; one real-model smoke
+  test is opt-in via `NODUM_RUN_SLOW=1`).
 - **`make format` after every code change** (ruff check --fix + format); CI
   runs `make lint` and `make test` on Python 3.12 and 3.13.
 - **Tests**: `make test` (pytest, rooted at `tests/`). Every test runs against

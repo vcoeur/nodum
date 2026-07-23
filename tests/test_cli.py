@@ -146,20 +146,44 @@ def test_search(fresh_db):
     assert result["hits"] == []
 
 
+def test_search_hybrid_signals_over_the_cli(fresh_db, fake_embedder):
+    node = _run_json(
+        "node", "create", "--type", "note", "--title", "Sap", "--content", "xylem carries sap"
+    )
+    result = _run_json("search", "xylem")
+    hit = result["hits"][0]
+    assert hit["node_id"] == node["id"]
+    assert set(hit["signals"]) == {"bm25", "vector"}
+    assert hit["score"] == hit["signals"]["bm25"] + hit["signals"]["vector"]
+
+
 def test_projector_run_status_rebuild(fresh_db):
     _run_json("node", "create", "--type", "note", "--title", "T", "--content", "body")
 
     status = _run_json("projector", "status")
-    (fts,) = status["projectors"]
-    assert fts["name"] == "fts"
-    assert fts["pending_events"] == 1
+    statuses = {projector["name"]: projector for projector in status["projectors"]}
+    assert set(statuses) == {"fts", "vec"}
+    assert statuses["fts"]["pending_events"] == 1
+    # No embedding provider in tests: vec reports itself unavailable.
+    assert statuses["vec"]["available"] is False
+    assert statuses["vec"]["detail"]
 
     runs = _run_json("projector", "run")
-    assert runs["projectors"] == [{"name": "fts", "applied": 1, "from_seq": 0, "to_seq": 1}]
+    by_name = {run["name"]: run for run in runs["projectors"]}
+    assert by_name["fts"] == {
+        "name": "fts",
+        "applied": 1,
+        "from_seq": 0,
+        "to_seq": 1,
+        "detail": None,
+    }
+    assert by_name["vec"]["applied"] == 0
+    assert by_name["vec"]["detail"]
 
     status = _run_json("projector", "status")
-    assert status["projectors"][0]["pending_events"] == 0
-    assert status["projectors"][0]["rows"] == 1
+    statuses = {projector["name"]: projector for projector in status["projectors"]}
+    assert statuses["fts"]["pending_events"] == 0
+    assert statuses["fts"]["rows"] == 1
 
     rebuilt = _run_json("projector", "rebuild", "fts")
     assert rebuilt["from_seq"] == 0

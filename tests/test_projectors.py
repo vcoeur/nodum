@@ -17,32 +17,42 @@ def _fts_rows(fresh_db):
         conn.close()
 
 
+def _statuses():
+    """Projector statuses keyed by name."""
+    return {status.name: status for status in projectors.projector_status()}
+
+
+def _runs(**kwargs):
+    """Projector runs keyed by name."""
+    return {run.name: run for run in projectors.run_projectors(**kwargs)}
+
+
 def test_checkpoint_starts_at_zero_with_backlog(fresh_db):
     service.create_node(type="note", title="T")
-    (status,) = projectors.projector_status()
-    assert status.name == "fts"
-    assert status.last_event_seq == 0
-    assert status.pending_events == 1
-    assert status.rows == 0
+    statuses = _statuses()
+    assert set(statuses) == {"fts", "vec"}
+    fts = statuses["fts"]
+    assert fts.last_event_seq == 0
+    assert fts.pending_events == 1
+    assert fts.rows == 0
 
 
 def test_run_applies_pending_events_incrementally(fresh_db):
     service.create_node(type="note", title="one")
-    (run,) = projectors.run_projectors()
-    assert run.name == "fts"
+    run = _runs()["fts"]
     assert run.applied == 1
     assert run.from_seq == 0
     assert run.to_seq == 1
 
     service.create_node(type="note", title="two")
     service.create_node(type="note", title="three")
-    (run,) = projectors.run_projectors()
+    run = _runs()["fts"]
     assert (run.applied, run.from_seq, run.to_seq) == (2, 1, 3)
 
     # Up to date: a further run applies nothing.
-    (run,) = projectors.run_projectors()
+    run = _runs()["fts"]
     assert (run.applied, run.from_seq, run.to_seq) == (0, 3, 3)
-    (status,) = projectors.projector_status()
+    status = _statuses()["fts"]
     assert status.pending_events == 0
     assert status.rows == 3
 
@@ -96,7 +106,7 @@ def test_fts_drops_a_node_when_its_create_is_undone(fresh_db):
     assert set(_fts_rows(fresh_db)) == {keep.id, gone.id}
 
     service.undo()  # reverses the create of `gone`
-    (run,) = projectors.run_projectors()
+    run = _runs()["fts"]
     assert run.applied == 1  # the undo event
     assert set(_fts_rows(fresh_db)) == {keep.id}
 

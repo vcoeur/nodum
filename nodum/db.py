@@ -6,6 +6,8 @@ import os
 import sqlite3
 from pathlib import Path
 
+import sqlite_vec
+
 from nodum.migrations import MIGRATIONS
 
 #: Environment variable overriding the database path.
@@ -29,14 +31,18 @@ def connect(path: str | Path | None = None) -> sqlite3.Connection:
             directory is created if needed. Use ``":memory:"`` for tests.
 
     Returns:
-        A connection with row access by column name, WAL journaling, and
-        foreign-key enforcement enabled.
+        A connection with row access by column name, WAL journaling,
+        foreign-key enforcement enabled, and the sqlite-vec extension loaded
+        (the ``node_vec`` vec0 table and its KNN queries need it).
     """
     db_file = Path(path).expanduser() if path is not None else db_path()
     if str(db_file) != ":memory:":
         db_file.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(db_file))
     conn.row_factory = sqlite3.Row
+    conn.enable_load_extension(True)
+    sqlite_vec.load(conn)
+    conn.enable_load_extension(False)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     return conn

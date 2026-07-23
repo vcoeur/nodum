@@ -9,6 +9,7 @@ requires-python = ">=3.12"
 dependencies = [
     "mcp>=1.28.1",
     "pydantic>=2.9",
+    "sqlite-vec>=0.1.9",
     "typer>=0.16",
 ]
 classifiers = [
@@ -30,6 +31,11 @@ Issues = "https://github.com/vcoeur/nodum/issues"
 
 [project.scripts]
 nodum = "nodum.cli:app"
+
+[project.optional-dependencies]
+embeddings = [
+    "fastembed>=0.8.0",
+]
 
 [build-system]
 requires = ["hatchling", "hatch-vcs"]

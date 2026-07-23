@@ -10,13 +10,15 @@ reversible.
 **Phase 1 (core)** landed: schema + migrations, service layer, event log +
 versions + undo, Markdown-as-truth content, wikilink materialization, and a
 JSON-emitting CLI. **Phase 2 (agent-native)** is underway: event-log
-projectors with checkpoint/rebuild mechanics and the first derived index —
-an FTS5 full-text index feeding BM25 keyword search — DB-stored **agent
-policies** with auto-accept on the write path, the **review/accept API** for
-the proposal queue, **proposed updates** (agent edits stage as `proposed`
-versions), and an **MCP server** (stdio) exposing the read + additive tool
-tiers. Still to come: vector search + hybrid fusion, the web UI, assets, and
-the consolidation cycle.
+projectors with checkpoint/rebuild mechanics and two derived indexes — an
+FTS5 full-text index and a sqlite-vec chunk-embedding index (local
+in-process fastembed model, no daemon, no API key) — feeding **hybrid
+search** (BM25 + vector fused by reciprocal rank fusion, then graph-expansion
+re-ranking), DB-stored **agent policies** with auto-accept on the write path,
+the **review/accept API** for the proposal queue, **proposed updates** (agent
+edits stage as `proposed` versions), and an **MCP server** (stdio) exposing
+the read + additive tool tiers. Still to come: the web UI, assets, and the
+consolidation cycle.
 
 ## Quick start
 
@@ -34,9 +36,10 @@ uv run nodum node create --type note --title "My note" \
     --content "Notes on [[Graph Theory]] and its applications."
 uv run nodum edge list --type mentions        # the wikilink became an edge
 
-uv run nodum search "graph theory"            # BM25 keyword search (FTS5)
-uv run nodum projector status                 # derived-index checkpoints
+uv run nodum search "graph theory"            # hybrid search (BM25 + vector, RRF-fused)
+uv run nodum projector status                 # derived-index checkpoints + availability
 uv run nodum projector rebuild fts            # drop + replay from event 0
+uv run nodum projector rebuild vec            # the model-change re-embed path
 
 uv run nodum node list --type note
 uv run nodum history <node-id>                # version snapshots
@@ -67,6 +70,24 @@ uv run nodum mcp serve --actor agent:researcher
 
 Run `uv run nodum --help` (or any subcommand with `--help`) for the full
 surface.
+
+### Semantic search (optional)
+
+The vector signal runs on a local, in-process embedding model (fastembed,
+ONNX on CPU — no daemon, no API key), installed as an extra:
+
+```sh
+uv sync --extra embeddings            # adds fastembed
+# First run downloads the model (~0.2 GB) — downloads are never implicit:
+NODUM_EMBED_DOWNLOAD=1 uv run nodum projector run vec
+uv run nodum search "osmosis in plants"   # now fuses BM25 + vector signals
+```
+
+Without the extra (or an uncached model) everything still works: the `vec`
+projector reports itself unavailable in `projector status` and search
+degrades to BM25 + graph expansion. `NODUM_EMBED_MODEL` switches the model
+(default: `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`,
+384-dim, multilingual); a model change is a `projector rebuild vec`.
 
 ## How it works
 
@@ -100,10 +121,13 @@ surface.
   reverses an event by restoring its `before` state.
 - **Derived indexes are projectors.** The event log feeds checkpointed,
   independently rebuildable projectors (`nodum projector run/status/rebuild`).
-  The first one, `fts`, maintains an FTS5 index over node title + content (+
-  extracted asset text once assets land); `nodum search` serves BM25-ranked
-  keyword results from it. Vector and graph-expansion signals slot into the
-  same hit shape later.
+  `fts` maintains an FTS5 index over node title + content (+ extracted asset
+  text once assets land); `vec` maintains sqlite-vec embeddings of
+  fixed-window text chunks (512 words, ~15% overlap, `model_id` recorded per
+  chunk). `nodum search` fuses both — BM25 and vector lists merged by
+  reciprocal rank fusion, then one-hop graph expansion along `active` edges —
+  and every hit carries a per-signal `signals` breakdown. With no embedding
+  provider, the vector signal drops out and search stays BM25 + graph.
 
 See [docs/architecture.md](docs/architecture.md) for the module map and
 [AGENTS.md](AGENTS.md) for contributor/agent workflow rules.
