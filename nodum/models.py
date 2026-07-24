@@ -51,6 +51,11 @@ class VersionOut(BaseModel):
     ``state`` is ``applied`` for snapshots of applied node state, ``proposed``
     for an agent's pending update (design §8.1), and ``archived`` for a
     rejected one.
+
+    ``proposed_fields`` names the fields a proposed update actually asked to
+    change — and the only ones an accept writes back; the rest of the snapshot
+    is the node's state at proposal time, shown as reviewer context. It is
+    ``None`` on snapshots that are not proposals.
     """
 
     id: int
@@ -61,6 +66,7 @@ class VersionOut(BaseModel):
     actor: str
     event_seq: int
     state: str
+    proposed_fields: list[str] | None = None
     created_at: str
 
 
@@ -193,8 +199,10 @@ class PolicyOut(BaseModel):
     ``job`` (internal-agent jobs, evaluated by the Phase-5 runtime) or
     ``edge_type`` (evaluated on the write path), each with an ``action``
     (``auto_accept`` / ``auto_apply`` / ``always_propose``) and an optional
-    ``min_confidence`` gate. Rules are validated on write; unknown extra keys
-    are preserved for forward compatibility.
+    ``min_confidence`` gate. A gate grades the agent's *self-reported*
+    confidence, so it only fires when the rule also sets
+    ``trust_self_reported_confidence: true``. Rules are validated on write;
+    unknown extra keys are preserved for forward compatibility.
     """
 
     agent: str

@@ -111,16 +111,121 @@ def test_accept_proposals_transitions_each_with_event(fresh_db):
     assert all(e.actor == "human" for e in service.list_events(limit=2))
 
 
+def test_single_item_reject_records_the_same_reason_as_a_batch(fresh_db):
+    """`transition` carries a reason for every kind, exactly as the batch does.
+
+    Without it the two spellings of one operation had different audit
+    guarantees: `nodum reject <id>` dropped the reviewer's reason on the floor.
+    """
+    _, _, note, edge = _seed_proposals()
+    version = service.update_node(note.id, content="v2", actor="agent:researcher")
+
+    service.transition(str(version.id), "reject", reason="wrong claim")
+    service.transition(note.id, "reject", reason="off topic")
+    service.reject_proposals([edge.id], reason="off topic")
+
+    events = {event.op: event for event in service.list_events(limit=3)}
+    assert set(events) == {"version.reject", "node.reject", "edge.reject"}
+    assert events["version.reject"].payload["reason"] == "wrong claim"
+    assert events["node.reject"].payload["reason"] == "off topic"
+    # The batch path's payload is the same shape — one operation, one record.
+    assert events["edge.reject"].payload["reason"] == "off topic"
+
+
+def test_accept_writes_no_reason_key(fresh_db):
+    """A reason belongs to a refusal; accepting one leaves the payload clean."""
+    _, _, note, _ = _seed_proposals()
+    service.transition(note.id, "accept")
+    assert "reason" not in service.list_events(limit=1)[0].payload
+
+
 def test_reject_proposals_archives_with_reason(fresh_db):
     _, _, note, edge = _seed_proposals()
-    result = service.reject_proposals([note.id, edge.id], reason="spam run", actor="agent:curator")
+    result = service.reject_proposals([note.id, edge.id], reason="spam run", actor="human")
     assert result.reason == "spam run"
     assert set(result.transitioned) == {note.id, edge.id}
     assert service.get_node(note.id).state == "archived"
     events = service.list_events(limit=2)
     assert sorted(e.op for e in events) == ["edge.reject", "node.reject"]
     assert all(e.payload["reason"] == "spam run" for e in events)
-    assert all(e.actor == "agent:curator" for e in events)
+    assert all(e.actor == "human" for e in events)
+
+
+# ── Review is the human tier: no agent actor may accept or reject ─────────────
+
+
+def test_agent_cannot_accept_its_own_proposal(fresh_db):
+    _, _, note, edge = _seed_proposals()
+    with pytest.raises(service.ReviewNotPermitted, match="only the 'human' actor"):
+        service.accept_proposals([note.id, edge.id], actor="agent:researcher")
+    # Nothing moved: the batch is refused whole, not id by id.
+    assert service.get_node(note.id).state == "proposed"
+    assert {p.id for p in service.list_proposals()} == {note.id, edge.id}
+
+
+def test_agent_cannot_reject_another_agents_proposal(fresh_db):
+    _, _, note, _ = _seed_proposals()
+    with pytest.raises(service.ReviewNotPermitted, match="only the 'human' actor"):
+        service.reject_proposals([note.id], reason="turf war", actor="agent:curator")
+    assert service.get_node(note.id).state == "proposed"
+
+
+def test_agent_cannot_review_through_any_service_entry_point(fresh_db):
+    _, _, note, _ = _seed_proposals()
+    version = service.update_node(note.id, content="v2", actor="agent:researcher")
+    agent = "agent:researcher"
+    for call in (
+        lambda: service.transition(note.id, "accept", actor=agent),
+        lambda: service.transition(note.id, "reject", actor=agent),
+        lambda: service.transition(str(version.id), "accept", actor=agent),
+        lambda: service.accept_matching(created_by=agent, actor=agent),
+        lambda: service.reject_matching(reason="all mine", created_by=agent, actor=agent),
+        lambda: service.accept_matching(created_by="agent:nobody", actor=agent),
+    ):
+        with pytest.raises(service.ReviewNotPermitted):
+            call()
+    assert service.get_node(note.id).state == "proposed"
+    assert [v.state for v in service.history(note.id)][-1] == "proposed"
+
+
+def test_agent_cannot_archive_live_state(fresh_db):
+    """Archiving retires live structure, so it is the human tier too."""
+    a, _, _, _ = _seed_proposals()
+    with pytest.raises(service.ReviewNotPermitted, match="only the 'human' actor"):
+        service.transition(a.id, "archive", actor="agent:researcher")
+    assert service.get_node(a.id).state == "active"
+    assert service.transition(a.id, "archive").state == "archived"
+
+
+def test_agent_cannot_undo(fresh_db):
+    """Undo restores an event's payload verbatim — `state = 'active'` included.
+
+    Leaving it open would let an agent write live state through the back
+    door, defeating the propose-only rule the rest of the tier enforces.
+    """
+    a, _, _, _ = _seed_proposals()
+    archived = service.transition(a.id, "archive")
+    archive_seq = service.list_events(limit=1)[0].seq
+
+    with pytest.raises(service.ReviewNotPermitted, match="only the 'human' actor"):
+        service.undo(archive_seq, actor="agent:researcher")
+    assert service.get_node(a.id).state == archived.state == "archived"
+    # No undo event was written either: the refusal is before any work.
+    assert service.list_events(limit=1)[0].seq == archive_seq
+
+    service.undo(archive_seq)
+    assert service.get_node(a.id).state == "active"
+
+
+def test_cli_undo_and_archive_refuse_an_agent_actor(fresh_db):
+    node = _run_json("node", "create", "--type", "note", "--title", "Live")
+    for args in (
+        ("archive", node["id"], "--actor", "agent:researcher"),
+        ("undo", "--actor", "agent:researcher"),
+    ):
+        result = _run_fail(*args)
+        assert "only the 'human' actor" in result.output
+    assert _run_json("node", "get", node["id"])["state"] == "active"
 
 
 def test_batch_collects_failures_without_aborting(fresh_db):
@@ -207,6 +312,18 @@ def test_cli_review_accept_and_reject(fresh_db):
     events = _run_json("events", "--limit", "1")
     assert events["events"][0]["op"] == "edge.reject"
     assert events["events"][0]["payload"]["reason"] == "not convinced"
+
+
+def test_cli_review_refuses_an_agent_actor(fresh_db):
+    note, _ = _cli_seed()
+    for args in (
+        ("review", "accept", note["id"], "--actor", "agent:researcher"),
+        ("review", "reject", note["id"], "--reason", "mine", "--actor", "agent:researcher"),
+        ("accept", note["id"], "--actor", "agent:researcher"),
+    ):
+        result = _run_fail(*args)
+        assert "only the 'human' actor" in result.output
+    assert _run_json("node", "get", note["id"])["state"] == "proposed"
 
 
 def test_cli_review_reject_requires_reason(fresh_db):

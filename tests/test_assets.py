@@ -45,6 +45,23 @@ def _register_image(fresh_db, tmp_path, name="photo.png", **kwargs):
     return assets.register_asset(source)
 
 
+def _webp_at(image, quality):
+    """Encode a prepared image as WebP at one quality, exactly as the encoder does."""
+    buffer = io.BytesIO()
+    image.save(buffer, "WEBP", quality=quality)
+    return buffer.getvalue()
+
+
+def _prepared(db_path, asset_hash, profile):
+    """Return the downscaled image the encoder is handed for a profile."""
+    conn = db.connect(db_path)
+    try:
+        with assets.open_original(conn, asset_hash) as original:
+            return assets._prepare_image(original, assets.PROFILES[profile])
+    finally:
+        conn.close()
+
+
 # ── Registration (a metadata row + a blob + a sha256) ─────────────────────────
 
 
@@ -67,7 +84,7 @@ def test_register_streams_bytes_into_the_database(fresh_db, tmp_path):
 
 
 def test_register_writes_nothing_beside_the_database(fresh_db, tmp_path):
-    """The single-file promise: no CAS directory, no rendition cache on disk."""
+    """The single-file promise: no asset directory, no rendition cache on disk."""
     asset = _register_image(fresh_db, tmp_path)
     assets.get_rendition(asset.hash, profile="thumb")
     beside = {child.name for child in fresh_db.parent.iterdir()}
@@ -145,6 +162,31 @@ def test_rgba_alpha_survives_rendition(fresh_db, tmp_path):
         assert decoded.mode == "RGBA"
 
 
+def test_thumb_is_encoded_at_the_profiles_nominal_quality(fresh_db, tmp_path):
+    """`thumb` has no size target, so its q75 is the encode — not the ladder's q70.
+
+    A WebP file records no quality factor, so the only way to pin this is to
+    re-encode the same prepared image here and compare bytes.
+    """
+    asset = _register_image(fresh_db, tmp_path, size=(600, 300), noise=True)
+    stored = assets.read_rendition_bytes(assets.get_rendition(asset.hash, profile="thumb"))
+
+    prepared = _prepared(fresh_db, asset.hash, "thumb")
+    assert assets.PROFILES["thumb"].quality == 75
+    assert stored == _webp_at(prepared, 75)
+    assert stored != _webp_at(prepared, 70)
+
+
+def test_preview_encodes_at_q80_when_it_already_fits_the_target(fresh_db, tmp_path):
+    """A target profile also starts at its nominal quality; steps are the fallback."""
+    asset = _register_image(fresh_db, tmp_path, size=(400, 400))
+    stored = assets.read_rendition_bytes(assets.get_rendition(asset.hash, profile="preview"))
+
+    prepared = _prepared(fresh_db, asset.hash, "preview")
+    assert len(stored) <= assets.PROFILES["preview"].target_bytes
+    assert stored == _webp_at(prepared, 80)
+
+
 def test_preview_respects_the_300kb_target(fresh_db, tmp_path):
     # Noise compresses badly: q80 WebP of this is far above 300 KB, forcing
     # the quality-stepping loop to fit the target.
@@ -152,6 +194,53 @@ def test_preview_respects_the_300kb_target(fresh_db, tmp_path):
     rendition = assets.get_rendition(asset.hash, profile="preview")
     assert rendition.size_bytes <= 300_000
     assert (rendition.width, rendition.height) == (1024, 1024)
+    # The nominal quality really was too big — the ladder is what fit it.
+    assert len(_webp_at(_prepared(fresh_db, asset.hash, "preview"), 80)) > 300_000
+
+
+# ── Modes WebP cannot encode directly are converted first ────────────────────
+
+
+@pytest.mark.parametrize(
+    ("mode", "name"),
+    [("P", "palette.png"), ("L", "grayscale.png"), ("CMYK", "print.jpg")],
+)
+def test_non_rgb_originals_are_converted_before_encoding(fresh_db, tmp_path, mode, name):
+    """Palette, grayscale and CMYK originals still render.
+
+    Real files arrive in these modes — exported palettes, scans, print-ready
+    JPEGs — and WebP takes none of them: without the conversion branch the
+    rendition would fail on the first non-RGB upload.
+    """
+    source = tmp_path / name
+    Image.new(mode, (300, 150)).save(source)
+    with Image.open(source) as reopened:
+        assert reopened.mode == mode  # the mode really survived the round-trip
+
+    asset = assets.register_asset(source)
+    rendition = assets.get_rendition(asset.hash, profile="thumb")
+    assert (rendition.width, rendition.height) == (256, 128)
+    with _decode(rendition) as decoded:
+        assert decoded.format == "WEBP"
+        assert decoded.mode == "RGB"
+
+
+def test_palette_transparency_becomes_alpha(fresh_db, tmp_path):
+    """A palette image with a transparent index converts to RGBA, not RGB.
+
+    Alpha lives in `info["transparency"]` for `P` mode, not in the bands, so
+    only checking the bands would silently flatten transparent PNGs.
+    """
+    source = tmp_path / "transparent.png"
+    image = Image.new("P", (200, 100), 1)
+    image.putpalette([255, 0, 0] * 256)
+    image.paste(0, (0, 0, 100, 100))  # half the image on the transparent index
+    image.save(source, transparency=0)
+
+    asset = assets.register_asset(source)
+    with _decode(assets.get_rendition(asset.hash, profile="thumb")) as decoded:
+        assert decoded.mode == "RGBA"
+        assert decoded.convert("RGBA").getpixel((10, 10))[3] == 0  # still transparent
 
 
 # ── Addressing, caching, eviction ─────────────────────────────────────────────
@@ -216,6 +305,30 @@ def test_purge_scoped_to_one_asset(fresh_db, tmp_path):
     result = assets.purge_renditions(asset_hash=one.hash)
     assert result.purged == 1
     assert assets.get_rendition(other.hash, profile="thumb").cached is True
+
+
+# ── Calling convention ────────────────────────────────────────────────────────
+
+
+def test_options_including_the_db_path_are_keyword_only(fresh_db, tmp_path):
+    """Every public function follows the service/search convention.
+
+    `path` used to be positional here alone, so `get_asset(x, y)` quietly read
+    `y` as a database path where `service.get_node(x, y)` is a TypeError.
+    """
+    asset = _register_image(fresh_db, tmp_path)
+    rendition = assets.get_rendition(asset.hash, profile="thumb")
+    for call in (
+        lambda: assets.register_asset(tmp_path / "photo.png", "renamed.png"),
+        lambda: assets.get_asset(asset.hash, "not-a-database"),
+        lambda: assets.list_assets(fresh_db),
+        lambda: assets.get_rendition(asset.hash, "thumb"),
+        lambda: assets.read_rendition_bytes(rendition, fresh_db),
+        lambda: assets.purge_renditions(asset.hash),
+        lambda: assets.copy_rendition(rendition, tmp_path / "out.webp", fresh_db),
+    ):
+        with pytest.raises(TypeError, match="positional"):
+            call()
 
 
 # ── Clean rejection ───────────────────────────────────────────────────────────
@@ -300,6 +413,64 @@ def test_vacuum_into_snapshot_carries_originals_and_renditions(fresh_db, tmp_pat
     finally:
         restored.close()
     assert assets.read_rendition_bytes(rendition)[:4] == b"RIFF"
+
+
+def test_register_refuses_a_source_that_shrank_between_passes(fresh_db, tmp_path, monkeypatch):
+    """Registration reads the file twice; the stored bytes must match the key.
+
+    A file still being written (a rotating log, a partial download) can be
+    shorter on the copy pass than on the hash pass. The blob keeps its
+    zero-filled tail, so the row would commit with
+    `sha256(stored) != assets.hash` — silently, and forever.
+    """
+    source = tmp_path / "rotating.log"
+    source.write_bytes(b"the whole payload, every byte of it")
+    hash_file = assets._hash_file
+
+    def hash_then_truncate(path):
+        digest_and_size = hash_file(path)
+        path.write_bytes(b"truncated")  # the writer rotates the file underneath us
+        return digest_and_size
+
+    monkeypatch.setattr(assets, "_hash_file", hash_then_truncate)
+    with pytest.raises(assets.AssetSourceChanged, match="changed while it was being registered"):
+        assets.register_asset(source)
+
+    monkeypatch.undo()
+    assert assets.list_assets() == []
+    conn = db.connect(fresh_db)
+    try:
+        assert conn.execute("SELECT count(*) AS n FROM asset_blobs").fetchone()["n"] == 0
+    finally:
+        conn.close()
+
+
+def test_stored_bytes_always_hash_to_their_key(fresh_db, tmp_path):
+    asset = _register_image(fresh_db, tmp_path)
+    conn = db.connect(fresh_db)
+    try:
+        with assets.open_original(conn, asset.hash) as blob:
+            stored = blob.read()
+    finally:
+        conn.close()
+    assert hashlib.sha256(stored).hexdigest() == asset.hash
+    assert len(stored) == asset.size_bytes
+
+
+def test_oversized_asset_is_refused_with_a_clear_message(fresh_db, tmp_path, monkeypatch):
+    """The blob-length ceiling is named up front, not as `blob too big`."""
+    source = tmp_path / "big.bin"
+    source.write_bytes(b"x" * 64)
+    monkeypatch.setattr(assets, "max_blob_bytes", lambda conn: 16)
+
+    with pytest.raises(assets.AssetTooLarge, match="cannot exceed SQLite's 16-byte blob limit"):
+        assets.register_asset(source)
+    assert assets.list_assets() == []
+
+
+def test_register_missing_file_raises_file_not_found(fresh_db, tmp_path):
+    with pytest.raises(FileNotFoundError):
+        assets.register_asset(tmp_path / "nope.png")
 
 
 def test_registration_rolls_back_when_the_blob_write_fails(fresh_db, tmp_path, monkeypatch):

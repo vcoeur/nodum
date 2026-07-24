@@ -6,6 +6,7 @@ import json
 
 from typer.testing import CliRunner
 
+from nodum import db
 from nodum.cli import app
 
 runner = CliRunner()
@@ -89,6 +90,50 @@ def test_state_transitions_and_actor(fresh_db):
     assert archived["state"] == "archived"
 
 
+def test_reject_records_its_reason_in_the_event(fresh_db):
+    """One id or a hundred, a reject leaves the same audit trail."""
+    proposed = _run_json(
+        "node", "create", "--type", "note", "--title", "bot", "--actor", "agent:test"
+    )
+    rejected = _run_json("reject", proposed["id"], "--reason", "off topic")
+    assert rejected["state"] == "archived"
+
+    event = _run_json("events", "--limit", "1")["events"][0]
+    assert event["op"] == "node.reject"
+    assert event["payload"]["reason"] == "off topic"
+
+
+def test_reject_without_a_reason_is_refused(fresh_db):
+    proposed = _run_json(
+        "node", "create", "--type", "note", "--title", "bot", "--actor", "agent:test"
+    )
+    result = runner.invoke(app, ["reject", proposed["id"]])
+    assert result.exit_code == 2  # typer: missing required --reason
+    assert _run_json("node", "get", proposed["id"])["state"] == "proposed"
+
+
+def test_every_list_command_reports_a_count(fresh_db):
+    """One envelope for lists: `{"<plural>": [...], "count": n}`, no exceptions."""
+    node = _run_json("node", "create", "--type", "note", "--title", "T", "--content", "body")
+    _run_json(
+        "policy", "set", "agent:x", "--rule", '{"edge_type":"mentions","action":"auto_accept"}'
+    )
+    for args, key in (
+        (("node", "list"), "nodes"),
+        (("node", "children", node["id"]), "nodes"),
+        (("edge", "list"), "edges"),
+        (("history", node["id"]), "versions"),
+        (("events",), "events"),
+        (("policy", "list"), "policies"),
+        (("review", "queue"), "proposals"),
+        (("asset", "list"), "assets"),
+        (("projector", "run"), "projectors"),
+        (("projector", "status"), "projectors"),
+    ):
+        payload = _run_json(*args)
+        assert payload["count"] == len(payload[key]), args
+
+
 def test_invalid_transition_exits_1(fresh_db):
     node = _run_json("node", "create", "--type", "note", "--title", "active")
     result = runner.invoke(app, ["accept", node["id"]])
@@ -133,6 +178,90 @@ def test_bad_set_pair_exits_1(fresh_db):
     assert "--set expects key=value" in result.stderr
 
 
+def test_set_values_are_json_with_a_raw_string_fallback(fresh_db):
+    """`--set` decodes JSON, and keeps anything that is not JSON as a string.
+
+    Without the fallback, `--set venue=Nature` would exit 1 on a decode error
+    instead of storing the obvious string.
+    """
+    created = _run_json(
+        "node",
+        "create",
+        "--type",
+        "source",
+        "--title",
+        "Paper",
+        "--set",
+        "venue=Nature",  # bare word: not JSON, kept verbatim
+        "--set",
+        "year=1815",  # int
+        "--set",
+        "peer_reviewed=true",  # bool
+        "--set",
+        'authors=["Ada", "Grace"]',  # array
+        "--set",
+        'doi={"prefix": "10.1000"}',  # object
+        "--set",
+        "note=",  # empty value is an empty string, not a crash
+        "--set",
+        "date=2024-01-02",  # JSON-ish but not JSON: still a string
+    )
+    assert created["props"] == {
+        "venue": "Nature",
+        "year": 1815,
+        "peer_reviewed": True,
+        "authors": ["Ada", "Grace"],
+        "doi": {"prefix": "10.1000"},
+        "note": "",
+        "date": "2024-01-02",
+    }
+
+
+# ── Every reachable failure is a stderr line and exit 1, never a traceback ───
+
+
+def test_undo_blocked_by_children_exits_1(fresh_db):
+    page = _run_json("node", "create", "--type", "page", "--title", "P")
+    _run_json("node", "create", "--type", "block", "--content", "b1", "--parent", page["id"])
+    create_seq = _run_json("events")["events"][-1]["seq"]
+
+    result = runner.invoke(app, ["undo", str(create_seq)])
+    assert result.exit_code == 1
+    assert "child node" in result.stderr
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+    assert _run_json("node", "get", page["id"])["id"] == page["id"]
+
+
+def test_asset_register_missing_file_exits_1(fresh_db, tmp_path):
+    result = runner.invoke(app, ["asset", "register", str(tmp_path / "missing.png")])
+    assert result.exit_code == 1
+    assert "missing.png" in result.stderr
+    assert "Traceback" not in result.stderr
+
+
+def test_locked_database_exits_1(fresh_db, monkeypatch):
+    """SQLite has one writer: contention is a message, not a stack trace."""
+    real_connect = db.connect
+
+    def impatient_connect(path=None):
+        conn = real_connect(path)
+        conn.execute("PRAGMA busy_timeout=50")  # keep the test quick
+        return conn
+
+    monkeypatch.setattr(db, "connect", impatient_connect)
+    blocker = real_connect(fresh_db)
+    blocker.execute("BEGIN EXCLUSIVE")
+    try:
+        result = runner.invoke(app, ["node", "create", "--type", "note", "--title", "blocked"])
+    finally:
+        blocker.rollback()
+        blocker.close()
+
+    assert result.exit_code == 1
+    assert "database is locked" in result.stderr
+    assert "Traceback" not in result.stderr
+
+
 def test_search(fresh_db):
     node = _run_json(
         "node", "create", "--type", "note", "--title", "Sap", "--content", "xylem carries sap"
@@ -168,7 +297,10 @@ def test_projector_run_status_rebuild(fresh_db):
     assert statuses["vec"]["available"] is False
     assert statuses["vec"]["detail"]
 
+    assert status["count"] == len(status["projectors"])
+
     runs = _run_json("projector", "run")
+    assert runs["count"] == len(runs["projectors"])
     by_name = {run["name"]: run for run in runs["projectors"]}
     assert by_name["fts"] == {
         "name": "fts",
@@ -249,6 +381,27 @@ def test_edge_create_batch_from_stdin(fresh_db):
     assert outcome["failed"][0]["index"] == 1
 
 
+def test_search_date_filters(fresh_db):
+    node = _run_json(
+        "node", "create", "--type", "note", "--title", "T", "--content", "tardigrade cryptobiosis"
+    )
+    stamp = node["created_at"]
+
+    # Bounds are exclusive, so the node's own timestamp excludes it either way.
+    assert _run_json("search", "tardigrade", "--created-after", stamp)["hits"] == []
+    assert _run_json("search", "tardigrade", "--created-before", stamp)["hits"] == []
+
+    windowed = _run_json(
+        "search",
+        "tardigrade",
+        "--created-after",
+        "2000-01-01 00:00:00",
+        "--created-before",
+        "2999-01-01 00:00:00",
+    )
+    assert [hit["node_id"] for hit in windowed["hits"]] == [node["id"]]
+
+
 def test_search_filters_and_expand(fresh_db):
     a = _run_json("node", "create", "--type", "concept", "--title", "xylem alpha")
     b = _run_json("node", "create", "--type", "note", "--title", "xylem beta")
@@ -275,6 +428,16 @@ def test_agent_update_proposes_and_review_accepts(fresh_db):
     accepted = _run_json("accept", str(version["id"]))
     assert accepted["state"] == "applied"
     assert _run_json("node", "get", note["id"])["content"] == "bot rewrite"
+
+
+# ── mcp serve: the actor is validated before anything is served ───────────────
+
+
+def test_mcp_serve_rejects_a_non_agent_actor(fresh_db):
+    for actor in ("human", "", "agent:", "agent", "researcher"):
+        result = runner.invoke(app, ["mcp", "serve", "--actor", actor])
+        assert result.exit_code == 1, result.output
+        assert "invalid --actor" in result.output
 
 
 # ── Assets and renditions ─────────────────────────────────────────────────────
@@ -310,7 +473,10 @@ def test_asset_rendition_out_and_purge(fresh_db, tmp_path):
     assert rendition["cached"] is False
     assert (rendition["width"], rendition["height"]) == (800, 400)
     assert out_file.read_bytes()[:4] == b"RIFF"
-    assert "data_base64" not in rendition or rendition["data_base64"] is None
+    # The key is always in the envelope; the CLI never fills it — bytes go to
+    # --out, never into stdout.
+    assert rendition["data_base64"] is None
+    assert out_file.stat().st_size == rendition["size_bytes"]
 
     cached = _run_json("asset", "rendition", asset["hash"], "--profile", "preview")
     assert cached["cached"] is True

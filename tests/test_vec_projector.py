@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import sqlite3
+
 import pytest
 from conftest import HashEmbedder
 
@@ -122,6 +124,27 @@ def test_long_content_produces_overlapping_chunks(fresh_db, fake_embedder):
     assert len(chunks[node.id]) == 3
     assert [seq for seq, _, _ in chunks[node.id]] == [0, 1, 2]
     assert len(vectors) == 3
+
+
+def test_vectors_of_the_wrong_width_are_what_the_dimension_guard_prevents(fresh_db):
+    """`node_vec` is fixed at 384, so a wider model cannot be stored at all.
+
+    `set_provider` is the configuration seam and skips the check that
+    `embeddings._resolve_default` applies to a `NODUM_EMBED_MODEL` override —
+    which makes this the failure that guard exists to keep out of a run.
+    """
+
+    class WideEmbedder:
+        model_id = "test-768-dim"
+        dimensions = 768
+
+        def embed(self, texts):
+            return [[0.1] * 768 for _ in texts]
+
+    embeddings.set_provider(WideEmbedder())
+    service.create_node(type="note", title="T", content="body")
+    with pytest.raises(sqlite3.OperationalError, match="Expected 384 dimensions"):
+        projectors.run_projectors(names=["vec"])
 
 
 def test_unavailable_provider_is_a_noop_not_a_crash(fresh_db):

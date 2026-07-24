@@ -128,6 +128,94 @@ def test_applied_update_is_undoable(fresh_db):
     assert service.get_node(note.id).content == "See [[Graph Theory]]."
 
 
+# ── Accepting applies only what the agent proposed ───────────────────────────
+
+
+def test_accept_does_not_revert_edits_made_after_the_proposal(fresh_db):
+    """The contract is "only the given fields change" — at accept time too.
+
+    An agent proposes a content-only change; a human fixes the title while the
+    proposal waits. Accepting must not replay the title the node had when the
+    proposal was staged.
+    """
+    _, note = _graph()
+    version = service.update_node(note.id, content="Bot rewrite.", actor=AGENT)
+    service.update_node(note.id, title="Human-corrected title")
+
+    service.transition(str(version.id), "accept")
+
+    node = service.get_node(note.id)
+    assert node.title == "Human-corrected title"
+    assert node.content == "Bot rewrite."
+
+
+def test_two_queued_proposals_do_not_clobber_each_other(fresh_db):
+    _, note = _graph()
+    content_proposal = service.update_node(note.id, content="New body.", actor=AGENT)
+    title_proposal = service.update_node(note.id, title="New title", actor="agent:other")
+
+    service.transition(str(content_proposal.id), "accept")
+    service.transition(str(title_proposal.id), "accept")
+
+    node = service.get_node(note.id)
+    assert (node.title, node.content) == ("New title", "New body.")
+
+
+def test_props_proposal_leaves_title_and_content_alone(fresh_db):
+    _, note = _graph()
+    version = service.update_node(note.id, props={"reviewed": True}, actor=AGENT)
+    service.update_node(note.id, content="Human body.")
+
+    service.transition(str(version.id), "accept")
+
+    node = service.get_node(note.id)
+    assert node.props == {"reviewed": True}
+    assert node.content == "Human body."
+
+
+def test_proposal_records_the_fields_it_names(fresh_db):
+    _, note = _graph()
+    version = service.update_node(note.id, content="v2", actor=AGENT)
+    assert version.proposed_fields == ["content"]
+    # The unnamed fields are still snapshotted as reviewer context.
+    assert version.title == "My note"
+
+    event = service.list_events(limit=1)[0]
+    assert event.payload["fields"] == ["content"]
+
+    (proposal,) = service.list_proposals(kind="update")
+    assert proposal.version.proposed_fields == ["content"]
+    # Applied snapshots are not proposals and name no fields.
+    assert service.history(note.id)[0].proposed_fields is None
+
+
+def test_accept_event_records_the_fields_it_applied(fresh_db):
+    _, note = _graph()
+    version = service.update_node(note.id, title="T2", props={"k": 1}, actor=AGENT)
+    service.transition(str(version.id), "accept")
+    event = service.list_events(limit=1)[0]
+    assert event.op == "node.update"
+    assert event.payload["applied_fields"] == ["title", "props"]
+
+
+def test_a_proposal_predating_the_column_still_applies_whole(fresh_db):
+    """`proposed_fields` NULL means "staged before migration 0008" — apply all."""
+    _, note = _graph()
+    version = service.update_node(
+        note.id, title="Legacy title", content="Legacy body.", actor=AGENT
+    )
+    conn = db.connect()
+    try:
+        conn.execute("UPDATE versions SET proposed_fields = NULL WHERE id = ?", (version.id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+    service.transition(str(version.id), "accept")
+    node = service.get_node(note.id)
+    assert (node.title, node.content) == ("Legacy title", "Legacy body.")
+
+
 # ── Reject ────────────────────────────────────────────────────────────────────
 
 

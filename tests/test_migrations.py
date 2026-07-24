@@ -1,8 +1,12 @@
-"""Migrations from scratch: schema shape, seed catalog, idempotency."""
+"""Migrations from scratch: schema shape, seed catalog, atomicity, idempotency."""
 
 from __future__ import annotations
 
-from nodum import db, service
+import sqlite3
+
+import pytest
+
+from nodum import assets, db, service
 from nodum.migrations import MIGRATIONS, SEED_EDGE_TYPES, SEED_NODE_TYPES
 
 CORE_TABLES = {
@@ -65,5 +69,111 @@ def test_wal_mode_enabled(fresh_db):
     try:
         mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
         assert mode == "wal"
+    finally:
+        conn.close()
+
+
+# ── Asset storage is introduced once, already in the database ────────────────
+
+
+def _prefix_through(name):
+    """The migration list truncated after ``name`` (an interrupted upgrade)."""
+    names = [entry[0] for entry in MIGRATIONS]
+    return MIGRATIONS[: names.index(name) + 1]
+
+
+def test_assets_are_storable_the_moment_the_asset_tables_exist(monkeypatch, tmp_path):
+    """No migration may leave assets registerable but their bytes homeless.
+
+    A schema where `assets` exists without in-database byte storage is what
+    stranded 0007-era assets: bytes written elsewhere, then a later migration
+    that never carried them over. Registering at that exact point must work.
+    """
+    monkeypatch.setenv("NODUM_DB", str(tmp_path / "partial.db"))
+    monkeypatch.setattr(db, "MIGRATIONS", _prefix_through("0007_assets_and_renditions"))
+    service.init()
+
+    source = tmp_path / "payload.bin"
+    source.write_bytes(b"asset bytes")
+    asset = assets.register_asset(source)
+
+    conn = db.connect()
+    try:
+        stored = conn.execute(
+            "SELECT data FROM asset_blobs WHERE hash = ?", (asset.hash,)
+        ).fetchone()["data"]
+    finally:
+        conn.close()
+    assert stored == b"asset bytes"
+
+
+def test_no_migration_moves_stored_bytes_between_tables(fresh_db):
+    """Asset bytes have exactly one home, so nothing has to be copied later."""
+    scripts = "\n".join(sql for _, sql in MIGRATIONS).upper()
+    assert "DROP TABLE" not in scripts
+
+    conn = db.connect()
+    try:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(renditions)")}
+        assert "data" in columns
+        # A filesystem path column is what made a row and its bytes able to
+        # disagree; renditions and originals are both bytes-in-the-row now.
+        assert "path" not in columns
+        assert "path" not in {row["name"] for row in conn.execute("PRAGMA table_info(assets)")}
+    finally:
+        conn.close()
+
+
+# ── Atomicity: a migration and its schema_migrations row commit together ─────
+
+
+HALF_APPLIED = (
+    "0099_half_applied",
+    """
+    CREATE TABLE first_half (id TEXT PRIMARY KEY);
+    CREATE TABLE first_half (id TEXT PRIMARY KEY);
+    """,
+)
+
+
+def test_a_migration_that_fails_midway_leaves_no_trace(fresh_db, monkeypatch):
+    """An interrupted migration rolls back whole — otherwise it can never retry.
+
+    Applying the script outside a transaction is what made an interruption
+    fatal: the statements that already ran stayed, the `schema_migrations`
+    row did not, and every later run re-ran the script and died on "table …
+    already exists".
+    """
+    monkeypatch.setattr(db, "MIGRATIONS", [*MIGRATIONS, HALF_APPLIED])
+    with pytest.raises(sqlite3.OperationalError):
+        service.init()
+
+    conn = db.connect()
+    try:
+        tables = {row["name"] for row in conn.execute("SELECT name FROM sqlite_master")}
+        assert "first_half" not in tables
+        assert HALF_APPLIED[0] not in db.applied_migrations(conn)
+    finally:
+        conn.close()
+
+
+def test_a_failed_migration_can_be_retried_after_a_fix(fresh_db, monkeypatch):
+    monkeypatch.setattr(db, "MIGRATIONS", [*MIGRATIONS, HALF_APPLIED])
+    with pytest.raises(sqlite3.OperationalError):
+        service.init()
+
+    fixed = (HALF_APPLIED[0], "CREATE TABLE first_half (id TEXT PRIMARY KEY);")
+    monkeypatch.setattr(db, "MIGRATIONS", [*MIGRATIONS, fixed])
+    assert service.init().applied == [fixed[0]]
+    # And the graph is usable again, not wedged on a half-applied schema.
+    assert service.create_node(type="note", title="after the fix").state == "active"
+
+
+def test_migration_names_are_checked_before_being_inlined(fresh_db):
+    conn = db.connect()
+    try:
+        with pytest.raises(ValueError, match="invalid migration name"):
+            db.apply_migration(conn, "0099'); DROP TABLE nodes; --", "SELECT 1;")
+        assert conn.execute("SELECT count(*) AS n FROM nodes").fetchone()["n"] == 0
     finally:
         conn.close()

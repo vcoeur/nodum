@@ -56,10 +56,40 @@ TRANSITIONS = {
     "archive": ("active", "archived"),
 }
 
+#: The transitions that *review* a proposal. They are the human's tier: they
+#: turn proposed structure into live structure (and archive what it replaces),
+#: so no ``agent:*`` actor may perform them (design §8.1/§8.2).
+REVIEW_ACTIONS = ("accept", "reject")
+
+#: Operations reserved to the ``human`` actor, each mapped to why it is not
+#: delegable. They all write or remove **live** state, which is precisely what
+#: an agent may never do directly (design §8.1/§8.2) — a rule that would mean
+#: nothing if the same agent could reach the same state through the back door
+#: of an archive or an undo.
+HUMAN_ONLY_ACTIONS = {
+    "accept": "review is the human tier and is never delegated to an agent",
+    "reject": "review is the human tier and is never delegated to an agent",
+    "archive": "archiving retires live structure, which is the human's call",
+    "undo": (
+        "undo writes an event's prior payload back verbatim — including "
+        "state 'active' — so delegating it would hand an agent the live state "
+        "it may not write directly"
+    ),
+}
+
+#: The node fields a version snapshots, and the only fields a proposed update
+#: may name.
+VERSION_FIELDS = ("title", "content", "props")
+
 #: Policy rule actions (design §8.3). Only ``auto_accept`` is evaluated on the
 #: direct write path today; ``auto_apply``/``always_propose`` govern internal
 #: agent jobs and are stored for the Phase-5 runtime.
 POLICY_ACTIONS = ("auto_accept", "auto_apply", "always_propose")
+
+#: Policy rule key opting a ``min_confidence`` gate in to grading the *agent's
+#: own* self-reported confidence. Absent (the default), a gated rule never
+#: auto-accepts on the direct write path — see :func:`_auto_accept_rule`.
+TRUST_SELF_CONFIDENCE = "trust_self_reported_confidence"
 
 #: Sentinel distinguishing "argument not given" from an explicit ``None``.
 _UNSET: Any = object()
@@ -68,11 +98,21 @@ _UNSET: Any = object()
 WIKILINK_RE = re.compile(r"\[\[([^\[\]\n]+)\]\]")
 
 
-class NodeNotFound(LookupError):
+class RecordNotFound(LookupError):
+    """Raised when a graph record id does not resolve to any kind of row.
+
+    The base of :class:`NodeNotFound`, :class:`EdgeNotFound`, and
+    :class:`VersionNotFound`, so a caller can catch the specific kind it asked
+    for *and* the id-shaped operations (``transition``) that accept all three
+    and therefore cannot say which kind was meant.
+    """
+
+
+class NodeNotFound(RecordNotFound):
     """Raised when a node id does not resolve."""
 
 
-class EdgeNotFound(LookupError):
+class EdgeNotFound(RecordNotFound):
     """Raised when an edge id does not resolve."""
 
 
@@ -88,12 +128,24 @@ class PolicyNotFound(LookupError):
     """Raised when no policy is stored for an agent."""
 
 
-class VersionNotFound(LookupError):
+class VersionNotFound(RecordNotFound):
     """Raised when a version id does not resolve."""
 
 
 class InvalidTransition(ValueError):
     """Raised when a state transition is not allowed from the current state."""
+
+
+class ReviewNotPermitted(PermissionError):
+    """Raised when a non-human actor tries to review, archive, or undo.
+
+    The human tier is :data:`HUMAN_ONLY_ACTIONS`: accepting or rejecting a
+    proposal, archiving live state, and undoing an event.
+    """
+
+
+class UndoNotPossible(ValueError):
+    """Raised when an event cannot be reversed against the current graph."""
 
 
 # ── Connection and row helpers ────────────────────────────────────────────────
@@ -176,6 +228,7 @@ def _get_version_row(conn: sqlite3.Connection, version_id: int) -> sqlite3.Row:
 def _version_out(row: sqlite3.Row | dict[str, Any]) -> VersionOut:
     """Build the public version model from a versions row (props decoded)."""
     data = dict(row)
+    raw_fields = data.get("proposed_fields")
     return VersionOut(
         id=data["id"],
         node_id=data["node_id"],
@@ -185,8 +238,25 @@ def _version_out(row: sqlite3.Row | dict[str, Any]) -> VersionOut:
         actor=data["actor"],
         event_seq=data["event_seq"],
         state=data["state"],
+        proposed_fields=None if raw_fields is None else json.loads(raw_fields),
         created_at=data["created_at"],
     )
+
+
+def _proposed_fields(version: dict[str, Any]) -> list[str]:
+    """Return the node fields a proposed version actually names.
+
+    A proposal stores a whole title/content/props snapshot — fields the agent
+    did not name are copied from the node at proposal time as reviewer
+    context — so this list is what an accept may write back. ``NULL`` means
+    the row predates the column (migration ``0008``); such a proposal is read
+    as naming all three fields, which is exactly what it meant when it was
+    staged.
+    """
+    raw = version.get("proposed_fields")
+    if raw is None:
+        return list(VERSION_FIELDS)
+    return [name for name in json.loads(raw) if name in VERSION_FIELDS]
 
 
 def _resolve_node_type(conn: sqlite3.Connection, type_ref: str) -> str:
@@ -217,6 +287,33 @@ def _default_state(actor: str) -> str:
 def _create_op(state: str) -> str:
     """Name a create-op after the state it lands in (``create`` vs ``propose``)."""
     return "create" if state == "active" else "propose"
+
+
+def _require_human_reviewer(actor: str, action: str) -> None:
+    """Refuse a :data:`HUMAN_ONLY_ACTIONS` operation by anything but the human.
+
+    Every gated action reaches live state (design §8.1/§8.2). Accepting turns
+    proposed structure into live structure — and archives whatever that
+    structure replaces — whether the proposal is the actor's own or another
+    agent's; archiving retires live structure; undo writes an event's prior
+    payload back verbatim, which is how an agent could otherwise restore
+    ``state = 'active'`` it was never allowed to write. Enforcing all of them
+    here, at the choke point each one passes through, keeps the guarantee
+    structural rather than adapter-deep.
+
+    Args:
+        actor: Who is performing the operation.
+        action: The operation name (only :data:`HUMAN_ONLY_ACTIONS` are gated).
+
+    Raises:
+        ReviewNotPermitted: If ``action`` is gated and ``actor`` is not
+            :data:`ACTOR_HUMAN`.
+    """
+    reason = HUMAN_ONLY_ACTIONS.get(action)
+    if reason is not None and actor != ACTOR_HUMAN:
+        raise ReviewNotPermitted(
+            f"only the {ACTOR_HUMAN!r} actor may {action}; got {actor!r} — {reason}"
+        )
 
 
 # ── Event log and versions ────────────────────────────────────────────────────
@@ -292,12 +389,22 @@ def _materialize_mentions(
     actor: str,
     cycle_id: str | None = None,
 ) -> None:
-    """Sync a node's ``[[wikilinks]]`` with its active ``mentions`` edges.
+    """Sync a node's ``[[wikilinks]]`` with its pending/active ``mentions`` edges.
 
-    Creates a ``mentions`` edge (active, ``created_by`` = writer) for every
-    newly linked target, archives edges whose target text disappeared, and
-    silently skips unresolvable targets (no dangling edges). Self-links are
-    ignored. Idempotent: re-running on unchanged content changes nothing.
+    Creates a ``mentions`` edge (``created_by`` = writer) for every newly
+    linked target, archives edges whose target text disappeared, and silently
+    skips unresolvable targets (no dangling edges). Self-links are ignored.
+
+    A materialised edge lands in the state its **actor** is allowed to write —
+    ``active`` for the human, ``proposed`` for an agent (:func:`_default_state`).
+    A wikilink is structure like any other: an agent writing ``[[Target]]``
+    must not thereby attach live structure to someone else's active node; the
+    pending edge goes live when a human accepts the proposing node
+    (:func:`_activate_pending_mentions`) or the edge itself.
+
+    Idempotent: re-running on unchanged content changes nothing, whichever
+    state the existing edges are in — pending edges count as already
+    materialised, so a later human write never duplicates them.
     """
     node = dict(node_row)
     targets = set(WIKILINK_RE.findall(node["content"] or ""))
@@ -307,10 +414,15 @@ def _materialize_mentions(
         if (dst := _resolve_wikilink(conn, target)) is not None and dst != node["id"]
     }
     current = conn.execute(
-        "SELECT * FROM edges WHERE src_id = ? AND type_id = 'mentions' AND state = 'active'",
+        """
+        SELECT * FROM edges
+        WHERE src_id = ? AND type_id = 'mentions' AND state IN ('active', 'proposed')
+        ORDER BY created_at, rowid
+        """,
         (node["id"],),
     ).fetchall()
     current_by_dst = {edge["dst_id"]: edge for edge in current}
+    state = _default_state(actor)
 
     for dst_id in sorted(resolved - set(current_by_dst)):
         _insert_edge(
@@ -321,12 +433,37 @@ def _materialize_mentions(
             props={},
             confidence=None,
             actor=actor,
-            state="active",
+            state=state,
             cycle_id=cycle_id,
         )
     for dst_id, edge in current_by_dst.items():
         if dst_id not in resolved:
-            _set_edge_state(conn, dict(edge), "archived", "archive", actor, cycle_id=cycle_id)
+            # A pending edge leaves `proposed`, so its op is `reject`, not
+            # `archive` — the state machine allows only one of the two.
+            action = "archive" if edge["state"] == "active" else "reject"
+            _set_edge_state(conn, dict(edge), "archived", action, actor, cycle_id=cycle_id)
+
+
+def _activate_pending_mentions(conn: sqlite3.Connection, node: dict[str, Any], actor: str) -> None:
+    """Bring an accepted node's own pending ``mentions`` edges to ``active``.
+
+    An agent's ``[[wikilinks]]`` materialise as ``proposed`` edges, so
+    accepting the node is what actually attaches it to the graph. Only the
+    edges the node's own author materialised are swept (``created_by`` match);
+    an unrelated agent's proposed ``mentions`` edge out of the same node stays
+    in the queue on its own merits. Each transition is its own event,
+    attributed to the accepting reviewer.
+    """
+    rows = conn.execute(
+        """
+        SELECT * FROM edges
+        WHERE src_id = ? AND type_id = 'mentions' AND state = 'proposed' AND created_by = ?
+        ORDER BY created_at, rowid
+        """,
+        (node["id"], node["created_by"]),
+    ).fetchall()
+    for row in rows:
+        _set_edge_state(conn, _row_dict(row), "active", "accept", actor)
 
 
 # ── Internal edge writers (shared by public ops and wikilink materialisation) ─
@@ -410,9 +547,10 @@ def _validate_rules(conn: sqlite3.Connection, rules: list[dict[str, Any]]) -> li
     """Validate a policy ruleset and return it with edge types resolved to ids.
 
     A rule must name at least one key (``job`` or ``edge_type``), carry a known
-    ``action``, and — when present — a ``min_confidence`` in ``[0, 1]``. An
-    ``edge_type`` must resolve against the catalog (it is stored as its id).
-    Unknown extra keys pass through untouched.
+    ``action``, and — when present — a ``min_confidence`` in ``[0, 1]`` and a
+    boolean :data:`TRUST_SELF_CONFIDENCE`. An ``edge_type`` must resolve
+    against the catalog (it is stored as its id). Unknown extra keys pass
+    through untouched.
 
     Raises:
         ValueError: If a rule is malformed.
@@ -433,6 +571,12 @@ def _validate_rules(conn: sqlite3.Connection, rules: list[dict[str, Any]]) -> li
         if min_confidence is not None and not 0 <= min_confidence <= 1:
             raise ValueError(
                 f"policy rule {index}: min_confidence must be between 0 and 1, got {min_confidence}"
+            )
+        trusted = rule.get(TRUST_SELF_CONFIDENCE)
+        if trusted is not None and not isinstance(trusted, bool):
+            raise ValueError(
+                f"policy rule {index}: {TRUST_SELF_CONFIDENCE} must be true or false, "
+                f"got {trusted!r}"
             )
         normalized = dict(rule)
         if "edge_type" in rule:
@@ -461,9 +605,19 @@ def _auto_accept_rule(
 
     Only the actor's own policy (exact actor-string match) applies, and only
     its ``edge_type`` rules with action ``auto_accept`` — ``job`` rules govern
-    the internal runtime, not direct writes. A rule matches when it names the
-    edge's type and its confidence gate passes: no ``min_confidence`` means no
-    gate; a gate requires the edge to carry a confidence at least as high.
+    the internal runtime, not direct writes. A rule with no ``min_confidence``
+    is an unconditional grant and matches on edge type alone.
+
+    **A ``min_confidence`` gate grades untrusted input.** The only confidence
+    available on the direct write path is the one the writing agent reports
+    about its own write, so an agent that wants a write to land ``active`` can
+    simply claim ``1.0`` — the gate is self-graded and, on its own, worth
+    nothing. A gated rule therefore fires only when the policy explicitly opts
+    in with ``"trust_self_reported_confidence": true``
+    (:data:`TRUST_SELF_CONFIDENCE`); without that flag the gate can never be
+    satisfied here and the edge stays ``proposed`` for human review. When a
+    later phase supplies an independently measured confidence, it grades
+    against the same gate without the opt-in.
     """
     row = conn.execute("SELECT rules FROM policies WHERE agent = ?", (actor,)).fetchone()
     if row is None:
@@ -472,7 +626,11 @@ def _auto_accept_rule(
         if rule.get("action") != "auto_accept" or rule.get("edge_type") != edge_type_id:
             continue
         gate = rule.get("min_confidence")
-        if gate is None or (confidence is not None and confidence >= gate):
+        if gate is None:
+            return rule
+        if rule.get(TRUST_SELF_CONFIDENCE) is not True:
+            continue
+        if confidence is not None and confidence >= gate:
             return rule
     return None
 
@@ -609,13 +767,17 @@ def update_node(
 ) -> NodeOut | VersionOut:
     """Update a node's title/content/props — or propose the update.
 
-    For the ``human`` actor the update applies in place: emit ``node.update``,
-    snapshot an ``applied`` version, and re-run wikilink materialisation when
-    the content changed. For any other actor (design §8.1) the edit is staged
-    as a ``proposed`` version — the node itself is untouched — and waits in
-    the review queue; accepting it applies the staged fields (emitting
-    ``node.update`` then), rejecting it archives the version. Only the given
-    fields change.
+    **Only the given fields change**, on both paths. For the ``human`` actor
+    the update applies in place: emit ``node.update``, snapshot an ``applied``
+    version, and re-run wikilink materialisation when the content changed. For
+    any other actor (design §8.1) the edit is staged as a ``proposed``
+    version — the node itself is untouched — and waits in the review queue;
+    accepting applies exactly the fields this call named (emitting
+    ``node.update`` then), rejecting archives the version. The version row
+    still carries a full snapshot, but the fields the agent did not name are
+    reviewer context only: they are recorded in ``proposed_fields`` as *not*
+    proposed, so an accept can never replay them over edits made in the
+    meantime.
 
     Returns:
         The updated node (human path) or the proposed version (agent path).
@@ -632,6 +794,8 @@ def update_node(
         if actor != ACTOR_HUMAN:
             # Agent path: stage the edit as a proposed version (design §8.1).
             # The event precedes the insert so the version can point at it.
+            given = dict(zip(VERSION_FIELDS, (title, content, props), strict=True))
+            fields = [name for name, value in given.items() if value is not _UNSET]
             seq = _emit(
                 conn,
                 actor,
@@ -639,6 +803,7 @@ def update_node(
                 {
                     "node_id": node_id,
                     "before": before,
+                    "fields": fields,
                     "proposed": {
                         "title": new_title,
                         "content": new_content,
@@ -648,10 +813,19 @@ def update_node(
             )
             cur = conn.execute(
                 """
-                INSERT INTO versions (node_id, title, content, props, actor, event_seq, state)
-                VALUES (?, ?, ?, ?, ?, ?, 'proposed')
+                INSERT INTO versions (node_id, title, content, props, actor, event_seq,
+                                      state, proposed_fields)
+                VALUES (?, ?, ?, ?, ?, ?, 'proposed', ?)
                 """,
-                (node_id, new_title, new_content, new_props, actor, seq),
+                (
+                    node_id,
+                    new_title,
+                    new_content,
+                    new_props,
+                    actor,
+                    seq,
+                    json.dumps(fields),
+                ),
             )
             version = _row_dict(_get_version_row(conn, int(cur.lastrowid)))
             conn.commit()
@@ -896,22 +1070,25 @@ def _transition_version(
 ) -> dict[str, Any]:
     """Accept or reject a proposed version inside an open connection.
 
-    Accepting *applies* the staged title/content/props to the node (emitting
-    ``node.update`` — undoable, and picked up by the FTS projector — with the
-    applied version id in the payload), flips the version to ``applied``, and
-    re-runs wikilink materialisation with the version's original actor.
+    Accepting *applies* the fields the proposal named — and only those
+    (:func:`_proposed_fields`) — to the node's **current** row, so an edit
+    landed between proposal and review survives instead of being reverted by a
+    stale snapshot. It emits ``node.update`` (undoable, and picked up by the
+    FTS projector) with the applied version id in the payload, flips the
+    version to ``applied``, and re-runs wikilink materialisation **as the
+    accepting actor** when the content was among the applied fields: the
+    reviewer owns every state change the accept causes (new ``mentions`` edges
+    go live, dropped ones are archived), not the agent that proposed the text.
     Rejecting flips it to ``archived`` and emits ``version.reject``.
     """
     version_id = before["id"]
     if action == "accept":
         node_before = _row_dict(_get_node_row(conn, before["node_id"]))
+        fields = _proposed_fields(before)
+        assignments = [f"{name} = ?" for name in fields] + ["updated_at = datetime('now')"]
         conn.execute(
-            """
-            UPDATE nodes
-            SET title = ?, content = ?, props = ?, updated_at = datetime('now')
-            WHERE id = ?
-            """,
-            (before["title"], before["content"], before["props"], before["node_id"]),
+            f"UPDATE nodes SET {', '.join(assignments)} WHERE id = ?",
+            (*[before[name] for name in fields], before["node_id"]),
         )
         node_after = _row_dict(_get_node_row(conn, before["node_id"]))
         conn.execute("UPDATE versions SET state = 'applied' WHERE id = ?", (version_id,))
@@ -923,10 +1100,12 @@ def _transition_version(
                 "before": node_before,
                 "after": node_after,
                 "applied_version_id": version_id,
+                "applied_fields": fields,
                 "proposed_event_seq": before["event_seq"],
             },
         )
-        _materialize_mentions(conn, node_after, before["actor"])
+        if "content" in fields:
+            _materialize_mentions(conn, node_after, actor)
     else:  # reject
         conn.execute("UPDATE versions SET state = 'archived' WHERE id = ?", (version_id,))
         archived = _row_dict(_get_version_row(conn, version_id))
@@ -951,11 +1130,14 @@ def _transition_row(
         ``"version"``.
 
     Raises:
-        NodeNotFound: If the id resolves to neither a node, an edge, nor a
-            version.
+        ReviewNotPermitted: If a non-human actor tries to transition anything.
+        RecordNotFound: If the id resolves to neither a node, an edge, nor a
+            version — the id alone does not say which kind was meant, so the
+            base class is what is raised.
         InvalidTransition: If the transition is not allowed from the current
             state.
     """
+    _require_human_reviewer(actor, action)
     from_state, to_state = TRANSITIONS[action]
     row = conn.execute("SELECT * FROM nodes WHERE id = ?", (record_id,)).fetchone()
     kind = "node"
@@ -966,7 +1148,7 @@ def _transition_row(
         row = conn.execute("SELECT * FROM versions WHERE id = ?", (int(record_id),)).fetchone()
         kind = "version"
     if row is None:
-        raise NodeNotFound(f"no node, edge, or version with id: {record_id}")
+        raise RecordNotFound(f"no node, edge, or version with id: {record_id}")
     before = _row_dict(row)
     if before["state"] != from_state:
         raise InvalidTransition(
@@ -986,12 +1168,19 @@ def _transition_row(
             payload["reason"] = reason
         seq = _emit(conn, actor, f"node.{action}", payload)
         _write_version(conn, after, actor, seq)
+        if action == "accept":
+            _activate_pending_mentions(conn, after, actor)
         return kind, after
     return kind, _set_edge_state(conn, before, to_state, action, actor, reason=reason)
 
 
 def transition(
-    record_id: str, action: str, *, actor: str = ACTOR_HUMAN, path: str | Path | None = None
+    record_id: str,
+    action: str,
+    *,
+    reason: str | None = None,
+    actor: str = ACTOR_HUMAN,
+    path: str | Path | None = None,
 ) -> NodeOut | EdgeOut | VersionOut:
     """Apply a state-machine transition to a node, edge, or proposed version.
 
@@ -1001,14 +1190,19 @@ def transition(
         action: One of ``accept`` (proposed→active, or applies a proposed
             update), ``reject`` (proposed→archived), ``archive``
             (active→archived; nodes/edges only).
-        actor: Who performs the transition.
+        reason: Recorded in the event payload — the same audit trail a batch
+            :func:`reject_proposals` writes, so reviewing one item and
+            reviewing a hundred leave the same record.
+        actor: Who performs the transition. Every transition is the human
+            tier (:data:`HUMAN_ONLY_ACTIONS`) and refuses any other actor.
         path: Explicit database path.
 
     Returns:
         The updated node, edge, or version.
 
     Raises:
-        NodeNotFound: If the id resolves to no node, edge, or version.
+        ReviewNotPermitted: If ``actor`` is not ``human``.
+        RecordNotFound: If the id resolves to no node, edge, or version.
         InvalidTransition: If the transition is not allowed from the current
             state.
     """
@@ -1016,7 +1210,7 @@ def transition(
         raise ValueError(f"unknown transition {action!r}; expected one of {sorted(TRANSITIONS)}")
     conn = _connect(path)
     try:
-        kind, after = _transition_row(conn, record_id, action, actor)
+        kind, after = _transition_row(conn, record_id, action, actor, reason=reason)
         conn.commit()
         if kind == "node":
             return _node_out(after)
@@ -1280,7 +1474,13 @@ def _transition_many(
     reason: str | None,
     path: str | Path | None,
 ) -> BatchTransitionOut:
-    """Transition many ids in one connection; bad ids are skipped, not fatal."""
+    """Transition many ids in one connection; bad ids are skipped, not fatal.
+
+    A refused reviewer is *not* a per-id failure: the whole batch raises
+    before any id is touched, so an agent never gets a partially applied
+    review.
+    """
+    _require_human_reviewer(actor, action)
     conn = _connect(path)
     try:
         transitioned: list[str] = []
@@ -1289,7 +1489,7 @@ def _transition_many(
             try:
                 _transition_row(conn, record_id, action, actor, reason=reason)
                 transitioned.append(record_id)
-            except (NodeNotFound, InvalidTransition) as exc:
+            except (RecordNotFound, InvalidTransition) as exc:
                 failed.append(TransitionFailure(id=record_id, error=str(exc)))
         conn.commit()
         return BatchTransitionOut(
@@ -1305,8 +1505,14 @@ def accept_proposals(
     """Accept proposed nodes/edges/updates by id, one event each.
 
     Accepting an update (a proposed version id, given as a string) applies
-    its staged fields to the node. Ids that are unknown or not ``proposed``
-    are collected in ``failed``; the rest still transition.
+    its staged fields to the node. Accepting a node also brings the pending
+    ``mentions`` edges its wikilinks materialised to ``active``. Ids that are
+    unknown or not ``proposed`` are collected in ``failed``; the rest still
+    transition.
+
+    Raises:
+        ReviewNotPermitted: If ``actor`` is not ``human`` — review is the
+            human tier, whoever filed the proposal.
     """
     return _transition_many(ids, "accept", actor=actor, reason=None, path=path)
 
@@ -1322,6 +1528,10 @@ def reject_proposals(
 
     The ``reason`` is recorded in every reject event's payload (design §8.1).
     Ids that are unknown or not ``proposed`` are collected in ``failed``.
+
+    Raises:
+        ReviewNotPermitted: If ``actor`` is not ``human`` — an agent may not
+            reject another agent's proposal any more than its own.
     """
     return _transition_many(ids, "reject", actor=actor, reason=reason, path=path)
 
@@ -1345,7 +1555,11 @@ def accept_matching(
 
     The filter resolves to concrete ids first, then each id transitions with
     its own event — the batch is a convenience, never a silent bulk update.
+
+    Raises:
+        ReviewNotPermitted: If ``actor`` is not ``human``.
     """
+    _require_human_reviewer(actor, "accept")
     if kind not in (None, "node", "edge", "update"):
         raise ValueError(f"kind must be 'node', 'edge', or 'update', got {kind!r}")
     conn = _connect(path)
@@ -1378,7 +1592,11 @@ def reject_matching(
 
     The filter resolves to concrete ids first, then each id transitions with
     its own event carrying the reason.
+
+    Raises:
+        ReviewNotPermitted: If ``actor`` is not ``human``.
     """
+    _require_human_reviewer(actor, "reject")
     if kind not in (None, "node", "edge", "update"):
         raise ValueError(f"kind must be 'node', 'edge', or 'update', got {kind!r}")
     conn = _connect(path)
@@ -1412,6 +1630,14 @@ def set_policy(
     types resolved to ids. Setting an empty ruleset disables the policy. The
     event payload carries the full before/after rulesets — policy grants
     write privileges, so every edit is audited with its actor.
+
+    A rule's optional ``min_confidence`` gate grades the confidence the agent
+    reports about **its own** write — untrusted input the agent is free to
+    inflate. A gated rule is therefore inert on the direct write path unless
+    the same rule also carries ``"trust_self_reported_confidence": true``,
+    which is how a human says in writing "I accept this agent's self-grading
+    for this edge type". Set a gate without the flag and the write stays
+    ``proposed``; see :func:`_auto_accept_rule`.
 
     Args:
         agent: The actor string the policy governs (e.g. ``agent:researcher``).
@@ -1492,11 +1718,23 @@ def undo(
     ``edge.*``) are reversible — audited non-graph events (``policy.set``)
     are skipped by default and refused when named explicitly.
 
+    Undo is the **human tier**: restoring an event's payload writes arbitrary
+    prior state back, ``state = 'active'`` included, so an agent allowed to
+    undo would be an agent allowed to write live state (design §8.1/§8.2).
+
+    Reversal never cascades beyond what the event itself created: an event
+    the graph has since grown past (a created node that now has children, a
+    row a later undo already removed) is refused, not forced.
+
     Raises:
+        ReviewNotPermitted: If ``actor`` is not ``human``.
         EventNotFound: If no event matches ``seq`` (or none exist to undo).
+        UndoNotPossible: If the target row is gone or the reversal would have
+            to delete rows the event never created.
         ValueError: If the target event is an ``undo`` event or a non-graph
             event.
     """
+    _require_human_reviewer(actor, "undo")
     conn = _connect(path)
     try:
         # Events already reversed by a prior undo are not reversible again.
@@ -1538,6 +1776,18 @@ def undo(
             # Reverse a create: remove the created row and anything that would
             # block the delete (a node's versions and incident edges).
             if kind == "node":
+                # Children are separate creates this event never covered, and
+                # they hold an FK to the row being deleted. Cascading would
+                # destroy work the reversal was never asked to touch, so the
+                # undo refuses and says what is in the way.
+                children = conn.execute(
+                    "SELECT id FROM nodes WHERE parent_id = ?", (after["id"],)
+                ).fetchall()
+                if children:
+                    raise UndoNotPossible(
+                        f"cannot undo event {event['seq']} ({event['op']}): node {after['id']} "
+                        f"still has {len(children)} child node(s) — undo or reparent them first"
+                    )
                 for edge in conn.execute(
                     "SELECT * FROM edges WHERE src_id = ? OR dst_id = ?",
                     (after["id"], after["id"]),
@@ -1555,10 +1805,19 @@ def undo(
         else:
             columns = [key for key in before if key != "id"]
             assignments = ", ".join(f"{key} = ?" for key in columns)
-            conn.execute(
+            cursor = conn.execute(
                 f"UPDATE {table} SET {assignments} WHERE id = ?",
                 (*[before[key] for key in columns], before["id"]),
             )
+            # An UPDATE that matched nothing restores nothing: the row was
+            # deleted after this event (typically by undoing its create), so
+            # reporting `restored` would be a lie and marking the event
+            # reversed would bury it.
+            if cursor.rowcount == 0:
+                raise UndoNotPossible(
+                    f"cannot undo event {event['seq']} ({event['op']}): "
+                    f"{kind} {before['id']} no longer exists"
+                )
             restored = before
         undo_seq = _emit(
             conn,

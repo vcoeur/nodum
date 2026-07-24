@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import sqlite3
 from pathlib import Path
 
@@ -12,6 +13,10 @@ from nodum.migrations import MIGRATIONS
 
 #: Environment variable overriding the database path.
 ENV_DB_VAR = "NODUM_DB"
+
+#: Shape a migration name must have. ``executescript`` takes no parameters, so
+#: the name is inlined into the transaction script and is checked first.
+MIGRATION_NAME_RE = re.compile(r"^[0-9a-z_]+$")
 
 #: Default database location when ``NODUM_DB`` is not set.
 DEFAULT_DB_PATH = Path("~/.local/share/nodum/nodum.db").expanduser()
@@ -60,10 +65,43 @@ def applied_migrations(conn: sqlite3.Connection) -> list[str]:
     return [row["name"] for row in rows]
 
 
+def apply_migration(conn: sqlite3.Connection, name: str, sql: str) -> None:
+    """Run one migration's script and record it, as a single transaction.
+
+    The script and its ``schema_migrations`` row commit together or not at
+    all: an interruption partway through (a crash, a full disk, a statement
+    that fails) rolls the whole thing back, so the next run retries the
+    migration against a clean schema instead of hitting "table … already
+    exists" forever on a half-applied one.
+
+    Args:
+        conn: The open connection.
+        name: The migration's name, recorded in ``schema_migrations``.
+        sql: The migration script (no transaction control of its own).
+
+    Raises:
+        ValueError: If ``name`` is not a plain ``[0-9a-z_]`` identifier — it is
+            inlined into the script, which takes no parameters.
+        sqlite3.Error: Whatever the script raised, after the rollback.
+    """
+    if not MIGRATION_NAME_RE.match(name):
+        raise ValueError(f"invalid migration name {name!r}: expected {MIGRATION_NAME_RE.pattern}")
+    try:
+        conn.executescript(
+            f"BEGIN;\n{sql}\nINSERT INTO schema_migrations (name) VALUES ('{name}');\nCOMMIT;"
+        )
+    except Exception:
+        conn.rollback()
+        raise
+
+
 def init_db(conn: sqlite3.Connection) -> list[str]:
     """Apply any pending migrations; return the names applied in this call.
 
     Idempotent: a fully migrated database applies nothing and returns ``[]``.
+    Each migration is applied atomically (:func:`apply_migration`), so a
+    failure leaves the database exactly as the last successful migration left
+    it.
     """
     conn.execute(
         """
@@ -73,13 +111,12 @@ def init_db(conn: sqlite3.Connection) -> list[str]:
         )
         """
     )
+    conn.commit()
     applied: list[str] = []
     already = set(applied_migrations(conn))
     for name, sql in MIGRATIONS:
         if name in already:
             continue
-        conn.executescript(sql)
-        conn.execute("INSERT INTO schema_migrations (name) VALUES (?)", (name,))
+        apply_migration(conn, name, sql)
         applied.append(name)
-    conn.commit()
     return applied

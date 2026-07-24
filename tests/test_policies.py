@@ -26,7 +26,20 @@ def _run_fail(*args):
     return result
 
 
-MENTIONS_RULE = {"edge_type": "mentions", "min_confidence": 0.9, "action": "auto_accept"}
+#: A gated rule that opts in to grading the agent's *self-reported* confidence.
+MENTIONS_RULE = {
+    "edge_type": "mentions",
+    "min_confidence": 0.9,
+    "action": "auto_accept",
+    "trust_self_reported_confidence": True,
+}
+
+#: The same rule without the opt-in — inert on the direct write path.
+UNTRUSTED_MENTIONS_RULE = {
+    "edge_type": "mentions",
+    "min_confidence": 0.9,
+    "action": "auto_accept",
+}
 
 
 def _two_nodes():
@@ -82,6 +95,20 @@ def test_set_policy_validates_min_confidence(fresh_db):
         )
 
 
+def test_set_policy_validates_the_trust_flag(fresh_db):
+    with pytest.raises(ValueError, match="trust_self_reported_confidence"):
+        service.set_policy(
+            "agent:x",
+            [
+                {
+                    "edge_type": "mentions",
+                    "action": "auto_accept",
+                    "trust_self_reported_confidence": "yes",
+                }
+            ],
+        )
+
+
 def test_set_policy_resolves_edge_type(fresh_db):
     with pytest.raises(TypeNotFound):
         service.set_policy("agent:x", [{"edge_type": "no-such-edge", "action": "auto_accept"}])
@@ -120,6 +147,62 @@ def test_auto_accept_matching_rule_and_confidence(fresh_db):
     assert events[0].op == "edge.create"  # op records the landing state
     assert events[0].actor == "agent:researcher"
     assert events[0].payload["policy_rule"] == MENTIONS_RULE
+
+
+# ── Self-reported confidence is untrusted input ───────────────────────────────
+
+
+def test_self_reported_confidence_alone_never_auto_accepts(fresh_db):
+    """The agent picks the number it is graded on — the gate needs an opt-in."""
+    a, b = _two_nodes()
+    service.set_policy("agent:researcher", [UNTRUSTED_MENTIONS_RULE])
+    for claimed in (0.9, 0.95, 1.0):
+        edge = service.create_edge(
+            a.id, b.id, "mentions", confidence=claimed, actor="agent:researcher"
+        )
+        assert edge.state == "proposed"
+        assert "policy_rule" not in service.list_events(limit=1)[0].payload
+
+
+def test_batch_proposals_cannot_buy_auto_accept_with_confidence(fresh_db):
+    a, b = _two_nodes()
+    service.set_policy("agent:researcher", [UNTRUSTED_MENTIONS_RULE])
+    result = service.propose_edges(
+        [{"src": a.id, "dst": b.id, "edge_type": "mentions", "confidence": 1.0}],
+        actor="agent:researcher",
+    )
+    assert result.created[0].state == "proposed"
+
+
+def test_trust_flag_opts_the_gate_back_in(fresh_db):
+    a, b = _two_nodes()
+    service.set_policy("agent:researcher", [MENTIONS_RULE])
+    trusted = service.create_edge(a.id, b.id, "mentions", confidence=0.95, actor="agent:researcher")
+    assert trusted.state == "active"
+
+
+def test_trust_flag_does_not_bypass_the_gate_itself(fresh_db):
+    a, b = _two_nodes()
+    service.set_policy("agent:researcher", [MENTIONS_RULE])
+    edge = service.create_edge(a.id, b.id, "mentions", confidence=0.5, actor="agent:researcher")
+    assert edge.state == "proposed"
+
+
+def test_trust_flag_without_a_gate_is_unremarkable(fresh_db):
+    a, b = _two_nodes()
+    service.set_policy(
+        "agent:researcher",
+        [
+            {
+                "edge_type": "mentions",
+                "action": "auto_accept",
+                "trust_self_reported_confidence": False,
+            }
+        ],
+    )
+    # No gate to grade, so the rule is the human's plain unconditional grant.
+    edge = service.create_edge(a.id, b.id, "mentions", confidence=0.0, actor="agent:researcher")
+    assert edge.state == "active"
 
 
 def test_below_threshold_stays_proposed(fresh_db):

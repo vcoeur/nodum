@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -20,16 +21,16 @@ from pydantic import BaseModel
 
 from nodum import assets, projectors, service
 from nodum import search as search_module
-from nodum.assets import AssetNotFound, UnsupportedRendition
+from nodum.assets import AssetNotFound, AssetSourceChanged, AssetTooLarge, UnsupportedRendition
 from nodum.db import ENV_DB_VAR
 from nodum.service import (
-    EdgeNotFound,
     EventNotFound,
     InvalidTransition,
-    NodeNotFound,
     PolicyNotFound,
+    RecordNotFound,
+    ReviewNotPermitted,
     TypeNotFound,
-    VersionNotFound,
+    UndoNotPossible,
 )
 
 app = typer.Typer(
@@ -43,8 +44,12 @@ projector_app = typer.Typer(
     no_args_is_help=True, help="Derived-index projectors over the event log."
 )
 policy_app = typer.Typer(no_args_is_help=True, help="Per-agent policy rulesets (auto-accept).")
-review_app = typer.Typer(no_args_is_help=True, help="The review queue: pending proposals.")
-mcp_app = typer.Typer(no_args_is_help=True, help="MCP server (read + additive tiers, design §8).")
+review_app = typer.Typer(
+    no_args_is_help=True, help="The review queue: pending proposals (human actor only)."
+)
+mcp_app = typer.Typer(
+    no_args_is_help=True, help="MCP server for external agents (read + additive tiers, design §8)."
+)
 asset_app = typer.Typer(
     no_args_is_help=True, help="Content-addressed assets and derived image renditions."
 )
@@ -113,22 +118,42 @@ def _read_content(content: str | None, content_file: str | None) -> str | None:
 
 
 def _run(func, *args, **kwargs):
-    """Call a service function, mapping expected errors to stderr + exit 1."""
+    """Call a service function, mapping expected errors to stderr + exit 1.
+
+    Everything a caller can provoke — a bad id, a refused actor, a missing
+    file, a database another writer is holding — is a message on stderr and
+    exit 1, never a traceback: the CLI's contract is one JSON object on
+    success and a readable line on failure.
+    """
     try:
         return func(*args, **kwargs)
     except (
-        NodeNotFound,
-        EdgeNotFound,
+        # RecordNotFound covers node/edge/version ids and the transition
+        # entry points that accept all three.
+        RecordNotFound,
         TypeNotFound,
         EventNotFound,
         PolicyNotFound,
-        VersionNotFound,
         AssetNotFound,
+        AssetTooLarge,
+        AssetSourceChanged,
         UnsupportedRendition,
         InvalidTransition,
+        ReviewNotPermitted,
+        UndoNotPossible,
         ValueError,
     ) as exc:
         typer.echo(str(exc), err=True)
+        raise typer.Exit(1) from exc
+    except OSError as exc:
+        # A missing/unreadable file (`asset register /missing.png`) or a
+        # database path the process cannot open.
+        typer.echo(f"{exc.strerror or exc}: {exc.filename}" if exc.filename else str(exc), err=True)
+        raise typer.Exit(1) from exc
+    except sqlite3.Error as exc:
+        # Chiefly "database is locked": SQLite allows one writer, so a
+        # concurrent write that outlasts the busy timeout lands here.
+        typer.echo(f"database error: {exc}", err=True)
         raise typer.Exit(1) from exc
 
 
@@ -282,20 +307,29 @@ def edge_create_batch(
 
 @app.command()
 def accept(
-    record_id: str = typer.Argument(..., help="Node or edge id."),
+    record_id: str = typer.Argument(..., help="Node, edge, or proposed-version id."),
     actor: str = ACTOR_OPTION,
 ) -> None:
-    """Accept a proposed node or edge (proposed → active)."""
+    """Accept a proposed node, edge, or update (proposed → active) — human actor only.
+
+    A proposed-version id applies exactly the fields the proposal named to
+    the node as it stands now.
+    """
     _emit(_run(service.transition, record_id, "accept", actor=actor))
 
 
 @app.command()
 def reject(
-    record_id: str = typer.Argument(..., help="Node or edge id."),
+    record_id: str = typer.Argument(..., help="Node, edge, or proposed-version id."),
+    reason: str = typer.Option(..., "--reason", help="Recorded in the reject event."),
     actor: str = ACTOR_OPTION,
 ) -> None:
-    """Reject a proposed node or edge (proposed → archived)."""
-    _emit(_run(service.transition, record_id, "reject", actor=actor))
+    """Reject a proposed node, edge, or update (proposed → archived) — human actor only.
+
+    The reason is required and lands in the event payload, exactly as it does
+    for the batch `review reject` — one operation, one audit guarantee.
+    """
+    _emit(_run(service.transition, record_id, "reject", reason=reason, actor=actor))
 
 
 @app.command()
@@ -433,7 +467,7 @@ def projector_run(
 ) -> None:
     """Apply pending event-log entries to the derived indexes."""
     runs = _run(projectors.run_projectors, names=names)
-    _print_json({"projectors": [run.model_dump(mode="json") for run in runs]})
+    _print_json({"projectors": [run.model_dump(mode="json") for run in runs], "count": len(runs)})
 
 
 @projector_app.command("rebuild")
@@ -446,7 +480,12 @@ def projector_rebuild(name: str = typer.Argument(..., help="Projector to rebuild
 def projector_status() -> None:
     """Show every projector's checkpoint, backlog, and derived-store size."""
     statuses = _run(projectors.projector_status)
-    _print_json({"projectors": [status.model_dump(mode="json") for status in statuses]})
+    _print_json(
+        {
+            "projectors": [status.model_dump(mode="json") for status in statuses],
+            "count": len(statuses),
+        }
+    )
 
 
 # ── Assets and renditions ─────────────────────────────────────────────────────
@@ -454,7 +493,9 @@ def projector_status() -> None:
 
 @asset_app.command("register")
 def asset_register(
-    file: str = typer.Argument(..., help="Local file to register into the CAS."),
+    file: str = typer.Argument(
+        ..., help="Local file to store in the database, keyed by its sha256."
+    ),
     name: str | None = typer.Option(
         None, "--name", help="Original name to record (default: the file's name)."
     ),
@@ -513,13 +554,20 @@ def asset_purge(
 @mcp_app.command("serve")
 def mcp_serve(
     actor: str = typer.Option(
-        "agent:mcp", "--actor", help="Actor every write is attributed to (the agent identity)."
+        "agent:mcp",
+        "--actor",
+        help="External-agent identity every write is attributed to: 'agent:<name>'.",
     ),
 ) -> None:
-    """Launch the MCP server on stdio (read + additive tiers, design §8)."""
+    """Launch the MCP server on stdio (read + additive tiers, design §8).
+
+    The actor must be an ``agent:<name>`` identity — the MCP surface serves
+    external agents only, so ``--actor human`` (or a malformed name) exits 1
+    rather than silently writing straight into the live graph.
+    """
     from nodum import mcp_server
 
-    mcp_server.serve(actor=actor)
+    _run(mcp_server.serve, actor=actor)
 
 
 # ── Policies ──────────────────────────────────────────────────────────────────
@@ -609,7 +657,7 @@ def review_queue(
 
 @review_app.command("accept")
 def review_accept(
-    ids: list[str] = typer.Argument(..., help="Node/edge ids to accept."),
+    ids: list[str] = typer.Argument(..., help="Node, edge, or proposed-version ids to accept."),
     actor: str = ACTOR_OPTION,
 ) -> None:
     """Accept proposals by id (proposed → active); bad ids are reported, not fatal."""
@@ -618,7 +666,7 @@ def review_accept(
 
 @review_app.command("reject")
 def review_reject(
-    ids: list[str] = typer.Argument(..., help="Node/edge ids to reject."),
+    ids: list[str] = typer.Argument(..., help="Node, edge, or proposed-version ids to reject."),
     reason: str = typer.Option(..., "--reason", help="Recorded in every reject event."),
     actor: str = ACTOR_OPTION,
 ) -> None:

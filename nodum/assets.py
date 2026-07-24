@@ -9,7 +9,12 @@ the thinnest registration needed to make renditions real — the full ingestion
 pipeline (text extraction, chunking, source/claim proposals) is Phase 4.
 
 Originals are streamed in and out through :meth:`sqlite3.Connection.blobopen`,
-so neither registration nor rendering ever holds a whole file in memory.
+so neither registration nor rendering ever holds a whole file in memory. The
+copy is re-hashed as it streams: content addressing is only worth something if
+the stored bytes really do hash to their key, and the file is read twice.
+A single asset cannot exceed ``SQLITE_LIMIT_LENGTH`` (1 GB) — checked up
+front. Note that the streamed copy holds SQLite's single write lock for its
+whole duration, so a very large registration blocks other writers.
 
 Renditions (§5.7) are derived, regenerable WebP images keyed by
 ``sha256(asset_hash + ':' + profile)``, lazily generated on first request,
@@ -50,6 +55,19 @@ class UnsupportedRendition(ValueError):
     """Raised when a rendition cannot be produced (unknown profile or non-image asset)."""
 
 
+class AssetTooLarge(ValueError):
+    """Raised when a file exceeds SQLite's maximum blob length."""
+
+
+class AssetSourceChanged(ValueError):
+    """Raised when the source file changed between the hash pass and the copy.
+
+    Registration reads the file twice; a file still being written, rotated, or
+    truncated in between would otherwise be stored under the sha256 of bytes
+    it no longer matches.
+    """
+
+
 @dataclass(frozen=True)
 class Profile:
     """One rendition profile: geometry cap, WebP quality, optional size target.
@@ -71,8 +89,10 @@ PROFILES = {
     "preview": Profile(max_edge=1024, quality=80, target_bytes=300_000),
 }
 
-#: Quality ladder for fitting a ``target_bytes`` cap, starting from the
-#: profile's nominal quality.
+#: Fallback qualities tried *below* a profile's nominal quality when its
+#: ``target_bytes`` cap is not met. The ladder an encode actually walks always
+#: starts at the profile's own quality (see :func:`_encode_webp`), so a nominal
+#: value absent from this tuple is still the first encode attempted.
 _QUALITY_STEPS = (80, 70, 60, 50, 40, 30, 20)
 
 
@@ -126,8 +146,18 @@ def open_original(conn: sqlite3.Connection, asset_hash: str, readonly: bool = Tr
     return conn.blobopen("asset_blobs", "data", row["rowid"], readonly=readonly)
 
 
+def max_blob_bytes(conn: sqlite3.Connection) -> int:
+    """Return this connection's maximum blob length (``SQLITE_LIMIT_LENGTH``).
+
+    Typically 1 GB — the ceiling on a single registered asset, since an
+    original is one blob value.
+    """
+    return conn.getlimit(sqlite3.SQLITE_LIMIT_LENGTH)
+
+
 def register_asset(
     source: str | Path,
+    *,
     name: str | None = None,
     path: str | Path | None = None,
 ) -> AssetOut:
@@ -138,6 +168,12 @@ def register_asset(
     memory. Content addressing makes registration idempotent: re-registering
     the same bytes returns the existing row without moving data (dedup).
 
+    The copy pass re-hashes what it writes and compares it with the key the
+    first pass produced. The two passes see the same file only if nothing
+    touched it in between — a file still being written, a rotating log, a
+    partial download — and a mismatch is refused rather than stored, because
+    the alternative is a row whose bytes do not hash to their own key.
+
     Args:
         source: Path to the local file to register.
         name: Original name to record (defaults to the source file's name);
@@ -147,6 +183,11 @@ def register_asset(
 
     Returns:
         The asset's metadata row (newly created or pre-existing).
+
+    Raises:
+        FileNotFoundError: If ``source`` does not exist.
+        AssetTooLarge: If the file is larger than SQLite's blob limit.
+        AssetSourceChanged: If the file changed between the two read passes.
     """
     source_file = Path(source).expanduser()
     asset_hash, size = _hash_file(source_file)
@@ -154,6 +195,12 @@ def register_asset(
 
     conn = _connect(path)
     try:
+        limit = max_blob_bytes(conn)
+        if size > limit:
+            raise AssetTooLarge(
+                f"{source_file} is {size} bytes; a single asset cannot exceed SQLite's "
+                f"{limit}-byte blob limit — split the file or keep it outside the graph"
+            )
         existing = conn.execute("SELECT * FROM assets WHERE hash = ?", (asset_hash,)).fetchone()
         if existing is not None:
             return _asset_out(existing)
@@ -174,17 +221,45 @@ def register_asset(
             (asset_hash, size),
         )
         if size:
-            with (
-                open_original(conn, asset_hash, readonly=False) as blob,
-                source_file.open("rb") as handle,
-            ):
-                while chunk := handle.read(_CHUNK_BYTES):
-                    blob.write(chunk)
+            _stream_into_blob(conn, source_file, asset_hash, size)
         conn.commit()
         row = conn.execute("SELECT * FROM assets WHERE hash = ?", (asset_hash,)).fetchone()
         return _asset_out(row)
     finally:
         conn.close()
+
+
+def _stream_into_blob(
+    conn: sqlite3.Connection, source_file: Path, asset_hash: str, size: int
+) -> None:
+    """Copy a file into its pre-sized blob, verifying it still hashes to its key.
+
+    A source that *grew* since the hash pass fails on its own (the write runs
+    past the end of the zeroblob). A source that *shrank* would not: the blob
+    keeps its zero-filled tail and the row would commit with
+    ``sha256(stored) != assets.hash``. Hashing the copied bytes catches both,
+    and any in-place rewrite of the same length as well.
+
+    Raises:
+        AssetSourceChanged: If fewer bytes arrived than the blob expects, or
+            the copied bytes do not hash to ``asset_hash``.
+    """
+    digest = hashlib.sha256()
+    copied = 0
+    with (
+        open_original(conn, asset_hash, readonly=False) as blob,
+        source_file.open("rb") as handle,
+    ):
+        while chunk := handle.read(_CHUNK_BYTES):
+            blob.write(chunk)
+            digest.update(chunk)
+            copied += len(chunk)
+    if copied != size or digest.hexdigest() != asset_hash:
+        raise AssetSourceChanged(
+            f"{source_file} changed while it was being registered "
+            f"({size} bytes hashed as {asset_hash}, then {copied} bytes copied as "
+            f"{digest.hexdigest()}) — nothing was stored; register it again once it is stable"
+        )
 
 
 def _resolve_hash(conn: sqlite3.Connection, id_or_hash: str) -> str:
@@ -205,7 +280,7 @@ def _resolve_hash(conn: sqlite3.Connection, id_or_hash: str) -> str:
     raise AssetNotFound(f"asset not found: {id_or_hash}")
 
 
-def get_asset(id_or_hash: str, path: str | Path | None = None) -> AssetOut:
+def get_asset(id_or_hash: str, *, path: str | Path | None = None) -> AssetOut:
     """Fetch one asset's metadata by hash or by an asset-reference node's id.
 
     Raises:
@@ -221,7 +296,7 @@ def get_asset(id_or_hash: str, path: str | Path | None = None) -> AssetOut:
         conn.close()
 
 
-def list_assets(path: str | Path | None = None) -> list[AssetOut]:
+def list_assets(*, path: str | Path | None = None) -> list[AssetOut]:
     """List every registered asset in registration order."""
     conn = _connect(path)
     try:
@@ -288,8 +363,15 @@ def _prepare_image(original: sqlite3.Blob, profile: Profile) -> Image.Image:
 
 
 def _encode_webp(image: Image.Image, profile: Profile) -> bytes:
-    """Encode as WebP, stepping quality down to fit the profile's size target."""
-    qualities = [q for q in _QUALITY_STEPS if q <= profile.quality] or [profile.quality]
+    """Encode as WebP at the profile's quality, stepping down to fit its size target.
+
+    The first attempt is always the profile's nominal quality, so a profile
+    without a ``target_bytes`` cap (``thumb``) is encoded at exactly that
+    quality and nothing else runs. A profile with a cap (``preview``) walks
+    :data:`_QUALITY_STEPS` below its nominal quality until the output fits;
+    if no step fits, the smallest encode wins.
+    """
+    qualities = [profile.quality, *(q for q in _QUALITY_STEPS if q < profile.quality)]
     smallest = b""
     for quality in qualities:
         buffer = io.BytesIO()
@@ -304,6 +386,7 @@ def _encode_webp(image: Image.Image, profile: Profile) -> bytes:
 
 def get_rendition(
     id_or_hash: str,
+    *,
     profile: str = "preview",
     include_data: bool = False,
     path: str | Path | None = None,
@@ -416,7 +499,7 @@ def _rendition_bytes(conn: sqlite3.Connection, rid: str) -> bytes:
     return row["data"]
 
 
-def read_rendition_bytes(rendition: RenditionOut, path: str | Path | None = None) -> bytes:
+def read_rendition_bytes(rendition: RenditionOut, *, path: str | Path | None = None) -> bytes:
     """Return a rendition's WebP bytes, from ``data_base64`` or the database.
 
     Args:
@@ -434,6 +517,7 @@ def read_rendition_bytes(rendition: RenditionOut, path: str | Path | None = None
 
 
 def purge_renditions(
+    *,
     asset_hash: str | None = None,
     path: str | Path | None = None,
 ) -> PurgeResult:
@@ -468,7 +552,7 @@ def purge_renditions(
 
 
 def copy_rendition(
-    rendition: RenditionOut, destination: str | Path, path: str | Path | None = None
+    rendition: RenditionOut, destination: str | Path, *, path: str | Path | None = None
 ) -> Path:
     """Write a rendition's stored WebP bytes to ``destination`` (the CLI's --out)."""
     target = Path(destination).expanduser()

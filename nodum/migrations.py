@@ -4,6 +4,10 @@ Migrations are applied in list order and recorded in ``schema_migrations``;
 once a migration has shipped it is never edited — later changes are new
 entries appended to :data:`MIGRATIONS`. Derived stores (FTS, vectors, assets,
 renditions) land as their own later migrations.
+
+Each entry is applied together with its ``schema_migrations`` row in one
+transaction (:func:`nodum.db.init_db`), so a migration is either wholly
+applied and recorded or wholly rolled back and retried — never half-applied.
 """
 
 CORE_DDL = """
@@ -227,10 +231,15 @@ CREATE INDEX idx_chunks_node ON chunks(node_id);
 
 
 ASSETS_DDL = """
--- Content-addressed binary assets (design §5.2). The row is the metadata;
--- the bytes live in the CAS directory next to the database file at
--- `assets/<hash[:2]>/<hash>` (see nodum.assets). `extracted_text` stays NULL
--- until the Phase-4 ingestion pipeline fills it. Registration is idempotent
+-- Content-addressed binary assets (design §5.2/§5.5). Metadata and bytes are
+-- separate tables in the *same* database file: `assets` is the metadata row,
+-- `asset_blobs` holds the bytes under the same sha256 key. Splitting them
+-- keeps metadata queries and FTS off blob overflow pages (and leaves the door
+-- open to ATTACHing the bytes out to a second file if scale ever demanded it),
+-- while `DB = everything` still holds for backup and restore. Asset bytes have
+-- never lived on the filesystem: there is no `path` column anywhere here, so
+-- no asset can be stranded by a later move. `extracted_text` stays NULL until
+-- the Phase-4 ingestion pipeline fills it. Registration is idempotent
 -- content-addressed dedup — no event-log entry (nothing to undo: the same
 -- bytes always resolve to the same row; asset events land with ingestion in
 -- Phase 4 and must never inline blob bytes into payloads).
@@ -243,45 +252,21 @@ CREATE TABLE assets (
     created_at     TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
--- Derived image renditions (design §5.7): lazily generated from the original,
--- cached on disk at `renditions/<id[:2]>/<id>.webp`, and evictable
--- (`asset purge`) — the DB row + file are both regenerable from the original.
--- `id` is sha256(asset_hash + ':' + profile); `path` is relative to the
--- database's data directory so the file stays portable.
-CREATE TABLE renditions (
-    id          TEXT PRIMARY KEY,
-    asset_hash  TEXT NOT NULL REFERENCES assets(hash),
-    profile     TEXT NOT NULL,
-    path        TEXT NOT NULL,
-    width       INTEGER NOT NULL,
-    height      INTEGER NOT NULL,
-    size_bytes  INTEGER NOT NULL,
-    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
-);
-CREATE INDEX idx_renditions_asset ON renditions(asset_hash);
-"""
-
-
-ASSET_BLOBS_DDL = """
--- Asset bytes, moved off the filesystem into this database file (design §5.1).
--- Bytes live in their own table rather than a column on `assets` so metadata
--- queries and FTS never scan blob overflow pages — and so the table could be
--- ATTACHed out to a second file later if scale ever demanded it. Keyed by the
--- same sha256 as `assets`, so content addressing and dedup are unchanged;
--- only the byte location moved. Never inline these bytes into event payloads.
--- The table keeps its implicit rowid: `Connection.blobopen` addresses blobs by
--- rowid, and streaming reads/writes depend on it.
+-- The originals' bytes. Keyed by the same sha256 as `assets`, so content
+-- addressing and dedup are properties of the key, not of the storage. The
+-- table keeps its implicit rowid: `Connection.blobopen` addresses blobs by
+-- rowid, and the streaming reads/writes that keep a large file out of memory
+-- depend on it. Never inline these bytes into event payloads.
 CREATE TABLE asset_blobs (
     hash TEXT PRIMARY KEY REFERENCES assets(hash),
     data BLOB NOT NULL
 );
 
--- Renditions move into the file for the same reason, replacing the on-disk
--- cache path with the bytes themselves — which also removes the class of bugs
--- where the row and its file disagree. Renditions are derived and regenerable,
--- so the table is rebuilt rather than migrated: anything cached before this
--- migration simply regenerates on next request.
-DROP TABLE renditions;
+-- Derived image renditions (design §5.7): lazily generated from the original,
+-- stored as bytes right here, and evictable (`asset purge`) — every row is
+-- regenerable, which is why the table carries the image rather than pointing
+-- at a cache file that could disagree with it. `id` is
+-- sha256(asset_hash + ':' + profile).
 CREATE TABLE renditions (
     id          TEXT PRIMARY KEY,
     asset_hash  TEXT NOT NULL REFERENCES assets(hash),
@@ -296,6 +281,19 @@ CREATE INDEX idx_renditions_asset ON renditions(asset_hash);
 """
 
 
+PROPOSED_FIELDS_DDL = """
+-- Which node fields an agent's proposed update actually named (design §8.1).
+-- A proposed version stores a full title/content/props snapshot — unnamed
+-- fields are copied from the node at proposal time as reviewer context — so
+-- without this column an accept would write the whole snapshot back and
+-- silently revert every edit made between proposal and review. The column is
+-- a JSON array of field names ('title', 'content', 'props'); NULL means "not
+-- a proposal" for applied/undo snapshots, and is read as all three fields for
+-- any proposal staged before this migration.
+ALTER TABLE versions ADD COLUMN proposed_fields TEXT;
+"""
+
+
 #: Ordered (name, SQL) migrations. Append-only — never edit a shipped entry.
 MIGRATIONS: list[tuple[str, str]] = [
     ("0001_core", CORE_DDL),
@@ -305,5 +303,5 @@ MIGRATIONS: list[tuple[str, str]] = [
     ("0005_proposed_versions", PROPOSED_VERSIONS_DDL),
     ("0006_vectors", VECTORS_DDL),
     ("0007_assets_and_renditions", ASSETS_DDL),
-    ("0008_asset_blobs", ASSET_BLOBS_DDL),
+    ("0008_version_proposed_fields", PROPOSED_FIELDS_DDL),
 ]

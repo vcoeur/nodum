@@ -185,7 +185,15 @@ def test_propose_edges_batch(fresh_db):
 def test_propose_edges_respects_policy_auto_accept(fresh_db):
     a, b, c, d, *_ = _chain()
     service.set_policy(
-        AGENT, [{"edge_type": "relates_to", "min_confidence": 0.5, "action": "auto_accept"}]
+        AGENT,
+        [
+            {
+                "edge_type": "relates_to",
+                "min_confidence": 0.5,
+                "action": "auto_accept",
+                "trust_self_reported_confidence": True,
+            }
+        ],
     )
     result = service.propose_edges(
         [{"src": a.id, "dst": d.id, "edge_type": "relates_to", "confidence": 0.9}], actor=AGENT

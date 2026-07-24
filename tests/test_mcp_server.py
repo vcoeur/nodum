@@ -12,6 +12,7 @@ import base64
 import io
 import json
 
+import pytest
 from mcp.shared.memory import create_connected_server_and_client_session
 from PIL import Image
 
@@ -39,12 +40,29 @@ def _call(session, tool, arguments=None):
 # ── Tool registry: tiers and annotations ──────────────────────────────────────
 
 
-def test_registered_tools_are_exactly_the_read_additive_and_review_tiers(fresh_db):
+def test_registered_tools_are_exactly_the_read_and_additive_tiers(fresh_db):
     tools = _run(lambda session: session.list_tools()).tools
     names = {tool.name for tool in tools}
-    assert names == set(READ_TOOLS) | set(ADDITIVE_TOOLS) | set(REVIEW_TOOLS)
+    assert names == set(READ_TOOLS) | set(ADDITIVE_TOOLS)
     # §8.2 structural enforcement: curative tools can never appear over MCP.
     assert names.isdisjoint(CURATIVE_TOOLS)
+
+
+def test_review_tools_are_never_registered(fresh_db):
+    """The §8.1 human tier is unreachable: an agent cannot review at all."""
+    tools = _run(lambda session: session.list_tools()).tools
+    names = {tool.name for tool in tools}
+    assert names.isdisjoint(REVIEW_TOOLS)
+
+    async def scenario(session):
+        return [
+            await _call(session, "accept", {"ids": ["whatever"]}),
+            await _call(session, "reject", {"ids": ["whatever"], "reason": "mine now"}),
+        ]
+
+    for result in _run(scenario):
+        assert result.isError
+        assert "unknown tool" in result.content[0].text.lower()
 
 
 def test_tool_annotations(fresh_db):
@@ -53,9 +71,38 @@ def test_tool_annotations(fresh_db):
     for name in READ_TOOLS:
         assert by_name[name].annotations.readOnlyHint is True
         assert by_name[name].annotations.destructiveHint is False
-    for name in ADDITIVE_TOOLS + REVIEW_TOOLS:
+    # Everything writable on this surface is additive, so `destructiveHint`
+    # false is honest — the one destructive op (accept) is not registered.
+    for name in ADDITIVE_TOOLS:
         assert by_name[name].annotations.readOnlyHint is False
         assert by_name[name].annotations.destructiveHint is False
+
+
+# ── Actor validation: the MCP surface is the external-agent surface ───────────
+
+
+@pytest.mark.parametrize(
+    "actor",
+    [
+        "human",
+        "",
+        "   ",
+        "agent:",
+        "agent",
+        "researcher",
+        "agent:with space",
+        ":agent:x",
+        "Agent:x",
+    ],
+)
+def test_create_server_rejects_a_non_agent_actor(fresh_db, actor):
+    with pytest.raises(ValueError, match="invalid --actor"):
+        create_server(actor=actor)
+
+
+@pytest.mark.parametrize("actor", ["agent:mcp", "agent:researcher", "agent:gpt-4.1_x"])
+def test_create_server_accepts_well_formed_agent_actors(fresh_db, actor):
+    assert create_server(actor=actor) is not None
 
 
 # ── Additive tier: writes are attributed and land proposed ────────────────────
@@ -169,6 +216,31 @@ def test_search_with_filters_and_expand(fresh_db):
     assert "graph" in hits[1]["signals"]
 
 
+def test_search_date_filters_reach_the_query(fresh_db):
+    """`created_after`/`created_before` are honoured, not just accepted."""
+    _, b, _ = _seed()
+    stamp = service.get_node(b.id).created_at
+
+    def hits(filters):
+        arguments = {"query": "graph", "filters": filters}
+        result = _run(lambda session: _call(session, "search", arguments))
+        return [hit["node_id"] for hit in result.structuredContent["hits"]]
+
+    assert b.id in hits({"created_after": "2000-01-01 00:00:00"})
+    assert hits({"created_before": "2000-01-01 00:00:00"}) == []
+    assert b.id not in hits({"created_after": stamp})  # bounds are exclusive
+
+
+def test_search_rejects_an_unknown_filter_key(fresh_db):
+    """A typo'd filter is an error, never a silently unfiltered search."""
+    _seed()
+    result = _run(
+        lambda session: _call(session, "search", {"query": "graph", "filters": {"crated_by": "x"}})
+    )
+    assert result.isError
+    assert "unknown search filter" in result.content[0].text
+
+
 def test_search_includes_the_vector_signal_when_a_provider_exists(fresh_db, fake_embedder):
     _, b, _ = _seed()
     # "Beta note" matches b's title (BM25) and b's chunk vocabulary (vector).
@@ -217,37 +289,56 @@ def test_history_and_diff(fresh_db):
     assert "+v2 body" in diff.structuredContent["diff"]
 
 
-# ── Review tools over MCP: the full proposal lifecycle ────────────────────────
+# ── The proposal lifecycle: the agent proposes, the human alone reviews ───────
 
 
-def test_proposed_update_accept_reject_lifecycle_over_mcp(fresh_db):
+def test_agent_proposes_over_mcp_and_only_the_human_can_review(fresh_db):
     note = service.create_node(type="note", title="Original", content="original body")
 
     async def scenario(session):
-        proposed = (
-            await _call(session, "update_node", {"id": note.id, "content": "accepted body"})
-        ).structuredContent
-        accepted = (
-            await _call(session, "accept", {"ids": [str(proposed["id"])]})
-        ).structuredContent
-        rejected_version = (
-            await _call(session, "update_node", {"id": note.id, "content": "rejected body"})
-        ).structuredContent
-        rejected = (
-            await _call(
-                session,
-                "reject",
-                {"ids": [str(rejected_version["id"])], "reason": "not good enough"},
-            )
-        ).structuredContent
-        return accepted, rejected
+        first = await _call(session, "update_node", {"id": note.id, "content": "accepted body"})
+        second = await _call(session, "update_node", {"id": note.id, "content": "rejected body"})
+        return first.structuredContent, second.structuredContent
 
-    accepted, rejected = _run(scenario)
-    assert accepted["transitioned"] != []
-    assert rejected["transitioned"] != []
+    keep, drop = _run(scenario)
+    # Neither proposal touched the node — the agent has no way to land them.
+    assert service.get_node(note.id).content == "original body"
+
+    # The agent's own actor cannot review either proposal, even its own.
+    with pytest.raises(service.ReviewNotPermitted):
+        service.accept_proposals([str(keep["id"])], actor=AGENT)
+    with pytest.raises(service.ReviewNotPermitted):
+        service.reject_proposals([str(drop["id"])], reason="mine", actor=AGENT)
+
+    # The human works the queue out of band (CLI / review API).
+    service.accept_proposals([str(keep["id"])], actor="human")
+    service.reject_proposals([str(drop["id"])], reason="not good enough", actor="human")
     assert service.get_node(note.id).content == "accepted body"
-    states = [v.state for v in service.history(note.id)]
-    assert states == ["applied", "applied", "archived"]
+    assert [v.state for v in service.history(note.id)] == ["applied", "applied", "archived"]
+
+
+def test_agent_wikilinks_over_mcp_stay_proposed(fresh_db):
+    """A create_node over MCP must not attach a live edge to a human's node."""
+    target = service.create_node(type="concept", title="Human Concept")
+
+    async def scenario(session):
+        result = await _call(
+            session,
+            "create_node",
+            {"type": "note", "title": "Bot note", "content": "See [[Human Concept]]."},
+        )
+        return result.structuredContent
+
+    node = _run(scenario)
+    assert node["state"] == "proposed"
+    assert service.list_edges(node_id=target.id, type="mentions", state="active") == []
+    (pending,) = service.list_edges(node_id=target.id, type="mentions", state="proposed")
+    assert pending.created_by == AGENT
+
+    # The human accepting the node is what brings the edge to life.
+    service.accept_proposals([node["id"]], actor="human")
+    (live,) = service.list_edges(node_id=target.id, type="mentions", state="active")
+    assert live.id == pending.id
 
 
 # ── get_asset: the §5.7 binary policy (renditions only, never originals) ──────

@@ -4,7 +4,8 @@ Design D10: the provider sits behind a small interface — ``model_id``,
 ``dimensions``, and ``embed(texts) -> vectors`` — so an API-key provider can
 slot in later without touching the projector or search layers. The default
 is a local, in-process fastembed model (ONNX Runtime on CPU; no daemon, no
-API key), downloaded from Hugging Face on first use.
+API key), resolved from the local Hugging Face cache — see the download rule
+below.
 
 Design D6: node text is embedded in fixed-window chunks (512 tokens, ~15%
 overlap — approximated as whitespace-separated words, see :func:`chunk_text`),
