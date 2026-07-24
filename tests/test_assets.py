@@ -445,6 +445,35 @@ def test_register_refuses_a_source_that_shrank_between_passes(fresh_db, tmp_path
         conn.close()
 
 
+def test_register_refuses_a_source_that_grew_between_passes(fresh_db, tmp_path, monkeypatch):
+    """A source that GROWS between the two passes is refused like a shrink/rewrite.
+
+    The extra bytes would overrun the pre-sized blob and surface as a raw
+    `ValueError: data longer than blob length`; registration must raise the
+    tidy `AssetSourceChanged` the other cases raise, with nothing committed.
+    """
+    source = tmp_path / "growing.log"
+    source.write_bytes(b"small")
+    hash_file = assets._hash_file
+
+    def hash_then_grow(path):
+        digest_and_size = hash_file(path)
+        path.write_bytes(b"small plus a great deal of freshly appended data")  # writer keeps going
+        return digest_and_size
+
+    monkeypatch.setattr(assets, "_hash_file", hash_then_grow)
+    with pytest.raises(assets.AssetSourceChanged, match="changed while it was being registered"):
+        assets.register_asset(source)
+
+    monkeypatch.undo()
+    assert assets.list_assets() == []
+    conn = db.connect(fresh_db)
+    try:
+        assert conn.execute("SELECT count(*) AS n FROM asset_blobs").fetchone()["n"] == 0
+    finally:
+        conn.close()
+
+
 def test_stored_bytes_always_hash_to_their_key(fresh_db, tmp_path):
     asset = _register_image(fresh_db, tmp_path)
     conn = db.connect(fresh_db)

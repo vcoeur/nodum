@@ -234,15 +234,18 @@ def _stream_into_blob(
 ) -> None:
     """Copy a file into its pre-sized blob, verifying it still hashes to its key.
 
-    A source that *grew* since the hash pass fails on its own (the write runs
-    past the end of the zeroblob). A source that *shrank* would not: the blob
-    keeps its zero-filled tail and the row would commit with
-    ``sha256(stored) != assets.hash``. Hashing the copied bytes catches both,
-    and any in-place rewrite of the same length as well.
+    A source that *grew* since the hash pass is caught before its extra bytes
+    overrun the zeroblob (which would otherwise surface as a raw ``ValueError:
+    data longer than blob length``), and refused as :class:`AssetSourceChanged`
+    like the others. A source that *shrank* leaves the blob's zero-filled tail
+    in place, so the row would commit with ``sha256(stored) != assets.hash``;
+    hashing the copied bytes catches that, and any in-place rewrite of the same
+    length as well.
 
     Raises:
-        AssetSourceChanged: If fewer bytes arrived than the blob expects, or
-            the copied bytes do not hash to ``asset_hash``.
+        AssetSourceChanged: If the source grew past its hashed size, fewer
+            bytes arrived than the blob expects, or the copied bytes do not
+            hash to ``asset_hash``.
     """
     digest = hashlib.sha256()
     copied = 0
@@ -251,6 +254,12 @@ def _stream_into_blob(
         source_file.open("rb") as handle,
     ):
         while chunk := handle.read(_CHUNK_BYTES):
+            if copied + len(chunk) > size:
+                raise AssetSourceChanged(
+                    f"{source_file} changed while it was being registered "
+                    f"({size} bytes hashed as {asset_hash}, then grew past {size} bytes on the "
+                    "copy pass) — nothing was stored; register it again once it is stable"
+                )
             blob.write(chunk)
             digest.update(chunk)
             copied += len(chunk)

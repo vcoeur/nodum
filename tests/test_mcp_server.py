@@ -93,6 +93,10 @@ def test_tool_annotations(fresh_db):
         "agent:with space",
         ":agent:x",
         "Agent:x",
+        # A trailing newline/CR must not slip past the anchor (fullmatch, not
+        # `$`, which would accept a trailing '\n').
+        "agent:x\n",
+        "agent:x\r",
     ],
 )
 def test_create_server_rejects_a_non_agent_actor(fresh_db, actor):

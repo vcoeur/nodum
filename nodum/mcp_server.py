@@ -94,7 +94,7 @@ def _validate_actor(actor: str) -> str:
     Raises:
         ValueError: If ``actor`` is not of the form ``agent:<name>``.
     """
-    if not isinstance(actor, str) or not AGENT_ACTOR_RE.match(actor):
+    if not isinstance(actor, str) or not AGENT_ACTOR_RE.fullmatch(actor):
         raise ValueError(
             f"invalid --actor {actor!r}: the MCP server serves external agents only — "
             "the actor must be 'agent:<name>' (e.g. 'agent:researcher'), never "

@@ -124,6 +124,66 @@ def test_no_migration_moves_stored_bytes_between_tables(fresh_db):
         conn.close()
 
 
+#: The pre-consolidation, path-based ``0007`` schema: asset bytes lived on the
+#: filesystem (``renditions.path``, no ``asset_blobs``). A dev DB built from an
+#: intermediate branch commit carries this under the ``0007`` migration name.
+STALE_PATH_BASED_0007 = """
+CREATE TABLE assets (
+    hash           TEXT PRIMARY KEY,
+    mime           TEXT NOT NULL,
+    size_bytes     INTEGER NOT NULL,
+    original_name  TEXT,
+    extracted_text TEXT,
+    created_at     TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TABLE renditions (
+    id          TEXT PRIMARY KEY,
+    asset_hash  TEXT NOT NULL REFERENCES assets(hash),
+    profile     TEXT NOT NULL,
+    path        TEXT NOT NULL,
+    width       INTEGER NOT NULL,
+    height      INTEGER NOT NULL,
+    size_bytes  INTEGER NOT NULL,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+"""
+
+
+def test_init_refuses_a_database_carrying_the_stale_path_based_0007(tmp_path, monkeypatch):
+    """A dev DB that applied the since-consolidated 0007 must fail loudly at init.
+
+    `init_db` keys on migration NAME, so a DB carrying the old path-based
+    `0007_assets_and_renditions` (renditions.path, no asset_blobs) has the name
+    recorded, skips 0007, applies only the tail migration, and would otherwise
+    leave a schema that breaks `register_asset` at runtime with `no such table:
+    asset_blobs`. init must detect and refuse it instead of auto-migrating.
+    """
+    path = tmp_path / "stale.db"
+    monkeypatch.setenv("NODUM_DB", str(path))
+
+    # Reconstruct the stale DB: core through vectors applied normally, then the
+    # old path-based assets tables recorded by hand under the 0007 name.
+    monkeypatch.setattr(db, "MIGRATIONS", _prefix_through("0006_vectors"))
+    conn = db.connect(path)
+    try:
+        db.init_db(conn)
+        conn.executescript(STALE_PATH_BASED_0007)
+        conn.execute("INSERT INTO schema_migrations (name) VALUES ('0007_assets_and_renditions')")
+        conn.commit()
+    finally:
+        conn.close()
+
+    # Now init with the full migration list: 0007 is skipped (name recorded),
+    # only the tail applies, and the consistency check must fire loudly.
+    monkeypatch.setattr(db, "MIGRATIONS", MIGRATIONS)
+    conn = db.connect(path)
+    try:
+        with pytest.raises(db.SchemaConsistencyError, match="asset_blobs"):
+            db.init_db(conn)
+    finally:
+        conn.close()
+
+
 # ── Atomicity: a migration and its schema_migrations row commit together ─────
 
 
@@ -175,5 +235,20 @@ def test_migration_names_are_checked_before_being_inlined(fresh_db):
         with pytest.raises(ValueError, match="invalid migration name"):
             db.apply_migration(conn, "0099'); DROP TABLE nodes; --", "SELECT 1;")
         assert conn.execute("SELECT count(*) AS n FROM nodes").fetchone()["n"] == 0
+    finally:
+        conn.close()
+
+
+def test_migration_name_with_a_trailing_newline_is_refused(fresh_db):
+    """The name check is fully anchored: a trailing newline is not a valid name.
+
+    `re.match` with a `$`-anchored pattern accepts `"0007_x\\n"` (the `$` sits
+    before the newline), which would inline a name carrying a newline into the
+    migration script. `fullmatch` refuses it.
+    """
+    conn = db.connect()
+    try:
+        with pytest.raises(ValueError, match="invalid migration name"):
+            db.apply_migration(conn, "0099_trailing_newline\n", "SELECT 1;")
     finally:
         conn.close()

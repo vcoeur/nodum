@@ -177,8 +177,10 @@ Phase-1 decision log.
   A `[[wikilink]]` written by an agent materialises a `proposed` `mentions`
   edge; accepting the node brings it to `active`.
 - **Everything that writes or retires live state requires `--actor human`**
-  (the default): `accept`, `reject`, `archive`, `undo`, and every `review`
-  subcommand. An `agent:*` actor exits 1 with `only the 'human' actor may
+  (the default): `accept`, `reject`, `archive`, `undo`, every `review`
+  subcommand, and `policy set` (a policy grants auto-accept, so an agent
+  setting one would self-grant the direct live write the human tier withholds).
+  An `agent:*` actor exits 1 with `only the 'human' actor may
   <action>`. It is not delegable, whoever filed the proposal — `undo` most of
   all, since restoring an event's payload can write `state = 'active'` back.
   Both spellings of a reject — single-item `reject <id> --reason` and batch

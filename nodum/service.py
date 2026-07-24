@@ -62,10 +62,11 @@ TRANSITIONS = {
 REVIEW_ACTIONS = ("accept", "reject")
 
 #: Operations reserved to the ``human`` actor, each mapped to why it is not
-#: delegable. They all write or remove **live** state, which is precisely what
-#: an agent may never do directly (design §8.1/§8.2) — a rule that would mean
-#: nothing if the same agent could reach the same state through the back door
-#: of an archive or an undo.
+#: delegable. They either write or remove **live** state directly, or (setting
+#: a policy) grant the auto-accept privilege that does — precisely what an
+#: agent may never reach on its own (design §8.1/§8.2). A review rule would
+#: mean nothing if the same agent could reach the same live state through the
+#: back door of an archive, an undo, or a self-granted auto-accept policy.
 HUMAN_ONLY_ACTIONS = {
     "accept": "review is the human tier and is never delegated to an agent",
     "reject": "review is the human tier and is never delegated to an agent",
@@ -74,6 +75,11 @@ HUMAN_ONLY_ACTIONS = {
         "undo writes an event's prior payload back verbatim — including "
         "state 'active' — so delegating it would hand an agent the live state "
         "it may not write directly"
+    ),
+    "set a policy": (
+        "a policy grants auto-accept — the privilege to land writes live "
+        "without review — so an agent setting one would self-grant the direct "
+        "write to live state the human tier exists to withhold"
     ),
 }
 
@@ -137,10 +143,11 @@ class InvalidTransition(ValueError):
 
 
 class ReviewNotPermitted(PermissionError):
-    """Raised when a non-human actor tries to review, archive, or undo.
+    """Raised when a non-human actor tries to review, archive, undo, or set a policy.
 
     The human tier is :data:`HUMAN_ONLY_ACTIONS`: accepting or rejecting a
-    proposal, archiving live state, and undoing an event.
+    proposal, archiving live state, undoing an event, and setting an agent
+    policy (which grants auto-accept).
     """
 
 
@@ -1642,12 +1649,18 @@ def set_policy(
     Args:
         agent: The actor string the policy governs (e.g. ``agent:researcher``).
         rules: The ruleset (list of rule objects).
-        actor: Who is editing the policy.
+        actor: Who is editing the policy. Human-only: a policy grants
+            auto-accept, so an agent setting one would self-grant the live
+            write the human tier exists to withhold.
         path: Explicit database path.
 
     Returns:
         The stored policy.
+
+    Raises:
+        ReviewNotPermitted: If ``actor`` is not ``human``.
     """
+    _require_human_reviewer(actor, "set a policy")
     conn = _connect(path)
     try:
         validated = _validate_rules(conn, rules)

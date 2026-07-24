@@ -9,7 +9,7 @@ from typer.testing import CliRunner
 
 from nodum import service
 from nodum.cli import app
-from nodum.service import PolicyNotFound, TypeNotFound
+from nodum.service import PolicyNotFound, ReviewNotPermitted, TypeNotFound
 
 runner = CliRunner()
 
@@ -68,9 +68,20 @@ def test_set_get_list_policy_roundtrip(fresh_db):
 
 def test_set_policy_replaces_ruleset(fresh_db):
     service.set_policy("agent:researcher", [MENTIONS_RULE])
-    updated = service.set_policy("agent:researcher", [], actor="agent:admin")
+    updated = service.set_policy("agent:researcher", [])
     assert updated.rules == []
-    assert updated.updated_by == "agent:admin"
+    assert updated.updated_by == "human"
+
+
+def test_set_policy_refuses_an_agent_actor(fresh_db):
+    """Setting a policy is human-only (design §8.1/§8.2).
+
+    A policy grants auto-accept, so an agent allowed to set its own would
+    self-grant an unconditional auto-accept rule and reach live state without
+    review — the same escalation the human review tier exists to prevent.
+    """
+    with pytest.raises(ReviewNotPermitted, match="only the 'human' actor may set a policy"):
+        service.set_policy("agent:researcher", [MENTIONS_RULE], actor="agent:researcher")
 
 
 def test_get_missing_policy_raises(fresh_db):

@@ -22,6 +22,22 @@ MIGRATION_NAME_RE = re.compile(r"^[0-9a-z_]+$")
 DEFAULT_DB_PATH = Path("~/.local/share/nodum/nodum.db").expanduser()
 
 
+class SchemaConsistencyError(RuntimeError):
+    """Raised when the live schema contradicts the recorded migrations.
+
+    :func:`init_db` keys purely on migration *name*, so a database that applied
+    an older, since-consolidated version of a migration keeps that migration's
+    name in ``schema_migrations`` — the name matches, the schema does not, and
+    the migration is silently skipped forever. The one such case in the shipped
+    history is ``0007_assets_and_renditions``: a dev database built from an
+    intermediate branch commit stored asset bytes on the filesystem
+    (``renditions.path``, no ``asset_blobs``) before the assets tables were
+    consolidated to in-database blobs. That drift would otherwise surface only
+    much later, as ``no such table: asset_blobs`` deep inside ``register_asset``
+    — this turns it into a loud failure at init time instead.
+    """
+
+
 def db_path() -> Path:
     """Return the configured database path (``NODUM_DB`` or the default)."""
     raw = os.environ.get(ENV_DB_VAR)
@@ -84,7 +100,7 @@ def apply_migration(conn: sqlite3.Connection, name: str, sql: str) -> None:
             inlined into the script, which takes no parameters.
         sqlite3.Error: Whatever the script raised, after the rollback.
     """
-    if not MIGRATION_NAME_RE.match(name):
+    if not MIGRATION_NAME_RE.fullmatch(name):
         raise ValueError(f"invalid migration name {name!r}: expected {MIGRATION_NAME_RE.pattern}")
     try:
         conn.executescript(
@@ -95,13 +111,58 @@ def apply_migration(conn: sqlite3.Connection, name: str, sql: str) -> None:
         raise
 
 
+def _verify_schema_consistency(conn: sqlite3.Connection) -> None:
+    """Refuse a database whose live schema contradicts its recorded migrations.
+
+    :func:`init_db` skips any migration whose name is already recorded, so a
+    database that applied a since-consolidated version of a migration keeps its
+    stale schema. The only such case in the shipped history is
+    ``0007_assets_and_renditions``: if the name is recorded, the assets store
+    must be the consolidated in-database one — ``asset_blobs`` present, and
+    ``renditions`` carrying ``data`` rather than the old filesystem ``path``.
+
+    Raises:
+        SchemaConsistencyError: If ``0007_assets_and_renditions`` is recorded
+            but the live schema is the pre-consolidation path-based one.
+    """
+    if "0007_assets_and_renditions" not in set(applied_migrations(conn)):
+        return
+    tables = {
+        row["name"] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+    }
+    rendition_columns = {row["name"] for row in conn.execute("PRAGMA table_info(renditions)")}
+    problems: list[str] = []
+    if "asset_blobs" not in tables:
+        problems.append("table 'asset_blobs' is missing")
+    if "data" not in rendition_columns:
+        problems.append("table 'renditions' has no 'data' column")
+    if "path" in rendition_columns:
+        problems.append("table 'renditions' still carries a filesystem 'path' column")
+    if problems:
+        raise SchemaConsistencyError(
+            "database schema is inconsistent with its recorded migrations: "
+            + "; ".join(problems)
+            + ". This database predates the consolidation of the assets tables into "
+            "migration 0007 (bytes now live in 'asset_blobs' and 'renditions.data', never "
+            "on a filesystem path); it cannot be auto-migrated — delete the database file "
+            "and re-run 'nodum init' to recreate it."
+        )
+
+
 def init_db(conn: sqlite3.Connection) -> list[str]:
     """Apply any pending migrations; return the names applied in this call.
 
     Idempotent: a fully migrated database applies nothing and returns ``[]``.
     Each migration is applied atomically (:func:`apply_migration`), so a
     failure leaves the database exactly as the last successful migration left
-    it.
+    it. After applying, the live schema is checked against the recorded
+    migrations (:func:`_verify_schema_consistency`) so a database that carries
+    a since-consolidated migration name fails loudly here rather than deep in a
+    later call.
+
+    Raises:
+        SchemaConsistencyError: If the live schema contradicts the recorded
+            migrations (see :func:`_verify_schema_consistency`).
     """
     conn.execute(
         """
@@ -119,4 +180,5 @@ def init_db(conn: sqlite3.Connection) -> list[str]:
             continue
         apply_migration(conn, name, sql)
         applied.append(name)
+    _verify_schema_consistency(conn)
     return applied
