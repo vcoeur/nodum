@@ -206,7 +206,9 @@ def create_server(*, actor: str = "agent:mcp", db_path: str | Path | None = None
         asset = assets.get_asset(id_or_hash, path=db_path)
         metadata: dict[str, Any] = {"asset": asset.model_dump(mode="json")}
         try:
-            rend = assets.get_rendition(id_or_hash, profile=rendition, path=db_path)
+            rend = assets.get_rendition(
+                id_or_hash, profile=rendition, include_data=True, path=db_path
+            )
         except assets.UnsupportedRendition:
             # Not a renderable image: metadata (+ extracted text) only, per §5.7.
             metadata["rendition"] = None

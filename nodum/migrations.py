@@ -262,6 +262,40 @@ CREATE INDEX idx_renditions_asset ON renditions(asset_hash);
 """
 
 
+ASSET_BLOBS_DDL = """
+-- Asset bytes, moved off the filesystem into this database file (design §5.1).
+-- Bytes live in their own table rather than a column on `assets` so metadata
+-- queries and FTS never scan blob overflow pages — and so the table could be
+-- ATTACHed out to a second file later if scale ever demanded it. Keyed by the
+-- same sha256 as `assets`, so content addressing and dedup are unchanged;
+-- only the byte location moved. Never inline these bytes into event payloads.
+-- The table keeps its implicit rowid: `Connection.blobopen` addresses blobs by
+-- rowid, and streaming reads/writes depend on it.
+CREATE TABLE asset_blobs (
+    hash TEXT PRIMARY KEY REFERENCES assets(hash),
+    data BLOB NOT NULL
+);
+
+-- Renditions move into the file for the same reason, replacing the on-disk
+-- cache path with the bytes themselves — which also removes the class of bugs
+-- where the row and its file disagree. Renditions are derived and regenerable,
+-- so the table is rebuilt rather than migrated: anything cached before this
+-- migration simply regenerates on next request.
+DROP TABLE renditions;
+CREATE TABLE renditions (
+    id          TEXT PRIMARY KEY,
+    asset_hash  TEXT NOT NULL REFERENCES assets(hash),
+    profile     TEXT NOT NULL,
+    data        BLOB NOT NULL,
+    width       INTEGER NOT NULL,
+    height      INTEGER NOT NULL,
+    size_bytes  INTEGER NOT NULL,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX idx_renditions_asset ON renditions(asset_hash);
+"""
+
+
 #: Ordered (name, SQL) migrations. Append-only — never edit a shipped entry.
 MIGRATIONS: list[tuple[str, str]] = [
     ("0001_core", CORE_DDL),
@@ -271,4 +305,5 @@ MIGRATIONS: list[tuple[str, str]] = [
     ("0005_proposed_versions", PROPOSED_VERSIONS_DDL),
     ("0006_vectors", VECTORS_DDL),
     ("0007_assets_and_renditions", ASSETS_DDL),
+    ("0008_asset_blobs", ASSET_BLOBS_DDL),
 ]

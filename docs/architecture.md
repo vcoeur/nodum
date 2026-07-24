@@ -12,12 +12,11 @@ flowchart LR
     mcp["nodum.mcp_server (FastMCP, stdio)"] --> svc
     cli --> qry["nodum.search (hybrid: BM25 + vector, RRF)"]
     mcp --> qry
-    cli --> ast["nodum.assets (CAS + renditions)"]
+    cli --> ast["nodum.assets (blobs + renditions)"]
     mcp --> ast
-    svc --> db[("SQLite (WAL): types · nodes · edge_types · edges · versions · events · assets · renditions · merge_redirects")]
+    svc --> db[("SQLite (WAL): types · nodes · edge_types · edges · versions · events · assets · asset_blobs · renditions · merge_redirects")]
     svc --> mig["nodum.migrations (append-only)"]
     ast --> db
-    ast --> cas[("assets/ CAS dir (originals) · renditions/ cache (derived)")]
     db -- "events (append-only)" --> prj["nodum.projectors (checkpoints · run · rebuild)"]
     prj --> fts[("node_fts (FTS5, derived)")]
     prj --> vec[("chunks + node_vec (sqlite-vec, derived)")]
@@ -37,7 +36,6 @@ flowchart LR
     style emb fill:#ffe6cc,color:#000
     style qry fill:#e6f0ff,color:#000
     style ast fill:#e6f0ff,color:#000
-    style cas fill:#d9f2d9,color:#000
 ```
 
 ## Module map
@@ -45,12 +43,12 @@ flowchart LR
 | Module | Role |
 |---|---|
 | `nodum.db` | Connection management (WAL, foreign keys), `NODUM_DB` resolution, the migration runner over `schema_migrations`. |
-| `nodum.migrations` | The append-only migration list: `0001_core` (core DDL), `0002_seed_builtin_types` (the built-in type catalog), `0003_projector_checkpoints_and_fts` (`projector_checkpoints` + the derived `node_fts` FTS5 table), `0004_policies` (per-agent policy rulesets), `0005_proposed_versions` (`versions.state` — `applied`/`proposed`/`archived`), `0006_vectors` (the derived `chunks` + `node_vec` sqlite-vec tables), `0007_assets_and_renditions` (`assets` metadata + the derived `renditions` cache rows). Shipped entries are never edited; later phases append their own. |
+| `nodum.migrations` | The append-only migration list: `0001_core` (core DDL), `0002_seed_builtin_types` (the built-in type catalog), `0003_projector_checkpoints_and_fts` (`projector_checkpoints` + the derived `node_fts` FTS5 table), `0004_policies` (per-agent policy rulesets), `0005_proposed_versions` (`versions.state` — `applied`/`proposed`/`archived`), `0006_vectors` (the derived `chunks` + `node_vec` sqlite-vec tables), `0007_assets_and_renditions` (`assets` metadata + the derived `renditions` rows), `0008_asset_blobs` (`asset_blobs` for original bytes; `renditions` rebuilt with a `data` blob replacing the on-disk `path`). Shipped entries are never edited; later phases append their own. |
 | `nodum.service` | The only writer. Validation, the `proposed → active → archived` state machine, the event log, versions (incl. `proposed` updates: agent edits stage a version; accept applies it as an ordinary `node.update`, reject archives it), undo, wikilink materialization, agent policies (CRUD + auto-accept evaluation on the edge write path), the review queue (proposal listing with reviewer context over nodes/edges/updates, batch accept/reject by id or filter), and the curated graph reads behind the MCP read tier (`get_neighborhood`, `traverse`, `find_path`, `get_schema`, `diff_versions`) plus `propose_edges` batch writes. Each public function opens a short-lived connection, applies pending migrations idempotently, and commits — adapters stay stateless. |
 | `nodum.projectors` | Derived-index consumers of the event log. The `Projector` base class (`reset`/`apply`/`count`/`availability`), the `REGISTRY`, per-projector checkpoints (`projector_checkpoints.last_event_seq`), incremental `run_projectors`, `rebuild_projector` (reset + replay from event 0), and `projector_status` (with availability + reason). The `fts` projector maintains `node_fts`; the `vec` projector maintains `chunks` + `node_vec` — re-chunking and re-embedding nodes from event payloads, recording `model_id` per chunk. Deterministic and LLM-free; the service layer never calls in — the event log is the only coupling. An unavailable projector (`vec` without a provider) no-ops and keeps its backlog. |
 | `nodum.embeddings` | The embedding provider seam (design D10) + chunking (design D6). Provider interface: `model_id`, `dimensions`, `embed(texts)`. The default `FastembedProvider` runs `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` (384-dim, multilingual) in-process via ONNX — behind the optional `embeddings` extra, resolved from the local HF cache only (downloads need `NODUM_EMBED_DOWNLOAD=1`; model override via `NODUM_EMBED_MODEL`). Chunking is a fixed 512-word window with ~15% overlap (words approximate tokens — dependency-free). `set_provider`/`reset_provider` are the test seam (a deterministic hashing fake lives in `tests/conftest.py`). |
 | `nodum.search` | The query path (design §7). `search()` catches the `fts` and `vec` projectors up with the log, runs BM25 (title boosted 5×) and — when a provider is available — a sqlite-vec KNN over chunk embeddings (closest chunk per node wins), fuses both lists by reciprocal rank fusion (K=60), then optionally expands the fused hits one hop along `active` edges (type weight × confidence). Hits carry the fused `score` plus a per-signal `signals` breakdown (`bm25`/`vector` RRF contributions summing to `score`, `graph` edge weight). Without a provider the vector signal is skipped — graceful degradation to BM25 + graph. |
-| `nodum.assets` | Content-addressed binaries + derived image renditions (design §5.5/§5.7). `register_asset` copies a local file into the CAS directory (`assets/<hash[:2]>/<hash>` next to the DB file) and inserts the `assets` metadata row — idempotent sha256 dedup, deliberately no event-log entry (nothing to undo; ingestion-time asset events are Phase 4). `get_rendition` lazily generates `thumb`/`preview` WebP images with Pillow (downscale-only, EXIF-transposed, 300 KB quality-stepping target on `preview`), caches them under `renditions/<id[:2]>/<id>.webp` keyed by `sha256(asset_hash + ':' + profile)`, and serves cache hits thereafter; `purge_renditions` evicts rows + files (all regenerable). Non-image assets and unknown profiles are rejected cleanly; `page:<n>` rasters are Phase 4. |
+| `nodum.assets` | Content-addressed binaries + derived image renditions (design §5.5/§5.7). `register_asset` streams a local file into `asset_blobs` through `Connection.blobopen` (hash pass, then a chunked copy into a `zeroblob` — a large file is never held in memory) and inserts the `assets` metadata row in the same transaction, so a failed copy rolls back whole — idempotent sha256 dedup, deliberately no event-log entry (nothing to undo; ingestion-time asset events are Phase 4). `get_rendition` lazily generates `thumb`/`preview` WebP images with Pillow (downscale-only, EXIF-transposed, 300 KB quality-stepping target on `preview`), stores them in `renditions` keyed by `sha256(asset_hash + ':' + profile)`, and serves cache hits thereafter without touching the blob column; `purge_renditions` deletes the rows (all regenerable). Pillow reads originals through `_BlobReader`, a file-like adapter that restores the tolerant out-of-range seeks `sqlite3.Blob` refuses and Pillow's format probing depends on. Non-image assets and unknown profiles are rejected cleanly; `page:<n>` rasters are Phase 4. |
 | `nodum.mcp_server` | The MCP adapter: a FastMCP (official Python SDK) server over stdio, launched by `nodum mcp serve`. Registers the design §8.1 read tier (`get_node`, `get_children`, `search`, `traverse`, `list_types`, `get_schema`, `find_path`, `history`, `diff`, `get_asset`), additive tier (`create_node`, `update_node`, `link`, `propose_edges`), and the `accept`/`reject` review tools — every tool a thin delegate to one service/search/assets function with `readOnlyHint`/`destructiveHint` annotations. `get_asset` enforces the §5.7 binary policy structurally: metadata + a `preview`/`thumb` WebP image block, originals never served. One configured `--actor` per server attributes every write. Curative tools (§8.2) are never registered. |
 | `nodum.models` | The pydantic I/O schema shared by every surface (`NodeOut`, `EdgeOut`, `VersionOut`, `EventOut`, `TypeOut`/`EdgeTypeOut`/`TypesOut`, `UndoResult`, `InitResult`, `ProjectorStatus`/`ProjectorRun`, `SearchHit`/`SearchResult`, `PolicyOut`, `ProposalOut`, `BatchTransitionOut`/`TransitionFailure`, `SubgraphOut`, `PathOut`, `DiffOut`, `ProposeEdgesOut`/`ItemFailure`, `AssetOut`, `RenditionOut`, `PurgeResult`). Every adapter serialises `model_dump(mode="json")`. |
 | `nodum.cli` | Typer adapter. Each command calls one service function and prints exactly one JSON object on stdout; errors go to stderr with exit code 1. No `--json` flag — JSON is the only format. Adds `search`, `traverse`, `find-path`, `diff`, `schema`, `edge create-batch`, the `projector run/status/rebuild` group, the `policy set/get/list` group, the `review queue/accept/reject/accept-all/reject-all` group, the `asset register/get/list/rendition/purge` group, and `mcp serve`. |
@@ -65,7 +63,7 @@ sections to the code:
 | §2.3 constraints (single write path, Markdown truth, LLM-free core) | `nodum.service` is the only mutation entry point; `content` is canonical Markdown; no LLM calls anywhere in the package — projectors included (Constraint 4). |
 | §4 architecture (service layer, event log, projectors) | `nodum.service` + the `events` table; `nodum.projectors` implements the derived-index consumers with checkpoint/rebuild mechanics. Internal agents are a later phase. |
 | §5.1 everything-is-a-node, structure vs. meaning | One `nodes` table with `parent_id` + fractional `position`; typed `edges` for meaning. |
-| §5.2 schema | `nodum.migrations` `0001_core` — Phase-1 subset (`types`, `nodes`, `edge_types`, `edges`, `versions`, `events`, `merge_redirects`), all with reserved `graph_id DEFAULT 'main'`; `0003_projector_checkpoints_and_fts` adds `projector_checkpoints` and `node_fts` (with the design's `extracted_text` column, empty until asset extraction lands in Phase 4); `0006_vectors` adds `chunks` + `node_vec` (`chunks.id` is an integer rowid for vec0 keying, and deliberately carries no FK to `nodes` — replaying the log must tolerate nodes whose create was undone); `0007_assets_and_renditions` adds `assets` (metadata; bytes in the CAS dir) and `renditions` (derived cache rows, plus `width`/`height`/`size_bytes` beyond the design's columns). |
+| §5.2 schema | `nodum.migrations` `0001_core` — Phase-1 subset (`types`, `nodes`, `edge_types`, `edges`, `versions`, `events`, `merge_redirects`), all with reserved `graph_id DEFAULT 'main'`; `0003_projector_checkpoints_and_fts` adds `projector_checkpoints` and `node_fts` (with the design's `extracted_text` column, empty until asset extraction lands in Phase 4); `0006_vectors` adds `chunks` + `node_vec` (`chunks.id` is an integer rowid for vec0 keying, and deliberately carries no FK to `nodes` — replaying the log must tolerate nodes whose create was undone); `0007_assets_and_renditions` adds `assets` (metadata) and `renditions` (derived rows, plus `width`/`height`/`size_bytes` beyond the design's columns); `0008_asset_blobs` adds `asset_blobs` and moves rendition bytes into the `renditions` table, so binaries live in the one file. |
 | §5.3 built-in types | `nodum.migrations` `0002_seed_builtin_types` (11 node types, 17 edge types with inverses). |
 | §5.4 wikilink sugar | `service._materialize_mentions` — parse on write, resolve by id or exact title, create/archive `mentions` edges, skip unresolvable targets. |
 | §5.5/§5.7 assets + rendition policy | `nodum.assets` + `get_asset` in `nodum.mcp_server`. `get_asset(id_or_hash, rendition)` accepts an asset hash or an asset-reference node id (resolved via the `asset_hash` prop) and returns metadata + a `preview`/`thumb` WebP image block — MCP never serves originals, and non-image assets get metadata only. `page:<n>` rasters, `get_download_url`/`request_upload_url`, and ingestion are Phase 4. |
@@ -219,22 +217,30 @@ sections to the code:
   backlog waits) and surfaces in `projector status` as
   `available`/`detail`. Rebuilding an unavailable projector is refused —
   it would empty the store without being able to refill it.
-- **Asset bytes live in a CAS directory, not the DB** (`assets/<hash[:2]>/
-  <hash>` next to the database file), exactly as design §5.2 writes it —
-  disaster recovery is `DB + assets/ = everything`. (Moving bytes into the
-  DB is a live, undecided proposal in the design project; the `renditions`
-  `path` column and the blob-table shape both keep that door open.)
+- **Asset bytes live in the database, not on the filesystem.** Originals go
+  in `asset_blobs` and renditions in `renditions`, both keyed off the same
+  sha256 as the `assets` metadata row, so disaster recovery is
+  `DB = everything` — one file to back up, copy, and restore, with no second
+  artefact that can drift or be restored inconsistently. Bytes sit in their
+  own table rather than a column on `assets` so metadata queries and FTS
+  never scan blob overflow pages, and so the table could be `ATTACH`ed out to
+  a second file if scale ever demanded it. `db.connect` sets
+  `PRAGMA page_size=8192` before enabling WAL (sqlite.org's blob benchmarks
+  peak at 8-16 KiB pages, and the page size cannot change once WAL is on).
   Registration is idempotent sha256 dedup with **no event-log entry**:
   content-addressed rows are immutable, so there is no state to transition
   or undo, and re-registering the same bytes returns the existing row.
-  Ingestion-time asset events (with the never-inline-blob-bytes discipline)
-  land with the Phase-4 pipeline.
+  Ingestion-time asset events land with the Phase-4 pipeline and must record
+  `hash`/`mime`/`size`/`original_name` only — **never inline blob bytes into
+  an event payload**, or every undoable asset write would copy megabytes of
+  base64 into the log.
 - **Renditions are lazily generated, not projected.** Unlike FTS/vectors
-  there is no event to consume — a rendition derives from CAS bytes, not
-  from graph events — so `get_rendition` builds on first request and caches
-  the WebP under `renditions/<id[:2]>/<id>.webp`, keyed by
-  `sha256(asset_hash + ':' + profile)` (§5.7). Rows and files are both
-  regenerable; `asset purge` is the eviction hatch. Downscaling uses
+  there is no event to consume — a rendition derives from stored bytes, not
+  from graph events — so `get_rendition` builds on first request and stores
+  the WebP in `renditions`, keyed by
+  `sha256(asset_hash + ':' + profile)` (§5.7). Everything is
+  regenerable; `asset purge` is the eviction hatch (freed pages return to the
+  filesystem on `VACUUM`). Downscaling uses
   `Image.thumbnail` (never upscales), EXIF orientation is applied, and
   `preview`'s ≤300 KB target is met by stepping WebP quality down from q80
   (the smallest encode wins if no step fits).

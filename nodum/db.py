@@ -31,9 +31,10 @@ def connect(path: str | Path | None = None) -> sqlite3.Connection:
             directory is created if needed. Use ``":memory:"`` for tests.
 
     Returns:
-        A connection with row access by column name, WAL journaling,
-        foreign-key enforcement enabled, and the sqlite-vec extension loaded
-        (the ``node_vec`` vec0 table and its KNN queries need it).
+        A connection with row access by column name, an 8 KiB page size, WAL
+        journaling, foreign-key enforcement enabled, and the sqlite-vec
+        extension loaded (the ``node_vec`` vec0 table and its KNN queries
+        need it).
     """
     db_file = Path(path).expanduser() if path is not None else db_path()
     if str(db_file) != ":memory:":
@@ -43,6 +44,11 @@ def connect(path: str | Path | None = None) -> sqlite3.Connection:
     conn.enable_load_extension(True)
     sqlite_vec.load(conn)
     conn.enable_load_extension(False)
+    # Asset bytes live in this file, and sqlite.org's blob benchmarks put peak
+    # blob I/O at 8-16 KiB pages. This only takes effect on an empty database
+    # and is silently ignored once WAL is on, so it must precede the WAL pragma
+    # — on an existing database the page size is already fixed.
+    conn.execute("PRAGMA page_size=8192")
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     return conn

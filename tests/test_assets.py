@@ -1,20 +1,28 @@
 """Asset registration and rendition tests (design §5.5/§5.7).
 
-Renditions are derived WebP images keyed by ``sha256(asset_hash + ':' +
-profile)``: lazily generated, cached on disk, evictable, and never upscaled.
-Tests generate their images with Pillow — no network, no fixtures on disk.
+Originals and renditions both live in the one database file. Renditions are
+derived WebP images keyed by ``sha256(asset_hash + ':' + profile)``: lazily
+generated, stored, evictable, and never upscaled. Tests generate their images
+with Pillow — no network, no fixtures on disk.
 """
 
 from __future__ import annotations
 
 import hashlib
+import io
 import random
+import sqlite3
 
 import pytest
 from PIL import Image
 
-from nodum import assets, service
+from nodum import assets, db, service
 from nodum.assets import AssetNotFound, UnsupportedRendition
+
+
+def _decode(rendition, path=None):
+    """Open a rendition's stored WebP bytes as a Pillow image."""
+    return Image.open(io.BytesIO(assets.read_rendition_bytes(rendition, path=path)))
 
 
 def _make_image(path, size=(2000, 1000), mode="RGB", noise=False):
@@ -37,17 +45,41 @@ def _register_image(fresh_db, tmp_path, name="photo.png", **kwargs):
     return assets.register_asset(source)
 
 
-# ── Registration (the thin CAS: a row + a file + a sha256) ────────────────────
+# ── Registration (a metadata row + a blob + a sha256) ─────────────────────────
 
 
-def test_register_copies_bytes_into_the_cas(fresh_db, tmp_path):
+def test_register_streams_bytes_into_the_database(fresh_db, tmp_path):
     asset = _register_image(fresh_db, tmp_path)
-    assert asset.hash == hashlib.sha256((tmp_path / "photo.png").read_bytes()).hexdigest()
+    original = (tmp_path / "photo.png").read_bytes()
+    assert asset.hash == hashlib.sha256(original).hexdigest()
     assert asset.mime == "image/png"
     assert asset.original_name == "photo.png"
-    assert asset.size_bytes > 0
-    cas_file = fresh_db.parent / "assets" / asset.hash[:2] / asset.hash
-    assert cas_file.read_bytes() == (tmp_path / "photo.png").read_bytes()
+    assert asset.size_bytes == len(original)
+
+    conn = db.connect(fresh_db)
+    try:
+        stored = conn.execute(
+            "SELECT data FROM asset_blobs WHERE hash = ?", (asset.hash,)
+        ).fetchone()["data"]
+    finally:
+        conn.close()
+    assert stored == original
+
+
+def test_register_writes_nothing_beside_the_database(fresh_db, tmp_path):
+    """The single-file promise: no CAS directory, no rendition cache on disk."""
+    asset = _register_image(fresh_db, tmp_path)
+    assets.get_rendition(asset.hash, profile="thumb")
+    beside = {child.name for child in fresh_db.parent.iterdir()}
+    assert not {name for name in beside if name in ("assets", "renditions")}
+
+
+def test_zero_byte_asset_registers(fresh_db, tmp_path):
+    empty = tmp_path / "empty.bin"
+    empty.write_bytes(b"")
+    asset = assets.register_asset(empty)
+    assert asset.size_bytes == 0
+    assert assets.get_asset(asset.hash).hash == asset.hash
 
 
 def test_register_dedups_identical_content(fresh_db, tmp_path):
@@ -88,7 +120,7 @@ def test_thumb_downscales_to_256_max_edge(fresh_db, tmp_path):
     asset = _register_image(fresh_db, tmp_path, size=(2000, 1000))
     rendition = assets.get_rendition(asset.hash, profile="thumb")
     assert (rendition.width, rendition.height) == (256, 128)
-    with Image.open(rendition.path) as decoded:
+    with _decode(rendition) as decoded:
         assert decoded.format == "WEBP"
         assert decoded.size == (256, 128)
 
@@ -109,7 +141,7 @@ def test_small_images_are_never_upscaled(fresh_db, tmp_path):
 def test_rgba_alpha_survives_rendition(fresh_db, tmp_path):
     asset = _register_image(fresh_db, tmp_path, mode="RGBA", size=(800, 800))
     rendition = assets.get_rendition(asset.hash, profile="preview")
-    with Image.open(rendition.path) as decoded:
+    with _decode(rendition) as decoded:
         assert decoded.mode == "RGBA"
 
 
@@ -131,7 +163,6 @@ def test_rendition_id_is_sha256_of_hash_and_profile(fresh_db, tmp_path):
     expected = hashlib.sha256(f"{asset.hash}:thumb".encode()).hexdigest()
     assert rendition.id == expected
     assert rendition.mime == "image/webp"
-    assert rendition.path.endswith(f"renditions/{expected[:2]}/{expected}.webp")
 
 
 def test_lazy_generation_then_cache_hit(fresh_db, tmp_path):
@@ -143,15 +174,6 @@ def test_lazy_generation_then_cache_hit(fresh_db, tmp_path):
     assert hit.id == generated.id
 
 
-def test_lost_cache_file_regenerates(fresh_db, tmp_path):
-    asset = _register_image(fresh_db, tmp_path)
-    first = assets.get_rendition(asset.hash, profile="thumb")
-    (fresh_db.parent / "renditions" / first.id[:2] / f"{first.id}.webp").unlink()
-    regenerated = assets.get_rendition(asset.hash, profile="thumb")
-    assert regenerated.cached is False
-    assert regenerated.id == first.id
-
-
 def test_include_data_embeds_base64_webp(fresh_db, tmp_path):
     asset = _register_image(fresh_db, tmp_path, size=(10, 10))
     rendition = assets.get_rendition(asset.hash, profile="thumb", include_data=True)
@@ -159,7 +181,15 @@ def test_include_data_embeds_base64_webp(fresh_db, tmp_path):
     assert raw[:4] == b"RIFF" and raw[8:12] == b"WEBP"
 
 
-def test_purge_evicts_rows_and_files(fresh_db, tmp_path):
+def test_metadata_only_fetch_reads_bytes_from_the_database(fresh_db, tmp_path):
+    asset = _register_image(fresh_db, tmp_path, size=(10, 10))
+    rendition = assets.get_rendition(asset.hash, profile="thumb")
+    assert rendition.data_base64 is None
+    raw = assets.read_rendition_bytes(rendition)
+    assert raw[:4] == b"RIFF" and len(raw) == rendition.size_bytes
+
+
+def test_purge_evicts_stored_renditions(fresh_db, tmp_path):
     asset = _register_image(fresh_db, tmp_path)
     assets.get_rendition(asset.hash, profile="thumb")
     assets.get_rendition(asset.hash, profile="preview")
@@ -167,9 +197,12 @@ def test_purge_evicts_rows_and_files(fresh_db, tmp_path):
     result = assets.purge_renditions()
     assert result.purged == 2
     assert result.bytes_freed > 0
-    assert not (fresh_db.parent / "renditions").exists() or not any(
-        (fresh_db.parent / "renditions").rglob("*.webp")
-    )
+
+    conn = db.connect(fresh_db)
+    try:
+        assert conn.execute("SELECT count(*) AS n FROM renditions").fetchone()["n"] == 0
+    finally:
+        conn.close()
     # Derived data regenerates on the next request.
     assert assets.get_rendition(asset.hash, profile="thumb").cached is False
 
@@ -213,3 +246,77 @@ def test_unknown_profile_is_rejected(fresh_db, tmp_path):
 def test_rendition_of_missing_asset_raises(fresh_db):
     with pytest.raises(AssetNotFound):
         assets.get_rendition("missing")
+
+
+# ── Streaming and the single-file promise ─────────────────────────────────────
+
+
+def test_open_original_streams_the_stored_bytes(fresh_db, tmp_path):
+    asset = _register_image(fresh_db, tmp_path)
+    original = (tmp_path / "photo.png").read_bytes()
+    conn = db.connect(fresh_db)
+    try:
+        with assets.open_original(conn, asset.hash) as blob:
+            assert len(blob) == len(original)
+            blob.seek(0)
+            head = blob.read(16)
+            blob.seek(0)
+            assert blob.read() == original
+        assert head == original[:16]
+    finally:
+        conn.close()
+
+
+def test_open_original_of_missing_asset_raises(fresh_db):
+    conn = db.connect(fresh_db)
+    try:
+        with pytest.raises(AssetNotFound):
+            assets.open_original(conn, "missing")
+    finally:
+        conn.close()
+
+
+def test_vacuum_into_snapshot_carries_originals_and_renditions(fresh_db, tmp_path, monkeypatch):
+    """DB = everything: a one-file backup restores the binaries with the graph."""
+    asset = _register_image(fresh_db, tmp_path)
+    rendition = assets.get_rendition(asset.hash, profile="thumb")
+    original = (tmp_path / "photo.png").read_bytes()
+
+    snapshot = tmp_path / "backup" / "graph.db"
+    snapshot.parent.mkdir()
+    conn = db.connect(fresh_db)
+    try:
+        conn.execute("VACUUM INTO ?", (str(snapshot),))
+    finally:
+        conn.close()
+
+    # Nothing but the one file is carried over.
+    monkeypatch.setenv("NODUM_DB", str(snapshot))
+    assert assets.get_asset(asset.hash).hash == asset.hash
+    restored = db.connect(snapshot)
+    try:
+        with assets.open_original(restored, asset.hash) as blob:
+            assert blob.read() == original
+    finally:
+        restored.close()
+    assert assets.read_rendition_bytes(rendition)[:4] == b"RIFF"
+
+
+def test_registration_rolls_back_when_the_blob_write_fails(fresh_db, tmp_path, monkeypatch):
+    """A crash mid-copy must leave no asset row behind."""
+    source = _make_image(tmp_path / "photo.png")
+
+    def explode(*args, **kwargs):
+        raise sqlite3.OperationalError("disk gone")
+
+    monkeypatch.setattr(assets, "open_original", explode)
+    with pytest.raises(sqlite3.OperationalError):
+        assets.register_asset(source)
+
+    monkeypatch.undo()
+    assert assets.list_assets() == []
+    conn = db.connect(fresh_db)
+    try:
+        assert conn.execute("SELECT count(*) AS n FROM asset_blobs").fetchone()["n"] == 0
+    finally:
+        conn.close()

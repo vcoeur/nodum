@@ -483,17 +483,17 @@ def asset_rendition(
     id_or_hash: str = typer.Argument(..., help="Asset hash or asset-reference node id."),
     profile: str = typer.Option("preview", "--profile", "-p", help="'thumb' or 'preview'."),
     out: str | None = typer.Option(
-        None, "--out", "-o", help="Also copy the cached WebP file to this path."
+        None, "--out", "-o", help="Also write the WebP bytes to this path."
     ),
 ) -> None:
     """Fetch an image rendition, generating and caching it on first request.
 
-    Prints the rendition metadata (the cache ``path`` always points at the
-    WebP file); image bytes are never inlined into the JSON output.
+    Prints the rendition metadata; image bytes stay in the database and are
+    never inlined into the JSON output — use ``--out`` to extract them.
     """
     rendition = _run(assets.get_rendition, id_or_hash, profile=profile)
     if out is not None:
-        assets.copy_rendition(rendition, out)
+        _run(assets.copy_rendition, rendition, out)
     _emit(rendition)
 
 
@@ -503,7 +503,7 @@ def asset_purge(
         None, "--asset", help="Limit the purge to one asset's renditions (hash)."
     ),
 ) -> None:
-    """Evict cached renditions (regenerable — they rebuild on next request)."""
+    """Evict stored renditions (regenerable — they rebuild on next request)."""
     _emit(_run(assets.purge_renditions, asset_hash=asset))
 
 
