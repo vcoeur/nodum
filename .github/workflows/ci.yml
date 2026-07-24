@@ -41,3 +41,28 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - name: Run test suite
         run: uv run --locked pytest -q
+
+  web:
+    name: Frontend build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Set up Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Install the frontend dependencies
+        run: make web-install
+      # Vitest over the pure modules in web/src. The suite pins its own
+      # timezone: this runner is UTC, and the zone-less-timestamp bug
+      # src/lib/time.ts fixes is invisible in UTC.
+      - name: Frontend unit tests
+        run: make web-test
+      # `web-build` runs `tsc --noEmit` before Vite, so this step is the type
+      # check as well as the build — the frontend cannot rot silently.
+      - name: Build the UI bundle
+        run: make web-build
+      - name: Check the bundle was emitted
+        run: test -f nodum/_web/index.html && test -d nodum/_web/assets

@@ -11,7 +11,9 @@ dependencies = [
     "pillow>=11",
     "pydantic>=2.9",
     "sqlite-vec>=0.1.9",
+    "starlette>=0.48",
     "typer>=0.16",
+    "uvicorn>=0.34",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -50,6 +52,11 @@ raw-options = { fallback_version = "0.0.0" }
 
 [tool.hatch.build.targets.wheel]
 packages = ["nodum"]
+# The Vite bundle is built into nodum/_web/ and gitignored, so hatchling's
+# VCS-based file selection would ship an empty directory. `artifacts` re-includes
+# ignored paths — run `make web-build` before building a wheel or the UI will be
+# the "not built" placeholder.
+artifacts = ["nodum/_web/**"]
 
 [dependency-groups]
 dev = [

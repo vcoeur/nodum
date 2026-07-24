@@ -1,0 +1,572 @@
+/*
+ * Search view styles. Imported by SearchView.tsx, not by src/styles/index.css —
+ * everything here is scoped under `.nd-search` / `.nd-search-hit` and belongs to
+ * this slice alone.
+ *
+ * One local addition to the design system, deliberately: a **signal identity
+ * ramp**. The shared system has two colour axes and both are taken — the accent
+ * means "you can act on this" and the state ramp means the service-layer state
+ * machine. A retrieval signal is neither, so reusing either would lie. The three
+ * hues below are therefore view-local and chosen to sit outside both: blue for
+ * keyword (the existing `--nd-info`), teal for semantic, rose for neighbour.
+ * If a second view ever needs to name a signal, this ramp is the thing to hoist
+ * into tokens.css.
+ */
+
+.nd-search {
+  --nd-signal-bm25: #6a93c4;
+  --nd-signal-bm25-wash: rgb(106 147 196 / 16%);
+  --nd-signal-vector: #4fa39a;
+  --nd-signal-vector-wash: rgb(79 163 154 / 16%);
+  --nd-signal-graph: #c4899e;
+  --nd-signal-graph-wash: rgb(196 137 158 / 16%);
+
+  gap: var(--nd-space-6);
+}
+
+/* --- Header hints ------------------------------------------------------ */
+
+.nd-search__hints {
+  display: flex;
+  align-items: center;
+  gap: var(--nd-space-2);
+  font-size: var(--nd-text-2xs);
+  color: var(--nd-text-faint);
+}
+
+.nd-search__hints span {
+  opacity: 0.5;
+}
+
+.nd-search kbd {
+  padding: 0 var(--nd-space-2);
+  border: 1px solid var(--nd-border);
+  border-bottom-width: 2px;
+  border-radius: var(--nd-radius-sm);
+  background: var(--nd-surface-raised);
+  color: var(--nd-text-muted);
+  font-size: var(--nd-text-2xs);
+  line-height: 1.5;
+}
+
+/* --- Query box + filters ----------------------------------------------- */
+
+/* Sticky: refining a query while reading result 30 is the normal case, and a
+   box that scrolls away turns that into a scroll-to-top every time. */
+.nd-search__controls {
+  position: sticky;
+  top: var(--nd-header-height);
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+  gap: var(--nd-space-6);
+  padding: var(--nd-space-6) 0;
+  background: var(--nd-bg);
+}
+
+.nd-search__box {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
+.nd-search__glyph {
+  position: absolute;
+  left: var(--nd-space-8);
+  color: var(--nd-text-faint);
+  pointer-events: none;
+}
+
+.nd-search__input {
+  padding: var(--nd-space-6) var(--nd-space-16) var(--nd-space-6) var(--nd-space-16);
+  font-size: var(--nd-text-md);
+  background: var(--nd-surface);
+}
+
+/* The UA's own clear affordance duplicates Escape and misaligns the glyph. */
+.nd-search__input::-webkit-search-cancel-button {
+  appearance: none;
+}
+
+.nd-search__box-status {
+  position: absolute;
+  right: var(--nd-space-8);
+  display: flex;
+  align-items: center;
+  /* Reserved whether or not the spinner is up, so nothing shifts mid-query. */
+  width: 1rem;
+  height: 1rem;
+  pointer-events: none;
+}
+
+.nd-search-filters {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: var(--nd-space-6);
+}
+
+.nd-search-filters__field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--nd-space-2);
+  min-width: 7rem;
+}
+
+.nd-search-filters__field--wide {
+  min-width: 11rem;
+  flex: 1 1 11rem;
+}
+
+.nd-search-filters__field--narrow {
+  min-width: 5.5rem;
+}
+
+.nd-search-filters__control {
+  padding: var(--nd-space-2) var(--nd-space-4);
+  font-size: var(--nd-text-xs);
+}
+
+.nd-search-filters__toggle {
+  display: flex;
+  align-items: center;
+  gap: var(--nd-space-4);
+  padding-bottom: var(--nd-space-2);
+  font-size: var(--nd-text-xs);
+  color: var(--nd-text-muted);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.nd-search-filters__toggle input {
+  accent-color: var(--nd-accent);
+  cursor: pointer;
+}
+
+/* --- Status line -------------------------------------------------------- */
+
+.nd-search__statusline {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--nd-space-8);
+  /* Always occupies its line, empty or not: results must not shift when the
+     count appears. */
+  min-height: 1.25rem;
+  font-size: var(--nd-text-xs);
+  color: var(--nd-text-muted);
+}
+
+.nd-search-legend {
+  display: flex;
+  align-items: center;
+  gap: var(--nd-space-8);
+  font-size: var(--nd-text-2xs);
+  color: var(--nd-text-faint);
+}
+
+.nd-search-legend__item {
+  display: flex;
+  align-items: center;
+  gap: var(--nd-space-3);
+}
+
+/* Solid swatches: the legend is what makes the bar readable, so its colours
+   must be the bar's colours, not the chips' washed backgrounds. */
+.nd-search-legend__dot {
+  width: 0.5em;
+  height: 0.5em;
+  border-radius: 50%;
+  flex: none;
+}
+
+.nd-search-legend__dot--bm25 {
+  background: var(--nd-signal-bm25);
+}
+
+.nd-search-legend__dot--vector {
+  background: var(--nd-signal-vector);
+}
+
+.nd-search-legend__dot--graph {
+  background: var(--nd-signal-graph);
+}
+
+/* --- Degraded-vector notice --------------------------------------------- */
+
+.nd-search__notice {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--nd-space-6);
+  padding: var(--nd-space-6) var(--nd-space-8);
+  border: 1px solid var(--nd-border);
+  border-left: 2px solid var(--nd-info);
+  border-radius: var(--nd-radius-md);
+  background: var(--nd-surface);
+  font-size: var(--nd-text-xs);
+  color: var(--nd-text-muted);
+}
+
+.nd-search__notice strong {
+  color: var(--nd-text);
+  font-weight: var(--nd-weight-semibold);
+}
+
+.nd-search__notice code {
+  color: var(--nd-text);
+}
+
+.nd-search__notice-mark {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.1rem;
+  height: 1.1rem;
+  border-radius: 50%;
+  background: var(--nd-info-wash);
+  color: var(--nd-info);
+  font-family: var(--nd-font-mono);
+  font-size: var(--nd-text-2xs);
+  font-weight: var(--nd-weight-semibold);
+}
+
+/* --- Error panel --------------------------------------------------------- */
+
+.nd-search__error {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--nd-space-8);
+  padding: var(--nd-space-8);
+  border: 1px solid var(--nd-danger);
+  border-radius: var(--nd-radius-md);
+  background: var(--nd-danger-wash);
+}
+
+.nd-search__error-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--nd-space-2);
+  min-width: 0;
+}
+
+.nd-search__error-detail {
+  overflow-wrap: anywhere;
+}
+
+/* --- Result list --------------------------------------------------------- */
+
+.nd-search__list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--nd-space-12);
+}
+
+/* Results stay on screen while the next query is in flight; dimming says
+   "these are the previous answers" without emptying the page. */
+.nd-search__list--stale {
+  opacity: 0.55;
+  transition: opacity var(--nd-duration-base) var(--nd-ease);
+}
+
+.nd-search__group {
+  display: flex;
+  flex-direction: column;
+  gap: var(--nd-space-4);
+}
+
+.nd-search__group-title {
+  display: flex;
+  align-items: center;
+  gap: var(--nd-space-4);
+  padding-bottom: var(--nd-space-2);
+  border-bottom: 1px solid var(--nd-border);
+}
+
+.nd-search__group-count {
+  padding: 0 var(--nd-space-3);
+  border-radius: var(--nd-radius-pill);
+  background: var(--nd-surface-raised);
+  color: var(--nd-text-muted);
+  font-family: var(--nd-font-mono);
+}
+
+.nd-search__results {
+  display: flex;
+  flex-direction: column;
+  gap: var(--nd-space-4);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+/* --- One hit -------------------------------------------------------------- */
+
+.nd-search-hit {
+  display: flex;
+  flex-direction: column;
+  gap: var(--nd-space-3);
+  padding: var(--nd-space-6) var(--nd-space-8);
+  border: 1px solid var(--nd-border);
+  border-radius: var(--nd-radius-md);
+  background: var(--nd-surface);
+  transition:
+    border-color var(--nd-duration-fast) var(--nd-ease),
+    background var(--nd-duration-fast) var(--nd-ease);
+}
+
+.nd-search-hit:hover {
+  border-color: var(--nd-border-strong);
+  background: var(--nd-surface-raised);
+}
+
+/* Focus lands on the title link; the whole row reads as current. */
+.nd-search-hit:focus-within {
+  border-color: var(--nd-accent-dim);
+  background: var(--nd-surface-raised);
+}
+
+/* A neighbour is not a match — it is marked as belonging to a different class
+   of row without being pushed out of the reading order. */
+.nd-search-hit--neighbour {
+  border-left: 2px solid var(--nd-signal-graph);
+}
+
+.nd-search-hit__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--nd-space-6);
+}
+
+.nd-search-hit__title {
+  font-size: var(--nd-text-md);
+  font-weight: var(--nd-weight-medium);
+  color: var(--nd-text);
+  text-decoration: none;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.nd-search-hit__title:hover,
+.nd-search-hit__title:focus-visible {
+  color: var(--nd-accent-bright);
+  text-decoration: underline;
+}
+
+.nd-search-hit__snippet {
+  /* Clamped to two lines and reserved at two lines: every row is the same
+     height, so skeletons match real rows and nothing reflows on arrival. */
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  overflow: hidden;
+  min-height: calc(2 * var(--nd-leading-normal) * 1em);
+  font-size: var(--nd-text-sm);
+  color: var(--nd-text-muted);
+}
+
+.nd-search-hit__snippet--placeholder {
+  color: var(--nd-text-faint);
+  font-style: italic;
+}
+
+.nd-search-hit__mark {
+  padding: 0 0.1em;
+  border-radius: var(--nd-radius-sm);
+  background: var(--nd-accent-wash);
+  color: var(--nd-accent-bright);
+}
+
+/* A term the client matched itself, not one the server marked — quieter. */
+.nd-search-hit__mark--term {
+  background: transparent;
+  color: var(--nd-text);
+  text-decoration: underline;
+  text-decoration-color: var(--nd-accent-dim);
+  text-underline-offset: 0.2em;
+}
+
+.nd-search-hit__foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--nd-space-8);
+  flex-wrap: wrap;
+}
+
+.nd-search-hit__actions {
+  display: flex;
+  align-items: center;
+  gap: var(--nd-space-6);
+  min-width: 0;
+}
+
+.nd-search-hit__id {
+  max-width: 12rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--nd-text-faint);
+}
+
+/* --- Signal breakdown ------------------------------------------------------ */
+
+.nd-search-signals {
+  display: flex;
+  align-items: center;
+  gap: var(--nd-space-6);
+  min-width: 0;
+}
+
+.nd-search-signals__bar {
+  display: flex;
+  width: 5rem;
+  height: 5px;
+  flex: none;
+  border-radius: var(--nd-radius-pill);
+  overflow: hidden;
+  background: var(--nd-surface-overlay);
+}
+
+.nd-search-signals__segment {
+  flex-basis: 0;
+  min-width: 2px;
+}
+
+.nd-search-signals__segment--bm25 {
+  background: var(--nd-signal-bm25);
+}
+
+.nd-search-signals__segment--vector {
+  background: var(--nd-signal-vector);
+}
+
+.nd-search-signals__segment--graph {
+  background: var(--nd-signal-graph);
+}
+
+.nd-search-signals__chips {
+  display: flex;
+  align-items: center;
+  gap: var(--nd-space-4);
+  flex-wrap: wrap;
+}
+
+.nd-search-signals__chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--nd-space-3);
+  padding: 0 var(--nd-space-4);
+  border: 1px solid var(--nd-border);
+  border-radius: var(--nd-radius-pill);
+  background: var(--nd-surface-raised);
+  color: var(--nd-text-muted);
+  font-size: var(--nd-text-2xs);
+  line-height: 1.7;
+  white-space: nowrap;
+  cursor: help;
+}
+
+.nd-search-signals__dot {
+  width: 0.5em;
+  height: 0.5em;
+  border-radius: 50%;
+  background: currentcolor;
+  flex: none;
+}
+
+.nd-search-signals__chip--bm25 {
+  border-color: rgb(106 147 196 / 35%);
+  background: var(--nd-signal-bm25-wash);
+  color: var(--nd-signal-bm25);
+}
+
+.nd-search-signals__chip--vector {
+  border-color: rgb(79 163 154 / 35%);
+  background: var(--nd-signal-vector-wash);
+  color: var(--nd-signal-vector);
+}
+
+.nd-search-signals__chip--graph {
+  border-color: rgb(196 137 158 / 35%);
+  background: var(--nd-signal-graph-wash);
+  color: var(--nd-signal-graph);
+}
+
+/* The recovered rank: the number a human can actually reason about. */
+.nd-search-signals__rank {
+  font-family: var(--nd-font-mono);
+  opacity: 0.8;
+}
+
+.nd-search-signals__agree {
+  padding: 0 var(--nd-space-3);
+  border-radius: var(--nd-radius-pill);
+  background: var(--nd-surface-overlay);
+  color: var(--nd-text-faint);
+  font-size: var(--nd-text-2xs);
+  letter-spacing: var(--nd-tracking-label);
+  text-transform: uppercase;
+  cursor: help;
+}
+
+.nd-search-signals__score {
+  cursor: help;
+  color: var(--nd-text-faint);
+}
+
+/* --- Skeleton --------------------------------------------------------------- */
+
+.nd-search-hit--skeleton {
+  pointer-events: none;
+}
+
+.nd-search-skeleton {
+  display: block;
+  height: 0.85rem;
+  border-radius: var(--nd-radius-sm);
+  background: var(--nd-surface-raised);
+  animation: nd-search-shimmer 1.4s ease-in-out infinite;
+}
+
+.nd-search-skeleton--title {
+  width: 40%;
+  height: 1rem;
+}
+
+.nd-search-skeleton--body {
+  width: 100%;
+  min-height: calc(2 * var(--nd-leading-normal) * 1em);
+}
+
+.nd-search-skeleton--foot {
+  width: 30%;
+}
+
+@keyframes nd-search-shimmer {
+  50% {
+    opacity: 0.45;
+  }
+}
+
+/* --- Small screens ---------------------------------------------------------- */
+
+@media (max-width: 46rem) {
+  .nd-search__controls {
+    position: static;
+  }
+
+  .nd-search__hints {
+    display: none;
+  }
+
+  .nd-search-hit__foot {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: var(--nd-space-4);
+  }
+}

@@ -1,5 +1,7 @@
 PYTHONPATH := $(shell pwd)
 SHELL := /usr/bin/bash
+WEB_DIR := web
+WEB_BUNDLE := nodum/_web
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "}; {printf "%-16s %s\n", $$1, $$2}'
@@ -30,4 +32,30 @@ format: ## Ruff auto-fix + format
 	uv run ruff check --fix .
 	uv run ruff format .
 
-.PHONY: help install dev-install cli init-db test coverage lint format
+# --- Frontend (web/) -------------------------------------------------------
+# Node is a build-time dependency only: the wheel ships the built bundle and the
+# runtime is pure Python. Run web-install once, then web-build before packaging.
+
+web-install: ## Install the frontend dependencies (npm ci in web/)
+	cd $(WEB_DIR) && npm ci
+
+web-build: ## Type-check and build the UI bundle into nodum/_web/
+	cd $(WEB_DIR) && npm run build
+
+web-dev: ## Run the Vite dev server (proxies /api and /healthz to nodum serve)
+	cd $(WEB_DIR) && npm run dev
+
+web-typecheck: ## Type-check the frontend without building
+	cd $(WEB_DIR) && npm run typecheck
+
+# Vitest over the pure modules in web/src. The run is pinned to a non-UTC
+# timezone (vitest.config.ts) because the zone-less-timestamp bug src/lib/time.ts
+# fixes is invisible in UTC — which is what CI runs in.
+web-test: ## Run the frontend unit tests (vitest)
+	cd $(WEB_DIR) && npm test
+
+web-clean: ## Drop the built bundle (nodum serve falls back to the placeholder)
+	rm -rf $(WEB_BUNDLE)
+
+.PHONY: help install dev-install cli init-db test coverage lint format \
+	web-install web-build web-dev web-typecheck web-test web-clean

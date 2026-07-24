@@ -20,8 +20,13 @@ the **review/accept API** for the proposal queue (human actor only),
 server** (stdio) exposing the read + additive tool tiers *and nothing else*,
 and **content-addressed assets** — binaries and
 their lazily generated `thumb`/`preview` renditions stored in the same file
-as the graph (agents get renditions, never originals). Still to come: the web
-UI, the ingestion pipeline, and the consolidation cycle.
+as the graph (agents get renditions, never originals). **Phase 3 (human UI)**
+is underway: `nodum serve` runs the **HTTP API** — the human surface, where
+every write is attributed to `human` and no request field can say otherwise —
+and serves the **web UI** from the same process: a Markdown editor, hybrid
+search, the review queue and policy editor, a graph view, an asset browser,
+and per-node version history. Still to come: the ingestion pipeline and the
+consolidation cycle.
 
 ## Quick start
 
@@ -75,6 +80,14 @@ uv run nodum traverse <id> --edge-type supports --depth 2
 uv run nodum find-path <a> <b>
 uv run nodum diff <version-a> <version-b>
 
+# A bounded, filtered neighborhood: every filter applied in SQL, the node
+# cap enforced *while walking*. `truncated` says whether it cut the walk short.
+uv run nodum subgraph <id> --depth 2 --edge-type supports \
+    --edge-state active --min-confidence 0.8 --node-type claim --limit 200
+
+# Title-prefix link suggestions for a `[[` autocomplete (no index needed)
+uv run nodum suggest-links "Grap" --limit 20
+
 # Assets: register a file into the database, derive stored WebP renditions
 uv run nodum asset register ./photo.jpg
 uv run nodum asset rendition <hash> --profile preview --out preview.webp
@@ -84,6 +97,12 @@ uv run nodum asset purge                      # evict the stored renditions
 # review tools, no curative tools. Every write is attributed to --actor and
 # lands proposed unless policy auto-accepts. --actor must be agent:<name>.
 uv run nodum mcp serve --actor agent:researcher
+
+# HTTP server for the human: JSON API under /api plus the web UI at /.
+# Loopback by default, no accounts; --token adds a bearer token for the LAN.
+uv run nodum serve                      # http://127.0.0.1:8420
+uv run nodum serve --token s3cret --host 0.0.0.0
+curl -s localhost:8420/api/nodes/<id>   # identical bytes to `nodum node get <id>`
 ```
 
 Run `uv run nodum --help` (or any subcommand with `--help`) for the full
@@ -154,6 +173,36 @@ degrades to BM25 + graph expansion. `NODUM_EMBED_MODEL` switches the model
   enforcement of §8.1/§8.2. One configured `--actor` per server attributes
   every write, and it must be an `agent:<name>` identity (`--actor human`, an
   empty actor, or an unprefixed name is a startup error).
+- **HTTP API + web UI.** `nodum serve` runs one process that answers the JSON
+  API under `/api` and serves the built UI at `/`. It is the mirror image of
+  the MCP server: that surface forces an `agent:<name>` identity, this one is
+  the **human** surface and forces `actor = human` on every write — and no
+  request field, header, or query parameter can set an actor, because the
+  adapter never reads one. A body that carries `{"actor": "agent:x"}` is
+  ignored, not honoured and not rejected with a hint. Responses are the same
+  envelope the CLI prints, byte for byte, and failures are
+  `{"error": {"type", "message"}}` carrying the CLI's own one-line message
+  (missing id → 404, bad value → 400, human-only → 403, impossible undo → 409,
+  database busy → a retryable 503). Requests carry only fields the service
+  itself has — disabling an agent policy, for instance, is an explicit
+  `{"rules": []}`, not an `enabled` flag the data model cannot express. Auth
+  is loopback-by-default with an
+  optional `--token` bearer for the LAN case, gating `/api` only — `/healthz`
+  and the UI stay open. With no UI bundle built, the API serves normally and
+  `/` is a page telling you to run `make web-build`.
+- **The six views.** `/editor` is a CodeMirror-6 Markdown editor with slash
+  commands, `[[` autocomplete, live Mermaid preview, drag-drop asset upload,
+  and debounced autosave — a node's `type` is fixed at creation, so the type
+  commands disappear once it is saved. `/search` is one box over hybrid search
+  that renders the server's order and never re-ranks it, with the per-signal
+  breakdown made legible. `/review` is the proposal queue and the policy
+  editor: a reject always asks for a reason, an accept always shows what it
+  will write, and the `min_confidence` trap is called out where it is set.
+  `/graph` renders `subgraph` in Cytoscape, with truncation and the
+  confidence floor's exclusions stated on screen rather than in a footnote.
+  `/assets` is the rendition grid and lightbox; `/history/:nodeId` is the
+  version timeline and side-by-side diff. Every route is a real URL that
+  survives a reload. Source and conventions: [`web/README.md`](web/README.md).
 - **Assets and renditions.** `asset register` streams a file into the
   database keyed by its sha256 (dedup is free) and records its metadata row;
   the copy is re-hashed as it is written, so a file that changed since it was
@@ -167,6 +216,19 @@ degrades to BM25 + graph expansion. `NODUM_EMBED_MODEL` switches the model
   up and you have backed up the graph, its history, and its binaries. Over
   MCP, `get_asset` returns metadata plus a rendition image block: **LLMs never
   receive original binaries** (design §5.7).
+- **Bounded reads for interactive clients.** `nodum subgraph` is `traverse`
+  with the filters a graph view needs — edge type, edge state, confidence
+  floor, edge author, node type — composed as one conjunction in SQL, plus a
+  `--limit` on nodes that is enforced **during** the breadth-first walk rather
+  than by slicing a materialized graph afterwards. A caller therefore cannot
+  ask for an unbounded result, and `truncated` on the response says whether
+  the cap cut the walk short instead of leaving a partial view to pass as the
+  whole neighborhood. An edge whose far node the filters exclude is dropped
+  with it, so the result never carries an edge pointing outside its own node
+  list. `nodum suggest-links "Grap"` is the companion title-prefix lookup
+  behind a `[[` autocomplete: it reads the node table directly, never a
+  projector index, so it answers on a cold database — an empty list always
+  means "no such title", never "the index has not run".
 - **Event log + versions.** Every mutation appends an event (actor, op, full
   before/after JSON payload) and — for nodes — a version snapshot. `undo`
   reverses an event by restoring its `before` state. It never cascades beyond
@@ -193,6 +255,25 @@ make test      # pytest
 make lint      # ruff check + format check
 make format    # ruff auto-fix + format (run after every code change)
 ```
+
+The frontend is a build-time dependency only — the wheel ships the built
+bundle and the runtime is pure Python:
+
+```sh
+make web-install    # npm ci in web/ (once)
+make web-test       # vitest over the pure modules in web/src
+make web-build      # tsc --noEmit && vite build -> nodum/_web/
+make web-dev        # Vite dev server on :5173, proxying /api to :8420
+make web-clean      # drop the bundle; nodum serve falls back to the placeholder
+```
+
+`make web-test` and `make web-build` are both CI gates. The test run pins a
+non-UTC `TZ`: the timestamp bug `web/src/lib/time.ts` fixes is invisible on a
+UTC machine, which is what CI is.
+
+`nodum/_web/` is gitignored whole (Vite wipes the directory on every build),
+and hatchling re-includes it in the wheel as a declared artifact, so a release
+must run `make web-build` before `uv build`.
 
 The package version is derived from the git tag (`vX.Y.Z`) at build time by
 hatch-vcs and is never committed.

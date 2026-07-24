@@ -1,0 +1,421 @@
+/*
+ * Editor view styles.
+ *
+ * Owned by the editor slice — imported from EditorView.tsx, never from
+ * `styles/index.css`. Everything is a `nd-` class for the reason the design
+ * system gives: mermaid injects a global stylesheet full of names like `.node`,
+ * `.label`, and `.edge`, and the preview pane renders its output inches from
+ * this chrome.
+ *
+ * The layout rule that matters: the editor owns the viewport below the header
+ * and nothing inside it scrolls the page. Each pane scrolls itself, so a long
+ * document, a tall diagram, and a burst of typing all leave the chrome exactly
+ * where it was.
+ */
+
+.nd-editor {
+  height: calc(100vh - var(--nd-header-height));
+  min-height: 0;
+  gap: 0;
+  overflow: hidden;
+}
+
+/* --- Meta bar --------------------------------------------------------- */
+
+.nd-editor__meta {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: var(--nd-space-4);
+  padding: var(--nd-space-6) var(--nd-space-12);
+  border-bottom: 1px solid var(--nd-border);
+  background: var(--nd-surface);
+}
+
+.nd-editor__meta-line {
+  display: flex;
+  align-items: center;
+  gap: var(--nd-space-8);
+  min-height: 2rem;
+}
+
+.nd-editor__meta-line--secondary {
+  min-height: 1.5rem;
+  flex-wrap: wrap;
+  gap: var(--nd-space-6);
+}
+
+.nd-editor__title {
+  flex: 1;
+  min-width: 0;
+  padding: var(--nd-space-2) 0;
+  border: 0;
+  background: none;
+  color: var(--nd-text);
+  font-size: var(--nd-text-lg);
+  font-weight: var(--nd-weight-semibold);
+  line-height: var(--nd-leading-tight);
+}
+
+.nd-editor__title::placeholder {
+  color: var(--nd-text-faint);
+  font-weight: var(--nd-weight-normal);
+}
+
+.nd-editor__type-field {
+  display: flex;
+  align-items: center;
+  gap: var(--nd-space-4);
+}
+
+.nd-editor__type-select {
+  width: auto;
+  min-width: 9rem;
+  padding: var(--nd-space-1) var(--nd-space-4);
+  font-size: var(--nd-text-xs);
+}
+
+.nd-editor__history-link {
+  font-size: var(--nd-text-xs);
+}
+
+.nd-editor__meta-warning {
+  color: var(--nd-warn);
+  font-size: var(--nd-text-xs);
+}
+
+.nd-editor__save-error {
+  display: flex;
+  align-items: center;
+  gap: var(--nd-space-4);
+  flex-wrap: wrap;
+  padding: var(--nd-space-4) var(--nd-space-6);
+  border: 1px solid var(--nd-danger);
+  border-radius: var(--nd-radius-md);
+  background: var(--nd-danger-wash);
+  color: var(--nd-text);
+  font-size: var(--nd-text-xs);
+}
+
+/* --- Save indicator ---------------------------------------------------
+ * Fixed width and right-aligned: this is the one element in the bar that
+ * changes several times a minute, and it must not move the title field when
+ * it does.
+ */
+
+.nd-editor__save {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--nd-space-4);
+  width: 11rem;
+  border: 0;
+  background: none;
+  color: var(--nd-text-faint);
+  font-size: var(--nd-text-xs);
+  text-align: right;
+  white-space: nowrap;
+}
+
+.nd-editor__save--dirty {
+  color: var(--nd-text-muted);
+}
+
+.nd-editor__save--saved {
+  color: var(--nd-state-active);
+}
+
+.nd-editor__save--failed {
+  color: var(--nd-danger);
+  font-weight: var(--nd-weight-semibold);
+  cursor: pointer;
+}
+
+/* --- Panes -------------------------------------------------------------- */
+
+.nd-editor__panes {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  align-items: stretch;
+}
+
+.nd-editor__pane {
+  position: relative;
+  flex: 1 1 50%;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.nd-editor__pane--source {
+  border-right: 1px solid var(--nd-border);
+}
+
+.nd-editor__pane--drop {
+  outline: 2px dashed var(--nd-accent);
+  outline-offset: -4px;
+}
+
+.nd-editor__surface {
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.nd-editor__drop-hint {
+  position: absolute;
+  inset-inline: var(--nd-space-8);
+  bottom: var(--nd-space-8);
+  padding: var(--nd-space-4) var(--nd-space-8);
+  border: 1px solid var(--nd-accent);
+  border-radius: var(--nd-radius-md);
+  background: var(--nd-surface-overlay);
+  color: var(--nd-accent-bright);
+  font-size: var(--nd-text-xs);
+  text-align: center;
+  pointer-events: none;
+}
+
+/* --- Status strip -------------------------------------------------------
+ * Floated over the editor rather than stacked above it: an upload starting
+ * must not push the line the user is typing on.
+ */
+
+.nd-editor__strip {
+  position: absolute;
+  inset-inline: var(--nd-space-6);
+  bottom: var(--nd-space-6);
+  display: flex;
+  flex-direction: column;
+  gap: var(--nd-space-2);
+  pointer-events: none;
+}
+
+.nd-editor__strip-item {
+  display: flex;
+  align-items: center;
+  gap: var(--nd-space-4);
+  padding: var(--nd-space-3) var(--nd-space-6);
+  border: 1px solid var(--nd-border-strong);
+  border-radius: var(--nd-radius-md);
+  background: var(--nd-surface-overlay);
+  box-shadow: var(--nd-shadow-raised);
+  color: var(--nd-text-muted);
+  font-size: var(--nd-text-xs);
+  pointer-events: auto;
+}
+
+.nd-editor__strip-item--failed {
+  border-color: var(--nd-danger);
+  background: var(--nd-danger-wash);
+  color: var(--nd-text);
+}
+
+.nd-editor__strip-dismiss {
+  margin-left: auto;
+  padding: 0 var(--nd-space-2);
+  border: 0;
+  background: none;
+  color: var(--nd-text-faint);
+  font-size: var(--nd-text-md);
+  line-height: 1;
+  cursor: pointer;
+}
+
+.nd-editor__strip-dismiss:hover {
+  color: var(--nd-text);
+}
+
+/* --- Preview pane -------------------------------------------------------- */
+
+.nd-editor__preview {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: var(--nd-space-12) var(--nd-space-16) 40vh;
+  background: var(--nd-bg);
+}
+
+.nd-editor__preview-idle {
+  color: var(--nd-text-faint);
+  font-size: var(--nd-text-sm);
+}
+
+/* --- Rendered Markdown ---------------------------------------------------
+ * Element selectors are scoped under `.nd-preview` because this subtree is
+ * generated HTML, not authored JSX — there is no class to hang them on.
+ */
+
+.nd-preview {
+  max-width: 46rem;
+  color: var(--nd-text);
+  font-size: var(--nd-text-md);
+  line-height: var(--nd-leading-prose);
+}
+
+.nd-preview > * + * {
+  margin-top: var(--nd-space-8);
+}
+
+.nd-preview h1,
+.nd-preview h2,
+.nd-preview h3,
+.nd-preview h4,
+.nd-preview h5,
+.nd-preview h6 {
+  margin-top: var(--nd-space-16);
+  color: var(--nd-text);
+}
+
+.nd-preview > :first-child {
+  margin-top: 0;
+}
+
+.nd-preview h2 {
+  padding-bottom: var(--nd-space-2);
+  border-bottom: 1px solid var(--nd-border);
+}
+
+.nd-preview ul,
+.nd-preview ol {
+  padding-inline-start: var(--nd-space-12);
+}
+
+.nd-preview li + li {
+  margin-top: var(--nd-space-2);
+}
+
+.nd-preview blockquote {
+  padding-left: var(--nd-space-8);
+  border-left: 3px solid var(--nd-border-strong);
+  color: var(--nd-text-muted);
+}
+
+.nd-preview pre {
+  padding: var(--nd-space-6) var(--nd-space-8);
+  border: 1px solid var(--nd-border);
+  border-radius: var(--nd-radius-md);
+  background: var(--nd-surface);
+  overflow-x: auto;
+  font-size: var(--nd-text-xs);
+  line-height: var(--nd-leading-normal);
+}
+
+.nd-preview :not(pre) > code {
+  padding: 0.1em 0.35em;
+  border-radius: var(--nd-radius-sm);
+  background: var(--nd-surface-raised);
+  color: var(--nd-accent-bright);
+}
+
+.nd-preview table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--nd-text-sm);
+}
+
+.nd-preview th,
+.nd-preview td {
+  padding: var(--nd-space-3) var(--nd-space-6);
+  border: 1px solid var(--nd-border);
+  text-align: left;
+}
+
+.nd-preview th {
+  background: var(--nd-surface);
+  color: var(--nd-text-muted);
+  font-weight: var(--nd-weight-semibold);
+}
+
+.nd-preview img {
+  max-width: 100%;
+  height: auto;
+  border-radius: var(--nd-radius-md);
+}
+
+.nd-preview hr {
+  border-top: 1px solid var(--nd-border);
+}
+
+/* --- Diagrams ------------------------------------------------------------ */
+
+.nd-preview__diagram {
+  display: flex;
+  justify-content: center;
+  padding: var(--nd-space-8);
+  border: 1px solid var(--nd-border);
+  border-radius: var(--nd-radius-md);
+  background: var(--nd-surface);
+  overflow-x: auto;
+}
+
+.nd-preview__diagram svg {
+  max-width: 100%;
+  height: auto;
+}
+
+.nd-preview__diagram--pending {
+  color: var(--nd-text-faint);
+  font-size: var(--nd-text-xs);
+}
+
+.nd-preview__diagram--failed {
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--nd-space-4);
+  justify-content: flex-start;
+  border-color: var(--nd-danger);
+  background: var(--nd-danger-wash);
+}
+
+.nd-preview__diagram-title {
+  color: var(--nd-danger);
+  font-size: var(--nd-text-sm);
+  font-weight: var(--nd-weight-semibold);
+}
+
+.nd-preview__diagram-message {
+  width: 100%;
+  margin: 0;
+  padding: var(--nd-space-4) var(--nd-space-6);
+  border-radius: var(--nd-radius-sm);
+  background: var(--nd-bg);
+  color: var(--nd-text-muted);
+  font-size: var(--nd-text-xs);
+  white-space: pre-wrap;
+  overflow-x: auto;
+}
+
+/* --- Narrow screens -------------------------------------------------------
+ * The header wraps below this width, so the viewport-height calculation stops
+ * holding; the panes stack and the view scrolls as a page instead.
+ */
+
+@media (max-width: 60rem) {
+  .nd-editor {
+    height: auto;
+    min-height: calc(100vh - var(--nd-header-height));
+    overflow: visible;
+  }
+
+  .nd-editor__panes {
+    flex-direction: column;
+  }
+
+  .nd-editor__pane--source {
+    border-right: 0;
+    border-bottom: 1px solid var(--nd-border);
+    min-height: 60vh;
+  }
+
+  .nd-editor__pane--preview {
+    min-height: 40vh;
+  }
+
+  .nd-editor__preview {
+    padding-bottom: var(--nd-space-16);
+  }
+}

@@ -259,12 +259,18 @@ class SubgraphOut(BaseModel):
 
     ``nodes`` always includes the root (first); ``edges`` are the active
     edges the walk followed (empty at depth 0).
+
+    ``truncated`` is true when a node cap stopped the walk before it ran out
+    of graph, so a caller can say "showing 200 of more" instead of presenting
+    a partial subgraph as the whole neighborhood. Only the capped read
+    (``subgraph``) can set it; the uncapped walks always report false.
     """
 
     root: str
     depth: int
     nodes: list[NodeOut]
     edges: list[EdgeOut]
+    truncated: bool = False
 
 
 class PathOut(BaseModel):
