@@ -5,7 +5,14 @@ from __future__ import annotations
 import pytest
 
 from nodum import service
-from nodum.service import InvalidTransition, NodeNotFound, TypeNotFound
+from nodum.service import (
+    EdgeNotFound,
+    InvalidTransition,
+    NodeNotFound,
+    RecordNotFound,
+    TypeNotFound,
+    VersionNotFound,
+)
 
 
 def test_create_node_defaults_active_for_human(fresh_db):
@@ -142,9 +149,34 @@ def test_transition_applies_to_edges_too(fresh_db):
     assert accepted.id == edge.id
 
 
-def test_transition_unknown_id(fresh_db):
-    with pytest.raises(NodeNotFound):
+def test_transition_unknown_id_raises_the_kind_agnostic_base(fresh_db):
+    """A bare id names no kind, so an unresolvable one is not a *node* miss.
+
+    Reporting `NodeNotFound` here told every caller the wrong thing: the id
+    may equally have been an edge or a proposed-version id.
+    """
+    with pytest.raises(RecordNotFound, match="no node, edge, or version") as raised:
         service.transition("missing", "accept")
+    assert not isinstance(raised.value, NodeNotFound | EdgeNotFound | VersionNotFound)
+
+
+def test_kind_specific_misses_keep_their_own_type(fresh_db):
+    """A caller that named a kind still gets that kind's exception…"""
+    with pytest.raises(NodeNotFound):
+        service.get_node("missing")
+    with pytest.raises(VersionNotFound):
+        service.diff_versions(1, 2)
+
+
+def test_every_not_found_is_catchable_through_one_base(fresh_db):
+    """…and one `except RecordNotFound` still covers all of them."""
+    for call in (
+        lambda: service.get_node("missing"),
+        lambda: service.diff_versions(1, 2),
+        lambda: service.transition("missing", "accept"),
+    ):
+        with pytest.raises(RecordNotFound):
+            call()
 
 
 def test_transition_unknown_action(fresh_db):

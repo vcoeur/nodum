@@ -12,19 +12,25 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import sys
+from pathlib import Path
 
 import typer
 from pydantic import BaseModel
 
-from nodum import service
+from nodum import assets, projectors, service
+from nodum import search as search_module
+from nodum.assets import AssetNotFound, AssetSourceChanged, AssetTooLarge, UnsupportedRendition
 from nodum.db import ENV_DB_VAR
 from nodum.service import (
-    EdgeNotFound,
     EventNotFound,
     InvalidTransition,
-    NodeNotFound,
+    PolicyNotFound,
+    RecordNotFound,
+    ReviewNotPermitted,
     TypeNotFound,
+    UndoNotPossible,
 )
 
 app = typer.Typer(
@@ -34,8 +40,26 @@ app = typer.Typer(
 )
 node_app = typer.Typer(no_args_is_help=True, help="Node operations.")
 edge_app = typer.Typer(no_args_is_help=True, help="Edge operations.")
+projector_app = typer.Typer(
+    no_args_is_help=True, help="Derived-index projectors over the event log."
+)
+policy_app = typer.Typer(no_args_is_help=True, help="Per-agent policy rulesets (auto-accept).")
+review_app = typer.Typer(
+    no_args_is_help=True, help="The review queue: pending proposals (human actor only)."
+)
+mcp_app = typer.Typer(
+    no_args_is_help=True, help="MCP server for external agents (read + additive tiers, design §8)."
+)
+asset_app = typer.Typer(
+    no_args_is_help=True, help="Content-addressed assets and derived image renditions."
+)
 app.add_typer(node_app, name="node")
 app.add_typer(edge_app, name="edge")
+app.add_typer(projector_app, name="projector")
+app.add_typer(policy_app, name="policy")
+app.add_typer(review_app, name="review")
+app.add_typer(mcp_app, name="mcp")
+app.add_typer(asset_app, name="asset")
 
 
 @app.callback()
@@ -94,18 +118,42 @@ def _read_content(content: str | None, content_file: str | None) -> str | None:
 
 
 def _run(func, *args, **kwargs):
-    """Call a service function, mapping expected errors to stderr + exit 1."""
+    """Call a service function, mapping expected errors to stderr + exit 1.
+
+    Everything a caller can provoke — a bad id, a refused actor, a missing
+    file, a database another writer is holding — is a message on stderr and
+    exit 1, never a traceback: the CLI's contract is one JSON object on
+    success and a readable line on failure.
+    """
     try:
         return func(*args, **kwargs)
     except (
-        NodeNotFound,
-        EdgeNotFound,
+        # RecordNotFound covers node/edge/version ids and the transition
+        # entry points that accept all three.
+        RecordNotFound,
         TypeNotFound,
         EventNotFound,
+        PolicyNotFound,
+        AssetNotFound,
+        AssetTooLarge,
+        AssetSourceChanged,
+        UnsupportedRendition,
         InvalidTransition,
+        ReviewNotPermitted,
+        UndoNotPossible,
         ValueError,
     ) as exc:
         typer.echo(str(exc), err=True)
+        raise typer.Exit(1) from exc
+    except OSError as exc:
+        # A missing/unreadable file (`asset register /missing.png`) or a
+        # database path the process cannot open.
+        typer.echo(f"{exc.strerror or exc}: {exc.filename}" if exc.filename else str(exc), err=True)
+        raise typer.Exit(1) from exc
+    except sqlite3.Error as exc:
+        # Chiefly "database is locked": SQLite allows one writer, so a
+        # concurrent write that outlasts the busy timeout lands here.
+        typer.echo(f"database error: {exc}", err=True)
         raise typer.Exit(1) from exc
 
 
@@ -145,9 +193,17 @@ def node_create(
 
 
 @node_app.command("get")
-def node_get(node_id: str = typer.Argument(..., help="Node id.")) -> None:
-    """Fetch one node by id."""
-    _emit(_run(service.get_node, node_id))
+def node_get(
+    node_id: str = typer.Argument(..., help="Node id."),
+    depth: int = typer.Option(
+        0, "--depth", help="Include the active-edge neighborhood out to this many hops."
+    ),
+) -> None:
+    """Fetch one node by id (plus its neighborhood when --depth > 0)."""
+    if depth > 0:
+        _emit(_run(service.get_neighborhood, node_id, depth=depth))
+    else:
+        _emit(_run(service.get_node, node_id))
 
 
 @node_app.command("update")
@@ -161,7 +217,7 @@ def node_update(
     set_props: list[str] | None = SET_OPTION,
     actor: str = ACTOR_OPTION,
 ) -> None:
-    """Update a node's title, content, and/or props (only given fields change)."""
+    """Update a node (applies for actor 'human', stages a proposed version otherwise)."""
     kwargs: dict = {"actor": actor}
     resolved = _read_content(content, content_file)
     if title is not None:
@@ -229,22 +285,51 @@ def edge_list(
     _print_json({"edges": [edge.model_dump(mode="json") for edge in edges], "count": len(edges)})
 
 
-@app.command()
-def accept(
-    record_id: str = typer.Argument(..., help="Node or edge id."),
+@edge_app.command("create-batch")
+def edge_create_batch(
+    suggestions_file: str = typer.Argument(
+        ..., help="JSON array of {src, dst, edge_type, props?, confidence?} ('-' = stdin)."
+    ),
     actor: str = ACTOR_OPTION,
 ) -> None:
-    """Accept a proposed node or edge (proposed → active)."""
+    """Propose a batch of edges; bad suggestions are reported, not fatal."""
+    raw = sys.stdin.read() if suggestions_file == "-" else Path(suggestions_file).read_text()
+    try:
+        suggestions = json.loads(raw)
+    except json.JSONDecodeError:
+        typer.echo("expected a JSON array of edge suggestions", err=True)
+        raise typer.Exit(1) from None
+    if not isinstance(suggestions, list):
+        typer.echo("expected a JSON array of edge suggestions", err=True)
+        raise typer.Exit(1)
+    _emit(_run(service.propose_edges, suggestions, actor=actor))
+
+
+@app.command()
+def accept(
+    record_id: str = typer.Argument(..., help="Node, edge, or proposed-version id."),
+    actor: str = ACTOR_OPTION,
+) -> None:
+    """Accept a proposed node, edge, or update (proposed → active) — human actor only.
+
+    A proposed-version id applies exactly the fields the proposal named to
+    the node as it stands now.
+    """
     _emit(_run(service.transition, record_id, "accept", actor=actor))
 
 
 @app.command()
 def reject(
-    record_id: str = typer.Argument(..., help="Node or edge id."),
+    record_id: str = typer.Argument(..., help="Node, edge, or proposed-version id."),
+    reason: str = typer.Option(..., "--reason", help="Recorded in the reject event."),
     actor: str = ACTOR_OPTION,
 ) -> None:
-    """Reject a proposed node or edge (proposed → archived)."""
-    _emit(_run(service.transition, record_id, "reject", actor=actor))
+    """Reject a proposed node, edge, or update (proposed → archived) — human actor only.
+
+    The reason is required and lands in the event payload, exactly as it does
+    for the batch `review reject` — one operation, one audit guarantee.
+    """
+    _emit(_run(service.transition, record_id, "reject", reason=reason, actor=actor))
 
 
 @app.command()
@@ -288,3 +373,350 @@ def events(limit: int = typer.Option(50, "--limit", help="Maximum rows.")) -> No
 def list_types() -> None:
     """Show the full type catalog (node types and edge types)."""
     _emit(_run(service.list_types))
+
+
+@app.command()
+def search(
+    query: str = typer.Argument(..., help="Free-text query; terms are ANDed."),
+    k: int = typer.Option(10, "--k", help="Maximum hits."),
+    state: str = typer.Option(
+        "active", "--state", help="Node-state filter ('any' searches all states)."
+    ),
+    type: str | None = typer.Option(None, "--type", "-t", help="Filter by node type."),
+    created_by: str | None = typer.Option(None, "--created-by", help="Filter by writer."),
+    created_after: str | None = typer.Option(
+        None, "--created-after", help="Only nodes created after this timestamp."
+    ),
+    created_before: str | None = typer.Option(
+        None, "--created-before", help="Only nodes created before this timestamp."
+    ),
+    expand: bool = typer.Option(
+        False, "--expand", help="Append one-hop active-edge neighbors of the hits."
+    ),
+) -> None:
+    """Hybrid-search node title + content (BM25 + vector, RRF-fused).
+
+    The vector signal participates when an embedding provider is available
+    (fastembed installed and the model cached; otherwise search silently
+    degrades to BM25). `signals` on each hit names what contributed.
+    """
+    result = _run(
+        search_module.search,
+        query,
+        k=k,
+        state=None if state == "any" else state,
+        type=type,
+        created_by=created_by,
+        created_after=created_after,
+        created_before=created_before,
+        expand=expand,
+    )
+    _emit(result)
+
+
+@app.command()
+def traverse(
+    start_id: str = typer.Argument(..., help="Node id to start from."),
+    edge_type: list[str] | None = typer.Option(
+        None, "--edge-type", help="Restrict to these edge types (repeatable)."
+    ),
+    depth: int = typer.Option(2, "--depth", help="Maximum hops."),
+    direction: str = typer.Option("both", "--direction", help="'out', 'in', or 'both'."),
+) -> None:
+    """Walk the subgraph reachable from a node over active edges."""
+    _emit(
+        _run(
+            service.traverse,
+            start_id,
+            edge_types=edge_type,
+            depth=depth,
+            direction=direction,
+        )
+    )
+
+
+@app.command(name="find-path")
+def find_path(
+    a: str = typer.Argument(..., help="Start node id."),
+    b: str = typer.Argument(..., help="Target node id."),
+) -> None:
+    """Find the shortest path between two nodes over active edges."""
+    _emit(_run(service.find_path, a, b))
+
+
+@app.command()
+def diff(
+    a: int = typer.Argument(..., help="First version id (see `history`)."),
+    b: int = typer.Argument(..., help="Second version id."),
+) -> None:
+    """Unified diff between two versions of one node."""
+    _emit(_run(service.diff_versions, a, b))
+
+
+@app.command()
+def schema(type: str = typer.Argument(..., help="Node or edge type id/name.")) -> None:
+    """Show one type's catalog entry, including its JSON schema."""
+    _emit(_run(service.get_schema, type))
+
+
+@projector_app.command("run")
+def projector_run(
+    names: list[str] | None = typer.Argument(
+        None, help="Projectors to run (default: all registered)."
+    ),
+) -> None:
+    """Apply pending event-log entries to the derived indexes."""
+    runs = _run(projectors.run_projectors, names=names)
+    _print_json({"projectors": [run.model_dump(mode="json") for run in runs], "count": len(runs)})
+
+
+@projector_app.command("rebuild")
+def projector_rebuild(name: str = typer.Argument(..., help="Projector to rebuild.")) -> None:
+    """Drop one projector's derived state and replay the full event log."""
+    _emit(_run(projectors.rebuild_projector, name))
+
+
+@projector_app.command("status")
+def projector_status() -> None:
+    """Show every projector's checkpoint, backlog, and derived-store size."""
+    statuses = _run(projectors.projector_status)
+    _print_json(
+        {
+            "projectors": [status.model_dump(mode="json") for status in statuses],
+            "count": len(statuses),
+        }
+    )
+
+
+# ── Assets and renditions ─────────────────────────────────────────────────────
+
+
+@asset_app.command("register")
+def asset_register(
+    file: str = typer.Argument(
+        ..., help="Local file to store in the database, keyed by its sha256."
+    ),
+    name: str | None = typer.Option(
+        None, "--name", help="Original name to record (default: the file's name)."
+    ),
+) -> None:
+    """Register a file as a content-addressed asset (idempotent dedup by sha256)."""
+    _emit(_run(assets.register_asset, file, name=name))
+
+
+@asset_app.command("get")
+def asset_get(
+    id_or_hash: str = typer.Argument(..., help="Asset hash or asset-reference node id."),
+) -> None:
+    """Show one asset's metadata (never its bytes)."""
+    _emit(_run(assets.get_asset, id_or_hash))
+
+
+@asset_app.command("list")
+def asset_list() -> None:
+    """List every registered asset."""
+    rows = _run(assets.list_assets)
+    _print_json({"assets": [row.model_dump(mode="json") for row in rows], "count": len(rows)})
+
+
+@asset_app.command("rendition")
+def asset_rendition(
+    id_or_hash: str = typer.Argument(..., help="Asset hash or asset-reference node id."),
+    profile: str = typer.Option("preview", "--profile", "-p", help="'thumb' or 'preview'."),
+    out: str | None = typer.Option(
+        None, "--out", "-o", help="Also write the WebP bytes to this path."
+    ),
+) -> None:
+    """Fetch an image rendition, generating and caching it on first request.
+
+    Prints the rendition metadata; image bytes stay in the database and are
+    never inlined into the JSON output — use ``--out`` to extract them.
+    """
+    rendition = _run(assets.get_rendition, id_or_hash, profile=profile)
+    if out is not None:
+        _run(assets.copy_rendition, rendition, out)
+    _emit(rendition)
+
+
+@asset_app.command("purge")
+def asset_purge(
+    asset: str | None = typer.Option(
+        None, "--asset", help="Limit the purge to one asset's renditions (hash)."
+    ),
+) -> None:
+    """Evict stored renditions (regenerable — they rebuild on next request)."""
+    _emit(_run(assets.purge_renditions, asset_hash=asset))
+
+
+# ── MCP server ────────────────────────────────────────────────────────────────
+
+
+@mcp_app.command("serve")
+def mcp_serve(
+    actor: str = typer.Option(
+        "agent:mcp",
+        "--actor",
+        help="External-agent identity every write is attributed to: 'agent:<name>'.",
+    ),
+) -> None:
+    """Launch the MCP server on stdio (read + additive tiers, design §8).
+
+    The actor must be an ``agent:<name>`` identity — the MCP surface serves
+    external agents only, so ``--actor human`` (or a malformed name) exits 1
+    rather than silently writing straight into the live graph.
+    """
+    from nodum import mcp_server
+
+    _run(mcp_server.serve, actor=actor)
+
+
+# ── Policies ──────────────────────────────────────────────────────────────────
+
+
+@policy_app.command("set")
+def policy_set(
+    agent: str = typer.Argument(..., help="Actor the policy governs, e.g. 'agent:researcher'."),
+    rule: list[str] = typer.Option(
+        ...,
+        "--rule",
+        help="Repeatable JSON rule object, e.g. "
+        '\'{"edge_type":"mentions","min_confidence":0.9,"action":"auto_accept"}\'.',
+    ),
+    actor: str = ACTOR_OPTION,
+) -> None:
+    """Create or replace an agent's policy ruleset (audited as policy.set)."""
+    rules = []
+    for raw in rule:
+        try:
+            rules.append(json.loads(raw))
+        except json.JSONDecodeError:
+            typer.echo(f"--rule expects a JSON object, got {raw!r}", err=True)
+            raise typer.Exit(1) from None
+    _emit(_run(service.set_policy, agent, rules, actor=actor))
+
+
+@policy_app.command("get")
+def policy_get(
+    agent: str = typer.Argument(..., help="Actor string, e.g. 'agent:researcher'."),
+) -> None:
+    """Show one agent's policy."""
+    _emit(_run(service.get_policy, agent))
+
+
+@policy_app.command("list")
+def policy_list() -> None:
+    """List every stored policy."""
+    policies = _run(service.list_policies)
+    _print_json(
+        {
+            "policies": [policy.model_dump(mode="json") for policy in policies],
+            "count": len(policies),
+        }
+    )
+
+
+# ── Review queue ──────────────────────────────────────────────────────────────
+
+KIND_OPTION = typer.Option(None, "--kind", help="Limit to 'node', 'edge', or 'update' proposals.")
+CREATED_BY_OPTION = typer.Option(None, "--created-by", help="Filter by proposing actor.")
+CREATED_BEFORE_OPTION = typer.Option(
+    None, "--created-before", help="Only proposals created before this timestamp."
+)
+CREATED_AFTER_OPTION = typer.Option(
+    None, "--created-after", help="Only proposals created after this timestamp."
+)
+REVIEW_TYPE_OPTION = typer.Option(None, "--type", "-t", help="Filter by node/edge type.")
+
+
+@review_app.command("queue")
+def review_queue(
+    created_by: str | None = CREATED_BY_OPTION,
+    type: str | None = REVIEW_TYPE_OPTION,
+    kind: str | None = KIND_OPTION,
+    created_before: str | None = CREATED_BEFORE_OPTION,
+    created_after: str | None = CREATED_AFTER_OPTION,
+    limit: int = typer.Option(500, "--limit", help="Maximum proposals."),
+) -> None:
+    """List pending proposals (proposed nodes/edges/updates) with reviewer context."""
+    proposals = _run(
+        service.list_proposals,
+        created_by=created_by,
+        type=type,
+        kind=kind,
+        created_before=created_before,
+        created_after=created_after,
+        limit=limit,
+    )
+    _print_json(
+        {
+            "proposals": [proposal.model_dump(mode="json") for proposal in proposals],
+            "count": len(proposals),
+        }
+    )
+
+
+@review_app.command("accept")
+def review_accept(
+    ids: list[str] = typer.Argument(..., help="Node, edge, or proposed-version ids to accept."),
+    actor: str = ACTOR_OPTION,
+) -> None:
+    """Accept proposals by id (proposed → active); bad ids are reported, not fatal."""
+    _emit(_run(service.accept_proposals, ids, actor=actor))
+
+
+@review_app.command("reject")
+def review_reject(
+    ids: list[str] = typer.Argument(..., help="Node, edge, or proposed-version ids to reject."),
+    reason: str = typer.Option(..., "--reason", help="Recorded in every reject event."),
+    actor: str = ACTOR_OPTION,
+) -> None:
+    """Reject proposals by id (proposed → archived); bad ids are reported, not fatal."""
+    _emit(_run(service.reject_proposals, ids, reason=reason, actor=actor))
+
+
+@review_app.command("accept-all")
+def review_accept_all(
+    created_by: str | None = CREATED_BY_OPTION,
+    type: str | None = REVIEW_TYPE_OPTION,
+    kind: str | None = KIND_OPTION,
+    created_before: str | None = CREATED_BEFORE_OPTION,
+    created_after: str | None = CREATED_AFTER_OPTION,
+    actor: str = ACTOR_OPTION,
+) -> None:
+    """Accept every proposal matching the filters (e.g. one agent's whole run)."""
+    _emit(
+        _run(
+            service.accept_matching,
+            created_by=created_by,
+            type=type,
+            kind=kind,
+            created_before=created_before,
+            created_after=created_after,
+            actor=actor,
+        )
+    )
+
+
+@review_app.command("reject-all")
+def review_reject_all(
+    reason: str = typer.Option(..., "--reason", help="Recorded in every reject event."),
+    created_by: str | None = CREATED_BY_OPTION,
+    type: str | None = REVIEW_TYPE_OPTION,
+    kind: str | None = KIND_OPTION,
+    created_before: str | None = CREATED_BEFORE_OPTION,
+    created_after: str | None = CREATED_AFTER_OPTION,
+    actor: str = ACTOR_OPTION,
+) -> None:
+    """Reject every proposal matching the filters, recording the reason."""
+    _emit(
+        _run(
+            service.reject_matching,
+            reason=reason,
+            created_by=created_by,
+            type=type,
+            kind=kind,
+            created_before=created_before,
+            created_after=created_after,
+            actor=actor,
+        )
+    )

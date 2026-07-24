@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from nodum import service
-from nodum.service import EventNotFound, NodeNotFound
+from nodum.service import EventNotFound, NodeNotFound, UndoNotPossible
 
 
 def _events():
@@ -140,3 +140,43 @@ def test_cannot_undo_an_undo(fresh_db):
 def test_undo_empty_log_raises(fresh_db):
     with pytest.raises(EventNotFound):
         service.undo()
+
+
+def test_undo_of_a_row_a_previous_undo_deleted_fails(fresh_db):
+    """Restoring a row that is gone is a failure, not a success with no effect."""
+    a = service.create_node(type="claim", title="A")
+    b = service.create_node(type="claim", title="B")
+    edge = service.create_edge(a.id, b.id, "supports")  # seq 3
+    service.transition(edge.id, "archive")  # seq 4
+    create_seq, archive_seq = _events()[2].seq, _events()[3].seq
+
+    service.undo(create_seq)  # the edge row is deleted
+    assert service.list_edges() == []
+
+    with pytest.raises(UndoNotPossible, match="no longer exists"):
+        service.undo(archive_seq)
+    # The archive is still open for a genuine undo — it was never marked
+    # reversed, and no phantom `undo` event claims it was.
+    undo_events = [event for event in _events() if event.op == "undo"]
+    assert [event.payload["reversed_seq"] for event in undo_events] == [create_seq]
+    assert service.list_edges() == []
+
+
+def test_undo_create_of_a_node_with_children_is_refused(fresh_db):
+    """Children are later creates: reversing one event must not delete them."""
+    page = service.create_node(type="page", title="P")
+    child = service.create_node(type="block", content="b1", parent_id=page.id)
+    create_page_seq = _events()[0].seq
+
+    with pytest.raises(UndoNotPossible, match="child node"):
+        service.undo(create_page_seq)
+
+    assert service.get_node(page.id).id == page.id
+    assert service.get_node(child.id).parent_id == page.id
+    assert [event.op for event in _events()] == ["node.create", "node.create"]
+
+    # Undoing the child's create first clears the way.
+    service.undo()
+    service.undo(create_page_seq)
+    with pytest.raises(NodeNotFound):
+        service.get_node(page.id)
