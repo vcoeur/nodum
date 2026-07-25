@@ -115,16 +115,12 @@ def test_reject_without_a_reason_is_refused(fresh_db):
 def test_every_list_command_reports_a_count(fresh_db):
     """One envelope for lists: `{"<plural>": [...], "count": n}`, no exceptions."""
     node = _run_json("node", "create", "--type", "note", "--title", "T", "--content", "body")
-    _run_json(
-        "policy", "set", "agent:x", "--rule", '{"edge_type":"mentions","action":"auto_accept"}'
-    )
     for args, key in (
         (("node", "list"), "nodes"),
         (("node", "children", node["id"]), "nodes"),
         (("edge", "list"), "edges"),
         (("history", node["id"]), "versions"),
         (("events",), "events"),
-        (("policy", "list"), "policies"),
         (("review", "queue"), "proposals"),
         (("asset", "list"), "assets"),
         (("projector", "run"), "projectors"),

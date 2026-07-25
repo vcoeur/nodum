@@ -197,7 +197,6 @@ def test_list_envelopes_are_byte_identical_to_the_cli(client, fresh_db, http_pat
 def test_every_list_endpoint_uses_the_named_key_plus_count(client, fresh_db):
     node = service.create_node(type="note", title="Envelope", content="x")
     service.create_node(type="note", title="Child", parent_id=node.id)
-    service.set_policy(AGENT, [{"edge_type": "mentions", "action": "auto_accept"}])
     service.create_node(type="note", title="Proposed", actor=AGENT)
 
     for path, key in [
@@ -207,7 +206,6 @@ def test_every_list_endpoint_uses_the_named_key_plus_count(client, fresh_db):
         ("/api/edges", "edges"),
         ("/api/links/suggest?prefix=", "nodes"),
         ("/api/review/queue", "proposals"),
-        ("/api/policies", "policies"),
         ("/api/assets", "assets"),
         ("/api/events", "events"),
     ]:
@@ -360,7 +358,6 @@ def test_real_failures_carry_the_same_taxonomy(client, fresh_db):
     assert client.get("/api/nodes/does-not-exist").status_code == 404
     assert client.get("/api/nodes/does-not-exist").json()["error"]["type"] == "NodeNotFound"
     assert client.get("/api/schema/nope").status_code == 404
-    assert client.get("/api/policies/agent:nobody").status_code == 404
     assert client.get("/api/assets/deadbeef").status_code == 404
     # A bad enum value is the caller's fault, not a missing record.
     assert client.get("/api/nodes?state=bogus").status_code == 400
@@ -651,7 +648,6 @@ def test_no_write_service_function_is_reachable_under_any_name():
         "create_edge",
         "transition",
         "undo",
-        "set_policy",
         "accept_proposals",
         "reject_proposals",
         "accept_matching",
@@ -783,7 +779,6 @@ def test_no_event_that_writes_live_state_is_attributable_to_an_agent(client, fre
             json={"src_id": note["id"], "dst_id": concept["id"], "type": "relates_to"},
         )
     )
-    _ok(client.put("/api/policies/agent:bot", json={"rules": []}))
     _ok(client.post("/api/assets", files={"file": ("photo.png", _png_bytes(), "image/png")}))
 
     accepted = service.create_node(type="note", title="Accept me", actor=AGENT)
@@ -906,7 +901,6 @@ CSRF_WRITES = [
     ("POST", "/api/nodes"),
     ("POST", "/api/edges"),
     ("PATCH", "/api/nodes/x"),
-    ("PUT", "/api/policies/agent:bot"),
 ]
 
 
@@ -1472,43 +1466,6 @@ def test_review_queue_filters_and_batch_forms(client, fresh_db):
     assert service.get_node(second.id).state == "archived"
     reject_event = _events("node.reject")[0]
     assert reject_event.payload["reason"] == "no"
-
-
-def test_policies_read_and_write(client, fresh_db):
-    rules = [{"edge_type": "mentions", "action": "auto_accept"}]
-    stored = _ok(client.put("/api/policies/agent:bot", json={"rules": rules}))
-    assert stored["rules"] == rules
-    assert stored["updated_by"] == service.ACTOR_HUMAN
-
-    assert _ok(client.get("/api/policies"))["count"] == 1
-    assert _ok(client.get("/api/policies/agent:bot"))["agent"] == "agent:bot"
-
-    assert client.put("/api/policies/agent:bot", json={}).status_code == 400
-    malformed = client.put("/api/policies/agent:bot", json={"rules": [{"action": "nope"}]})
-    assert malformed.status_code == 400
-
-
-def test_disabling_a_policy_is_an_explicit_empty_ruleset(client, fresh_db):
-    """No adapter-invented ``enabled`` flag: the body is ``{"rules": [...]}`` only.
-
-    ``PolicyOut`` has no ``enabled`` field and the service's only
-    representation of "disabled" is an empty ruleset, so a caller that wants to
-    disable must say so and see it. A flag would have wiped a stored ruleset on
-    a value the domain cannot express — silently destructive, and unrecoverable
-    once the response shows ``rules: []``.
-    """
-    rules = [{"edge_type": "mentions", "action": "auto_accept"}]
-    _ok(client.put("/api/policies/agent:bot", json={"rules": rules}))
-
-    disabled = _ok(client.put("/api/policies/agent:bot", json={"rules": []}))
-    assert disabled["rules"] == []
-    assert service.get_policy("agent:bot").rules == []
-
-    # An `enabled` key is inert: it is not read, so the rules still land.
-    untouched = _ok(client.put("/api/policies/agent:bot", json={"rules": rules, "enabled": False}))
-    assert untouched["rules"] == rules
-    assert service.get_policy("agent:bot").rules == rules
-    assert "enabled" not in _ok(client.get("/api/policies/agent:bot"))
 
 
 def test_asset_upload_list_get_and_rendition(client, fresh_db):

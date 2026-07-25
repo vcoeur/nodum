@@ -421,6 +421,88 @@ CREATE UNIQUE INDEX idx_asset_ref_per_space ON nodes(
 """
 
 
+PRINCIPALS_DDL = """
+-- Principals and grants (Q13, design §5.2 as amended 2026-07-25). Human
+-- accounts are identity + credentials + attribution, never a permission
+-- scope — the file is the only isolation boundary, and every human is
+-- full-rights. Agents act within per-(agent, space) grants; the owner
+-- holds no grants at all. The policies table dies here (design §8.3:
+-- learned trust, no policy layer) — auto-accept on the write path dies
+-- with it.
+CREATE TABLE humans (
+    id              TEXT PRIMARY KEY,
+    name            TEXT NOT NULL,
+    credential_hash TEXT,                -- argon2id; NULL until a password is set
+    disabled        INTEGER NOT NULL DEFAULT 0,
+    created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE agents (
+    id              TEXT PRIMARY KEY,
+    kind            TEXT NOT NULL CHECK (kind IN ('internal','external')),
+    name            TEXT NOT NULL,
+    owner_human_id  TEXT REFERENCES humans(id),  -- NOT NULL for external; NULL for internal
+    credential_hash TEXT,                -- sha-256 of the current token; NULL for internal
+    disabled        INTEGER NOT NULL DEFAULT 0,
+    created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE grants (
+    agent_id   TEXT NOT NULL REFERENCES agents(id),
+    space_id   TEXT NOT NULL REFERENCES nodes(id),   -- a node of builtin type 'space'
+    level      TEXT NOT NULL CHECK (level IN ('read','suggest','edit')),
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (agent_id, space_id)
+);
+
+CREATE TABLE sessions (
+    id         TEXT PRIMARY KEY,         -- random; the cookie value
+    human_id   TEXT NOT NULL REFERENCES humans(id),
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    expires_at TEXT NOT NULL             -- 30 days, sliding
+);
+
+-- The first human account: trusted-local bootstrap, no password yet — it
+-- cannot log in over HTTP until `nodum human passwd` sets one.
+INSERT INTO humans (id, name) VALUES ('owner', 'owner');
+
+-- One agents row per agent identity the log already knows (event actors,
+-- version actors, created_by columns, and the dying policies table), all
+-- external, owned by the first human, with no token — they cannot
+-- authenticate until one is minted.
+INSERT INTO agents (id, kind, name, owner_human_id)
+SELECT DISTINCT name, 'external', name, 'owner' FROM (
+    SELECT substr(actor, 7) AS name FROM events WHERE actor LIKE 'agent:%'
+    UNION SELECT substr(actor, 7) FROM versions WHERE actor LIKE 'agent:%'
+    UNION SELECT substr(created_by, 7) FROM nodes WHERE created_by LIKE 'agent:%'
+    UNION SELECT substr(created_by, 7) FROM edges WHERE created_by LIKE 'agent:%'
+    UNION SELECT agent FROM policies
+);
+
+-- Parity grants: exactly today's behaviour (read everything, propose
+-- anywhere) so migration changes no agent's effective reach. The owner
+-- tightens from here.
+INSERT INTO grants (agent_id, space_id, level)
+SELECT id, 'meta', 'read' FROM agents;
+INSERT INTO grants (agent_id, space_id, level)
+SELECT id, 'main', 'suggest' FROM agents;
+
+DROP TABLE policies;
+"""
+
+
+ACTOR_STRINGS_DDL = """
+-- Structured actor strings (Q13 R2): the bare 'human' becomes a reference
+-- to the first human account. Agent strings are already 'agent:<name>'
+-- with agent ids equal to the names, so they need no rewrite. Event
+-- payloads (JSON before/after) are immutable history and keep old values.
+UPDATE events   SET actor      = 'human:owner' WHERE actor      = 'human';
+UPDATE versions SET actor      = 'human:owner' WHERE actor      = 'human';
+UPDATE nodes    SET created_by = 'human:owner' WHERE created_by = 'human';
+UPDATE edges    SET created_by = 'human:owner' WHERE created_by = 'human';
+"""
+
+
 #: Ordered (name, SQL) migrations. Append-only — never edit a shipped entry.
 MIGRATIONS: list[tuple[str, str]] = [
     ("0001_core", CORE_DDL),
@@ -432,4 +514,6 @@ MIGRATIONS: list[tuple[str, str]] = [
     ("0007_assets_and_renditions", ASSETS_DDL),
     ("0008_version_proposed_fields", PROPOSED_FIELDS_DDL),
     ("0009_spaces_and_type_nodes", SPACES_AND_TYPE_NODES_DDL),
+    ("0010_principals", PRINCIPALS_DDL),
+    ("0011_actor_strings", ACTOR_STRINGS_DDL),
 ]

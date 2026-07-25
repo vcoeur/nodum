@@ -137,21 +137,17 @@ def test_update_node_stages_a_proposed_version(fresh_db):
     assert service.get_node(note.id).content == "original body"
 
 
-def test_link_and_policy_auto_accept(fresh_db):
+def test_link_lands_proposed(fresh_db):
     a = service.create_node(type="concept", title="A")
     b = service.create_node(type="concept", title="B")
-    c = service.create_node(type="concept", title="C")
-    service.set_policy(AGENT, [{"edge_type": "mentions", "action": "auto_accept"}])
 
     async def scenario(session):
-        auto = await _call(session, "link", {"src": a.id, "dst": b.id, "edge_type": "mentions"})
-        gated = await _call(session, "link", {"src": a.id, "dst": c.id, "edge_type": "supports"})
-        return auto.structuredContent, gated.structuredContent
+        edge = await _call(session, "link", {"src": a.id, "dst": b.id, "edge_type": "mentions"})
+        return edge.structuredContent
 
-    auto_edge, gated_edge = _run(scenario)
-    assert auto_edge["state"] == "active"  # policy auto-accepted
-    assert auto_edge["created_by"] == AGENT
-    assert gated_edge["state"] == "proposed"  # no matching rule
+    edge = _run(scenario)
+    assert edge["state"] == "proposed"
+    assert edge["created_by"] == AGENT
 
 
 def test_propose_edges_batch(fresh_db):

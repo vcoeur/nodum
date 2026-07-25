@@ -33,7 +33,6 @@ from nodum.models import (
     ItemFailure,
     NodeOut,
     PathOut,
-    PolicyOut,
     ProposalOut,
     ProposeEdgesOut,
     SubgraphOut,
@@ -64,11 +63,10 @@ TRANSITIONS = {
 REVIEW_ACTIONS = ("accept", "reject")
 
 #: Operations reserved to the ``human`` actor, each mapped to why it is not
-#: delegable. They either write or remove **live** state directly, or (setting
-#: a policy) grant the auto-accept privilege that does — precisely what an
-#: agent may never reach on its own (design §8.1/§8.2). A review rule would
-#: mean nothing if the same agent could reach the same live state through the
-#: back door of an archive, an undo, or a self-granted auto-accept policy.
+#: delegable. They either write or remove **live** state directly — precisely
+#: what an agent may never reach on its own (design §8.1/§8.2). A review rule
+#: would mean nothing if the same agent could reach the same live state
+#: through the back door of an archive or an undo.
 HUMAN_ONLY_ACTIONS = {
     "accept": "review is the human tier and is never delegated to an agent",
     "reject": "review is the human tier and is never delegated to an agent",
@@ -77,11 +75,6 @@ HUMAN_ONLY_ACTIONS = {
         "undo writes an event's prior payload back verbatim — including "
         "state 'active' — so delegating it would hand an agent the live state "
         "it may not write directly"
-    ),
-    "set a policy": (
-        "a policy grants auto-accept — the privilege to land writes live "
-        "without review — so an agent setting one would self-grant the direct "
-        "write to live state the human tier exists to withhold"
     ),
 }
 
@@ -108,16 +101,6 @@ MAX_SUBGRAPH_LIMIT = 2000
 #: the edge list needs its own bound, derived from ``limit`` so that one
 #: argument still describes the size of the whole result.
 SUBGRAPH_EDGE_FACTOR = 8
-
-#: Policy rule actions (design §8.3). Only ``auto_accept`` is evaluated on the
-#: direct write path today; ``auto_apply``/``always_propose`` govern internal
-#: agent jobs and are stored for the Phase-5 runtime.
-POLICY_ACTIONS = ("auto_accept", "auto_apply", "always_propose")
-
-#: Policy rule key opting a ``min_confidence`` gate in to grading the *agent's
-#: own* self-reported confidence. Absent (the default), a gated rule never
-#: auto-accepts on the direct write path — see :func:`_auto_accept_rule`.
-TRUST_SELF_CONFIDENCE = "trust_self_reported_confidence"
 
 #: Sentinel distinguishing "argument not given" from an explicit ``None``.
 _UNSET: Any = object()
@@ -152,10 +135,6 @@ class EventNotFound(LookupError):
     """Raised when an event seq does not resolve."""
 
 
-class PolicyNotFound(LookupError):
-    """Raised when no policy is stored for an agent."""
-
-
 class VersionNotFound(RecordNotFound):
     """Raised when a version id does not resolve."""
 
@@ -165,11 +144,10 @@ class InvalidTransition(ValueError):
 
 
 class ReviewNotPermitted(PermissionError):
-    """Raised when a non-human actor tries to review, archive, undo, or set a policy.
+    """Raised when a non-human actor tries to review, archive, or undo.
 
     The human tier is :data:`HUMAN_ONLY_ACTIONS`: accepting or rejecting a
-    proposal, archiving live state, undoing an event, and setting an agent
-    policy (which grants auto-accept).
+    proposal, archiving live state, and undoing an event.
     """
 
 
@@ -517,13 +495,8 @@ def _insert_edge(
     actor: str,
     state: str,
     cycle_id: str | None = None,
-    policy_rule: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Insert one edge row and emit its create/propose event; returns the row.
-
-    ``policy_rule`` records the policy rule that auto-accepted the write, so
-    the event log alone shows *why* an agent write landed active (design §6).
-    """
+    """Insert one edge row and emit its create/propose event; returns the row."""
     edge_id = uuid.uuid4().hex
     conn.execute(
         """
@@ -543,8 +516,6 @@ def _insert_edge(
     )
     row = _row_dict(_get_edge_row(conn, edge_id))
     payload: dict[str, Any] = {"before": None, "after": row}
-    if policy_rule is not None:
-        payload["policy_rule"] = policy_rule
     _emit(
         conn,
         actor,
@@ -575,101 +546,6 @@ def _set_edge_state(
         payload["reason"] = reason
     _emit(conn, actor, f"edge.{action}", payload, cycle_id=cycle_id)
     return after
-
-
-# ── Agent policies (design §8.3) ──────────────────────────────────────────────
-
-
-def _validate_rules(conn: sqlite3.Connection, rules: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Validate a policy ruleset and return it with edge types resolved to ids.
-
-    A rule must name at least one key (``job`` or ``edge_type``), carry a known
-    ``action``, and — when present — a ``min_confidence`` in ``[0, 1]`` and a
-    boolean :data:`TRUST_SELF_CONFIDENCE`. An ``edge_type`` must resolve
-    against the catalog (it is stored as its id). Unknown extra keys pass
-    through untouched.
-
-    Raises:
-        ValueError: If a rule is malformed.
-        TypeNotFound: If a rule's ``edge_type`` does not resolve.
-    """
-    validated: list[dict[str, Any]] = []
-    for index, rule in enumerate(rules):
-        if not isinstance(rule, dict):
-            raise ValueError(f"policy rule {index} must be an object, got {rule!r}")
-        action = rule.get("action")
-        if action not in POLICY_ACTIONS:
-            raise ValueError(
-                f"policy rule {index}: action must be one of {POLICY_ACTIONS}, got {action!r}"
-            )
-        if "job" not in rule and "edge_type" not in rule:
-            raise ValueError(f"policy rule {index}: needs a 'job' or 'edge_type' key")
-        min_confidence = rule.get("min_confidence")
-        if min_confidence is not None and not 0 <= min_confidence <= 1:
-            raise ValueError(
-                f"policy rule {index}: min_confidence must be between 0 and 1, got {min_confidence}"
-            )
-        trusted = rule.get(TRUST_SELF_CONFIDENCE)
-        if trusted is not None and not isinstance(trusted, bool):
-            raise ValueError(
-                f"policy rule {index}: {TRUST_SELF_CONFIDENCE} must be true or false, "
-                f"got {trusted!r}"
-            )
-        normalized = dict(rule)
-        if "edge_type" in rule:
-            normalized["edge_type"] = _resolve_edge_type(conn, str(rule["edge_type"]))
-        validated.append(normalized)
-    return validated
-
-
-def _policy_out(row: sqlite3.Row) -> PolicyOut:
-    """Build the public policy model from a policies row (rules decoded)."""
-    return PolicyOut(
-        agent=row["agent"],
-        rules=json.loads(row["rules"]),
-        updated_by=row["updated_by"],
-        updated_at=row["updated_at"],
-    )
-
-
-def _auto_accept_rule(
-    conn: sqlite3.Connection,
-    actor: str,
-    edge_type_id: str,
-    confidence: float | None,
-) -> dict[str, Any] | None:
-    """Return the policy rule auto-accepting this edge write, or ``None``.
-
-    Only the actor's own policy (exact actor-string match) applies, and only
-    its ``edge_type`` rules with action ``auto_accept`` — ``job`` rules govern
-    the internal runtime, not direct writes. A rule with no ``min_confidence``
-    is an unconditional grant and matches on edge type alone.
-
-    **A ``min_confidence`` gate grades untrusted input.** The only confidence
-    available on the direct write path is the one the writing agent reports
-    about its own write, so an agent that wants a write to land ``active`` can
-    simply claim ``1.0`` — the gate is self-graded and, on its own, worth
-    nothing. A gated rule therefore fires only when the policy explicitly opts
-    in with ``"trust_self_reported_confidence": true``
-    (:data:`TRUST_SELF_CONFIDENCE`); without that flag the gate can never be
-    satisfied here and the edge stays ``proposed`` for human review. When a
-    later phase supplies an independently measured confidence, it grades
-    against the same gate without the opt-in.
-    """
-    row = conn.execute("SELECT rules FROM policies WHERE agent = ?", (actor,)).fetchone()
-    if row is None:
-        return None
-    for rule in json.loads(row["rules"]):
-        if rule.get("action") != "auto_accept" or rule.get("edge_type") != edge_type_id:
-            continue
-        gate = rule.get("min_confidence")
-        if gate is None:
-            return rule
-        if rule.get(TRUST_SELF_CONFIDENCE) is not True:
-            continue
-        if confidence is not None and confidence >= gate:
-            return rule
-    return None
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -1042,8 +918,8 @@ def _create_edge_in_conn(
     """Validate and write one edge inside an open connection (no commit).
 
     Shared by :func:`create_edge` and :func:`propose_edges`. The landing
-    state follows the actor rule unless the actor's policy auto-accepts the
-    write (design §8.3).
+    state follows the actor rule (grant-aware levels land with the scoped
+    store, Q13 step 2).
     """
     _get_node_row(conn, src_id)
     _get_node_row(conn, dst_id)
@@ -1051,11 +927,6 @@ def _create_edge_in_conn(
     if confidence is not None and not 0 <= confidence <= 1:
         raise ValueError(f"confidence must be between 0 and 1, got {confidence}")
     state = _default_state(actor)
-    policy_rule = None
-    if state == "proposed":
-        policy_rule = _auto_accept_rule(conn, actor, type_id, confidence)
-        if policy_rule is not None:
-            state = "active"
     return _insert_edge(
         conn,
         src_id=src_id,
@@ -1065,7 +936,6 @@ def _create_edge_in_conn(
         confidence=confidence,
         actor=actor,
         state=state,
-        policy_rule=policy_rule,
     )
 
 
@@ -1082,11 +952,7 @@ def create_edge(
     """Create a typed, directed edge and emit ``edge.create``/``edge.propose``.
 
     Both endpoints must exist. The initial state follows the actor rule
-    (``active`` for humans, ``proposed`` otherwise) unless the actor's policy
-    auto-accepts the write (design §8.3: a matching ``edge_type`` rule with
-    action ``auto_accept`` whose confidence gate passes). An auto-accepted
-    write is still the agent's own event — the op records the landing state
-    (``edge.create``) and the payload records the matched rule.
+    (``active`` for humans, ``proposed`` otherwise).
 
     Raises:
         NodeNotFound: If either endpoint does not resolve.
@@ -1114,7 +980,7 @@ def propose_edges(
 
     Each suggestion names ``src``, ``dst``, and ``edge_type``, plus optional
     ``props`` and ``confidence`` — the same inputs as :func:`create_edge`,
-    including policy auto-accept. A malformed suggestion (missing key,
+    A malformed suggestion (missing key,
     unknown endpoint/type, bad confidence) lands in ``failed`` with its
     input index; the rest still write. One commit for the whole batch.
 
@@ -1744,101 +1610,6 @@ def reject_matching(
     return _transition_many(ids, "reject", actor=actor, reason=reason, path=path)
 
 
-# ── Policy CRUD (design §8.3) ─────────────────────────────────────────────────
-
-
-def set_policy(
-    agent: str,
-    rules: list[dict[str, Any]],
-    *,
-    actor: str = ACTOR_HUMAN,
-    path: str | Path | None = None,
-) -> PolicyOut:
-    """Create or replace one agent's policy ruleset, emitting ``policy.set``.
-
-    Rules are validated (see :func:`_validate_rules`) and stored with edge
-    types resolved to ids. Setting an empty ruleset disables the policy. The
-    event payload carries the full before/after rulesets — policy grants
-    write privileges, so every edit is audited with its actor.
-
-    A rule's optional ``min_confidence`` gate grades the confidence the agent
-    reports about **its own** write — untrusted input the agent is free to
-    inflate. A gated rule is therefore inert on the direct write path unless
-    the same rule also carries ``"trust_self_reported_confidence": true``,
-    which is how a human says in writing "I accept this agent's self-grading
-    for this edge type". Set a gate without the flag and the write stays
-    ``proposed``; see :func:`_auto_accept_rule`.
-
-    Args:
-        agent: The actor string the policy governs (e.g. ``agent:researcher``).
-        rules: The ruleset (list of rule objects).
-        actor: Who is editing the policy. Human-only: a policy grants
-            auto-accept, so an agent setting one would self-grant the live
-            write the human tier exists to withhold.
-        path: Explicit database path.
-
-    Returns:
-        The stored policy.
-
-    Raises:
-        ReviewNotPermitted: If ``actor`` is not ``human``.
-    """
-    _require_human_reviewer(actor, "set a policy")
-    conn = _connect(path)
-    try:
-        validated = _validate_rules(conn, rules)
-        existing = conn.execute("SELECT rules FROM policies WHERE agent = ?", (agent,)).fetchone()
-        before = json.loads(existing["rules"]) if existing else None
-        conn.execute(
-            """
-            INSERT INTO policies (agent, rules, updated_by, updated_at)
-            VALUES (?, ?, ?, datetime('now'))
-            ON CONFLICT(agent) DO UPDATE SET
-                rules = excluded.rules,
-                updated_by = excluded.updated_by,
-                updated_at = excluded.updated_at
-            """,
-            (agent, json.dumps(validated, ensure_ascii=False), actor),
-        )
-        _emit(
-            conn,
-            actor,
-            "policy.set",
-            {"agent": agent, "before": before, "after": validated},
-        )
-        row = conn.execute("SELECT * FROM policies WHERE agent = ?", (agent,)).fetchone()
-        conn.commit()
-        return _policy_out(row)
-    finally:
-        conn.close()
-
-
-def get_policy(agent: str, *, path: str | Path | None = None) -> PolicyOut:
-    """Fetch one agent's policy.
-
-    Raises:
-        PolicyNotFound: If no policy is stored for ``agent``.
-    """
-    conn = _connect(path)
-    try:
-        row = conn.execute("SELECT * FROM policies WHERE agent = ?", (agent,)).fetchone()
-        if row is None:
-            raise PolicyNotFound(f"no policy for agent: {agent}")
-        return _policy_out(row)
-    finally:
-        conn.close()
-
-
-def list_policies(*, path: str | Path | None = None) -> list[PolicyOut]:
-    """List every stored policy, ordered by agent."""
-    conn = _connect(path)
-    try:
-        rows = conn.execute("SELECT * FROM policies ORDER BY agent").fetchall()
-        return [_policy_out(row) for row in rows]
-    finally:
-        conn.close()
-
-
 def undo(
     seq: int | None = None, *, actor: str = ACTOR_HUMAN, path: str | Path | None = None
 ) -> UndoResult:
@@ -1851,7 +1622,7 @@ def undo(
     wikilink materialisation so the graph stays consistent with the restored
     content. The reversal itself is appended as an ``undo`` event; undo
     events cannot themselves be undone. Only graph events (``node.*`` /
-    ``edge.*``) are reversible — audited non-graph events (``policy.set``)
+    ``edge.*``) are reversible — audited non-graph events
     are skipped by default and refused when named explicitly.
 
     Undo is the **human tier**: restoring an event's payload writes arbitrary
@@ -2237,9 +2008,8 @@ def subgraph(
     result never contains an edge pointing at a node it does not carry. The
     root is always present and is exempt from ``node_types`` — it is what was
     asked for, not something the walk found. A ``min_confidence`` floor drops
-    edges with no stated confidence: unstated is not "meets the bar", the same
-    reading the policy gate takes (:func:`_auto_accept_rule`). A filter that
-    removes nodes does *not* set ``truncated`` — the caller asked for that.
+    edges with no stated confidence: unstated is not "meets the bar". A filter
+    that removes nodes does *not* set ``truncated`` — the caller asked for that.
 
     The walk is breadth-first and undirected (edges count in either
     direction); within a level, edges are taken in ``(created_at, rowid)``

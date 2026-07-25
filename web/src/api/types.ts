@@ -177,35 +177,6 @@ export interface SearchResult {
 }
 
 /**
- * One agent's policy ruleset (design §8.3).
- *
- * `rules` is the stored JSON ruleset verbatim: rule objects keyed by `job` or
- * `edge_type`, each with an `action` and an optional `min_confidence` gate.
- */
-export interface PolicyOut {
-  agent: string;
-  rules: PolicyRule[];
-  updated_by: string;
-  updated_at: string;
-}
-
-/**
- * One policy rule. Unknown extra keys are preserved by the service for forward
- * compatibility, hence the index signature.
- *
- * A `min_confidence` gate grades the agent's *self-reported* confidence, so it
- * is inert unless the same rule sets `trust_self_reported_confidence: true`.
- */
-export interface PolicyRule {
-  job?: string;
-  edge_type?: string;
-  action?: "auto_accept" | "auto_apply" | "always_propose" | string;
-  min_confidence?: number;
-  trust_self_reported_confidence?: boolean;
-  [key: string]: unknown;
-}
-
-/**
  * One pending proposal in the review queue.
  *
  * `context` carries what a reviewer needs beyond the row itself — for an edge,
@@ -484,9 +455,4 @@ export interface AcceptProposalsBody {
 export interface RejectProposalsBody {
   ids: string[];
   reason: string;
-}
-
-/** Body for `PUT /api/policies/{agent}`. */
-export interface SetPolicyBody {
-  rules: PolicyRule[];
 }

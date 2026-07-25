@@ -29,7 +29,6 @@ from nodum.envelope import envelope, list_envelope, render_json
 from nodum.service import (
     EventNotFound,
     InvalidTransition,
-    PolicyNotFound,
     RecordNotFound,
     ReviewNotPermitted,
     TypeNotFound,
@@ -46,7 +45,6 @@ edge_app = typer.Typer(no_args_is_help=True, help="Edge operations.")
 projector_app = typer.Typer(
     no_args_is_help=True, help="Derived-index projectors over the event log."
 )
-policy_app = typer.Typer(no_args_is_help=True, help="Per-agent policy rulesets (auto-accept).")
 review_app = typer.Typer(
     no_args_is_help=True, help="The review queue: pending proposals (human actor only)."
 )
@@ -59,7 +57,6 @@ asset_app = typer.Typer(
 app.add_typer(node_app, name="node")
 app.add_typer(edge_app, name="edge")
 app.add_typer(projector_app, name="projector")
-app.add_typer(policy_app, name="policy")
 app.add_typer(review_app, name="review")
 app.add_typer(mcp_app, name="mcp")
 app.add_typer(asset_app, name="asset")
@@ -155,7 +152,6 @@ def _run(func, *args, **kwargs):
         RecordNotFound,
         TypeNotFound,
         EventNotFound,
-        PolicyNotFound,
         AssetNotFound,
         AssetTooLarge,
         AssetSourceChanged,
@@ -733,46 +729,6 @@ def serve(
             typer.echo(f"could not serve on {host}:{port}", err=True)
             raise typer.Exit(1) from exc
         raise
-
-
-# ── Policies ──────────────────────────────────────────────────────────────────
-
-
-@policy_app.command("set")
-def policy_set(
-    agent: str = typer.Argument(..., help="Actor the policy governs, e.g. 'agent:researcher'."),
-    rule: list[str] = typer.Option(
-        ...,
-        "--rule",
-        help="Repeatable JSON rule object, e.g. "
-        '\'{"edge_type":"mentions","min_confidence":0.9,"action":"auto_accept"}\'.',
-    ),
-    actor: str = ACTOR_OPTION,
-) -> None:
-    """Create or replace an agent's policy ruleset (audited as policy.set)."""
-    rules = []
-    for raw in rule:
-        try:
-            rules.append(json.loads(raw))
-        except json.JSONDecodeError:
-            typer.echo(f"--rule expects a JSON object, got {raw!r}", err=True)
-            raise typer.Exit(1) from None
-    _emit(_run(service.set_policy, agent, rules, actor=actor))
-
-
-@policy_app.command("get")
-def policy_get(
-    agent: str = typer.Argument(..., help="Actor string, e.g. 'agent:researcher'."),
-) -> None:
-    """Show one agent's policy."""
-    _emit(_run(service.get_policy, agent))
-
-
-@policy_app.command("list")
-def policy_list() -> None:
-    """List every stored policy."""
-    policies = _run(service.list_policies)
-    _emit_list("policies", policies)
 
 
 # ── Review queue ──────────────────────────────────────────────────────────────

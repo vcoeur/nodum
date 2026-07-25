@@ -13,7 +13,7 @@ block); original binaries are never served over MCP.
 
 **Neither the review tier nor the curative tier is ever registered.** The
 review tools (``accept``, ``reject``) belong to the §8.1 "write
-(human/policy)" tier — accepting is a *destructive* effect (it makes proposed
+(human)" tier — accepting is a *destructive* effect (it makes proposed
 structure live and archives what that structure replaces), so it stays with
 the human, on the CLI and the review API. The curative tools
 (``merge_nodes``, ``retype``, ``supersede_edge``, ``bulk_relink``,
@@ -22,10 +22,9 @@ do not exist here, so there is no runtime check to argue around — and
 :mod:`nodum.service` refuses a non-human reviewer regardless of surface.
 
 Identity: one configured actor per server (``nodum mcp serve --actor``), so
-every write is attributed to the connecting agent and lands ``proposed``
-unless the agent's stored policy auto-accepts it. The actor must be an
-``agent:<name>`` string — this surface has no human tier to configure.
-Transport is stdio — what MCP clients actually launch.
+every write is attributed to the connecting agent and lands ``proposed``.
+The actor must be an ``agent:<name>`` string — this surface has no human
+tier to configure. Transport is stdio — what MCP clients actually launch.
 
 Every tool delegates to :mod:`nodum.service` / :mod:`nodum.search`; there is
 no logic here beyond argument mapping and JSON shaping.
@@ -56,7 +55,7 @@ _ADDITIVE = ToolAnnotations(readOnlyHint=False, destructiveHint=False)
 #: Curative tools (design §8.2) — asserted absent from the registry in tests.
 CURATIVE_TOOLS = ("merge_nodes", "retype", "supersede_edge", "bulk_relink", "consolidate")
 
-#: Review tools (design §8.1 "write (human/policy)" tier). Like the curative
+#: Review tools (design §8.1 "write (human)" tier). Like the curative
 #: tools these are **never registered** — asserted absent in tests. Accepting
 #: archives the active structure a proposal replaces, so it is destructive and
 #: human-only; the CLI (``nodum review …``) is where it lives.
@@ -116,7 +115,7 @@ def create_server(*, actor: str = "agent:mcp", db_path: str | Path | None = None
     Args:
         actor: The actor string every write is attributed to. Must be an
             ``agent:<name>`` identity (e.g. ``agent:researcher``) — writes
-            land ``proposed`` unless the agent's stored policy auto-accepts.
+            land ``proposed``.
         db_path: Explicit database path; defaults to ``NODUM_DB`` resolution.
 
     Returns:
@@ -134,10 +133,10 @@ def create_server(*, actor: str = "agent:mcp", db_path: str | Path | None = None
             "nodum knowledge graph — read tier (get_node/get_children/search/traverse/"
             "list_types/get_schema/find_path/history/diff/get_asset) and additive tier "
             "(create_node/update_node/link/propose_edges). You can only grow this graph: "
-            "every write lands as a proposal for human review unless the human's stored "
-            "policy auto-accepts it. Reviewing (accept/reject) and curative operations "
-            "are not available over MCP — they belong to the human. Assets are served as "
-            "small derived renditions — never the original binary (design §5.7)."
+            "every write lands as a proposal for human review. Reviewing (accept/reject) "
+            "and curative operations are not available over MCP — they belong to the "
+            "human. Assets are served as small derived renditions — never the original "
+            "binary (design §5.7)."
         ),
     )
 
@@ -320,11 +319,10 @@ def create_server(*, actor: str = "agent:mcp", db_path: str | Path | None = None
         props: dict[str, Any] | None = None,
         confidence: float | None = None,
     ) -> dict[str, Any]:
-        """Create a typed, directed edge; lands `proposed` unless the human's policy auto-accepts.
+        """Create a typed, directed edge; lands `proposed` for human review.
 
-        `confidence` is your own estimate and is recorded as such. It cannot
-        buy auto-accept on its own: a policy confidence gate is only graded
-        when the human's rule opts in to trusting self-reported confidence.
+        `confidence` is your own estimate and is recorded as such — it is
+        indicative data for the reviewer and triggers nothing on its own.
         """
         return _dump(
             service.create_edge(
@@ -340,7 +338,7 @@ def create_server(*, actor: str = "agent:mcp", db_path: str | Path | None = None
         """
         return _dump(service.propose_edges(suggestions, actor=actor, path=db_path))
 
-    # ── Review tier (§8.1 "write (human/policy)") is deliberately absent ──
+    # ── Review tier (§8.1 "write (human)") is deliberately absent ──
     # `accept`/`reject` are not registered here: accepting makes proposed
     # structure live and archives what it replaces, which is destructive and
     # the human's call. The human works the queue through `nodum review …`.

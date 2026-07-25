@@ -106,7 +106,6 @@ from nodum.envelope import envelope, list_envelope, render_json
 from nodum.service import (
     EventNotFound,
     InvalidTransition,
-    PolicyNotFound,
     RecordNotFound,
     ReviewNotPermitted,
     TypeNotFound,
@@ -307,7 +306,6 @@ EXCEPTION_STATUS: dict[type[Exception], int] = {
     RecordNotFound: 404,
     TypeNotFound: 404,
     EventNotFound: 404,
-    PolicyNotFound: 404,
     AssetNotFound: 404,
     # 400 — the request itself is wrong: a bad value, an impossible transition,
     # an asset that cannot be stored or rendered. OverflowError is a caller's
@@ -361,7 +359,7 @@ except metadata.PackageNotFoundError:  # pragma: no cover - uninstalled source c
 def _write(operation: Any, /, *args: Any, **kwargs: Any) -> Any:
     """Call a service write as :data:`HTTP_ACTOR` — the only actor this surface has.
 
-    Every write, review, policy, archive, and undo handler goes through here,
+    Every write, review, archive, and undo handler goes through here,
     and this is the **one** place in the module that binds ``actor`` at all. A
     caller cannot supply one: an ``actor`` keyword arriving here would mean a
     handler forwarded request data wholesale, so it is refused rather than
@@ -1243,32 +1241,6 @@ def create_app(
             raise ValueError("diff needs two version ids: ?a=<id>&b=<id>")
         return EnvelopeResponse(envelope(service.diff_versions(a, b, path=db_path)))
 
-    # ── Policies ──────────────────────────────────────────────────────────
-
-    async def list_policies(request: Request) -> Response:
-        """Every stored agent policy."""
-        return EnvelopeResponse(list_envelope("policies", service.list_policies(path=db_path)))
-
-    async def get_policy(request: Request) -> Response:
-        """One agent's ruleset."""
-        policy = service.get_policy(request.path_params["agent"], path=db_path)
-        return EnvelopeResponse(envelope(policy))
-
-    async def set_policy(request: Request) -> Response:
-        """Replace one agent's ruleset (audited as ``policy.set``; human-only).
-
-        The body is ``{"rules": [...]}`` and nothing else. Disabling a policy
-        is ``{"rules": []}`` — the service's only representation of it, and
-        there is no ``enabled`` flag to add here: an adapter-invented one would
-        wipe a stored ruleset on a value the domain cannot even express.
-        """
-        body = await _json_body(request)
-        rules = body.get("rules")
-        if not isinstance(rules, list):
-            raise ValueError("'rules' must be a list of rule objects")
-        policy = _write(service.set_policy, request.path_params["agent"], rules, path=db_path)
-        return EnvelopeResponse(envelope(policy))
-
     # ── Assets ────────────────────────────────────────────────────────────
 
     async def upload_asset(request: Request) -> Response:
@@ -1439,9 +1411,6 @@ def create_app(
         Route("/api/review/accept", review_accept, methods=["POST"]),
         Route("/api/review/reject", review_reject, methods=["POST"]),
         Route("/api/diff", diff_versions),
-        Route("/api/policies", list_policies),
-        Route("/api/policies/{agent}", get_policy),
-        Route("/api/policies/{agent}", set_policy, methods=["PUT"]),
         Route("/api/assets", list_assets),
         Route("/api/assets", upload_asset, methods=["POST"]),
         Route("/api/assets/{id}", get_asset),

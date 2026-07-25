@@ -191,25 +191,6 @@ class SearchResult(BaseModel):
     hits: list[SearchHit]
 
 
-class PolicyOut(BaseModel):
-    """One agent's policy ruleset (design §8.3).
-
-    ``rules`` is the stored JSON ruleset verbatim: rule objects keyed by
-    ``job`` (internal-agent jobs, evaluated by the Phase-5 runtime) or
-    ``edge_type`` (evaluated on the write path), each with an ``action``
-    (``auto_accept`` / ``auto_apply`` / ``always_propose``) and an optional
-    ``min_confidence`` gate. A gate grades the agent's *self-reported*
-    confidence, so it only fires when the rule also sets
-    ``trust_self_reported_confidence: true``. Rules are validated on write;
-    unknown extra keys are preserved for forward compatibility.
-    """
-
-    agent: str
-    rules: list[dict[str, Any]]
-    updated_by: str
-    updated_at: str
-
-
 class ProposalOut(BaseModel):
     """One pending proposal in the review queue.
 

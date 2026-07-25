@@ -39,14 +39,12 @@ import type {
   NodeFilters,
   NodeOut,
   PathOut,
-  PolicyOut,
   ProposalOut,
   RejectProposalsBody,
   RenditionProfile,
   ReviewQueueFilters,
   SearchFilters,
   SearchResult,
-  SetPolicyBody,
   SubgraphOut,
   SubgraphParams,
   TypeOut,
@@ -464,7 +462,7 @@ export function findPath(a: string, b: string, signal?: AbortSignal): Promise<Pa
 }
 
 /* ------------------------------------------------------------------ */
-/* Review + policy (human tier)                                         */
+/* Review (human tier)                                         */
 /* ------------------------------------------------------------------ */
 
 /** `GET /api/review/queue` — pending proposals with reviewer context, oldest first. */
@@ -513,35 +511,6 @@ export function diffVersions(a: number, b: number, signal?: AbortSignal): Promis
   return request<DiffOut>(`/diff${query({ a, b })}`, signal ? { signal } : {});
 }
 
-/** `GET /api/policies` — every stored agent policy. */
-export function listPolicies(signal?: AbortSignal): Promise<PolicyOut[]> {
-  return requestList<PolicyOut>("policies", "/policies", signal ? { signal } : {});
-}
-
-/** `GET /api/policies/{agent}` — one agent's ruleset. */
-export function getPolicy(agent: string, signal?: AbortSignal): Promise<PolicyOut> {
-  return request<PolicyOut>(`/policies/${encodeURIComponent(agent)}`, signal ? { signal } : {});
-}
-
-/**
- * `PUT /api/policies/{agent}` — replace one agent's ruleset.
- *
- * Human-only: a policy grants auto-accept, so an agent setting one would
- * self-grant the live write the human tier withholds.
- */
-export function setPolicy(
-  agent: string,
-  body: SetPolicyBody,
-  signal?: AbortSignal,
-): Promise<PolicyOut> {
-  return request<PolicyOut>(`/policies/${encodeURIComponent(agent)}`, {
-    method: "PUT",
-    body,
-    ...(signal ? { signal } : {}),
-  });
-}
-
-/* ------------------------------------------------------------------ */
 /* Assets                                                               */
 /* ------------------------------------------------------------------ */
 
@@ -642,9 +611,6 @@ export const api = {
   acceptProposals,
   rejectProposals,
   diffVersions,
-  listPolicies,
-  getPolicy,
-  setPolicy,
   uploadAsset,
   listAssets,
   getAsset,
