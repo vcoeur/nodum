@@ -262,6 +262,15 @@ Phase-1 decision log.
   `NODUM_SMOKE_REQUIRE_WEB=1`, which turns a missing bundle from a note into a
   failure; that is the check that stops a placeholder wheel reaching PyPI.
   **v0.1.0 predates this and ships the placeholder.**
+- **Docs site.** `docs/` + `mkdocs.yml` build the mkdocs-material site at
+  <https://nodum.vcoeur.com/>, deployed by `.github/workflows/docs.yml` on any
+  push to `main` that touches those paths. The build runs `--strict`, so a
+  broken internal link or a page missing from `nav` **fails CI** — check a docs
+  change locally with `uv run --with mkdocs-material mkdocs build --strict`.
+  `docs/CNAME` carries the custom domain and must survive any docs
+  reorganisation. `docs/architecture.md` is both the in-repo architecture doc
+  and a site page, so links out of it must be absolute URLs — a relative link
+  to something outside `docs/` resolves in the repo but breaks the site build.
 
 ## CLI contract (for agents driving the CLI)
 

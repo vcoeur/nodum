@@ -12,6 +12,9 @@ htmlcov/
 # JetBrains IDE project files — per-developer, never shared.
 .idea/
 
+# mkdocs build output; the docs site is built and deployed by CI.
+site/
+
 # Frontend (web/) — source is tracked, build output and deps are not.
 web/node_modules/
 web/dist/
