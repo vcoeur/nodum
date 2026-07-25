@@ -8,3 +8,14 @@ htmlcov/
 .pytest_cache/
 .ruff_cache/
 .env
+
+# Frontend (web/) — source is tracked, build output and deps are not.
+web/node_modules/
+web/dist/
+# Vite's dep-optimizer cache; pinned to web/node_modules/.vite, ignored anywhere.
+.vite/
+# The built bundle Vite emits into the package, included in the wheel as a
+# hatchling artifact. Ignored whole: Vite's emptyOutDir wipes this directory on
+# every build, so a tracked file here would be deleted each time and leave the
+# tree dirty. The "UI not built" fallback lives at nodum/_web_placeholder.html.
+nodum/_web/

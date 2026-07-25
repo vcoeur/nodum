@@ -1,0 +1,259 @@
+/*
+ * The app shell: header, view navigation, main region, and the toast stack.
+ *
+ * Owned by App.tsx and the shared components. Views style their own interiors;
+ * nothing here reaches inside `.nd-view`.
+ */
+
+.nd-app {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+}
+
+/* --- Header ---------------------------------------------------------- */
+
+.nd-header {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  gap: var(--nd-space-12);
+  height: var(--nd-header-height);
+  padding: 0 var(--nd-space-12);
+  border-bottom: 1px solid var(--nd-border);
+  background: var(--nd-surface);
+}
+
+.nd-header__brand {
+  display: flex;
+  align-items: baseline;
+  gap: var(--nd-space-4);
+  font-size: var(--nd-text-md);
+  font-weight: var(--nd-weight-semibold);
+  letter-spacing: 0.01em;
+  color: var(--nd-text);
+  text-decoration: none;
+}
+
+.nd-header__brand:hover {
+  color: var(--nd-text);
+}
+
+/* The brand mark is a knot of two edges — nodum is Latin for "knot". */
+.nd-header__mark {
+  color: var(--nd-accent);
+  flex: none;
+}
+
+.nd-header__tagline {
+  font-size: var(--nd-text-2xs);
+  font-weight: var(--nd-weight-normal);
+  letter-spacing: var(--nd-tracking-label);
+  text-transform: uppercase;
+  color: var(--nd-text-faint);
+}
+
+.nd-header__status {
+  margin-left: auto;
+}
+
+/* --- Navigation ------------------------------------------------------- */
+
+.nd-nav {
+  display: flex;
+  align-items: center;
+  gap: var(--nd-space-1);
+}
+
+.nd-nav__link {
+  padding: var(--nd-space-2) var(--nd-space-6);
+  border-radius: var(--nd-radius-md);
+  color: var(--nd-text-muted);
+  font-size: var(--nd-text-sm);
+  text-decoration: none;
+  transition:
+    color var(--nd-duration-fast) var(--nd-ease),
+    background var(--nd-duration-fast) var(--nd-ease);
+}
+
+.nd-nav__link:hover {
+  background: var(--nd-surface-raised);
+  color: var(--nd-text);
+}
+
+.nd-nav__link--active {
+  background: var(--nd-accent-wash);
+  color: var(--nd-accent-bright);
+}
+
+.nd-nav__link--active:hover {
+  color: var(--nd-accent-bright);
+}
+
+/* --- Main ------------------------------------------------------------- */
+
+.nd-main {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/** Wrapper a view can use for the common centred, padded layout. */
+.nd-view {
+  flex: 1;
+  width: 100%;
+  max-width: var(--nd-content-max);
+  margin: 0 auto;
+  padding: var(--nd-space-12);
+  display: flex;
+  flex-direction: column;
+  gap: var(--nd-space-8);
+}
+
+/** Full-bleed variant for the graph and editor, which manage their own space. */
+.nd-view--wide {
+  max-width: none;
+  padding: 0;
+}
+
+.nd-view__header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--nd-space-8);
+  flex-wrap: wrap;
+}
+
+/* --- Toasts ----------------------------------------------------------- */
+
+.nd-toast-region {
+  position: fixed;
+  right: var(--nd-space-8);
+  bottom: var(--nd-space-8);
+  z-index: var(--nd-z-toast);
+  display: flex;
+  flex-direction: column;
+  gap: var(--nd-space-4);
+  width: min(24rem, calc(100vw - 2 * var(--nd-space-8)));
+  pointer-events: none;
+}
+
+.nd-toast {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--nd-space-6);
+  padding: var(--nd-space-6) var(--nd-space-8);
+  border: 1px solid var(--nd-border-strong);
+  border-left-width: 3px;
+  border-radius: var(--nd-radius-md);
+  background: var(--nd-surface-overlay);
+  box-shadow: var(--nd-shadow-overlay);
+  pointer-events: auto;
+  animation: nd-toast-in var(--nd-duration-base) var(--nd-ease);
+}
+
+.nd-toast--error {
+  border-left-color: var(--nd-danger);
+}
+
+.nd-toast--success {
+  border-left-color: var(--nd-state-active);
+}
+
+.nd-toast--info {
+  border-left-color: var(--nd-info);
+}
+
+.nd-toast__body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--nd-space-1);
+}
+
+.nd-toast__title {
+  font-size: var(--nd-text-sm);
+  font-weight: var(--nd-weight-semibold);
+}
+
+.nd-toast__detail {
+  font-size: var(--nd-text-xs);
+  color: var(--nd-text-muted);
+  overflow-wrap: anywhere;
+}
+
+.nd-toast__dismiss {
+  flex: none;
+  padding: 0 var(--nd-space-2);
+  border: 0;
+  background: none;
+  color: var(--nd-text-faint);
+  font-size: var(--nd-text-md);
+  line-height: 1;
+  cursor: pointer;
+}
+
+.nd-toast__dismiss:hover {
+  color: var(--nd-text);
+}
+
+@keyframes nd-toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(0.5rem);
+  }
+}
+
+/* --- Error boundary ---------------------------------------------------- */
+
+.nd-crash {
+  margin: var(--nd-space-16) auto;
+  max-width: 44rem;
+  padding: var(--nd-space-12);
+  border: 1px solid var(--nd-danger);
+  border-radius: var(--nd-radius-lg);
+  background: var(--nd-danger-wash);
+  display: flex;
+  flex-direction: column;
+  gap: var(--nd-space-6);
+}
+
+.nd-crash__title {
+  color: var(--nd-danger);
+}
+
+.nd-crash__detail {
+  padding: var(--nd-space-6);
+  border-radius: var(--nd-radius-md);
+  background: var(--nd-bg);
+  color: var(--nd-text-muted);
+  font-family: var(--nd-font-mono);
+  font-size: var(--nd-text-xs);
+  white-space: pre-wrap;
+  overflow-x: auto;
+}
+
+/* --- Small screens ------------------------------------------------------ */
+
+@media (max-width: 46rem) {
+  .nd-header {
+    height: auto;
+    flex-wrap: wrap;
+    gap: var(--nd-space-4);
+    padding: var(--nd-space-4) var(--nd-space-8);
+  }
+
+  .nd-nav {
+    order: 3;
+    width: 100%;
+    overflow-x: auto;
+  }
+
+  .nd-view {
+    padding: var(--nd-space-8);
+  }
+}

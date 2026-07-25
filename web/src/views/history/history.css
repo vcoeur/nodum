@@ -1,0 +1,254 @@
+/*
+ * Version history and side-by-side diff.
+ *
+ * The diff colours are the only place in the view that is not the state ramp:
+ * removed and added lines borrow the danger and active hues at wash strength,
+ * which is the one convention a diff cannot do without. Everything that
+ * encodes a *version state* still uses the ramp, via `.nd-badge--*`.
+ */
+
+.nd-history__heading {
+  display: flex;
+  flex-direction: column;
+  gap: var(--nd-space-2);
+  min-width: 0;
+}
+
+.nd-history__subject {
+  overflow-wrap: anywhere;
+}
+
+.nd-history__links {
+  font-size: var(--nd-text-xs);
+  color: var(--nd-text-faint);
+}
+
+.nd-history__body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--nd-space-12);
+}
+
+.nd-history__timeline {
+  display: flex;
+  flex-direction: column;
+  gap: var(--nd-space-6);
+}
+
+.nd-history__timeline-head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--nd-space-8);
+  flex-wrap: wrap;
+}
+
+.nd-history__hint {
+  padding: var(--nd-space-8);
+  border: 1px dashed var(--nd-border);
+  border-radius: var(--nd-radius-lg);
+  text-align: center;
+}
+
+/* --- Timeline ---------------------------------------------------------- */
+
+.nd-timeline {
+  display: flex;
+  flex-direction: column;
+  gap: var(--nd-space-4);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.nd-timeline__row {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--nd-space-8);
+  padding: var(--nd-space-6) var(--nd-space-8);
+  border: 1px solid var(--nd-border);
+  border-radius: var(--nd-radius-lg);
+  background: var(--nd-surface);
+}
+
+/* Selection is an affordance, not data — so it is the accent, not the ramp. */
+.nd-timeline__row--selected {
+  border-color: var(--nd-accent);
+  background: var(--nd-accent-wash);
+}
+
+.nd-timeline__pick {
+  display: flex;
+  align-items: center;
+  gap: var(--nd-space-4);
+  padding-top: var(--nd-space-1);
+  cursor: pointer;
+}
+
+.nd-timeline__pick input {
+  accent-color: var(--nd-accent);
+  cursor: pointer;
+}
+
+.nd-timeline__ordinal {
+  color: var(--nd-text);
+  font-weight: var(--nd-weight-semibold);
+}
+
+.nd-timeline__body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--nd-space-3);
+}
+
+.nd-timeline__head {
+  display: flex;
+  align-items: center;
+  gap: var(--nd-space-6);
+  flex-wrap: wrap;
+}
+
+.nd-timeline__actor {
+  color: var(--nd-text);
+}
+
+.nd-timeline__seq {
+  margin-left: auto;
+}
+
+.nd-timeline__title {
+  font-size: var(--nd-text-sm);
+}
+
+.nd-timeline__fields {
+  display: flex;
+  align-items: center;
+  gap: var(--nd-space-4);
+  flex-wrap: wrap;
+}
+
+/* --- Diff ---------------------------------------------------------------- */
+
+.nd-diff {
+  display: flex;
+  flex-direction: column;
+  gap: var(--nd-space-6);
+}
+
+.nd-diff__header {
+  display: flex;
+  align-items: baseline;
+  gap: var(--nd-space-8);
+  flex-wrap: wrap;
+}
+
+.nd-diff__title {
+  font-family: var(--nd-font-mono);
+  font-size: var(--nd-text-md);
+}
+
+.nd-diff__identical {
+  padding: var(--nd-space-8);
+  border: 1px solid var(--nd-border);
+  border-radius: var(--nd-radius-lg);
+  background: var(--nd-surface);
+  color: var(--nd-text-muted);
+}
+
+/* A diff is wide by nature; it scrolls inside its own box rather than pushing
+   the page sideways. */
+.nd-diff__scroll {
+  overflow-x: auto;
+  border: 1px solid var(--nd-border);
+  border-radius: var(--nd-radius-lg);
+  background: var(--nd-surface);
+}
+
+.nd-diff__table {
+  width: 100%;
+  border-collapse: collapse;
+  table-layout: fixed;
+  font-size: var(--nd-text-xs);
+}
+
+.nd-diff__table thead th {
+  position: sticky;
+  top: 0;
+  padding: var(--nd-space-4) var(--nd-space-6);
+  border-bottom: 1px solid var(--nd-border);
+  background: var(--nd-surface-raised);
+  text-align: left;
+  font-weight: var(--nd-weight-semibold);
+}
+
+.nd-diff__gutter {
+  width: 3.25rem;
+  padding: 0 var(--nd-space-4);
+  color: var(--nd-text-faint);
+  font-family: var(--nd-font-mono);
+  font-size: var(--nd-text-2xs);
+  text-align: right;
+  user-select: none;
+  vertical-align: top;
+}
+
+.nd-diff__cell {
+  width: 50%;
+  padding: 0 var(--nd-space-6);
+  vertical-align: top;
+}
+
+.nd-diff__cell code {
+  display: block;
+  font-size: var(--nd-text-xs);
+  line-height: 1.6;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.nd-diff__row--hunk td {
+  padding: var(--nd-space-3) var(--nd-space-6);
+  border-top: 1px solid var(--nd-border);
+  border-bottom: 1px solid var(--nd-border);
+  background: var(--nd-surface-raised);
+  color: var(--nd-text-faint);
+}
+
+.nd-diff__row--remove .nd-diff__cell--left,
+.nd-diff__row--replace .nd-diff__cell--left {
+  background: var(--nd-danger-wash);
+}
+
+.nd-diff__row--add .nd-diff__cell--right,
+.nd-diff__row--replace .nd-diff__cell--right {
+  background: var(--nd-state-active-wash);
+}
+
+.nd-diff__raw > summary {
+  cursor: pointer;
+  color: var(--nd-text-muted);
+  font-size: var(--nd-text-xs);
+}
+
+.nd-diff__raw-body {
+  margin-top: var(--nd-space-4);
+  padding: var(--nd-space-8);
+  border: 1px solid var(--nd-border);
+  border-radius: var(--nd-radius-md);
+  background: var(--nd-bg);
+  color: var(--nd-text-muted);
+  font-size: var(--nd-text-xs);
+  overflow-x: auto;
+  white-space: pre;
+}
+
+@media (max-width: 46rem) {
+  .nd-timeline__seq {
+    margin-left: 0;
+  }
+
+  .nd-diff__table {
+    min-width: 40rem;
+  }
+}

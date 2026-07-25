@@ -33,13 +33,33 @@ tools are never registered), and **assets + image renditions**
 (a metadata row + an in-database blob + sha256) and lazily generated, stored,
 evictable `thumb`/`preview` WebP renditions (design §5.7), exposed over MCP
 as `get_asset` (metadata + rendition image block — never the original).
-**Deliberately not built yet** (later phases — do not add): the web UI, the
+Phase 3 (human UI) has landed: the **HTTP API** (`nodum.http_api`, `nodum
+serve`) is the human surface — a Starlette app serving the JSON API under
+`/api` and the built web UI at `/`, with every write forced to `actor =
+human` and no request field able to say otherwise — the shared **envelope**
+module (`nodum.envelope`) both the CLI and the API render through, and the
+**web UI** itself (`web/`, React 19 + TypeScript, built into `nodum/_web/` by
+`make web-build`; gitignored, shipped in the wheel as a hatchling artifact):
+six views — Markdown editor, hybrid search, review queue + policy editor,
+graph, assets, per-node version history.
+**Deliberately not built yet** (later phases — do not add): the
 Phase-4 ingestion pipeline (text extraction, chunking, source/claim
 proposals, `ingest_file`/`ingest_url`), `page:<n>` PDF rasters,
 `get_download_url`/`request_upload_url`, the internal agent runtime and
-consolidation cycle, Markdown Mirror / JSON export. The schema reserves room
-for them (`graph_id`, `merge_redirects`, `cycle_id`,
+consolidation cycle, **Markdown Mirror** and any whole-graph export (the only
+export that exists is the thin per-node snapshot,
+`GET /api/export/node/{id}?depth=`, which is `get_neighborhood` with a
+`content-disposition` header — not a format, not a backup), the curative tier
+(`merge_nodes`, `retype`, `supersede_edge`, `bulk_relink`, `consolidate`),
+and the **dream-journal view**, which Phase 3 deferred to Phase 5 on purpose —
+it belongs with the consolidation cycle that gives it something to show. The
+schema reserves room for them (`graph_id`, `merge_redirects`, `cycle_id`,
 `assets.extracted_text`); each lands as its own append-only migration.
+A node's `type` is likewise **fixed at creation by design**, not by omission:
+`service.update_node` takes `title`/`content`/`props` only, and retyping is a
+curative operation (§8.2 `retype`). Do not add a `type` field to
+`PATCH /api/nodes/{id}` — the editor withholds its type commands on a saved
+node for exactly this reason.
 
 ## Architecture
 
@@ -53,10 +73,22 @@ for them (`graph_id`, `merge_redirects`, `cycle_id`,
   `reject`, `archive`, and `undo` — every operation that writes or retires
   live state), and the curated graph reads
   (`get_neighborhood`, `traverse`, `find_path`, `get_schema`,
-  `diff_versions`, `propose_edges`). Each public function opens its own
-  short-lived connection (applying pending migrations idempotently) and
-  commits. New behaviour and validation go here first; adapters must not add
-  behaviour the service lacks.
+  `diff_versions`, `propose_edges`). Two reads exist for interactive clients
+  rather than agents: **`subgraph`** — `traverse` plus edge state/confidence/
+  author and node-type filters, all applied in SQL, with a node `limit`
+  enforced *during* the breadth-first walk — tested **before** the far side
+  of an edge is read, so a hub costs `limit` node reads and not one per
+  neighbour — a separate edge cap (`limit * SUBGRAPH_EDGE_FACTOR`), since a
+  node cap bounds nodes only and one pair of nodes can carry any number of
+  edges, a server-side ceiling on `limit` itself (`MAX_SUBGRAPH_LIMIT`, 2000 —
+  the value the graph view's slider already clamps to), an edge list **closed
+  over the returned node set** so the outermost ring is joined up rather than
+  drawn with gaps, and a `truncated` flag saying whether **either** cap bit —
+  and **`suggest_links`**, a title-prefix lookup for a `[[` autocomplete that
+  reads `nodes` directly, so it answers on a database whose projectors have
+  never run. Each public function opens its own short-lived connection
+  (applying pending migrations idempotently) and commits. New behaviour and
+  validation go here first; adapters must not add behaviour the service lacks.
 - **`nodum.mcp_server`** — the MCP adapter (stdio, official Python SDK
   FastMCP), the **external-agent** surface. Registers the design §8.1 read +
   additive tiers and nothing else, each tool a thin delegate to a
@@ -66,6 +98,49 @@ for them (`graph_id`, `merge_redirects`, `cycle_id`,
   curative tools (`merge_nodes`, `retype`, `supersede_edge`, `bulk_relink`,
   `consolidate` — §8.2) are **never registered**: structural enforcement, not
   a runtime check. Launched by `nodum mcp serve`.
+- **`nodum.http_api`** — the HTTP adapter (design §9), the **human** surface
+  and the exact inverse of the MCP server. `create_app(*, db_path, token)`
+  builds a Starlette app: the JSON API under `/api`, the built UI at `/`,
+  launched by `nodum serve` (loopback, port 8420). Every write is attributed
+  to `HTTP_ACTOR` (= `service.ACTOR_HUMAN`) and **no request field, header, or
+  query parameter can set an actor** — a body carrying `{"actor": "agent:x"}`
+  is ignored, not honoured. That absence is structural, not a filter: the
+  module binds `actor` in exactly one expression (inside `_write`, to the
+  constant), handlers forward only fields they name, and `_write` refuses a
+  caller-supplied actor outright. Three tests in `tests/test_http_api.py`
+  enforce it over the *live route table* and the module's AST, so a new
+  endpoint is covered without being added to a list — if you add an endpoint,
+  route its writes through `_write` and never mention an actor in a handler.
+  One `EXCEPTION_STATUS` table becomes the error envelope. It covers every
+  class `cli._run` catches — the `sqlite3.Error` and `OSError` rows are the
+  **base** classes, so `DatabaseError`/`IntegrityError`/`ProgrammingError`/
+  `DataError` land on a status rather than a generic 500 — plus
+  `sqlite3.OperationalError` → 503, `OverflowError` → 400, `PayloadTooLarge` →
+  413 and `ClientDisconnect` → 499, which only a network surface meets.
+  `test_every_exception_cli_run_catches_is_mapped` reads `cli._run`'s own
+  except clauses and asserts the claim instead of restating it. Unmapped
+  exceptions are a generic 500 with no traceback in the body.
+  `RequestGuardMiddleware` is the origin control under all of it (see the
+  HTTP contract below) — binding loopback keeps other machines out, not other
+  *origins*, and a browser reaches `127.0.0.1` from any page.
+- **`nodum.envelope`** — the JSON envelope both the CLI and the HTTP API emit:
+  `envelope()`, `list_envelope()` (the `{"<plural>": [...], "count": n}`
+  convention), and `render_json()`. Extracted so the surfaces cannot drift;
+  `GET /api/nodes/{id}` is byte-identical to `nodum node get <id>` on stdout.
+  New list output goes through `list_envelope`, never a hand-built dict.
+- **`web/`** — the human UI (React 19 + TypeScript + Vite), built into
+  `nodum/_web/` by `make web-build` and served by `nodum serve`. Seven routes
+  over six views, each lazily loaded so CodeMirror, Mermaid, and Cytoscape stay
+  out of the initial bundle. `src/api/client.ts` is the only `fetch` in the
+  app and has **no actor parameter anywhere** — the server's structural rule,
+  mirrored in the client. It is also where the optional bearer token is
+  adopted, from the `#token=…` fragment `nodum serve --token` prints, into
+  `sessionStorage`; and it sends `Content-Type: application/json` on every
+  non-GET request, bodyless ones included, because the server requires it.
+  `src/lib/` holds the cross-view invariants
+  (timestamps, failure classification); `src/components/` holds shared React
+  components; a view owns its own directory and links to other views by URL,
+  never by import. Full conventions: `web/README.md`.
 - **`nodum.projectors`** — derived-index consumers of the event log. A
   projector registry (`REGISTRY`), per-projector checkpoints in
   `projector_checkpoints`, incremental `run_projectors`, and
@@ -159,6 +234,19 @@ Phase-1 decision log.
   through the CLI in the same change, and update `README.md`,
   `docs/architecture.md`, and this file in the same commit.
 - **Line length 100**; ruff rules `E, F, I, UP, B, SIM`.
+- **Frontend**: `make web-install` once, then `make web-build` (which runs
+  `tsc --noEmit` first, so the build is the type gate) or `make web-dev` for
+  the Vite server on 5173 proxying to `nodum serve` on 8420. Two gates, both in
+  CI: `tsc --noEmit` over the whole tree, and **`make web-test`** — Vitest over
+  the pure modules in `web/src` (`*.test.ts` beside the module it covers).
+  There is no ESLint and no component/DOM harness, so anything React renders is
+  still verified by type-checking it and driving it in a browser.
+  **The Vitest run pins `TZ` to a non-UTC zone** (`web/vitest.config.ts`) and
+  `time.test.ts` asserts the pin took: the zone-less-timestamp bug `lib/time.ts`
+  fixes is invisible in UTC, so an ambient-timezone run would pass while the
+  code was broken. Do not remove the pin, and do not add a test that depends on
+  the ambient zone. `nodum/_web/` is gitignored whole and rewritten by every
+  build; a release must `make web-build` before `uv build --wheel`.
 
 ## CLI contract (for agents driving the CLI)
 
@@ -199,17 +287,197 @@ Phase-1 decision log.
   create/list/create-batch`, `accept <id>` / `reject <id> --reason` /
   `archive <id>` (each takes a node, edge, or proposed-version id), `undo [seq]`,
   `history <node-id>`, `events`, `types`, `schema <type>`, `search <query>`,
-  `traverse`, `find-path`, `diff`, `projector run/status/rebuild`,
+  `traverse`, `subgraph <root-id>`, `suggest-links <prefix>`, `find-path`,
+  `diff`, `projector run/status/rebuild`,
   `policy set/get/list`, `review queue/accept/reject/accept-all/reject-all`,
   `asset register/get/list/rendition/purge`,
-  `mcp serve --actor agent:<name>`.
+  `mcp serve --actor agent:<name>`,
+  `serve [--host 127.0.0.1] [--port 8420] [--token TOKEN] [--allow-host NAME]
+  [--db PATH]`. `serve` refuses a non-loopback bind without `--token` (exit 1),
+  prints the database path and the `#token=…` UI URL on stderr, and translates
+  uvicorn's own startup failure (a port already in use) into the contract's
+  exit 1 — it used to escape as uvicorn's exit 3.
 - Reads are not state-filtered by default beyond edge traversal: `node get`,
   `node children`, `node list`, and `history` return `proposed` rows, and
   `search --state any` includes them. Only *traversals* (`node get --depth`,
-  `traverse`, `find-path`, `search --expand`) are restricted to `active`
-  edges — proposed structure is inert, not hidden.
+  `traverse`, `subgraph`, `find-path`, `search --expand`) are restricted to
+  `active` edges — proposed structure is inert, not hidden. `subgraph
+  --edge-state proposed` is the one way to walk it, and it has to be asked
+  for. `suggest-links` follows the node-read rule with one exception:
+  `archived` titles are never suggested, since a retired node is not a link
+  target.
+- `subgraph` is the bounded read, and it is bounded twice: `--limit` is a hard
+  node cap applied while walking (tested before the far node is read, so the
+  cost is `O(limit)`, not `O(neighbours)`), and the edge list has its own cap
+  at `limit * SUBGRAPH_EDGE_FACTOR` — without it a single pair of nodes with
+  300 edges between them returns 300 edges under a 2-node cap. `--limit` is
+  itself clamped to `MAX_SUBGRAPH_LIMIT` (2000), so a caller passing
+  `--limit 1000000000` gets the ceiling rather than the graph. `truncated` is
+  true when **either** cap bit and is deliberately conservative: it reports a
+  walk that stopped early even if the graph happened to have nothing more to
+  give. A filter removing nodes is **not** truncation — the caller asked for
+  that. A limit below 1 is still an error rather than SQL's "unbounded". Every
+  filter composes as one conjunction, and an edge whose far node is filtered
+  out is dropped with it — the result never names an edge endpoint it does not
+  also return. The edge list is also *closed* over the node list: an edge
+  between two returned nodes comes back even when the walk never traversed it
+  (the B–C edge of a triangle read at depth 1), which the uncapped `traverse`
+  does not do.
 - Asset images reach agents only as renditions: `asset rendition` prints
   rendition metadata alone — the WebP bytes stay in the database and are never
   inlined into the JSON (`--out <file>` is how you extract them); the MCP
   `get_asset` tool returns metadata + a WebP image block of the requested
   rendition — originals are never served over MCP (design §5.7).
+
+## HTTP contract (for agents touching `nodum serve`)
+
+- **The HTTP surface is the human's.** Every write it makes is `actor =
+  human`; the actor is never read from a request. Do not add an "actor"
+  parameter, header, or override "for testing" — the MCP surface is where
+  agent identity lives, and the inversion is the whole point.
+- Route handlers are thin delegates: one service/search/assets call each, no
+  behaviour the service lacks. Writes go through `_write(service.fn, …)`,
+  which is the only place the actor is bound. **Never import a service function
+  that takes an `actor` into `http_api`** — an alias hides it from every
+  source-level check, and `test_no_write_service_function_is_reachable_under_
+  any_name` fails on the import itself. Never splat request data into a call
+  either: `**` may only unpack a dict an allowlisting helper built, and any new
+  one fails `test_no_call_splats_anything_but_an_allowlisting_helper` until it
+  is reviewed.
+- **The test that actually holds the boundary is the runtime sweep**
+  (`test_no_endpoint_can_attribute_a_write_to_an_agent`): it drives every
+  state-changing method of every route in `app.routes` with actor-carrying
+  bodies, query strings and headers, then asserts nothing written during the
+  sweep names anything but `human`. The AST properties beside it are a belt —
+  all of them were evadable by a handler that forwarded a body it never
+  inspected, which is how a rogue endpoint once produced
+  `created_by: "agent:evil"` on a fully green suite.
+- **A state-changing request must prove it is same-origin**
+  (`RequestGuardMiddleware`), because `nodum serve` binds loopback with no token
+  and loopback is reachable from every page the user visits. The rule:
+  `Sec-Fetch-Site` in `{same-origin, none}`, **or** an `Origin` whose host is
+  allowed, **or** the `X-Nodum-Client` header — which is how a non-browser
+  client declares itself, since a browser always sends one of the first two and
+  cannot be scripted out of either. A cross-site `Sec-Fetch-Site` or a
+  mismatched `Origin` is refused outright. Reads are unencumbered.
+- **Every JSON route requires `Content-Type: application/json`, bodyless ones
+  included.** That is not pedantry: `application/json` is not a CORS-simple
+  content type, so a cross-origin page cannot send it without a preflight, and
+  this app answers none. `POST /api/assets` is the one exception — multipart
+  *is* simple — so it rests entirely on the same-origin proof above. A new
+  upload route goes in `MULTIPART_ROUTES` or it inherits the JSON rule.
+- **The `Host` header is validated** against `resolve_allowed_hosts(host,
+  --allow-host)`. This is the DNS-rebinding defence and the only check that
+  protects *reads*: after a rebind the attacker's page is same-origin by every
+  other measure. Host names are compared without ports, which is what keeps the
+  `make web-dev` proxy (`Host: localhost:5173`) working.
+- **`--token` is the only defence against a local process.** Any process on the
+  machine can satisfy every origin check with three curl headers — including an
+  MCP server launched with `--actor agent:x`, which would thereby regain over
+  HTTP the `accept` the MCP tool list structurally withholds. `nodum serve`
+  says so in its startup banner when no token is set, and refuses a non-loopback
+  bind without one. The UI receives the token from the `#token=…` fragment the
+  banner prints (`web/src/api/client.ts`, `adoptToken`) — a fragment because it
+  never reaches the wire, a log, or a `Referer`.
+- **A wrong verb on a real route is a 405 with an `Allow` header**, not the
+  catch-all's 404. The catch-all claims every method so a `fetch` never gets
+  HTML, which also means it out-matches a real route's 405 unless it asks the
+  real routes what they would have matched — which `api_not_found` does.
+- **`/healthz` reports liveness only.** It sits outside auth, so anything it
+  says is said to everyone; it used to say the absolute database path.
+- **`POST /api/assets` is bounded before it buffers**: `MAX_REQUEST_BYTES` is
+  checked against `Content-Length` and then enforced mid-stream (the header is
+  client-supplied and cannot be the only guard), the type is sniffed from the
+  bytes against `UPLOAD_MIME_ALLOWLIST` rather than read off the filename, and
+  `assets.MAX_IMAGE_PIXELS` refuses a decompression bomb from the image header.
+  The allowlist is deliberately narrower than what `assets.register_asset` will
+  store: the CLI registers a local file the operator owns, this one takes a
+  file from a stranger. **There is no delete route**, so anything that does land
+  is only reclaimable out of band — a known gap, not an oversight.
+- **Do not invent request fields the domain has no representation for.**
+  `PUT /api/policies/{agent}` takes `{"rules": [...]}` and nothing else: a
+  policy is disabled by storing an empty ruleset, which is the service's only
+  spelling of it, and `PolicyOut` has no `enabled` field to echo one back. An
+  `enabled: false` flag was tried and removed — it silently wiped the stored
+  ruleset with no way to recover it. Same rule everywhere: if a body key has
+  no counterpart in `nodum.models`/`nodum.service`, it does not belong here.
+- Responses use `nodum.envelope`: single results as the model dump, lists as
+  `{"<plural>": [...], "count": n}`, rendered exactly as the CLI prints them.
+  A new list endpoint keys on the same plural the CLI command uses.
+- Failures are `{"error": {"type", "message"}}` from `EXCEPTION_STATUS`; add a
+  new mapping there rather than catching in a handler. Anything unmapped is a
+  500 with a generic body — never leak a traceback to a client.
+- Repeatable filters (`edge_type`, `edge_state`, `node_type`) are repeated
+  query keys; `/healthz` sits outside `/api` and outside auth; an unknown `/api`
+  path is a JSON 404 while unknown non-API paths fall through to the SPA
+  entry point (or the "UI not built" placeholder). **`/favicon.ico` is the one
+  exemption**: a browser asks for it unprompted and it is definitely not a
+  client route, so it is answered with the bundle's icon if there is one and a
+  204 otherwise — never an HTML document under a 200, which a client asking for
+  an image has no way to detect. Any other path a browser requests on its own
+  belongs in that same exemption list, not in the catch-all.
+- Asset originals are never served — only `thumb`/`preview` renditions, as
+  WebP bytes at `/api/assets/{id}/rendition/{profile}` (design §5.7).
+
+## Frontend contract (for agents touching `web/`)
+
+- **One `fetch`.** Everything goes through `src/api/client.ts`. It has no actor
+  parameter and must never grow one — the server forces `actor = human` and the
+  client being unable to express an actor is the second layer under that. Two
+  things it *does* own, both because the server made them requirements: the
+  bearer token (`adoptToken` reads `#token=…` once, stores it in
+  `sessionStorage`, and strips the fragment — `setAuthToken` had no caller at
+  all before, so `--token` shipped a UI in which every request was a 401) and
+  `Content-Type: application/json` on every non-GET request, bodyless ones
+  included. Neither belongs in a view.
+- **Never call `new Date()` on a server string.** SQLite writes
+  `datetime('now')` — UTC, no zone marker — which every browser reads as *local*
+  time. Parse through `parseTimestamp` (`src/lib/time.ts`) and format through
+  its formatters. `new Date()` on a client-side epoch number ("saved at",
+  "checked at") is fine and is the only exception.
+- **Never re-derive a failure's meaning.** `describeFailure` (`src/lib/failure.ts`)
+  is the one place that tells *the API refused this* apart from *nothing was
+  listening* — and the two are not one test: same-origin it is a `fetch`
+  `TypeError`, behind the dev proxy it is a 502. Map its `kind` onto your own
+  panel; do not re-test `status` or `instanceof`.
+- **A view owns its directory and links to other views by URL.** No view imports
+  another. Route paths live in `src/router.tsx`; grep for the path string before
+  renaming one. A view's entry component keeps a **default export** — the routes
+  are lazily loaded and `lazy()` needs it.
+- **Promote to `src/lib/` or `src/components/` on the second user, not the
+  first.** Both are inherited by every view.
+- **Do not render a control for something the service cannot do.** A node's
+  `type` is immutable after creation, so the editor drops the type commands on a
+  saved node rather than offering one that silently no-ops. Same rule as the
+  HTTP contract's "do not invent request fields", one layer up.
+- **The design system has two colour axes and both are taken**: the brass accent
+  means "you can act on this", the state ramp means the service-layer state
+  machine (`proposed` violet, `active` sea-green, `archived` lowest-contrast).
+  Anything else needs its own hue, kept view-local until a second view names it.
+  Class names are `nd-`-prefixed because Mermaid and Cytoscape inject global
+  stylesheets on `.node`, `.label`, and `.edge`.
+- **A pure module gets a `*.test.ts` beside it** (`make web-test`, Vitest). The
+  harness is unit-only by design — no component rendering — so pull the logic
+  worth testing out of the component and test it there, which is what
+  `filters.ts`, `unifiedDiff.ts`, `signals.ts`, `grouping.ts`, and
+  `policyRules.ts` already are. Assert the *semantics* the module encodes (a
+  `min_confidence` of 0 is a filter, not a no-op; a 502 is unreachable, not a
+  refusal), not its line coverage. The global environment is `node`; a suite
+  that genuinely needs a DOM says so in **its own** docblock
+  (`// @vitest-environment jsdom`, as `markdownRender.test.ts` does) rather than
+  changing the config for everyone.
+- **Nothing reaches `innerHTML` without going through DOMPurify.** The preview
+  renders Markdown that *agents* wrote, in the origin that may write to the API,
+  so `markdownRender.ts` reduces it to an allowlist with **no SVG and no
+  MathML** — that namespace is where `<animate>` retargets an anchor's `href` to
+  `javascript:` and where a lowercase `<style>` slips past any check keyed on
+  `tagName`. `mermaidRender.ts` runs a second, SVG-shaped policy over mermaid's
+  output. Both are covered by `markdownRender.test.ts`; a new sink means a new
+  policy, not a new exception. `nodum.http_api.CONTENT_SECURITY_POLICY` is the
+  runtime backstop under both — `script-src 'self'`, no `'unsafe-inline'`.
+- **A dialog locks body scroll and hands focus somewhere real.** Both the review
+  `Modal` and the assets lightbox set `body.style.overflow` on open and restore
+  it on close. On close, focus returns to the opener *only if it is still in the
+  document* — after a successful confirm it usually is not, and focusing a
+  detached node silently drops the user on `<body>`. The view places focus in
+  that case (the review inbox sends them to the outcome panel).

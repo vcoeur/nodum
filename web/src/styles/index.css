@@ -1,0 +1,13 @@
+/*
+ * The single stylesheet entry point — imported once, by `src/main.tsx`.
+ *
+ * Order matters: tokens define the custom properties everything else reads,
+ * base sets element defaults, primitives and app add classes on top. A view
+ * that needs its own styles adds `views/<name>/<name>.css` and imports it from
+ * its own component, never from here.
+ */
+
+@import "./tokens.css";
+@import "./base.css";
+@import "./primitives.css";
+@import "./app.css";

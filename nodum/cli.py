@@ -14,15 +14,17 @@ import json
 import os
 import sqlite3
 import sys
+from collections.abc import Sequence
 from pathlib import Path
 
 import typer
 from pydantic import BaseModel
 
-from nodum import assets, projectors, service
+from nodum import assets, db, projectors, service
 from nodum import search as search_module
 from nodum.assets import AssetNotFound, AssetSourceChanged, AssetTooLarge, UnsupportedRendition
 from nodum.db import ENV_DB_VAR
+from nodum.envelope import envelope, list_envelope, render_json
 from nodum.service import (
     EventNotFound,
     InvalidTransition,
@@ -75,12 +77,17 @@ def _main(
 
 def _print_json(payload: dict) -> None:
     """Write a single JSON object to stdout (the only thing on the success path)."""
-    print(json.dumps(payload, indent=2, ensure_ascii=False))
+    print(render_json(payload))
 
 
 def _emit(result: BaseModel) -> None:
     """Print a pydantic result as the single JSON object on stdout."""
-    _print_json(result.model_dump(mode="json"))
+    _print_json(envelope(result))
+
+
+def _emit_list(key: str, results: Sequence[BaseModel]) -> None:
+    """Print a list result under its plural key plus a ``count``."""
+    _print_json(list_envelope(key, results))
 
 
 def _parse_set(pairs: list[str] | None) -> dict:
@@ -241,14 +248,14 @@ def node_list(
 ) -> None:
     """List nodes in creation order, optionally filtered."""
     nodes = _run(service.list_nodes, type=type, state=state, parent_id=parent, limit=limit)
-    _print_json({"nodes": [node.model_dump(mode="json") for node in nodes], "count": len(nodes)})
+    _emit_list("nodes", nodes)
 
 
 @node_app.command("children")
 def node_children(node_id: str = typer.Argument(..., help="Parent node id.")) -> None:
     """List a node's children in position order."""
     nodes = _run(service.list_children, node_id)
-    _print_json({"nodes": [node.model_dump(mode="json") for node in nodes], "count": len(nodes)})
+    _emit_list("nodes", nodes)
 
 
 @edge_app.command("create")
@@ -282,7 +289,7 @@ def edge_list(
 ) -> None:
     """List edges, optionally filtered by incident node, type, or state."""
     edges = _run(service.list_edges, node_id=node, type=type, state=state, limit=limit)
-    _print_json({"edges": [edge.model_dump(mode="json") for edge in edges], "count": len(edges)})
+    _emit_list("edges", edges)
 
 
 @edge_app.command("create-batch")
@@ -354,19 +361,14 @@ def undo(
 def history(node_id: str = typer.Argument(..., help="Node id.")) -> None:
     """Show a node's version history (chronological)."""
     versions = _run(service.history, node_id)
-    _print_json(
-        {
-            "versions": [version.model_dump(mode="json") for version in versions],
-            "count": len(versions),
-        }
-    )
+    _emit_list("versions", versions)
 
 
 @app.command()
 def events(limit: int = typer.Option(50, "--limit", help="Maximum rows.")) -> None:
     """Show the most recent event-log entries (newest first)."""
     rows = _run(service.list_events, limit=limit)
-    _print_json({"events": [row.model_dump(mode="json") for row in rows], "count": len(rows)})
+    _emit_list("events", rows)
 
 
 @app.command(name="types")
@@ -414,6 +416,21 @@ def search(
     _emit(result)
 
 
+@app.command(name="suggest-links")
+def suggest_links(
+    prefix: str = typer.Argument(..., help="Title prefix typed so far ('' matches every title)."),
+    limit: int = typer.Option(20, "--limit", help="Maximum suggestions."),
+) -> None:
+    """Suggest wikilink targets by title prefix (case-insensitive).
+
+    Backs an editor's autocomplete. Reads the node table directly, not an
+    index, so it answers on a database whose projectors have never run.
+    Archived nodes are never suggested.
+    """
+    nodes = _run(service.suggest_links, prefix, limit=limit)
+    _emit_list("nodes", nodes)
+
+
 @app.command()
 def traverse(
     start_id: str = typer.Argument(..., help="Node id to start from."),
@@ -431,6 +448,50 @@ def traverse(
             edge_types=edge_type,
             depth=depth,
             direction=direction,
+        )
+    )
+
+
+@app.command()
+def subgraph(
+    root_id: str = typer.Argument(..., help="Node id at the centre of the subgraph."),
+    depth: int = typer.Option(2, "--depth", help="Maximum hops."),
+    edge_type: list[str] | None = typer.Option(
+        None, "--edge-type", help="Only follow these edge types (repeatable)."
+    ),
+    edge_state: list[str] | None = typer.Option(
+        None, "--edge-state", help="Edge states to follow (repeatable; default: active)."
+    ),
+    min_confidence: float | None = typer.Option(
+        None, "--min-confidence", help="Only follow edges whose stated confidence reaches this."
+    ),
+    created_by: str | None = typer.Option(
+        None, "--created-by", help="Only follow edges written by this actor."
+    ),
+    node_type: list[str] | None = typer.Option(
+        None, "--node-type", help="Only include nodes of these types (repeatable)."
+    ),
+    limit: int = typer.Option(200, "--limit", help="Maximum nodes, root included."),
+) -> None:
+    """Bounded, filtered neighborhood of a node — node and edge caps stop the walk.
+
+    Unlike `traverse` (edge type only), every filter here composes, and
+    `--limit` is enforced while walking rather than by slicing afterwards, and
+    is clamped to a server ceiling of 2000. The edge list is capped with it,
+    since a node cap does not bound edges. `truncated` says whether either cap
+    cut the walk short.
+    """
+    _emit(
+        _run(
+            service.subgraph,
+            root_id,
+            depth=depth,
+            edge_types=edge_type,
+            edge_states=edge_state,
+            min_confidence=min_confidence,
+            created_by=created_by,
+            node_types=node_type,
+            limit=limit,
         )
     )
 
@@ -467,7 +528,7 @@ def projector_run(
 ) -> None:
     """Apply pending event-log entries to the derived indexes."""
     runs = _run(projectors.run_projectors, names=names)
-    _print_json({"projectors": [run.model_dump(mode="json") for run in runs], "count": len(runs)})
+    _emit_list("projectors", runs)
 
 
 @projector_app.command("rebuild")
@@ -480,12 +541,7 @@ def projector_rebuild(name: str = typer.Argument(..., help="Projector to rebuild
 def projector_status() -> None:
     """Show every projector's checkpoint, backlog, and derived-store size."""
     statuses = _run(projectors.projector_status)
-    _print_json(
-        {
-            "projectors": [status.model_dump(mode="json") for status in statuses],
-            "count": len(statuses),
-        }
-    )
+    _emit_list("projectors", statuses)
 
 
 # ── Assets and renditions ─────────────────────────────────────────────────────
@@ -516,7 +572,7 @@ def asset_get(
 def asset_list() -> None:
     """List every registered asset."""
     rows = _run(assets.list_assets)
-    _print_json({"assets": [row.model_dump(mode="json") for row in rows], "count": len(rows)})
+    _emit_list("assets", rows)
 
 
 @asset_app.command("rendition")
@@ -570,6 +626,89 @@ def mcp_serve(
     _run(mcp_server.serve, actor=actor)
 
 
+# ── HTTP server (the human surface) ──────────────────────────────────────────
+
+#: Default port for ``nodum serve``. The frontend dev server proxies ``/api``
+#: and ``/healthz`` here, so changing it means changing `web/vite.config.ts`.
+DEFAULT_HTTP_PORT = 8420
+
+
+@app.command()
+def serve(
+    host: str = typer.Option("127.0.0.1", "--host", help="Interface to bind (loopback default)."),
+    port: int = typer.Option(DEFAULT_HTTP_PORT, "--port", help="TCP port to listen on."),
+    token: str | None = typer.Option(
+        None, "--token", help="Require 'Authorization: Bearer <token>' on /api (LAN case)."
+    ),
+    allow_host: list[str] = typer.Option(
+        None,
+        "--allow-host",
+        help="Extra Host/Origin name to answer to (repeatable); '*' disables the check.",
+    ),
+    db_path: str | None = typer.Option(
+        None, "--db", help=f"Database path for this server (overrides ${ENV_DB_VAR})."
+    ),
+) -> None:
+    """Serve the human web UI and its JSON API (design §9).
+
+    The inverse of ``mcp serve``: every write this surface makes is attributed
+    to the ``human`` actor and no request field can change that. Binds loopback
+    by default; ``--token`` adds a static bearer token on ``/api`` only
+    (``/healthz`` and the UI stay open). Unbuilt frontend? The API still serves;
+    the UI is a "run make web-build" placeholder.
+
+    Two things this command refuses to do quietly. A non-loopback bind without
+    ``--token`` is an unauthenticated write API on the network, so it exits 1
+    rather than starting. And a loopback bind without ``--token`` is reachable
+    by **every process on this machine**, including an MCP server launched with
+    ``--actor agent:x``, which could then accept its own proposals over HTTP —
+    so it says so at startup instead of leaving the operator to work it out.
+    """
+    import uvicorn
+
+    from nodum import http_api
+
+    if token is None and http_api.bare_host(host) not in http_api.LOOPBACK_BIND_ADDRESSES:
+        typer.echo(
+            f"refusing to bind {host} with no --token: that is an unauthenticated write API "
+            "reachable from the network. Pass --token, or bind 127.0.0.1.",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+    resolved_db = Path(db_path) if db_path is not None else db.db_path()
+    typer.echo(f"nodum serve → http://{host}:{port}  (database: {resolved_db})", err=True)
+    if token is None:
+        typer.echo(
+            "no --token: any process on this machine can drive this API as the 'human' actor, "
+            "including local agents. Do not run it alongside agents you do not trust.",
+            err=True,
+        )
+    else:
+        typer.echo(f"open the UI at http://{host}:{port}/#token={token}", err=True)
+
+    try:
+        _run(
+            uvicorn.run,
+            http_api.create_app(
+                db_path=db_path,
+                token=token,
+                allowed_hosts=http_api.resolve_allowed_hosts(host, allow_host),
+            ),
+            host=host,
+            port=port,
+        )
+    except SystemExit as exc:
+        # uvicorn catches a failed bind ("address already in use") itself, logs
+        # it, and signals the caller with `sys.exit(STARTUP_FAILURE)` — a
+        # non-zero code, but not the 1 this CLI's contract promises for every
+        # error. Translate it rather than leaving one command exempt.
+        if exc.code:
+            typer.echo(f"could not serve on {host}:{port}", err=True)
+            raise typer.Exit(1) from exc
+        raise
+
+
 # ── Policies ──────────────────────────────────────────────────────────────────
 
 
@@ -607,12 +746,7 @@ def policy_get(
 def policy_list() -> None:
     """List every stored policy."""
     policies = _run(service.list_policies)
-    _print_json(
-        {
-            "policies": [policy.model_dump(mode="json") for policy in policies],
-            "count": len(policies),
-        }
-    )
+    _emit_list("policies", policies)
 
 
 # ── Review queue ──────────────────────────────────────────────────────────────
@@ -647,12 +781,7 @@ def review_queue(
         created_after=created_after,
         limit=limit,
     )
-    _print_json(
-        {
-            "proposals": [proposal.model_dump(mode="json") for proposal in proposals],
-            "count": len(proposals),
-        }
-    )
+    _emit_list("proposals", proposals)
 
 
 @review_app.command("accept")

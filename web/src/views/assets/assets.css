@@ -1,0 +1,479 @@
+/*
+ * Assets view: uploader, rendition grid, lightbox.
+ *
+ * Everything is prefixed `nd-` and scoped to this view. The one rule that is
+ * load-bearing rather than cosmetic is the reserved frame on a tile and on the
+ * lightbox stage: renditions are generated lazily, so images arrive late and
+ * out of order, and without a reserved box the grid reflows under the pointer
+ * for as long as the first pass takes.
+ */
+
+.nd-assets {
+  position: relative;
+}
+
+/* --- Uploader --------------------------------------------------------- */
+
+.nd-uploader {
+  display: flex;
+  flex-direction: column;
+  gap: var(--nd-space-6);
+  padding: var(--nd-space-8);
+  border: 1px dashed var(--nd-border-strong);
+  border-radius: var(--nd-radius-lg);
+  background: var(--nd-surface);
+}
+
+.nd-uploader__headline {
+  font-size: var(--nd-text-sm);
+  font-weight: var(--nd-weight-semibold);
+}
+
+.nd-uploader__prompt {
+  display: flex;
+  flex-direction: column;
+  gap: var(--nd-space-2);
+}
+
+.nd-uploader__actions {
+  align-self: flex-start;
+}
+
+.nd-uploader__queue {
+  display: flex;
+  flex-direction: column;
+  gap: var(--nd-space-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.nd-uploader__item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 5rem 9rem minmax(0, 1fr);
+  align-items: center;
+  gap: var(--nd-space-6);
+  padding: var(--nd-space-3) var(--nd-space-6);
+  border-radius: var(--nd-radius-sm);
+  background: var(--nd-bg);
+  font-size: var(--nd-text-xs);
+}
+
+.nd-uploader__status {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--nd-space-4);
+  color: var(--nd-text-muted);
+}
+
+.nd-uploader__item--registered .nd-uploader__status {
+  color: var(--nd-state-active);
+}
+
+/* A dedup hit is a non-event: the archived ramp says "nothing happened here"
+   without borrowing the danger colour, which would read as a failure. */
+.nd-uploader__item--duplicate .nd-uploader__status {
+  color: var(--nd-state-archived);
+}
+
+.nd-uploader__item--failed .nd-uploader__status {
+  color: var(--nd-danger);
+}
+
+.nd-uploader__detail {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.nd-uploader__note {
+  margin-top: var(--nd-space-2);
+}
+
+/* --- Drop overlay ------------------------------------------------------ */
+
+.nd-assets__drop-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: var(--nd-z-modal);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgb(8 10 13 / 72%);
+  border: 2px dashed var(--nd-accent);
+}
+
+.nd-assets__drop-label {
+  font-size: var(--nd-text-xl);
+  font-weight: var(--nd-weight-semibold);
+  color: var(--nd-accent-bright);
+}
+
+/* --- Grid --------------------------------------------------------------- */
+
+.nd-asset-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(9.5rem, 1fr));
+  gap: var(--nd-space-8);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.nd-asset-tile {
+  display: flex;
+  flex-direction: column;
+  gap: var(--nd-space-2);
+  width: 100%;
+  padding: var(--nd-space-4);
+  border: 1px solid var(--nd-border);
+  border-radius: var(--nd-radius-lg);
+  background: var(--nd-surface);
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition:
+    border-color var(--nd-duration-fast) var(--nd-ease),
+    background var(--nd-duration-fast) var(--nd-ease);
+}
+
+.nd-asset-tile:hover {
+  border-color: var(--nd-border-strong);
+  background: var(--nd-surface-raised);
+}
+
+/* The reserved box. Its height is fixed by the aspect ratio before any image
+   exists, so a late-arriving rendition never moves the tiles below it. */
+.nd-asset-tile__frame {
+  position: relative;
+  display: block;
+  width: 100%;
+  aspect-ratio: 1 / 1;
+  border-radius: var(--nd-radius-md);
+  background: var(--nd-bg);
+  overflow: hidden;
+}
+
+.nd-asset-tile__image {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  opacity: 1;
+  transition: opacity var(--nd-duration-base) var(--nd-ease);
+}
+
+.nd-asset-tile__image[data-status="loading"],
+.nd-asset-tile__image[data-status="failed"] {
+  opacity: 0;
+}
+
+.nd-asset-tile__pending,
+.nd-asset-tile__typed {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--nd-space-2);
+  padding: var(--nd-space-4);
+  text-align: center;
+}
+
+.nd-asset-tile__glyph {
+  font-size: var(--nd-text-2xl);
+  line-height: 1;
+  color: var(--nd-text-faint);
+}
+
+.nd-asset-tile__typed-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+  color: var(--nd-text-faint);
+}
+
+.nd-asset-tile__name {
+  font-size: var(--nd-text-xs);
+  font-weight: var(--nd-weight-medium);
+}
+
+.nd-asset-tile__meta {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* --- Lightbox ------------------------------------------------------------ */
+
+.nd-lightbox-backdrop {
+  padding: var(--nd-space-8);
+}
+
+.nd-lightbox {
+  display: flex;
+  flex-direction: column;
+  width: min(72rem, 100%);
+  max-height: min(92vh, 56rem);
+  border: 1px solid var(--nd-border-strong);
+  border-radius: var(--nd-radius-lg);
+  background: var(--nd-surface-overlay);
+  box-shadow: var(--nd-shadow-overlay);
+}
+
+.nd-lightbox__header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--nd-space-8);
+  padding: var(--nd-space-8);
+  border-bottom: 1px solid var(--nd-border);
+}
+
+.nd-lightbox__heading {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--nd-space-1);
+}
+
+.nd-lightbox__title {
+  font-size: var(--nd-text-lg);
+}
+
+.nd-lightbox__body {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 22rem;
+}
+
+.nd-lightbox__stage {
+  display: flex;
+  align-items: center;
+  gap: var(--nd-space-4);
+  padding: var(--nd-space-8);
+  min-width: 0;
+}
+
+.nd-lightbox__step {
+  flex: none;
+  width: 2rem;
+  height: 3rem;
+  border: 1px solid transparent;
+  border-radius: var(--nd-radius-md);
+  background: transparent;
+  color: var(--nd-text-muted);
+  font-size: var(--nd-text-xl);
+  line-height: 1;
+  cursor: pointer;
+}
+
+.nd-lightbox__step:hover:not(:disabled) {
+  background: var(--nd-surface-raised);
+  color: var(--nd-text);
+}
+
+.nd-lightbox__step:disabled {
+  opacity: 0.3;
+  cursor: not-allowed;
+}
+
+/* Reserved stage: the preview is fetched on open and may be generated on the
+   spot, so the box exists before the bytes do. */
+.nd-lightbox__frame {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--nd-space-4);
+  min-height: min(58vh, 30rem);
+  padding: var(--nd-space-6);
+  border-radius: var(--nd-radius-md);
+  background: var(--nd-bg);
+}
+
+.nd-lightbox__image {
+  max-width: 100%;
+  max-height: min(58vh, 30rem);
+  object-fit: contain;
+  border-radius: var(--nd-radius-sm);
+}
+
+.nd-lightbox__image[data-status="loading"],
+.nd-lightbox__image[data-status="failed"] {
+  display: none;
+}
+
+.nd-lightbox__pending {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--nd-space-6);
+  max-width: 26rem;
+  text-align: center;
+}
+
+.nd-lightbox__frame--typed {
+  gap: var(--nd-space-6);
+}
+
+.nd-lightbox__glyph {
+  font-size: 2.5rem;
+  line-height: 1;
+  color: var(--nd-text-faint);
+}
+
+.nd-lightbox__typed-title {
+  font-size: var(--nd-text-md);
+  font-weight: var(--nd-weight-semibold);
+}
+
+.nd-lightbox__typed-body {
+  max-width: 28rem;
+  text-align: center;
+}
+
+/* Sits over the image, so it carries its own backing rather than relying on
+   whatever the rendition happens to have in that corner. */
+.nd-lightbox__dimensions {
+  position: absolute;
+  right: var(--nd-space-4);
+  bottom: var(--nd-space-4);
+  padding: var(--nd-space-1) var(--nd-space-4);
+  border-radius: var(--nd-radius-pill);
+  background: rgb(18 21 26 / 82%);
+  font-family: var(--nd-font-mono);
+  font-size: var(--nd-text-2xs);
+}
+
+.nd-lightbox__meta {
+  display: flex;
+  flex-direction: column;
+  gap: var(--nd-space-8);
+  padding: var(--nd-space-8);
+  border-left: 1px solid var(--nd-border);
+  overflow-y: auto;
+}
+
+.nd-lightbox__dl {
+  display: grid;
+  grid-template-columns: 7rem minmax(0, 1fr);
+  gap: var(--nd-space-3) var(--nd-space-6);
+  margin: 0;
+  font-size: var(--nd-text-xs);
+}
+
+.nd-lightbox__dl dt {
+  font-size: var(--nd-text-2xs);
+  font-weight: var(--nd-weight-semibold);
+  letter-spacing: var(--nd-tracking-label);
+  text-transform: uppercase;
+  color: var(--nd-text-faint);
+}
+
+.nd-lightbox__dl dd {
+  margin: 0;
+  min-width: 0;
+}
+
+.nd-lightbox__hash {
+  overflow-wrap: anywhere;
+  line-height: var(--nd-leading-normal);
+}
+
+.nd-lightbox__refs {
+  display: flex;
+  flex-direction: column;
+  gap: var(--nd-space-4);
+  padding-top: var(--nd-space-8);
+  border-top: 1px solid var(--nd-border);
+}
+
+.nd-lightbox__ref-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--nd-space-6);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.nd-lightbox__ref {
+  display: flex;
+  flex-direction: column;
+  gap: var(--nd-space-3);
+  padding: var(--nd-space-6);
+  border: 1px solid var(--nd-border);
+  border-radius: var(--nd-radius-md);
+  background: var(--nd-surface);
+}
+
+.nd-lightbox__ref-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--nd-space-6);
+  min-width: 0;
+}
+
+.nd-lightbox__ref-history {
+  flex: none;
+  font-size: var(--nd-text-2xs);
+}
+
+.nd-lightbox__ref .nd-export {
+  align-items: flex-start;
+}
+
+.nd-lightbox__ref .nd-export__note {
+  display: none;
+}
+
+.nd-lightbox__refs-note {
+  overflow-wrap: anywhere;
+}
+
+.nd-lightbox__footer {
+  padding: var(--nd-space-6) var(--nd-space-8);
+  border-top: 1px solid var(--nd-border);
+}
+
+.nd-lightbox__footer kbd {
+  padding: 0 var(--nd-space-2);
+  border: 1px solid var(--nd-border-strong);
+  border-radius: var(--nd-radius-sm);
+  background: var(--nd-bg);
+  font-size: var(--nd-text-2xs);
+}
+
+@media (max-width: 60rem) {
+  .nd-lightbox__body {
+    grid-template-columns: minmax(0, 1fr);
+    overflow-y: auto;
+  }
+
+  .nd-lightbox__meta {
+    border-left: 0;
+    border-top: 1px solid var(--nd-border);
+  }
+
+  .nd-lightbox__frame {
+    min-height: 40vh;
+  }
+
+  .nd-lightbox__image {
+    max-height: 40vh;
+  }
+}
+
+@media (max-width: 46rem) {
+  .nd-uploader__item {
+    grid-template-columns: minmax(0, 1fr) auto;
+    row-gap: var(--nd-space-2);
+  }
+}

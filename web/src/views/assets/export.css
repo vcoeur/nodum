@@ -1,0 +1,50 @@
+/*
+ * The thin JSON export control. Lives with the assets slice but is used by the
+ * history view too, so it carries its own stylesheet rather than leaning on
+ * either view's.
+ */
+
+.nd-export {
+  display: flex;
+  flex-direction: column;
+  gap: var(--nd-space-2);
+  align-items: flex-end;
+}
+
+.nd-export__controls {
+  display: flex;
+  align-items: center;
+  gap: var(--nd-space-4);
+}
+
+.nd-export__label {
+  font-size: var(--nd-text-2xs);
+  font-weight: var(--nd-weight-semibold);
+  letter-spacing: var(--nd-tracking-label);
+  text-transform: uppercase;
+  color: var(--nd-text-faint);
+}
+
+/* `.nd-select` is width:100% by design; the export picker sits inline. */
+.nd-export__depth {
+  width: auto;
+  padding: var(--nd-space-2) var(--nd-space-4);
+  font-size: var(--nd-text-xs);
+}
+
+.nd-export__note {
+  max-width: 24rem;
+  font-size: var(--nd-text-2xs);
+  color: var(--nd-text-faint);
+  text-align: right;
+}
+
+@media (max-width: 46rem) {
+  .nd-export {
+    align-items: flex-start;
+  }
+
+  .nd-export__note {
+    text-align: left;
+  }
+}

@@ -1,0 +1,596 @@
+/**
+ * Loading a node into the editor and saving it back, on a debounce.
+ *
+ * The buffer is never transformed. What `getNode` returns as `content` is what
+ * the editor opens with, and what the editor holds is what `createNode` /
+ * `updateNode` are handed — no normalisation, no trimming, no round-trip
+ * through another representation. That is design §2.3.2 stated as code.
+ *
+ * ## Why the live buffer lives in refs
+ *
+ * `contentRef` is written on every keystroke; the React state around it is
+ * written only when something the *interface* shows actually changes. A buffer
+ * kept in `useState` would re-render the whole view on every character, which
+ * on a two-pane editor is exactly the layout jitter this slice is not allowed
+ * to have.
+ *
+ * ## Losing work is the failure that matters
+ *
+ * A failed save leaves `saveState` at `failed` with the reason attached and the
+ * buffer untouched — nothing is cleared, reset, or reloaded over the top of it.
+ * Further typing re-arms the same debounce, so a save that failed because the
+ * single SQLite writer was busy retries by itself, and one that failed for a
+ * reason typing will not fix stays visible until the user acts on it.
+ *
+ * ## Two documents at once
+ *
+ * `/editor/:nodeId` → `/editor/:otherId` is a *parameter* change, not a remount:
+ * the component stays up and only this hook's effects re-run. So neither the
+ * `beforeunload` warning nor the unmount flush fires, and both of the things
+ * that keep a buffer safe have to be done explicitly on that transition:
+ *
+ * - the buffer is flushed through {@link flushLeftover} **before** it is
+ *   overwritten, carrying its values rather than reading refs that are about to
+ *   describe a different document;
+ * - every save is tagged with the document it was issued for, so a response that
+ *   lands after the switch cannot write the old document's text into the new
+ *   one's baseline, flash the old node's metadata into the meta bar, or navigate
+ *   away from the node the reader just opened.
+ */
+
+import { useCallback, useEffect, useRef, useState } from "react";
+import { useNavigate } from "react-router-dom";
+import { api } from "../../api/client";
+import type { NodeOut, UpdateNodeBody } from "../../api/types";
+import { useToast } from "../../components";
+import { describeError, isNotFound } from "../../lib";
+
+/** How the node itself loaded. */
+export type LoadStatus = "loading" | "ready" | "missing" | "unavailable";
+
+/** Where the buffer stands relative to the database. */
+export type SaveState = "clean" | "dirty" | "saving" | "saved" | "failed";
+
+/** Quiet time after the last edit before a save goes out. */
+const AUTOSAVE_MS = 1200;
+
+/** A document's buffer as it stood at the moment the editor let go of it. */
+export interface LeftoverBuffer {
+  /** The node it belongs to, or null when it was never saved. */
+  id: string | null;
+  title: string;
+  content: string;
+  /** What the server was known to hold, so the write stays minimal. */
+  saved: { title: string; content: string };
+  /** The type a create would use; null when the type catalog never answered. */
+  createType: string | null;
+}
+
+/**
+ * Write a buffer the editor has stopped holding.
+ *
+ * Opening another document replaces the live buffer wholesale, so a debounce
+ * still counting down has nothing left to read by the time it fires. This
+ * carries the values instead, and deliberately touches no React state: the view
+ * is showing a *different* document by now, and a "saved" badge there would be
+ * describing something the reader is not looking at.
+ *
+ * @param leftover The buffer, captured before it was replaced.
+ * @returns The id written, or null when there was nothing to write.
+ * @throws Error If a never-saved buffer has text but no type to create it under
+ *   — silently dropping it would be the loss this hook exists to prevent.
+ */
+export async function flushLeftover(leftover: LeftoverBuffer): Promise<string | null> {
+  const { id, title, content, saved, createType } = leftover;
+
+  if (id === null) {
+    // Same rule as the debounced path: opening `/editor` and walking away must
+    // not litter the graph with empty nodes.
+    if (content.trim() === "" && title.trim() === "") return null;
+    if (createType === null) {
+      throw new Error(
+        "No node type available — the type catalog did not load, so this text could not be " +
+          "written as a new node.",
+      );
+    }
+    const created = await api.createNode({
+      type: createType,
+      title: title.trim() === "" ? null : title,
+      content,
+    });
+    return created.id;
+  }
+
+  const body: UpdateNodeBody = {};
+  if (title !== saved.title) body.title = title.trim() === "" ? null : title;
+  if (content !== saved.content) body.content = content;
+  if (Object.keys(body).length === 0) return null;
+  await api.updateNode(id, body);
+  return id;
+}
+
+interface UseNodeDocumentOptions {
+  /** The `:nodeId` route parameter, or undefined on `/editor`. */
+  nodeId: string | undefined;
+  /**
+   * Type id the first save creates the node with.
+   *
+   * Null while the type catalog has not answered — a new node cannot be created
+   * without one, and this hook refuses rather than inventing a type id.
+   */
+  createType: string | null;
+}
+
+/** Everything the editor view needs to render and drive one document. */
+export interface NodeDocument {
+  status: LoadStatus;
+  /** Why loading failed, when `status` is `missing` or `unavailable`. */
+  loadError: string | null;
+  /** The stored node, or null while a new document has never been saved. */
+  node: NodeOut | null;
+  /**
+   * Identity of the buffer currently open.
+   *
+   * Used as the editor component's React key: it changes when a *different*
+   * document is opened, and deliberately does not change when the open document
+   * is saved for the first time — that would remount the editor mid-sentence.
+   */
+  docKey: string;
+  /** The document the editor should open with. */
+  initialContent: string;
+  title: string;
+  setTitle(next: string): void;
+  saveState: SaveState;
+  /** Why the last save failed, when `saveState` is `failed`. */
+  saveError: string | null;
+  /** When the last successful save landed, for the indicator. */
+  savedAt: number | null;
+  /** Report an edit. Cheap by design: called on every keystroke. */
+  handleContentChange(content: string): void;
+  /** Save immediately, skipping the debounce. */
+  saveNow(): void;
+  /** Re-fetch the node from the server. */
+  reload(): void;
+}
+
+/**
+ * Drive one node's buffer: load, track, and autosave it.
+ *
+ * @param options The route's node id and the type a create would use.
+ */
+export function useNodeDocument({ nodeId, createType }: UseNodeDocumentOptions): NodeDocument {
+  const navigate = useNavigate();
+  const toast = useToast();
+
+  const [status, setStatus] = useState<LoadStatus>("loading");
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [node, setNode] = useState<NodeOut | null>(null);
+  const [docKey, setDocKey] = useState("new:0");
+  const [initialContent, setInitialContent] = useState("");
+  const [title, setTitleState] = useState("");
+  const [saveState, setSaveState] = useState<SaveState>("clean");
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [savedAt, setSavedAt] = useState<number | null>(null);
+  const [reloadToken, setReloadToken] = useState(0);
+
+  /** The live buffer — authoritative between renders. */
+  const contentRef = useRef("");
+  const titleRef = useRef("");
+  /** What the server is known to hold, to diff against and to send minimally. */
+  const savedRef = useRef({ title: "", content: "" });
+  /** The node this editor is bound to; null until the first save creates one. */
+  const ownedIdRef = useRef<string | null>(null);
+  const startedRef = useRef(false);
+  const savingRef = useRef(false);
+  const pendingRef = useRef(false);
+  const timerRef = useRef<number | null>(null);
+  const blankCountRef = useRef(0);
+
+  /**
+   * Which buffer the editor is bound to right now.
+   *
+   * Bumped whenever a *different* document takes the editor over. A save
+   * captures it on the way out and re-checks it on the way back in: SQLite has
+   * one writer and the debounce is over a second long, so a response landing
+   * after the reader has moved on is ordinary, not exotic.
+   */
+  const docTokenRef = useRef(0);
+  /** The save in flight, so a detached flush can queue behind it rather than race it. */
+  const inFlightRef = useRef<Promise<void> | null>(null);
+  /** What that save is writing, so a flush does not re-send bytes already on the wire. */
+  const inFlightValuesRef = useRef<{ title: string; content: string } | null>(null);
+
+  const createTypeRef = useRef(createType);
+  createTypeRef.current = createType;
+  const navigateRef = useRef(navigate);
+  navigateRef.current = navigate;
+  const toastRef = useRef(toast);
+  toastRef.current = toast;
+
+  const cancelTimer = useCallback(() => {
+    if (timerRef.current !== null) {
+      window.clearTimeout(timerRef.current);
+      timerRef.current = null;
+    }
+  }, []);
+
+  /**
+   * Whether the buffer differs from what the server is known to hold.
+   *
+   * A never-saved blank document compares equal to the empty baseline, so
+   * opening `/editor` and leaving raises no warning and writes nothing.
+   */
+  const hasUnsaved = useCallback(() => {
+    const saved = savedRef.current;
+    return contentRef.current !== saved.content || titleRef.current !== saved.title;
+  }, []);
+
+  /* ---------------------------------------------------------------- */
+  /* Saving                                                            */
+  /* ---------------------------------------------------------------- */
+
+  const persist = useCallback(async (): Promise<void> => {
+    cancelTimer();
+    if (savingRef.current) {
+      pendingRef.current = true;
+      return;
+    }
+
+    const content = contentRef.current;
+    const currentTitle = titleRef.current;
+    const saved = savedRef.current;
+    const id = ownedIdRef.current;
+    // The document this save is *for*. Everything below the first `await` is
+    // conditional on it: a response that outlives its document has to be dropped
+    // rather than written into whatever the editor is showing by then.
+    const token = docTokenRef.current;
+    const stillCurrent = () => docTokenRef.current === token;
+
+    if (content === saved.content && currentTitle === saved.title) {
+      setSaveState((current) => (current === "dirty" ? (id === null ? "clean" : "saved") : current));
+      return;
+    }
+
+    if (id === null) {
+      // Nothing typed yet: opening `/editor` and walking away must not litter
+      // the graph with empty nodes.
+      if (content.trim() === "" && currentTitle.trim() === "") {
+        setSaveState("clean");
+        return;
+      }
+      const type = createTypeRef.current;
+      if (type === null) {
+        setSaveState("failed");
+        setSaveError(
+          "No node type available — the type catalog did not load, so a new node cannot be created. Your text is still here.",
+        );
+        return;
+      }
+
+      savingRef.current = true;
+      inFlightValuesRef.current = { title: currentTitle, content };
+      setSaveState("saving");
+      setSaveError(null);
+      try {
+        const created = await api.createNode({
+          type,
+          title: currentTitle.trim() === "" ? null : currentTitle,
+          content,
+        });
+        // The node exists either way — but if the reader has opened something
+        // else since, adopting it here would rebind the editor to it and the
+        // navigate below would yank them off the document they just opened.
+        if (!stillCurrent()) return;
+        ownedIdRef.current = created.id;
+        savedRef.current = { title: currentTitle, content };
+        setNode(created);
+        setSavedAt(Date.now());
+        settle();
+        // Replace rather than push: the blank `/editor` entry is not a place
+        // the back button should return to.
+        navigateRef.current(`/editor/${created.id}`, { replace: true });
+      } catch (error) {
+        if (!stillCurrent()) {
+          toastRef.current.showError(error, "The new note could not be saved");
+          return;
+        }
+        setSaveState("failed");
+        setSaveError(describeError(error));
+      } finally {
+        savingRef.current = false;
+        inFlightValuesRef.current = null;
+        drainPending();
+      }
+      return;
+    }
+
+    // Send only what changed: an omitted key is left alone server-side, while
+    // a present one is written — so a no-op field is never re-stamped.
+    const body: UpdateNodeBody = {};
+    if (currentTitle !== saved.title) body.title = currentTitle.trim() === "" ? null : currentTitle;
+    if (content !== saved.content) body.content = content;
+
+    savingRef.current = true;
+    inFlightValuesRef.current = { title: currentTitle, content };
+    setSaveState("saving");
+    setSaveError(null);
+    try {
+      // No abort signal, deliberately: cancelling a write in flight tells you
+      // nothing about whether the server applied it. The response is *ignored*
+      // when it belongs to a document that is no longer open, which is the same
+      // protection without putting the write itself at risk.
+      const updated = await api.updateNode(id, body);
+      if (!stillCurrent()) return;
+      savedRef.current = { title: currentTitle, content };
+      setNode(updated);
+      setSavedAt(Date.now());
+      settle();
+    } catch (error) {
+      if (!stillCurrent()) {
+        // The buffer it belonged to is gone from the screen, so there is no
+        // panel that could carry this. An unreported failed write is the loss
+        // this hook is built around, so it goes to the app-wide surface.
+        toastRef.current.showError(error, "An edit to the previous note was not saved");
+        return;
+      }
+      setSaveState("failed");
+      setSaveError(
+        isNotFound(error)
+          ? `${describeError(error)} The text on screen is still yours — copy it before leaving.`
+          : describeError(error),
+      );
+    } finally {
+      savingRef.current = false;
+      inFlightValuesRef.current = null;
+      drainPending();
+    }
+
+    /** After a save, say `saved` only if nothing has been typed since. */
+    function settle(): void {
+      setSaveState(hasUnsaved() ? "dirty" : "saved");
+    }
+
+    /** Run the save that arrived while this one was in flight. */
+    function drainPending(): void {
+      if (!pendingRef.current) return;
+      pendingRef.current = false;
+      scheduleSave();
+    }
+  }, [cancelTimer, hasUnsaved]);
+
+  const persistRef = useRef(persist);
+  persistRef.current = persist;
+
+  /** Run a save and keep a handle on it, so a flush can wait its turn. */
+  const runPersist = useCallback(() => {
+    const run = persistRef.current();
+    inFlightRef.current = run;
+    void run.finally(() => {
+      if (inFlightRef.current === run) inFlightRef.current = null;
+    });
+    return run;
+  }, []);
+
+  /**
+   * Whether the buffer holds anything not already saved or already on the wire.
+   *
+   * Distinct from {@link hasUnsaved}, which compares against the last *landed*
+   * save: during a request `savedRef` still describes the state before it, so a
+   * flush keyed on `hasUnsaved` would re-send bytes already in flight and cut a
+   * second version row for nothing.
+   */
+  const hasUnflushed = useCallback(() => {
+    const target = inFlightValuesRef.current ?? savedRef.current;
+    return contentRef.current !== target.content || titleRef.current !== target.title;
+  }, []);
+
+  /**
+   * Send the live buffer on its way before something overwrites it.
+   *
+   * Called on every transition that swaps the open document without unmounting
+   * the view. The write is detached — it carries the buffer's values and reports
+   * through the toast surface rather than through this document's save state,
+   * because by the time it answers the editor is showing something else.
+   */
+  const flushBuffer = useCallback(() => {
+    cancelTimer();
+    // Whatever `pendingRef` was going to re-arm is being taken here instead;
+    // leaving it set would re-read a buffer that by then holds another document.
+    pendingRef.current = false;
+    if (!hasUnflushed()) return;
+
+    const leftover: LeftoverBuffer = {
+      id: ownedIdRef.current,
+      title: titleRef.current,
+      content: contentRef.current,
+      saved: savedRef.current,
+      createType: createTypeRef.current,
+    };
+    const issue = () => {
+      void flushLeftover(leftover).catch((error: unknown) => {
+        toastRef.current.showError(error, "Unsaved changes to the previous note were lost");
+      });
+    };
+
+    // Two writes to the same node racing each other can land in either order,
+    // and the loser would win.
+    const inFlight = inFlightRef.current;
+    if (inFlight === null) issue();
+    else void inFlight.then(issue, issue);
+  }, [cancelTimer, hasUnflushed]);
+
+  // Read through a ref by the unmount effect, which must run exactly once and
+  // so cannot list `flushBuffer` as a dependency.
+  const flushBufferRef = useRef(flushBuffer);
+  flushBufferRef.current = flushBuffer;
+
+  const scheduleSave = useCallback(() => {
+    cancelTimer();
+    timerRef.current = window.setTimeout(() => {
+      timerRef.current = null;
+      void runPersist();
+    }, AUTOSAVE_MS);
+  }, [cancelTimer, runPersist]);
+
+  const handleContentChange = useCallback(
+    (content: string) => {
+      contentRef.current = content;
+      // Identity-preserving update: React bails out, so a burst of typing costs
+      // one render at the start of the burst and none after it.
+      setSaveState((current) => (current === "dirty" || current === "saving" ? current : "dirty"));
+      scheduleSave();
+    },
+    [scheduleSave],
+  );
+
+  const setTitle = useCallback(
+    (next: string) => {
+      titleRef.current = next;
+      setTitleState(next);
+      setSaveState((current) => (current === "dirty" || current === "saving" ? current : "dirty"));
+      scheduleSave();
+    },
+    [scheduleSave],
+  );
+
+  const saveNow = useCallback(() => {
+    void runPersist();
+  }, [runPersist]);
+
+  const reload = useCallback(() => {
+    // Before `ownedIdRef` is cleared: a flush after it would read a null id and
+    // create a second node out of the document being re-fetched.
+    flushBuffer();
+    ownedIdRef.current = null;
+    startedRef.current = false;
+    setReloadToken((token) => token + 1);
+  }, [flushBuffer]);
+
+  /* ---------------------------------------------------------------- */
+  /* Loading                                                           */
+  /* ---------------------------------------------------------------- */
+
+  const openBlank = useCallback(() => {
+    // The "New" link is a route-parameter change on a mounted component, so
+    // nothing else would have sent the buffer anywhere before it is cleared.
+    flushBuffer();
+    docTokenRef.current += 1;
+    ownedIdRef.current = null;
+    contentRef.current = "";
+    titleRef.current = "";
+    savedRef.current = { title: "", content: "" };
+    startedRef.current = true;
+    blankCountRef.current += 1;
+    setNode(null);
+    setTitleState("");
+    setInitialContent("");
+    setDocKey(`new:${blankCountRef.current}`);
+    setStatus("ready");
+    setLoadError(null);
+    setSaveState("clean");
+    setSaveError(null);
+    setSavedAt(null);
+  }, [cancelTimer]);
+
+  useEffect(() => {
+    if (nodeId === undefined) {
+      // Already sitting on an untouched blank document — leave it alone rather
+      // than resetting a buffer the user may have started typing into.
+      if (startedRef.current && ownedIdRef.current === null) return;
+      openBlank();
+      return;
+    }
+
+    // The node this editor just created: the URL changed, the document did not.
+    if (startedRef.current && nodeId === ownedIdRef.current) return;
+
+    const controller = new AbortController();
+    let cancelled = false;
+
+    // Order matters. The buffer goes out first, carrying the document it still
+    // belongs to; only then is the editor re-pointed, which orphans any save
+    // already on the wire so its answer cannot land on the incoming document.
+    flushBuffer();
+    docTokenRef.current += 1;
+    setStatus("loading");
+    setLoadError(null);
+
+    void (async () => {
+      try {
+        const loaded = await api.getNode(nodeId, controller.signal);
+        if (cancelled) return;
+        ownedIdRef.current = loaded.id;
+        contentRef.current = loaded.content;
+        titleRef.current = loaded.title ?? "";
+        savedRef.current = { title: loaded.title ?? "", content: loaded.content };
+        startedRef.current = true;
+        setNode(loaded);
+        setTitleState(loaded.title ?? "");
+        setInitialContent(loaded.content);
+        setDocKey(`node:${loaded.id}`);
+        setSaveState("clean");
+        setSaveError(null);
+        setSavedAt(null);
+        setStatus("ready");
+      } catch (error) {
+        if (cancelled || controller.signal.aborted) return;
+        setLoadError(describeError(error));
+        setStatus(isNotFound(error) ? "missing" : "unavailable");
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      controller.abort();
+    };
+  }, [nodeId, reloadToken, flushBuffer, openBlank]);
+
+  /* ---------------------------------------------------------------- */
+  /* Not losing the buffer                                             */
+  /* ---------------------------------------------------------------- */
+
+  useEffect(() => {
+    const warn = (event: BeforeUnloadEvent) => {
+      if (!hasUnsaved()) return;
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    const flushOnHide = () => {
+      // Still the same document on screen, so this one reports through the save
+      // indicator like any other save.
+      if (document.visibilityState === "hidden" && hasUnsaved()) void runPersist();
+    };
+    window.addEventListener("beforeunload", warn);
+    document.addEventListener("visibilitychange", flushOnHide);
+    return () => {
+      window.removeEventListener("beforeunload", warn);
+      document.removeEventListener("visibilitychange", flushOnHide);
+    };
+  }, [hasUnsaved, runPersist]);
+
+  useEffect(
+    () => () => {
+      // Leaving the view: fire the pending save rather than dropping it. The
+      // request outlives the component, which is the point — and it goes out
+      // detached, because there is no longer a save indicator to answer to.
+      flushBufferRef.current();
+    },
+    [],
+  );
+
+  return {
+    status,
+    loadError,
+    node,
+    docKey,
+    initialContent,
+    title,
+    setTitle,
+    saveState,
+    saveError,
+    savedAt,
+    handleContentChange,
+    saveNow,
+    reload,
+  };
+}

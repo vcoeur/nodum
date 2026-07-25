@@ -257,14 +257,28 @@ class BatchTransitionOut(BaseModel):
 class SubgraphOut(BaseModel):
     """A rooted subgraph: the nodes and edges reached by a traversal.
 
-    ``nodes`` always includes the root (first); ``edges`` are the active
-    edges the walk followed (empty at depth 0).
+    ``nodes`` always includes the root (first); ``edges`` are the edges the
+    walk followed (empty at depth 0). No edge ever names a node ``nodes`` does
+    not carry. From the capped read (``subgraph``) the edge list is also
+    *closed* over ``nodes``: an edge between two returned nodes is returned
+    even when the walk never traversed it, so nothing is drawn as unconnected
+    that the stored graph connects. The uncapped walks (``traverse``,
+    ``get_neighborhood``) return only what they traversed, so at their
+    outermost ring two returned nodes may be connected by an edge they omit.
+
+    ``truncated`` is true when a cap — on nodes **or** on edges — stopped the
+    walk before it ran out of graph, so a caller can say "showing 200 of more"
+    instead of presenting a partial subgraph as the whole neighborhood. A
+    filter removing nodes is not truncation: the caller asked for that. Only
+    the capped read (``subgraph``) can set it; the uncapped walks always
+    report false.
     """
 
     root: str
     depth: int
     nodes: list[NodeOut]
     edges: list[EdgeOut]
+    truncated: bool = False
 
 
 class PathOut(BaseModel):

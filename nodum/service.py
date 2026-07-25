@@ -16,6 +16,7 @@ import difflib
 import json
 import re
 import sqlite3
+import unicodedata
 import uuid
 from pathlib import Path
 from typing import Any
@@ -86,6 +87,26 @@ HUMAN_ONLY_ACTIONS = {
 #: The node fields a version snapshots, and the only fields a proposed update
 #: may name.
 VERSION_FIELDS = ("title", "content", "props")
+
+#: Node states :func:`suggest_links` draws link targets from. ``proposed``
+#: stays in, as it does for every other node read; ``archived`` is out,
+#: because a retired node is not something to link to.
+SUGGEST_STATES = ("active", "proposed")
+
+#: Edge states :func:`subgraph` follows when the caller names none — the live
+#: graph, matching every other traversal (design §8.1).
+DEFAULT_EDGE_STATES = ("active",)
+
+#: Ceiling on :func:`subgraph`'s node cap. A caller's ``limit`` is clamped to
+#: it rather than refused, so a query string cannot turn the bounded read into
+#: an unbounded one; ``truncated`` reports the clamp like any other cap.
+MAX_SUBGRAPH_LIMIT = 2000
+
+#: Edges :func:`subgraph` may return per node it is allowed to admit. The node
+#: cap bounds nodes only — one pair of nodes can carry any number of edges — so
+#: the edge list needs its own bound, derived from ``limit`` so that one
+#: argument still describes the size of the whole result.
+SUBGRAPH_EDGE_FACTOR = 8
 
 #: Policy rule actions (design §8.3). Only ``auto_accept`` is evaluated on the
 #: direct write path today; ``auto_apply``/``always_propose`` govern internal
@@ -906,6 +927,85 @@ def list_children(node_id: str, *, path: str | Path | None = None) -> list[NodeO
             "SELECT * FROM nodes WHERE parent_id = ? ORDER BY position", (node_id,)
         ).fetchall()
         return [_node_out(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def _normalized(text: str) -> str:
+    """Return ``text`` in NFC, so equivalent spellings compare equal.
+
+    The same characters reach the database in more than one encoding — macOS
+    paths and some input methods produce NFD ("É" as E + U+0301), most other
+    sources NFC — and Python compares them by code point, so an unnormalised
+    ``startswith`` misses a title it should match.
+    """
+    return unicodedata.normalize("NFC", text)
+
+
+def _match_key(text: str) -> str:
+    """Return the case- and normalisation-insensitive form of ``text``.
+
+    Case folding can itself denormalise (and expands ``ß`` to ``ss``, which
+    SQL ``lower()`` cannot do), so normalisation is applied on both sides of
+    it — matching UAX #15's caseless-match recipe, with NFC as the form.
+    """
+    return _normalized(_normalized(text).casefold())
+
+
+def suggest_links(prefix: str, *, limit: int = 20, path: str | Path | None = None) -> list[NodeOut]:
+    """Suggest ``[[wikilink]]`` targets whose title starts with ``prefix``.
+
+    Backs the editor's ``[[`` autocomplete. It reads the ``nodes`` table
+    directly rather than an index, so it answers on a database whose
+    projectors have never run — an empty suggestion list always means "no such
+    title", never "the index is cold".
+
+    Matching folds case in Python (:meth:`str.casefold`) rather than in SQL:
+    SQLite's ``LIKE`` and ``lower()`` fold ASCII only, and titles here are
+    multilingual. Both sides are Unicode-normalised as well
+    (:func:`_match_key`), so a title stored NFD — as macOS paths and some
+    input methods write it — is found by an NFC prefix and vice versa.
+    Ranking puts titles that match the typed case first (typing ``Gra``
+    surfaces "Graph Theory" ahead of "grammar"), then sorts by title and id,
+    so the same prefix always returns the same list.
+
+    Archived nodes are excluded — a retired node is not a link target — while
+    ``proposed`` ones stay in, matching how the other node reads treat state
+    (:data:`SUGGEST_STATES`). An empty prefix matches every titled node.
+
+    Args:
+        prefix: The text typed so far, matched against the start of the title.
+        limit: Maximum suggestions returned.
+        path: Explicit database path.
+
+    Returns:
+        Matching nodes, best-ranked first, capped at ``limit``.
+
+    Raises:
+        ValueError: If ``limit`` is below 1.
+    """
+    if limit < 1:
+        raise ValueError(f"limit must be >= 1, got {limit}")
+    conn = _connect(path)
+    try:
+        placeholders = ",".join("?" * len(SUGGEST_STATES))
+        candidates = conn.execute(
+            f"SELECT id, title FROM nodes WHERE title IS NOT NULL AND state IN ({placeholders})",
+            SUGGEST_STATES,
+        ).fetchall()
+        folded = _match_key(prefix)
+        typed = _normalized(prefix)
+        matches = [row for row in candidates if _match_key(row["title"]).startswith(folded)]
+        matches.sort(
+            key=lambda row: (
+                not _normalized(row["title"]).startswith(typed),
+                _match_key(row["title"]),
+                _normalized(row["title"]),
+                row["id"],
+            )
+        )
+        # Only the survivors are read in full — titles are cheap, content is not.
+        return [_node_out(_get_node_row(conn, row["id"])) for row in matches[:limit]]
     finally:
         conn.close()
 
@@ -2082,6 +2182,206 @@ def traverse(
             depth=depth,
             nodes=[_node_out(row) for row in nodes],
             edges=[_edge_out(row) for row in edges],
+        )
+    finally:
+        conn.close()
+
+
+def subgraph(
+    root_id: str,
+    *,
+    depth: int = 2,
+    edge_types: list[str] | None = None,
+    edge_states: list[str] | None = None,
+    min_confidence: float | None = None,
+    created_by: str | None = None,
+    node_types: list[str] | None = None,
+    limit: int = 200,
+    path: str | Path | None = None,
+) -> SubgraphOut:
+    """Walk a bounded, server-side-filtered neighborhood of one node.
+
+    The filtered sibling of :func:`traverse`, written for clients that render
+    a graph: every filter is applied in the database and **both caps are
+    enforced during the walk, not after it**.
+
+    *Nodes* are capped by ``limit``, tested before the far side of an edge is
+    read, so the walk costs O(``limit``) node reads no matter how many
+    neighbours a hub has. ``limit`` is itself clamped to
+    :data:`MAX_SUBGRAPH_LIMIT`: a caller passing an enormous number gets the
+    ceiling, not the whole graph. *Edges* are capped separately at ``limit *``
+    :data:`SUBGRAPH_EDGE_FACTOR`, because a node cap bounds nodes only — one
+    pair of nodes can carry any number of edges between them, and without its
+    own bound the edge list is unbounded whatever ``limit`` says.
+    ``truncated`` is true when **either** cap bit, so a caller can always tell
+    a partial graph from a whole one; it is deliberately conservative, true
+    whenever a cap stopped the walk early even if the graph happened to have
+    nothing more to give.
+
+    The filters compose as one conjunction. An edge is followed only if it
+    passes edge state **and** type **and** ``min_confidence`` **and**
+    ``created_by``; a node is admitted only if it also passes ``node_types``.
+    An edge to a node the type filter excludes is dropped with it, so the
+    result never contains an edge pointing at a node it does not carry. The
+    root is always present and is exempt from ``node_types`` — it is what was
+    asked for, not something the walk found. A ``min_confidence`` floor drops
+    edges with no stated confidence: unstated is not "meets the bar", the same
+    reading the policy gate takes (:func:`_auto_accept_rule`). A filter that
+    removes nodes does *not* set ``truncated`` — the caller asked for that.
+
+    The walk is breadth-first and undirected (edges count in either
+    direction); within a level, edges are taken in ``(created_at, rowid)``
+    order and nodes appear in the order first reached, so the same call always
+    returns the same subgraph.
+
+    The result is then **closed over its own node set**: one further bounded
+    query adds edges whose endpoints were both admitted but which no walked
+    level was incident to — the B–C edge of a triangle read at depth 1. A
+    renderer therefore never draws two nodes it is showing as unconnected when
+    the stored graph connects them.
+
+    Args:
+        root_id: Node at the centre of the subgraph.
+        depth: Maximum hops from the root (0 returns the root alone).
+        edge_types: Edge type ids/names the walk may follow (default: any).
+        edge_states: Edge states the walk may follow (default:
+            :data:`DEFAULT_EDGE_STATES`, the live graph).
+        min_confidence: Floor on an edge's stored confidence.
+        created_by: Only follow edges written by this actor.
+        node_types: Node type ids/names that may be admitted (default: any).
+        limit: Hard cap on the number of nodes returned, root included,
+            clamped to :data:`MAX_SUBGRAPH_LIMIT`.
+        path: Explicit database path.
+
+    Returns:
+        The subgraph, with ``truncated`` true when the node cap or the edge
+        cap stopped it short of the whole neighborhood.
+
+    Raises:
+        NodeNotFound: If ``root_id`` does not resolve.
+        TypeNotFound: If an edge or node type does not resolve.
+        ValueError: If ``depth`` is negative, ``limit`` is below 1, an edge
+            state is unknown, or ``min_confidence`` is outside [0, 1].
+    """
+    if depth < 0:
+        raise ValueError(f"depth must be >= 0, got {depth}")
+    if limit < 1:
+        raise ValueError(f"limit must be >= 1, got {limit}")
+    # Clamped rather than refused: a caller asking for more than the server
+    # will ever draw gets the ceiling plus an honest `truncated`.
+    limit = min(limit, MAX_SUBGRAPH_LIMIT)
+    edge_limit = limit * SUBGRAPH_EDGE_FACTOR
+    states = tuple(edge_states) if edge_states else DEFAULT_EDGE_STATES
+    for state in states:
+        if state not in STATES:
+            raise ValueError(f"state must be one of {STATES}, got {state!r}")
+    if min_confidence is not None and not 0 <= min_confidence <= 1:
+        raise ValueError(f"min_confidence must be between 0 and 1, got {min_confidence}")
+    conn = _connect(path)
+    try:
+        edge_clauses = [f"state IN ({','.join('?' * len(states))})"]
+        edge_params: list[Any] = list(states)
+        if edge_types:
+            type_ids = [_resolve_edge_type(conn, edge_type) for edge_type in edge_types]
+            edge_clauses.append(f"type_id IN ({','.join('?' * len(type_ids))})")
+            edge_params += type_ids
+        if min_confidence is not None:
+            edge_clauses.append("confidence IS NOT NULL AND confidence >= ?")
+            edge_params.append(min_confidence)
+        if created_by is not None:
+            edge_clauses.append("created_by = ?")
+            edge_params.append(created_by)
+        admissible_types = (
+            {_resolve_node_type(conn, node_type) for node_type in node_types}
+            if node_types
+            else None
+        )
+
+        nodes: dict[str, dict[str, Any]] = {root_id: _row_dict(_get_node_row(conn, root_id))}
+        order = [root_id]
+        edges: list[dict[str, Any]] = []
+        seen_edges: set[str] = set()
+        truncated = False
+        frontier = {root_id}
+        for _level in range(depth):
+            if not frontier:
+                break
+            if len(edges) >= edge_limit:
+                # No budget left to connect anything a further level could
+                # reach, so stop rather than admit nodes with no edge to them.
+                break
+            placeholders = ",".join("?" * len(frontier))
+            sql = (
+                f"SELECT * FROM edges WHERE (src_id IN ({placeholders}) "
+                f"OR dst_id IN ({placeholders})) AND {' AND '.join(edge_clauses)} "
+                "ORDER BY created_at, rowid"
+            )
+            next_frontier: set[str] = set()
+            # Streamed, not fetched whole: the loop stops pulling rows the
+            # moment the edge budget is spent.
+            for edge_row in conn.execute(sql, sorted(frontier) * 2 + edge_params):
+                edge = _row_dict(edge_row)
+                if edge["id"] in seen_edges:
+                    continue
+                if len(edges) >= edge_limit:
+                    break  # the edge cap bites here, mid-walk
+                # One endpoint is in the frontier, so at most one is new.
+                far = edge["dst_id"] if edge["src_id"] in nodes else edge["src_id"]
+                if far not in nodes:
+                    if len(nodes) >= limit:
+                        # Tested *before* the far row is read: a hub with
+                        # 10_000 spokes costs `limit` node reads, not 10_000.
+                        truncated = True
+                        continue  # the node cap bites here, mid-walk
+                    row = _row_dict(_get_node_row(conn, far))
+                    if admissible_types is not None and row["type_id"] not in admissible_types:
+                        continue  # excluded node — its edge would dangle
+                    nodes[far] = row
+                    order.append(far)
+                    next_frontier.add(far)
+                seen_edges.add(edge["id"])
+                edges.append(edge)
+            frontier = next_frontier
+        # Close the ring: edges between two admitted nodes that no walked level
+        # was incident to (B–C of a triangle rooted at A, depth 1). One extra
+        # query over a node set the cap already bounds — without it the graph
+        # view draws nodes it is showing as unconnected, under `truncated`
+        # false, which reads as data loss.
+        if len(order) > 1 and len(edges) < edge_limit:
+            admitted = sorted(nodes)
+            placeholders = ",".join("?" * len(admitted))
+            # `LIMIT edge_limit` is exactly enough and never too few: every row
+            # this returns is either one the walk already took (at most
+            # `len(edges)` of them) or a new one (at most the remaining
+            # budget), and those two sum to `edge_limit`. It also keeps
+            # SQLite's own sorter bounded on a dense node set.
+            closing_sql = (
+                f"SELECT * FROM edges WHERE src_id IN ({placeholders}) "
+                f"AND dst_id IN ({placeholders}) AND {' AND '.join(edge_clauses)} "
+                "ORDER BY created_at, rowid LIMIT ?"
+            )
+            for edge_row in conn.execute(closing_sql, admitted * 2 + edge_params + [edge_limit]):
+                edge = _row_dict(edge_row)
+                if edge["id"] in seen_edges:
+                    continue
+                if len(edges) >= edge_limit:
+                    break
+                seen_edges.add(edge["id"])
+                edges.append(edge)
+        if len(edges) >= edge_limit:
+            # A spent budget is reported as truncation wherever it ran out —
+            # mid-level, between levels, or in the closing pass, whose SQL
+            # `LIMIT` makes "no more rows" and "no more budget" the same event.
+            # Conservative by design: a graph that happens to fill the cap
+            # exactly says "partial" rather than claiming a completeness the
+            # walk never checked.
+            truncated = True
+        return SubgraphOut(
+            root=root_id,
+            depth=depth,
+            nodes=[_node_out(nodes[node_id]) for node_id in order],
+            edges=[_edge_out(row) for row in edges],
+            truncated=truncated,
         )
     finally:
         conn.close()

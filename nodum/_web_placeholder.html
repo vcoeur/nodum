@@ -1,0 +1,97 @@
+<!doctype html>
+<!--
+  PLACEHOLDER — served by `nodum serve` when nodum/_web/ holds no built bundle.
+
+  It lives outside nodum/_web/ on purpose. Vite builds with emptyOutDir, which
+  wipes every file in that directory, so nothing tracked can survive there: a
+  placeholder kept inside it would be deleted by every build, leaving the tree
+  permanently dirty and hatch-vcs stamping a dirty version onto the wheel.
+
+  So nodum/_web/ is gitignored whole and this file is the tracked fallback.
+  create_app() serves it when the bundle is absent — a page that says what to
+  run is a better answer than a crash on a missing directory.
+-->
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <title>nodum — UI not built</title>
+    <style>
+      :root {
+        color-scheme: dark;
+      }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 2rem;
+        background: #12151a;
+        color: #dfe4ec;
+        font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+        font-size: 0.875rem;
+        line-height: 1.6;
+      }
+      main {
+        max-width: 34rem;
+        display: flex;
+        flex-direction: column;
+        gap: 1rem;
+      }
+      h1 {
+        margin: 0;
+        font-size: 1.375rem;
+      }
+      p {
+        margin: 0;
+        color: #9aa3b2;
+      }
+      code {
+        padding: 0.15em 0.4em;
+        border: 1px solid #272d37;
+        border-radius: 4px;
+        background: #171b21;
+        color: #c9a24a;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 0.9em;
+      }
+      ol {
+        margin: 0;
+        padding-left: 1.25rem;
+        color: #9aa3b2;
+      }
+      li + li {
+        margin-top: 0.35rem;
+      }
+      .api {
+        padding-top: 0.5rem;
+        border-top: 1px solid #272d37;
+        font-size: 0.8125rem;
+        color: #7a8394;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>UI not built</h1>
+      <p>
+        The API is running, but no frontend bundle has been built into
+        <code>nodum/_web/</code>. Build it once, then reload this page:
+      </p>
+      <ol>
+        <li><code>make web-install</code> — install the Node dependencies</li>
+        <li><code>make web-build</code> — build the bundle into <code>nodum/_web/</code></li>
+      </ol>
+      <p>
+        For frontend development, <code>make web-dev</code> runs the Vite dev server on
+        <code>http://127.0.0.1:5173</code> and proxies the API back to this process.
+      </p>
+      <p class="api">
+        The REST API is unaffected and available at <code>/api</code>; liveness is at
+        <code>/healthz</code>.
+      </p>
+    </main>
+  </body>
+</html>
