@@ -58,6 +58,15 @@ packages = ["nodum"]
 # the "not built" placeholder.
 artifacts = ["nodum/_web/**"]
 
+# The same re-include is required on the sdist, and it is not redundant: a bare
+# `uv build` builds the sdist and then builds the wheel *from that sdist*, so
+# anything the sdist drops cannot reappear in the wheel. Without this, `uv build`
+# silently produced a placeholder-UI wheel while `uv build --wheel` (which reads
+# the source tree directly) produced a correct one — which is exactly how v0.2.0
+# shipped with no UI despite a green release.
+[tool.hatch.build.targets.sdist]
+artifacts = ["nodum/_web/**"]
+
 [dependency-groups]
 dev = [
     "pytest>=9.0.2",

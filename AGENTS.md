@@ -261,7 +261,18 @@ Phase-1 decision log.
   elsewhere cannot reach the wheel. The `smoke` job builds it too and runs with
   `NODUM_SMOKE_REQUIRE_WEB=1`, which turns a missing bundle from a note into a
   failure; that is the check that stops a placeholder wheel reaching PyPI.
-  **v0.1.0 predates this and ships the placeholder.**
+  **v0.1.0 and v0.2.0 predate the working version and ship the placeholder.**
+- **`uv build` builds the wheel *from the sdist*, so the sdist must carry the
+  bundle too.** `artifacts = ["nodum/_web/**"]` is declared on **both** the
+  `wheel` and the `sdist` hatch targets, and the sdist one is not redundant: a
+  bare `uv build` (what `release.yml` publishes with) builds the sdist first and
+  then builds the wheel from it, so anything the sdist drops cannot reappear in
+  the wheel. `uv build --wheel` reads the source tree directly and does not have
+  this problem — which is precisely the trap. **Never build the wheel a
+  different way in a test than the release does:** v0.2.0 published a
+  placeholder-UI wheel with a fully green release because `scripts/smoke-install.sh`
+  used `--wheel` and so validated a build path the release never performs. The
+  script now uses plain `uv build`.
 
 ## CLI contract (for agents driving the CLI)
 

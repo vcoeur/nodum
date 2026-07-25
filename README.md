@@ -43,8 +43,9 @@ The local embedding model is an optional extra
 (`pipx install 'nodum[embeddings]'`); without it, search falls back to BM25
 keyword ranking.
 
-> The web UI (`nodum serve`) ships from v0.2.0 onward. **v0.1.0 serves an "UI
-> not built" placeholder** — its CLI, HTTP API, and MCP server are unaffected.
+> The web UI (`nodum serve`) ships from v0.2.1 onward. **v0.1.0 and v0.2.0
+> serve an "UI not built" placeholder** — their CLI, HTTP API, and MCP server
+> are unaffected.
 
 ## Quick start
 
