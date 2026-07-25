@@ -29,8 +29,13 @@ trap 'rm -rf "$work"' EXIT
 dist="$work/dist"
 venv="$work/venv"
 
-echo "==> Build wheel"
-uv build --wheel --out-dir "$dist"
+# Plain `uv build`, NOT `uv build --wheel` — this must exercise the exact build
+# path release.yml publishes from. The two differ: `uv build` builds the sdist
+# and then builds the wheel *from* it, while `--wheel` reads the source tree
+# directly. v0.2.0 shipped a placeholder-UI wheel because the smoke test used
+# `--wheel` and so tested a build the release never performs.
+echo "==> Build (sdist, then wheel from sdist — as the release does)"
+uv build --out-dir "$dist"
 wheels=("$dist"/*.whl)
 echo "    ${wheels[0]}"
 
