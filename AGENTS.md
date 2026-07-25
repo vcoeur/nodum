@@ -279,7 +279,10 @@ Phase-1 decision log.
   broken internal link or a page missing from `nav` **fails CI** — check a docs
   change locally with `uv run --with mkdocs-material mkdocs build --strict`.
   `docs/CNAME` carries the custom domain and must survive any docs
-  reorganisation. `docs/architecture.md` is both the in-repo architecture doc
+  reorganisation. **`docs/llms.txt`** is the agent-facing summary published at
+  `/llms.txt` (mkdocs copies non-Markdown files through verbatim); it states the
+  CLI contract, the actor/privilege split, and the MCP tier boundary, so a
+  change to any of those belongs in it as well as in this file. `docs/architecture.md` is both the in-repo architecture doc
   and a site page, so links out of it must be absolute URLs — a relative link
   to something outside `docs/` resolves in the repo but breaks the site build.
 
