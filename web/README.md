@@ -14,10 +14,10 @@ Six views ship: **editor** (`/editor`, `/editor/:nodeId`), **search**
 ```bash
 make web-install          # once — npm ci in web/
 make web-dev              # Vite dev server on http://127.0.0.1:5700
-uv run nodum serve        # the API on http://127.0.0.1:8420, in another shell
+uv run nodum serve        # the API on http://127.0.0.1:8600, in another shell
 ```
 
-The dev server proxies `/api` and `/healthz` to `127.0.0.1:8420`, so develop
+The dev server proxies `/api` and `/healthz` to `127.0.0.1:8600`, so develop
 against `http://127.0.0.1:5700` and let the proxy reach the Python process.
 The header shows a `connected` / `no server` pill so you can tell at a glance
 whether the backend is answering.
@@ -221,7 +221,7 @@ Both settled; noted here because breaking either is invisible in dev.
    `favicon.ico` if one exists and a **204** otherwise — this page declares its
    icon as an inline data URI, so normally there is no file to serve and the
    honest answer is "nothing here".
-2. **The port.** `nodum serve` defaults to `127.0.0.1:8420` and the dev proxy in
+2. **The port.** `nodum serve` defaults to `127.0.0.1:8600` and the dev proxy in
    `vite.config.ts` targets the same. Change one and change the other.
 3. **`nodum/_web/` is gitignored whole.** Vite's `emptyOutDir` wipes it on every
    build, so nothing tracked can live there. When the bundle is absent

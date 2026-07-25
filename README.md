@@ -102,12 +102,12 @@ uv run nodum mcp serve --actor agent:researcher
 # HTTP server for the human: JSON API under /api plus the web UI at /.
 # Loopback by default and no accounts — which means every process on this
 # machine can drive it as the human. A non-loopback bind needs --token.
-uv run nodum serve                      # http://127.0.0.1:8420
+uv run nodum serve                      # http://127.0.0.1:8600
 uv run nodum serve --token s3cret --host 0.0.0.0   # then open the /#token=… URL it prints
-curl -s localhost:8420/api/nodes/<id>   # identical bytes to `nodum node get <id>`
+curl -s localhost:8600/api/nodes/<id>   # identical bytes to `nodum node get <id>`
 
 # Reads need nothing. A write from a non-browser client says it is one:
-curl -s -X POST localhost:8420/api/nodes \
+curl -s -X POST localhost:8600/api/nodes \
   -H 'Content-Type: application/json' -H 'X-Nodum-Client: curl' \
   -d '{"type":"note","title":"From curl"}'
 ```
@@ -296,7 +296,7 @@ bundle and the runtime is pure Python:
 make web-install    # npm ci in web/ (once)
 make web-test       # vitest over the pure modules in web/src
 make web-build      # tsc --noEmit && vite build -> nodum/_web/
-make web-dev        # Vite dev server on :5700, proxying /api to :8420
+make web-dev        # Vite dev server on :5700, proxying /api to :8600
 make web-clean      # drop the bundle; nodum serve falls back to the placeholder
 ```
 
