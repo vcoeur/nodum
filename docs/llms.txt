@@ -1,0 +1,32 @@
+# nodum
+
+> DB-native knowledge graph: a typed graph of Markdown-content nodes and typed edges in **one SQLite file** — not files with an index over them. Every mutation flows through a deterministic, LLM-free service layer that validates it, moves it through a `proposed → active → archived` state machine, appends it to an event log with full before/after payloads, snapshots a node version, and leaves it reversible via `undo`. `[[wikilinks]]` in content materialize as `mentions` edges on write. Retrieval is hybrid search: an FTS5 BM25 index and a sqlite-vec chunk-embedding index (local in-process model, no daemon and no API key), fused by reciprocal rank fusion and re-ranked by graph expansion. Four surfaces share that one store — a JSON-emitting CLI, an HTTP API, an MCP server for external agents, and a React web UI. Installable from PyPI with `pipx install nodum`; there is no server to run and no database URL.
+
+## Docs
+
+- [Overview](https://nodum.vcoeur.com/): what nodum is, why one file, what makes it agent-native, and the current phase status.
+- [Install](https://nodum.vcoeur.com/install/): `pipx install nodum`, the optional `embeddings` extra, database path resolution, and verifying an install.
+- [Quick start](https://nodum.vcoeur.com/quick-start/): build a graph, watch a wikilink become an edge, search it, read its history, then the agent proposal flow.
+- [Concepts](https://nodum.vcoeur.com/concepts/): typed graph, the state machine, the event log, actors and privilege, projectors, assets, and why the surfaces cannot drift.
+- [Architecture](https://nodum.vcoeur.com/architecture/): the service spine and the thin adapters over it, module by module.
+- [Commands](https://nodum.vcoeur.com/commands/): the full CLI surface plus the conventions every command shares.
+
+## For agents
+
+- **Self-orient with `nodum schema-dump`.** It prints this CLI's entire command tree as JSON — every command, its one-line help, its parameters, and one level of subcommands. It needs no database, so it works immediately after install. Note it is a different thing from `nodum schema <type>`, which reports one *node or edge type's* catalog entry read from the database.
+- **Every command prints exactly one JSON object on stdout** and nothing else on the success path, so parse stdout directly. There is no `--json` flag — JSON is the only output format. Human-facing messages and errors go to stderr. Errors are always one line with exit 1, never a traceback.
+- **List commands wrap rows in a named key plus a count**: `{"nodes": [...], "count": 2}`. The HTTP API returns the same envelope bytes, so a client parses one shape whichever surface it talks to.
+- **You are not a human, and the service enforces that.** Pass `--actor agent:<name>`; your writes land `proposed` and wait in the review queue unless a stored policy auto-accepts them. `accept`, `reject`, `archive`, `undo`, every `review` subcommand, and `policy set` require `--actor human` and will exit 1 for an `agent:*` actor. This is structural, not a filter — do not try to route around it.
+- **Editing does not overwrite.** An agent `node update` stages a `proposed` *version* recording which fields it named. Accepting applies **only those fields** to the node as it stands at that moment, so a human edit made while your proposal waited is not reverted.
+- **Over MCP, `nodum mcp serve --actor agent:<name>` exposes the read and additive tiers and nothing else.** The review tools and the curative tools are never registered — they are absent from the tool list, not refused at call time. You can propose; you cannot dispose.
+- **Search is hybrid.** `nodum search <query>` returns `{query, k, hits}` where each hit carries `node_id`, `type`, `title`, `snippet`, `score`, and a per-signal `signals` breakdown (`bm25`, and `vector` when the embedding extra is installed). Without that extra, ranking degrades to BM25 rather than failing.
+- **Derived indexes are projections of the event log**, so they can lag. `nodum projector status` reports each projector's checkpoint, backlog, and availability; `nodum projector run` applies pending entries; `nodum projector rebuild <name>` replays from event 0.
+- **Graph reads**: `node get <id> --depth N` for a neighbourhood, `traverse`, `subgraph <root-id>` (bounded by node and edge caps, with a `truncated` flag), `find-path`, and `suggest-links <prefix>` for `[[` autocomplete — the last reads `nodes` directly, so it answers on a database whose projectors have never run.
+- **Assets**: registration is content-addressed by sha256 and idempotent. `asset get` returns metadata and never bytes; `asset rendition` returns a generated, cached `thumb`/`preview`. **Agents receive renditions only — originals are never served over MCP.**
+- **`--set key=value` is repeatable**, and values are parsed as JSON with a raw-string fallback: `--set year=1815` yields an integer, `--set venue=Nature` a string.
+- **A rejection needs a reason.** Both `reject <id> --reason` and `review reject … --reason` require it and record it in the reject event's payload.
+
+## Optional
+
+- [Source on GitHub](https://github.com/vcoeur/nodum)
+- [nodum on PyPI](https://pypi.org/project/nodum/)
