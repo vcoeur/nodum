@@ -1,0 +1,69 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  test:
+    name: Tests (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0 # hatch-vcs needs full history + tags to derive the version
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Run test suite
+        run: uv run --locked pytest -q
+
+  smoke:
+    name: Clean-install smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0 # hatch-vcs needs full history + tags to derive the version
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v7
+      - name: Clean-install smoke
+        run: bash scripts/smoke-install.sh
+
+  build-and-publish:
+    name: Build and publish to PyPI
+    # Never publish a wheel that fails tests, or one that fails to install and
+    # self-describe clean — tag pushes do not trigger ci.yml, so the release
+    # workflow must gate on the suite itself. The matrix mirrors ci.yml's so the
+    # tag gate is not weaker than the PR gate.
+    needs: [test, smoke]
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write   # required for OIDC trusted publishing
+      contents: read    # required so actions/checkout@v6 can read the repo
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0 # hatch-vcs needs full history + tags to derive the version
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Build
+        run: uv build
+
+      - name: Publish to PyPI
+        # Pinned to an exact release tag (not the floating `release/v1` branch):
+        # this job holds OIDC publish rights, so its action ref must not be a
+        # moving target someone else controls.
+        uses: pypa/gh-action-pypi-publish@v1.14.1
+        with:
+          # A tag re-push (e.g. amending lint fixes onto an already-released
+          # version) re-runs this job; without this the second run hard-fails
+          # with "400 File already exists" instead of being a no-op.
+          skip-existing: true
