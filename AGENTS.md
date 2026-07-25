@@ -227,6 +227,15 @@ Phase-1 decision log.
   unavailable so nothing can reach the network.
 - **Version** comes from the git tag (`vX.Y.Z`) via hatch-vcs at build time;
   never bump a version in code.
+- **Releasing.** Land the change on `main`, then push an annotated `vX.Y.Z`
+  tag on a commit reachable from `origin/main`. That triggers
+  `.github/workflows/release.yml`: the test matrix and the clean-install smoke
+  gate a `uv build`, which publishes to PyPI over OIDC trusted publishing (no
+  API token). Tag pushes do **not** trigger `ci.yml`, which is why the release
+  workflow re-runs the suite itself. The publish step sets `skip-existing:
+  true`, so re-pushing a tag onto an already-released version is a no-op rather
+  than a `400 File already exists` failure, and pins the publish action to an
+  exact tag because that job holds OIDC publish rights.
 - **Docstrings on public APIs**: one-line summary plus args/returns where
   applicable. Comment the *why*, not the *what*. Don't annotate code you
   didn't change.
@@ -292,10 +301,17 @@ Phase-1 decision log.
 - A policy rule's `min_confidence` grades the *agent's own* reported
   confidence, so it is inert unless the rule also sets
   `"trust_self_reported_confidence": true`.
+- `--version` prints `nodum <version>` and exits 0; `schema-dump` prints the
+  CLI's whole command tree as JSON. Both short-circuit without touching a
+  database, so they work on a bare install — that is what
+  `scripts/smoke-install.sh` asserts against a freshly built wheel. Note
+  `schema-dump` (the CLI adapter's own surface) is a different thing from
+  `schema <type>` (one node/edge type's catalog entry from the database).
 - Surface: `init`, `node create/get/update/list/children`, `edge
   create/list/create-batch`, `accept <id>` / `reject <id> --reason` /
   `archive <id>` (each takes a node, edge, or proposed-version id), `undo [seq]`,
-  `history <node-id>`, `events`, `types`, `schema <type>`, `search <query>`,
+  `history <node-id>`, `events`, `types`, `schema <type>`, `schema-dump`,
+  `search <query>`,
   `traverse`, `subgraph <root-id>`, `suggest-links <prefix>`, `find-path`,
   `diff`, `projector run/status/rebuild`,
   `policy set/get/list`, `review queue/accept/reject/accept-all/reject-all`,

@@ -9,6 +9,9 @@ htmlcov/
 .ruff_cache/
 .env
 
+# JetBrains IDE project files — per-developer, never shared.
+.idea/
+
 # mkdocs build output; the docs site is built and deployed by CI.
 site/
 

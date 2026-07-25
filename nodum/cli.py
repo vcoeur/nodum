@@ -20,9 +20,10 @@ from pathlib import Path
 import typer
 from pydantic import BaseModel
 
-from nodum import assets, db, projectors, service
+from nodum import __version__, assets, db, projectors, service
 from nodum import search as search_module
 from nodum.assets import AssetNotFound, AssetSourceChanged, AssetTooLarge, UnsupportedRendition
+from nodum.cli_schema import build_cli_schema
 from nodum.db import ENV_DB_VAR
 from nodum.envelope import envelope, list_envelope, render_json
 from nodum.service import (
@@ -64,13 +65,27 @@ app.add_typer(mcp_app, name="mcp")
 app.add_typer(asset_app, name="asset")
 
 
-@app.callback()
+@app.callback(invoke_without_command=True)
 def _main(
     db_path: str | None = typer.Option(
         None, "--db", help=f"Database path (overrides ${ENV_DB_VAR})."
     ),
+    version: bool = typer.Option(
+        False,
+        "--version",
+        help="Print version and exit.",
+        is_eager=True,
+    ),
 ) -> None:
-    """Resolve the database path for this invocation."""
+    """Resolve the database path for this invocation, and handle `--version`.
+
+    The `invoke_without_command=True` + `no_args_is_help=True` combo lets
+    `nodum --version` short-circuit without triggering the usage text; a bare
+    `nodum` with no subcommand still falls through to the help view.
+    """
+    if version:
+        typer.echo(f"nodum {__version__}")
+        raise typer.Exit(0)
     if db_path is not None:
         os.environ[ENV_DB_VAR] = db_path
 
@@ -518,6 +533,12 @@ def diff(
 def schema(type: str = typer.Argument(..., help="Node or edge type id/name.")) -> None:
     """Show one type's catalog entry, including its JSON schema."""
     _emit(_run(service.get_schema, type))
+
+
+@app.command("schema-dump")
+def schema_dump() -> None:
+    """Describe this CLI's own command surface (no database needed)."""
+    _print_json(build_cli_schema())
 
 
 @projector_app.command("run")
