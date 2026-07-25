@@ -101,7 +101,7 @@ node for exactly this reason.
 - **`nodum.http_api`** — the HTTP adapter (design §9), the **human** surface
   and the exact inverse of the MCP server. `create_app(*, db_path, token)`
   builds a Starlette app: the JSON API under `/api`, the built UI at `/`,
-  launched by `nodum serve` (loopback, port 8420). Every write is attributed
+  launched by `nodum serve` (loopback, port 8600). Every write is attributed
   to `HTTP_ACTOR` (= `service.ACTOR_HUMAN`) and **no request field, header, or
   query parameter can set an actor** — a body carrying `{"actor": "agent:x"}`
   is ignored, not honoured. That absence is structural, not a filter: the
@@ -236,7 +236,7 @@ Phase-1 decision log.
 - **Line length 100**; ruff rules `E, F, I, UP, B, SIM`.
 - **Frontend**: `make web-install` once, then `make web-build` (which runs
   `tsc --noEmit` first, so the build is the type gate) or `make web-dev` for
-  the Vite server on 5700 proxying to `nodum serve` on 8420. Two gates, both in
+  the Vite server on 5700 proxying to `nodum serve` on 8600. Two gates, both in
   CI: `tsc --noEmit` over the whole tree, and **`make web-test`** — Vitest over
   the pure modules in `web/src` (`*.test.ts` beside the module it covers).
   There is no ESLint and no component/DOM harness, so anything React renders is
@@ -292,7 +292,7 @@ Phase-1 decision log.
   `policy set/get/list`, `review queue/accept/reject/accept-all/reject-all`,
   `asset register/get/list/rendition/purge`,
   `mcp serve --actor agent:<name>`,
-  `serve [--host 127.0.0.1] [--port 8420] [--token TOKEN] [--allow-host NAME]
+  `serve [--host 127.0.0.1] [--port 8600] [--token TOKEN] [--allow-host NAME]
   [--db PATH]`. `serve` refuses a non-loopback bind without `--token` (exit 1),
   prints the database path and the `#token=…` UI URL on stderr, and translates
   uvicorn's own startup failure (a port already in use) into the contract's

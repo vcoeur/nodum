@@ -251,7 +251,7 @@ SAME_ORIGIN_FETCH_SITES = frozenset({"same-origin", "none"})
 LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "0.0.0.0"})
 
 #: Addresses whose *bind* reaches only this machine. Not the same set as
-#: :data:`LOOPBACK_HOSTS`: ``http://0.0.0.0:8420`` typed into a browser resolves
+#: :data:`LOOPBACK_HOSTS`: ``http://0.0.0.0:8600`` typed into a browser resolves
 #: to loopback and is a fine ``Host`` value, while ``--host 0.0.0.0`` binds
 #: every interface and puts the API on the network.
 LOOPBACK_BIND_ADDRESSES = frozenset({"localhost", "127.0.0.1", "::1"})
@@ -486,7 +486,7 @@ def _normalise_path(scope: Scope) -> None:
 def bare_host(value: str) -> str:
     """Return the bare host name of a ``Host``-style header value, lowercased.
 
-    Strips a port and the brackets of an IPv6 literal, so ``[::1]:8420`` and
+    Strips a port and the brackets of an IPv6 literal, so ``[::1]:8600`` and
     ``::1`` compare equal.
     """
     host = value.strip().lower()
@@ -540,7 +540,7 @@ class RequestGuardMiddleware:
 
     ``nodum serve`` binds loopback with no token by default, and **loopback is
     reachable from every page the user visits**. Nothing about the bind stops
-    ``https://evil.example`` from posting to ``http://127.0.0.1:8420``; the
+    ``https://evil.example`` from posting to ``http://127.0.0.1:8600``; the
     absence of CORS headers only stops it *reading the reply*, which a CSRF
     attacker does not need. This middleware is what stops the write landing.
 

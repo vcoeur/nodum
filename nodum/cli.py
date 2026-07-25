@@ -630,7 +630,12 @@ def mcp_serve(
 
 #: Default port for ``nodum serve``. The frontend dev server proxies ``/api``
 #: and ``/healthz`` here, so changing it means changing `web/vite.config.ts`.
-DEFAULT_HTTP_PORT = 8420
+#:
+#: 8600 is not arbitrary: each app in this workspace owns an 8xxx decade so two
+#: can run side by side, and 86xx is nodum's. Do not "just pick a free port" —
+#: 84xx belongs to another app, and 8000/8080 are avoided because unrelated
+#: tools take them.
+DEFAULT_HTTP_PORT = 8600
 
 
 @app.command()

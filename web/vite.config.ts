@@ -5,9 +5,9 @@ import react from "@vitejs/plugin-react";
  * The Python process serves the built bundle from `nodum/_web/` at `/`, so the
  * production app is same-origin with the API (no CORS anywhere in the stack).
  * In dev the Vite server stands in for that mount and proxies the two API
- * prefixes to `nodum serve` on 127.0.0.1:8420.
+ * prefixes to `nodum serve` on 127.0.0.1:8600.
  */
-const API_PORT = 8420;
+const API_PORT = 8600;
 
 /** Vite dev server. nodum owns 57xx; see the note on `server.port` below. */
 const DEV_PORT = 5700;

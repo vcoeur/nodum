@@ -45,7 +45,7 @@ from nodum import assets, cli, http_api, service
 AGENT = "agent:researcher"
 #: The tests are a non-browser client on the loopback interface, which is what
 #: the ``Host`` allowlist answers to.
-BASE_URL = "http://127.0.0.1:8420"
+BASE_URL = "http://127.0.0.1:8600"
 #: What a curl-shaped client sends to say it is not a browser (see
 #: ``RequestGuardMiddleware``). The ``Client`` below sends it on every write, so
 #: individual tests read as they did before origin control existed.
@@ -931,7 +931,7 @@ def test_a_cross_origin_write_is_refused(client, fresh_db, method, path):
 def test_the_text_plain_form_post_that_accepted_an_agents_proposal(client, fresh_db):
     """The reported exploit, replayed end to end.
 
-    A page anywhere on the web could submit ``<form action="http://127.0.0.1:8420
+    A page anywhere on the web could submit ``<form action="http://127.0.0.1:8600
     /api/review/accept" method="post" enctype="text/plain">`` — a CORS-*simple*
     request, so no preflight, so the absence of CORS headers stopped the
     attacker reading the reply and nothing else. It returned 200, moved an
@@ -1581,12 +1581,12 @@ def test_a_cancelled_upload_is_a_mapped_outcome_not_a_traceback(fresh_db):
         "query_string": b"",
         "scheme": "http",
         "headers": [
-            (b"host", b"127.0.0.1:8420"),
+            (b"host", b"127.0.0.1:8600"),
             (b"content-type", b"multipart/form-data; boundary=x"),
             (http_api.CLIENT_HEADER.encode(), b"nodum-tests"),
         ],
         "client": ("127.0.0.1", 51000),
-        "server": ("127.0.0.1", 8420),
+        "server": ("127.0.0.1", 8600),
     }
     sent: list[dict] = []
 
@@ -1606,7 +1606,7 @@ def test_a_cancelled_upload_is_a_mapped_outcome_not_a_traceback(fresh_db):
 
 
 def test_the_cli_serve_command_wires_the_app(fresh_db, monkeypatch):
-    """`nodum serve` builds the app and hands it to uvicorn on port 8420."""
+    """`nodum serve` builds the app and hands it to uvicorn on port 8600."""
     captured: dict = {}
 
     def fake_run(app, **kwargs):
@@ -1617,7 +1617,7 @@ def test_the_cli_serve_command_wires_the_app(fresh_db, monkeypatch):
     result = runner.invoke(cli.app, ["serve"])
 
     assert result.exit_code == 0, result.output
-    assert (captured["host"], captured["port"]) == ("127.0.0.1", 8420)
+    assert (captured["host"], captured["port"]) == ("127.0.0.1", 8600)
     assert Client(captured["app"]).get("/healthz").status_code == 200
 
 
@@ -1666,10 +1666,10 @@ def test_serve_exits_1_when_the_port_is_in_use(fresh_db, monkeypatch):
         raise SystemExit(3)
 
     monkeypatch.setattr("uvicorn.run", fails_to_start)
-    result = runner.invoke(cli.app, ["serve", "--port", "8420"])
+    result = runner.invoke(cli.app, ["serve", "--port", "8600"])
 
     assert result.exit_code == 1
-    assert "could not serve on 127.0.0.1:8420" in result.output
+    assert "could not serve on 127.0.0.1:8600" in result.output
 
 
 def test_serve_allows_extra_hosts_on_the_command_line(fresh_db, monkeypatch):
