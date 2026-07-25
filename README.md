@@ -28,9 +28,29 @@ search, the review queue and policy editor, a graph view, an asset browser,
 and per-node version history. Still to come: the ingestion pipeline and the
 consolidation cycle.
 
+## Install
+
+nodum is published to PyPI on every `vX.Y.Z` tag. For the CLI as a standalone
+tool, [pipx](https://pipx.pypa.io/) is the least invasive route:
+
+```sh
+pipx install nodum
+nodum --version
+nodum schema-dump      # the whole command surface, as JSON
+```
+
+The local embedding model is an optional extra
+(`pipx install 'nodum[embeddings]'`); without it, search falls back to BM25
+keyword ranking.
+
+> The web UI (`nodum serve`) is only in wheels whose build ran `make
+> web-build`; other wheels serve an "UI not built" placeholder. The CLI, the
+> HTTP API, and the MCP server are unaffected.
+
 ## Quick start
 
-Requires Python ≥ 3.12 and [uv](https://docs.astral.sh/uv/).
+For working *on* nodum. Requires Python ≥ 3.12 and
+[uv](https://docs.astral.sh/uv/).
 
 ```sh
 make dev-install        # uv sync --all-groups

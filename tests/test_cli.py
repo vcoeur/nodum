@@ -495,3 +495,35 @@ def test_asset_rendition_rejects_non_images(fresh_db, tmp_path):
     result = runner.invoke(app, ["asset", "rendition", asset["hash"]])
     assert result.exit_code == 1
     assert "only supported for image assets" in result.stderr
+
+
+def test_version_flag_short_circuits():
+    """`--version` prints the version and exits 0 without needing a database."""
+    result = runner.invoke(app, ["--version"])
+    assert result.exit_code == 0, result.output
+    assert result.stdout.startswith("nodum ")
+
+
+def test_schema_dump_describes_command_surface():
+    """`schema-dump` enumerates the CLI's own commands — the self-describing contract."""
+    payload = _run_json("schema-dump")
+    assert payload["tool"] == "nodum"
+    assert payload["version"]
+
+    names = {command["name"] for command in payload["commands"]}
+    assert {"node", "edge", "search", "schema", "schema-dump", "mcp"} <= names
+
+
+def test_schema_dump_recurses_into_groups():
+    """A command group carries its subcommands, so the dump covers the real surface."""
+    payload = _run_json("schema-dump")
+    node = next(c for c in payload["commands"] if c["name"] == "node")
+    subcommands = {sub["name"] for sub in node["subcommands"]}
+    assert {"create", "get", "update"} <= subcommands
+
+
+def test_schema_dump_surfaces_params():
+    """Params are introspected despite typer vendoring its own click."""
+    payload = _run_json("schema-dump")
+    schema_command = next(c for c in payload["commands"] if c["name"] == "schema")
+    assert any(p["kind"] == "argument" and p["name"] == "type" for p in schema_command["params"])
