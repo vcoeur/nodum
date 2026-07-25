@@ -9,6 +9,9 @@ htmlcov/
 .ruff_cache/
 .env
 
+# JetBrains IDE project files — per-developer, never shared.
+.idea/
+
 # Frontend (web/) — source is tracked, build output and deps are not.
 web/node_modules/
 web/dist/
