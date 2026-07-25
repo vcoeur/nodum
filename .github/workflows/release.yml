@@ -32,7 +32,21 @@ jobs:
           fetch-depth: 0 # hatch-vcs needs full history + tags to derive the version
       - name: Set up uv
         uses: astral-sh/setup-uv@v7
+      - name: Set up Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      # The bundle must exist before the wheel is built, or the smoke test
+      # would exercise a placeholder wheel and pass while the real artifact
+      # was broken. NODUM_SMOKE_REQUIRE_WEB makes the bundle assertion fatal
+      # here, so this step cannot silently become a no-op.
+      - name: Build the UI bundle
+        run: make web-install web-build
       - name: Clean-install smoke
+        env:
+          NODUM_SMOKE_REQUIRE_WEB: "1"
         run: bash scripts/smoke-install.sh
 
   build-and-publish:
@@ -53,6 +67,24 @@ jobs:
 
       - name: Set up uv
         uses: astral-sh/setup-uv@v7
+
+      - name: Set up Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      # `nodum/_web/` is gitignored, so a fresh checkout has no bundle and
+      # hatchling would ship the "UI not built" placeholder. GitHub Actions
+      # jobs do not share a filesystem, so the bundle the `web` job builds is
+      # unreachable here — it has to be built in this job, immediately before
+      # the wheel that re-includes it via `artifacts = ["nodum/_web/**"]`.
+      - name: Build the UI bundle
+        run: make web-install web-build
+
+      - name: Check the bundle was emitted
+        run: test -f nodum/_web/index.html && test -d nodum/_web/assets
 
       - name: Build
         run: uv build

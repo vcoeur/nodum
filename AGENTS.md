@@ -256,6 +256,12 @@ Phase-1 decision log.
   code was broken. Do not remove the pin, and do not add a test that depends on
   the ambient zone. `nodum/_web/` is gitignored whole and rewritten by every
   build; a release must `make web-build` before `uv build --wheel`.
+  `release.yml` does this **inside the `build-and-publish` job**, not in a
+  separate one — Actions jobs do not share a filesystem, so a bundle built
+  elsewhere cannot reach the wheel. The `smoke` job builds it too and runs with
+  `NODUM_SMOKE_REQUIRE_WEB=1`, which turns a missing bundle from a note into a
+  failure; that is the check that stops a placeholder wheel reaching PyPI.
+  **v0.1.0 predates this and ships the placeholder.**
 - **Docs site.** `docs/` + `mkdocs.yml` build the mkdocs-material site at
   <https://nodum.vcoeur.com/>, deployed by `.github/workflows/docs.yml` on any
   push to `main` that touches those paths. The build runs `--strict`, so a
