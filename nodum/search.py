@@ -25,7 +25,7 @@ from pathlib import Path
 
 import sqlite_vec
 
-from nodum import auth, db, embeddings, projectors
+from nodum import db, embeddings, projectors
 from nodum.migrations import META_SPACE_ID
 from nodum.models import SearchHit, SearchResult
 from nodum.principal import Principal
@@ -344,7 +344,7 @@ def search(
     created_before: str | None = None,
     include_meta: bool = False,
     expand: bool = False,
-    principal: Principal | None = None,
+    principal: Principal,
     path: str | Path | None = None,
 ) -> SearchResult:
     """Hybrid-search node title + content: BM25 and vector signals, RRF-fused.
@@ -380,8 +380,6 @@ def search(
     match = _match_query(query)
     # Derived indexes first: the projectors are incremental, so this is cheap.
     projectors.run_projectors(names=["fts", "vec"], path=path)
-    if principal is None:
-        principal = auth.owner_principal(path=path)
     conn = _connect(path)
     try:
         type_id = None

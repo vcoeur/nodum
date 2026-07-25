@@ -127,7 +127,12 @@ def test_create_node_lands_proposed_with_the_configured_actor(fresh_db):
 
 
 def test_update_node_stages_a_proposed_version(fresh_db):
-    note = service.create_node(type="note", title="Original", content="original body")
+    note = service.create_node(
+        type="note",
+        title="Original",
+        content="original body",
+        principal=owner(),
+    )
 
     async def scenario(session):
         result = await _call(session, "update_node", {"id": note.id, "content": "bot rewrite"})
@@ -137,12 +142,12 @@ def test_update_node_stages_a_proposed_version(fresh_db):
     version = _run(scenario)
     assert version["state"] == "proposed"
     assert version["content"] == "bot rewrite"
-    assert service.get_node(note.id).content == "original body"
+    assert service.get_node(note.id, principal=owner()).content == "original body"
 
 
 def test_link_lands_proposed(fresh_db):
-    a = service.create_node(type="concept", title="A")
-    b = service.create_node(type="concept", title="B")
+    a = service.create_node(type="concept", title="A", principal=owner())
+    b = service.create_node(type="concept", title="B", principal=owner())
 
     async def scenario(session):
         edge = await _call(session, "link", {"src": a.id, "dst": b.id, "edge_type": "mentions"})
@@ -154,8 +159,8 @@ def test_link_lands_proposed(fresh_db):
 
 
 def test_propose_edges_batch(fresh_db):
-    a = service.create_node(type="concept", title="A")
-    b = service.create_node(type="concept", title="B")
+    a = service.create_node(type="concept", title="A", principal=owner())
+    b = service.create_node(type="concept", title="B", principal=owner())
 
     async def scenario(session):
         result = await _call(
@@ -180,10 +185,25 @@ def test_propose_edges_batch(fresh_db):
 
 
 def _seed():
-    a = service.create_node(type="concept", title="Alpha concept", content="graph theory")
-    b = service.create_node(type="note", title="Beta note", content="about graph theory")
-    child = service.create_node(type="block", title="Child block", parent_id=b.id)
-    service.create_edge(a.id, b.id, "supports", confidence=0.9)
+    a = service.create_node(
+        type="concept",
+        title="Alpha concept",
+        content="graph theory",
+        principal=owner(),
+    )
+    b = service.create_node(
+        type="note",
+        title="Beta note",
+        content="about graph theory",
+        principal=owner(),
+    )
+    child = service.create_node(
+        type="block",
+        title="Child block",
+        parent_id=b.id,
+        principal=owner(),
+    )
+    service.create_edge(a.id, b.id, "supports", confidence=0.9, principal=owner())
     return a, b, child
 
 
@@ -222,7 +242,7 @@ def test_search_with_filters_and_expand(fresh_db):
 def test_search_date_filters_reach_the_query(fresh_db):
     """`created_after`/`created_before` are honoured, not just accepted."""
     _, b, _ = _seed()
-    stamp = service.get_node(b.id).created_at
+    stamp = service.get_node(b.id, principal=owner()).created_at
 
     def hits(filters):
         arguments = {"query": "graph", "filters": filters}
@@ -278,8 +298,8 @@ def test_list_types_and_get_schema(fresh_db):
 
 
 def test_history_and_diff(fresh_db):
-    note = service.create_node(type="note", title="Draft", content="v1 body")
-    service.update_node(note.id, content="v2 body")
+    note = service.create_node(type="note", title="Draft", content="v1 body", principal=owner())
+    service.update_node(note.id, content="v2 body", principal=owner())
 
     history = _run(lambda session: _call(session, "history", {"node_id": note.id}))
     versions = history.structuredContent["result"]
@@ -296,7 +316,12 @@ def test_history_and_diff(fresh_db):
 
 
 def test_agent_proposes_over_mcp_and_only_the_human_can_review(fresh_db):
-    note = service.create_node(type="note", title="Original", content="original body")
+    note = service.create_node(
+        type="note",
+        title="Original",
+        content="original body",
+        principal=owner(),
+    )
 
     async def scenario(session):
         first = await _call(session, "update_node", {"id": note.id, "content": "accepted body"})
@@ -305,7 +330,7 @@ def test_agent_proposes_over_mcp_and_only_the_human_can_review(fresh_db):
 
     keep, drop = _run(scenario)
     # Neither proposal touched the node — the agent has no way to land them.
-    assert service.get_node(note.id).content == "original body"
+    assert service.get_node(note.id, principal=owner()).content == "original body"
 
     # The agent's own principal cannot review either proposal, even its own:
     # suggest covers proposing, never accepting — refusals land per item.
@@ -317,13 +342,14 @@ def test_agent_proposes_over_mcp_and_only_the_human_can_review(fresh_db):
     # The human works the queue out of band (CLI / review API).
     service.accept_proposals([str(keep["id"])], principal=owner())
     service.reject_proposals([str(drop["id"])], reason="not good enough", principal=owner())
-    assert service.get_node(note.id).content == "accepted body"
-    assert [v.state for v in service.history(note.id)] == ["applied", "applied", "archived"]
+    assert service.get_node(note.id, principal=owner()).content == "accepted body"
+    versions = service.history(note.id, principal=owner())
+    assert [v.state for v in versions] == ["applied", "applied", "archived"]
 
 
 def test_agent_wikilinks_over_mcp_stay_proposed(fresh_db):
     """A create_node over MCP must not attach a live edge to a human's node."""
-    target = service.create_node(type="concept", title="Human Concept")
+    target = service.create_node(type="concept", title="Human Concept", principal=owner())
 
     async def scenario(session):
         result = await _call(
@@ -335,13 +361,20 @@ def test_agent_wikilinks_over_mcp_stay_proposed(fresh_db):
 
     node = _run(scenario)
     assert node["state"] == "proposed"
-    assert service.list_edges(node_id=target.id, type="mentions", state="active") == []
-    (pending,) = service.list_edges(node_id=target.id, type="mentions", state="proposed")
+    assert (
+        service.list_edges(node_id=target.id, type="mentions", state="active", principal=owner())
+        == []
+    )
+    (pending,) = service.list_edges(
+        node_id=target.id, type="mentions", state="proposed", principal=owner()
+    )
     assert pending.created_by == AGENT
 
     # The human accepting the node is what brings the edge to life.
     service.accept_proposals([node["id"]], principal=owner())
-    (live,) = service.list_edges(node_id=target.id, type="mentions", state="active")
+    (live,) = service.list_edges(
+        node_id=target.id, type="mentions", state="active", principal=owner()
+    )
     assert live.id == pending.id
 
 

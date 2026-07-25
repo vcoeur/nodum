@@ -5,6 +5,7 @@ from __future__ import annotations
 import sqlite3
 
 import pytest
+from helpers import owner
 
 from nodum import assets, db, service
 from nodum.migrations import MIGRATIONS, SEED_EDGE_TYPES, SEED_NODE_TYPES
@@ -47,7 +48,7 @@ def test_init_creates_core_tables(fresh_db):
 
 
 def test_init_seeds_builtin_node_types(fresh_db):
-    catalog = service.list_types()
+    catalog = service.list_types(principal=owner())
     names = {node_type.name for node_type in catalog.node_types}
     # 0009 adds the metaclass root and the space type to the seed vocabulary.
     assert names == set(SEED_NODE_TYPES) | {"type", "space"}
@@ -57,7 +58,7 @@ def test_init_seeds_builtin_node_types(fresh_db):
 
 
 def test_init_seeds_builtin_edge_types_with_inverses(fresh_db):
-    catalog = service.list_types()
+    catalog = service.list_types(principal=owner())
     by_name = {edge_type.name: edge_type for edge_type in catalog.edge_types}
     assert set(by_name) == {name for name, _ in SEED_EDGE_TYPES}
     for name, inverse in SEED_EDGE_TYPES:
@@ -69,10 +70,10 @@ def test_init_seeds_builtin_edge_types_with_inverses(fresh_db):
 
 def test_new_nodes_land_in_the_main_space(fresh_db):
     """graph_id became space_id on nodes only (0009); edges carry no space."""
-    node = service.create_node(type="note", title="n1")
+    node = service.create_node(type="note", title="n1", principal=owner())
     assert node.space_id == "main"
-    edge_target = service.create_node(type="note", title="n2")
-    edge = service.create_edge(node.id, edge_target.id, "relates_to")
+    edge_target = service.create_node(type="note", title="n2", principal=owner())
+    edge = service.create_edge(node.id, edge_target.id, "relates_to", principal=owner())
     assert not hasattr(edge, "space_id")
 
 
@@ -242,7 +243,11 @@ def test_a_failed_migration_can_be_retried_after_a_fix(fresh_db, monkeypatch):
     monkeypatch.setattr(db, "MIGRATIONS", [*MIGRATIONS, fixed])
     assert service.init().applied == [fixed[0]]
     # And the graph is usable again, not wedged on a half-applied schema.
-    assert service.create_node(type="note", title="after the fix").state == "active"
+    assert service.create_node(
+        type="note",
+        title="after the fix",
+        principal=owner(),
+    )
 
 
 def test_migration_names_are_checked_before_being_inlined(fresh_db):

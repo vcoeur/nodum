@@ -14,6 +14,7 @@ import random
 import sqlite3
 
 import pytest
+from helpers import owner
 from PIL import Image
 
 from nodum import assets, db, service
@@ -121,7 +122,12 @@ def test_get_asset_by_hash_and_by_node_id(fresh_db, tmp_path):
     asset = _register_image(fresh_db, tmp_path)
     assert assets.get_asset(asset.hash).hash == asset.hash
 
-    node = service.create_node(type="asset_ref", title="Photo", props={"asset_hash": asset.hash})
+    node = service.create_node(
+        type="asset_ref",
+        title="Photo",
+        props={"asset_hash": asset.hash},
+        principal=owner(),
+    )
     assert assets.get_asset(node.id).hash == asset.hash
 
 
@@ -314,7 +320,7 @@ def test_options_including_the_db_path_are_keyword_only(fresh_db, tmp_path):
     """Every public function follows the service/search convention.
 
     `path` used to be positional here alone, so `get_asset(x, y)` quietly read
-    `y` as a database path where `service.get_node(x, y)` is a TypeError.
+    `y` as a database path where `service.get_node(x, y, principal=owner())` is a TypeError.
     """
     asset = _register_image(fresh_db, tmp_path)
     rendition = assets.get_rendition(asset.hash, profile="thumb")

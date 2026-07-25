@@ -21,7 +21,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from nodum import auth, db
+from nodum import db
 from nodum.migrations import MAIN_SPACE_ID, META_SPACE_ID
 from nodum.models import (
     BatchTransitionOut,
@@ -137,17 +137,6 @@ def _connect(path: str | Path | None) -> sqlite3.Connection:
     conn = db.connect(path)
     db.init_db(conn)
     return conn
-
-
-def _principal_or_owner(principal: Principal | None, path: str | Path | None) -> Principal:
-    """Resolve the trusted-local default: no principal means the owner.
-
-    The service layer is not a network boundary — adapters authenticate and
-    pass the principal they minted; tests and one-shot scripts use the
-    default. The Q13 surfaces task's AST guard asserts the adapters never
-    rely on it.
-    """
-    return principal if principal is not None else auth.owner_principal(path=path)
 
 
 def _row_dict(row: sqlite3.Row) -> dict[str, Any]:
@@ -581,7 +570,7 @@ def create_node(
     parent_id: str | None = None,
     props: dict[str, Any] | None = None,
     space: str | None = None,
-    principal: Principal | None = None,
+    principal: Principal,
     path: str | Path | None = None,
 ) -> NodeOut:
     """Create a node, emit ``node.create``/``node.propose``, snapshot a version.
@@ -611,7 +600,6 @@ def create_node(
     """
     conn = _connect(path)
     try:
-        principal = _principal_or_owner(principal, path)
         store = Store(conn, principal)
         actor = principal.actor_string
         type_id = _resolve_node_type(conn, type, principal)
@@ -666,9 +654,7 @@ def create_node(
         conn.close()
 
 
-def get_node(
-    node_id: str, *, principal: Principal | None = None, path: str | Path | None = None
-) -> NodeOut:
+def get_node(node_id: str, *, principal: Principal, path: str | Path | None = None) -> NodeOut:
     """Fetch one node by id.
 
     Raises:
@@ -678,7 +664,6 @@ def get_node(
     """
     conn = _connect(path)
     try:
-        principal = _principal_or_owner(principal, path)
         store = Store(conn, principal)
         row = _get_node_row(conn, node_id)
         if not store.node_visible(row):
@@ -694,7 +679,7 @@ def update_node(
     title: Any = _UNSET,
     content: Any = _UNSET,
     props: Any = _UNSET,
-    principal: Principal | None = None,
+    principal: Principal,
     path: str | Path | None = None,
 ) -> NodeOut | VersionOut:
     """Update a node's title/content/props — or propose the update.
@@ -719,7 +704,6 @@ def update_node(
     """
     conn = _connect(path)
     try:
-        principal = _principal_or_owner(principal, path)
         store = Store(conn, principal)
         actor = principal.actor_string
         before_row = _get_node_row(conn, node_id)
@@ -795,7 +779,7 @@ def list_nodes(
     state: str | None = None,
     parent_id: str | None = None,
     include_meta: bool = False,
-    principal: Principal | None = None,
+    principal: Principal,
     limit: int = 500,
     path: str | Path | None = None,
 ) -> list[NodeOut]:
@@ -809,7 +793,6 @@ def list_nodes(
     """
     conn = _connect(path)
     try:
-        principal = _principal_or_owner(principal, path)
         store = Store(conn, principal)
         clauses: list[str] = []
         params: list[Any] = []
@@ -842,7 +825,7 @@ def list_nodes(
 
 
 def list_children(
-    node_id: str, *, principal: Principal | None = None, path: str | Path | None = None
+    node_id: str, *, principal: Principal, path: str | Path | None = None
 ) -> list[NodeOut]:
     """List a node's children in ``position`` order.
 
@@ -851,7 +834,6 @@ def list_children(
     """
     conn = _connect(path)
     try:
-        principal = _principal_or_owner(principal, path)
         store = Store(conn, principal)
         parent = _get_node_row(conn, node_id)
         if not store.node_visible(parent):
@@ -891,7 +873,7 @@ def suggest_links(
     prefix: str,
     *,
     limit: int = 20,
-    principal: Principal | None = None,
+    principal: Principal,
     path: str | Path | None = None,
 ) -> list[NodeOut]:
     """Suggest ``[[wikilink]]`` targets whose title starts with ``prefix``.
@@ -929,7 +911,6 @@ def suggest_links(
         raise ValueError(f"limit must be >= 1, got {limit}")
     conn = _connect(path)
     try:
-        principal = _principal_or_owner(principal, path)
         store = Store(conn, principal)
         placeholders = ",".join("?" * len(SUGGEST_STATES))
         scope, scope_params = store.node_scope()
@@ -1010,7 +991,7 @@ def create_edge(
     *,
     props: dict[str, Any] | None = None,
     confidence: float | None = None,
-    principal: Principal | None = None,
+    principal: Principal,
     path: str | Path | None = None,
 ) -> EdgeOut:
     """Create a typed, directed edge and emit ``edge.create``/``edge.propose``.
@@ -1030,7 +1011,6 @@ def create_edge(
     """
     conn = _connect(path)
     try:
-        principal = _principal_or_owner(principal, path)
         store = Store(conn, principal)
         row = _create_edge_in_conn(
             conn,
@@ -1051,7 +1031,7 @@ def create_edge(
 def propose_edges(
     suggestions: list[dict[str, Any]],
     *,
-    principal: Principal | None = None,
+    principal: Principal,
     path: str | Path | None = None,
 ) -> ProposeEdgesOut:
     """Write a batch of edge suggestions, one event per edge (design §8.1).
@@ -1067,7 +1047,6 @@ def propose_edges(
     """
     conn = _connect(path)
     try:
-        principal = _principal_or_owner(principal, path)
         store = Store(conn, principal)
         created: list[EdgeOut] = []
         failed: list[ItemFailure] = []
@@ -1102,7 +1081,7 @@ def list_edges(
     node_id: str | None = None,
     type: str | None = None,
     state: str | None = None,
-    principal: Principal | None = None,
+    principal: Principal,
     limit: int = 500,
     path: str | Path | None = None,
 ) -> list[EdgeOut]:
@@ -1113,7 +1092,6 @@ def list_edges(
     """
     conn = _connect(path)
     try:
-        principal = _principal_or_owner(principal, path)
         store = Store(conn, principal)
         clauses: list[str] = []
         params: list[Any] = []
@@ -1282,7 +1260,7 @@ def transition(
     action: str,
     *,
     reason: str | None = None,
-    principal: Principal | None = None,
+    principal: Principal,
     path: str | Path | None = None,
 ) -> NodeOut | EdgeOut | VersionOut:
     """Apply a state-machine transition to a node, edge, or proposed version.
@@ -1313,7 +1291,6 @@ def transition(
         raise ValueError(f"unknown transition {action!r}; expected one of {sorted(TRANSITIONS)}")
     conn = _connect(path)
     try:
-        principal = _principal_or_owner(principal, path)
         store = Store(conn, principal)
         kind, after = _transition_row(
             conn, record_id, action, principal.actor_string, store, reason=reason
@@ -1512,7 +1489,7 @@ def list_proposals(
     kind: str | None = None,
     created_before: str | None = None,
     created_after: str | None = None,
-    principal: Principal | None = None,
+    principal: Principal,
     limit: int = 500,
     path: str | Path | None = None,
 ) -> list[ProposalOut]:
@@ -1536,7 +1513,6 @@ def list_proposals(
         raise ValueError(f"kind must be 'node', 'edge', or 'update', got {kind!r}")
     conn = _connect(path)
     try:
-        principal = _principal_or_owner(principal, path)
         store = Store(conn, principal)
         rows = _proposal_rows(
             conn,
@@ -1595,7 +1571,7 @@ def _transition_many(
     ids: list[str],
     action: str,
     *,
-    principal: Principal | None,
+    principal: Principal,
     reason: str | None,
     path: str | Path | None,
 ) -> BatchTransitionOut:
@@ -1608,7 +1584,6 @@ def _transition_many(
     """
     conn = _connect(path)
     try:
-        principal = _principal_or_owner(principal, path)
         store = Store(conn, principal)
         actor = principal.actor_string
         transitioned: list[str] = []
@@ -1628,7 +1603,7 @@ def _transition_many(
 
 
 def accept_proposals(
-    ids: list[str], *, principal: Principal | None = None, path: str | Path | None = None
+    ids: list[str], *, principal: Principal, path: str | Path | None = None
 ) -> BatchTransitionOut:
     """Accept proposed nodes/edges/updates by id, one event each.
 
@@ -1649,7 +1624,7 @@ def reject_proposals(
     ids: list[str],
     *,
     reason: str,
-    principal: Principal | None = None,
+    principal: Principal,
     path: str | Path | None = None,
 ) -> BatchTransitionOut:
     """Reject proposed nodes/edges/updates by id, one event each.
@@ -1677,7 +1652,7 @@ def accept_matching(
     kind: str | None = None,
     created_before: str | None = None,
     created_after: str | None = None,
-    principal: Principal | None = None,
+    principal: Principal,
     path: str | Path | None = None,
 ) -> BatchTransitionOut:
     """Accept every proposal matching the filters (e.g. one agent's whole run).
@@ -1713,7 +1688,7 @@ def reject_matching(
     kind: str | None = None,
     created_before: str | None = None,
     created_after: str | None = None,
-    principal: Principal | None = None,
+    principal: Principal,
     path: str | Path | None = None,
 ) -> BatchTransitionOut:
     """Reject every proposal matching the filters, recording ``reason``.
@@ -1742,7 +1717,7 @@ def reject_matching(
 
 
 def undo(
-    seq: int | None = None, *, principal: Principal | None = None, path: str | Path | None = None
+    seq: int | None = None, *, principal: Principal, path: str | Path | None = None
 ) -> UndoResult:
     """Reverse one event (default: the latest non-undo event), restoring state.
 
@@ -1774,7 +1749,6 @@ def undo(
     """
     conn = _connect(path)
     try:
-        principal = _principal_or_owner(principal, path)
         store = Store(conn, principal)
         store.require_human("undo")
         actor = principal.actor_string
@@ -1887,7 +1861,7 @@ def undo(
 
 
 def history(
-    node_id: str, *, principal: Principal | None = None, path: str | Path | None = None
+    node_id: str, *, principal: Principal, path: str | Path | None = None
 ) -> list[VersionOut]:
     """Return a node's version snapshots in chronological order.
 
@@ -1899,7 +1873,6 @@ def history(
     """
     conn = _connect(path)
     try:
-        principal = _principal_or_owner(principal, path)
         store = Store(conn, principal)
         node = _get_node_row(conn, node_id)
         if not store.node_visible(node):
@@ -1912,10 +1885,17 @@ def history(
         conn.close()
 
 
-def list_events(*, limit: int = 50, path: str | Path | None = None) -> list[EventOut]:
-    """Return the most recent events (newest first), capped at ``limit``."""
+def list_events(
+    principal: Principal, *, limit: int = 50, path: str | Path | None = None
+) -> list[EventOut]:
+    """Return the most recent events (newest first), capped at ``limit``.
+
+    The event log is the audit trail — a human surface (CLI today); agents
+    do not read it.
+    """
     conn = _connect(path)
     try:
+        Store(conn, principal).require_human("read the event log")
         rows = conn.execute("SELECT * FROM events ORDER BY seq DESC LIMIT ?", (limit,)).fetchall()
         return [
             EventOut(
@@ -1946,14 +1926,18 @@ def _type_out(row: sqlite3.Row) -> TypeOut | EdgeTypeOut:
     return TypeOut(parent_type_id=props.get("parent_type_id"), **base)
 
 
-def list_types(*, path: str | Path | None = None) -> TypesOut:
+def list_types(*, principal: Principal, path: str | Path | None = None) -> TypesOut:
     """Return the full type catalog (node types and edge types).
 
     Types are nodes (Q13, migration ``0009``): the catalog is the active
-    type-nodes, which live in the meta space.
+    type-nodes, which live in the meta space — an agent must be able to read
+    meta (the parity/file-birth grants give it that) to use the vocabulary.
     """
     conn = _connect(path)
     try:
+        principal_meta = principal.level_on(META_SPACE_ID)
+        if principal_meta < READ:
+            raise TypeNotFound("the type catalog is not readable by this principal")
         rows = conn.execute(
             "SELECT * FROM nodes WHERE type_id = 'type' AND state = 'active' ORDER BY title"
         ).fetchall()
@@ -1969,14 +1953,19 @@ def list_types(*, path: str | Path | None = None) -> TypesOut:
 # ── Curated graph reads (design §8.1 read tier — no query DSL, per T2) ───────
 
 
-def get_schema(type: str, *, path: str | Path | None = None) -> TypeOut | EdgeTypeOut:
+def get_schema(
+    type: str, *, principal: Principal, path: str | Path | None = None
+) -> TypeOut | EdgeTypeOut:
     """Fetch one type's catalog entry (node types checked first, then edges).
 
     Raises:
-        TypeNotFound: If the id/name resolves in neither catalog.
+        TypeNotFound: If the id/name resolves in neither catalog — or the
+            catalog is not readable by the principal.
     """
     conn = _connect(path)
     try:
+        if principal.level_on(META_SPACE_ID) < READ:
+            raise TypeNotFound("the type catalog is not readable by this principal")
         row = conn.execute(
             "SELECT * FROM nodes WHERE (id = ? OR title = ?) AND type_id = 'type'"
             " AND state = 'active' ORDER BY json_extract(props, '$.type_kind') DESC LIMIT 1",
@@ -2055,7 +2044,7 @@ def get_neighborhood(
     node_id: str,
     *,
     depth: int = 1,
-    principal: Principal | None = None,
+    principal: Principal,
     path: str | Path | None = None,
 ) -> SubgraphOut:
     """Return a node plus its active-edge neighborhood out to ``depth`` hops.
@@ -2070,7 +2059,6 @@ def get_neighborhood(
         raise ValueError(f"depth must be >= 0, got {depth}")
     conn = _connect(path)
     try:
-        principal = _principal_or_owner(principal, path)
         store = Store(conn, principal)
         nodes, edges = _walk(
             conn, node_id, type_ids=None, depth=depth, direction="both", store=store
@@ -2091,7 +2079,7 @@ def traverse(
     edge_types: list[str] | None = None,
     depth: int = 2,
     direction: str = "both",
-    principal: Principal | None = None,
+    principal: Principal,
     path: str | Path | None = None,
 ) -> SubgraphOut:
     """Walk the subgraph reachable from ``start_id`` over active edges.
@@ -2111,7 +2099,6 @@ def traverse(
         raise ValueError(f"depth must be >= 0, got {depth}")
     conn = _connect(path)
     try:
-        principal = _principal_or_owner(principal, path)
         store = Store(conn, principal)
         type_ids = (
             [_resolve_edge_type(conn, edge_type)[0] for edge_type in edge_types]
@@ -2140,7 +2127,7 @@ def subgraph(
     min_confidence: float | None = None,
     created_by: str | None = None,
     node_types: list[str] | None = None,
-    principal: Principal | None = None,
+    principal: Principal,
     limit: int = 200,
     path: str | Path | None = None,
 ) -> SubgraphOut:
@@ -2223,7 +2210,6 @@ def subgraph(
         raise ValueError(f"min_confidence must be between 0 and 1, got {min_confidence}")
     conn = _connect(path)
     try:
-        principal = _principal_or_owner(principal, path)
         store = Store(conn, principal)
         root = _get_node_row(conn, root_id)
         if not store.node_visible(root):
@@ -2341,7 +2327,7 @@ def subgraph(
 
 
 def find_path(
-    a_id: str, b_id: str, *, principal: Principal | None = None, path: str | Path | None = None
+    a_id: str, b_id: str, *, principal: Principal, path: str | Path | None = None
 ) -> PathOut:
     """Find the shortest path between two nodes over active edges (any type).
 
@@ -2354,7 +2340,6 @@ def find_path(
     """
     conn = _connect(path)
     try:
-        principal = _principal_or_owner(principal, path)
         store = Store(conn, principal)
         a = _get_node_row(conn, a_id)
         b = _get_node_row(conn, b_id)
@@ -2425,7 +2410,7 @@ def _render_version(version: dict[str, Any]) -> str:
 
 
 def diff_versions(
-    a: int, b: int, *, principal: Principal | None = None, path: str | Path | None = None
+    a: int, b: int, *, principal: Principal, path: str | Path | None = None
 ) -> DiffOut:
     """Diff two versions of one node (design §8.1 ``diff(a, b)``).
 
@@ -2436,7 +2421,6 @@ def diff_versions(
     """
     conn = _connect(path)
     try:
-        principal = _principal_or_owner(principal, path)
         store = Store(conn, principal)
         version_a = _row_dict(_get_version_row(conn, a))
         version_b = _row_dict(_get_version_row(conn, b))

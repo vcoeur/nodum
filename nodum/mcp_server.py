@@ -220,12 +220,12 @@ def create_server(*, actor: str = "agent:mcp", db_path: str | Path | None = None
     @server.tool(annotations=_READ)
     def list_types() -> dict[str, Any]:
         """List the full type catalog (node types and edge types)."""
-        return _dump(service.list_types(path=db_path))
+        return _dump(service.list_types(principal=principal, path=db_path))
 
     @server.tool(annotations=_READ)
     def get_schema(type: str) -> dict[str, Any]:
         """Fetch one node or edge type's catalog entry (id or name), incl. its JSON schema."""
-        return _dump(service.get_schema(type, path=db_path))
+        return _dump(service.get_schema(type, principal=principal, path=db_path))
 
     @server.tool(annotations=_READ)
     def find_path(a: str, b: str) -> dict[str, Any]:

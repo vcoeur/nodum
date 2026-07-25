@@ -231,12 +231,13 @@ def node_get(
     depth: int = typer.Option(
         0, "--depth", help="Include the active-edge neighborhood out to this many hops."
     ),
+    as_human: str = AS_OPTION,
 ) -> None:
     """Fetch one node by id (plus its neighborhood when --depth > 0)."""
     if depth > 0:
-        _emit(_run(service.get_neighborhood, node_id, depth=depth))
+        _emit(_run(service.get_neighborhood, node_id, depth=depth, principal=_principal(as_human)))
     else:
-        _emit(_run(service.get_node, node_id))
+        _emit(_run(service.get_node, node_id, principal=_principal(as_human)))
 
 
 @node_app.command("update")
@@ -271,16 +272,27 @@ def node_list(
     state: str | None = typer.Option(None, "--state", help="Filter by state."),
     parent: str | None = typer.Option(None, "--parent", help="Filter by parent node id."),
     limit: int = typer.Option(500, "--limit", help="Maximum rows."),
+    as_human: str = AS_OPTION,
 ) -> None:
     """List nodes in creation order, optionally filtered."""
-    nodes = _run(service.list_nodes, type=type, state=state, parent_id=parent, limit=limit)
+    nodes = _run(
+        service.list_nodes,
+        type=type,
+        state=state,
+        parent_id=parent,
+        principal=_principal(as_human),
+        limit=limit,
+    )
     _emit_list("nodes", nodes)
 
 
 @node_app.command("children")
-def node_children(node_id: str = typer.Argument(..., help="Parent node id.")) -> None:
+def node_children(
+    node_id: str = typer.Argument(..., help="Parent node id."),
+    as_human: str = AS_OPTION,
+) -> None:
     """List a node's children in position order."""
-    nodes = _run(service.list_children, node_id)
+    nodes = _run(service.list_children, node_id, principal=_principal(as_human))
     _emit_list("nodes", nodes)
 
 
@@ -312,9 +324,17 @@ def edge_list(
     type: str | None = typer.Option(None, "--type", "-t", help="Filter by edge type."),
     state: str | None = typer.Option(None, "--state", help="Filter by state."),
     limit: int = typer.Option(500, "--limit", help="Maximum rows."),
+    as_human: str = AS_OPTION,
 ) -> None:
     """List edges, optionally filtered by incident node, type, or state."""
-    edges = _run(service.list_edges, node_id=node, type=type, state=state, limit=limit)
+    edges = _run(
+        service.list_edges,
+        node_id=node,
+        type=type,
+        state=state,
+        principal=_principal(as_human),
+        limit=limit,
+    )
     _emit_list("edges", edges)
 
 
@@ -392,23 +412,29 @@ def undo(
 
 
 @app.command()
-def history(node_id: str = typer.Argument(..., help="Node id.")) -> None:
+def history(
+    node_id: str = typer.Argument(..., help="Node id."),
+    as_human: str = AS_OPTION,
+) -> None:
     """Show a node's version history (chronological)."""
-    versions = _run(service.history, node_id)
+    versions = _run(service.history, node_id, principal=_principal(as_human))
     _emit_list("versions", versions)
 
 
 @app.command()
-def events(limit: int = typer.Option(50, "--limit", help="Maximum rows.")) -> None:
+def events(
+    limit: int = typer.Option(50, "--limit", help="Maximum rows."),
+    as_human: str = AS_OPTION,
+) -> None:
     """Show the most recent event-log entries (newest first)."""
-    rows = _run(service.list_events, limit=limit)
+    rows = _run(service.list_events, _principal(as_human), limit=limit)
     _emit_list("events", rows)
 
 
 @app.command(name="types")
-def list_types() -> None:
+def list_types(as_human: str = AS_OPTION) -> None:
     """Show the full type catalog (node types and edge types)."""
-    _emit(_run(service.list_types))
+    _emit(_run(service.list_types, principal=_principal(as_human)))
 
 
 @app.command()
@@ -429,6 +455,7 @@ def search(
     expand: bool = typer.Option(
         False, "--expand", help="Append one-hop active-edge neighbors of the hits."
     ),
+    as_human: str = AS_OPTION,
 ) -> None:
     """Hybrid-search node title + content (BM25 + vector, RRF-fused).
 
@@ -446,6 +473,7 @@ def search(
         created_after=created_after,
         created_before=created_before,
         expand=expand,
+        principal=_principal(as_human),
     )
     _emit(result)
 
@@ -454,6 +482,7 @@ def search(
 def suggest_links(
     prefix: str = typer.Argument(..., help="Title prefix typed so far ('' matches every title)."),
     limit: int = typer.Option(20, "--limit", help="Maximum suggestions."),
+    as_human: str = AS_OPTION,
 ) -> None:
     """Suggest wikilink targets by title prefix (case-insensitive).
 
@@ -461,7 +490,7 @@ def suggest_links(
     index, so it answers on a database whose projectors have never run.
     Archived nodes are never suggested.
     """
-    nodes = _run(service.suggest_links, prefix, limit=limit)
+    nodes = _run(service.suggest_links, prefix, principal=_principal(as_human), limit=limit)
     _emit_list("nodes", nodes)
 
 
@@ -473,6 +502,7 @@ def traverse(
     ),
     depth: int = typer.Option(2, "--depth", help="Maximum hops."),
     direction: str = typer.Option("both", "--direction", help="'out', 'in', or 'both'."),
+    as_human: str = AS_OPTION,
 ) -> None:
     """Walk the subgraph reachable from a node over active edges."""
     _emit(
@@ -482,6 +512,7 @@ def traverse(
             edge_types=edge_type,
             depth=depth,
             direction=direction,
+            principal=_principal(as_human),
         )
     )
 
@@ -506,6 +537,7 @@ def subgraph(
         None, "--node-type", help="Only include nodes of these types (repeatable)."
     ),
     limit: int = typer.Option(200, "--limit", help="Maximum nodes, root included."),
+    as_human: str = AS_OPTION,
 ) -> None:
     """Bounded, filtered neighborhood of a node — node and edge caps stop the walk.
 
@@ -525,6 +557,7 @@ def subgraph(
             min_confidence=min_confidence,
             created_by=created_by,
             node_types=node_type,
+            principal=_principal(as_human),
             limit=limit,
         )
     )
@@ -534,24 +567,29 @@ def subgraph(
 def find_path(
     a: str = typer.Argument(..., help="Start node id."),
     b: str = typer.Argument(..., help="Target node id."),
+    as_human: str = AS_OPTION,
 ) -> None:
     """Find the shortest path between two nodes over active edges."""
-    _emit(_run(service.find_path, a, b))
+    _emit(_run(service.find_path, a, b, principal=_principal(as_human)))
 
 
 @app.command()
 def diff(
     a: int = typer.Argument(..., help="First version id (see `history`)."),
     b: int = typer.Argument(..., help="Second version id."),
+    as_human: str = AS_OPTION,
 ) -> None:
     """Unified diff between two versions of one node."""
-    _emit(_run(service.diff_versions, a, b))
+    _emit(_run(service.diff_versions, a, b, principal=_principal(as_human)))
 
 
 @app.command()
-def schema(type: str = typer.Argument(..., help="Node or edge type id/name.")) -> None:
+def schema(
+    type: str = typer.Argument(..., help="Node or edge type id/name."),
+    as_human: str = AS_OPTION,
+) -> None:
     """Show one type's catalog entry, including its JSON schema."""
-    _emit(_run(service.get_schema, type))
+    _emit(_run(service.get_schema, type, principal=_principal(as_human)))
 
 
 @app.command("schema-dump")
@@ -775,6 +813,7 @@ def review_queue(
     created_before: str | None = CREATED_BEFORE_OPTION,
     created_after: str | None = CREATED_AFTER_OPTION,
     limit: int = typer.Option(500, "--limit", help="Maximum proposals."),
+    as_human: str = AS_OPTION,
 ) -> None:
     """List pending proposals (proposed nodes/edges/updates) with reviewer context."""
     proposals = _run(
@@ -784,6 +823,7 @@ def review_queue(
         kind=kind,
         created_before=created_before,
         created_after=created_after,
+        principal=_principal(as_human),
         limit=limit,
     )
     _emit_list("proposals", proposals)

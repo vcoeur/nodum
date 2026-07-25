@@ -36,7 +36,7 @@ from pathlib import Path
 
 import httpx
 import pytest
-from helpers import OWNER_ACTOR, agent
+from helpers import OWNER_ACTOR, agent, owner
 from PIL import Image
 from starlette.requests import ClientDisconnect
 from typer.testing import CliRunner
@@ -148,7 +148,7 @@ def _png_bytes() -> bytes:
 
 def _events(op: str | None = None) -> list:
     """Read the event log, newest first, optionally filtered by op."""
-    rows = service.list_events(limit=500)
+    rows = service.list_events(limit=500, principal=owner())
     return [row for row in rows if op is None or row.op == op]
 
 
@@ -162,8 +162,9 @@ def test_node_get_is_byte_identical_to_the_cli(client, fresh_db):
         title="École — théorie des graphes",
         content="Un résumé « précis » avec des ✓ et une flèche →.",
         props={"clé": "valeur"},
+        principal=owner(),
     )
-    result = runner.invoke(cli.app, ["node", "get", node.id])
+    result = runner.invoke(cli.app, ["node", "get", node.id, "--as", "owner"])
     assert result.exit_code == 0, result.output
 
     response = client.get(f"/api/nodes/{node.id}")
@@ -175,14 +176,19 @@ def test_node_get_is_byte_identical_to_the_cli(client, fresh_db):
 @pytest.mark.parametrize(
     ("http_path", "cli_args"),
     [
-        ("/api/nodes", ["node", "list"]),
-        ("/api/edges", ["edge", "list"]),
-        ("/api/events", ["events"]),
+        ("/api/nodes", ["node", "list", "--as", "owner"]),
+        ("/api/edges", ["edge", "list", "--as", "owner"]),
+        ("/api/events", ["events", "--as", "owner"]),
     ],
 )
 def test_list_envelopes_are_byte_identical_to_the_cli(client, fresh_db, http_path, cli_args):
-    service.create_node(type="concept", title="Graph Theory")
-    service.create_node(type="note", title="Note", content="about [[Graph Theory]]")
+    service.create_node(type="concept", title="Graph Theory", principal=owner())
+    service.create_node(
+        type="note",
+        title="Note",
+        content="about [[Graph Theory]]",
+        principal=owner(),
+    )
 
     result = runner.invoke(cli.app, cli_args)
     assert result.exit_code == 0, result.output
@@ -196,8 +202,8 @@ def test_list_envelopes_are_byte_identical_to_the_cli(client, fresh_db, http_pat
 
 
 def test_every_list_endpoint_uses_the_named_key_plus_count(client, fresh_db):
-    node = service.create_node(type="note", title="Envelope", content="x")
-    service.create_node(type="note", title="Child", parent_id=node.id)
+    node = service.create_node(type="note", title="Envelope", content="x", principal=owner())
+    service.create_node(type="note", title="Child", parent_id=node.id, principal=owner())
     service.create_node(type="note", title="Proposed", principal=agent(AGENT))
 
     for path, key in [
@@ -363,7 +369,7 @@ def test_real_failures_carry_the_same_taxonomy(client, fresh_db):
     # A bad enum value is the caller's fault, not a missing record.
     assert client.get("/api/nodes?state=bogus").status_code == 400
     # Archiving twice: the second transition is impossible from `archived`.
-    node = service.create_node(type="note", title="Twice")
+    node = service.create_node(type="note", title="Twice", principal=owner())
     assert client.post(f"/api/nodes/{node.id}/archive").status_code == 200
     repeat = client.post(f"/api/nodes/{node.id}/archive")
     assert repeat.status_code == 400
@@ -371,8 +377,8 @@ def test_real_failures_carry_the_same_taxonomy(client, fresh_db):
 
 
 def test_an_undo_the_graph_has_grown_past_is_a_409(client, fresh_db):
-    parent = service.create_node(type="note", title="Parent")
-    service.create_node(type="note", title="Child", parent_id=parent.id)
+    parent = service.create_node(type="note", title="Parent", principal=owner())
+    service.create_node(type="note", title="Child", parent_id=parent.id, principal=owner())
     create_seq = next(
         row.seq for row in _events("node.create") if row.payload["after"]["id"] == parent.id
     )
@@ -502,14 +508,14 @@ def test_no_endpoint_can_attribute_a_write_to_an_agent(fresh_db):
     same database the assertion reads.
     """
     app = http_api.create_app()
-    node = service.create_node(type="concept", title="Sweep target")
-    other = service.create_node(type="concept", title="Sweep other")
+    node = service.create_node(type="concept", title="Sweep target", principal=owner())
+    other = service.create_node(type="concept", title="Sweep other", principal=owner())
     proposal = service.create_node(type="note", title="Sweep proposal", principal=agent(AGENT))
     ids = {"node": node.id, "other": other.id, "proposal": proposal.id}
 
-    before_seq = max((event.seq for event in service.list_events(limit=5000)), default=0)
-    before_nodes = {row.id for row in service.list_nodes(limit=5000)}
-    before_edges = {row.id for row in service.list_edges(limit=5000)}
+    before_seq = max((event.seq for event in service.list_events(owner(), limit=5000)), default=0)
+    before_nodes = {row.id for row in service.list_nodes(principal=owner(), limit=5000)}
+    before_edges = {row.id for row in service.list_edges(principal=owner(), limit=5000)}
 
     fired = _swept_requests(app, ids)
 
@@ -517,15 +523,25 @@ def test_no_endpoint_can_attribute_a_write_to_an_agent(fresh_db):
     assert len(fired) >= 40, fired
     assert sum(1 for _, _, status in fired if status < 300) >= 5, fired
 
-    new_events = [event for event in service.list_events(limit=5000) if event.seq > before_seq]
+    new_events = [
+        event for event in service.list_events(owner(), limit=5000) if event.seq > before_seq
+    ]
     assert new_events, "the sweep wrote nothing, so it proves nothing"
     offenders = [
         (event.op, event.seq, event.actor) for event in new_events if event.actor != OWNER_ACTOR
     ]
     assert offenders == [], f"writes attributed to a non-human actor: {offenders}"
 
-    written_nodes = [row for row in service.list_nodes(limit=5000) if row.id not in before_nodes]
-    written_edges = [row for row in service.list_edges(limit=5000) if row.id not in before_edges]
+    written_nodes = [
+        row
+        for row in service.list_nodes(principal=owner(), limit=5000)
+        if row.id not in before_nodes
+    ]
+    written_edges = [
+        row
+        for row in service.list_edges(principal=owner(), limit=5000)
+        if row.id not in before_edges
+    ]
     assert {row.created_by for row in written_nodes} <= {OWNER_ACTOR}
     assert {row.created_by for row in written_edges} <= {OWNER_ACTOR}
 
@@ -577,8 +593,15 @@ def test_no_route_handler_can_read_an_actor_from_a_request(fresh_db):
     assert offenders == [], f"route handlers must never name an actor: {offenders}"
 
 
-def test_the_principal_is_bound_exactly_once_and_minted_through_auth():
-    """One binding site, and the principal comes from auth — never the request."""
+def test_every_principal_binding_mints_through_auth():
+    """Every ``principal=`` in the module comes from auth — never the request.
+
+    Writes bind once (``_write``); reads bind per handler during the INTERIM
+    owner phase. The rule either way: the value is always
+    ``_http_principal()``, so identity can only ever come from the auth path
+    (the session, once sessions land), and a handler that tried to bind
+    request data as an identity fails here.
+    """
     bindings = [
         keyword
         for node in ast.walk(_module_ast())
@@ -586,13 +609,13 @@ def test_the_principal_is_bound_exactly_once_and_minted_through_auth():
         for keyword in node.keywords
         if keyword.arg == "principal"
     ]
-    assert len(bindings) == 1, "exactly one expression may bind a service principal"
-    value = bindings[0].value
-    assert (
-        isinstance(value, ast.Call)
-        and isinstance(value.func, ast.Name)
-        and value.func.id == "_http_principal"
-    )
+    assert bindings, "the module binds at least one principal"
+    for value in (keyword.value for keyword in bindings):
+        assert (
+            isinstance(value, ast.Call)
+            and isinstance(value.func, ast.Name)
+            and value.func.id == "_http_principal"
+        ), "every principal= binding must mint through _http_principal()"
 
 
 #: Values that may be splatted into a call in ``nodum.http_api``. Each one is
@@ -736,11 +759,11 @@ def test_a_smuggled_actor_on_a_create_is_ignored(client, fresh_db):
 
 def test_an_agent_proposal_accepted_over_http_is_a_human_write(client, fresh_db):
     """Property 3 (end-to-end): propose as an agent, accept over HTTP."""
-    target = service.create_node(type="concept", title="Osmosis")
+    target = service.create_node(type="concept", title="Osmosis", principal=owner())
     proposal = service.create_node(
         type="note", title="Agent draft", content="see [[Osmosis]]", principal=agent(AGENT)
     )
-    pending_edge = service.list_edges(node_id=proposal.id)[0]
+    pending_edge = service.list_edges(node_id=proposal.id, principal=owner())[0]
     assert pending_edge.state == "proposed"
 
     queue = _ok(client.get("/api/review/queue"))
@@ -760,7 +783,7 @@ def test_an_agent_proposal_accepted_over_http_is_a_human_write(client, fresh_db)
     # The wikilink edge the agent staged went live under the reviewer's name.
     edge_accept = _events("edge.accept")[0]
     assert edge_accept.actor == OWNER_ACTOR
-    assert service.list_edges(node_id=target.id)[0].state == "active"
+    assert service.list_edges(node_id=target.id, principal=owner())[0].state == "active"
 
 
 def test_no_event_that_writes_live_state_is_attributable_to_an_agent(client, fresh_db):
@@ -793,17 +816,17 @@ def test_no_event_that_writes_live_state_is_attributable_to_an_agent(client, fre
     # the write undo makes and the reason it is human-only.
     _ok(client.post(f"/api/nodes/{concept['id']}/archive"))
     _ok(client.post("/api/undo", json={}))
-    assert service.get_node(concept["id"]).state == "active"
+    assert service.get_node(concept["id"], principal=owner()).state == "active"
 
     live_writes = 0
-    for event in service.list_events(limit=500):
+    for event in service.list_events(limit=500, principal=owner()):
         for row in (event.payload.get("after"), event.payload.get("restored")):
             if isinstance(row, dict) and row.get("state") == "active":
                 live_writes += 1
                 assert event.actor == OWNER_ACTOR, f"{event.op} at seq {event.seq}"
     # A vacuous pass would be worthless: the run really did write live state.
     assert live_writes >= 6
-    assert any(event.actor == AGENT for event in service.list_events(limit=500))
+    assert any(event.actor == AGENT for event in service.list_events(limit=500, principal=owner()))
 
 
 def test_a_reject_without_a_reason_is_refused(client, fresh_db):
@@ -813,7 +836,7 @@ def test_a_reject_without_a_reason_is_refused(client, fresh_db):
         response = client.post("/api/review/reject", json=body)
         assert response.status_code == 400
         assert "reason" in response.json()["error"]["message"]
-    assert service.get_node(proposal.id).state == "proposed"
+    assert service.get_node(proposal.id, principal=owner()).state == "proposed"
 
 
 def test_a_bodyless_review_refuses_to_touch_the_whole_queue(client, fresh_db):
@@ -821,7 +844,7 @@ def test_a_bodyless_review_refuses_to_touch_the_whole_queue(client, fresh_db):
     response = client.post("/api/review/accept", json={})
     assert response.status_code == 400
     assert "whole queue" in response.json()["error"]["message"]
-    assert len(service.list_proposals()) == 1
+    assert len(service.list_proposals(principal=owner())) == 1
 
 
 # ── 4. Auth ───────────────────────────────────────────────────────────────────
@@ -948,20 +971,20 @@ def test_the_text_plain_form_post_that_accepted_an_agents_proposal(client, fresh
     )
 
     assert response.status_code == 403
-    assert service.get_node(proposal.id).state == "proposed"
+    assert service.get_node(proposal.id, principal=owner()).state == "proposed"
     assert _events("node.accept") == []
 
 
 def test_a_bodyless_cross_origin_post_cannot_archive_live_content(client, fresh_db):
     """``fetch(url, {method:'POST', mode:'no-cors'})`` — no body, no content type."""
-    node = service.create_node(type="note", title="Live human content")
+    node = service.create_node(type="note", title="Live human content", principal=owner())
 
     response = client.post(
         f"/api/nodes/{node.id}/archive", guard=False, headers=CROSS_ORIGIN_HEADERS
     )
 
     assert response.status_code == 403
-    assert service.get_node(node.id).state == "active"
+    assert service.get_node(node.id, principal=owner()).state == "active"
 
 
 @pytest.mark.parametrize(
@@ -1048,7 +1071,7 @@ def test_dns_rebinding_is_refused_on_reads_and_writes(client, fresh_db):
     not a defence against a browser. ``GET /api/nodes`` with
     ``Host: attacker-rebind.example`` used to return 200 and the node content.
     """
-    service.create_node(type="note", title="Private content")
+    service.create_node(type="note", title="Private content", principal=owner())
 
     read = client.get("/api/nodes", headers={"Host": "attacker-rebind.example"})
     assert read.status_code == 400
@@ -1379,8 +1402,8 @@ def test_node_lifecycle_over_http(client, fresh_db):
 
 
 def test_node_get_with_depth_returns_the_neighborhood(client, fresh_db):
-    hub = service.create_node(type="concept", title="Hub")
-    service.create_node(type="note", title="Leaf", content="[[Hub]]")
+    hub = service.create_node(type="concept", title="Hub", principal=owner())
+    service.create_node(type="note", title="Leaf", content="[[Hub]]", principal=owner())
 
     bare = _ok(client.get(f"/api/nodes/{hub.id}"))
     assert "nodes" not in bare
@@ -1394,8 +1417,8 @@ def test_node_get_with_depth_returns_the_neighborhood(client, fresh_db):
 
 
 def test_edges_list_and_create(client, fresh_db):
-    a = service.create_node(type="concept", title="A")
-    b = service.create_node(type="concept", title="B")
+    a = service.create_node(type="concept", title="A", principal=owner())
+    b = service.create_node(type="concept", title="B", principal=owner())
     edge = _ok(
         client.post(
             "/api/edges",
@@ -1414,7 +1437,9 @@ def test_edges_list_and_create(client, fresh_db):
 
 
 def test_search_and_link_suggestions(client, fresh_db):
-    service.create_node(type="note", title="Osmosis in plants", content="water moves")
+    service.create_node(
+        type="note", title="Osmosis in plants", content="water moves", principal=owner()
+    )
 
     hits = _ok(client.get("/api/search?q=osmosis&limit=5"))
     assert hits["k"] == 5
@@ -1431,9 +1456,10 @@ def test_search_and_link_suggestions(client, fresh_db):
 
 
 def test_graph_subgraph_and_path(client, fresh_db):
-    hub = service.create_node(type="concept", title="Hub")
+    hub = service.create_node(type="concept", title="Hub", principal=owner())
     leaves = [
-        service.create_node(type="note", title=f"Leaf {i}", content="[[Hub]]") for i in range(3)
+        service.create_node(type="note", title=f"Leaf {i}", content="[[Hub]]", principal=owner())
+        for i in range(3)
     ]
 
     capped = _ok(client.get(f"/api/graph/subgraph?root={hub.id}&limit=2"))
@@ -1466,7 +1492,7 @@ def test_review_queue_filters_and_batch_forms(client, fresh_db):
     assert accepted["transitioned"] == [first.id]
     rejected = _ok(client.post("/api/review/reject", json={"ids": [second.id], "reason": "no"}))
     assert rejected["reason"] == "no"
-    assert service.get_node(second.id).state == "archived"
+    assert service.get_node(second.id, principal=owner()).state == "archived"
     reject_event = _events("node.reject")[0]
     assert reject_event.payload["reason"] == "no"
 
@@ -1510,8 +1536,8 @@ def test_events_and_undo(client, fresh_db):
 
 
 def test_export_downloads_the_node_as_json(client, fresh_db):
-    hub = service.create_node(type="concept", title="Hub")
-    service.create_node(type="note", title="Leaf", content="[[Hub]]")
+    hub = service.create_node(type="concept", title="Hub", principal=owner())
+    service.create_node(type="note", title="Leaf", content="[[Hub]]", principal=owner())
 
     response = client.get(f"/api/export/node/{hub.id}?depth=1")
     assert response.status_code == 200

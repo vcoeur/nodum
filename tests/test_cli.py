@@ -13,23 +13,14 @@ from nodum.cli import app
 runner = CliRunner()
 
 
-#: Command groups that change state — every one requires an explicit `--as`.
-WRITE_NODE_SUB = {"create", "update"}
-WRITE_EDGE_SUB = {"create", "create-batch"}
-WRITE_REVIEW_SUB = {"accept", "reject", "accept-all", "reject-all"}
+#: Commands that never touch a principal: init, schema-dump, --version,
+#: projector/asset plumbing, and the two server launches. Everything else
+#: requires an explicit `--as` — reads included, since reads take a principal.
+NO_AS_GROUPS = {"init", "schema-dump", "projector", "asset", "mcp", "serve"}
 
 
 def _needs_as(args) -> bool:
-    if not args or "--as" in args:
-        return False
-    group = args[0]
-    if group in ("accept", "reject", "archive", "undo"):
-        return True
-    if group == "node" and len(args) > 1 and args[1] in WRITE_NODE_SUB:
-        return True
-    if group == "edge" and len(args) > 1 and args[1] in WRITE_EDGE_SUB:
-        return True
-    return group == "review" and len(args) > 1 and args[1] in WRITE_REVIEW_SUB
+    return bool(args) and args[0] not in NO_AS_GROUPS and "--as" not in args
 
 
 def _run_json(*args, input_text=None):
@@ -126,7 +117,7 @@ def test_reject_records_its_reason_in_the_event(fresh_db):
 
 def test_reject_without_a_reason_is_refused(fresh_db):
     proposed = service.create_node(type="note", title="bot", principal=agent("test"))
-    result = runner.invoke(app, ["reject", proposed.id])
+    result = runner.invoke(app, ["reject", proposed.id, "--as", "owner"])
     assert result.exit_code == 2  # typer: missing required --reason
     assert _run_json("node", "get", proposed.id)["state"] == "proposed"
 
@@ -182,7 +173,7 @@ def test_events_and_types(fresh_db):
 
 
 def test_unknown_node_exits_1(fresh_db):
-    result = runner.invoke(app, ["node", "get", "missing"])
+    result = runner.invoke(app, ["node", "get", "missing", "--as", "owner"])
     assert result.exit_code == 1
     assert "not found" in result.stderr
 

@@ -1041,12 +1041,18 @@ def create_app(
 
     async def get_types(request: Request) -> Response:
         """The live type catalog (node types and edge types)."""
-        return EnvelopeResponse(envelope(service.list_types(path=db_path)))
+        return EnvelopeResponse(
+            envelope(service.list_types(principal=_http_principal(), path=db_path))
+        )
 
     async def get_schema(request: Request) -> Response:
         """One node or edge type's catalog entry, including its JSON schema."""
         return EnvelopeResponse(
-            envelope(service.get_schema(request.path_params["type"], path=db_path))
+            envelope(
+                service.get_schema(
+                    request.path_params["type"], principal=_http_principal(), path=db_path
+                )
+            )
         )
 
     # ── Nodes ─────────────────────────────────────────────────────────────
@@ -1058,6 +1064,7 @@ def create_app(
             type=params.get("type"),
             state=params.get("state"),
             parent_id=_param(params, "parent_id", "parent"),
+            principal=_http_principal(),
             limit=_int_param(params, "limit", default=500),
             path=db_path,
         )
@@ -1084,9 +1091,11 @@ def create_app(
         if depth is not None and depth != 0:
             # Mirrors `nodum node get --depth`: 0 (and absent) is the bare
             # node, and a negative depth reaches the service, which rejects it.
-            result = service.get_neighborhood(node_id, depth=depth, path=db_path)
+            result = service.get_neighborhood(
+                node_id, depth=depth, principal=_http_principal(), path=db_path
+            )
         else:
-            result = service.get_node(node_id, path=db_path)
+            result = service.get_node(node_id, principal=_http_principal(), path=db_path)
         return EnvelopeResponse(envelope(result))
 
     async def update_node(request: Request) -> Response:
@@ -1102,12 +1111,16 @@ def create_app(
 
     async def list_children(request: Request) -> Response:
         """A node's children in ``position`` order (the document tree)."""
-        nodes = service.list_children(request.path_params["id"], path=db_path)
+        nodes = service.list_children(
+            request.path_params["id"], principal=_http_principal(), path=db_path
+        )
         return EnvelopeResponse(list_envelope("nodes", nodes))
 
     async def node_history(request: Request) -> Response:
         """A node's version snapshots, chronological."""
-        versions = service.history(request.path_params["id"], path=db_path)
+        versions = service.history(
+            request.path_params["id"], principal=_http_principal(), path=db_path
+        )
         return EnvelopeResponse(list_envelope("versions", versions))
 
     async def archive_node(request: Request) -> Response:
@@ -1124,6 +1137,7 @@ def create_app(
             node_id=_param(params, "node_id", "node"),
             type=params.get("type"),
             state=params.get("state"),
+            principal=_http_principal(),
             limit=_int_param(params, "limit", default=500),
             path=db_path,
         )
@@ -1157,6 +1171,7 @@ def create_app(
             created_after=params.get("created_after"),
             created_before=params.get("created_before"),
             expand=_bool_param(params, "expand"),
+            principal=_http_principal(),
             path=db_path,
         )
         return EnvelopeResponse(envelope(result))
@@ -1166,6 +1181,7 @@ def create_app(
         params = request.query_params
         nodes = service.suggest_links(
             params.get("prefix", ""),
+            principal=_http_principal(),
             limit=_int_param(params, "limit", default=20),
             path=db_path,
         )
@@ -1184,6 +1200,7 @@ def create_app(
             min_confidence=_float_param(params, "min_confidence"),
             created_by=params.get("created_by"),
             node_types=_list_param(params, "node_type", "node_types"),
+            principal=_http_principal(),
             limit=_int_param(params, "limit", default=200),
             path=db_path,
         )
@@ -1193,7 +1210,10 @@ def create_app(
         """The shortest active-edge path between two nodes."""
         params = request.query_params
         result = service.find_path(
-            _required_param(params, "a"), _required_param(params, "b"), path=db_path
+            _required_param(params, "a"),
+            _required_param(params, "b"),
+            principal=_http_principal(),
+            path=db_path,
         )
         return EnvelopeResponse(envelope(result))
 
@@ -1204,6 +1224,7 @@ def create_app(
         params = request.query_params
         proposals = service.list_proposals(
             **_proposal_filters(params),
+            principal=_http_principal(),
             limit=_int_param(params, "limit", default=500),
             path=db_path,
         )
@@ -1244,7 +1265,9 @@ def create_app(
         b = _int_param(params, "b")
         if a is None or b is None:
             raise ValueError("diff needs two version ids: ?a=<id>&b=<id>")
-        return EnvelopeResponse(envelope(service.diff_versions(a, b, path=db_path)))
+        return EnvelopeResponse(
+            envelope(service.diff_versions(a, b, principal=_http_principal(), path=db_path))
+        )
 
     # ── Assets ────────────────────────────────────────────────────────────
 
@@ -1313,7 +1336,9 @@ def create_app(
         """The append-only event log, newest first."""
         limit = _int_param(request.query_params, "limit", default=50)
         return EnvelopeResponse(
-            list_envelope("events", service.list_events(limit=limit, path=db_path))
+            list_envelope(
+                "events", service.list_events(_http_principal(), limit=limit, path=db_path)
+            )
         )
 
     async def undo(request: Request) -> Response:
@@ -1331,7 +1356,9 @@ def create_app(
         """Download a node — and optionally its neighborhood — as a JSON file."""
         node_id = request.path_params["id"]
         depth = _int_param(request.query_params, "depth", default=0)
-        result = service.get_neighborhood(node_id, depth=depth, path=db_path)
+        result = service.get_neighborhood(
+            node_id, depth=depth, principal=_http_principal(), path=db_path
+        )
         response = EnvelopeResponse(envelope(result))
         safe_id = _SAFE_FILENAME_RE.sub("-", node_id)[:64] or "node"
         response.headers["content-disposition"] = f'attachment; filename="nodum-{safe_id}.json"'

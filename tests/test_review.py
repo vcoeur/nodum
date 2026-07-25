@@ -14,19 +14,12 @@ from nodum.cli import app
 runner = CliRunner()
 
 
-WRITE_SUB = {
-    "review": {"accept", "reject", "accept-all", "reject-all"},
-    "node": {"create", "update"},
-    "edge": {"create", "create-batch"},
-}
+NO_AS_GROUPS = {"init", "schema-dump", "projector", "asset", "mcp", "serve"}
 
 
 def _maybe_as(args):
     args = list(args)
-    if "--as" not in args and (
-        args[0] in ("accept", "reject", "archive", "undo")
-        or (len(args) > 1 and args[1] in WRITE_SUB.get(args[0], ()))
-    ):
+    if args and args[0] not in NO_AS_GROUPS and "--as" not in args:
         args += ["--as", "owner"]
     return args
 
@@ -45,8 +38,8 @@ def _run_fail(*args):
 
 def _seed_proposals():
     """Two active concepts plus an agent's proposed node and proposed edge."""
-    a = service.create_node(type="concept", title="Alpha")
-    b = service.create_node(type="concept", title="Beta")
+    a = service.create_node(type="concept", title="Alpha", principal=owner())
+    b = service.create_node(type="concept", title="Beta", principal=owner())
     note = service.create_node(
         type="note", title="Bot note", content="draft", principal=agent("researcher")
     )
@@ -61,7 +54,7 @@ def _seed_proposals():
 
 def test_list_proposals_returns_nodes_and_edges(fresh_db):
     _, _, note, edge = _seed_proposals()
-    proposals = service.list_proposals()
+    proposals = service.list_proposals(principal=owner())
     assert {p.id for p in proposals} == {note.id, edge.id}
     by_kind = {p.kind: p for p in proposals}
     assert by_kind["node"].node.title == "Bot note"
@@ -71,18 +64,18 @@ def test_list_proposals_returns_nodes_and_edges(fresh_db):
 
 def test_list_proposals_edge_context_has_endpoints(fresh_db):
     a, b, _, edge = _seed_proposals()
-    (proposal,) = service.list_proposals(kind="edge")
+    (proposal,) = service.list_proposals(kind="edge", principal=owner())
     assert proposal.id == edge.id
     assert proposal.context["src"] == {"id": a.id, "title": "Alpha"}
     assert proposal.context["dst"] == {"id": b.id, "title": "Beta"}
 
 
 def test_list_proposals_node_context_has_parent(fresh_db):
-    page = service.create_node(type="page", title="Page")
+    page = service.create_node(type="page", title="Page", principal=owner())
     child = service.create_node(
         type="block", content="x", parent_id=page.id, principal=agent("researcher")
     )
-    (proposal,) = service.list_proposals(kind="node")
+    (proposal,) = service.list_proposals(kind="node", principal=owner())
     assert proposal.id == child.id
     assert proposal.context["parent"] == {"id": page.id, "title": "Page"}
 
@@ -91,28 +84,27 @@ def test_list_proposals_filters(fresh_db):
     _, _, note, edge = _seed_proposals()
     service.create_node(type="note", title="Other bot", principal=agent("other"))
 
-    assert {p.id for p in service.list_proposals(created_by="agent:researcher")} == {
-        note.id,
-        edge.id,
+    assert {
+        p.id for p in service.list_proposals(created_by="agent:researcher", principal=owner())
+    } == {note.id, edge.id}
+    assert [p.id for p in service.list_proposals(kind="edge", principal=owner())] == [edge.id]
+    assert {p.id for p in service.list_proposals(type="note", principal=owner())} == {
+        p.id for p in service.list_proposals(kind="node", principal=owner())
     }
-    assert [p.id for p in service.list_proposals(kind="edge")] == [edge.id]
-    assert {p.id for p in service.list_proposals(type="note")} == {
-        p.id for p in service.list_proposals(kind="node")
-    }
-    assert [p.id for p in service.list_proposals(type="supports")] == [edge.id]
+    assert [p.id for p in service.list_proposals(type="supports", principal=owner())] == [edge.id]
     # Far-future bound excludes everything; far-past bound includes everything.
-    assert service.list_proposals(created_before="2000-01-01 00:00:00") == []
-    assert len(service.list_proposals(created_after="2000-01-01 00:00:00")) == 3
+    assert service.list_proposals(created_before="2000-01-01 00:00:00", principal=owner()) == []
+    assert len(service.list_proposals(created_after="2000-01-01 00:00:00", principal=owner())) == 3
     with pytest.raises(service.TypeNotFound):
-        service.list_proposals(type="no-such-type")
+        service.list_proposals(type="no-such-type", principal=owner())
     with pytest.raises(ValueError, match="kind"):
-        service.list_proposals(kind="widget")
+        service.list_proposals(kind="widget", principal=owner())
 
 
 def test_accepted_proposals_leave_the_queue(fresh_db):
     _, _, note, edge = _seed_proposals()
-    service.transition(note.id, "accept")
-    assert [p.id for p in service.list_proposals()] == [edge.id]
+    service.transition(note.id, "accept", principal=owner())
+    assert [p.id for p in service.list_proposals(principal=owner())] == [edge.id]
 
 
 # ── Batch accept/reject by id ─────────────────────────────────────────────────
@@ -124,11 +116,11 @@ def test_accept_proposals_transitions_each_with_event(fresh_db):
     assert result.action == "accept"
     assert set(result.transitioned) == {note.id, edge.id}
     assert result.failed == []
-    assert service.get_node(note.id).state == "active"
-    assert service.list_edges(node_id=edge.src_id)[0].state == "active"
-    ops = [e.op for e in service.list_events(limit=2)]
+    assert service.get_node(note.id, principal=owner()).state == "active"
+    assert service.list_edges(node_id=edge.src_id, principal=owner())[0].state == "active"
+    ops = [e.op for e in service.list_events(limit=2, principal=owner())]
     assert sorted(ops) == ["edge.accept", "node.accept"]
-    assert all(e.actor == OWNER_ACTOR for e in service.list_events(limit=2))
+    assert all(e.actor == OWNER_ACTOR for e in service.list_events(limit=2, principal=owner()))
 
 
 def test_single_item_reject_records_the_same_reason_as_a_batch(fresh_db):
@@ -140,11 +132,11 @@ def test_single_item_reject_records_the_same_reason_as_a_batch(fresh_db):
     _, _, note, edge = _seed_proposals()
     version = service.update_node(note.id, content="v2", principal=agent("researcher"))
 
-    service.transition(str(version.id), "reject", reason="wrong claim")
-    service.transition(note.id, "reject", reason="off topic")
-    service.reject_proposals([edge.id], reason="off topic")
+    service.transition(str(version.id), "reject", reason="wrong claim", principal=owner())
+    service.transition(note.id, "reject", reason="off topic", principal=owner())
+    service.reject_proposals([edge.id], reason="off topic", principal=owner())
 
-    events = {event.op: event for event in service.list_events(limit=3)}
+    events = {event.op: event for event in service.list_events(limit=3, principal=owner())}
     assert set(events) == {"version.reject", "node.reject", "edge.reject"}
     assert events["version.reject"].payload["reason"] == "wrong claim"
     assert events["node.reject"].payload["reason"] == "off topic"
@@ -155,8 +147,8 @@ def test_single_item_reject_records_the_same_reason_as_a_batch(fresh_db):
 def test_accept_writes_no_reason_key(fresh_db):
     """A reason belongs to a refusal; accepting one leaves the payload clean."""
     _, _, note, _ = _seed_proposals()
-    service.transition(note.id, "accept")
-    assert "reason" not in service.list_events(limit=1)[0].payload
+    service.transition(note.id, "accept", principal=owner())
+    assert "reason" not in service.list_events(limit=1, principal=owner())[0].payload
 
 
 def test_reject_proposals_archives_with_reason(fresh_db):
@@ -164,8 +156,8 @@ def test_reject_proposals_archives_with_reason(fresh_db):
     result = service.reject_proposals([note.id, edge.id], reason="spam run", principal=owner())
     assert result.reason == "spam run"
     assert set(result.transitioned) == {note.id, edge.id}
-    assert service.get_node(note.id).state == "archived"
-    events = service.list_events(limit=2)
+    assert service.get_node(note.id, principal=owner()).state == "archived"
+    events = service.list_events(limit=2, principal=owner())
     assert sorted(e.op for e in events) == ["edge.reject", "node.reject"]
     assert all(e.payload["reason"] == "spam run" for e in events)
     assert all(e.actor == OWNER_ACTOR for e in events)
@@ -181,8 +173,8 @@ def test_suggest_agent_cannot_accept_its_own_proposal(fresh_db):
     assert result.transitioned == []
     assert len(result.failed) == 2
     assert all("edit" in f.error for f in result.failed)
-    assert service.get_node(note.id).state == "proposed"
-    assert {p.id for p in service.list_proposals()} == {note.id, edge.id}
+    assert service.get_node(note.id, principal=owner()).state == "proposed"
+    assert {p.id for p in service.list_proposals(principal=owner())} == {note.id, edge.id}
 
 
 def test_suggest_agent_cannot_reject_another_agents_proposal(fresh_db):
@@ -190,7 +182,7 @@ def test_suggest_agent_cannot_reject_another_agents_proposal(fresh_db):
     result = service.reject_proposals([note.id], reason="turf war", principal=agent("curator"))
     assert result.transitioned == []
     assert len(result.failed) == 1
-    assert service.get_node(note.id).state == "proposed"
+    assert service.get_node(note.id, principal=owner()).state == "proposed"
 
 
 def test_suggest_agent_cannot_review_through_any_service_entry_point(fresh_db):
@@ -213,8 +205,8 @@ def test_suggest_agent_cannot_review_through_any_service_entry_point(fresh_db):
     assert refused.transitioned == [] and refused.failed
     noop = service.accept_matching(created_by="agent:nobody", principal=suggest)
     assert noop.transitioned == [] and noop.failed == []
-    assert service.get_node(note.id).state == "proposed"
-    assert [v.state for v in service.history(note.id)][-1] == "proposed"
+    assert service.get_node(note.id, principal=owner()).state == "proposed"
+    assert [v.state for v in service.history(note.id, principal=owner())][-1] == "proposed"
 
 
 def test_edit_agent_reviews_within_its_granted_space(fresh_db):
@@ -223,7 +215,7 @@ def test_edit_agent_reviews_within_its_granted_space(fresh_db):
     editor = agent("editor", grants={"meta": "read", "main": "edit"})
     result = service.accept_proposals([note.id, edge.id], principal=editor)
     assert set(result.transitioned) == {note.id, edge.id}
-    assert service.get_node(note.id).state == "active"
+    assert service.get_node(note.id, principal=owner()).state == "active"
     assert result.actor == "agent:editor"
 
 
@@ -232,8 +224,8 @@ def test_suggest_agent_cannot_archive_live_state(fresh_db):
     a, _, _, _ = _seed_proposals()
     with pytest.raises(service.GrantNotPermitted):
         service.transition(a.id, "archive", principal=agent("researcher"))
-    assert service.get_node(a.id).state == "active"
-    assert service.transition(a.id, "archive").state == "archived"
+    assert service.get_node(a.id, principal=owner()).state == "active"
+    assert service.transition(a.id, "archive", principal=owner()).state == "archived"
 
 
 def test_agent_cannot_undo(fresh_db):
@@ -243,13 +235,13 @@ def test_agent_cannot_undo(fresh_db):
     prior state across spaces is the live-state back door (Q13 note 01).
     """
     a, _, _, _ = _seed_proposals()
-    archived = service.transition(a.id, "archive")
-    archive_seq = service.list_events(limit=1)[0].seq
+    archived = service.transition(a.id, "archive", principal=owner())
+    archive_seq = service.list_events(limit=1, principal=owner())[0].seq
 
     with pytest.raises(service.GrantNotPermitted, match="only a human"):
         service.undo(archive_seq, principal=agent("researcher"))
-    assert service.get_node(a.id).state == archived.state == "archived"
-    assert service.list_events(limit=1)[0].seq == archive_seq
+    assert service.get_node(a.id, principal=owner()).state == archived.state == "archived"
+    assert service.list_events(limit=1, principal=owner())[0].seq == archive_seq
 
     # Not even with edit on the space: undo is not a grantable authority.
     with pytest.raises(service.GrantNotPermitted, match="only a human"):
@@ -257,14 +249,14 @@ def test_agent_cannot_undo(fresh_db):
             archive_seq, principal=agent("editor", grants={"meta": "read", "main": "edit"})
         )
 
-    service.undo(archive_seq)
-    assert service.get_node(a.id).state == "active"
+    service.undo(archive_seq, principal=owner())
+    assert service.get_node(a.id, principal=owner()).state == "active"
 
 
 def test_batch_collects_failures_without_aborting(fresh_db):
-    active = service.create_node(type="note", title="already active")
+    active = service.create_node(type="note", title="already active", principal=owner())
     _, _, note, _ = _seed_proposals()
-    result = service.accept_proposals([note.id, active.id, "missing-id"])
+    result = service.accept_proposals([note.id, active.id, "missing-id"], principal=owner())
     assert result.transitioned == [note.id]
     assert {f.id for f in result.failed} == {active.id, "missing-id"}
     assert any("cannot accept" in f.error for f in result.failed)
@@ -277,21 +269,26 @@ def test_batch_collects_failures_without_aborting(fresh_db):
 def test_accept_matching_by_agent(fresh_db):
     _, _, note, edge = _seed_proposals()
     other = service.create_node(type="note", title="keep", principal=agent("other"))
-    result = service.accept_matching(created_by="agent:researcher")
+    result = service.accept_matching(created_by="agent:researcher", principal=owner())
     assert set(result.transitioned) == {note.id, edge.id}
-    assert service.get_node(other.id).state == "proposed"
+    assert service.get_node(other.id, principal=owner()).state == "proposed"
 
 
 def test_reject_matching_by_type_and_kind(fresh_db):
     _, _, note, edge = _seed_proposals()
-    result = service.reject_matching(reason="bad links", kind="edge", type="supports")
+    result = service.reject_matching(
+        reason="bad links",
+        kind="edge",
+        type="supports",
+        principal=owner(),
+    )
     assert result.transitioned == [edge.id]
-    assert service.get_node(note.id).state == "proposed"
+    assert service.get_node(note.id, principal=owner()).state == "proposed"
 
 
 def test_matching_with_no_match_is_a_noop(fresh_db):
     _seed_proposals()
-    result = service.accept_matching(created_by="agent:nobody")
+    result = service.accept_matching(created_by="agent:nobody", principal=owner())
     assert result.transitioned == []
     assert result.failed == []
 
@@ -299,8 +296,8 @@ def test_matching_with_no_match_is_a_noop(fresh_db):
 def test_reject_matching_records_actor_and_reason(fresh_db):
     _seed_proposals()
     service.reject_matching(reason="cleanup", created_by="agent:researcher", principal=owner())
-    assert service.list_proposals() == []
-    events = service.list_events(limit=2)
+    assert service.list_proposals(principal=owner()) == []
+    events = service.list_events(limit=2, principal=owner())
     assert all(e.op.endswith(".reject") for e in events)
     assert all(e.payload["reason"] == "cleanup" for e in events)
 
