@@ -245,7 +245,7 @@ SAME_ORIGIN_FETCH_SITES = frozenset({"same-origin", "none"})
 
 #: Host names a loopback-bound server answers to. Ports are deliberately not
 #: compared: the ``make web-dev`` proxy forwards the browser's own
-#: ``Host: localhost:5173``, and a port is no part of the rebinding defence
+#: ``Host: localhost:5700``, and a port is no part of the rebinding defence
 #: anyway — an attacker who rebinds ``evil.example`` to 127.0.0.1 still has to
 #: send ``Host: evil.example``.
 LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "0.0.0.0"})
@@ -513,7 +513,7 @@ def resolve_allowed_hosts(host: str, extra: Iterable[str] | None = None) -> froz
     """Build the host allowlist for a server bound to ``host``.
 
     A loopback bind answers to every loopback spelling (and to
-    ``make web-dev``'s proxied ``Host: localhost:5173``, since ports are not
+    ``make web-dev``'s proxied ``Host: localhost:5700``, since ports are not
     compared). A non-loopback bind answers to the address it was given, and
     anything else — a DNS name in front of it, a reverse proxy — has to be named
     with ``--allow-host``.

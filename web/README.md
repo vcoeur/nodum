@@ -13,12 +13,12 @@ Six views ship: **editor** (`/editor`, `/editor/:nodeId`), **search**
 
 ```bash
 make web-install          # once — npm ci in web/
-make web-dev              # Vite dev server on http://127.0.0.1:5173
+make web-dev              # Vite dev server on http://127.0.0.1:5700
 uv run nodum serve        # the API on http://127.0.0.1:8420, in another shell
 ```
 
 The dev server proxies `/api` and `/healthz` to `127.0.0.1:8420`, so develop
-against `http://127.0.0.1:5173` and let the proxy reach the Python process.
+against `http://127.0.0.1:5700` and let the proxy reach the Python process.
 The header shows a `connected` / `no server` pill so you can tell at a glance
 whether the backend is answering.
 

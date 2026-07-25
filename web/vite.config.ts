@@ -9,6 +9,12 @@ import react from "@vitejs/plugin-react";
  */
 const API_PORT = 8420;
 
+/** Vite dev server. nodum owns 57xx; see the note on `server.port` below. */
+const DEV_PORT = 5700;
+
+/** `npm run preview` — the built bundle, served without the Python process. */
+const PREVIEW_PORT = 5701;
+
 export default defineConfig({
   plugins: [react()],
   base: "/",
@@ -24,7 +30,11 @@ export default defineConfig({
     sourcemap: false,
   },
   server: {
-    port: 5173,
+    // 5700, not Vite's default 5173: every vcoeur app owns a port range so two
+    // of them can run side by side, and 5173 is explicitly avoided because any
+    // unrelated Vite project grabs it first. strictPort so a collision fails
+    // loudly instead of silently landing on another app's port.
+    port: DEV_PORT,
     strictPort: true,
     proxy: {
       "/api": {
@@ -36,5 +46,9 @@ export default defineConfig({
         changeOrigin: false,
       },
     },
+  },
+  preview: {
+    port: PREVIEW_PORT,
+    strictPort: true,
   },
 });
