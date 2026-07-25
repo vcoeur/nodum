@@ -26,6 +26,7 @@ from pathlib import Path
 import sqlite_vec
 
 from nodum import db, embeddings, projectors
+from nodum.migrations import META_SPACE_ID
 from nodum.models import SearchHit, SearchResult
 
 #: bm25() column weights for (node_id, title, content, extracted_text): node_id
@@ -76,10 +77,14 @@ def _node_filters(
     created_by: str | None,
     created_after: str | None,
     created_before: str | None,
+    include_meta: bool,
 ) -> tuple[list[str], list]:
     """Build the shared ``nodes``-table WHERE clauses (alias ``n``) and params."""
     clauses: list[str] = []
     params: list = []
+    if not include_meta:
+        clauses.append("n.space_id != ?")
+        params.append(META_SPACE_ID)
     if state is not None:
         clauses.append("n.state = ?")
         params.append(state)
@@ -120,9 +125,12 @@ def _search_bm25(
     created_by: str | None,
     created_after: str | None,
     created_before: str | None,
+    include_meta: bool,
 ) -> list[_RankedRow]:
     """Run the BM25-ranked FTS query, best (most-negative bm25) first."""
-    filters, params = _node_filters(state, type_id, created_by, created_after, created_before)
+    filters, params = _node_filters(
+        state, type_id, created_by, created_after, created_before, include_meta
+    )
     clauses = ["node_fts MATCH ?", *filters]
     weights = ", ".join(str(w) for w in _BM25_WEIGHTS)
     rows = conn.execute(
@@ -158,6 +166,7 @@ def _search_vector(
     created_by: str | None,
     created_after: str | None,
     created_before: str | None,
+    include_meta: bool,
 ) -> list[_RankedRow]:
     """Run the sqlite-vec ANN query, aggregating chunks to nodes (best chunk wins).
 
@@ -167,7 +176,9 @@ def _search_vector(
     which is exactly what RRF expects: a weak vector hit still fuses, just
     with a small contribution.
     """
-    filters, params = _node_filters(state, type_id, created_by, created_after, created_before)
+    filters, params = _node_filters(
+        state, type_id, created_by, created_after, created_before, include_meta
+    )
     clauses = filters or ["1=1"]
     rows = conn.execute(
         f"""
@@ -256,6 +267,7 @@ def _expand_hits(
     k: int,
     state: str | None,
     type_id: str | None,
+    include_meta: bool,
 ) -> list[SearchHit]:
     """One-hop graph expansion: active-edge neighbors of the fused hits.
 
@@ -283,6 +295,8 @@ def _expand_hits(
         row = conn.execute("SELECT * FROM nodes WHERE id = ?", (node_id,)).fetchone()
         if row is None:
             continue
+        if not include_meta and row["space_id"] == META_SPACE_ID:
+            continue
         if state is not None and row["state"] != state:
             continue
         if type_id is not None and row["type_id"] != type_id:
@@ -309,6 +323,7 @@ def search(
     created_by: str | None = None,
     created_after: str | None = None,
     created_before: str | None = None,
+    include_meta: bool = False,
     expand: bool = False,
     path: str | Path | None = None,
 ) -> SearchResult:
@@ -350,7 +365,9 @@ def search(
         type_id = None
         if type is not None:
             row = conn.execute(
-                "SELECT id FROM types WHERE id = ? OR name = ?", (type, type)
+                "SELECT id FROM nodes WHERE (id = ? OR title = ?) AND type_id = 'type'"
+                " AND json_extract(props, '$.type_kind') = 'node' AND state = 'active'",
+                (type, type),
             ).fetchone()
             if row is None:
                 raise ValueError(f"unknown node type: {type}")
@@ -364,6 +381,7 @@ def search(
             created_by=created_by,
             created_after=created_after,
             created_before=created_before,
+            include_meta=include_meta,
         )
         vector_rows: list[_RankedRow] = []
         provider = embeddings.get_provider()
@@ -378,10 +396,13 @@ def search(
                 created_by=created_by,
                 created_after=created_after,
                 created_before=created_before,
+                include_meta=include_meta,
             )
         hits = _fuse(bm25_rows, vector_rows, k=k)
         if expand and hits:
-            hits += _expand_hits(conn, hits, k=k, state=state, type_id=type_id)
+            hits += _expand_hits(
+                conn, hits, k=k, state=state, type_id=type_id, include_meta=include_meta
+            )
         return SearchResult(query=query, k=k, hits=hits)
     finally:
         conn.close()

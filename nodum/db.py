@@ -147,6 +147,40 @@ def _verify_schema_consistency(conn: sqlite3.Connection) -> None:
             "on a filesystem path); it cannot be auto-migrated — delete the database file "
             "and re-run 'nodum init' to recreate it."
         )
+    _verify_spaces_consistency(conn)
+
+
+def _verify_spaces_consistency(conn: sqlite3.Connection) -> None:
+    """Refuse a database whose 0009 record contradicts its live schema.
+
+    If ``0009_spaces_and_type_nodes`` is recorded, the type catalogs must be
+    gone and nodes must carry ``space_id`` — a database that applied an
+    intermediate version of the spaces migration keeps the name and skips the
+    fix forever otherwise.
+
+    Raises:
+        SchemaConsistencyError: If the name is recorded but the live schema
+            still has the type tables or lacks ``nodes.space_id``.
+    """
+    if "0009_spaces_and_type_nodes" not in set(applied_migrations(conn)):
+        return
+    tables = {
+        row["name"] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+    }
+    node_columns = {row["name"] for row in conn.execute("PRAGMA table_info(nodes)")}
+    problems: list[str] = []
+    if "types" in tables or "edge_types" in tables:
+        problems.append("type catalog tables still present")
+    if "space_id" not in node_columns:
+        problems.append("table 'nodes' has no 'space_id' column")
+    if problems:
+        raise SchemaConsistencyError(
+            "database schema is inconsistent with its recorded migrations: "
+            + "; ".join(problems)
+            + ". This database predates the final shape of migration 0009 "
+            "(spaces and types-as-nodes); it cannot be auto-migrated — delete "
+            "the database file and re-run 'nodum init' to recreate it."
+        )
 
 
 def init_db(conn: sqlite3.Connection) -> list[str]:

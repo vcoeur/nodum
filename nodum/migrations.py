@@ -294,6 +294,133 @@ ALTER TABLE versions ADD COLUMN proposed_fields TEXT;
 """
 
 
+#: Bootstrap space ids created by ``0009_spaces_and_type_nodes`` (Q13). Meta
+#: holds the type vocabulary and, later, the gardener's learned conventions;
+#: everyday content reads exclude it — the type catalog is served by the
+#: type queries, not by content listings. ``main`` is the first default
+#: space and carries no special rules (design-pass note 03 Q9).
+META_SPACE_ID = "meta"
+MAIN_SPACE_ID = "main"
+
+
+SPACES_AND_TYPE_NODES_DDL = """
+-- Spaces and types-are-nodes (Q13, design §5.1/§5.2 as amended 2026-07-25).
+-- `graph_id` becomes `space_id` on nodes only; types and edge types stop
+-- being tables and become ordinary nodes living in the meta space, keeping
+-- their ids so every existing `type_id` value stays valid across the rewire.
+-- The whole rebuild runs with foreign-key enforcement deferred to COMMIT:
+-- the bootstrap is mutually referential (the metaclass root is its own type,
+-- meta's space is itself), and the table rebuilds transiently drop tables
+-- that other tables reference.
+PRAGMA defer_foreign_keys = ON;
+
+CREATE TABLE nodes_new (
+    id          TEXT PRIMARY KEY,
+    space_id    TEXT REFERENCES nodes_new(id),
+    type_id     TEXT NOT NULL REFERENCES nodes_new(id),
+    parent_id   TEXT REFERENCES nodes_new(id),
+    position    REAL,
+    title       TEXT,
+    content     TEXT NOT NULL DEFAULT '',
+    props       TEXT NOT NULL DEFAULT '{}',
+    state       TEXT NOT NULL DEFAULT 'active'
+                CHECK (state IN ('active','proposed','archived')),
+    created_by  TEXT NOT NULL,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Existing nodes all land in the main space.
+INSERT INTO nodes_new
+    (id, space_id, type_id, parent_id, position, title, content, props,
+     state, created_by, created_at, updated_at)
+SELECT id, 'main', type_id, parent_id, position, title, content, props,
+       state, created_by, created_at, updated_at
+FROM nodes;
+
+-- Bootstrap, in dependency order (enforcement is deferred, so the mutual
+-- references resolve at COMMIT): the `type` metaclass root (its own type),
+-- the `space` type, and the two space nodes. Meta's space is itself, which
+-- keeps "every node has a space" uniform. `type_kind` in props distinguishes
+-- node types from edge types among the type-nodes.
+INSERT INTO nodes_new
+    (id, space_id, type_id, title, props, state, created_by)
+VALUES
+    ('type',  'meta', 'type',  'type',
+     '{"type_kind":"node","is_builtin":1}', 'active', 'system'),
+    ('space', 'meta', 'type',  'space',
+     '{"type_kind":"node","is_builtin":1}', 'active', 'system'),
+    ('meta',  'meta', 'space', 'meta',  '{}', 'active', 'system'),
+    ('main',  'meta', 'space', 'main',  '{}', 'active', 'system');
+
+-- Type rows become type-nodes in meta, ids preserved. Their catalogs'
+-- columns move into props.
+INSERT INTO nodes_new
+    (id, space_id, type_id, title, props, state, created_by, created_at, updated_at)
+SELECT id, 'meta', 'type', name,
+       json_object('type_kind', 'node',
+                   'schema_json', json(schema_json),
+                   'is_builtin', is_builtin,
+                   'parent_type_id', parent_type_id),
+       'active', 'system', created_at, created_at
+FROM types;
+
+INSERT INTO nodes_new
+    (id, space_id, type_id, title, props, state, created_by, created_at, updated_at)
+SELECT id, 'meta', 'type', name,
+       json_object('type_kind', 'edge',
+                   'schema_json', json(schema_json),
+                   'is_builtin', is_builtin,
+                   'inverse_name', inverse_name),
+       'active', 'system', datetime('now'), datetime('now')
+FROM edge_types;
+
+DROP TABLE nodes;
+ALTER TABLE nodes_new RENAME TO nodes;
+CREATE INDEX idx_nodes_parent ON nodes(parent_id, position);
+CREATE INDEX idx_nodes_type   ON nodes(type_id);
+CREATE INDEX idx_nodes_state  ON nodes(state);
+CREATE INDEX idx_nodes_space  ON nodes(space_id);
+
+-- Edges lose `graph_id` entirely (space derives from the endpoints) and
+-- retarget `type_id` at the type-nodes.
+CREATE TABLE edges_new (
+    id          TEXT PRIMARY KEY,
+    src_id      TEXT NOT NULL REFERENCES nodes(id),
+    dst_id      TEXT NOT NULL REFERENCES nodes(id),
+    type_id     TEXT NOT NULL REFERENCES nodes(id),
+    props       TEXT NOT NULL DEFAULT '{}',
+    confidence  REAL CHECK (confidence BETWEEN 0 AND 1),
+    created_by  TEXT NOT NULL,
+    state       TEXT NOT NULL DEFAULT 'active'
+                CHECK (state IN ('active','proposed','archived')),
+    valid_from  TEXT,
+    valid_to    TEXT,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+INSERT INTO edges_new
+    (id, src_id, dst_id, type_id, props, confidence, created_by, state,
+     valid_from, valid_to, created_at)
+SELECT id, src_id, dst_id, type_id, props, confidence, created_by, state,
+       valid_from, valid_to, created_at
+FROM edges;
+
+DROP TABLE edges;
+ALTER TABLE edges_new RENAME TO edges;
+CREATE INDEX idx_edges_src ON edges(src_id, state);
+CREATE INDEX idx_edges_dst ON edges(dst_id, state);
+
+DROP TABLE types;
+DROP TABLE edge_types;
+
+-- One describing asset_ref node per (hash, space) — guards the shape before
+-- Phase 4 writes any (design-pass note 04).
+CREATE UNIQUE INDEX idx_asset_ref_per_space ON nodes(
+    json_extract(props,'$.asset_hash'), space_id
+) WHERE type_id = 'asset_ref';
+"""
+
+
 #: Ordered (name, SQL) migrations. Append-only — never edit a shipped entry.
 MIGRATIONS: list[tuple[str, str]] = [
     ("0001_core", CORE_DDL),
@@ -304,4 +431,5 @@ MIGRATIONS: list[tuple[str, str]] = [
     ("0006_vectors", VECTORS_DDL),
     ("0007_assets_and_renditions", ASSETS_DDL),
     ("0008_version_proposed_fields", PROPOSED_FIELDS_DDL),
+    ("0009_spaces_and_type_nodes", SPACES_AND_TYPE_NODES_DDL),
 ]

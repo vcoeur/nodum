@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from nodum import db
+from nodum.migrations import MAIN_SPACE_ID, META_SPACE_ID
 from nodum.models import (
     BatchTransitionOut,
     DiffOut,
@@ -196,7 +197,7 @@ def _node_out(row: sqlite3.Row | dict[str, Any]) -> NodeOut:
     data = dict(row)
     return NodeOut(
         id=data["id"],
-        graph_id=data["graph_id"],
+        space_id=data["space_id"],
         type=data["type_id"],
         parent_id=data["parent_id"],
         position=data["position"],
@@ -215,7 +216,6 @@ def _edge_out(row: sqlite3.Row | dict[str, Any]) -> EdgeOut:
     data = dict(row)
     return EdgeOut(
         id=data["id"],
-        graph_id=data["graph_id"],
         src_id=data["src_id"],
         dst_id=data["dst_id"],
         type=data["type_id"],
@@ -288,9 +288,16 @@ def _proposed_fields(version: dict[str, Any]) -> list[str]:
 
 
 def _resolve_node_type(conn: sqlite3.Connection, type_ref: str) -> str:
-    """Resolve a node-type id or name to its id, or raise :class:`TypeNotFound`."""
+    """Resolve a node-type id or name to its id, or raise :class:`TypeNotFound`.
+
+    Types are nodes (Q13, migration ``0009``): a node type is an active node
+    whose own type is the ``type`` metaclass root, distinguished from edge
+    types by ``type_kind`` in props.
+    """
     row = conn.execute(
-        "SELECT id FROM types WHERE id = ? OR name = ?", (type_ref, type_ref)
+        "SELECT id FROM nodes WHERE (id = ? OR title = ?) AND type_id = 'type'"
+        " AND json_extract(props, '$.type_kind') = 'node' AND state = 'active'",
+        (type_ref, type_ref),
     ).fetchone()
     if row is None:
         raise TypeNotFound(f"unknown node type: {type_ref}")
@@ -300,7 +307,9 @@ def _resolve_node_type(conn: sqlite3.Connection, type_ref: str) -> str:
 def _resolve_edge_type(conn: sqlite3.Connection, type_ref: str) -> str:
     """Resolve an edge-type id or name to its id, or raise :class:`TypeNotFound`."""
     row = conn.execute(
-        "SELECT id FROM edge_types WHERE id = ? OR name = ?", (type_ref, type_ref)
+        "SELECT id FROM nodes WHERE (id = ? OR title = ?) AND type_id = 'type'"
+        " AND json_extract(props, '$.type_kind') = 'edge' AND state = 'active'",
+        (type_ref, type_ref),
     ).fetchone()
     if row is None:
         raise TypeNotFound(f"unknown edge type: {type_ref}")
@@ -745,12 +754,15 @@ def create_node(
         position = float(row["pos"])
         conn.execute(
             """
-            INSERT INTO nodes (id, type_id, parent_id, position, title, content, props,
-                               state, created_by)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO nodes (id, space_id, type_id, parent_id, position, title, content,
+                               props, state, created_by)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 node_id,
+                # Grant-aware target spaces land with the scoped store (Q13
+                # step 2); until then every write goes to the default space.
+                MAIN_SPACE_ID,
                 type_id,
                 parent_id,
                 position,
@@ -882,17 +894,23 @@ def list_nodes(
     type: str | None = None,
     state: str | None = None,
     parent_id: str | None = None,
+    include_meta: bool = False,
     limit: int = 500,
     path: str | Path | None = None,
 ) -> list[NodeOut]:
     """List nodes, optionally filtered by type name/id, state, or parent.
 
     Ordered by ``created_at``; ``limit`` caps the result (default 500).
+    Meta-space nodes (the type vocabulary, spaces) are excluded unless
+    ``include_meta`` — content listings are not the type catalog.
     """
     conn = _connect(path)
     try:
         clauses: list[str] = []
         params: list[Any] = []
+        if not include_meta:
+            clauses.append("space_id != ?")
+            params.append(META_SPACE_ID)
         if type is not None:
             clauses.append("type_id = ?")
             params.append(_resolve_node_type(conn, type))
@@ -990,8 +1008,9 @@ def suggest_links(prefix: str, *, limit: int = 20, path: str | Path | None = Non
     try:
         placeholders = ",".join("?" * len(SUGGEST_STATES))
         candidates = conn.execute(
-            f"SELECT id, title FROM nodes WHERE title IS NOT NULL AND state IN ({placeholders})",
-            SUGGEST_STATES,
+            f"SELECT id, title FROM nodes WHERE title IS NOT NULL AND state IN ({placeholders})"
+            " AND space_id != ?",
+            (*SUGGEST_STATES, META_SPACE_ID),
         ).fetchall()
         folded = _match_key(prefix)
         typed = _normalized(prefix)
@@ -1356,12 +1375,16 @@ def _proposal_filters(
     """
     node_type_id = edge_type_id = None
     if type is not None:
-        row = conn.execute("SELECT id FROM types WHERE id = ? OR name = ?", (type, type)).fetchone()
-        node_type_id = row["id"] if row else None
         row = conn.execute(
-            "SELECT id FROM edge_types WHERE id = ? OR name = ?", (type, type)
-        ).fetchone()
-        edge_type_id = row["id"] if row else None
+            "SELECT id, json_extract(props, '$.type_kind') AS kind FROM nodes"
+            " WHERE (id = ? OR title = ?) AND type_id = 'type' AND state = 'active'",
+            (type, type),
+        ).fetchall()
+        for r in row:
+            if r["kind"] == "node":
+                node_type_id = r["id"]
+            elif r["kind"] == "edge":
+                edge_type_id = r["id"]
         if node_type_id is None and edge_type_id is None:
             raise TypeNotFound(f"unknown node or edge type: {type}")
 
@@ -1998,33 +2021,35 @@ def list_events(*, limit: int = 50, path: str | Path | None = None) -> list[Even
         conn.close()
 
 
+def _type_out(row: sqlite3.Row) -> TypeOut | EdgeTypeOut:
+    """Build the public type-catalog model from a type-node row."""
+    props = json.loads(row["props"])
+    base = {
+        "id": row["id"],
+        "name": row["title"] or row["id"],
+        "json_schema": props.get("schema_json", {}),
+        "is_builtin": bool(props.get("is_builtin", 0)),
+    }
+    if props.get("type_kind") == "edge":
+        return EdgeTypeOut(inverse_name=props.get("inverse_name"), **base)
+    return TypeOut(parent_type_id=props.get("parent_type_id"), **base)
+
+
 def list_types(*, path: str | Path | None = None) -> TypesOut:
-    """Return the full type catalog (node types and edge types)."""
+    """Return the full type catalog (node types and edge types).
+
+    Types are nodes (Q13, migration ``0009``): the catalog is the active
+    type-nodes, which live in the meta space.
+    """
     conn = _connect(path)
     try:
-        node_rows = conn.execute("SELECT * FROM types ORDER BY name").fetchall()
-        edge_rows = conn.execute("SELECT * FROM edge_types ORDER BY name").fetchall()
+        rows = conn.execute(
+            "SELECT * FROM nodes WHERE type_id = 'type' AND state = 'active' ORDER BY title"
+        ).fetchall()
+        types = [_type_out(row) for row in rows]
         return TypesOut(
-            node_types=[
-                TypeOut(
-                    id=row["id"],
-                    name=row["name"],
-                    parent_type_id=row["parent_type_id"],
-                    json_schema=json.loads(row["schema_json"]),
-                    is_builtin=bool(row["is_builtin"]),
-                )
-                for row in node_rows
-            ],
-            edge_types=[
-                EdgeTypeOut(
-                    id=row["id"],
-                    name=row["name"],
-                    inverse_name=row["inverse_name"],
-                    json_schema=json.loads(row["schema_json"]),
-                    is_builtin=bool(row["is_builtin"]),
-                )
-                for row in edge_rows
-            ],
+            node_types=[t for t in types if isinstance(t, TypeOut)],
+            edge_types=[t for t in types if isinstance(t, EdgeTypeOut)],
         )
     finally:
         conn.close()
@@ -2041,27 +2066,14 @@ def get_schema(type: str, *, path: str | Path | None = None) -> TypeOut | EdgeTy
     """
     conn = _connect(path)
     try:
-        row = conn.execute("SELECT * FROM types WHERE id = ? OR name = ?", (type, type)).fetchone()
-        if row is not None:
-            return TypeOut(
-                id=row["id"],
-                name=row["name"],
-                parent_type_id=row["parent_type_id"],
-                json_schema=json.loads(row["schema_json"]),
-                is_builtin=bool(row["is_builtin"]),
-            )
         row = conn.execute(
-            "SELECT * FROM edge_types WHERE id = ? OR name = ?", (type, type)
+            "SELECT * FROM nodes WHERE (id = ? OR title = ?) AND type_id = 'type'"
+            " AND state = 'active' ORDER BY json_extract(props, '$.type_kind') DESC LIMIT 1",
+            (type, type),
         ).fetchone()
         if row is None:
             raise TypeNotFound(f"unknown node or edge type: {type}")
-        return EdgeTypeOut(
-            id=row["id"],
-            name=row["name"],
-            inverse_name=row["inverse_name"],
-            json_schema=json.loads(row["schema_json"]),
-            is_builtin=bool(row["is_builtin"]),
-        )
+        return _type_out(row)
     finally:
         conn.close()
 

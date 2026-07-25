@@ -15,7 +15,7 @@ class NodeOut(BaseModel):
     """A graph node as emitted to clients. ``type`` is the type id."""
 
     id: str
-    graph_id: str
+    space_id: str | None
     type: str
     parent_id: str | None
     position: float | None
@@ -32,7 +32,6 @@ class EdgeOut(BaseModel):
     """A typed, directed edge. ``type`` is the edge-type id."""
 
     id: str
-    graph_id: str
     src_id: str
     dst_id: str
     type: str

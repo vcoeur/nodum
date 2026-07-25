@@ -31,7 +31,7 @@ export type RenditionProfile = "thumb" | "preview";
 /** A graph node as emitted to clients. `type` is the type id. */
 export interface NodeOut {
   id: string;
-  graph_id: string;
+  space_id: string | null;
   type: string;
   parent_id: string | null;
   position: number | null;
@@ -47,7 +47,6 @@ export interface NodeOut {
 /** A typed, directed edge. `type` is the edge-type id. */
 export interface EdgeOut {
   id: string;
-  graph_id: string;
   src_id: string;
   dst_id: string;
   type: string;
