@@ -273,6 +273,15 @@ Phase-1 decision log.
   placeholder-UI wheel with a fully green release because `scripts/smoke-install.sh`
   used `--wheel` and so validated a build path the release never performs. The
   script now uses plain `uv build`.
+- **Docs site.** `docs/` + `mkdocs.yml` build the mkdocs-material site at
+  <https://nodum.vcoeur.com/>, deployed by `.github/workflows/docs.yml` on any
+  push to `main` that touches those paths. The build runs `--strict`, so a
+  broken internal link or a page missing from `nav` **fails CI** — check a docs
+  change locally with `uv run --with mkdocs-material mkdocs build --strict`.
+  `docs/CNAME` carries the custom domain and must survive any docs
+  reorganisation. `docs/architecture.md` is both the in-repo architecture doc
+  and a site page, so links out of it must be absolute URLs — a relative link
+  to something outside `docs/` resolves in the repo but breaks the site build.
 
 ## CLI contract (for agents driving the CLI)
 
