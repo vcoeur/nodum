@@ -9,6 +9,9 @@ htmlcov/
 .ruff_cache/
 .env
 
+# mkdocs build output; the docs site is built and deployed by CI.
+site/
+
 # Frontend (web/) — source is tracked, build output and deps are not.
 web/node_modules/
 web/dist/

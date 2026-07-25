@@ -1,0 +1,86 @@
+site_name: nodum
+site_url: https://nodum.vcoeur.com/
+site_description: DB-native knowledge graph — a typed graph of Markdown-content nodes and typed edges in one SQLite file, with an append-only event log, node versions, undo, and hybrid search, behind a deterministic service layer fronted by a CLI, an HTTP API, an MCP server, and a React SPA.
+site_author: Alice Voland
+copyright: 'Developed by Alice Voland &middot; <a href="https://vcoeur.com">vcoeur.com</a> &middot; <a href="/legal/">Legal</a>'
+
+repo_url: https://github.com/vcoeur/nodum
+repo_name: vcoeur/nodum
+edit_uri: edit/main/docs/
+
+theme:
+  name: material
+  font: false
+  favicon: assets/favicon.svg
+  logo: assets/favicon.svg
+  icon:
+    repo: fontawesome/brands/github
+  features:
+    - navigation.instant
+    - navigation.tracking
+    - navigation.sections
+    - navigation.top
+    - content.code.copy
+    - content.tabs.link
+    - search.highlight
+    - search.suggest
+    - toc.follow
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: custom
+      accent: custom
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: custom
+      accent: custom
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+
+extra_css:
+  - assets/stylesheets/extra.css
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/vcoeur/nodum
+    - icon: fontawesome/brands/python
+      link: https://pypi.org/project/nodum/
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - def_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.tasklist:
+      custom_checkbox: true
+
+nav:
+  - Overview: index.md
+  - Install: install.md
+  - Quick start: quick-start.md
+  - Concepts: concepts.md
+  - Architecture: architecture.md
+  - Commands: commands.md
+  - Legal: legal.md
