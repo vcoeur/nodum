@@ -125,12 +125,6 @@ class InvalidTransition(ValueError):
     """Raised when a state transition is not allowed from the current state."""
 
 
-#: The write-gate failure. Kept under its historical name as an alias: the
-#: gate is no longer "human only" but "human, or the grant that covers this
-#: item" (Q13 note 03 Q1) — :class:`GrantNotPermitted` says it better.
-ReviewNotPermitted = GrantNotPermitted
-
-
 class UndoNotPossible(ValueError):
     """Raised when an event cannot be reversed against the current graph."""
 
@@ -1310,7 +1304,7 @@ def transition(
         The updated node, edge, or version.
 
     Raises:
-        ReviewNotPermitted: If ``actor`` is not ``human``.
+        GrantNotPermitted: If the principal may not review this item.
         RecordNotFound: If the id resolves to no node, edge, or version.
         InvalidTransition: If the transition is not allowed from the current
             state.
@@ -1645,7 +1639,7 @@ def accept_proposals(
     transition.
 
     Raises:
-        ReviewNotPermitted: If ``actor`` is not ``human`` — review is the
+        GrantNotPermitted: If the principal may not review — review is the
             human tier, whoever filed the proposal.
     """
     return _transition_many(ids, "accept", principal=principal, reason=None, path=path)

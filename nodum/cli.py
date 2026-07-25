@@ -29,9 +29,9 @@ from nodum.envelope import envelope, list_envelope, render_json
 from nodum.principal import Principal
 from nodum.service import (
     EventNotFound,
+    GrantNotPermitted,
     InvalidTransition,
     RecordNotFound,
-    ReviewNotPermitted,
     TypeNotFound,
     UndoNotPossible,
 )
@@ -158,7 +158,7 @@ def _run(func, *args, **kwargs):
         AssetSourceChanged,
         UnsupportedRendition,
         InvalidTransition,
-        ReviewNotPermitted,
+        GrantNotPermitted,
         UndoNotPossible,
         ValueError,
     ) as exc:

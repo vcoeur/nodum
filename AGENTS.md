@@ -20,11 +20,11 @@ title + content), the **`vec` projector** (sqlite-vec chunk embeddings,
 local in-process fastembed model — migration 0006), **hybrid search**
 (`nodum.search`, CLI `search`): BM25 + vector lists fused by reciprocal rank
 fusion, then one-hop graph-expansion re-ranking, with a per-signal `signals`
-breakdown, **agent policies** (DB-stored per-agent rulesets, design §8.3,
-with auto-accept evaluation on the edge write path), the **review/accept
-API** (proposal listing with reviewer context, batch accept/reject by id or
-filter — the human tier: a non-`human` actor is refused, as it is for
-`archive` and `undo`), **proposed updates** (agent `update_node` stages a
+breakdown, **principals, spaces and grants** (Q13: `humans`/`agents`/
+`grants` tables, a scope-bound store, `read`/`suggest`/`edit` per
+(agent, space)), the **review/accept API** (proposal listing with reviewer
+context, batch accept/reject by id or filter — a human, or `edit` on the
+item's space; `undo` stays human-only), **proposed updates** (agent `update_node` stages a
 `proposed` version recording which fields it named; accept applies exactly
 those, reject archives it — migrations 0005/0008), the **MCP server**
 (`nodum.mcp_server`, stdio, read + additive tiers only; review and curative
@@ -40,7 +40,7 @@ human` and no request field able to say otherwise — the shared **envelope**
 module (`nodum.envelope`) both the CLI and the API render through, and the
 **web UI** itself (`web/`, React 19 + TypeScript, built into `nodum/_web/` by
 `make web-build`; gitignored, shipped in the wheel as a hatchling artifact):
-six views — Markdown editor, hybrid search, review queue + policy editor,
+six views — Markdown editor, hybrid search, review queue,
 graph, assets, per-node version history.
 **Deliberately not built yet** (later phases — do not add): the
 Phase-4 ingestion pipeline (text extraction, chunking, source/claim
@@ -53,7 +53,7 @@ export that exists is the thin per-node snapshot,
 (`merge_nodes`, `retype`, `supersede_edge`, `bulk_relink`, `consolidate`),
 and the **dream-journal view**, which Phase 3 deferred to Phase 5 on purpose —
 it belongs with the consolidation cycle that gives it something to show. The
-schema reserves room for them (`graph_id`, `merge_redirects`, `cycle_id`,
+schema reserves room for them (`space_id`, `merge_redirects`, `cycle_id`,
 `assets.extracted_text`); each lands as its own append-only migration.
 A node's `type` is likewise **fixed at creation by design**, not by omission:
 `service.update_node` takes `title`/`content`/`props` only, and retyping is a
@@ -67,11 +67,10 @@ node for exactly this reason.
   `proposed → active → archived` state machine, the event log, versions
   (including `proposed` version updates: agent edits stage the fields they
   name, accept applies exactly those, reject archives), undo, wikilink
-  materialization, agent policies (CRUD + auto-accept evaluation on the write
-  path), the review queue (proposal listing, batch accept/reject), the human
-  tier (`_require_human_reviewer` refuses a non-`human` actor for `accept`,
-  `reject`, `archive`, and `undo` — every operation that writes or retires
-  live state), and the curated graph reads
+  materialization, the review queue (proposal listing, batch accept/reject),
+  and grant enforcement through the scope-bound store (`suggest` lands
+  `proposed`, `edit` lands `active` and carries in-space
+  accept/reject/archive; `undo` stays human-only), and the curated graph reads
   (`get_neighborhood`, `traverse`, `find_path`, `get_schema`,
   `diff_versions`, `propose_edges`). Two reads exist for interactive clients
   rather than agents: **`subgraph`** — `traverse` plus edge state/confidence/
@@ -92,9 +91,11 @@ node for exactly this reason.
 - **`nodum.mcp_server`** — the MCP adapter (stdio, official Python SDK
   FastMCP), the **external-agent** surface. Registers the design §8.1 read +
   additive tiers and nothing else, each tool a thin delegate to a
-  service/search function; one configured `--actor` per server attributes
-  every write and must be an `agent:<name>` identity. The review tools
-  (`accept`, `reject` — the §8.1 "write (human/policy)" tier) and the
+  service/search function; one configured `--actor` per server names the
+  agent, whose principal is loaded with its grant set — every write and read
+  is confined to those grants (INTERIM: unauthenticated until token
+  verification lands). The review tools
+  (`accept`, `reject` — the §8.1 "write (human)" tier) and the
   curative tools (`merge_nodes`, `retype`, `supersede_edge`, `bulk_relink`,
   `consolidate` — §8.2) are **never registered**: structural enforcement, not
   a runtime check. Launched by `nodum mcp serve`.
@@ -102,15 +103,16 @@ node for exactly this reason.
   and the exact inverse of the MCP server. `create_app(*, db_path, token)`
   builds a Starlette app: the JSON API under `/api`, the built UI at `/`,
   launched by `nodum serve` (loopback, port 8600). Every write is attributed
-  to `HTTP_ACTOR` (= `service.ACTOR_HUMAN`) and **no request field, header, or
-  query parameter can set an actor** — a body carrying `{"actor": "agent:x"}`
-  is ignored, not honoured. That absence is structural, not a filter: the
-  module binds `actor` in exactly one expression (inside `_write`, to the
-  constant), handlers forward only fields they name, and `_write` refuses a
-  caller-supplied actor outright. Three tests in `tests/test_http_api.py`
+  to the session's human principal (INTERIM: the owner, until password
+  sessions land) and **no request field, header, or query parameter can set
+  an identity** — a body carrying `{"actor": "agent:x"}` is ignored, not
+  honoured. That absence is structural, not a filter: the module binds
+  `principal` in exactly one expression (inside `_write`, minted through
+  `auth`), handlers forward only fields they name, and `_write` refuses a
+  caller-supplied principal outright. Three tests in `tests/test_http_api.py`
   enforce it over the *live route table* and the module's AST, so a new
   endpoint is covered without being added to a list — if you add an endpoint,
-  route its writes through `_write` and never mention an actor in a handler.
+  route its writes through `_write` and never mention an identity in a handler.
   One `EXCEPTION_STATUS` table becomes the error envelope. It covers every
   class `cli._run` catches — the `sqlite3.Error` and `OSError` rows are the
   **base** classes, so `DatabaseError`/`IntegrityError`/`ProgrammingError`/
@@ -132,10 +134,8 @@ node for exactly this reason.
   `nodum/_web/` by `make web-build` and served by `nodum serve`. Seven routes
   over six views, each lazily loaded so CodeMirror, Mermaid, and Cytoscape stay
   out of the initial bundle. `src/api/client.ts` is the only `fetch` in the
-  app and has **no actor parameter anywhere** — the server's structural rule,
-  mirrored in the client. It is also where the optional bearer token is
-  adopted, from the `#token=…` fragment `nodum serve --token` prints, into
-  `sessionStorage`; and it sends `Content-Type: application/json` on every
+  app and has **no identity parameter anywhere** — the server's structural
+  rule, mirrored in the client. It sends `Content-Type: application/json` on every
   non-GET request, bodyless ones included, because the server requires it.
   `src/lib/` holds the cross-view invariants
   (timestamps, failure classification); `src/components/` holds shared React
@@ -294,21 +294,21 @@ Phase-1 decision log.
   commands to that shape.
 - DB path resolution: `--db` flag → `NODUM_DB` env var →
   `~/.local/share/nodum/nodum.db`.
-- Writes default to actor `human` (state `active`); pass `--actor agent:<name>`
-  to land writes in `proposed` instead — unless the agent's stored policy
-  auto-accepts the write (`policy set`). An agent `node update` stages a
-  `proposed` *version* recording which fields it named; `accept <version-id>`
-  applies **only those fields** to the node as it stands then (so a human edit
-  made while the proposal waited is not reverted), `reject` archives it.
-  A `[[wikilink]]` written by an agent materialises a `proposed` `mentions`
-  edge; accepting the node brings it to `active`.
-- **Everything that writes or retires live state requires `--actor human`**
-  (the default): `accept`, `reject`, `archive`, `undo`, every `review`
-  subcommand, and `policy set` (a policy grants auto-accept, so an agent
-  setting one would self-grant the direct live write the human tier withholds).
-  An `agent:*` actor exits 1 with `only the 'human' actor may
-  <action>`. It is not delegable, whoever filed the proposal — `undo` most of
-  all, since restoring an event's payload can write `state = 'active'` back.
+- **The CLI is human-only, and every write command names its human** with a
+  required `--as human:<id>` (or the bare id): attribution is explicit, always
+  (there is no `--actor` — agents drive MCP, never the CLI). A write by a
+  human lands `active`. An agent's write (over MCP) lands per its grants:
+  `suggest` → `proposed`, `edit` → `active`. An agent `node update` with
+  `suggest` stages a `proposed` *version* recording which fields it named;
+  `accept <version-id>` applies **only those fields** to the node as it
+  stands then (so a human edit made while the proposal waited is not
+  reverted), `reject` archives it. A `[[wikilink]]` written by an agent
+  materialises a `proposed` `mentions` edge; accepting the node brings it to
+  `active`.
+- **Review authority is a human, or `edit` on the item's space** (Q13):
+  `accept`, `reject`, `archive`, and every `review` subcommand. `undo` stays
+  human-only — restoring an event's payload can write `state = 'active'`
+  back, and no grant delegates that.
   Both spellings of a reject — single-item `reject <id> --reason` and batch
   `review reject … --reason` — require the reason and record it in the reject
   event's payload: one operation, one audit guarantee.
@@ -318,9 +318,6 @@ Phase-1 decision log.
   has grown past (a created node that now has children).
 - `--set key=value` is repeatable; values are parsed as JSON with a raw-string
   fallback.
-- A policy rule's `min_confidence` grades the *agent's own* reported
-  confidence, so it is inert unless the rule also sets
-  `"trust_self_reported_confidence": true`.
 - `--version` prints `nodum <version>` and exits 0; `schema-dump` prints the
   CLI's whole command tree as JSON. Both short-circuit without touching a
   database, so they work on a bare install — that is what
@@ -334,14 +331,15 @@ Phase-1 decision log.
   `search <query>`,
   `traverse`, `subgraph <root-id>`, `suggest-links <prefix>`, `find-path`,
   `diff`, `projector run/status/rebuild`,
-  `policy set/get/list`, `review queue/accept/reject/accept-all/reject-all`,
+  `review queue/accept/reject/accept-all/reject-all`,
   `asset register/get/list/rendition/purge`,
   `mcp serve --actor agent:<name>`,
   `serve [--host 127.0.0.1] [--port 8600] [--token TOKEN] [--allow-host NAME]
-  [--db PATH]`. `serve` refuses a non-loopback bind without `--token` (exit 1),
-  prints the database path and the `#token=…` UI URL on stderr, and translates
+  [--db PATH]`. `serve` prints the database path on stderr and translates
   uvicorn's own startup failure (a port already in use) into the contract's
-  exit 1 — it used to escape as uvicorn's exit 3.
+  exit 1 — it used to escape as uvicorn's exit 3. (Account/grant/space admin
+  commands land with the surfaces step; `--token` and the non-loopback
+  refusal die when password sessions land.)
 - Reads are not state-filtered by default beyond edge traversal: `node get`,
   `node children`, `node list`, and `history` return `proposed` rows, and
   `search --state any` includes them. Only *traversals* (`node get --depth`,
@@ -416,14 +414,12 @@ Phase-1 decision log.
   protects *reads*: after a rebind the attacker's page is same-origin by every
   other measure. Host names are compared without ports, which is what keeps the
   `make web-dev` proxy (`Host: localhost:5700`) working.
-- **`--token` is the only defence against a local process.** Any process on the
-  machine can satisfy every origin check with three curl headers — including an
-  MCP server launched with `--actor agent:x`, which would thereby regain over
-  HTTP the `accept` the MCP tool list structurally withholds. `nodum serve`
-  says so in its startup banner when no token is set, and refuses a non-loopback
-  bind without one. The UI receives the token from the `#token=…` fragment the
-  banner prints (`web/src/api/client.ts`, `adoptToken`) — a fragment because it
-  never reaches the wire, a log, or a `Referer`.
+- **INTERIM (Q13 surfaces step): `--token` is still the only defence against a
+  local process, and it is dying.** Any process on the machine can satisfy
+  every origin check with three curl headers; password sessions replace the
+  static bearer in the surfaces step, at which point this bullet becomes
+  "a local process needs a human password". Until then the banner still
+  warns when no token is set.
 - **A wrong verb on a real route is a 405 with an `Allow` header**, not the
   catch-all's 404. The catch-all claims every method so a `fetch` never gets
   HTML, which also means it out-matches a real route's 405 unless it asks the
@@ -439,13 +435,11 @@ Phase-1 decision log.
   store: the CLI registers a local file the operator owns, this one takes a
   file from a stranger. **There is no delete route**, so anything that does land
   is only reclaimable out of band — a known gap, not an oversight.
-- **Do not invent request fields the domain has no representation for.**
-  `PUT /api/policies/{agent}` takes `{"rules": [...]}` and nothing else: a
-  policy is disabled by storing an empty ruleset, which is the service's only
-  spelling of it, and `PolicyOut` has no `enabled` field to echo one back. An
-  `enabled: false` flag was tried and removed — it silently wiped the stored
-  ruleset with no way to recover it. Same rule everywhere: if a body key has
-  no counterpart in `nodum.models`/`nodum.service`, it does not belong here.
+- **Do not invent request fields the domain has no representation for.** If a
+  body key has no counterpart in `nodum.models`/`nodum.service`, it does not
+  belong here. (The lesson was learned on the since-deleted policies API: an
+  `enabled: false` flag, accepted once, silently wiped the stored ruleset with
+  no way to recover it.)
 - Responses use `nodum.envelope`: single results as the model dump, lists as
   `{"<plural>": [...], "count": n}`, rendered exactly as the CLI prints them.
   A new list endpoint keys on the same plural the CLI command uses.
@@ -466,15 +460,13 @@ Phase-1 decision log.
 
 ## Frontend contract (for agents touching `web/`)
 
-- **One `fetch`.** Everything goes through `src/api/client.ts`. It has no actor
-  parameter and must never grow one — the server forces `actor = human` and the
-  client being unable to express an actor is the second layer under that. Two
-  things it *does* own, both because the server made them requirements: the
-  bearer token (`adoptToken` reads `#token=…` once, stores it in
-  `sessionStorage`, and strips the fragment — `setAuthToken` had no caller at
-  all before, so `--token` shipped a UI in which every request was a 401) and
-  `Content-Type: application/json` on every non-GET request, bodyless ones
-  included. Neither belongs in a view.
+- **One `fetch`.** Everything goes through `src/api/client.ts`. It has no
+  identity parameter and must never grow one — the server binds the principal
+  and the client being unable to express one is the second layer under that.
+  It also owns `Content-Type: application/json` on every non-GET request,
+  bodyless ones included, because the server requires it. (INTERIM: the
+  `#token=…` bearer adoption still lives here; the login flow replaces it in
+  the surfaces step.)
 - **Never call `new Date()` on a server string.** SQLite writes
   `datetime('now')` — UTC, no zone marker — which every browser reads as *local*
   time. Parse through `parseTimestamp` (`src/lib/time.ts`) and format through
@@ -504,8 +496,8 @@ Phase-1 decision log.
 - **A pure module gets a `*.test.ts` beside it** (`make web-test`, Vitest). The
   harness is unit-only by design — no component rendering — so pull the logic
   worth testing out of the component and test it there, which is what
-  `filters.ts`, `unifiedDiff.ts`, `signals.ts`, `grouping.ts`, and
-  `policyRules.ts` already are. Assert the *semantics* the module encodes (a
+  `filters.ts`, `unifiedDiff.ts`, `signals.ts`, and `grouping.ts` already
+  are. Assert the *semantics* the module encodes (a
   `min_confidence` of 0 is a filter, not a no-op; a 502 is unreachable, not a
   refusal), not its line coverage. The global environment is `node`; a suite
   that genuinely needs a DOM says so in **its own** docblock

@@ -14,17 +14,20 @@ projectors with checkpoint/rebuild mechanics and two derived indexes — an
 FTS5 full-text index and a sqlite-vec chunk-embedding index (local
 in-process fastembed model, no daemon, no API key) — feeding **hybrid
 search** (BM25 + vector fused by reciprocal rank fusion, then graph-expansion
-re-ranking), DB-stored **agent policies** with auto-accept on the write path,
-the **review/accept API** for the proposal queue (human actor only),
+re-ranking), **principals, spaces and grants** (Q13: human and agent accounts,
+`read`/`suggest`/`edit` grants per (agent, space), enforced by a scope-bound
+store), the **review/accept API** for the proposal queue (a human, or `edit`
+on the item's space; `undo` stays human-only),
 **proposed updates** (agent edits stage as `proposed` versions), an **MCP
 server** (stdio) exposing the read + additive tool tiers *and nothing else*,
 and **content-addressed assets** — binaries and
 their lazily generated `thumb`/`preview` renditions stored in the same file
 as the graph (agents get renditions, never originals). **Phase 3 (human UI)**
 is underway: `nodum serve` runs the **HTTP API** — the human surface, where
-every write is attributed to `human` and no request field can say otherwise —
-and serves the **web UI** from the same process: a Markdown editor, hybrid
-search, the review queue and policy editor, a graph view, an asset browser,
+every write is attributed to the session's human and no request field can say
+otherwise — and serves the **web UI** from the same process: a Markdown
+editor, hybrid
+search, the review queue, a graph view, an asset browser,
 and per-node version history. Still to come: the ingestion pipeline and the
 consolidation cycle.
 
@@ -74,26 +77,20 @@ uv run nodum history <node-id>                # version snapshots
 uv run nodum undo                             # reverse the latest event
 uv run nodum types                            # the seeded type catalog
 
-# Agent writes land in `proposed` and wait in the review queue…
-uv run nodum node create --type note --title "Bot draft" --actor agent:researcher
-uv run nodum node update <id> --content "bot rewrite" --actor agent:researcher
+# The CLI is human-only and every write names its human explicitly:
+uv run nodum node create --type note --title "Draft" --as owner
+uv run nodum node update <id> --content "rewrite" --as owner
+
+# Agent writes (over MCP) land per their grants — `suggest` queues them in
+# the review queue as `proposed`:
 uv run nodum review queue --created-by agent:researcher   # nodes, edges, updates
 
-# …and only the human touches live state: accept/reject/archive/undo all
-# refuse an agent:* actor. An accepted update applies only the fields the
-# agent named, so edits made while it waited survive.
-uv run nodum review accept-all --created-by agent:researcher
-uv run nodum review reject <id> --reason "not convinced"
-uv run nodum reject <id> --reason "not convinced"   # same audit trail, one id
-
-# …unless a stored policy auto-accepts them (still the agent's own event).
-# A min_confidence gate grades the agent's *self-reported* confidence, so it
-# only counts when the rule says so out loud:
-uv run nodum policy set agent:researcher --rule \
-    '{"edge_type":"mentions","action":"auto_accept"}'
-uv run nodum policy set agent:researcher --rule \
-    '{"edge_type":"mentions","min_confidence":0.9,"action":"auto_accept","trust_self_reported_confidence":true}'
-uv run nodum policy list
+# Review authority is a human, or `edit` on the item's space; undo stays
+# human-only. An accepted update applies only the fields the agent named, so
+# edits made while it waited survive.
+uv run nodum review accept-all --created-by agent:researcher --as owner
+uv run nodum review reject <id> --reason "not convinced" --as owner
+uv run nodum reject <id> --reason "not convinced" --as owner   # same audit trail
 
 # Curated graph reads (the MCP read tier's service functions)
 uv run nodum traverse <id> --edge-type supports --depth 2

@@ -106,9 +106,9 @@ from nodum.envelope import envelope, list_envelope, render_json
 from nodum.principal import Principal
 from nodum.service import (
     EventNotFound,
+    GrantNotPermitted,
     InvalidTransition,
     RecordNotFound,
-    ReviewNotPermitted,
     TypeNotFound,
     UndoNotPossible,
 )
@@ -324,7 +324,7 @@ EXCEPTION_STATUS: dict[type[Exception], int] = {
     OverflowError: 400,
     # 403 — the human tier refused a non-human actor. Unreachable from this
     # surface by construction; mapped so it could never surface as a 500.
-    ReviewNotPermitted: 403,
+    GrantNotPermitted: 403,
     # 409 — the graph has grown past the event being undone.
     UndoNotPossible: 409,
     # 413 — the body passed the ceiling this server is willing to read.
