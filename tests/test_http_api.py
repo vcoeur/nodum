@@ -1026,14 +1026,14 @@ def test_the_spa_itself_is_not_broken_by_any_of_this(client, fresh_db):
     assert created.status_code == 200
     assert created.json()["created_by"] == service.ACTOR_HUMAN
 
-    # `make web-dev` proxies from :5173 with the browser's own Host and Origin,
+    # `make web-dev` proxies from :5700 with the browser's own Host and Origin,
     # and ports are not compared, so the dev server keeps working.
     dev = client.post(
         "/api/nodes",
         guard=False,
         headers={
-            "Host": "localhost:5173",
-            "Origin": "http://localhost:5173",
+            "Host": "localhost:5700",
+            "Origin": "http://localhost:5700",
             "Sec-Fetch-Site": "same-origin",
             "Content-Type": "application/json",
         },

@@ -296,7 +296,7 @@ bundle and the runtime is pure Python:
 make web-install    # npm ci in web/ (once)
 make web-test       # vitest over the pure modules in web/src
 make web-build      # tsc --noEmit && vite build -> nodum/_web/
-make web-dev        # Vite dev server on :5173, proxying /api to :8420
+make web-dev        # Vite dev server on :5700, proxying /api to :8420
 make web-clean      # drop the bundle; nodum serve falls back to the placeholder
 ```
 

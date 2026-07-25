@@ -513,7 +513,7 @@ sections to the code:
   the server answers to, which is the only check that survives DNS rebinding —
   after a rebind the attacker's page *is* same-origin by every other measure.
   Host names are compared without ports, deliberately: the `make web-dev` proxy
-  forwards the browser's own `Host: localhost:5173`, and a port is no part of
+  forwards the browser's own `Host: localhost:5700`, and a port is no part of
   the rebinding defence. What none of it does is authenticate — any local
   process satisfies every check with three curl headers — so `nodum serve` says
   that in its banner and refuses a non-loopback bind without `--token`.

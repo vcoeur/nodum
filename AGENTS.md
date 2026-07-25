@@ -236,7 +236,7 @@ Phase-1 decision log.
 - **Line length 100**; ruff rules `E, F, I, UP, B, SIM`.
 - **Frontend**: `make web-install` once, then `make web-build` (which runs
   `tsc --noEmit` first, so the build is the type gate) or `make web-dev` for
-  the Vite server on 5173 proxying to `nodum serve` on 8420. Two gates, both in
+  the Vite server on 5700 proxying to `nodum serve` on 8420. Two gates, both in
   CI: `tsc --noEmit` over the whole tree, and **`make web-test`** — Vitest over
   the pure modules in `web/src` (`*.test.ts` beside the module it covers).
   There is no ESLint and no component/DOM harness, so anything React renders is
@@ -370,7 +370,7 @@ Phase-1 decision log.
   --allow-host)`. This is the DNS-rebinding defence and the only check that
   protects *reads*: after a rebind the attacker's page is same-origin by every
   other measure. Host names are compared without ports, which is what keeps the
-  `make web-dev` proxy (`Host: localhost:5173`) working.
+  `make web-dev` proxy (`Host: localhost:5700`) working.
 - **`--token` is the only defence against a local process.** Any process on the
   machine can satisfy every origin check with three curl headers — including an
   MCP server launched with `--actor agent:x`, which would thereby regain over
