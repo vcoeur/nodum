@@ -80,8 +80,9 @@ uv run nodum traverse <id> --edge-type supports --depth 2
 uv run nodum find-path <a> <b>
 uv run nodum diff <version-a> <version-b>
 
-# A bounded, filtered neighborhood: every filter applied in SQL, the node
-# cap enforced *while walking*. `truncated` says whether it cut the walk short.
+# A bounded, filtered neighborhood: every filter applied in SQL, the node cap
+# enforced *while walking* (and the edge list capped with it). `truncated` says
+# whether either cap cut the walk short.
 uv run nodum subgraph <id> --depth 2 --edge-type supports \
     --edge-state active --min-confidence 0.8 --node-type claim --limit 200
 
@@ -99,10 +100,16 @@ uv run nodum asset purge                      # evict the stored renditions
 uv run nodum mcp serve --actor agent:researcher
 
 # HTTP server for the human: JSON API under /api plus the web UI at /.
-# Loopback by default, no accounts; --token adds a bearer token for the LAN.
+# Loopback by default and no accounts — which means every process on this
+# machine can drive it as the human. A non-loopback bind needs --token.
 uv run nodum serve                      # http://127.0.0.1:8420
-uv run nodum serve --token s3cret --host 0.0.0.0
+uv run nodum serve --token s3cret --host 0.0.0.0   # then open the /#token=… URL it prints
 curl -s localhost:8420/api/nodes/<id>   # identical bytes to `nodum node get <id>`
+
+# Reads need nothing. A write from a non-browser client says it is one:
+curl -s -X POST localhost:8420/api/nodes \
+  -H 'Content-Type: application/json' -H 'X-Nodum-Client: curl' \
+  -d '{"type":"note","title":"From curl"}'
 ```
 
 Run `uv run nodum --help` (or any subcommand with `--help`) for the full
@@ -185,11 +192,31 @@ degrades to BM25 + graph expansion. `NODUM_EMBED_MODEL` switches the model
   (missing id → 404, bad value → 400, human-only → 403, impossible undo → 409,
   database busy → a retryable 503). Requests carry only fields the service
   itself has — disabling an agent policy, for instance, is an explicit
-  `{"rules": []}`, not an `enabled` flag the data model cannot express. Auth
-  is loopback-by-default with an
-  optional `--token` bearer for the LAN case, gating `/api` only — `/healthz`
-  and the UI stay open. With no UI bundle built, the API serves normally and
-  `/` is a page telling you to run `make web-build`.
+  `{"rules": []}`, not an `enabled` flag the data model cannot express. With no
+  UI bundle built, the API serves normally and `/` is a page telling you to run
+  `make web-build`.
+- **Origin control, which is not the same thing as auth.** Binding loopback is
+  no defence against a *browser*: every page the user visits can reach
+  `127.0.0.1`. So a state-changing request must prove it came from this origin
+  — `Sec-Fetch-Site: same-origin`, or a matching `Origin`, or (for a
+  non-browser client, which has neither) the explicit `X-Nodum-Client` header —
+  every JSON route requires `Content-Type: application/json`, which a
+  cross-origin page cannot send without a preflight this app never answers, and
+  the `Host` header is checked against the names the server answers to, which
+  is what stops DNS rebinding. Reads need none of it. `--allow-host` names an
+  extra host for a reverse proxy.
+- **Auth is `--token`, and only `--token`.** It gates `/api` only — `/healthz`
+  and the UI stay open, and `/healthz` reports liveness and nothing else.
+  **Without it, any process on this machine can drive the API as the human**,
+  including a local agent: origin control stops browsers, not processes. A
+  non-loopback bind without a token is refused outright. `nodum serve --token X`
+  prints a `#token=X` URL; opening it hands the token to the UI (in the
+  fragment, so it never reaches a log) for the rest of that browser tab.
+- **Uploads are images only, and bounded.** `POST /api/assets` caps the request
+  body before anything buffers it (32 MiB), identifies the type from the bytes
+  rather than the filename, and refuses an image whose pixel count would make
+  decoding it expensive. There is no delete route, so what lands stays until the
+  file is managed out of band.
 - **The six views.** `/editor` is a CodeMirror-6 Markdown editor with slash
   commands, `[[` autocomplete, live Mermaid preview, drag-drop asset upload,
   and debounced autosave — a node's `type` is fixed at creation, so the type
@@ -220,15 +247,21 @@ degrades to BM25 + graph expansion. `NODUM_EMBED_MODEL` switches the model
   with the filters a graph view needs — edge type, edge state, confidence
   floor, edge author, node type — composed as one conjunction in SQL, plus a
   `--limit` on nodes that is enforced **during** the breadth-first walk rather
-  than by slicing a materialized graph afterwards. A caller therefore cannot
-  ask for an unbounded result, and `truncated` on the response says whether
-  the cap cut the walk short instead of leaving a partial view to pass as the
-  whole neighborhood. An edge whose far node the filters exclude is dropped
-  with it, so the result never carries an edge pointing outside its own node
-  list. `nodum suggest-links "Grap"` is the companion title-prefix lookup
-  behind a `[[` autocomplete: it reads the node table directly, never a
-  projector index, so it answers on a cold database — an empty list always
-  means "no such title", never "the index has not run".
+  than by slicing a materialized graph afterwards — tested before the far node
+  is read, so a hub with ten thousand spokes costs `limit` reads, not ten
+  thousand. The edge list is capped with it (`limit * SUBGRAPH_EDGE_FACTOR`),
+  because a node cap bounds nodes only, and `--limit` is clamped to a server
+  ceiling of 2000. A caller therefore cannot ask for an unbounded result in
+  either dimension, and `truncated` says whether either cap cut the walk short
+  instead of leaving a partial view to pass as the whole neighborhood. What
+  does come back is closed over its own node list: two returned nodes are
+  never drawn unconnected when the stored graph connects them. An edge whose
+  far node the filters exclude is dropped with it, so the result never carries
+  an edge pointing outside its own node list. `nodum suggest-links "Grap"` is
+  the companion title-prefix lookup behind a `[[` autocomplete: it reads the
+  node table directly, never a projector index, so it answers on a cold
+  database — an empty list always means "no such title", never "the index has
+  not run".
 - **Event log + versions.** Every mutation appends an event (actor, op, full
   before/after JSON payload) and — for nodes — a version snapshot. `undo`
   reverses an event by restoring its `before` state. It never cascades beyond

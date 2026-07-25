@@ -8,6 +8,11 @@
  * because the diagrams land asynchronously — React would either have to own DOM
  * it did not create or re-render the whole tree once per diagram. Since React
  * renders no children into the target element, mutating it directly is safe.
+ *
+ * **Both `innerHTML` writes in this file take already-sanitised markup** —
+ * `renderMarkdown` returns HTML reduced to `markdownRender`'s policy, and
+ * `renderDiagram` returns SVG reduced to `mermaidRender`'s. Nothing here may
+ * assign markup that has not been through one of them.
  */
 
 import { useEffect, useRef } from "react";

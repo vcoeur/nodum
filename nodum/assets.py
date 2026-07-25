@@ -22,6 +22,15 @@ stored as bytes in the ``renditions`` table, and evictable via
 :func:`purge_renditions`. Two profiles exist (``thumb``, ``preview``);
 ``page:<n>`` PDF rasters are Phase 4. **LLMs never receive original
 binaries** — the MCP server serves renditions and metadata only.
+
+Rendering is bounded by pixel count, not just by file size: a decompression
+bomb is a small file whose *decode* is enormous, so :data:`MAX_IMAGE_PIXELS`
+is checked from the image header — before any decoding — both when a caller
+offers bytes (:func:`check_image_pixel_budget`) and when a stored original is
+about to be rendered (:func:`_prepare_image`). :func:`sniff_image_mime` is the
+matching "what is this really" helper: registration records the MIME
+``mimetypes`` derives from the *name*, which is fine for a local file the
+operator chose and useless against a network upload.
 """
 
 from __future__ import annotations
@@ -46,6 +55,33 @@ RENDITION_MIME = "image/webp"
 #: Chunk size for streaming originals into and out of the blob store.
 _CHUNK_BYTES = 1 << 20
 
+#: Largest image, in pixels, that a rendition is allowed to decode.
+#:
+#: 40 MP is roughly a 6300×6300 photograph — comfortably above anything a
+#: camera or a screenshot produces and far below what makes a decode expensive
+#: (each megapixel is ~4 MB resident as RGBA). Pillow's own
+#: ``DecompressionBombWarning`` / ``DecompressionBombError`` pair is not a
+#: usable guard on its own: it *warns* between 1× and 2× its threshold and
+#: decodes anyway, which is exactly the 121 MP case that cost 185 MB of RSS.
+MAX_IMAGE_PIXELS = 40_000_000
+
+#: Image formats this system can render, and the magic bytes that identify
+#: each. Sniffed rather than trusted: ``mimetypes.guess_type`` reads the
+#: filename, which whoever supplied the bytes also chose.
+_IMAGE_SIGNATURES: tuple[tuple[bytes, str], ...] = (
+    (b"\x89PNG\r\n\x1a\n", "image/png"),
+    (b"\xff\xd8\xff", "image/jpeg"),
+    (b"GIF87a", "image/gif"),
+    (b"GIF89a", "image/gif"),
+    (b"BM", "image/bmp"),
+    (b"II*\x00", "image/tiff"),
+    (b"MM\x00*", "image/tiff"),
+)
+
+#: Bytes read to identify a format. WebP needs 12 (``RIFF….WEBP``); the rest
+#: are shorter.
+_SNIFF_BYTES = 16
+
 
 class AssetNotFound(LookupError):
     """Raised when an asset hash or asset-reference id does not resolve."""
@@ -65,6 +101,17 @@ class AssetSourceChanged(ValueError):
     Registration reads the file twice; a file still being written, rotated, or
     truncated in between would otherwise be stored under the sha256 of bytes
     it no longer matches.
+    """
+
+
+class ImageTooLarge(ValueError):
+    """Raised when an image's pixel count exceeds :data:`MAX_IMAGE_PIXELS`.
+
+    A decompression bomb is small on disk and enormous in memory: a 612 KB PNG
+    decoding to 14000×14000 is 196 megapixels, and a 375 KB one at 121 MP sits
+    *below* Pillow's own bomb threshold and simply decodes, costing ~185 MB of
+    resident memory on the event loop. Both are refused by pixel count, read
+    from the image header before any decoding happens.
     """
 
 
@@ -118,6 +165,61 @@ def _asset_out(row: sqlite3.Row) -> AssetOut:
 def rendition_id(asset_hash: str, profile: str) -> str:
     """Return the deterministic rendition id: ``sha256(asset_hash + ':' + profile)``."""
     return hashlib.sha256(f"{asset_hash}:{profile}".encode()).hexdigest()
+
+
+def sniff_image_mime(source: str | Path) -> str | None:
+    """Identify a file's image type from its leading bytes.
+
+    Args:
+        source: Path to the file to inspect.
+
+    Returns:
+        The MIME type, or ``None`` for anything that is not a recognised raster
+        image. A caller deciding whether to *accept* bytes must use this rather
+        than the filename: the two disagree exactly when it matters.
+    """
+    with Path(source).expanduser().open("rb") as handle:
+        head = handle.read(_SNIFF_BYTES)
+    if head.startswith(b"RIFF") and head[8:12] == b"WEBP":
+        return "image/webp"
+    for signature, mime in _IMAGE_SIGNATURES:
+        if head.startswith(signature):
+            return mime
+    return None
+
+
+def check_image_pixel_budget(
+    source: str | Path, *, limit: int = MAX_IMAGE_PIXELS
+) -> tuple[int, int]:
+    """Read an image's dimensions from its header and refuse a decompression bomb.
+
+    ``Image.open`` parses the header only, so this costs nothing next to the
+    decode it is there to prevent.
+
+    Args:
+        source: Path to the image file.
+        limit: Maximum pixel count to allow.
+
+    Returns:
+        The image's ``(width, height)``.
+
+    Raises:
+        ImageTooLarge: If ``width * height`` exceeds ``limit``, or if Pillow
+            refuses the header outright as a bomb.
+        UnsupportedRendition: If the file is not an image Pillow can read.
+    """
+    try:
+        with Image.open(Path(source).expanduser()) as image:
+            width, height = image.size
+    except Image.DecompressionBombError as exc:
+        raise ImageTooLarge(f"image refused as a decompression bomb: {exc}") from exc
+    except UnidentifiedImageError as exc:
+        raise UnsupportedRendition(f"not a raster image Pillow can read: {source}") from exc
+    if width * height > limit:
+        raise ImageTooLarge(
+            f"image is {width}×{height} ({width * height} pixels); the limit is {limit}"
+        )
+    return width, height
 
 
 def _hash_file(source_file: Path) -> tuple[str, int]:
@@ -358,10 +460,22 @@ class _BlobReader(io.RawIOBase):
 def _prepare_image(original: sqlite3.Blob, profile: Profile) -> Image.Image:
     """Read an original from its blob handle and return the downscaled image.
 
-    Pillow reads through the blob handle, so only the decoded image — not the
-    stored file — is ever held in memory.
+    Pillow reads through the blob handle, so only the decoded file — not the
+    stored bytes — is ever held in memory. The pixel budget is checked from the
+    header first: the HTTP surface refuses a bomb at upload, but an asset
+    registered through the CLI (or before that check existed) reaches here
+    unfiltered, and the decode is what costs the memory.
+
+    Raises:
+        ImageTooLarge: If the stored image is above :data:`MAX_IMAGE_PIXELS`.
     """
     with Image.open(io.BufferedReader(_BlobReader(original))) as image:
+        width, height = image.size
+        if width * height > MAX_IMAGE_PIXELS:
+            raise ImageTooLarge(
+                f"stored image is {width}×{height} ({width * height} pixels); "
+                f"the rendition limit is {MAX_IMAGE_PIXELS} — purge it or keep it outside the graph"
+            )
         transposed = ImageOps.exif_transpose(image)
         if transposed.mode not in ("RGB", "RGBA"):
             has_alpha = "A" in transposed.getbands() or "transparency" in transposed.info
@@ -453,6 +567,11 @@ def get_rendition(
             raise UnsupportedRendition(
                 f"cannot render {asset['mime']} ({asset['original_name']}): not a raster image"
             ) from exc
+        except Image.DecompressionBombError as exc:
+            # Pillow's own ceiling, which sits above ours: reached only if a
+            # caller widened MAX_IMAGE_PIXELS past it. A 500 either way is
+            # wrong — the stored image is the problem, not the server.
+            raise ImageTooLarge(f"cannot render {asset['original_name']}: {exc}") from exc
         encoded = _encode_webp(image, spec)
 
         conn.execute(

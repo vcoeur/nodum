@@ -19,7 +19,12 @@ export const EDGE_STATES: readonly NodeState[] = ["active", "proposed", "archive
 export interface GraphFilters {
   /** Maximum hops from the root. */
   depth: number;
-  /** Hard node cap, enforced server-side *during* the walk. */
+  /**
+   * Hard node cap, enforced server-side *during* the walk.
+   *
+   * It bounds edges too: the server caps those at `limit * SUBGRAPH_EDGE_FACTOR`
+   * and reports either cap through the one `truncated` flag.
+   */
   limit: number;
   /** Edge states the walk may follow. Never empty — `active` is the floor. */
   edgeStates: NodeState[];
@@ -54,7 +59,20 @@ export const DEFAULT_FILTERS: GraphFilters = {
 export const MIN_DEPTH = 0;
 export const MAX_DEPTH = 8;
 
-/** Node-cap bounds. The ceiling exists so "raise the limit" cannot run away. */
+/**
+ * Node-cap bounds. The ceiling exists so "raise the limit" cannot run away.
+ *
+ * `MAX_LIMIT` **mirrors `service.MAX_SUBGRAPH_LIMIT`**, which is a real
+ * server-side clamp, not a slider preference: `subgraph` silently reduces any
+ * larger `limit` to it. Raising this number alone therefore raises nothing —
+ * the request goes out with the bigger cap and comes back clamped, so the view
+ * would promise a ceiling it cannot reach. Change the server constant first,
+ * then this one.
+ *
+ * It also sets the edge ceiling: the server caps edges at
+ * `limit * SUBGRAPH_EDGE_FACTOR`, so the node cap the user picks here is what
+ * bounds both.
+ */
 export const MIN_LIMIT = 1;
 export const MAX_LIMIT = 2000;
 

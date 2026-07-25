@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import unicodedata
 
 import pytest
 from typer.testing import CliRunner
@@ -58,6 +59,28 @@ def test_folds_case_beyond_ascii(fresh_db):
     service.create_node(type="concept", title="Ökologie")
     assert _titles(service.suggest_links("éc")) == ["École normale"]
     assert _titles(service.suggest_links("ÖK")) == ["Ökologie"]
+    # The reason folding happens in Python: SQL `lower()` cannot do this one.
+    service.create_node(type="concept", title="Straße")
+    assert _titles(service.suggest_links("STRASSE")) == ["Straße"]
+
+
+def test_matches_across_unicode_normalisation_forms(fresh_db):
+    """An accented letter is one code point or two, depending on who typed it.
+
+    NFD titles arrive from macOS paths and some input methods; a browser sends
+    NFC. Comparing code points without normalising loses the match entirely.
+    """
+    decomposed = unicodedata.normalize("NFD", "École normale")
+    composed = unicodedata.normalize("NFC", "Cinéma vérité")
+    assert decomposed != unicodedata.normalize("NFC", decomposed)  # the forms differ
+    service.create_node(type="concept", title=decomposed)
+    service.create_node(type="concept", title=composed)
+
+    for form in ("NFC", "NFD"):
+        assert _titles(service.suggest_links(unicodedata.normalize(form, "École"))) == [decomposed]
+        assert _titles(service.suggest_links(unicodedata.normalize(form, "Ciné"))) == [composed]
+        # …and case-folded on top of the normalisation.
+        assert _titles(service.suggest_links(unicodedata.normalize(form, "école"))) == [decomposed]
 
 
 def test_archived_excluded_proposed_included(fresh_db):

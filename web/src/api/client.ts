@@ -12,7 +12,11 @@
  *   raised as {@link ApiError};
  * - writes never carry an actor. The HTTP surface *is* the human surface and
  *   forces `actor="human"` server-side; a client-supplied actor would be
- *   ignored, so this client never sends one.
+ *   ignored, so this client never sends one;
+ * - every write carries `Content-Type: application/json` (or multipart, for an
+ *   upload), because the server refuses anything else — see {@link rawRequest};
+ * - the optional bearer token is adopted from `#token=…` on first load — see
+ *   {@link adoptToken}.
  *
  * The endpoints themselves land with the API slice; this file is the contract
  * the view slices code against.
@@ -85,6 +89,9 @@ export class ApiError extends Error {
   }
 }
 
+/** Where a token picked out of the URL is kept for the rest of the session. */
+const TOKEN_STORAGE_KEY = "nodum.authToken";
+
 /** Optional bearer token, for the LAN case (`nodum serve --token`). */
 let authToken: string | null = null;
 
@@ -95,7 +102,47 @@ let authToken: string | null = null;
  */
 export function setAuthToken(token: string | null): void {
   authToken = token;
+  try {
+    if (token === null) sessionStorage.removeItem(TOKEN_STORAGE_KEY);
+    else sessionStorage.setItem(TOKEN_STORAGE_KEY, token);
+  } catch {
+    // Private mode, or storage disabled: the in-memory token still works for
+    // this page load, which is better than refusing to run.
+  }
 }
+
+/**
+ * Adopt a token from `#token=…` in the URL, then from session storage.
+ *
+ * `nodum serve --token X` prints `http://host:port/#token=X`; opening that link
+ * is how the token reaches the app. Before this existed `setAuthToken` had no
+ * caller at all, so `--token` produced a UI in which every request was a 401
+ * and no view could load — an auth mode where the product did not work.
+ *
+ * The token travels in the **fragment**, which browsers never put on the wire:
+ * it stays out of the server's access log, out of `Referer`, and out of any
+ * proxy in between — none of which is true of a query parameter. It is moved
+ * into session storage (per tab, dropped when the tab closes) and stripped from
+ * the address bar immediately, so a reload or a bookmark does not carry it.
+ */
+function adoptToken(): void {
+  if (typeof window === "undefined") return;
+  const fragment = window.location.hash.replace(/^#/, "");
+  const fromUrl = new URLSearchParams(fragment).get("token");
+  if (fromUrl) {
+    setAuthToken(fromUrl);
+    const { pathname, search } = window.location;
+    window.history.replaceState(null, "", `${pathname}${search}`);
+    return;
+  }
+  try {
+    authToken = sessionStorage.getItem(TOKEN_STORAGE_KEY);
+  } catch {
+    authToken = null;
+  }
+}
+
+adoptToken();
 
 /**
  * Build a query string, dropping undefined/null and repeating array values.
@@ -163,15 +210,22 @@ async function rawRequest<T>(path: string, options: RequestOptions = {}): Promis
   const headers: Record<string, string> = { Accept: "application/json" };
   if (authToken) headers.Authorization = `Bearer ${authToken}`;
 
+  const method = options.method ?? "GET";
   let body: BodyInit | undefined;
   if (options.form) {
+    // The browser sets `multipart/form-data` with its own boundary; setting it
+    // here would send a boundary-less header the server cannot parse.
     body = options.form;
-  } else if (options.body !== undefined) {
+  } else if (method !== "GET") {
+    // Every state-changing JSON route requires `Content-Type: application/json`
+    // — including the ones that take no body (`POST /nodes/{id}/archive`). That
+    // is deliberate on the server: `application/json` is not a CORS-simple
+    // content type, so a cross-origin form cannot forge one of these requests.
     headers["Content-Type"] = "application/json";
-    body = JSON.stringify(options.body);
+    body = JSON.stringify(options.body ?? {});
   }
 
-  const init: RequestInit = { method: options.method ?? "GET", headers };
+  const init: RequestInit = { method, headers };
   if (body !== undefined) init.body = body;
   if (options.signal) init.signal = options.signal;
 

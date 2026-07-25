@@ -1,5 +1,4 @@
-import { useCallback, useEffect, useId, useRef, useState } from "react";
-import type { KeyboardEvent as ReactKeyboardEvent } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { Link } from "react-router-dom";
 import { renditionUrl } from "../../api/client";
@@ -21,6 +20,25 @@ import { formatBytes, isImageMime } from "./formatting";
  * Renditions are generated lazily on first request, so the first open of an
  * asset can take seconds while Pillow works. That is a loading state, not a
  * hang, and it is shown as one.
+ *
+ * ## Keyboard behaviour follows `views/review/Modal.tsx`
+ *
+ * That component is the reference for what a dialog in this app does, and three
+ * of its decisions are load-bearing here for reasons the lightbox makes worse
+ * rather than better:
+ *
+ * - **Escape is bound on `document`, not on the dialog element.** A React
+ *   `onKeyDown` only fires while focus is inside the subtree, so the moment
+ *   anything drops focus out of it the dialog becomes unclosable by keyboard.
+ *   This one has an everyday way to do exactly that: the step buttons are
+ *   `disabled` at the ends of the list, so arrowing to the last asset disables
+ *   the button the pointer just used and the browser hands focus to `<body>`.
+ * - **Focus is taken back when it leaves.** Same cause; the trap cannot help,
+ *   because a trap only sees keys that reach it.
+ * - **Focus is restored only to an element still in the document.** Registering
+ *   an upload reloads the grid, so the tile that opened the lightbox is usually
+ *   detached by the time it closes, and focusing a detached node silently drops
+ *   focus to `<body>` — worse than leaving it where it is.
  */
 
 /** Everything inside the dialog that a Tab can land on. */
@@ -64,16 +82,22 @@ export function AssetLightbox({
   const dialogRef = useRef<HTMLDivElement>(null);
   const titleId = useId();
   const asset = assets[index];
+  // `assets` can empty out under an open lightbox — a Refresh landing on a
+  // library whose last asset is gone. The component then renders null, so every
+  // effect below has to be gated on the same condition rather than locking the
+  // page's scroll for a dialog that is not on screen.
+  const open = asset !== undefined;
 
-  // Captured once, before the dialog steals focus, so close can hand it back.
-  const openerRef = useRef<HTMLElement | null>(null);
-  if (openerRef.current === null && typeof document !== "undefined") {
-    openerRef.current = document.activeElement as HTMLElement | null;
-  }
+  /** Where focus was before the dialog took it, so close can hand it back. */
+  const restoreTo = useRef<HTMLElement | null>(null);
 
   useEffect(() => {
-    const dialog = dialogRef.current;
-    dialog?.focus();
+    if (!open) return;
+    // In an effect, not during render: render can run without committing, and
+    // React may run it more than once, either of which captures the wrong
+    // element — usually the dialog itself on the second pass.
+    restoreTo.current = document.activeElement as HTMLElement | null;
+    dialogRef.current?.focus();
 
     // The page behind a modal must not scroll under it.
     const previousOverflow = document.body.style.overflow;
@@ -81,12 +105,16 @@ export function AssetLightbox({
 
     return () => {
       document.body.style.overflow = previousOverflow;
-      openerRef.current?.focus?.();
+      // Only if it still exists: focusing a detached node drops focus onto
+      // `<body>`, which is worse than leaving it for the view to place.
+      if (restoreTo.current?.isConnected) restoreTo.current.focus();
     };
-  }, []);
+  }, [open]);
 
-  const handleKeyDown = useCallback(
-    (event: ReactKeyboardEvent<HTMLDivElement>) => {
+  useEffect(() => {
+    if (!open) return;
+
+    const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
         event.stopPropagation();
         onClose();
@@ -111,6 +139,7 @@ export function AssetLightbox({
       const focusable = [...dialog.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)].filter(
         (element) => element.offsetParent !== null || element === document.activeElement,
       );
+      const active = document.activeElement;
       if (focusable.length === 0) {
         event.preventDefault();
         dialog.focus();
@@ -118,7 +147,13 @@ export function AssetLightbox({
       }
       const first = focusable[0] as HTMLElement;
       const last = focusable[focusable.length - 1] as HTMLElement;
-      const active = document.activeElement;
+      // Focus already outside the portal — a disabled step button, or a stray
+      // click on the page behind. Tab is the moment to pull it back in.
+      if (active === null || !dialog.contains(active)) {
+        event.preventDefault();
+        (event.shiftKey ? last : first).focus();
+        return;
+      }
       if (event.shiftKey && (active === first || active === dialog)) {
         event.preventDefault();
         last.focus();
@@ -126,9 +161,20 @@ export function AssetLightbox({
         event.preventDefault();
         first.focus();
       }
-    },
-    [onClose, onNavigate],
-  );
+    };
+
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, [open, onClose, onNavigate]);
+
+  useEffect(() => {
+    if (!open) return;
+    // Stepping to either end disables the button that was just activated, and
+    // the browser answers by focusing `<body>`. `aria-modal="true"` promises
+    // that cannot happen, so the dialog takes focus back.
+    const dialog = dialogRef.current;
+    if (dialog && !dialog.contains(document.activeElement)) dialog.focus();
+  }, [open, index]);
 
   if (!asset) return null;
 
@@ -148,7 +194,6 @@ export function AssetLightbox({
         aria-modal="true"
         aria-labelledby={titleId}
         tabIndex={-1}
-        onKeyDown={handleKeyDown}
       >
         <header className="nd-lightbox__header">
           <div className="nd-lightbox__heading">

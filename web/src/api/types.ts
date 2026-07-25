@@ -252,10 +252,11 @@ export interface BatchTransitionOut {
  * `nodes` always includes the root (first); `edges` are the active edges the
  * walk followed (empty at depth 0).
  *
- * `truncated` is true when a node cap stopped the walk before it ran out of
- * graph — say "showing 200 of more" rather than presenting a partial subgraph
- * as the whole neighbourhood. Only the capped read sets it; the uncapped walks
- * always report false.
+ * `truncated` is true when a cap — on nodes **or** on edges — stopped the walk
+ * before it ran out of graph. A filter removing nodes is not truncation.
+ * Say "showing 200 of more" rather than presenting a partial subgraph as the
+ * whole neighbourhood. Only the capped read sets it; the uncapped walks always
+ * report false.
  */
 export interface SubgraphOut {
   root: string;

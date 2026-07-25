@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { uploadAsset } from "../../api/client";
 import { Spinner } from "../../components";
 import { describeFailure } from "../../lib";
@@ -73,7 +73,28 @@ export function useAssetUploads({ isKnownHash, onRegistered }: UseAssetUploadsOp
   const [busy, setBusy] = useState(false);
   const nextId = useRef(1);
 
+  /**
+   * Aborted when the view goes away.
+   *
+   * A batch is a sequence of awaits with a state write after every one, so
+   * leaving the view halfway through would otherwise keep writing into a queue
+   * readout nobody can see and keep the single SQLite writer occupied for it.
+   * Stopping is safe to undo: registration is idempotent sha256 dedup, so
+   * re-dropping the same files re-runs the batch without duplicating anything.
+   *
+   * Assigned inside the effect, not lazily in render, so a StrictMode remount
+   * does not inherit the controller its own cleanup just aborted.
+   */
+  const lifetime = useRef<AbortController | null>(null);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    lifetime.current = controller;
+    return () => controller.abort();
+  }, []);
+
   const update = useCallback((id: number, patch: Partial<UploadItem>) => {
+    if (lifetime.current?.signal.aborted) return;
     setItems((current) => current.map((item) => (item.id === id ? { ...item, ...patch } : item)));
   }, []);
 
@@ -95,11 +116,13 @@ export function useAssetUploads({ isKnownHash, onRegistered }: UseAssetUploadsOp
       const registeredHere = new Set<string>();
 
       for (const [position, file] of files.entries()) {
+        const signal = lifetime.current?.signal;
+        if (signal?.aborted) return;
         const item = queued[position];
         if (!item) continue;
         update(item.id, { status: "uploading" });
         try {
-          const asset = await uploadAsset(file);
+          const asset = await uploadAsset(file, signal);
           const duplicate = isKnownHash(asset.hash) || registeredHere.has(asset.hash);
           registeredHere.add(asset.hash);
           update(item.id, {
@@ -107,10 +130,12 @@ export function useAssetUploads({ isKnownHash, onRegistered }: UseAssetUploadsOp
             detail: asset.hash,
           });
         } catch (error) {
+          if (signal?.aborted) return;
           update(item.id, { status: "failed", detail: describeFailure(error, "this upload").body });
         }
       }
 
+      if (lifetime.current?.signal.aborted) return;
       setBusy(false);
       onRegistered();
     },

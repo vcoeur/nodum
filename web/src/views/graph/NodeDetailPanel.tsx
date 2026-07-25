@@ -11,6 +11,7 @@
 import { Link } from "react-router-dom";
 import { NodeBadge } from "../../components";
 import type { NodeOut } from "../../api/types";
+import { formatAbsolute, formatTimestampLong } from "../../lib";
 import type { IncidentEdge } from "./graphElements";
 
 interface NodeDetailPanelProps {
@@ -92,10 +93,17 @@ export function NodeDetailPanel({
         <dd className="nd-mono">{node.id}</dd>
         <dt>created by</dt>
         <dd className="nd-mono">{node.created_by}</dd>
+        {/* Through `lib/time.ts`, like every other timestamp: the server sends
+            SQLite's zone-less UTC, which a raw render leaves the reader to
+            misread as their own clock. */}
         <dt>created</dt>
-        <dd className="nd-mono">{node.created_at}</dd>
+        <dd className="nd-mono" title={formatTimestampLong(node.created_at)}>
+          {formatAbsolute(node.created_at)}
+        </dd>
         <dt>updated</dt>
-        <dd className="nd-mono">{node.updated_at}</dd>
+        <dd className="nd-mono" title={formatTimestampLong(node.updated_at)}>
+          {formatAbsolute(node.updated_at)}
+        </dd>
         {node.parent_id ? (
           <>
             <dt>parent</dt>

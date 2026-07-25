@@ -120,21 +120,32 @@ export function useReviewQueue(paused: boolean): ReviewQueue {
 }
 
 /**
- * Classify a caught value for the banners the review view shows.
+ * Which banner the review view shows for a caught failure.
+ *
+ * Named for the view, not `FailureKind`: the shared classifier in
+ * `src/lib/failure.ts` owns that name, and it means something different — the
+ * *kind of failure*, which every view reads the same way. This is a choice of
+ * panel, and each view makes its own.
  *
  * A 403 should be impossible — the HTTP surface forces `actor="human"` on every
  * review call, so the human tier can never refuse it — which is exactly why it
- * gets its own loud case rather than becoming a generic red toast. The
- * unreachable/refused split is the shared one (`src/lib/failure.ts`), so the dev
- * proxy's 502 reads as "nothing was listening" here too.
+ * gets its own loud case rather than becoming a generic red toast.
+ *
+ * A 503 is the opposite: entirely expected. SQLite has one writer, an accept of
+ * a whole run is a long write, and the review view is the surface most likely to
+ * be sitting behind one. It is retryable, and saying so is the whole difference
+ * between "wait a second" and "something is broken" — so it keeps its own case
+ * here rather than collapsing into `api`, the way the graph view already reads
+ * it (`views/graph/errors.ts`).
  */
-export type FailureKind = "forbidden" | "unreachable" | "api";
+export type ReviewFailureKind = "forbidden" | "unreachable" | "busy" | "api";
 
 /** Which banner a failure deserves. */
-export function classifyFailure(error: unknown): FailureKind {
+export function classifyFailure(error: unknown): ReviewFailureKind {
   const kind = describeFailure(error).kind;
   if (kind === "forbidden") return "forbidden";
   if (kind === "unreachable") return "unreachable";
+  if (kind === "busy") return "busy";
   return "api";
 }
 

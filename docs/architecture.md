@@ -55,13 +55,13 @@ flowchart LR
 | `nodum.projectors` | Derived-index consumers of the event log. The `Projector` base class (`reset`/`apply`/`count`/`availability`), the `REGISTRY`, per-projector checkpoints (`projector_checkpoints.last_event_seq`), incremental `run_projectors`, `rebuild_projector` (reset + replay from event 0), and `projector_status` (with availability + reason). The `fts` projector maintains `node_fts`; the `vec` projector maintains `chunks` + `node_vec` — re-chunking and re-embedding nodes from event payloads, recording `model_id` per chunk. Deterministic and LLM-free; the service layer never calls in — the event log is the only coupling. An unavailable projector (`vec` without a provider) no-ops and keeps its backlog. |
 | `nodum.embeddings` | The embedding provider seam (design D10) + chunking (design D6). Provider interface: `model_id`, `dimensions`, `embed(texts)`. The default `FastembedProvider` runs `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` (384-dim, multilingual) in-process via ONNX — behind the optional `embeddings` extra, resolved from the local HF cache only (downloads need `NODUM_EMBED_DOWNLOAD=1`; model override via `NODUM_EMBED_MODEL`). Chunking is a fixed 512-word window with ~15% overlap (words approximate tokens — dependency-free). `set_provider`/`reset_provider` are the test seam (a deterministic hashing fake lives in `tests/conftest.py`). |
 | `nodum.search` | The query path (design §7). `search()` catches the `fts` and `vec` projectors up with the log, runs BM25 (title boosted 5×) and — when a provider is available — a sqlite-vec KNN over chunk embeddings (closest chunk per node wins), fuses both lists by reciprocal rank fusion (K=60), then optionally expands the fused hits one hop along `active` edges (type weight × confidence). Hits carry the fused `score` plus a per-signal `signals` breakdown (`bm25`/`vector` RRF contributions summing to `score`, `graph` edge weight). Without a provider the vector signal is skipped — graceful degradation to BM25 + graph. |
-| `nodum.assets` | Content-addressed binaries + derived image renditions (design §5.5/§5.7). `register_asset` streams a local file into `asset_blobs` through `Connection.blobopen` (hash pass, then a chunked copy into a `zeroblob` — a large file is never held in memory) and inserts the `assets` metadata row in the same transaction, so a failed copy rolls back whole — idempotent sha256 dedup, deliberately no event-log entry (nothing to undo; ingestion-time asset events are Phase 4). The copy pass re-hashes what it writes and refuses a mismatch (`AssetSourceChanged`): a source that shrank between the passes would otherwise commit with a zero-filled tail under a key its bytes do not match. A file over `SQLITE_LIMIT_LENGTH` (1 GB, read from the connection) is refused up front (`AssetTooLarge`) rather than as a bare `DataError: string or blob too big`. `get_rendition` lazily generates `thumb`/`preview` WebP images with Pillow (downscale-only, EXIF-transposed, 300 KB quality-stepping target on `preview`), stores them in `renditions` keyed by `sha256(asset_hash + ':' + profile)`, and serves cache hits from the stored row thereafter — the rendition's `data` column is read **only** when the caller asks for the bytes, which the MCP `get_asset` path always does (`include_data=True`) and the CLI does only for `asset rendition --out`; `purge_renditions` deletes the rows (all regenerable). Pillow reads originals through `_BlobReader`, a file-like adapter that restores the tolerant out-of-range seeks `sqlite3.Blob` refuses and Pillow's format probing depends on. Non-image assets and unknown profiles are rejected cleanly; `page:<n>` rasters are Phase 4. |
+| `nodum.assets` | Content-addressed binaries + derived image renditions (design §5.5/§5.7). `register_asset` streams a local file into `asset_blobs` through `Connection.blobopen` (hash pass, then a chunked copy into a `zeroblob` — a large file is never held in memory) and inserts the `assets` metadata row in the same transaction, so a failed copy rolls back whole — idempotent sha256 dedup, deliberately no event-log entry (nothing to undo; ingestion-time asset events are Phase 4). The copy pass re-hashes what it writes and refuses a mismatch (`AssetSourceChanged`): a source that shrank between the passes would otherwise commit with a zero-filled tail under a key its bytes do not match. A file over `SQLITE_LIMIT_LENGTH` (1 GB, read from the connection) is refused up front (`AssetTooLarge`) rather than as a bare `DataError: string or blob too big`. `get_rendition` lazily generates `thumb`/`preview` WebP images with Pillow (downscale-only, EXIF-transposed, 300 KB quality-stepping target on `preview`), stores them in `renditions` keyed by `sha256(asset_hash + ':' + profile)`, and serves cache hits from the stored row thereafter — the rendition's `data` column is read **only** when the caller asks for the bytes, which the MCP `get_asset` path always does (`include_data=True`) and the CLI does only for `asset rendition --out`; `purge_renditions` deletes the rows (all regenerable). Pillow reads originals through `_BlobReader`, a file-like adapter that restores the tolerant out-of-range seeks `sqlite3.Blob` refuses and Pillow's format probing depends on. Non-image assets and unknown profiles are rejected cleanly; `page:<n>` rasters are Phase 4. Two helpers exist for callers that take bytes from a stranger rather than a local file the operator chose: `sniff_image_mime` identifies a format from its magic bytes (registration records what `mimetypes.guess_type` derives from the *name*, which is fine for the CLI and useless over HTTP), and `check_image_pixel_budget` reads dimensions from the image header and refuses anything over `MAX_IMAGE_PIXELS` (40 MP) as `ImageTooLarge` — the same ceiling `_prepare_image` applies before decoding a stored original, since Pillow's own bomb detection *warns* between 1× and 2× its threshold and decodes anyway. |
 | `nodum.mcp_server` | The MCP adapter: a FastMCP (official Python SDK) server over stdio, launched by `nodum mcp serve`. This is the **external-agent** surface, so it registers the additive half of the tool contract and nothing else: the design §8.1 read tier (`get_node`, `get_children`, `search`, `traverse`, `list_types`, `get_schema`, `find_path`, `history`, `diff`, `get_asset`) and additive tier (`create_node`, `update_node`, `link`, `propose_edges`) — every tool a thin delegate to one service/search/assets function, annotated `readOnlyHint` for reads and non-destructive for additive writes (honest, because nothing registered here archives or overwrites state). `get_asset` enforces the §5.7 binary policy structurally: metadata + a `preview`/`thumb` WebP image block, originals never served. The review tools (`accept`/`reject`, §8.1 "write (human/policy)") and the curative tools (§8.2) are **never registered**. One configured `--actor` per server attributes every write, and it must match `agent:<name>` — `--actor human`, an empty actor, or an unprefixed name is refused at startup. |
 | `nodum.models` | The pydantic I/O schema shared by every surface (`NodeOut`, `EdgeOut`, `VersionOut`, `EventOut`, `TypeOut`/`EdgeTypeOut`/`TypesOut`, `UndoResult`, `InitResult`, `ProjectorStatus`/`ProjectorRun`, `SearchHit`/`SearchResult`, `PolicyOut`, `ProposalOut`, `BatchTransitionOut`/`TransitionFailure`, `SubgraphOut`, `PathOut`, `DiffOut`, `ProposeEdgesOut`/`ItemFailure`, `AssetOut`, `RenditionOut`, `PurgeResult`). Every adapter serialises `model_dump(mode="json")`. |
-| `nodum.cli` | Typer adapter. Each command calls one service function and prints exactly one JSON object on stdout — a list-returning command always as `{"<plural>": [...], "count": n}`; errors go to stderr with exit code 1 — including the ones that are not service errors at all: `OSError` (a missing file for `asset register`) and `sqlite3.Error` (chiefly "database is locked", SQLite having one writer) are mapped to a message rather than escaping as a traceback. No `--json` flag — JSON is the only format. Adds `search`, `traverse`, `subgraph`, `suggest-links`, `find-path`, `diff`, `schema`, `edge create-batch`, the `projector run/status/rebuild` group, the `policy set/get/list` group, the `review queue/accept/reject/accept-all/reject-all` group, the `asset register/get/list/rendition/purge` group, `mcp serve`, and `serve` (the HTTP server, port 8420). |
-| `nodum.http_api` | The HTTP adapter (design §9): a Starlette app (`create_app`) serving the JSON API under `/api` plus the built web UI at `/`, launched by `nodum serve`. This is the **human** surface and the exact inverse of the MCP server: every write is attributed to `HTTP_ACTOR` (`human`) and **no request field, header, or query parameter can set an actor** — the module binds `actor` in exactly one expression, inside `_write`, and route handlers never name the concept, so absence is structural rather than a filter each new endpoint must remember. The service's human tier still applies underneath; nothing is re-implemented here. One `EXCEPTION_STATUS` table (the exact classes `cli._run` catches, plus `sqlite3.OperationalError` → 503) becomes Starlette exception handlers returning `{"error": {"type", "message"}}` with the CLI's own one-line message; anything unmapped is a generic 500 whose traceback goes to the server log, never the body. Auth is loopback-by-default with an optional static bearer token gating `/api` only (`/healthz` and the UI stay open); no CORS, because the UI is same-origin. Static hosting serves `nodum/_web/` with unknown non-API paths falling through to its `index.html` (client-side routing) and to the tracked `nodum/_web_placeholder.html` when no bundle is built; `/favicon.ico` is routed ahead of that catch-all and answers with the bundle's icon or a 204, never an HTML document. |
+| `nodum.cli` | Typer adapter. Each command calls one service function and prints exactly one JSON object on stdout — a list-returning command always as `{"<plural>": [...], "count": n}`; errors go to stderr with exit code 1 — including the ones that are not service errors at all: `OSError` (a missing file for `asset register`) and `sqlite3.Error` (chiefly "database is locked", SQLite having one writer) are mapped to a message rather than escaping as a traceback. No `--json` flag — JSON is the only format. Adds `search`, `traverse`, `subgraph`, `suggest-links`, `find-path`, `diff`, `schema`, `edge create-batch`, the `projector run/status/rebuild` group, the `policy set/get/list` group, the `review queue/accept/reject/accept-all/reject-all` group, the `asset register/get/list/rendition/purge` group, `mcp serve`, and `serve` (the HTTP server, port 8420 — which refuses a non-loopback bind without `--token`, prints the database path plus a `#token=…` UI URL on stderr, and converts uvicorn's own startup failure into the contract's exit 1 rather than letting uvicorn's exit 3 escape). |
+| `nodum.http_api` | The HTTP adapter (design §9): a Starlette app (`create_app`) serving the JSON API under `/api` plus the built web UI at `/`, launched by `nodum serve`. This is the **human** surface and the exact inverse of the MCP server: every write is attributed to `HTTP_ACTOR` (`human`) and **no request field, header, or query parameter can set an actor** — the module binds `actor` in exactly one expression, inside `_write`, and route handlers never name the concept, so absence is structural rather than a filter each new endpoint must remember. The service's human tier still applies underneath; nothing is re-implemented here. One `EXCEPTION_STATUS` table (every class `cli._run` catches — `sqlite3.Error` and `OSError` by base class — plus `sqlite3.OperationalError` → 503, `OverflowError` → 400, `PayloadTooLarge` → 413, `ClientDisconnect` → 499) becomes Starlette exception handlers returning `{"error": {"type", "message"}}` with the CLI's own one-line message; anything unmapped is a generic 500 whose traceback goes to the server log, never the body. `RequestGuardMiddleware` is the origin control: `Host` validated against the names the server answers to (DNS rebinding), a same-origin proof required on every state-changing request (`Sec-Fetch-Site`, `Origin`, or the explicit `X-Nodum-Client` header for a non-browser client), `Content-Type: application/json` required on every JSON write so that no CORS-simple request can reach one, and a request-body cap enforced in the wrapped `receive` before anything buffers. Auth is loopback-by-default with an optional static bearer token gating `/api` only (`/healthz` and the UI stay open, and `/healthz` reports liveness alone); no CORS, because the UI is same-origin — and origin control keeps *browsers* out, while only `--token` keeps other local *processes* out. Static hosting serves `nodum/_web/` with unknown non-API paths falling through to its `index.html` (client-side routing) and to the tracked `nodum/_web_placeholder.html` when no bundle is built; `/favicon.ico` is routed ahead of that catch-all and answers with the bundle's icon or a 204, never an HTML document. |
 | `nodum.envelope` | The JSON envelope both the CLI and the HTTP API emit: `envelope()` (one `model_dump(mode="json")`), `list_envelope()` (the `{"<plural>": [...], "count": n}` convention), `render_json()` (indented, `ensure_ascii=False`). Extracted so the two surfaces cannot drift — `GET /api/nodes/{id}` and `nodum node get <id>` are byte-identical, and a test asserts exactly that. |
-| `web/` (built into `nodum/_web/`) | The human web UI (design §9): React 19 + TypeScript, Vite, no CSS framework, no runtime network dependency. Seven routes over six views — editor (`/editor`, `/editor/:nodeId`), search (`/search`), review (`/review`), graph (`/graph`, `/graph/:rootId`), assets (`/assets`), history (`/history/:nodeId`) — each lazily loaded, so CodeMirror, Mermaid, and Cytoscape stay out of the initial bundle. `src/api/client.ts` is the only `fetch` in the app and has **no actor parameter anywhere**, mirroring the server's structural rule in the client. `src/lib/` holds the two things every view must get identically right: `time.ts` (SQLite's zone-less UTC timestamps, which a bare `new Date()` reads as local) and `failure.ts` (the API-refused versus nothing-listening split, including the dev proxy's 502). Views never import each other — they link by URL, and `src/router.tsx` is where those paths are defined. Two gates, both in CI: `tsc --noEmit` over the tree, and Vitest (`make web-test`) over the pure modules — a unit harness with no DOM environment, pinned to a non-UTC `TZ` so the timestamp bug stays visible. Conventions: [`web/README.md`](../web/README.md). |
+| `web/` (built into `nodum/_web/`) | The human web UI (design §9): React 19 + TypeScript, Vite, no CSS framework, no runtime network dependency. Seven routes over six views — editor (`/editor`, `/editor/:nodeId`), search (`/search`), review (`/review`), graph (`/graph`, `/graph/:rootId`), assets (`/assets`), history (`/history/:nodeId`) — each lazily loaded, so CodeMirror, Mermaid, and Cytoscape stay out of the initial bundle. `src/api/client.ts` is the only `fetch` in the app and has **no actor parameter anywhere**, mirroring the server's structural rule in the client; it also adopts the optional bearer token from the `#token=…` fragment `nodum serve --token` prints (a fragment, so it never reaches the wire, a log, or a `Referer`) into `sessionStorage`, and sends `Content-Type: application/json` on every non-GET request because the server requires it. `src/lib/` holds the two things every view must get identically right: `time.ts` (SQLite's zone-less UTC timestamps, which a bare `new Date()` reads as local) and `failure.ts` (the API-refused versus nothing-listening split, including the dev proxy's 502). Views never import each other — they link by URL, and `src/router.tsx` is where those paths are defined. Two gates, both in CI: `tsc --noEmit` over the tree, and Vitest (`make web-test`) over the pure modules — a unit harness with no DOM environment, pinned to a non-UTC `TZ` so the timestamp bug stays visible. Conventions: [`web/README.md`](../web/README.md). |
 
 ## Design-doc mapping
 
@@ -372,27 +372,49 @@ sections to the code:
   because `traverse` filters by edge type alone and has no ceiling — fine for
   a CLI, wrong for a client that renders whatever it is handed. Its filters
   (edge type, edge state, confidence floor, edge author, node type) compose as
-  one SQL conjunction, and its `limit` is checked as each new node is about to
-  be admitted, so the breadth-first walk simply stops growing at the cap: the
-  graph beyond it is never read, let alone materialized and sliced. `limit`
-  is rejected below 1 rather than passed to SQL, where `LIMIT -1` means
+  one SQL conjunction, and its `limit` is checked **before the far side of an
+  edge is read**, so the walk both stops growing at the cap and stops *paying*
+  at it — the graph beyond the cap is never read, let alone materialized and
+  sliced. The node cap alone is not enough: it bounds nodes, and one pair of
+  nodes can carry any number of edges, so the edge list has a second cap at
+  `limit * SUBGRAPH_EDGE_FACTOR` and `limit` itself has a server ceiling
+  (`MAX_SUBGRAPH_LIMIT`) that the HTTP layer's pass-through cannot exceed.
+  `truncated` reports whichever cap bit, conservatively — a walk that stopped
+  early says "partial" rather than checking whether it would have found more.
+  `limit` is rejected below 1 rather than passed to SQL, where `LIMIT -1` means
   *unbounded* — the exact hole the cap exists to close. An edge whose far node
   the node-type filter or the cap excludes is dropped with it, so the result
   never carries an edge pointing outside its own node list; the root is exempt
   from the node-type filter, being what was asked for rather than something
-  the walk found. `SubgraphOut.truncated` reports the cap honestly and
+  the walk found. `SubgraphOut.truncated` reports whichever cap bit and
   defaults to false, so the uncapped walks sharing the model are unchanged. A
   `min_confidence` floor drops edges with no stated confidence, the same
   reading `_auto_accept_rule` takes: unstated is not "meets the bar".
+
+  **The result is closed over its own node set.** A breadth-first walk only
+  ever selects edges incident to its frontier, so at the outermost ring two
+  returned nodes can be connected by an edge the walk never touched — the B–C
+  edge of a triangle read at depth 1. `traverse` lives with that; `subgraph`
+  does not, because a renderer showing two nodes with no line between them is
+  asserting something false. One extra query, bounded by the node cap that
+  already exists and costing no node reads, adds the edges whose endpoints
+  were both admitted.
 - **Autocomplete must not depend on a projector.** `service.suggest_links`
   matches a title prefix against the `nodes` table itself, never `node_fts`,
   so an editor's `[[` popup works on a database whose projectors have never
   run — an empty list means "no such title", not "the index is cold". Case is
   folded in Python (`str.casefold`) rather than by SQL `LIKE`/`lower()`, which
-  fold ASCII only while the graph's titles are multilingual; only the `limit`
-  survivors are then read in full, so titles are scanned but content is not.
-  Archived nodes are excluded — a retired node is not a link target — while
-  `proposed` ones are kept, matching how every other node read treats state.
+  fold ASCII only while the graph's titles are multilingual (`STRASSE` matches
+  `Straße`). Folding is not enough on its own: both sides are NFC-normalised
+  around the fold (UAX #15's caseless match), because the same title arrives
+  NFD from macOS paths and some input methods and NFC from a browser, and
+  comparing code points loses the match entirely. Note that `_resolve_wikilink`
+  still matches titles by exact SQL comparison and therefore does **not** share
+  this tolerance — a hand-typed NFC `[[…]]` against an NFD-stored title does
+  not resolve. Only the `limit` survivors are then read in full, so titles are
+  scanned but content is not. Archived nodes are excluded — a retired node is
+  not a link target — while `proposed` ones are kept, matching how every other
+  node read treats state.
 - **The HTTP surface is the human's, and says so structurally.** `nodum serve`
   is the inverse of `mcp serve`: the MCP adapter validates its configured
   actor into `agent:<name>` and refuses `human`, while `nodum.http_api` never
@@ -402,11 +424,35 @@ sections to the code:
   expression (`_write`, to the module constant `HTTP_ACTOR`), handlers name
   the fields they forward one by one rather than splatting request data, and
   `_write` refuses a caller-supplied actor outright, so a future `**body`
-  forward would raise rather than write as an agent. Three structural tests
-  hold the line: no route handler in the live route table may mention an actor
-  at all, the module's AST may contain exactly one `actor=` binding, and no
-  actor-taking service function may be called outside `_write` — each one
-  covering endpoints that do not exist yet.
+  forward would raise rather than write as an agent.
+- **A structural claim needs a test that can falsify it.** The first cut said
+  the boundary held because three AST/source properties enforced it: no route
+  handler may mention an actor, exactly one `actor=` binding may exist, and no
+  actor-taking service function may be called outside `_write`. All three were
+  evadable, and a reviewer landed a handler that passed every one of them while
+  writing `created_by: "agent:evil"` —
+
+  ```python
+  from nodum.service import create_node as _service_create_node
+  async def quick_create(request):
+      body = await _json_body(request)
+      return EnvelopeResponse(envelope(_service_create_node(**body, path=db_path)))
+  ```
+
+  — because the handler never spells "actor" (the source scan looks for the
+  literal), a `**` unpack is an `ast.keyword` with `arg=None` (the binding count
+  looks for `arg == "actor"`), and an aliased bare-name import is not an
+  `ast.Attribute` on the name `service` (the direct-call scan looks for exactly
+  that). The load-bearing test is now a **runtime sweep** over the live route
+  table: every state-changing method of every route is driven with
+  actor-carrying bodies, query strings and headers, and the assertion is made
+  against the database — nothing written during the sweep may name anything but
+  `human`. It knows no endpoint, no helper and no mechanism, so it covers a
+  rogue handler however that handler reaches the service. The AST properties
+  remain as a belt, each widened to the spelling that evaded it: the import ban
+  (which catches every alias, since an alias renames only the local name), a
+  ban on `getattr` over an adapter module, and an allowlist of the `**` unpack
+  sources a call may use.
 - **An adapter may not invent a field the domain cannot express.** The first
   cut of `PUT /api/policies/{agent}` accepted `{rules, enabled}`, mapping
   `enabled: false` onto the service's "an empty ruleset disables the policy".
@@ -427,14 +473,69 @@ sections to the code:
   rather than after re-parsing both sides. The alternative (two independently
   correct serialisers) drifts the first time one of them is touched.
 - **Errors are the CLI's, translated to status codes.** `EXCEPTION_STATUS`
-  maps the exact exception classes `cli._run` catches, so a failure reads the
-  same on both surfaces: not-found ids are 404, bad values and impossible
-  transitions 400, `ReviewNotPermitted` 403, `UndoNotPossible` 409, and
+  maps every exception class `cli._run` catches, so a failure reads the same on
+  both surfaces: not-found ids are 404, bad values and impossible transitions
+  400, `ReviewNotPermitted` 403, `UndoNotPossible` 409, and
   `sqlite3.OperationalError` — "database is locked", which a large asset
   registration really can cause, since it holds SQLite's single writer for the
-  whole streamed copy — a **retryable 503** rather than a server error. The
-  test is parametrised over the table itself, so a new mapping is covered the
-  moment it is added.
+  whole streamed copy — a **retryable 503** rather than a server error.
+  The table's `sqlite3.Error` and `OSError` rows are **base** classes: the first
+  cut listed `sqlite3.OperationalError` alone while claiming to hold "exactly
+  the ones `cli._run` catches", so a `--db` pointing at a non-SQLite file was a
+  generic 500 where the CLI prints `database error: file is not a database`,
+  and `IntegrityError`, `ProgrammingError`, `DataError` and every `OSError` were
+  the same. `OSError`'s message is the one deliberate divergence — the CLI
+  appends the filename, this surface must not, because over a socket that path
+  is a stranger's. `OverflowError` → 400 (a caller's `?limit=` bignum, which
+  reached the sqlite3 driver as a 500 before `_int_param` bounded it),
+  `PayloadTooLarge` → 413 and `ClientDisconnect` → 499 complete it.
+  The table-driven test that used to cover this was tautological: parametrised
+  over `EXCEPTION_STATUS` itself with a monkeypatched read endpoint, it could
+  only confirm that what was in the table was in the table, and all four 500s
+  above were invisible to it. It is replaced by provocations through real
+  endpoints plus one test that reads `cli._run`'s own `except` clauses and
+  asserts each class is mapped — so the claim is checked rather than restated.
+- **Loopback is not an origin boundary.** `nodum serve` binds `127.0.0.1` with
+  no token, and every page the user visits can reach `127.0.0.1`: a form with
+  `enctype="text/plain"` posting to `/api/review/accept` is a CORS-*simple*
+  request, so there is no preflight, and the absence of CORS response headers
+  stops the attacker *reading the reply* — not the write landing. That is worse
+  than an unauthorized write, because the accept is stamped `human` and the
+  event log then says a human reviewed agent output when none did.
+  `RequestGuardMiddleware` answers it in layers rather than with one trick:
+  every JSON route requires `Content-Type: application/json` (not CORS-simple,
+  so a cross-origin page needs a preflight this app never answers — bodyless
+  writes included, which is where it is the only content-type signal there is);
+  every state-changing request must additionally *prove* it is same-origin via
+  `Sec-Fetch-Site`, `Origin`, or an explicit non-browser header, which is what
+  covers `POST /api/assets`, whose multipart content type is simple and cannot
+  be gated the first way; and the `Host` header is validated against the names
+  the server answers to, which is the only check that survives DNS rebinding —
+  after a rebind the attacker's page *is* same-origin by every other measure.
+  Host names are compared without ports, deliberately: the `make web-dev` proxy
+  forwards the browser's own `Host: localhost:5173`, and a port is no part of
+  the rebinding defence. What none of it does is authenticate — any local
+  process satisfies every check with three curl headers — so `nodum serve` says
+  that in its banner and refuses a non-loopback bind without `--token`.
+- **A limit that fires after the bytes are on disk is not a limit.**
+  `POST /api/assets` was bounded only by `assets.AssetTooLarge` at SQLite's 1 GB
+  blob ceiling, checked inside `register_asset` — after Starlette's parser had
+  spooled the whole part to disk and the handler had copied it to a second temp
+  file. A 400 MB upload measured 839 MB of `/tmp` (2.1× amplification) and
+  tripping the real limit needed >2 GB first, which makes it a disk-exhaustion
+  primitive rather than a guard. The cap now lives in the middleware's wrapped
+  `receive`: `Content-Length` is refused up front where a client offers one, and
+  the stream is cut mid-read regardless, because that header is client-supplied.
+  Type is decided by sniffing the bytes, not by `mimetypes.guess_type(name)` —
+  the name is chosen by whoever sent the file, so `.exe` renamed `.png` used to
+  be stored as `image/png`. And size in bytes says nothing about cost to decode:
+  a 612 KB PNG at 14000×14000 raised `DecompressionBombError` as a 500, while a
+  375 KB one at 121 MP sat *below* Pillow's threshold and simply decoded, at
+  +185 MB RSS on the event loop — so `assets.MAX_IMAGE_PIXELS` is checked from
+  the image header, at upload and again before any stored original is rendered.
+  There is deliberately **no delete route**: reclaiming asset bytes is a design
+  decision (event log, undo semantics, rendition eviction) rather than a fix, so
+  the gap is recorded instead of closed.
 - **An unbuilt UI is a page, not a crash.** `nodum/_web/` is gitignored whole
   (Vite's `emptyOutDir` wipes it on every build, so nothing tracked can live
   there) and may be missing entirely in a source checkout. The static handler

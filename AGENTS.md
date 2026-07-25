@@ -76,13 +76,19 @@ node for exactly this reason.
   `diff_versions`, `propose_edges`). Two reads exist for interactive clients
   rather than agents: **`subgraph`** — `traverse` plus edge state/confidence/
   author and node-type filters, all applied in SQL, with a node `limit`
-  enforced *during* the breadth-first walk (never by slicing afterwards) and
-  a `truncated` flag saying whether the cap bit — and **`suggest_links`**, a
-  title-prefix lookup for a `[[` autocomplete that reads `nodes` directly, so
-  it answers on a database whose projectors have never run. Each public
-  function opens its own short-lived connection (applying pending migrations
-  idempotently) and commits. New behaviour and validation go here first;
-  adapters must not add behaviour the service lacks.
+  enforced *during* the breadth-first walk — tested **before** the far side
+  of an edge is read, so a hub costs `limit` node reads and not one per
+  neighbour — a separate edge cap (`limit * SUBGRAPH_EDGE_FACTOR`), since a
+  node cap bounds nodes only and one pair of nodes can carry any number of
+  edges, a server-side ceiling on `limit` itself (`MAX_SUBGRAPH_LIMIT`, 2000 —
+  the value the graph view's slider already clamps to), an edge list **closed
+  over the returned node set** so the outermost ring is joined up rather than
+  drawn with gaps, and a `truncated` flag saying whether **either** cap bit —
+  and **`suggest_links`**, a title-prefix lookup for a `[[` autocomplete that
+  reads `nodes` directly, so it answers on a database whose projectors have
+  never run. Each public function opens its own short-lived connection
+  (applying pending migrations idempotently) and commits. New behaviour and
+  validation go here first; adapters must not add behaviour the service lacks.
 - **`nodum.mcp_server`** — the MCP adapter (stdio, official Python SDK
   FastMCP), the **external-agent** surface. Registers the design §8.1 read +
   additive tiers and nothing else, each tool a thin delegate to a
@@ -105,9 +111,18 @@ node for exactly this reason.
   enforce it over the *live route table* and the module's AST, so a new
   endpoint is covered without being added to a list — if you add an endpoint,
   route its writes through `_write` and never mention an actor in a handler.
-  One `EXCEPTION_STATUS` table (the classes `cli._run` catches, plus
-  `sqlite3.OperationalError` → 503) becomes the error envelope; unmapped
+  One `EXCEPTION_STATUS` table becomes the error envelope. It covers every
+  class `cli._run` catches — the `sqlite3.Error` and `OSError` rows are the
+  **base** classes, so `DatabaseError`/`IntegrityError`/`ProgrammingError`/
+  `DataError` land on a status rather than a generic 500 — plus
+  `sqlite3.OperationalError` → 503, `OverflowError` → 400, `PayloadTooLarge` →
+  413 and `ClientDisconnect` → 499, which only a network surface meets.
+  `test_every_exception_cli_run_catches_is_mapped` reads `cli._run`'s own
+  except clauses and asserts the claim instead of restating it. Unmapped
   exceptions are a generic 500 with no traceback in the body.
+  `RequestGuardMiddleware` is the origin control under all of it (see the
+  HTTP contract below) — binding loopback keeps other machines out, not other
+  *origins*, and a browser reaches `127.0.0.1` from any page.
 - **`nodum.envelope`** — the JSON envelope both the CLI and the HTTP API emit:
   `envelope()`, `list_envelope()` (the `{"<plural>": [...], "count": n}`
   convention), and `render_json()`. Extracted so the surfaces cannot drift;
@@ -118,7 +133,11 @@ node for exactly this reason.
   over six views, each lazily loaded so CodeMirror, Mermaid, and Cytoscape stay
   out of the initial bundle. `src/api/client.ts` is the only `fetch` in the
   app and has **no actor parameter anywhere** — the server's structural rule,
-  mirrored in the client. `src/lib/` holds the cross-view invariants
+  mirrored in the client. It is also where the optional bearer token is
+  adopted, from the `#token=…` fragment `nodum serve --token` prints, into
+  `sessionStorage`; and it sends `Content-Type: application/json` on every
+  non-GET request, bodyless ones included, because the server requires it.
+  `src/lib/` holds the cross-view invariants
   (timestamps, failure classification); `src/components/` holds shared React
   components; a view owns its own directory and links to other views by URL,
   never by import. Full conventions: `web/README.md`.
@@ -273,7 +292,11 @@ Phase-1 decision log.
   `policy set/get/list`, `review queue/accept/reject/accept-all/reject-all`,
   `asset register/get/list/rendition/purge`,
   `mcp serve --actor agent:<name>`,
-  `serve [--host 127.0.0.1] [--port 8420] [--token TOKEN] [--db PATH]`.
+  `serve [--host 127.0.0.1] [--port 8420] [--token TOKEN] [--allow-host NAME]
+  [--db PATH]`. `serve` refuses a non-loopback bind without `--token` (exit 1),
+  prints the database path and the `#token=…` UI URL on stderr, and translates
+  uvicorn's own startup failure (a port already in use) into the contract's
+  exit 1 — it used to escape as uvicorn's exit 3.
 - Reads are not state-filtered by default beyond edge traversal: `node get`,
   `node children`, `node list`, and `history` return `proposed` rows, and
   `search --state any` includes them. Only *traversals* (`node get --depth`,
@@ -283,12 +306,23 @@ Phase-1 decision log.
   for. `suggest-links` follows the node-read rule with one exception:
   `archived` titles are never suggested, since a retired node is not a link
   target.
-- `subgraph` is the bounded read: `--limit` is a hard node cap applied while
-  walking, so no caller can provoke an unbounded result, and `truncated` in
-  the response says whether the cap cut the walk short. A limit below 1 is an
-  error rather than SQL's "unbounded". Every filter composes as one
-  conjunction, and an edge whose far node is filtered out is dropped with it —
-  the result never names an edge endpoint it does not also return.
+- `subgraph` is the bounded read, and it is bounded twice: `--limit` is a hard
+  node cap applied while walking (tested before the far node is read, so the
+  cost is `O(limit)`, not `O(neighbours)`), and the edge list has its own cap
+  at `limit * SUBGRAPH_EDGE_FACTOR` — without it a single pair of nodes with
+  300 edges between them returns 300 edges under a 2-node cap. `--limit` is
+  itself clamped to `MAX_SUBGRAPH_LIMIT` (2000), so a caller passing
+  `--limit 1000000000` gets the ceiling rather than the graph. `truncated` is
+  true when **either** cap bit and is deliberately conservative: it reports a
+  walk that stopped early even if the graph happened to have nothing more to
+  give. A filter removing nodes is **not** truncation — the caller asked for
+  that. A limit below 1 is still an error rather than SQL's "unbounded". Every
+  filter composes as one conjunction, and an edge whose far node is filtered
+  out is dropped with it — the result never names an edge endpoint it does not
+  also return. The edge list is also *closed* over the node list: an edge
+  between two returned nodes comes back even when the walk never traversed it
+  (the B–C edge of a triangle read at depth 1), which the uncapped `traverse`
+  does not do.
 - Asset images reach agents only as renditions: `asset rendition` prints
   rendition metadata alone — the WebP bytes stay in the database and are never
   inlined into the JSON (`--out <file>` is how you extract them); the MCP
@@ -303,7 +337,63 @@ Phase-1 decision log.
   agent identity lives, and the inversion is the whole point.
 - Route handlers are thin delegates: one service/search/assets call each, no
   behaviour the service lacks. Writes go through `_write(service.fn, …)`,
-  which is the only place the actor is bound.
+  which is the only place the actor is bound. **Never import a service function
+  that takes an `actor` into `http_api`** — an alias hides it from every
+  source-level check, and `test_no_write_service_function_is_reachable_under_
+  any_name` fails on the import itself. Never splat request data into a call
+  either: `**` may only unpack a dict an allowlisting helper built, and any new
+  one fails `test_no_call_splats_anything_but_an_allowlisting_helper` until it
+  is reviewed.
+- **The test that actually holds the boundary is the runtime sweep**
+  (`test_no_endpoint_can_attribute_a_write_to_an_agent`): it drives every
+  state-changing method of every route in `app.routes` with actor-carrying
+  bodies, query strings and headers, then asserts nothing written during the
+  sweep names anything but `human`. The AST properties beside it are a belt —
+  all of them were evadable by a handler that forwarded a body it never
+  inspected, which is how a rogue endpoint once produced
+  `created_by: "agent:evil"` on a fully green suite.
+- **A state-changing request must prove it is same-origin**
+  (`RequestGuardMiddleware`), because `nodum serve` binds loopback with no token
+  and loopback is reachable from every page the user visits. The rule:
+  `Sec-Fetch-Site` in `{same-origin, none}`, **or** an `Origin` whose host is
+  allowed, **or** the `X-Nodum-Client` header — which is how a non-browser
+  client declares itself, since a browser always sends one of the first two and
+  cannot be scripted out of either. A cross-site `Sec-Fetch-Site` or a
+  mismatched `Origin` is refused outright. Reads are unencumbered.
+- **Every JSON route requires `Content-Type: application/json`, bodyless ones
+  included.** That is not pedantry: `application/json` is not a CORS-simple
+  content type, so a cross-origin page cannot send it without a preflight, and
+  this app answers none. `POST /api/assets` is the one exception — multipart
+  *is* simple — so it rests entirely on the same-origin proof above. A new
+  upload route goes in `MULTIPART_ROUTES` or it inherits the JSON rule.
+- **The `Host` header is validated** against `resolve_allowed_hosts(host,
+  --allow-host)`. This is the DNS-rebinding defence and the only check that
+  protects *reads*: after a rebind the attacker's page is same-origin by every
+  other measure. Host names are compared without ports, which is what keeps the
+  `make web-dev` proxy (`Host: localhost:5173`) working.
+- **`--token` is the only defence against a local process.** Any process on the
+  machine can satisfy every origin check with three curl headers — including an
+  MCP server launched with `--actor agent:x`, which would thereby regain over
+  HTTP the `accept` the MCP tool list structurally withholds. `nodum serve`
+  says so in its startup banner when no token is set, and refuses a non-loopback
+  bind without one. The UI receives the token from the `#token=…` fragment the
+  banner prints (`web/src/api/client.ts`, `adoptToken`) — a fragment because it
+  never reaches the wire, a log, or a `Referer`.
+- **A wrong verb on a real route is a 405 with an `Allow` header**, not the
+  catch-all's 404. The catch-all claims every method so a `fetch` never gets
+  HTML, which also means it out-matches a real route's 405 unless it asks the
+  real routes what they would have matched — which `api_not_found` does.
+- **`/healthz` reports liveness only.** It sits outside auth, so anything it
+  says is said to everyone; it used to say the absolute database path.
+- **`POST /api/assets` is bounded before it buffers**: `MAX_REQUEST_BYTES` is
+  checked against `Content-Length` and then enforced mid-stream (the header is
+  client-supplied and cannot be the only guard), the type is sniffed from the
+  bytes against `UPLOAD_MIME_ALLOWLIST` rather than read off the filename, and
+  `assets.MAX_IMAGE_PIXELS` refuses a decompression bomb from the image header.
+  The allowlist is deliberately narrower than what `assets.register_asset` will
+  store: the CLI registers a local file the operator owns, this one takes a
+  file from a stranger. **There is no delete route**, so anything that does land
+  is only reclaimable out of band — a known gap, not an oversight.
 - **Do not invent request fields the domain has no representation for.**
   `PUT /api/policies/{agent}` takes `{"rules": [...]}` and nothing else: a
   policy is disabled by storing an empty ruleset, which is the service's only
@@ -318,8 +408,8 @@ Phase-1 decision log.
   new mapping there rather than catching in a handler. Anything unmapped is a
   500 with a generic body — never leak a traceback to a client.
 - Repeatable filters (`edge_type`, `edge_state`, `node_type`) are repeated
-  query keys; `/healthz` sits outside `/api` and outside auth; unknown `/api`
-  paths are JSON 404s while unknown non-API paths fall through to the SPA
+  query keys; `/healthz` sits outside `/api` and outside auth; an unknown `/api`
+  path is a JSON 404 while unknown non-API paths fall through to the SPA
   entry point (or the "UI not built" placeholder). **`/favicon.ico` is the one
   exemption**: a browser asks for it unprompted and it is definitely not a
   client route, so it is answered with the bundle's icon if there is one and a
@@ -333,7 +423,13 @@ Phase-1 decision log.
 
 - **One `fetch`.** Everything goes through `src/api/client.ts`. It has no actor
   parameter and must never grow one — the server forces `actor = human` and the
-  client being unable to express an actor is the second layer under that.
+  client being unable to express an actor is the second layer under that. Two
+  things it *does* own, both because the server made them requirements: the
+  bearer token (`adoptToken` reads `#token=…` once, stores it in
+  `sessionStorage`, and strips the fragment — `setAuthToken` had no caller at
+  all before, so `--token` shipped a UI in which every request was a 401) and
+  `Content-Type: application/json` on every non-GET request, bodyless ones
+  included. Neither belongs in a view.
 - **Never call `new Date()` on a server string.** SQLite writes
   `datetime('now')` — UTC, no zone marker — which every browser reads as *local*
   time. Parse through `parseTimestamp` (`src/lib/time.ts`) and format through
@@ -361,12 +457,24 @@ Phase-1 decision log.
   Class names are `nd-`-prefixed because Mermaid and Cytoscape inject global
   stylesheets on `.node`, `.label`, and `.edge`.
 - **A pure module gets a `*.test.ts` beside it** (`make web-test`, Vitest). The
-  harness is unit-only by design — no DOM, no component rendering — so pull the
-  logic worth testing out of the component and test it there, which is what
+  harness is unit-only by design — no component rendering — so pull the logic
+  worth testing out of the component and test it there, which is what
   `filters.ts`, `unifiedDiff.ts`, `signals.ts`, `grouping.ts`, and
   `policyRules.ts` already are. Assert the *semantics* the module encodes (a
   `min_confidence` of 0 is a filter, not a no-op; a 502 is unreachable, not a
-  refusal), not its line coverage.
+  refusal), not its line coverage. The global environment is `node`; a suite
+  that genuinely needs a DOM says so in **its own** docblock
+  (`// @vitest-environment jsdom`, as `markdownRender.test.ts` does) rather than
+  changing the config for everyone.
+- **Nothing reaches `innerHTML` without going through DOMPurify.** The preview
+  renders Markdown that *agents* wrote, in the origin that may write to the API,
+  so `markdownRender.ts` reduces it to an allowlist with **no SVG and no
+  MathML** — that namespace is where `<animate>` retargets an anchor's `href` to
+  `javascript:` and where a lowercase `<style>` slips past any check keyed on
+  `tagName`. `mermaidRender.ts` runs a second, SVG-shaped policy over mermaid's
+  output. Both are covered by `markdownRender.test.ts`; a new sink means a new
+  policy, not a new exception. `nodum.http_api.CONTENT_SECURITY_POLICY` is the
+  runtime backstop under both — `script-src 'self'`, no `'unsafe-inline'`.
 - **A dialog locks body scroll and hands focus somewhere real.** Both the review
   `Modal` and the assets lightbox set `body.style.overflow` on open and restore
   it on close. On close, focus returns to the opener *only if it is still in the

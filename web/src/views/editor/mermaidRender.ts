@@ -17,7 +17,16 @@
  * Mermaid is ~500 kB of the bundle and only the editor's preview needs it, so
  * it is pulled in with a dynamic `import()` — the editor route opens without
  * paying for it, and the pane fills in when the first diagram appears.
+ *
+ * Rendered SVG goes through DOMPurify on the way out ({@link sanitiseDiagramSvg}).
+ * Mermaid's own `securityLevel: "strict"` already sanitises the labels it draws,
+ * but the preview inserts this markup with `innerHTML` into a page holding the
+ * API's write credentials, and one library's strict mode should not be the only
+ * thing standing between an agent's diagram source and script execution.
  */
+
+import DOMPurify from "dompurify";
+import type { Config as PurifyConfig, DOMPurify as Purifier } from "dompurify";
 
 /** The mermaid API surface, without importing the module up front. */
 type MermaidApi = (typeof import("mermaid"))["default"];
@@ -105,7 +114,7 @@ export async function renderDiagram(source: string): Promise<DiagramResult> {
   try {
     const mermaid = await loadMermaid();
     const { svg } = await mermaid.render(id, source);
-    result = { ok: true, svg };
+    result = { ok: true, svg: sanitiseDiagramSvg(svg) };
   } catch (error) {
     result = { ok: false, message: describeDiagramError(error) };
   } finally {
@@ -131,6 +140,138 @@ export async function renderDiagram(source: string): Promise<DiagramResult> {
  */
 export function peekDiagram(source: string): DiagramResult | undefined {
   return cache.get(source);
+}
+
+/* ------------------------------------------------------------------ */
+/* Sanitising                                                           */
+/* ------------------------------------------------------------------ */
+
+/** Attributes whose value the browser will fetch or navigate to. */
+const URL_ATTRIBUTES = ["href", "src", "xlink:href"];
+
+/**
+ * Characters a browser strips from a URL attribute before acting on it — the
+ * same set DOMPurify normalises with, so a prefix test sees the same string.
+ */
+const ATTRIBUTE_WHITESPACE = /[\u0000-\u0020\u00a0\u1680\u180e\u2000-\u2029\u205f\u3000]/g;
+
+/**
+ * Animation and scripting elements, forbidden by name.
+ *
+ * `<animate>`, `<set>` and the `animate*` family can retarget another element's
+ * attribute — `attributeName="href"` pointed at a `javascript:` value is the
+ * canonical SVG XSS, and it lands *after* any static URL check has run. Mermaid
+ * emits none of them at any security level, so forbidding them costs nothing
+ * and removes the possibility that a future mermaid release, a directive, or a
+ * parser bug hands one to `innerHTML`.
+ *
+ * `animatemotion`, `animatetransform` and `animatecolor` are in DOMPurify's
+ * *allowed* SVG profile; the others it already refuses. Naming all of them
+ * keeps the rule readable rather than dependent on which side of that line each
+ * one happens to sit today.
+ */
+const FORBIDDEN_DIAGRAM_TAGS = [
+  "animate",
+  "animatecolor",
+  "animatemotion",
+  "animatetransform",
+  "discard",
+  "handler",
+  "script",
+  "set",
+  "iframe",
+  "object",
+  "embed",
+  "form",
+  "input",
+  "button",
+  "textarea",
+  "select",
+  "base",
+  "link",
+  "meta",
+];
+
+/**
+ * The policy rendered diagrams are reduced to.
+ *
+ * Deliberately looser than the Markdown preview's, because the input is
+ * different: this is machine-generated markup from a library configured in
+ * strict mode, not prose an agent typed.
+ *
+ * - **SVG profiles instead of an element list** — mermaid emits a different
+ *   element vocabulary per diagram type (flowchart, sequence, gantt, class,
+ *   state, ER, pie, git…). An allowlist enumerated by hand would silently break
+ *   whichever diagram type nobody tested.
+ * - **`foreignobject` added back, and made an HTML integration point** —
+ *   `flowchart.htmlLabels` is on, so labels are HTML inside `<foreignObject>`.
+ *   Without both settings every flowchart loses its label text.
+ * - **`<style>` and the `style` attribute survive.** Mermaid inlines the whole
+ *   theme as a `<style>` block scoped to the diagram's own id, plus per-element
+ *   `style` attributes; dropping either renders every diagram unthemed. This is
+ *   the one concession, and it is a real one: CSS reaching the page is the
+ *   residual trust placed in mermaid's strict mode. It buys back the classes
+ *   that matter — script, event handlers, animation retargeting, `javascript:`.
+ * - **{@link FORBIDDEN_DIAGRAM_TAGS}** on top of the profile, and no `on*`
+ *   attribute is ever on a DOMPurify allowlist.
+ * - **DOMPurify's stock `ALLOWED_URI_REGEXP`**, unlike the Markdown preview's.
+ *   That pattern is applied to *every* attribute value DOMPurify has not been
+ *   told is inert, and an SVG's vocabulary is `viewBox="0 0 100 40"`,
+ *   `d="M0,0 L8,4"`, `markerWidth="8"` — geometry, not URLs. Narrowing the
+ *   pattern here would strip a diagram down to bare tags; enumerating the SVG
+ *   attributes that are *not* URLs would be a second allowlist to keep in step
+ *   with mermaid. The stock pattern already refuses `javascript:` and
+ *   `data:`, which is what the URL check is for; {@link stripDataUrls} closes
+ *   the one hole it leaves.
+ */
+const DIAGRAM_POLICY: PurifyConfig = {
+  USE_PROFILES: { svg: true, svgFilters: true, html: true },
+  ADD_TAGS: ["foreignobject"],
+  HTML_INTEGRATION_POINTS: { foreignobject: true },
+  FORBID_TAGS: FORBIDDEN_DIAGRAM_TAGS,
+  FORBID_ATTR: ["formaction", "ping", "srcset", "background"],
+};
+
+/**
+ * Its own DOMPurify instance, so the preview's link-hardening hook — registered
+ * on that module's instance — cannot reach diagram markup, or vice versa.
+ * Created on first use: only a browser has a `window`.
+ */
+let purifier: Purifier | null = null;
+
+function diagramPurifier(): Purifier {
+  if (purifier === null) {
+    purifier = DOMPurify(window);
+    purifier.addHook("afterSanitizeAttributes", stripDataUrls);
+  }
+  return purifier;
+}
+
+/**
+ * Remove `data:` URLs, which DOMPurify permits on media elements — `<image>`
+ * among them — whatever `ALLOWED_URI_REGEXP` says. A diagram has no use for an
+ * inline document, and `data:image/svg+xml` is a document.
+ */
+function stripDataUrls(element: Element): void {
+  for (const name of URL_ATTRIBUTES) {
+    const value = element.getAttribute(name);
+    if (value === null) continue;
+    const normalised = value.replace(ATTRIBUTE_WHITESPACE, "").toLowerCase();
+    if (normalised.startsWith("data:")) element.removeAttribute(name);
+  }
+}
+
+/**
+ * Reduce one rendered diagram to {@link DIAGRAM_POLICY}.
+ *
+ * Exported so the policy can be tested against a payload directly, without
+ * loading mermaid.
+ *
+ * @param svg The SVG markup mermaid produced.
+ * @returns The same markup with scripting and animation constructs removed.
+ */
+export function sanitiseDiagramSvg(svg: string): string {
+  return diagramPurifier().sanitize(svg, DIAGRAM_POLICY);
 }
 
 /** Store a result, evicting the oldest entry once the cache is full. */

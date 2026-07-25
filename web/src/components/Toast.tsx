@@ -1,4 +1,4 @@
-import { createContext, useCallback, useContext, useMemo, useRef, useState } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { describeError, describeFailure } from "../lib";
 
@@ -56,9 +56,30 @@ const AUTO_DISMISS_MS = 4500;
 export function ToastProvider({ children }: { children: ReactNode }) {
   const [toasts, setToasts] = useState<Toast[]>([]);
   const nextId = useRef(1);
+  /**
+   * Live auto-dismiss timers, by toast id.
+   *
+   * Kept so a toast dismissed by hand does not leave a timer to fire into an
+   * id that is already gone, and so the provider can clear the lot on unmount
+   * instead of leaving up to one callback per toast pointed at a dead tree.
+   */
+  const timers = useRef(new Map<number, number>());
 
   const dismiss = useCallback((id: number) => {
+    const timer = timers.current.get(id);
+    if (timer !== undefined) {
+      window.clearTimeout(timer);
+      timers.current.delete(id);
+    }
     setToasts((current) => current.filter((toast) => toast.id !== id));
+  }, []);
+
+  useEffect(() => {
+    const live = timers.current;
+    return () => {
+      for (const timer of live.values()) window.clearTimeout(timer);
+      live.clear();
+    };
   }, []);
 
   const show = useCallback(
@@ -69,7 +90,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
         : { id, tone, title, detail }]);
       // Errors are not auto-dismissed: they usually need an action.
       if (tone !== "error") {
-        window.setTimeout(() => dismiss(id), AUTO_DISMISS_MS);
+        timers.current.set(id, window.setTimeout(() => dismiss(id), AUTO_DISMISS_MS));
       }
       return id;
     },

@@ -20,7 +20,7 @@ from pathlib import Path
 import typer
 from pydantic import BaseModel
 
-from nodum import assets, projectors, service
+from nodum import assets, db, projectors, service
 from nodum import search as search_module
 from nodum.assets import AssetNotFound, AssetSourceChanged, AssetTooLarge, UnsupportedRendition
 from nodum.db import ENV_DB_VAR
@@ -473,12 +473,13 @@ def subgraph(
     ),
     limit: int = typer.Option(200, "--limit", help="Maximum nodes, root included."),
 ) -> None:
-    """Bounded, filtered neighborhood of a node — the node cap stops the walk.
+    """Bounded, filtered neighborhood of a node — node and edge caps stop the walk.
 
     Unlike `traverse` (edge type only), every filter here composes, and
-    `limit` is enforced while walking rather than by slicing afterwards, so
-    the result can never be larger than asked for. `truncated` says whether
-    the cap cut the walk short.
+    `--limit` is enforced while walking rather than by slicing afterwards, and
+    is clamped to a server ceiling of 2000. The edge list is capped with it,
+    since a node cap does not bound edges. `truncated` says whether either cap
+    cut the walk short.
     """
     _emit(
         _run(
@@ -639,6 +640,11 @@ def serve(
     token: str | None = typer.Option(
         None, "--token", help="Require 'Authorization: Bearer <token>' on /api (LAN case)."
     ),
+    allow_host: list[str] = typer.Option(
+        None,
+        "--allow-host",
+        help="Extra Host/Origin name to answer to (repeatable); '*' disables the check.",
+    ),
     db_path: str | None = typer.Option(
         None, "--db", help=f"Database path for this server (overrides ${ENV_DB_VAR})."
     ),
@@ -647,21 +653,60 @@ def serve(
 
     The inverse of ``mcp serve``: every write this surface makes is attributed
     to the ``human`` actor and no request field can change that. Binds loopback
-    by default and has no auth there; ``--token`` adds a static bearer token
-    for the LAN case, on ``/api`` only (``/healthz`` and the UI stay open).
-    Unbuilt frontend? The API still serves; the UI is a "run make web-build"
-    placeholder.
+    by default; ``--token`` adds a static bearer token on ``/api`` only
+    (``/healthz`` and the UI stay open). Unbuilt frontend? The API still serves;
+    the UI is a "run make web-build" placeholder.
+
+    Two things this command refuses to do quietly. A non-loopback bind without
+    ``--token`` is an unauthenticated write API on the network, so it exits 1
+    rather than starting. And a loopback bind without ``--token`` is reachable
+    by **every process on this machine**, including an MCP server launched with
+    ``--actor agent:x``, which could then accept its own proposals over HTTP —
+    so it says so at startup instead of leaving the operator to work it out.
     """
     import uvicorn
 
     from nodum import http_api
 
-    _run(
-        uvicorn.run,
-        http_api.create_app(db_path=db_path, token=token),
-        host=host,
-        port=port,
-    )
+    if token is None and http_api.bare_host(host) not in http_api.LOOPBACK_BIND_ADDRESSES:
+        typer.echo(
+            f"refusing to bind {host} with no --token: that is an unauthenticated write API "
+            "reachable from the network. Pass --token, or bind 127.0.0.1.",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+    resolved_db = Path(db_path) if db_path is not None else db.db_path()
+    typer.echo(f"nodum serve → http://{host}:{port}  (database: {resolved_db})", err=True)
+    if token is None:
+        typer.echo(
+            "no --token: any process on this machine can drive this API as the 'human' actor, "
+            "including local agents. Do not run it alongside agents you do not trust.",
+            err=True,
+        )
+    else:
+        typer.echo(f"open the UI at http://{host}:{port}/#token={token}", err=True)
+
+    try:
+        _run(
+            uvicorn.run,
+            http_api.create_app(
+                db_path=db_path,
+                token=token,
+                allowed_hosts=http_api.resolve_allowed_hosts(host, allow_host),
+            ),
+            host=host,
+            port=port,
+        )
+    except SystemExit as exc:
+        # uvicorn catches a failed bind ("address already in use") itself, logs
+        # it, and signals the caller with `sys.exit(STARTUP_FAILURE)` — a
+        # non-zero code, but not the 1 this CLI's contract promises for every
+        # error. Translate it rather than leaving one command exempt.
+        if exc.code:
+            typer.echo(f"could not serve on {host}:{port}", err=True)
+            raise typer.Exit(1) from exc
+        raise
 
 
 # ── Policies ──────────────────────────────────────────────────────────────────

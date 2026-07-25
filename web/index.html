@@ -5,6 +5,20 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="color-scheme" content="dark" />
     <!--
+      Defence in depth under the real policy, which `nodum.http_api` sends as a
+      response header (it is the authority; see CONTENT_SECURITY_POLICY there).
+      This copy is what protects the page if the bundle is ever served by
+      something that forgets the header. It is deliberately *not* a duplicate of
+      it: `frame-ancestors` cannot be expressed in a meta tag at all, and a
+      `<meta>` policy only governs what follows it — the Vite dev server injects
+      its client and the React Refresh preamble ahead of this point, so keeping
+      the two in step by hand is not the goal. The header is.
+    -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; frame-src 'none'; base-uri 'none'; form-action 'none'"
+    />
+    <!--
       Inlined as a data URI on purpose: the app is served by a local Python
       process from a directory Vite wipes on every build, so an asset file here
       would be one more thing to package. Declaring it also stops the browser

@@ -40,14 +40,22 @@ make web-test             # or: cd web && npx vitest run
 cd web && npx vitest      # watch mode while working
 ```
 
-[Vitest](https://vitest.dev) over the **pure modules** in `src/` — no DOM, no
-component rendering, no `@testing-library`. A test lives beside the module it
-covers (`src/lib/time.test.ts`), and `vitest.config.ts` is kept separate from
+[Vitest](https://vitest.dev) over the **pure modules** in `src/` — no component
+rendering, no `@testing-library`. A test lives beside the module it covers
+(`src/lib/time.test.ts`), and `vitest.config.ts` is kept separate from
 `vite.config.ts` so a test setting can never change what ships in the wheel.
+
+The default environment is `node`. One suite opts out —
+`views/editor/markdownRender.test.ts` sets `// @vitest-environment jsdom` in its
+own docblock, because the preview's sanitising policy *is* a parse and asserting
+it against strings would assert against the wrong thing. The opt-out is per
+file; the global config stays `node`.
 
 Covered today: `lib/time.ts`, `lib/failure.ts`, `views/graph/filters.ts`,
 `views/history/unifiedDiff.ts`, `views/search/signals.ts`,
-`views/review/grouping.ts`, `views/review/policyRules.ts`.
+`views/review/grouping.ts`, `views/review/policyRules.ts`,
+`views/editor/markdownRender.ts` + `views/editor/mermaidRender.ts` (the
+sanitising policies).
 
 **The run pins `TZ` to `Asia/Kathmandu`, and this matters.** SQLite's
 `datetime('now')` is UTC with no zone marker, so the bug `lib/time.ts` fixes —
@@ -128,9 +136,11 @@ Conventions that hold across the tree:
 | `@codemirror/state`, `@codemirror/view`, `@codemirror/lang-markdown`, `@codemirror/commands`, `@codemirror/autocomplete`, `@codemirror/language`, `@codemirror/theme-one-dark` | editor slice |
 | `mermaid` | live diagram preview in the editor |
 | `marked` | Markdown preview rendering |
+| `dompurify` | sanitising the preview's HTML and mermaid's SVG before either reaches `innerHTML` |
 | `cytoscape`, `@types/cytoscape`, `cytoscape-fcose` | graph slice |
 | `vite`, `@vitejs/plugin-react`, `typescript`, `@types/react`, `@types/react-dom` | toolchain |
-| `vitest` | the unit harness — no DOM environment, no component-testing stack |
+| `vitest` | the unit harness — no component-testing stack |
+| `jsdom` | the DOM environment the sanitiser suite alone opts into |
 
 `cytoscape-fcose` ships no types; a minimal declaration lives in
 `types/cytoscape-fcose.d.ts`.

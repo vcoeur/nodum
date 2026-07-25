@@ -495,7 +495,10 @@ function BatchSection({
             type="checkbox"
             checked={allSelected}
             onChange={(event) => onSetBatchSelection(batch, event.target.checked)}
-            aria-label={`Select the whole run of ${batch.agent} from ${batch.startedAt}`}
+            // The same instant the label beside it shows: a raw server
+            // timestamp here would read out UTC to a screen reader while the
+            // sighted label says local time.
+            aria-label={`Select the whole run of ${batch.agent} from ${formatAbsolute(batch.startedAt)}`}
           />
           <span className="nd-rv-batch__label">
             Run · {formatAbsolute(batch.startedAt)}
@@ -703,6 +706,28 @@ function QueueFailure({ error, onRetry }: { error: unknown; onRetry: () => void 
           <>
             The review queue could not be loaded — the API did not respond.
             Start it with <code>uv run nodum serve</code> and try again.
+            <br />
+            <span className="nd-mono">{message}</span>
+          </>
+        }
+        action={
+          <button type="button" className="nd-button nd-button--primary" onClick={onRetry}>
+            Try again
+          </button>
+        }
+      />
+    );
+  }
+
+  if (kind === "busy") {
+    return (
+      <EmptyState
+        title="The database is busy"
+        body={
+          <>
+            SQLite has a single writer, and something is holding it — a large
+            accept, an import, or another process writing to the same file. The
+            queue itself is fine; nothing has been changed. Try again in a moment.
             <br />
             <span className="nd-mono">{message}</span>
           </>

@@ -11,12 +11,18 @@
 
 import { describeFailure } from "../../lib";
 
-/** Which panel to show for a caught failure. */
-export type FailureKind = "root-missing" | "unreachable" | "rejected" | "unknown";
+/**
+ * Which panel to show for a caught failure.
+ *
+ * Named for the view rather than `FailureKind`: that name belongs to the shared
+ * classifier in `src/lib/failure.ts` and means the *kind of failure*, which is
+ * the same everywhere. This is a choice of panel, which is not.
+ */
+export type GraphFailureKind = "root-missing" | "unreachable" | "rejected" | "unknown";
 
 /** A caught failure, reduced to what the view renders. */
 export interface Failure {
-  kind: FailureKind;
+  kind: GraphFailureKind;
   /** Headline, in the interface's voice. */
   title: string;
   /** One line saying what to do about it. */

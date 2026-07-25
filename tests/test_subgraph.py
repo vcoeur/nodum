@@ -42,6 +42,19 @@ def _ids(result):
     return {node.id for node in result.nodes}
 
 
+def _count_node_reads(monkeypatch):
+    """Record every node row the service reads; returns the growing id list."""
+    reads: list[str] = []
+    original = service._get_node_row
+
+    def counting(conn, node_id):
+        reads.append(node_id)
+        return original(conn, node_id)
+
+    monkeypatch.setattr(service, "_get_node_row", counting)
+    return reads
+
+
 # ── The node cap ──────────────────────────────────────────────────────────────
 
 
@@ -78,13 +91,35 @@ def test_cap_never_yields_an_edge_without_its_node(fresh_db):
         assert edge.dst_id in present
 
 
-def test_cap_bites_before_the_far_side_is_read(fresh_db):
-    """A deep chain past the cap is never walked, let alone sliced."""
-    nodes = [service.create_node(type="note", title=f"N{index}") for index in range(10)]
-    for left, right in zip(nodes, nodes[1:], strict=False):
-        service.create_edge(left.id, right.id, "relates_to")
-    result = service.subgraph(nodes[0].id, depth=9, limit=4)
-    assert [node.id for node in result.nodes] == [node.id for node in nodes[:4]]
+def test_cap_bites_before_the_far_side_is_read(fresh_db, monkeypatch):
+    """The cap bounds the *work*, not just the result: O(limit) node reads.
+
+    A hub, not a chain: a chain has one neighbour per level, so reading the far
+    side before testing the cap costs nothing there and the ordering bug hides.
+    A 40-spoke hub read with `limit=1` must cost exactly one node read — the
+    root — and 3 must cost 3, however many spokes wait behind the cap.
+    """
+    hub, _leaves = _star(spokes=40)
+    reads = _count_node_reads(monkeypatch)
+
+    result = service.subgraph(hub.id, depth=1, limit=1)
+    assert [node.id for node in result.nodes] == [hub.id]
+    assert result.truncated
+    assert reads == [hub.id]  # the 40 spokes were never read
+
+    reads.clear()
+    result = service.subgraph(hub.id, depth=1, limit=3)
+    assert len(result.nodes) == 3
+    assert result.truncated
+    assert len(reads) == 3  # root + the two admitted spokes, nothing else
+
+
+def test_limit_is_clamped_to_the_server_ceiling(fresh_db, monkeypatch):
+    """An absurd `limit` gets the ceiling, not the whole graph."""
+    monkeypatch.setattr(service, "MAX_SUBGRAPH_LIMIT", 3)
+    hub, _leaves = _star(spokes=8)
+    result = service.subgraph(hub.id, depth=1, limit=10**9)
+    assert len(result.nodes) == 3
     assert result.truncated
 
 
@@ -94,6 +129,51 @@ def test_limit_must_be_positive(fresh_db):
         service.subgraph(hub.id, limit=0)
     with pytest.raises(ValueError, match="limit"):
         service.subgraph(hub.id, limit=-1)  # LIMIT -1 would be unbounded in SQL
+
+
+# ── The edge cap ──────────────────────────────────────────────────────────────
+
+
+def test_edge_list_is_capped_independently_of_the_node_cap(fresh_db):
+    """Two nodes can carry any number of edges — the node cap bounds neither."""
+    a = service.create_node(type="note", title="A")
+    b = service.create_node(type="note", title="B")
+    for _index in range(300):
+        service.create_edge(a.id, b.id, "relates_to")
+    result = service.subgraph(a.id, depth=1, limit=2)
+    assert len(result.nodes) == 2  # the node cap did not bite
+    assert len(result.edges) == 2 * service.SUBGRAPH_EDGE_FACTOR
+    assert result.truncated  # …but the edge cap did, and it says so
+
+
+def test_edge_cap_bounds_the_ring_closing_pass_too(fresh_db):
+    """Closing the ring cannot smuggle an unbounded edge list past the cap."""
+    a = service.create_node(type="note", title="A")
+    b = service.create_node(type="note", title="B")
+    c = service.create_node(type="note", title="C")
+    service.create_edge(a.id, b.id, "relates_to")
+    service.create_edge(a.id, c.id, "relates_to")
+    for _index in range(100):
+        service.create_edge(b.id, c.id, "relates_to")  # ring edges, far past the budget
+
+    result = service.subgraph(a.id, depth=1, limit=3)
+    assert len(result.edges) == 3 * service.SUBGRAPH_EDGE_FACTOR
+    assert result.truncated
+    assert len({edge.id for edge in result.edges}) == len(result.edges)
+    assert [edge.id for edge in service.subgraph(a.id, depth=1, limit=3).edges] == [
+        edge.id for edge in result.edges
+    ]
+
+
+def test_edge_count_stays_bounded_under_a_node_cap(fresh_db):
+    """Nodes admitted, edges carried, and the endpoint invariant, together."""
+    hub, _leaves = _star(spokes=8)
+    result = service.subgraph(hub.id, depth=2, limit=4)
+    present = _ids(result)
+    assert len(present) == 4
+    assert len(result.edges) == 3  # one per admitted spoke, none dangling
+    assert all(edge.src_id in present and edge.dst_id in present for edge in result.edges)
+    assert result.truncated
 
 
 # ── Filters ───────────────────────────────────────────────────────────────────
@@ -149,6 +229,27 @@ def test_filters_compose_as_a_conjunction(fresh_db):
     assert _ids(result) == {hub.id, live.id}
 
 
+def test_a_filter_is_not_truncation(fresh_db):
+    """`truncated` means a cap bit, never that the caller's own filter matched.
+
+    A view showing "some hidden" for a filter the user set would be noise; the
+    flag exists to say the *server* stopped short.
+    """
+    hub, live, pending, weak, person = _mixed()
+    filtered = service.subgraph(hub.id, depth=1, node_types=["note"])
+    assert person.id not in _ids(filtered)
+    assert not filtered.truncated
+
+    for kwargs in (
+        {"edge_types": ["supports"]},
+        {"min_confidence": 0.5},
+        {"created_by": "human"},
+    ):
+        result = service.subgraph(hub.id, depth=1, **kwargs)
+        assert len(result.nodes) < 5, kwargs  # something really was dropped
+        assert not result.truncated, kwargs
+
+
 def test_node_type_filter_blocks_the_path_beyond_it(fresh_db):
     hub = service.create_node(type="concept", title="Hub")
     middle = service.create_node(type="person", title="Middle")
@@ -178,6 +279,47 @@ def test_walk_is_undirected_and_breadth_first(fresh_db):
     service.create_edge(c.id, b.id, "relates_to")  # points *at* the middle
     result = service.subgraph(b.id, depth=1)
     assert [node.id for node in result.nodes] == [b.id, a.id, c.id]
+
+
+def test_outermost_ring_is_closed(fresh_db, monkeypatch):
+    """Two returned nodes are never drawn unconnected when an edge joins them.
+
+    A triangle read at depth 1: the walk only ever sees the two edges incident
+    to the root, so B–C has to be picked up afterwards — and by one bounded
+    query, not a node read per admitted node.
+    """
+    a = service.create_node(type="note", title="A")
+    b = service.create_node(type="note", title="B")
+    c = service.create_node(type="note", title="C")
+    service.create_edge(a.id, b.id, "relates_to")
+    service.create_edge(a.id, c.id, "relates_to")
+    bc = service.create_edge(b.id, c.id, "relates_to")
+
+    reads = _count_node_reads(monkeypatch)
+    result = service.subgraph(a.id, depth=1)
+    assert _ids(result) == {a.id, b.id, c.id}
+    assert bc.id in {edge.id for edge in result.edges}
+    assert len(result.edges) == 3
+    assert not result.truncated
+    assert len(reads) == 3  # closing the ring costs no extra node reads
+
+
+def test_closing_edges_obey_the_filters_and_the_node_set(fresh_db):
+    """A closed ring is still a filtered, endpoint-safe ring."""
+    a = service.create_node(type="note", title="A")
+    b = service.create_node(type="note", title="B")
+    c = service.create_node(type="note", title="C")
+    service.create_edge(a.id, b.id, "relates_to")
+    service.create_edge(a.id, c.id, "relates_to")
+    service.create_edge(b.id, c.id, "relates_to", actor=AGENT)  # proposed
+
+    result = service.subgraph(a.id, depth=1)
+    assert len(result.edges) == 2  # the proposed cross edge is not live graph
+    opened = service.subgraph(a.id, depth=1, edge_states=["active", "proposed"])
+    assert len(opened.edges) == 3
+
+    present = _ids(result)
+    assert all(edge.src_id in present and edge.dst_id in present for edge in result.edges)
 
 
 def test_repeated_calls_return_the_same_subgraph(fresh_db):

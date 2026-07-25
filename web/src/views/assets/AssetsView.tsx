@@ -41,18 +41,34 @@ export default function AssetsView() {
 
   const assets = list.status === "ready" ? list.assets : [];
 
+  /**
+   * Aborted when the view goes away.
+   *
+   * Most loads here are fired from a button — Refresh, Try again, and the reload
+   * after an upload batch — not from an effect, so without a signal that outlives
+   * the call site there is nothing to stop them writing state into an unmounted
+   * view. Assigned inside the mount effect rather than lazily in render so a
+   * StrictMode remount gets a fresh, un-aborted controller.
+   */
+  const lifetime = useRef<AbortController | null>(null);
+
   const load = useCallback((signal?: AbortSignal) => {
+    const active = signal ?? lifetime.current?.signal;
     setList((current) => (current.status === "ready" ? current : { status: "loading" }));
-    return listAssets(signal)
-      .then((loaded) => setList({ status: "ready", assets: loaded }))
+    return listAssets(active)
+      .then((loaded) => {
+        if (active?.aborted) return;
+        setList({ status: "ready", assets: loaded });
+      })
       .catch((error: unknown) => {
-        if (signal?.aborted) return;
+        if (active?.aborted) return;
         setList({ status: "failed", failure: describeFailure(error, "the asset library") });
       });
   }, []);
 
   useEffect(() => {
     const controller = new AbortController();
+    lifetime.current = controller;
     void load(controller.signal);
     return () => controller.abort();
   }, [load]);
@@ -211,15 +227,23 @@ export default function AssetsView() {
 function useAssetReferences(needed: boolean) {
   const [references, setReferences] = useState<Map<string, NodeOut[]>>(new Map());
   const [referencesLoading, setLoading] = useState(false);
-  const requested = useRef(false);
+  /**
+   * Whether the scan has *landed*, not whether one was ever started.
+   *
+   * Latching on the attempt wedges the feature: closing the lightbox aborts the
+   * scan, so the spinner it left behind is never turned off, and the latch then
+   * refuses to run another one — so every later open shows a permanent
+   * "looking…" over a lookup that will never happen again.
+   */
+  const resolved = useRef(false);
 
   useEffect(() => {
-    if (!needed || requested.current) return;
-    requested.current = true;
+    if (!needed || resolved.current) return;
     const controller = new AbortController();
     setLoading(true);
     listNodes({ limit: REFERENCE_SCAN_LIMIT }, controller.signal)
       .then((nodes) => {
+        if (controller.signal.aborted) return;
         const byHash = new Map<string, NodeOut[]>();
         for (const node of nodes) {
           const hash = node.props["asset_hash"];
@@ -228,13 +252,17 @@ function useAssetReferences(needed: boolean) {
           if (bucket) bucket.push(node);
           else byHash.set(hash, [node]);
         }
+        resolved.current = true;
         setReferences(byHash);
       })
       .catch(() => {
         // Non-essential: an empty map renders as "no node references this".
       })
       .finally(() => {
-        if (!controller.signal.aborted) setLoading(false);
+        // An aborted scan leaves nothing on screen to spin for, but the flag
+        // still has to come down: the next open re-runs the effect and would
+        // otherwise inherit a `true` it never set.
+        setLoading(false);
       });
     return () => controller.abort();
   }, [needed]);
