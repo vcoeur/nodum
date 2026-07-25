@@ -4,16 +4,39 @@ from __future__ import annotations
 
 import json
 
+from helpers import agent
 from typer.testing import CliRunner
 
-from nodum import db
+from nodum import db, service
 from nodum.cli import app
 
 runner = CliRunner()
 
 
+#: Command groups that change state — every one requires an explicit `--as`.
+WRITE_NODE_SUB = {"create", "update"}
+WRITE_EDGE_SUB = {"create", "create-batch"}
+WRITE_REVIEW_SUB = {"accept", "reject", "accept-all", "reject-all"}
+
+
+def _needs_as(args) -> bool:
+    if not args or "--as" in args:
+        return False
+    group = args[0]
+    if group in ("accept", "reject", "archive", "undo"):
+        return True
+    if group == "node" and len(args) > 1 and args[1] in WRITE_NODE_SUB:
+        return True
+    if group == "edge" and len(args) > 1 and args[1] in WRITE_EDGE_SUB:
+        return True
+    return group == "review" and len(args) > 1 and args[1] in WRITE_REVIEW_SUB
+
+
 def _run_json(*args, input_text=None):
-    result = runner.invoke(app, list(args), input=input_text)
+    args = list(args)
+    if _needs_as(args):
+        args += ["--as", "owner"]
+    result = runner.invoke(app, args, input=input_text)
     assert result.exit_code == 0, result.output
     return json.loads(result.stdout)
 
@@ -80,10 +103,10 @@ def test_edge_create_and_list(fresh_db):
 
 
 def test_state_transitions_and_actor(fresh_db):
-    proposed = _run_json(
-        "node", "create", "--type", "note", "--title", "bot", "--actor", "agent:test"
-    )
-    assert proposed["state"] == "proposed"
+    # A suggest-level agent's write (via the service; the CLI is human-only).
+    proposed = service.create_node(type="note", title="bot", principal=agent("test"))
+    assert proposed.state == "proposed"
+    proposed = proposed.model_dump(mode="json")
     accepted = _run_json("accept", proposed["id"])
     assert accepted["state"] == "active"
     archived = _run_json("archive", accepted["id"])
@@ -92,10 +115,8 @@ def test_state_transitions_and_actor(fresh_db):
 
 def test_reject_records_its_reason_in_the_event(fresh_db):
     """One id or a hundred, a reject leaves the same audit trail."""
-    proposed = _run_json(
-        "node", "create", "--type", "note", "--title", "bot", "--actor", "agent:test"
-    )
-    rejected = _run_json("reject", proposed["id"], "--reason", "off topic")
+    proposed = service.create_node(type="note", title="bot", principal=agent("test"))
+    rejected = _run_json("reject", proposed.id, "--reason", "off topic")
     assert rejected["state"] == "archived"
 
     event = _run_json("events", "--limit", "1")["events"][0]
@@ -104,12 +125,10 @@ def test_reject_records_its_reason_in_the_event(fresh_db):
 
 
 def test_reject_without_a_reason_is_refused(fresh_db):
-    proposed = _run_json(
-        "node", "create", "--type", "note", "--title", "bot", "--actor", "agent:test"
-    )
-    result = runner.invoke(app, ["reject", proposed["id"]])
+    proposed = service.create_node(type="note", title="bot", principal=agent("test"))
+    result = runner.invoke(app, ["reject", proposed.id])
     assert result.exit_code == 2  # typer: missing required --reason
-    assert _run_json("node", "get", proposed["id"])["state"] == "proposed"
+    assert _run_json("node", "get", proposed.id)["state"] == "proposed"
 
 
 def test_every_list_command_reports_a_count(fresh_db):
@@ -132,7 +151,7 @@ def test_every_list_command_reports_a_count(fresh_db):
 
 def test_invalid_transition_exits_1(fresh_db):
     node = _run_json("node", "create", "--type", "note", "--title", "active")
-    result = runner.invoke(app, ["accept", node["id"]])
+    result = runner.invoke(app, ["accept", node["id"], "--as", "owner"])
     assert result.exit_code == 1
     assert "cannot accept" in result.stderr
 
@@ -169,7 +188,9 @@ def test_unknown_node_exits_1(fresh_db):
 
 
 def test_bad_set_pair_exits_1(fresh_db):
-    result = runner.invoke(app, ["node", "create", "--type", "note", "--set", "nokey"])
+    result = runner.invoke(
+        app, ["node", "create", "--type", "note", "--set", "nokey", "--as", "owner"]
+    )
     assert result.exit_code == 1
     assert "--set expects key=value" in result.stderr
 
@@ -221,7 +242,7 @@ def test_undo_blocked_by_children_exits_1(fresh_db):
     _run_json("node", "create", "--type", "block", "--content", "b1", "--parent", page["id"])
     create_seq = _run_json("events")["events"][-1]["seq"]
 
-    result = runner.invoke(app, ["undo", str(create_seq)])
+    result = runner.invoke(app, ["undo", str(create_seq), "--as", "owner"])
     assert result.exit_code == 1
     assert "child node" in result.stderr
     assert result.exception is None or isinstance(result.exception, SystemExit)
@@ -248,7 +269,9 @@ def test_locked_database_exits_1(fresh_db, monkeypatch):
     blocker = real_connect(fresh_db)
     blocker.execute("BEGIN EXCLUSIVE")
     try:
-        result = runner.invoke(app, ["node", "create", "--type", "note", "--title", "blocked"])
+        result = runner.invoke(
+            app, ["node", "create", "--type", "note", "--title", "blocked", "--as", "owner"]
+        )
     finally:
         blocker.rollback()
         blocker.close()
@@ -368,12 +391,10 @@ def test_edge_create_batch_from_stdin(fresh_db):
             {"src": a["id"], "dst": "missing", "edge_type": "supports"},
         ]
     )
-    result = runner.invoke(
-        app, ["edge", "create-batch", "-", "--actor", "agent:researcher"], input=suggestions
-    )
+    result = runner.invoke(app, ["edge", "create-batch", "-", "--as", "owner"], input=suggestions)
     assert result.exit_code == 0, result.output
     outcome = json.loads(result.stdout)
-    assert outcome["created"][0]["state"] == "proposed"
+    assert outcome["created"][0]["state"] == "active"
     assert outcome["failed"][0]["index"] == 1
 
 
@@ -413,15 +434,15 @@ def test_search_filters_and_expand(fresh_db):
 
 def test_agent_update_proposes_and_review_accepts(fresh_db):
     note = _run_json("node", "create", "--type", "note", "--title", "N", "--content", "original")
-    version = _run_json(
-        "node", "update", note["id"], "--content", "bot rewrite", "--actor", "agent:researcher"
-    )
-    assert version["state"] == "proposed"
+    # The CLI is human-only (agents use MCP); a suggest-level agent's update is
+    # staged via the service, then reviewed over the CLI.
+    version = service.update_node(note["id"], content="bot rewrite", principal=agent("researcher"))
+    assert version.state == "proposed"
 
     queue = _run_json("review", "queue", "--kind", "update")
-    assert queue["proposals"][0]["id"] == str(version["id"])
+    assert queue["proposals"][0]["id"] == str(version.id)
 
-    accepted = _run_json("accept", str(version["id"]))
+    accepted = _run_json("accept", str(version.id))
     assert accepted["state"] == "applied"
     assert _run_json("node", "get", note["id"])["content"] == "bot rewrite"
 

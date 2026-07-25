@@ -36,6 +36,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+from helpers import OWNER_ACTOR, agent
 from PIL import Image
 from starlette.requests import ClientDisconnect
 from typer.testing import CliRunner
@@ -197,7 +198,7 @@ def test_list_envelopes_are_byte_identical_to_the_cli(client, fresh_db, http_pat
 def test_every_list_endpoint_uses_the_named_key_plus_count(client, fresh_db):
     node = service.create_node(type="note", title="Envelope", content="x")
     service.create_node(type="note", title="Child", parent_id=node.id)
-    service.create_node(type="note", title="Proposed", actor=AGENT)
+    service.create_node(type="note", title="Proposed", principal=agent(AGENT))
 
     for path, key in [
         ("/api/nodes", "nodes"),
@@ -409,15 +410,21 @@ def _module_ast() -> ast.Module:
     return ast.parse(Path(http_api.__file__).read_text(encoding="utf-8"))
 
 
-def _actor_taking_service_functions() -> set[str]:
-    """Service functions that accept an ``actor`` — i.e. every write."""
-    return {
-        name
-        for name, function in vars(service).items()
-        if inspect.isfunction(function)
-        and function.__module__ == service.__name__
-        and "actor" in inspect.signature(function).parameters
-    }
+#: The write surface: the only service functions a handler must reach through
+#: ``_write`` (each takes a ``principal``; reads take one too, but are safe to
+#: call directly — the principal binds identity, and reads change nothing).
+WRITE_FUNCTIONS = {
+    "create_node",
+    "update_node",
+    "create_edge",
+    "propose_edges",
+    "transition",
+    "undo",
+    "accept_proposals",
+    "reject_proposals",
+    "accept_matching",
+    "reject_matching",
+}
 
 
 def _swept_requests(app, ids: dict[str, str]) -> list[tuple[str, str, int]]:
@@ -497,7 +504,7 @@ def test_no_endpoint_can_attribute_a_write_to_an_agent(fresh_db):
     app = http_api.create_app()
     node = service.create_node(type="concept", title="Sweep target")
     other = service.create_node(type="concept", title="Sweep other")
-    proposal = service.create_node(type="note", title="Sweep proposal", actor=AGENT)
+    proposal = service.create_node(type="note", title="Sweep proposal", principal=agent(AGENT))
     ids = {"node": node.id, "other": other.id, "proposal": proposal.id}
 
     before_seq = max((event.seq for event in service.list_events(limit=5000)), default=0)
@@ -513,16 +520,14 @@ def test_no_endpoint_can_attribute_a_write_to_an_agent(fresh_db):
     new_events = [event for event in service.list_events(limit=5000) if event.seq > before_seq]
     assert new_events, "the sweep wrote nothing, so it proves nothing"
     offenders = [
-        (event.op, event.seq, event.actor)
-        for event in new_events
-        if event.actor != service.ACTOR_HUMAN
+        (event.op, event.seq, event.actor) for event in new_events if event.actor != OWNER_ACTOR
     ]
     assert offenders == [], f"writes attributed to a non-human actor: {offenders}"
 
     written_nodes = [row for row in service.list_nodes(limit=5000) if row.id not in before_nodes]
     written_edges = [row for row in service.list_edges(limit=5000) if row.id not in before_edges]
-    assert {row.created_by for row in written_nodes} <= {service.ACTOR_HUMAN}
-    assert {row.created_by for row in written_edges} <= {service.ACTOR_HUMAN}
+    assert {row.created_by for row in written_nodes} <= {OWNER_ACTOR}
+    assert {row.created_by for row in written_edges} <= {OWNER_ACTOR}
 
 
 def test_the_route_table_holds_only_endpoints_the_sweep_can_reach(fresh_db):
@@ -572,19 +577,22 @@ def test_no_route_handler_can_read_an_actor_from_a_request(fresh_db):
     assert offenders == [], f"route handlers must never name an actor: {offenders}"
 
 
-def test_the_actor_is_bound_exactly_once_and_to_the_human_constant():
-    """One binding site, and it is a constant."""
+def test_the_principal_is_bound_exactly_once_and_minted_through_auth():
+    """One binding site, and the principal comes from auth — never the request."""
     bindings = [
         keyword
         for node in ast.walk(_module_ast())
         if isinstance(node, ast.Call)
         for keyword in node.keywords
-        if keyword.arg == "actor"
+        if keyword.arg == "principal"
     ]
-    assert len(bindings) == 1, "exactly one expression may bind a service actor"
+    assert len(bindings) == 1, "exactly one expression may bind a service principal"
     value = bindings[0].value
-    assert isinstance(value, ast.Name) and value.id == "HTTP_ACTOR"
-    assert http_api.HTTP_ACTOR == service.ACTOR_HUMAN
+    assert (
+        isinstance(value, ast.Call)
+        and isinstance(value.func, ast.Name)
+        and value.func.id == "_http_principal"
+    )
 
 
 #: Values that may be splatted into a call in ``nodum.http_api``. Each one is
@@ -641,18 +649,13 @@ def test_no_write_service_function_is_reachable_under_any_name():
     import ban is the one that does the work: an alias renames the *local*
     name, never the name in the ``ImportFrom`` node.
     """
-    writers = _actor_taking_service_functions()
-    assert writers >= {
-        "create_node",
-        "update_node",
-        "create_edge",
-        "transition",
-        "undo",
-        "accept_proposals",
-        "reject_proposals",
-        "accept_matching",
-        "reject_matching",
-    }
+    writers = WRITE_FUNCTIONS
+    missing = [
+        name
+        for name in writers
+        if "principal" not in inspect.signature(getattr(service, name)).parameters
+    ]
+    assert not missing, f"write functions must take a principal: {missing}"
     tree = _module_ast()
     adapter_modules = {"service", "assets", "search_module", "db"}
 
@@ -690,10 +693,10 @@ def test_no_write_service_function_is_reachable_under_any_name():
     assert reflective == [], f"no reflective lookup on an adapter module: {reflective}"
 
 
-def test_the_write_helper_refuses_a_caller_supplied_actor(fresh_db):
+def test_the_write_helper_refuses_a_caller_supplied_principal(fresh_db):
     """The backstop: even a wholesale kwargs forward cannot smuggle an identity."""
-    with pytest.raises(RuntimeError, match="never takes an actor"):
-        http_api._write(service.create_node, type="note", actor=AGENT)
+    with pytest.raises(RuntimeError, match="never takes a principal"):
+        http_api._write(service.create_node, type="note", principal=agent(AGENT))
 
 
 @pytest.mark.parametrize(
@@ -707,15 +710,15 @@ def test_the_write_helper_refuses_a_caller_supplied_actor(fresh_db):
 )
 def test_a_smuggled_actor_is_ignored_not_honored(client, fresh_db, smuggled):
     """Property 2 (adversarial smuggling): the field is inert, not an error."""
-    proposal = service.create_node(type="note", title="Bot draft", actor=AGENT)
+    proposal = service.create_node(type="note", title="Bot draft", principal=agent(AGENT))
     body = {**smuggled, "ids": [proposal.id]}
 
     payload = _ok(client.post("/api/review/accept", json=body))
 
-    assert payload["actor"] == service.ACTOR_HUMAN
+    assert payload["actor"] == OWNER_ACTOR
     assert payload["transitioned"] == [proposal.id]
     accepts = _events("node.accept")
-    assert [row.actor for row in accepts] == [service.ACTOR_HUMAN]
+    assert [row.actor for row in accepts] == [OWNER_ACTOR]
 
 
 def test_a_smuggled_actor_on_a_create_is_ignored(client, fresh_db):
@@ -726,7 +729,7 @@ def test_a_smuggled_actor_on_a_create_is_ignored(client, fresh_db):
             headers={"X-Actor": AGENT},
         )
     )
-    assert payload["created_by"] == service.ACTOR_HUMAN
+    assert payload["created_by"] == OWNER_ACTOR
     # Landing `active` *is* the human attribution: an agent write lands proposed.
     assert payload["state"] == "active"
 
@@ -735,7 +738,7 @@ def test_an_agent_proposal_accepted_over_http_is_a_human_write(client, fresh_db)
     """Property 3 (end-to-end): propose as an agent, accept over HTTP."""
     target = service.create_node(type="concept", title="Osmosis")
     proposal = service.create_node(
-        type="note", title="Agent draft", content="see [[Osmosis]]", actor=AGENT
+        type="note", title="Agent draft", content="see [[Osmosis]]", principal=agent(AGENT)
     )
     pending_edge = service.list_edges(node_id=proposal.id)[0]
     assert pending_edge.state == "proposed"
@@ -752,11 +755,11 @@ def test_an_agent_proposal_accepted_over_http_is_a_human_write(client, fresh_db)
     assert node["created_by"] == AGENT
 
     accept = _events("node.accept")[0]
-    assert accept.actor == service.ACTOR_HUMAN
+    assert accept.actor == OWNER_ACTOR
     assert accept.payload["after"]["state"] == "active"
     # The wikilink edge the agent staged went live under the reviewer's name.
     edge_accept = _events("edge.accept")[0]
-    assert edge_accept.actor == service.ACTOR_HUMAN
+    assert edge_accept.actor == OWNER_ACTOR
     assert service.list_edges(node_id=target.id)[0].state == "active"
 
 
@@ -781,8 +784,8 @@ def test_no_event_that_writes_live_state_is_attributable_to_an_agent(client, fre
     )
     _ok(client.post("/api/assets", files={"file": ("photo.png", _png_bytes(), "image/png")}))
 
-    accepted = service.create_node(type="note", title="Accept me", actor=AGENT)
-    rejected = service.create_node(type="note", title="Reject me", actor=AGENT)
+    accepted = service.create_node(type="note", title="Accept me", principal=agent(AGENT))
+    rejected = service.create_node(type="note", title="Reject me", principal=agent(AGENT))
     _ok(client.post("/api/review/accept", json={"ids": [accepted.id]}))
     _ok(client.post("/api/review/reject", json={"ids": [rejected.id], "reason": "off topic"}))
 
@@ -797,7 +800,7 @@ def test_no_event_that_writes_live_state_is_attributable_to_an_agent(client, fre
         for row in (event.payload.get("after"), event.payload.get("restored")):
             if isinstance(row, dict) and row.get("state") == "active":
                 live_writes += 1
-                assert event.actor == service.ACTOR_HUMAN, f"{event.op} at seq {event.seq}"
+                assert event.actor == OWNER_ACTOR, f"{event.op} at seq {event.seq}"
     # A vacuous pass would be worthless: the run really did write live state.
     assert live_writes >= 6
     assert any(event.actor == AGENT for event in service.list_events(limit=500))
@@ -805,7 +808,7 @@ def test_no_event_that_writes_live_state_is_attributable_to_an_agent(client, fre
 
 def test_a_reject_without_a_reason_is_refused(client, fresh_db):
     """The CLI's audit guarantee, mirrored: no reason, no reject."""
-    proposal = service.create_node(type="note", title="Bot draft", actor=AGENT)
+    proposal = service.create_node(type="note", title="Bot draft", principal=agent(AGENT))
     for body in ({"ids": [proposal.id]}, {"ids": [proposal.id], "reason": "   "}):
         response = client.post("/api/review/reject", json=body)
         assert response.status_code == 400
@@ -814,7 +817,7 @@ def test_a_reject_without_a_reason_is_refused(client, fresh_db):
 
 
 def test_a_bodyless_review_refuses_to_touch_the_whole_queue(client, fresh_db):
-    service.create_node(type="note", title="Bot draft", actor=AGENT)
+    service.create_node(type="note", title="Bot draft", principal=agent(AGENT))
     response = client.post("/api/review/accept", json={})
     assert response.status_code == 400
     assert "whole queue" in response.json()["error"]["message"]
@@ -935,7 +938,7 @@ def test_the_text_plain_form_post_that_accepted_an_agents_proposal(client, fresh
     Two independent layers now refuse it: the content type is not
     ``application/json``, and the request is cross-site.
     """
-    proposal = service.create_node(type="note", title="Agent draft", actor=AGENT)
+    proposal = service.create_node(type="note", title="Agent draft", principal=agent(AGENT))
 
     response = client.post(
         "/api/review/accept",
@@ -1018,7 +1021,7 @@ def test_the_spa_itself_is_not_broken_by_any_of_this(client, fresh_db):
         json={"type": "note", "title": "From the UI"},
     )
     assert created.status_code == 200
-    assert created.json()["created_by"] == service.ACTOR_HUMAN
+    assert created.json()["created_by"] == OWNER_ACTOR
 
     # `make web-dev` proxies from :5700 with the browser's own Host and Origin,
     # and ports are not compared, so the dev server keeps working.
@@ -1399,7 +1402,7 @@ def test_edges_list_and_create(client, fresh_db):
             json={"src_id": a.id, "dst_id": b.id, "type": "relates_to", "confidence": 0.5},
         )
     )
-    assert (edge["state"], edge["created_by"]) == ("active", service.ACTOR_HUMAN)
+    assert (edge["state"], edge["created_by"]) == ("active", OWNER_ACTOR)
 
     listing = _ok(client.get(f"/api/edges?node_id={a.id}&type=relates_to"))
     assert listing["count"] == 1
@@ -1452,8 +1455,8 @@ def test_graph_subgraph_and_path(client, fresh_db):
 
 
 def test_review_queue_filters_and_batch_forms(client, fresh_db):
-    first = service.create_node(type="note", title="One", actor=AGENT)
-    second = service.create_node(type="note", title="Two", actor="agent:other")
+    first = service.create_node(type="note", title="One", principal=agent(AGENT))
+    second = service.create_node(type="note", title="Two", principal=agent("other"))
 
     assert _ok(client.get("/api/review/queue"))["count"] == 2
     assert _ok(client.get(f"/api/review/queue?agent={AGENT}"))["count"] == 1
@@ -1498,7 +1501,7 @@ def test_events_and_undo(client, fresh_db):
 
     events = _ok(client.get("/api/events?limit=5"))
     assert events["events"][0]["op"] == "node.create"
-    assert events["events"][0]["actor"] == service.ACTOR_HUMAN
+    assert events["events"][0]["actor"] == OWNER_ACTOR
 
     result = _ok(client.post("/api/undo", json={}))
     assert result["undone_op"] == "node.create"

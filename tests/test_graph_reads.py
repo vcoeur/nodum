@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+from helpers import agent
 
 from nodum import search as search_module
 from nodum import service
@@ -44,7 +45,7 @@ def test_neighborhood_walks_both_directions_by_depth(fresh_db):
 
 def test_neighborhood_ignores_proposed_edges(fresh_db):
     a, b, c, d, *_ = _chain()
-    service.create_edge(a.id, d.id, "relates_to", actor=AGENT)  # proposed
+    service.create_edge(a.id, d.id, "relates_to", principal=agent(AGENT))  # proposed
     subgraph = service.get_neighborhood(a.id, depth=1)
     assert d.id not in {node.id for node in subgraph.nodes}
 
@@ -173,7 +174,7 @@ def test_propose_edges_batch(fresh_db):
             {"src": a.id, "dst": d.id},  # missing edge_type
             "not an object",
         ],
-        actor=AGENT,
+        principal=agent(AGENT),
     )
     assert len(result.created) == 1
     assert result.created[0].state == "proposed"

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+from helpers import OWNER_ACTOR, agent
 
 from nodum import db, search, service
 
@@ -71,7 +72,9 @@ def test_query_punctuation_and_operators_are_literal_terms(fresh_db):
 
 
 def test_proposed_and_archived_nodes_are_filtered_by_default(fresh_db):
-    proposed = service.create_node(type="note", title="P", content="zebra stripes", actor="agent:x")
+    proposed = service.create_node(
+        type="note", title="P", content="zebra stripes", principal=agent("x")
+    )
     archived = service.create_node(type="note", title="A", content="zebra hooves")
     service.transition(archived.id, "archive")
     active = service.create_node(type="note", title="N", content="zebra mane")
@@ -97,8 +100,10 @@ def test_type_filter(fresh_db):
 
 def test_created_by_filter(fresh_db):
     human = service.create_node(type="note", title="H", content="anaerobic digestion")
-    service.create_node(type="note", title="B", content="anaerobic fermentation", actor="agent:x")
-    mine = search.search("anaerobic", created_by="human")
+    service.create_node(
+        type="note", title="B", content="anaerobic fermentation", principal=agent("x")
+    )
+    mine = search.search("anaerobic", created_by=OWNER_ACTOR)
     assert [hit.node_id for hit in mine.hits] == [human.id]
 
 

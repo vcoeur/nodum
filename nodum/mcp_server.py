@@ -41,7 +41,7 @@ from mcp.server.fastmcp.utilities.types import Image
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel
 
-from nodum import assets, service
+from nodum import assets, auth, service
 from nodum import search as search_module
 
 #: Tool annotations per registered tier (design §8): reads are read-only;
@@ -97,7 +97,7 @@ def _validate_actor(actor: str) -> str:
         raise ValueError(
             f"invalid --actor {actor!r}: the MCP server serves external agents only — "
             "the actor must be 'agent:<name>' (e.g. 'agent:researcher'), never "
-            f"{service.ACTOR_HUMAN!r} or an empty/unprefixed name"
+            "'human' or an empty/unprefixed name"
         )
     return actor
 
@@ -127,6 +127,11 @@ def create_server(*, actor: str = "agent:mcp", db_path: str | Path | None = None
         ValueError: If ``actor`` is not of the form ``agent:<name>``.
     """
     _validate_actor(actor)
+    # INTERIM (Q13 surfaces task): the principal is loaded with its grant set
+    # but NO credential is verified — this surface authenticates nothing yet.
+    # Token verification (NODUM_AGENT_TOKEN) lands in the surfaces task; do
+    # not read this as authentication until then.
+    principal = auth.agent_principal(actor.removeprefix("agent:"), path=db_path)
     server = FastMCP(
         "nodum",
         instructions=(
@@ -145,12 +150,12 @@ def create_server(*, actor: str = "agent:mcp", db_path: str | Path | None = None
     @server.tool(annotations=_READ)
     def get_node(id: str, depth: int = 1) -> dict[str, Any]:
         """Fetch a node plus its active-edge neighborhood out to `depth` hops (0 = node alone)."""
-        return _dump(service.get_neighborhood(id, depth=depth, path=db_path))
+        return _dump(service.get_neighborhood(id, depth=depth, principal=principal, path=db_path))
 
     @server.tool(annotations=_READ)
     def get_children(id: str) -> list[dict[str, Any]]:
         """List a node's children in position order (the document tree)."""
-        return _dump(service.list_children(id, path=db_path))
+        return _dump(service.list_children(id, principal=principal, path=db_path))
 
     @server.tool(annotations=_READ)
     def search(
@@ -184,6 +189,7 @@ def create_server(*, actor: str = "agent:mcp", db_path: str | Path | None = None
             created_after=filters.pop("created_after", None),
             created_before=filters.pop("created_before", None),
             expand=expand,
+            principal=principal,
             path=db_path,
         )
         return _dump(result)
@@ -202,7 +208,12 @@ def create_server(*, actor: str = "agent:mcp", db_path: str | Path | None = None
         """
         return _dump(
             service.traverse(
-                start_id, edge_types=edge_types, depth=depth, direction=direction, path=db_path
+                start_id,
+                edge_types=edge_types,
+                depth=depth,
+                direction=direction,
+                principal=principal,
+                path=db_path,
             )
         )
 
@@ -219,17 +230,17 @@ def create_server(*, actor: str = "agent:mcp", db_path: str | Path | None = None
     @server.tool(annotations=_READ)
     def find_path(a: str, b: str) -> dict[str, Any]:
         """Find the shortest path between two nodes over active edges (any type)."""
-        return _dump(service.find_path(a, b, path=db_path))
+        return _dump(service.find_path(a, b, principal=principal, path=db_path))
 
     @server.tool(annotations=_READ)
     def history(node_id: str) -> list[dict[str, Any]]:
         """List a node's version history (applied snapshots and proposed/rejected updates)."""
-        return _dump(service.history(node_id, path=db_path))
+        return _dump(service.history(node_id, principal=principal, path=db_path))
 
     @server.tool(annotations=_READ)
     def diff(a: int, b: int) -> dict[str, Any]:
         """Unified diff between two versions of one node (ids from `history`)."""
-        return _dump(service.diff_versions(a, b, path=db_path))
+        return _dump(service.diff_versions(a, b, principal=principal, path=db_path))
 
     @server.tool(annotations=_READ, structured_output=False)
     def get_asset(id_or_hash: str, rendition: str = "preview") -> list[Any]:
@@ -282,7 +293,7 @@ def create_server(*, actor: str = "agent:mcp", db_path: str | Path | None = None
                 content=content,
                 parent_id=parent,
                 props=props,
-                actor=actor,
+                principal=principal,
                 path=db_path,
             )
         )
@@ -309,7 +320,7 @@ def create_server(*, actor: str = "agent:mcp", db_path: str | Path | None = None
             kwargs["content"] = content
         if props is not None:
             kwargs["props"] = props
-        return _dump(service.update_node(id, actor=actor, path=db_path, **kwargs))
+        return _dump(service.update_node(id, principal=principal, path=db_path, **kwargs))
 
     @server.tool(annotations=_ADDITIVE)
     def link(
@@ -326,7 +337,13 @@ def create_server(*, actor: str = "agent:mcp", db_path: str | Path | None = None
         """
         return _dump(
             service.create_edge(
-                src, dst, edge_type, props=props, confidence=confidence, actor=actor, path=db_path
+                src,
+                dst,
+                edge_type,
+                props=props,
+                confidence=confidence,
+                principal=principal,
+                path=db_path,
             )
         )
 
@@ -336,7 +353,7 @@ def create_server(*, actor: str = "agent:mcp", db_path: str | Path | None = None
 
         Bad suggestions are reported in `failed` by index; the rest still write.
         """
-        return _dump(service.propose_edges(suggestions, actor=actor, path=db_path))
+        return _dump(service.propose_edges(suggestions, principal=principal, path=db_path))
 
     # ── Review tier (§8.1 "write (human)") is deliberately absent ──
     # `accept`/`reject` are not registered here: accepting makes proposed

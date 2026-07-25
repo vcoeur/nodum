@@ -21,7 +21,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from nodum import db
+from nodum import auth, db
 from nodum.migrations import MAIN_SPACE_ID, META_SPACE_ID
 from nodum.models import (
     BatchTransitionOut,
@@ -42,10 +42,8 @@ from nodum.models import (
     UndoResult,
     VersionOut,
 )
-
-#: Actor value for human-driven writes (the CLI default). Human writes land in
-#: ``active``; every other actor's writes land in ``proposed``.
-ACTOR_HUMAN = "human"
+from nodum.principal import EDIT, READ, SUGGEST, Principal
+from nodum.store import GrantNotPermitted, Store
 
 #: Allowed state values shared by nodes and edges.
 STATES = ("proposed", "active", "archived")
@@ -57,26 +55,10 @@ TRANSITIONS = {
     "archive": ("active", "archived"),
 }
 
-#: The transitions that *review* a proposal. They are the human's tier: they
-#: turn proposed structure into live structure (and archive what it replaces),
-#: so no ``agent:*`` actor may perform them (design §8.1/§8.2).
+#: The transitions that *review* a proposal. Reviewing turns proposed
+#: structure into live structure (and archives what it replaces), so it needs
+#: a human — or an ``edit`` grant on the item's space (Q13 note 03 Q1).
 REVIEW_ACTIONS = ("accept", "reject")
-
-#: Operations reserved to the ``human`` actor, each mapped to why it is not
-#: delegable. They either write or remove **live** state directly — precisely
-#: what an agent may never reach on its own (design §8.1/§8.2). A review rule
-#: would mean nothing if the same agent could reach the same live state
-#: through the back door of an archive or an undo.
-HUMAN_ONLY_ACTIONS = {
-    "accept": "review is the human tier and is never delegated to an agent",
-    "reject": "review is the human tier and is never delegated to an agent",
-    "archive": "archiving retires live structure, which is the human's call",
-    "undo": (
-        "undo writes an event's prior payload back verbatim — including "
-        "state 'active' — so delegating it would hand an agent the live state "
-        "it may not write directly"
-    ),
-}
 
 #: The node fields a version snapshots, and the only fields a proposed update
 #: may name.
@@ -143,12 +125,10 @@ class InvalidTransition(ValueError):
     """Raised when a state transition is not allowed from the current state."""
 
 
-class ReviewNotPermitted(PermissionError):
-    """Raised when a non-human actor tries to review, archive, or undo.
-
-    The human tier is :data:`HUMAN_ONLY_ACTIONS`: accepting or rejecting a
-    proposal, archiving live state, and undoing an event.
-    """
+#: The write-gate failure. Kept under its historical name as an alias: the
+#: gate is no longer "human only" but "human, or the grant that covers this
+#: item" (Q13 note 03 Q1) — :class:`GrantNotPermitted` says it better.
+ReviewNotPermitted = GrantNotPermitted
 
 
 class UndoNotPossible(ValueError):
@@ -163,6 +143,17 @@ def _connect(path: str | Path | None) -> sqlite3.Connection:
     conn = db.connect(path)
     db.init_db(conn)
     return conn
+
+
+def _principal_or_owner(principal: Principal | None, path: str | Path | None) -> Principal:
+    """Resolve the trusted-local default: no principal means the owner.
+
+    The service layer is not a network boundary — adapters authenticate and
+    pass the principal they minted; tests and one-shot scripts use the
+    default. The Q13 surfaces task's AST guard asserts the adapters never
+    rely on it.
+    """
+    return principal if principal is not None else auth.owner_principal(path=path)
 
 
 def _row_dict(row: sqlite3.Row) -> dict[str, Any]:
@@ -265,70 +256,64 @@ def _proposed_fields(version: dict[str, Any]) -> list[str]:
     return [name for name in json.loads(raw) if name in VERSION_FIELDS]
 
 
-def _resolve_node_type(conn: sqlite3.Connection, type_ref: str) -> str:
+def _resolve_node_type(
+    conn: sqlite3.Connection, type_ref: str, principal: Principal | None = None
+) -> str:
     """Resolve a node-type id or name to its id, or raise :class:`TypeNotFound`.
 
     Types are nodes (Q13, migration ``0009``): a node type is an active node
     whose own type is the ``type`` metaclass root, distinguished from edge
-    types by ``type_kind`` in props.
+    types by ``type_kind`` in props. With ``principal``, a type in a space
+    the principal cannot read does not resolve — the catalog is not a leak
+    channel either.
     """
     row = conn.execute(
-        "SELECT id FROM nodes WHERE (id = ? OR title = ?) AND type_id = 'type'"
+        "SELECT id, space_id FROM nodes WHERE (id = ? OR title = ?) AND type_id = 'type'"
         " AND json_extract(props, '$.type_kind') = 'node' AND state = 'active'",
         (type_ref, type_ref),
     ).fetchone()
-    if row is None:
+    if row is None or (principal is not None and principal.level_on(row["space_id"]) < READ):
         raise TypeNotFound(f"unknown node type: {type_ref}")
     return row["id"]
 
 
-def _resolve_edge_type(conn: sqlite3.Connection, type_ref: str) -> str:
-    """Resolve an edge-type id or name to its id, or raise :class:`TypeNotFound`."""
+def _resolve_edge_type(
+    conn: sqlite3.Connection, type_ref: str, principal: Principal | None = None
+) -> tuple[str, str | None]:
+    """Resolve an edge-type id or name to ``(id, space_id)``, or raise.
+
+    The space comes back because a cross-space edge's type node must live in
+    meta (the one structural rule, enforced in :func:`_create_edge_in_conn`).
+    The same read check as :func:`_resolve_node_type` applies.
+    """
     row = conn.execute(
-        "SELECT id FROM nodes WHERE (id = ? OR title = ?) AND type_id = 'type'"
+        "SELECT id, space_id FROM nodes WHERE (id = ? OR title = ?) AND type_id = 'type'"
         " AND json_extract(props, '$.type_kind') = 'edge' AND state = 'active'",
         (type_ref, type_ref),
     ).fetchone()
-    if row is None:
+    if row is None or (principal is not None and principal.level_on(row["space_id"]) < READ):
         raise TypeNotFound(f"unknown edge type: {type_ref}")
+    return row["id"], row["space_id"]
+
+
+def _resolve_space(conn: sqlite3.Connection, space_ref: str) -> str:
+    """Resolve a space id or name to its id, or raise :class:`TypeNotFound`.
+
+    Spaces are nodes of builtin type ``space`` (Q13 note 03 Q7).
+    """
+    row = conn.execute(
+        "SELECT id FROM nodes WHERE (id = ? OR title = ?) AND type_id = 'space'"
+        " AND state = 'active'",
+        (space_ref, space_ref),
+    ).fetchone()
+    if row is None:
+        raise TypeNotFound(f"unknown space: {space_ref}")
     return row["id"]
-
-
-def _default_state(actor: str) -> str:
-    """Return the initial write state for an actor: humans active, agents proposed."""
-    return "active" if actor == ACTOR_HUMAN else "proposed"
 
 
 def _create_op(state: str) -> str:
     """Name a create-op after the state it lands in (``create`` vs ``propose``)."""
     return "create" if state == "active" else "propose"
-
-
-def _require_human_reviewer(actor: str, action: str) -> None:
-    """Refuse a :data:`HUMAN_ONLY_ACTIONS` operation by anything but the human.
-
-    Every gated action reaches live state (design §8.1/§8.2). Accepting turns
-    proposed structure into live structure — and archives whatever that
-    structure replaces — whether the proposal is the actor's own or another
-    agent's; archiving retires live structure; undo writes an event's prior
-    payload back verbatim, which is how an agent could otherwise restore
-    ``state = 'active'`` it was never allowed to write. Enforcing all of them
-    here, at the choke point each one passes through, keeps the guarantee
-    structural rather than adapter-deep.
-
-    Args:
-        actor: Who is performing the operation.
-        action: The operation name (only :data:`HUMAN_ONLY_ACTIONS` are gated).
-
-    Raises:
-        ReviewNotPermitted: If ``action`` is gated and ``actor`` is not
-            :data:`ACTOR_HUMAN`.
-    """
-    reason = HUMAN_ONLY_ACTIONS.get(action)
-    if reason is not None and actor != ACTOR_HUMAN:
-        raise ReviewNotPermitted(
-            f"only the {ACTOR_HUMAN!r} actor may {action}; got {actor!r} — {reason}"
-        )
 
 
 # ── Event log and versions ────────────────────────────────────────────────────
@@ -377,23 +362,26 @@ def _write_version(
 # ── Wikilink materialisation ──────────────────────────────────────────────────
 
 
-def _resolve_wikilink(conn: sqlite3.Connection, target: str) -> str | None:
-    """Resolve a ``[[target]]`` to a node id, or ``None`` when unresolvable.
+def _resolve_wikilink(conn: sqlite3.Connection, target: str, store: Store) -> str | None:
+    """Resolve a ``[[target]]` to a node id, or ``None`` when unresolvable.
 
     Resolution order: exact node id first, then exact title match among
-    non-archived nodes (oldest first when several share a title).
+    non-archived nodes (oldest first when several share a title). Targets
+    outside the principal's read set do not resolve — a wikilink must not
+    probe the existence of a node the writer cannot see.
     """
-    row = conn.execute("SELECT id FROM nodes WHERE id = ?", (target,)).fetchone()
+    scope, params = store.node_scope()
+    row = conn.execute(f"SELECT id FROM nodes WHERE id = ?{scope}", (target, *params)).fetchone()
     if row is not None:
         return row["id"]
     row = conn.execute(
-        """
+        f"""
         SELECT id FROM nodes
-        WHERE title = ? AND state != 'archived'
+        WHERE title = ? AND state != 'archived'{scope}
         ORDER BY created_at, rowid
         LIMIT 1
         """,
-        (target,),
+        (target, *params),
     ).fetchone()
     return row["id"] if row is not None else None
 
@@ -402,6 +390,7 @@ def _materialize_mentions(
     conn: sqlite3.Connection,
     node_row: sqlite3.Row | dict[str, Any],
     actor: str,
+    store: Store,
     cycle_id: str | None = None,
 ) -> None:
     """Sync a node's ``[[wikilinks]]`` with its pending/active ``mentions`` edges.
@@ -410,11 +399,11 @@ def _materialize_mentions(
     linked target, archives edges whose target text disappeared, and silently
     skips unresolvable targets (no dangling edges). Self-links are ignored.
 
-    A materialised edge lands in the state its **actor** is allowed to write —
-    ``active`` for the human, ``proposed`` for an agent (:func:`_default_state`).
-    A wikilink is structure like any other: an agent writing ``[[Target]]``
-    must not thereby attach live structure to someone else's active node; the
-    pending edge goes live when a human accepts the proposing node
+    A materialised edge lands in the state the writer's grants allow on both
+    endpoint spaces (``active`` on edit, ``proposed`` on suggest); a target
+    the writer may not link to — unreadable, or under-granted — is skipped
+    rather than failing the write (:func:`Store.edge_landing_state`). A
+    pending edge goes live when a reviewer accepts the proposing node
     (:func:`_activate_pending_mentions`) or the edge itself.
 
     Idempotent: re-running on unchanged content changes nothing, whichever
@@ -423,11 +412,20 @@ def _materialize_mentions(
     """
     node = dict(node_row)
     targets = set(WIKILINK_RE.findall(node["content"] or ""))
-    resolved = {
-        dst
-        for target in targets
-        if (dst := _resolve_wikilink(conn, target)) is not None and dst != node["id"]
-    }
+    resolved: set[str] = set()
+    landing: dict[str, str] = {}
+    for target in targets:
+        dst = _resolve_wikilink(conn, target, store)
+        if dst is None or dst == node["id"]:
+            continue
+        dst_space = conn.execute("SELECT space_id FROM nodes WHERE id = ?", (dst,)).fetchone()[
+            "space_id"
+        ]
+        try:
+            landing[dst] = store.edge_landing_state(node["space_id"], dst_space, META_SPACE_ID)
+        except GrantNotPermitted:
+            continue  # no grant to link there — the wikilink is skipped, not fatal
+        resolved.add(dst)
     current = conn.execute(
         """
         SELECT * FROM edges
@@ -437,7 +435,6 @@ def _materialize_mentions(
         (node["id"],),
     ).fetchall()
     current_by_dst = {edge["dst_id"]: edge for edge in current}
-    state = _default_state(actor)
 
     for dst_id in sorted(resolved - set(current_by_dst)):
         _insert_edge(
@@ -448,7 +445,7 @@ def _materialize_mentions(
             props={},
             confidence=None,
             actor=actor,
-            state=state,
+            state=landing[dst_id],
             cycle_id=cycle_id,
         )
     for dst_id, edge in current_by_dst.items():
@@ -589,35 +586,53 @@ def create_node(
     content: str = "",
     parent_id: str | None = None,
     props: dict[str, Any] | None = None,
-    actor: str = ACTOR_HUMAN,
+    space: str | None = None,
+    principal: Principal | None = None,
     path: str | Path | None = None,
 ) -> NodeOut:
     """Create a node, emit ``node.create``/``node.propose``, snapshot a version.
 
-    The initial state is ``active`` for the ``human`` actor and ``proposed``
-    otherwise. When ``parent_id`` is given the node is appended after its
+    The landing state comes from the principal's grant on the target space:
+    ``edit`` writes ``active``, ``suggest`` writes ``proposed`` (design §6 as
+    amended, Q13). When ``parent_id`` is given the node is appended after its
     siblings (``max(position) + 1.0``). Wikilinks in ``content`` are
     materialised as ``mentions`` edges.
 
     Args:
-        type: Node-type id or name (must exist in the catalog).
+        type: Node-type id or name (must resolve, and be readable).
         title: Optional display title (wikilink targets resolve against it).
         content: Canonical Markdown body.
-        parent_id: Optional parent node id (must exist).
+        parent_id: Optional parent node id (must exist, be readable, and live
+            in the same space — the document tree does not cross spaces).
         props: Free-form JSON-object metadata.
-        actor: Who is writing (``human`` or ``agent:<name>``).
+        space: Target space id or name (default: the ``main`` space).
+        principal: Who is writing (default: the trusted-local owner).
         path: Explicit database path.
 
     Returns:
         The created node.
+
+    Raises:
+        GrantNotPermitted: If the principal has no write grant on the space.
     """
     conn = _connect(path)
     try:
-        type_id = _resolve_node_type(conn, type)
+        principal = _principal_or_owner(principal, path)
+        store = Store(conn, principal)
+        actor = principal.actor_string
+        type_id = _resolve_node_type(conn, type, principal)
+        target_space = _resolve_space(conn, space) if space is not None else MAIN_SPACE_ID
         if parent_id is not None:
-            _get_node_row(conn, parent_id)
+            parent = _get_node_row(conn, parent_id)
+            if not store.node_visible(parent):
+                raise NodeNotFound(f"node not found: {parent_id}")
+            if parent["space_id"] != target_space:
+                raise ValueError(
+                    f"a node's parent must live in the same space: parent is in "
+                    f"{parent['space_id']!r}, target is {target_space!r}"
+                )
         node_id = uuid.uuid4().hex
-        state = _default_state(actor)
+        state = store.landing_state(target_space)
         if parent_id is None:
             row = conn.execute(
                 "SELECT COALESCE(MAX(position), 0) + 1.0 AS pos FROM nodes WHERE parent_id IS NULL"
@@ -636,9 +651,7 @@ def create_node(
             """,
             (
                 node_id,
-                # Grant-aware target spaces land with the scoped store (Q13
-                # step 2); until then every write goes to the default space.
-                MAIN_SPACE_ID,
+                target_space,
                 type_id,
                 parent_id,
                 position,
@@ -652,22 +665,31 @@ def create_node(
         node = _row_dict(_get_node_row(conn, node_id))
         seq = _emit(conn, actor, f"node.{_create_op(state)}", {"before": None, "after": node})
         _write_version(conn, node, actor, seq)
-        _materialize_mentions(conn, node, actor)
+        _materialize_mentions(conn, node, actor, store)
         conn.commit()
         return _node_out(node)
     finally:
         conn.close()
 
 
-def get_node(node_id: str, *, path: str | Path | None = None) -> NodeOut:
+def get_node(
+    node_id: str, *, principal: Principal | None = None, path: str | Path | None = None
+) -> NodeOut:
     """Fetch one node by id.
 
     Raises:
-        NodeNotFound: If the id does not resolve.
+        NodeNotFound: If the id does not resolve — or the node sits in a
+            space the principal cannot read (an unreadable space does not
+            exist, Q13 note 03).
     """
     conn = _connect(path)
     try:
-        return _node_out(_get_node_row(conn, node_id))
+        principal = _principal_or_owner(principal, path)
+        store = Store(conn, principal)
+        row = _get_node_row(conn, node_id)
+        if not store.node_visible(row):
+            raise NodeNotFound(f"node not found: {node_id}")
+        return _node_out(row)
     finally:
         conn.close()
 
@@ -678,7 +700,7 @@ def update_node(
     title: Any = _UNSET,
     content: Any = _UNSET,
     props: Any = _UNSET,
-    actor: str = ACTOR_HUMAN,
+    principal: Principal | None = None,
     path: str | Path | None = None,
 ) -> NodeOut | VersionOut:
     """Update a node's title/content/props — or propose the update.
@@ -703,12 +725,20 @@ def update_node(
     """
     conn = _connect(path)
     try:
-        before = _row_dict(_get_node_row(conn, node_id))
+        principal = _principal_or_owner(principal, path)
+        store = Store(conn, principal)
+        actor = principal.actor_string
+        before_row = _get_node_row(conn, node_id)
+        if not store.node_visible(before_row):
+            raise NodeNotFound(f"node not found: {node_id}")
+        before = _row_dict(before_row)
+        if not principal.is_human and principal.level_on(before["space_id"]) < SUGGEST:
+            raise GrantNotPermitted(f"{actor} has no write grant on space {before['space_id']!r}")
         new_title = before["title"] if title is _UNSET else title
         new_content = before["content"] if content is _UNSET else content
         new_props = before["props"] if props is _UNSET else json.dumps(props, ensure_ascii=False)
-        if actor != ACTOR_HUMAN:
-            # Agent path: stage the edit as a proposed version (design §8.1).
+        if principal.level_on(before["space_id"]) < EDIT:
+            # Suggest path: stage the edit as a proposed version (design §8.1).
             # The event precedes the insert so the version can point at it.
             given = dict(zip(VERSION_FIELDS, (title, content, props), strict=True))
             fields = [name for name, value in given.items() if value is not _UNSET]
@@ -758,7 +788,7 @@ def update_node(
         seq = _emit(conn, actor, "node.update", {"before": before, "after": after})
         _write_version(conn, after, actor, seq)
         if content is not _UNSET:
-            _materialize_mentions(conn, after, actor)
+            _materialize_mentions(conn, after, actor, store)
         conn.commit()
         return _node_out(after)
     finally:
@@ -771,6 +801,7 @@ def list_nodes(
     state: str | None = None,
     parent_id: str | None = None,
     include_meta: bool = False,
+    principal: Principal | None = None,
     limit: int = 500,
     path: str | Path | None = None,
 ) -> list[NodeOut]:
@@ -778,13 +809,21 @@ def list_nodes(
 
     Ordered by ``created_at``; ``limit`` caps the result (default 500).
     Meta-space nodes (the type vocabulary, spaces) are excluded unless
-    ``include_meta`` — content listings are not the type catalog.
+    ``include_meta`` — content listings are not the type catalog. An agent
+    principal is additionally confined to its read set (which may include
+    meta, e.g. for the type vocabulary).
     """
     conn = _connect(path)
     try:
+        principal = _principal_or_owner(principal, path)
+        store = Store(conn, principal)
         clauses: list[str] = []
         params: list[Any] = []
-        if not include_meta:
+        scope, scope_params = store.node_scope()
+        if scope:
+            clauses.append(scope.removeprefix(" AND "))
+            params.extend(scope_params)
+        elif not include_meta:
             clauses.append("space_id != ?")
             params.append(META_SPACE_ID)
         if type is not None:
@@ -808,17 +847,25 @@ def list_nodes(
         conn.close()
 
 
-def list_children(node_id: str, *, path: str | Path | None = None) -> list[NodeOut]:
+def list_children(
+    node_id: str, *, principal: Principal | None = None, path: str | Path | None = None
+) -> list[NodeOut]:
     """List a node's children in ``position`` order.
 
     Raises:
-        NodeNotFound: If the id does not resolve.
+        NodeNotFound: If the id does not resolve, or is not readable.
     """
     conn = _connect(path)
     try:
-        _get_node_row(conn, node_id)
+        principal = _principal_or_owner(principal, path)
+        store = Store(conn, principal)
+        parent = _get_node_row(conn, node_id)
+        if not store.node_visible(parent):
+            raise NodeNotFound(f"node not found: {node_id}")
+        scope, params = store.node_scope()
         rows = conn.execute(
-            "SELECT * FROM nodes WHERE parent_id = ? ORDER BY position", (node_id,)
+            f"SELECT * FROM nodes WHERE parent_id = ?{scope} ORDER BY position",
+            (node_id, *params),
         ).fetchall()
         return [_node_out(row) for row in rows]
     finally:
@@ -846,7 +893,13 @@ def _match_key(text: str) -> str:
     return _normalized(_normalized(text).casefold())
 
 
-def suggest_links(prefix: str, *, limit: int = 20, path: str | Path | None = None) -> list[NodeOut]:
+def suggest_links(
+    prefix: str,
+    *,
+    limit: int = 20,
+    principal: Principal | None = None,
+    path: str | Path | None = None,
+) -> list[NodeOut]:
     """Suggest ``[[wikilink]]`` targets whose title starts with ``prefix``.
 
     Backs the editor's ``[[`` autocomplete. It reads the ``nodes`` table
@@ -882,12 +935,22 @@ def suggest_links(prefix: str, *, limit: int = 20, path: str | Path | None = Non
         raise ValueError(f"limit must be >= 1, got {limit}")
     conn = _connect(path)
     try:
+        principal = _principal_or_owner(principal, path)
+        store = Store(conn, principal)
         placeholders = ",".join("?" * len(SUGGEST_STATES))
-        candidates = conn.execute(
-            f"SELECT id, title FROM nodes WHERE title IS NOT NULL AND state IN ({placeholders})"
-            " AND space_id != ?",
-            (*SUGGEST_STATES, META_SPACE_ID),
-        ).fetchall()
+        scope, scope_params = store.node_scope()
+        if scope:
+            candidates = conn.execute(
+                f"SELECT id, title FROM nodes WHERE title IS NOT NULL"
+                f" AND state IN ({placeholders}){scope}",
+                (*SUGGEST_STATES, *scope_params),
+            ).fetchall()
+        else:
+            candidates = conn.execute(
+                f"SELECT id, title FROM nodes WHERE title IS NOT NULL AND state IN ({placeholders})"
+                " AND space_id != ?",
+                (*SUGGEST_STATES, META_SPACE_ID),
+            ).fetchall()
         folded = _match_key(prefix)
         typed = _normalized(prefix)
         matches = [row for row in candidates if _match_key(row["title"]).startswith(folded)]
@@ -914,19 +977,26 @@ def _create_edge_in_conn(
     props: dict[str, Any] | None,
     confidence: float | None,
     actor: str,
+    store: Store,
 ) -> dict[str, Any]:
     """Validate and write one edge inside an open connection (no commit).
 
-    Shared by :func:`create_edge` and :func:`propose_edges`. The landing
-    state follows the actor rule (grant-aware levels land with the scoped
-    store, Q13 step 2).
+    Shared by :func:`create_edge` and :func:`propose_edges`. An endpoint the
+    principal cannot read is *not found* (an unreadable space does not
+    exist); the landing state needs the matching grant on **both** endpoint
+    spaces, and a cross-space edge's type node must live in meta
+    (:func:`Store.edge_landing_state` — Q13 note 03).
     """
-    _get_node_row(conn, src_id)
-    _get_node_row(conn, dst_id)
-    type_id = _resolve_edge_type(conn, type)
+    src = _get_node_row(conn, src_id)
+    dst = _get_node_row(conn, dst_id)
+    if not store.node_visible(src):
+        raise NodeNotFound(f"node not found: {src_id}")
+    if not store.node_visible(dst):
+        raise NodeNotFound(f"node not found: {dst_id}")
+    type_id, type_space = _resolve_edge_type(conn, type, store.principal)
     if confidence is not None and not 0 <= confidence <= 1:
         raise ValueError(f"confidence must be between 0 and 1, got {confidence}")
-    state = _default_state(actor)
+    state = store.edge_landing_state(src["space_id"], dst["space_id"], type_space)
     return _insert_edge(
         conn,
         src_id=src_id,
@@ -946,23 +1016,37 @@ def create_edge(
     *,
     props: dict[str, Any] | None = None,
     confidence: float | None = None,
-    actor: str = ACTOR_HUMAN,
+    principal: Principal | None = None,
     path: str | Path | None = None,
 ) -> EdgeOut:
     """Create a typed, directed edge and emit ``edge.create``/``edge.propose``.
 
-    Both endpoints must exist. The initial state follows the actor rule
-    (``active`` for humans, ``proposed`` otherwise).
+    Both endpoints must exist and be readable. The landing state needs the
+    matching grant on both endpoint spaces (``edit`` → ``active``,
+    ``suggest`` → ``proposed``); a cross-space edge's type node must live in
+    meta.
 
     Raises:
-        NodeNotFound: If either endpoint does not resolve.
+        NodeNotFound: If either endpoint does not resolve — or is not
+            readable by the principal.
         TypeNotFound: If the edge type does not resolve.
+        GrantNotPermitted: If the grants on the endpoint spaces do not cover
+            the write, or a cross-space edge uses a non-meta type.
         ValueError: If ``confidence`` is outside ``[0, 1]``.
     """
     conn = _connect(path)
     try:
+        principal = _principal_or_owner(principal, path)
+        store = Store(conn, principal)
         row = _create_edge_in_conn(
-            conn, src_id, dst_id, type, props=props, confidence=confidence, actor=actor
+            conn,
+            src_id,
+            dst_id,
+            type,
+            props=props,
+            confidence=confidence,
+            actor=principal.actor_string,
+            store=store,
         )
         conn.commit()
         return _edge_out(row)
@@ -973,7 +1057,7 @@ def create_edge(
 def propose_edges(
     suggestions: list[dict[str, Any]],
     *,
-    actor: str = ACTOR_HUMAN,
+    principal: Principal | None = None,
     path: str | Path | None = None,
 ) -> ProposeEdgesOut:
     """Write a batch of edge suggestions, one event per edge (design §8.1).
@@ -989,6 +1073,8 @@ def propose_edges(
     """
     conn = _connect(path)
     try:
+        principal = _principal_or_owner(principal, path)
+        store = Store(conn, principal)
         created: list[EdgeOut] = []
         failed: list[ItemFailure] = []
         for index, suggestion in enumerate(suggestions):
@@ -1003,12 +1089,13 @@ def propose_edges(
                     str(suggestion["edge_type"]),
                     props=suggestion.get("props"),
                     confidence=suggestion.get("confidence"),
-                    actor=actor,
+                    actor=principal.actor_string,
+                    store=store,
                 )
                 created.append(_edge_out(row))
             except KeyError as exc:
                 failed.append(ItemFailure(index=index, error=f"missing key: {exc.args[0]}"))
-            except (NodeNotFound, TypeNotFound, ValueError) as exc:
+            except (NodeNotFound, TypeNotFound, ValueError, GrantNotPermitted) as exc:
                 failed.append(ItemFailure(index=index, error=str(exc)))
         conn.commit()
         return ProposeEdgesOut(created=created, failed=failed)
@@ -1021,23 +1108,31 @@ def list_edges(
     node_id: str | None = None,
     type: str | None = None,
     state: str | None = None,
+    principal: Principal | None = None,
     limit: int = 500,
     path: str | Path | None = None,
 ) -> list[EdgeOut]:
     """List edges, optionally filtered by incident node, type, or state.
 
-    ``node_id`` matches edges in either direction.
+    ``node_id`` matches edges in either direction. An agent principal sees
+    only edges whose endpoints are both readable.
     """
     conn = _connect(path)
     try:
+        principal = _principal_or_owner(principal, path)
+        store = Store(conn, principal)
         clauses: list[str] = []
         params: list[Any] = []
+        scope, scope_params = store.edge_scope()
+        if scope:
+            clauses.append(scope.removeprefix(" AND "))
+            params.extend(scope_params)
         if node_id is not None:
             clauses.append("(src_id = ? OR dst_id = ?)")
             params.extend([node_id, node_id])
         if type is not None:
             clauses.append("type_id = ?")
-            params.append(_resolve_edge_type(conn, type))
+            params.append(_resolve_edge_type(conn, type)[0])
         if state is not None:
             if state not in STATES:
                 raise ValueError(f"state must be one of {STATES}, got {state!r}")
@@ -1058,6 +1153,7 @@ def _transition_version(
     before: dict[str, Any],
     action: str,
     actor: str,
+    store: Store,
     reason: str | None = None,
 ) -> dict[str, Any]:
     """Accept or reject a proposed version inside an open connection.
@@ -1097,7 +1193,7 @@ def _transition_version(
             },
         )
         if "content" in fields:
-            _materialize_mentions(conn, node_after, actor)
+            _materialize_mentions(conn, node_after, actor, store)
     else:  # reject
         conn.execute("UPDATE versions SET state = 'archived' WHERE id = ?", (version_id,))
         archived = _row_dict(_get_version_row(conn, version_id))
@@ -1108,11 +1204,25 @@ def _transition_version(
     return _row_dict(_get_version_row(conn, version_id))
 
 
+def _item_spaces(conn: sqlite3.Connection, kind: str, row: dict[str, Any]) -> set[str | None]:
+    """The spaces a transition touches: the node's, both endpoints' for an
+    edge, the node's for a version (typed through it)."""
+    if kind == "node":
+        return {row["space_id"]}
+    if kind == "version":
+        node = _get_node_row(conn, row["node_id"])
+        return {node["space_id"]}
+    src = _get_node_row(conn, row["src_id"])
+    dst = _get_node_row(conn, row["dst_id"])
+    return {src["space_id"], dst["space_id"]}
+
+
 def _transition_row(
     conn: sqlite3.Connection,
     record_id: str,
     action: str,
     actor: str,
+    store: Store,
     reason: str | None = None,
 ) -> tuple[str, dict[str, Any]]:
     """Apply one state transition inside an open connection (no commit).
@@ -1122,14 +1232,15 @@ def _transition_row(
         ``"version"``.
 
     Raises:
-        ReviewNotPermitted: If a non-human actor tries to transition anything.
+        GrantNotPermitted: If the principal is not a human and holds no
+            ``edit`` grant on the item's space (both endpoint spaces for an
+            edge).
         RecordNotFound: If the id resolves to neither a node, an edge, nor a
-            version — the id alone does not say which kind was meant, so the
-            base class is what is raised.
+            version the principal can read — the id alone does not say which
+            kind was meant, so the base class is what is raised.
         InvalidTransition: If the transition is not allowed from the current
             state.
     """
-    _require_human_reviewer(actor, action)
     from_state, to_state = TRANSITIONS[action]
     row = conn.execute("SELECT * FROM nodes WHERE id = ?", (record_id,)).fetchone()
     kind = "node"
@@ -1142,13 +1253,19 @@ def _transition_row(
     if row is None:
         raise RecordNotFound(f"no node, edge, or version with id: {record_id}")
     before = _row_dict(row)
+    spaces = _item_spaces(conn, kind, before)
+    if not store.principal.is_human and not all(
+        space in (store.principal.read_spaces or ()) for space in spaces
+    ):
+        raise RecordNotFound(f"no node, edge, or version with id: {record_id}")
+    store.require_review(spaces, action)
     if before["state"] != from_state:
         raise InvalidTransition(
             f"cannot {action} a {kind} in state {before['state']!r} (requires state {from_state!r})"
         )
     if kind == "version":
         # Versions only ever sit in `proposed`; accept applies, reject archives.
-        return kind, _transition_version(conn, before, action, actor, reason=reason)
+        return kind, _transition_version(conn, before, action, actor, store, reason=reason)
     if kind == "node":
         conn.execute(
             "UPDATE nodes SET state = ?, updated_at = datetime('now') WHERE id = ?",
@@ -1171,7 +1288,7 @@ def transition(
     action: str,
     *,
     reason: str | None = None,
-    actor: str = ACTOR_HUMAN,
+    principal: Principal | None = None,
     path: str | Path | None = None,
 ) -> NodeOut | EdgeOut | VersionOut:
     """Apply a state-machine transition to a node, edge, or proposed version.
@@ -1202,7 +1319,11 @@ def transition(
         raise ValueError(f"unknown transition {action!r}; expected one of {sorted(TRANSITIONS)}")
     conn = _connect(path)
     try:
-        kind, after = _transition_row(conn, record_id, action, actor, reason=reason)
+        principal = _principal_or_owner(principal, path)
+        store = Store(conn, principal)
+        kind, after = _transition_row(
+            conn, record_id, action, principal.actor_string, store, reason=reason
+        )
         conn.commit()
         if kind == "node":
             return _node_out(after)
@@ -1305,6 +1426,7 @@ def _update_proposal_filter(
 
 def _proposal_rows(
     conn: sqlite3.Connection,
+    store: Store | None = None,
     *,
     kind: str | None = None,
     **filters: Any,
@@ -1316,14 +1438,21 @@ def _proposal_rows(
     different kinds may interleave.
     """
     node_filter, edge_filter, node_type_id = _proposal_filters(conn, **filters)
+    node_scope = edge_scope = ""
+    scope_params: list[Any] = []
+    edge_scope_params: list[Any] = []
+    if store is not None:
+        node_scope, scope_params = store.node_scope()
+        edge_scope, edge_scope_params = store.edge_scope()
     results: list[tuple[str, sqlite3.Row]] = []
     if kind in (None, "node") and node_filter is not None:
         where, params = node_filter
         results += [
             ("node", row)
             for row in conn.execute(
-                f"SELECT rowid AS _rowid, * FROM nodes WHERE {where} ORDER BY created_at, rowid",
-                params,
+                f"SELECT rowid AS _rowid, * FROM nodes WHERE {where}{node_scope}"
+                " ORDER BY created_at, rowid",
+                (*params, *scope_params),
             ).fetchall()
         ]
     if kind in (None, "edge") and edge_filter is not None:
@@ -1331,8 +1460,9 @@ def _proposal_rows(
         results += [
             ("edge", row)
             for row in conn.execute(
-                f"SELECT rowid AS _rowid, * FROM edges WHERE {where} ORDER BY created_at, rowid",
-                params,
+                f"SELECT rowid AS _rowid, * FROM edges WHERE {where}{edge_scope}"
+                " ORDER BY created_at, rowid",
+                (*params, *edge_scope_params),
             ).fetchall()
         ]
     if kind in (None, "update") and (filters.get("type") is None or node_type_id is not None):
@@ -1342,13 +1472,14 @@ def _proposal_rows(
             created_before=filters.get("created_before"),
             created_after=filters.get("created_after"),
         )
+        update_scope = node_scope.replace("space_id", "n.space_id") if node_scope else ""
         results += [
             ("update", row)
             for row in conn.execute(
                 "SELECT v.rowid AS _rowid, v.*, n.type_id AS node_type_id FROM versions v "
                 "JOIN nodes n ON n.id = v.node_id "
-                f"WHERE {where} ORDER BY v.created_at, v.rowid",
-                params,
+                f"WHERE {where}{update_scope} ORDER BY v.created_at, v.rowid",
+                (*params, *scope_params),
             ).fetchall()
         ]
     results.sort(key=lambda item: (item[1]["created_at"], item[1]["_rowid"]))
@@ -1387,6 +1518,7 @@ def list_proposals(
     kind: str | None = None,
     created_before: str | None = None,
     created_after: str | None = None,
+    principal: Principal | None = None,
     limit: int = 500,
     path: str | Path | None = None,
 ) -> list[ProposalOut]:
@@ -1410,8 +1542,11 @@ def list_proposals(
         raise ValueError(f"kind must be 'node', 'edge', or 'update', got {kind!r}")
     conn = _connect(path)
     try:
+        principal = _principal_or_owner(principal, path)
+        store = Store(conn, principal)
         rows = _proposal_rows(
             conn,
+            store,
             kind=kind,
             created_by=created_by,
             type=type,
@@ -1466,7 +1601,7 @@ def _transition_many(
     ids: list[str],
     action: str,
     *,
-    actor: str,
+    principal: Principal | None,
     reason: str | None,
     path: str | Path | None,
 ) -> BatchTransitionOut:
@@ -1474,18 +1609,21 @@ def _transition_many(
 
     A refused reviewer is *not* a per-id failure: the whole batch raises
     before any id is touched, so an agent never gets a partially applied
-    review.
+    review. Grant-refusals on individual items land in ``failed`` like any
+    other per-id error.
     """
-    _require_human_reviewer(actor, action)
     conn = _connect(path)
     try:
+        principal = _principal_or_owner(principal, path)
+        store = Store(conn, principal)
+        actor = principal.actor_string
         transitioned: list[str] = []
         failed: list[TransitionFailure] = []
         for record_id in ids:
             try:
-                _transition_row(conn, record_id, action, actor, reason=reason)
+                _transition_row(conn, record_id, action, actor, store, reason=reason)
                 transitioned.append(record_id)
-            except (RecordNotFound, InvalidTransition) as exc:
+            except (RecordNotFound, InvalidTransition, GrantNotPermitted) as exc:
                 failed.append(TransitionFailure(id=record_id, error=str(exc)))
         conn.commit()
         return BatchTransitionOut(
@@ -1496,7 +1634,7 @@ def _transition_many(
 
 
 def accept_proposals(
-    ids: list[str], *, actor: str = ACTOR_HUMAN, path: str | Path | None = None
+    ids: list[str], *, principal: Principal | None = None, path: str | Path | None = None
 ) -> BatchTransitionOut:
     """Accept proposed nodes/edges/updates by id, one event each.
 
@@ -1510,14 +1648,14 @@ def accept_proposals(
         ReviewNotPermitted: If ``actor`` is not ``human`` — review is the
             human tier, whoever filed the proposal.
     """
-    return _transition_many(ids, "accept", actor=actor, reason=None, path=path)
+    return _transition_many(ids, "accept", principal=principal, reason=None, path=path)
 
 
 def reject_proposals(
     ids: list[str],
     *,
     reason: str,
-    actor: str = ACTOR_HUMAN,
+    principal: Principal | None = None,
     path: str | Path | None = None,
 ) -> BatchTransitionOut:
     """Reject proposed nodes/edges/updates by id, one event each.
@@ -1526,10 +1664,11 @@ def reject_proposals(
     Ids that are unknown or not ``proposed`` are collected in ``failed``.
 
     Raises:
-        ReviewNotPermitted: If ``actor`` is not ``human`` — an agent may not
-            reject another agent's proposal any more than its own.
+        GrantNotPermitted: If the principal may not review an item — an agent
+            may not reject another agent's proposal any more than its own,
+            outside its edit-granted spaces.
     """
-    return _transition_many(ids, "reject", actor=actor, reason=reason, path=path)
+    return _transition_many(ids, "reject", principal=principal, reason=reason, path=path)
 
 
 def _matching_ids(conn: sqlite3.Connection, *, kind: str | None, **filters: Any) -> list[str]:
@@ -1544,7 +1683,7 @@ def accept_matching(
     kind: str | None = None,
     created_before: str | None = None,
     created_after: str | None = None,
-    actor: str = ACTOR_HUMAN,
+    principal: Principal | None = None,
     path: str | Path | None = None,
 ) -> BatchTransitionOut:
     """Accept every proposal matching the filters (e.g. one agent's whole run).
@@ -1553,9 +1692,8 @@ def accept_matching(
     its own event — the batch is a convenience, never a silent bulk update.
 
     Raises:
-        ReviewNotPermitted: If ``actor`` is not ``human``.
+        GrantNotPermitted: If the principal may not review an item.
     """
-    _require_human_reviewer(actor, "accept")
     if kind not in (None, "node", "edge", "update"):
         raise ValueError(f"kind must be 'node', 'edge', or 'update', got {kind!r}")
     conn = _connect(path)
@@ -1570,7 +1708,7 @@ def accept_matching(
         )
     finally:
         conn.close()
-    return _transition_many(ids, "accept", actor=actor, reason=None, path=path)
+    return _transition_many(ids, "accept", principal=principal, reason=None, path=path)
 
 
 def reject_matching(
@@ -1581,7 +1719,7 @@ def reject_matching(
     kind: str | None = None,
     created_before: str | None = None,
     created_after: str | None = None,
-    actor: str = ACTOR_HUMAN,
+    principal: Principal | None = None,
     path: str | Path | None = None,
 ) -> BatchTransitionOut:
     """Reject every proposal matching the filters, recording ``reason``.
@@ -1590,9 +1728,8 @@ def reject_matching(
     its own event carrying the reason.
 
     Raises:
-        ReviewNotPermitted: If ``actor`` is not ``human``.
+        GrantNotPermitted: If the principal may not review an item.
     """
-    _require_human_reviewer(actor, "reject")
     if kind not in (None, "node", "edge", "update"):
         raise ValueError(f"kind must be 'node', 'edge', or 'update', got {kind!r}")
     conn = _connect(path)
@@ -1607,11 +1744,11 @@ def reject_matching(
         )
     finally:
         conn.close()
-    return _transition_many(ids, "reject", actor=actor, reason=reason, path=path)
+    return _transition_many(ids, "reject", principal=principal, reason=reason, path=path)
 
 
 def undo(
-    seq: int | None = None, *, actor: str = ACTOR_HUMAN, path: str | Path | None = None
+    seq: int | None = None, *, principal: Principal | None = None, path: str | Path | None = None
 ) -> UndoResult:
     """Reverse one event (default: the latest non-undo event), restoring state.
 
@@ -1634,16 +1771,19 @@ def undo(
     row a later undo already removed) is refused, not forced.
 
     Raises:
-        ReviewNotPermitted: If ``actor`` is not ``human``.
+        GrantNotPermitted: If the principal is not a human.
         EventNotFound: If no event matches ``seq`` (or none exist to undo).
         UndoNotPossible: If the target row is gone or the reversal would have
             to delete rows the event never created.
         ValueError: If the target event is an ``undo`` event or a non-graph
             event.
     """
-    _require_human_reviewer(actor, "undo")
     conn = _connect(path)
     try:
+        principal = _principal_or_owner(principal, path)
+        store = Store(conn, principal)
+        store.require_human("undo")
+        actor = principal.actor_string
         # Events already reversed by a prior undo are not reversible again.
         reversed_seqs = {
             json.loads(row["payload"])["reversed_seq"]
@@ -1739,7 +1879,7 @@ def undo(
         )
         if restored is not None and kind == "node":
             _write_version(conn, restored, actor, undo_seq)
-            _materialize_mentions(conn, restored, actor)
+            _materialize_mentions(conn, restored, actor, store)
         conn.commit()
         return UndoResult(
             undone_seq=event["seq"],
@@ -1752,18 +1892,24 @@ def undo(
         conn.close()
 
 
-def history(node_id: str, *, path: str | Path | None = None) -> list[VersionOut]:
+def history(
+    node_id: str, *, principal: Principal | None = None, path: str | Path | None = None
+) -> list[VersionOut]:
     """Return a node's version snapshots in chronological order.
 
     Proposed and rejected updates appear alongside applied snapshots, marked
     by their ``state``.
 
     Raises:
-        NodeNotFound: If the id does not resolve.
+        NodeNotFound: If the id does not resolve, or is not readable.
     """
     conn = _connect(path)
     try:
-        _get_node_row(conn, node_id)
+        principal = _principal_or_owner(principal, path)
+        store = Store(conn, principal)
+        node = _get_node_row(conn, node_id)
+        if not store.node_visible(node):
+            raise NodeNotFound(f"node not found: {node_id}")
         rows = conn.execute(
             "SELECT * FROM versions WHERE node_id = ? ORDER BY id", (node_id,)
         ).fetchall()
@@ -1860,14 +2006,20 @@ def _walk(
     type_ids: list[str] | None,
     depth: int,
     direction: str,
+    store: Store,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Breadth-first walk over ``active`` edges; returns (node rows, edge rows).
 
     The root comes first in the node list; every edge the walk crossed is
     returned once (including edges between two visited nodes). Proposed and
-    archived edges are never followed — reads default to the live graph.
+    archived edges are never followed — reads default to the live graph. An
+    edge is followed only when **both** endpoints are readable by the
+    principal, so the walk never crosses into an unreadable space (Q13).
     """
-    nodes: dict[str, dict[str, Any]] = {start_id: _row_dict(_get_node_row(conn, start_id))}
+    start = _get_node_row(conn, start_id)
+    if not store.node_visible(start):
+        raise NodeNotFound(f"node not found: {start_id}")
+    nodes: dict[str, dict[str, Any]] = {start_id: _row_dict(start)}
     order = [start_id]
     edges: list[dict[str, Any]] = []
     seen_edges: set[str] = set()
@@ -1884,7 +2036,9 @@ def _walk(
         else:
             column = "src_id" if direction == "out" else "dst_id"
             where = f"{column} IN ({placeholders})"
-        sql = f"SELECT * FROM edges WHERE state = 'active' AND {where}"
+        scope, scope_params = store.edge_scope()
+        sql = f"SELECT * FROM edges WHERE state = 'active' AND {where}{scope}"
+        params += scope_params
         if type_ids:
             sql += f" AND type_id IN ({','.join('?' * len(type_ids))})"
             params += type_ids
@@ -1904,21 +2058,29 @@ def _walk(
 
 
 def get_neighborhood(
-    node_id: str, *, depth: int = 1, path: str | Path | None = None
+    node_id: str,
+    *,
+    depth: int = 1,
+    principal: Principal | None = None,
+    path: str | Path | None = None,
 ) -> SubgraphOut:
     """Return a node plus its active-edge neighborhood out to ``depth`` hops.
 
     Depth 0 returns the node alone. Design §8.1 ``get_node(id, depth)``.
 
     Raises:
-        NodeNotFound: If the id does not resolve.
+        NodeNotFound: If the id does not resolve, or is not readable.
         ValueError: If ``depth`` is negative.
     """
     if depth < 0:
         raise ValueError(f"depth must be >= 0, got {depth}")
     conn = _connect(path)
     try:
-        nodes, edges = _walk(conn, node_id, type_ids=None, depth=depth, direction="both")
+        principal = _principal_or_owner(principal, path)
+        store = Store(conn, principal)
+        nodes, edges = _walk(
+            conn, node_id, type_ids=None, depth=depth, direction="both", store=store
+        )
         return SubgraphOut(
             root=node_id,
             depth=depth,
@@ -1935,6 +2097,7 @@ def traverse(
     edge_types: list[str] | None = None,
     depth: int = 2,
     direction: str = "both",
+    principal: Principal | None = None,
     path: str | Path | None = None,
 ) -> SubgraphOut:
     """Walk the subgraph reachable from ``start_id`` over active edges.
@@ -1954,12 +2117,16 @@ def traverse(
         raise ValueError(f"depth must be >= 0, got {depth}")
     conn = _connect(path)
     try:
+        principal = _principal_or_owner(principal, path)
+        store = Store(conn, principal)
         type_ids = (
-            [_resolve_edge_type(conn, edge_type) for edge_type in edge_types]
+            [_resolve_edge_type(conn, edge_type)[0] for edge_type in edge_types]
             if edge_types
             else None
         )
-        nodes, edges = _walk(conn, start_id, type_ids=type_ids, depth=depth, direction=direction)
+        nodes, edges = _walk(
+            conn, start_id, type_ids=type_ids, depth=depth, direction=direction, store=store
+        )
         return SubgraphOut(
             root=start_id,
             depth=depth,
@@ -1979,6 +2146,7 @@ def subgraph(
     min_confidence: float | None = None,
     created_by: str | None = None,
     node_types: list[str] | None = None,
+    principal: Principal | None = None,
     limit: int = 200,
     path: str | Path | None = None,
 ) -> SubgraphOut:
@@ -2061,10 +2229,19 @@ def subgraph(
         raise ValueError(f"min_confidence must be between 0 and 1, got {min_confidence}")
     conn = _connect(path)
     try:
+        principal = _principal_or_owner(principal, path)
+        store = Store(conn, principal)
+        root = _get_node_row(conn, root_id)
+        if not store.node_visible(root):
+            raise NodeNotFound(f"node not found: {root_id}")
         edge_clauses = [f"state IN ({','.join('?' * len(states))})"]
         edge_params: list[Any] = list(states)
+        scope, scope_params = store.edge_scope()
+        if scope:
+            edge_clauses.append(scope.removeprefix(" AND "))
+            edge_params += scope_params
         if edge_types:
-            type_ids = [_resolve_edge_type(conn, edge_type) for edge_type in edge_types]
+            type_ids = [_resolve_edge_type(conn, edge_type)[0] for edge_type in edge_types]
             edge_clauses.append(f"type_id IN ({','.join('?' * len(type_ids))})")
             edge_params += type_ids
         if min_confidence is not None:
@@ -2079,7 +2256,7 @@ def subgraph(
             else None
         )
 
-        nodes: dict[str, dict[str, Any]] = {root_id: _row_dict(_get_node_row(conn, root_id))}
+        nodes: dict[str, dict[str, Any]] = {root_id: _row_dict(root)}
         order = [root_id]
         edges: list[dict[str, Any]] = []
         seen_edges: set[str] = set()
@@ -2169,21 +2346,30 @@ def subgraph(
         conn.close()
 
 
-def find_path(a_id: str, b_id: str, *, path: str | Path | None = None) -> PathOut:
+def find_path(
+    a_id: str, b_id: str, *, principal: Principal | None = None, path: str | Path | None = None
+) -> PathOut:
     """Find the shortest path between two nodes over active edges (any type).
 
     Breadth-first, direction-agnostic. When no path exists, ``found`` is
-    false and both lists are empty.
+    false and both lists are empty. The walk never crosses into a space the
+    principal cannot read — a path through one simply does not exist.
 
     Raises:
-        NodeNotFound: If either id does not resolve.
+        NodeNotFound: If either id does not resolve, or is not readable.
     """
     conn = _connect(path)
     try:
-        _get_node_row(conn, a_id)
-        _get_node_row(conn, b_id)
+        principal = _principal_or_owner(principal, path)
+        store = Store(conn, principal)
+        a = _get_node_row(conn, a_id)
+        b = _get_node_row(conn, b_id)
+        if not store.node_visible(a):
+            raise NodeNotFound(f"node not found: {a_id}")
+        if not store.node_visible(b):
+            raise NodeNotFound(f"node not found: {b_id}")
         if a_id == b_id:
-            node = _node_out(_get_node_row(conn, a_id))
+            node = _node_out(a)
             return PathOut(found=True, hops=0, nodes=[node], edges=[])
         # parent[child] = (parent node id, edge row connecting them)
         parent: dict[str, tuple[str, dict[str, Any]]] = {}
@@ -2194,11 +2380,12 @@ def find_path(a_id: str, b_id: str, *, path: str | Path | None = None) -> PathOu
             frontier_set = set(frontier)
             next_frontier: list[str] = []
             placeholders = ",".join("?" * len(frontier_set))
+            scope, scope_params = store.edge_scope()
             rows = conn.execute(
                 "SELECT * FROM edges WHERE state = 'active' "
-                f"AND (src_id IN ({placeholders}) OR dst_id IN ({placeholders})) "
+                f"AND (src_id IN ({placeholders}) OR dst_id IN ({placeholders})){scope} "
                 "ORDER BY created_at, rowid",
-                sorted(frontier_set) * 2,
+                sorted(frontier_set) * 2 + scope_params,
             ).fetchall()
             for edge_row in rows:
                 edge = _row_dict(edge_row)
@@ -2243,17 +2430,25 @@ def _render_version(version: dict[str, Any]) -> str:
     return f"title: {version['title'] or ''}\nprops: {props}\n\n{version['content']}"
 
 
-def diff_versions(a: int, b: int, *, path: str | Path | None = None) -> DiffOut:
+def diff_versions(
+    a: int, b: int, *, principal: Principal | None = None, path: str | Path | None = None
+) -> DiffOut:
     """Diff two versions of one node (design §8.1 ``diff(a, b)``).
 
     Raises:
         VersionNotFound: If either version id does not resolve.
+        NodeNotFound: If the node is not readable by the principal.
         ValueError: If the versions belong to different nodes.
     """
     conn = _connect(path)
     try:
+        principal = _principal_or_owner(principal, path)
+        store = Store(conn, principal)
         version_a = _row_dict(_get_version_row(conn, a))
         version_b = _row_dict(_get_version_row(conn, b))
+        node = _get_node_row(conn, version_a["node_id"])
+        if not store.node_visible(node):
+            raise NodeNotFound(f"node not found: {version_a['node_id']}")
         if version_a["node_id"] != version_b["node_id"]:
             raise ValueError(
                 f"versions {a} and {b} belong to different nodes "

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+from helpers import OWNER_ACTOR, agent
 
 from nodum import service
 from nodum.service import (
@@ -18,13 +19,13 @@ from nodum.service import (
 def test_create_node_defaults_active_for_human(fresh_db):
     node = service.create_node(type="note", title="Hello", content="body")
     assert node.state == "active"
-    assert node.created_by == "human"
+    assert node.created_by == OWNER_ACTOR
     assert node.type == "note"
     assert node.props == {}
 
 
 def test_create_node_proposed_for_agent(fresh_db):
-    node = service.create_node(type="note", title="Bot note", actor="agent:researcher")
+    node = service.create_node(type="note", title="Bot note", principal=agent("researcher"))
     assert node.state == "proposed"
     assert node.created_by == "agent:researcher"
 
@@ -74,7 +75,7 @@ def test_children_positions_increment(fresh_db):
 def test_list_nodes_filters(fresh_db):
     service.create_node(type="note", title="n1")
     service.create_node(type="claim", title="c1")
-    agent_node = service.create_node(type="note", title="n2", actor="agent:x")
+    agent_node = service.create_node(type="note", title="n2", principal=agent("x"))
     assert len(service.list_nodes()) == 3
     assert [n.title for n in service.list_nodes(type="note")] == ["n1", "n2"]
     assert [n.id for n in service.list_nodes(state="proposed")] == [agent_node.id]
@@ -100,7 +101,7 @@ def test_create_edge_and_list(fresh_db):
 def test_create_edge_proposed_for_agent(fresh_db):
     a = service.create_node(type="claim", title="A")
     b = service.create_node(type="claim", title="B")
-    edge = service.create_edge(a.id, b.id, "supports", actor="agent:researcher")
+    edge = service.create_edge(a.id, b.id, "supports", principal=agent("researcher"))
     assert edge.state == "proposed"
 
 
@@ -116,14 +117,14 @@ def test_create_edge_validates(fresh_db):
 
 
 def test_accept_reject_archive_transitions(fresh_db):
-    node = service.create_node(type="note", title="p", actor="agent:x")
+    node = service.create_node(type="note", title="p", principal=agent("x"))
     assert node.state == "proposed"
     accepted = service.transition(node.id, "accept")
     assert accepted.state == "active"
     archived = service.transition(node.id, "archive")
     assert archived.state == "archived"
 
-    other = service.create_node(type="note", title="q", actor="agent:x")
+    other = service.create_node(type="note", title="q", principal=agent("x"))
     rejected = service.transition(other.id, "reject")
     assert rejected.state == "archived"
 
@@ -135,7 +136,7 @@ def test_invalid_transitions_rejected(fresh_db):
     with pytest.raises(InvalidTransition):
         service.transition(node.id, "reject")
 
-    proposed = service.create_node(type="note", title="p", actor="agent:x")
+    proposed = service.create_node(type="note", title="p", principal=agent("x"))
     with pytest.raises(InvalidTransition):
         service.transition(proposed.id, "archive")
 
@@ -143,7 +144,7 @@ def test_invalid_transitions_rejected(fresh_db):
 def test_transition_applies_to_edges_too(fresh_db):
     a = service.create_node(type="claim", title="A")
     b = service.create_node(type="claim", title="B")
-    edge = service.create_edge(a.id, b.id, "supports", actor="agent:x")
+    edge = service.create_edge(a.id, b.id, "supports", principal=agent("x"))
     accepted = service.transition(edge.id, "accept")
     assert accepted.state == "active"
     assert accepted.id == edge.id

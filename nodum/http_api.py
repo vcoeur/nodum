@@ -2,8 +2,8 @@
 
 This surface is for the **human**, and it is the exact inverse of
 :mod:`nodum.mcp_server`. The MCP server forces an ``agent:<name>`` actor and
-refuses ``human``; here every write is attributed to :data:`HTTP_ACTOR` —
-``human`` — and *nothing a request carries can change that*.
+refuses ``human``; here every write is attributed to the session's human
+principal — and *nothing a request carries can change that*.
 
 **How the actor boundary is structural.** There is exactly one expression in
 this module that binds a service function's ``actor`` argument, and it lives in
@@ -93,7 +93,7 @@ from starlette.responses import FileResponse, JSONResponse, Response
 from starlette.routing import Match, Route
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from nodum import assets, service
+from nodum import assets, auth, service
 from nodum import search as search_module
 from nodum.assets import (
     AssetNotFound,
@@ -103,6 +103,7 @@ from nodum.assets import (
     UnsupportedRendition,
 )
 from nodum.envelope import envelope, list_envelope, render_json
+from nodum.principal import Principal
 from nodum.service import (
     EventNotFound,
     InvalidTransition,
@@ -112,11 +113,14 @@ from nodum.service import (
     UndoNotPossible,
 )
 
-#: The actor every write on this surface is attributed to. The HTTP API *is*
-#: the human surface (design §9), so this is a module constant rather than
-#: anything a request can influence — the inverse of the MCP server, which
-#: forces ``agent:<name>`` and refuses ``human``.
-HTTP_ACTOR = service.ACTOR_HUMAN
+
+#: INTERIM (Q13 surfaces task): the principal every write on this surface is
+#: attributed to — the owner, until password sessions land and the session
+#: middleware resolves the *actual* human per request. As before, it is a
+#: module-level binding rather than anything a request can influence.
+def _http_principal() -> Principal:
+    return auth.owner_principal()
+
 
 #: Prefix every API route carries. ``/healthz`` deliberately sits outside it:
 #: a liveness probe must answer without credentials.
@@ -357,31 +361,32 @@ except metadata.PackageNotFoundError:  # pragma: no cover - uninstalled source c
 
 
 def _write(operation: Any, /, *args: Any, **kwargs: Any) -> Any:
-    """Call a service write as :data:`HTTP_ACTOR` — the only actor this surface has.
+    """Call a service write as the HTTP principal — the only one this surface has.
 
     Every write, review, archive, and undo handler goes through here,
-    and this is the **one** place in the module that binds ``actor`` at all. A
-    caller cannot supply one: an ``actor`` keyword arriving here would mean a
-    handler forwarded request data wholesale, so it is refused rather than
-    honoured and no request field can ever reach the service as an identity.
+    and this is the **one** place in the module that binds ``principal`` at
+    all. A caller cannot supply one: a ``principal`` (or legacy ``actor``)
+    keyword arriving here would mean a handler forwarded request data
+    wholesale, so it is refused rather than honoured and no request field can
+    ever reach the service as an identity.
 
     Args:
         operation: The :mod:`nodum.service` function to invoke.
         *args: Positional arguments for it.
-        **kwargs: Keyword arguments for it, never including ``actor``.
+        **kwargs: Keyword arguments for it, never including ``principal``.
 
     Returns:
         Whatever the service function returns.
 
     Raises:
-        RuntimeError: If a caller tried to supply an actor.
+        RuntimeError: If a caller tried to supply a principal.
     """
-    if "actor" in kwargs:
+    if "principal" in kwargs or "actor" in kwargs:
         raise RuntimeError(
-            "the HTTP surface never takes an actor from a caller: "
-            f"writes are always attributed to {HTTP_ACTOR!r}"
+            "the HTTP surface never takes a principal from a caller: "
+            "identity comes from the authenticated session, never the request"
         )
-    return operation(*args, actor=HTTP_ACTOR, **kwargs)
+    return operation(*args, principal=_http_principal(), **kwargs)
 
 
 # ── Responses ─────────────────────────────────────────────────────────────────

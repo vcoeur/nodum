@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+from helpers import OWNER_ACTOR, agent
 
 from nodum import service
 from nodum.service import EventNotFound, NodeNotFound, UndoNotPossible
@@ -16,7 +17,7 @@ def test_create_appends_event_with_full_after_payload(fresh_db):
     node = service.create_node(type="note", title="T", content="body")
     (event,) = _events()
     assert event.op == "node.create"
-    assert event.actor == "human"
+    assert event.actor == OWNER_ACTOR
     assert event.cycle_id is None
     assert event.payload["before"] is None
     assert event.payload["after"]["id"] == node.id
@@ -24,7 +25,7 @@ def test_create_appends_event_with_full_after_payload(fresh_db):
 
 
 def test_agent_create_logs_propose_op(fresh_db):
-    service.create_node(type="note", title="T", actor="agent:x")
+    service.create_node(type="note", title="T", principal=agent("x"))
     (event,) = _events()
     assert event.op == "node.propose"
     assert event.actor == "agent:x"
@@ -40,7 +41,7 @@ def test_update_event_carries_before_and_after(fresh_db):
 
 
 def test_transition_events(fresh_db):
-    node = service.create_node(type="note", title="T", actor="agent:x")
+    node = service.create_node(type="note", title="T", principal=agent("x"))
     service.transition(node.id, "accept")
     service.transition(node.id, "archive")
     ops = [event.op for event in _events()]
@@ -48,12 +49,12 @@ def test_transition_events(fresh_db):
 
 
 def test_every_node_mutation_writes_a_version(fresh_db):
-    node = service.create_node(type="note", title="T", content="v1", actor="agent:x")
+    node = service.create_node(type="note", title="T", content="v1", principal=agent("x"))
     service.update_node(node.id, content="v2")
     service.transition(node.id, "accept")
     versions = service.history(node.id)
     assert [v.content for v in versions] == ["v1", "v2", "v2"]
-    assert [v.actor for v in versions] == ["agent:x", "human", "human"]
+    assert [v.actor for v in versions] == ["agent:x", OWNER_ACTOR, OWNER_ACTOR]
     # Each version points at the event that caused it.
     seqs = [event.seq for event in _events()]
     assert [v.event_seq for v in versions] == seqs

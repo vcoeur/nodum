@@ -13,6 +13,7 @@ import io
 import json
 
 import pytest
+from helpers import agent, owner
 from mcp.shared.memory import create_connected_server_and_client_session
 from PIL import Image
 
@@ -26,6 +27,7 @@ def _run(fn):
     """Run an async MCP interaction against a fresh server bound to AGENT."""
 
     async def runner():
+        agent(AGENT)  # seed the account; the server loads its principal
         server = create_server(actor=AGENT)
         async with create_connected_server_and_client_session(server) as session:
             return await fn(session)
@@ -106,6 +108,7 @@ def test_create_server_rejects_a_non_agent_actor(fresh_db, actor):
 
 @pytest.mark.parametrize("actor", ["agent:mcp", "agent:researcher", "agent:gpt-4.1_x"])
 def test_create_server_accepts_well_formed_agent_actors(fresh_db, actor):
+    agent(actor)  # the account must exist for the principal to load
     assert create_server(actor=actor) is not None
 
 
@@ -304,15 +307,16 @@ def test_agent_proposes_over_mcp_and_only_the_human_can_review(fresh_db):
     # Neither proposal touched the node — the agent has no way to land them.
     assert service.get_node(note.id).content == "original body"
 
-    # The agent's own actor cannot review either proposal, even its own.
-    with pytest.raises(service.ReviewNotPermitted):
-        service.accept_proposals([str(keep["id"])], actor=AGENT)
-    with pytest.raises(service.ReviewNotPermitted):
-        service.reject_proposals([str(drop["id"])], reason="mine", actor=AGENT)
+    # The agent's own principal cannot review either proposal, even its own:
+    # suggest covers proposing, never accepting — refusals land per item.
+    refused = service.accept_proposals([str(keep["id"])], principal=agent(AGENT))
+    assert refused.transitioned == [] and len(refused.failed) == 1
+    refused = service.reject_proposals([str(drop["id"])], reason="mine", principal=agent(AGENT))
+    assert refused.transitioned == [] and len(refused.failed) == 1
 
     # The human works the queue out of band (CLI / review API).
-    service.accept_proposals([str(keep["id"])], actor="human")
-    service.reject_proposals([str(drop["id"])], reason="not good enough", actor="human")
+    service.accept_proposals([str(keep["id"])], principal=owner())
+    service.reject_proposals([str(drop["id"])], reason="not good enough", principal=owner())
     assert service.get_node(note.id).content == "accepted body"
     assert [v.state for v in service.history(note.id)] == ["applied", "applied", "archived"]
 
@@ -336,7 +340,7 @@ def test_agent_wikilinks_over_mcp_stay_proposed(fresh_db):
     assert pending.created_by == AGENT
 
     # The human accepting the node is what brings the edge to life.
-    service.accept_proposals([node["id"]], actor="human")
+    service.accept_proposals([node["id"]], principal=owner())
     (live,) = service.list_edges(node_id=target.id, type="mentions", state="active")
     assert live.id == pending.id
 

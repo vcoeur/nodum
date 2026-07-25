@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from helpers import OWNER_ACTOR, agent
+
 from nodum import service
 
 
@@ -16,7 +18,7 @@ def test_link_by_title_materializes_mentions_edge(fresh_db):
     assert len(edges) == 1
     assert edges[0].src_id == source.id
     assert edges[0].dst_id == target.id
-    assert edges[0].created_by == "human"
+    assert edges[0].created_by == OWNER_ACTOR
     assert edges[0].state == "active"
 
 
@@ -101,7 +103,7 @@ def test_agent_create_materializes_a_proposed_edge(fresh_db):
     """An agent may not attach live structure to a human's active node."""
     target = service.create_node(type="concept", title="Human Concept")
     source = service.create_node(
-        type="note", title="Bot note", content="See [[Human Concept]].", actor=AGENT
+        type="note", title="Bot note", content="See [[Human Concept]].", principal=agent(AGENT)
     )
     assert _mentions_in(source.id, "active") == []
     (edge,) = _mentions_in(source.id, "proposed")
@@ -113,7 +115,7 @@ def test_agent_create_materializes_a_proposed_edge(fresh_db):
 
 def test_agent_mentions_edge_is_a_propose_event(fresh_db):
     service.create_node(type="concept", title="C")
-    service.create_node(type="note", title="S", content="[[C]]", actor=AGENT)
+    service.create_node(type="note", title="S", content="[[C]]", principal=agent(AGENT))
     ops = [e.op for e in service.list_events(limit=10) if e.op.startswith("edge.")]
     assert ops == ["edge.propose"]
 
@@ -121,7 +123,7 @@ def test_agent_mentions_edge_is_a_propose_event(fresh_db):
 def test_accepting_the_node_activates_its_pending_mentions(fresh_db):
     target = service.create_node(type="concept", title="Human Concept")
     source = service.create_node(
-        type="note", title="Bot note", content="See [[Human Concept]].", actor=AGENT
+        type="note", title="Bot note", content="See [[Human Concept]].", principal=agent(AGENT)
     )
     (pending,) = _mentions_in(source.id, "proposed")
 
@@ -132,14 +134,14 @@ def test_accepting_the_node_activates_its_pending_mentions(fresh_db):
     assert live.dst_id == target.id
     # The accept is the human's event, not the proposer's.
     accept_event = next(e for e in service.list_events(limit=10) if e.op == "edge.accept")
-    assert accept_event.actor == "human"
+    assert accept_event.actor == OWNER_ACTOR
 
 
 def test_accepting_a_node_leaves_another_agents_pending_edge_alone(fresh_db):
     service.create_node(type="concept", title="C")
-    source = service.create_node(type="note", title="S", content="[[C]]", actor=AGENT)
+    source = service.create_node(type="note", title="S", content="[[C]]", principal=agent(AGENT))
     other = service.create_node(type="concept", title="Other")
-    outsider = service.create_edge(source.id, other.id, "mentions", actor="agent:outsider")
+    outsider = service.create_edge(source.id, other.id, "mentions", principal=agent("outsider"))
 
     service.transition(source.id, "accept")
     assert [e.id for e in _mentions_in(source.id, "proposed")] == [outsider.id]
@@ -147,7 +149,7 @@ def test_accepting_a_node_leaves_another_agents_pending_edge_alone(fresh_db):
 
 def test_human_rewrite_does_not_duplicate_a_pending_edge(fresh_db):
     service.create_node(type="concept", title="C")
-    source = service.create_node(type="note", title="S", content="[[C]]", actor=AGENT)
+    source = service.create_node(type="note", title="S", content="[[C]]", principal=agent(AGENT))
     (pending,) = _mentions_in(source.id, "proposed")
 
     service.update_node(source.id, content="still about [[C]]")
@@ -157,7 +159,7 @@ def test_human_rewrite_does_not_duplicate_a_pending_edge(fresh_db):
 
 def test_dropping_the_text_archives_a_pending_edge(fresh_db):
     service.create_node(type="concept", title="C")
-    source = service.create_node(type="note", title="S", content="[[C]]", actor=AGENT)
+    source = service.create_node(type="note", title="S", content="[[C]]", principal=agent(AGENT))
     service.update_node(source.id, content="no link now")
     assert _mentions_in(source.id, "proposed") == []
     assert len(_mentions_in(source.id, "archived")) == 1
@@ -172,15 +174,15 @@ def test_accepting_an_agent_update_materializes_as_the_reviewer(fresh_db):
     other = service.create_node(type="concept", title="Topology")
     note = service.create_node(type="note", title="N", content="See [[Graph Theory]].")
 
-    version = service.update_node(note.id, content="Now [[Topology]].", actor=AGENT)
+    version = service.update_node(note.id, content="Now [[Topology]].", principal=agent(AGENT))
     service.transition(str(version.id), "accept")
 
     (live,) = _mentions_in(note.id, "active")
     assert live.dst_id == other.id
     # Both the new edge and the archived one are the reviewer's doing.
-    assert live.created_by == "human"
+    assert live.created_by == OWNER_ACTOR
     edge_events = [e for e in service.list_events(limit=10) if e.op.startswith("edge.")]
-    assert {e.actor for e in edge_events} == {"human"}
+    assert {e.actor for e in edge_events} == {OWNER_ACTOR}
     assert [e.dst_id for e in _mentions_in(note.id, "archived")] == [concept.id]
 
 

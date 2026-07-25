@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 
 import pytest
+from helpers import OWNER_ACTOR, agent
 from typer.testing import CliRunner
 
 from nodum import service
@@ -32,7 +33,7 @@ def _mixed():
     weak = service.create_node(type="note", title="Weak")
     person = service.create_node(type="person", title="Author")
     service.create_edge(hub.id, live.id, "supports", confidence=0.9)
-    service.create_edge(hub.id, pending.id, "relates_to", confidence=0.9, actor=AGENT)
+    service.create_edge(hub.id, pending.id, "relates_to", confidence=0.9, principal=agent(AGENT))
     service.create_edge(hub.id, weak.id, "relates_to", confidence=0.1)
     service.create_edge(hub.id, person.id, "authored_by")
     return hub, live, pending, weak, person
@@ -243,7 +244,7 @@ def test_a_filter_is_not_truncation(fresh_db):
     for kwargs in (
         {"edge_types": ["supports"]},
         {"min_confidence": 0.5},
-        {"created_by": "human"},
+        {"created_by": OWNER_ACTOR},
     ):
         result = service.subgraph(hub.id, depth=1, **kwargs)
         assert len(result.nodes) < 5, kwargs  # something really was dropped
@@ -311,7 +312,7 @@ def test_closing_edges_obey_the_filters_and_the_node_set(fresh_db):
     c = service.create_node(type="note", title="C")
     service.create_edge(a.id, b.id, "relates_to")
     service.create_edge(a.id, c.id, "relates_to")
-    service.create_edge(b.id, c.id, "relates_to", actor=AGENT)  # proposed
+    service.create_edge(b.id, c.id, "relates_to", principal=agent(AGENT))  # proposed
 
     result = service.subgraph(a.id, depth=1)
     assert len(result.edges) == 2  # the proposed cross edge is not live graph

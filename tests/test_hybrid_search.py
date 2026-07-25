@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from helpers import agent
+
 from nodum import search, service
 
 
@@ -67,7 +69,7 @@ def test_vector_signal_respects_filters(fresh_db, fake_embedder):
     assert [hit.node_id for hit in result.hits] == [note.id]
 
     proposed = service.create_node(
-        type="note", title="P", content="mycelium draft", actor="agent:x"
+        type="note", title="P", content="mycelium draft", principal=agent("x")
     )
     result = search.search("mycelium", k=10)
     assert proposed.id not in {hit.node_id for hit in result.hits}

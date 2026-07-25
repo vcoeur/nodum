@@ -26,6 +26,7 @@ from nodum.assets import AssetNotFound, AssetSourceChanged, AssetTooLarge, Unsup
 from nodum.cli_schema import build_cli_schema
 from nodum.db import ENV_DB_VAR
 from nodum.envelope import envelope, list_envelope, render_json
+from nodum.principal import Principal
 from nodum.service import (
     EventNotFound,
     InvalidTransition,
@@ -175,7 +176,21 @@ def _run(func, *args, **kwargs):
         raise typer.Exit(1) from exc
 
 
-ACTOR_OPTION = typer.Option("human", "--actor", help="Write actor: 'human' or 'agent:<name>'.")
+AS_OPTION = typer.Option(
+    ...,
+    "--as",
+    help="Your human account ('human:<id>' or '<id>') — attribution is explicit, always.",
+)
+
+
+def _principal(as_human: str) -> Principal:
+    """Resolve ``--as`` to a human principal (trusted-local, no password)."""
+    from nodum import auth
+
+    human_id = as_human.removeprefix("human:")
+    return auth.owner_principal(human_id)
+
+
 SET_OPTION = typer.Option(None, "--set", help="Repeatable key=value props (values parsed as JSON).")
 
 
@@ -195,7 +210,7 @@ def node_create(
     ),
     parent: str | None = typer.Option(None, "--parent", help="Parent node id."),
     set_props: list[str] | None = SET_OPTION,
-    actor: str = ACTOR_OPTION,
+    as_human: str = AS_OPTION,
 ) -> None:
     """Create a node (active for actor 'human', proposed otherwise)."""
     node = _run(
@@ -205,7 +220,7 @@ def node_create(
         content=_read_content(content, content_file) or "",
         parent_id=parent,
         props=_parse_set(set_props),
-        actor=actor,
+        principal=_principal(as_human),
     )
     _emit(node)
 
@@ -233,10 +248,10 @@ def node_update(
         None, "--content-file", help="Read the new Markdown body from a file ('-' = stdin)."
     ),
     set_props: list[str] | None = SET_OPTION,
-    actor: str = ACTOR_OPTION,
+    as_human: str = AS_OPTION,
 ) -> None:
-    """Update a node (applies for actor 'human', stages a proposed version otherwise)."""
-    kwargs: dict = {"actor": actor}
+    """Update a node (applies with edit, stages a proposed version with suggest)."""
+    kwargs: dict = {"principal": _principal(as_human)}
     resolved = _read_content(content, content_file)
     if title is not None:
         kwargs["title"] = title
@@ -276,7 +291,7 @@ def edge_create(
     type: str = typer.Option(..., "--type", "-t", help="Edge type id or name."),
     confidence: float | None = typer.Option(None, "--confidence", help="Confidence in [0, 1]."),
     set_props: list[str] | None = SET_OPTION,
-    actor: str = ACTOR_OPTION,
+    as_human: str = AS_OPTION,
 ) -> None:
     """Create a typed, directed edge between two nodes."""
     edge = _run(
@@ -286,7 +301,7 @@ def edge_create(
         type,
         props=_parse_set(set_props),
         confidence=confidence,
-        actor=actor,
+        principal=_principal(as_human),
     )
     _emit(edge)
 
@@ -308,7 +323,7 @@ def edge_create_batch(
     suggestions_file: str = typer.Argument(
         ..., help="JSON array of {src, dst, edge_type, props?, confidence?} ('-' = stdin)."
     ),
-    actor: str = ACTOR_OPTION,
+    as_human: str = AS_OPTION,
 ) -> None:
     """Propose a batch of edges; bad suggestions are reported, not fatal."""
     raw = sys.stdin.read() if suggestions_file == "-" else Path(suggestions_file).read_text()
@@ -320,52 +335,60 @@ def edge_create_batch(
     if not isinstance(suggestions, list):
         typer.echo("expected a JSON array of edge suggestions", err=True)
         raise typer.Exit(1)
-    _emit(_run(service.propose_edges, suggestions, actor=actor))
+    _emit(_run(service.propose_edges, suggestions, principal=_principal(as_human)))
 
 
 @app.command()
 def accept(
     record_id: str = typer.Argument(..., help="Node, edge, or proposed-version id."),
-    actor: str = ACTOR_OPTION,
+    as_human: str = AS_OPTION,
 ) -> None:
     """Accept a proposed node, edge, or update (proposed → active) — human actor only.
 
     A proposed-version id applies exactly the fields the proposal named to
     the node as it stands now.
     """
-    _emit(_run(service.transition, record_id, "accept", actor=actor))
+    _emit(_run(service.transition, record_id, "accept", principal=_principal(as_human)))
 
 
 @app.command()
 def reject(
     record_id: str = typer.Argument(..., help="Node, edge, or proposed-version id."),
     reason: str = typer.Option(..., "--reason", help="Recorded in the reject event."),
-    actor: str = ACTOR_OPTION,
+    as_human: str = AS_OPTION,
 ) -> None:
     """Reject a proposed node, edge, or update (proposed → archived) — human actor only.
 
     The reason is required and lands in the event payload, exactly as it does
     for the batch `review reject` — one operation, one audit guarantee.
     """
-    _emit(_run(service.transition, record_id, "reject", reason=reason, actor=actor))
+    _emit(
+        _run(
+            service.transition,
+            record_id,
+            "reject",
+            reason=reason,
+            principal=_principal(as_human),
+        )
+    )
 
 
 @app.command()
 def archive(
     record_id: str = typer.Argument(..., help="Node or edge id."),
-    actor: str = ACTOR_OPTION,
+    as_human: str = AS_OPTION,
 ) -> None:
     """Archive an active node or edge (active → archived)."""
-    _emit(_run(service.transition, record_id, "archive", actor=actor))
+    _emit(_run(service.transition, record_id, "archive", principal=_principal(as_human)))
 
 
 @app.command()
 def undo(
     seq: int | None = typer.Argument(None, help="Event seq to reverse (default: latest)."),
-    actor: str = ACTOR_OPTION,
+    as_human: str = AS_OPTION,
 ) -> None:
     """Reverse an event, restoring the prior state from its payload."""
-    _emit(_run(service.undo, seq, actor=actor))
+    _emit(_run(service.undo, seq, principal=_principal(as_human)))
 
 
 @app.command()
@@ -769,20 +792,20 @@ def review_queue(
 @review_app.command("accept")
 def review_accept(
     ids: list[str] = typer.Argument(..., help="Node, edge, or proposed-version ids to accept."),
-    actor: str = ACTOR_OPTION,
+    as_human: str = AS_OPTION,
 ) -> None:
     """Accept proposals by id (proposed → active); bad ids are reported, not fatal."""
-    _emit(_run(service.accept_proposals, ids, actor=actor))
+    _emit(_run(service.accept_proposals, ids, principal=_principal(as_human)))
 
 
 @review_app.command("reject")
 def review_reject(
     ids: list[str] = typer.Argument(..., help="Node, edge, or proposed-version ids to reject."),
     reason: str = typer.Option(..., "--reason", help="Recorded in every reject event."),
-    actor: str = ACTOR_OPTION,
+    as_human: str = AS_OPTION,
 ) -> None:
     """Reject proposals by id (proposed → archived); bad ids are reported, not fatal."""
-    _emit(_run(service.reject_proposals, ids, reason=reason, actor=actor))
+    _emit(_run(service.reject_proposals, ids, reason=reason, principal=_principal(as_human)))
 
 
 @review_app.command("accept-all")
@@ -792,7 +815,7 @@ def review_accept_all(
     kind: str | None = KIND_OPTION,
     created_before: str | None = CREATED_BEFORE_OPTION,
     created_after: str | None = CREATED_AFTER_OPTION,
-    actor: str = ACTOR_OPTION,
+    as_human: str = AS_OPTION,
 ) -> None:
     """Accept every proposal matching the filters (e.g. one agent's whole run)."""
     _emit(
@@ -803,7 +826,7 @@ def review_accept_all(
             kind=kind,
             created_before=created_before,
             created_after=created_after,
-            actor=actor,
+            principal=_principal(as_human),
         )
     )
 
@@ -816,7 +839,7 @@ def review_reject_all(
     kind: str | None = KIND_OPTION,
     created_before: str | None = CREATED_BEFORE_OPTION,
     created_after: str | None = CREATED_AFTER_OPTION,
-    actor: str = ACTOR_OPTION,
+    as_human: str = AS_OPTION,
 ) -> None:
     """Reject every proposal matching the filters, recording the reason."""
     _emit(
@@ -828,6 +851,6 @@ def review_reject_all(
             kind=kind,
             created_before=created_before,
             created_after=created_after,
-            actor=actor,
+            principal=_principal(as_human),
         )
     )

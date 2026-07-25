@@ -6,6 +6,7 @@ import json
 import unicodedata
 
 import pytest
+from helpers import agent
 from typer.testing import CliRunner
 
 from nodum import service
@@ -85,7 +86,7 @@ def test_matches_across_unicode_normalisation_forms(fresh_db):
 
 def test_archived_excluded_proposed_included(fresh_db):
     library = _library()
-    service.create_node(type="note", title="graph draft", actor=AGENT)  # proposed
+    service.create_node(type="note", title="graph draft", principal=agent(AGENT))  # proposed
     service.transition(library["graphite"].id, "archive")
     titles = _titles(service.suggest_links("graph"))
     assert "graph draft" in titles

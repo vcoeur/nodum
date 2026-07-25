@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+from helpers import OWNER_ACTOR, agent
 
 from nodum import db, service
 from nodum.service import InvalidTransition, VersionNotFound
@@ -22,7 +23,7 @@ def _graph():
 
 def test_agent_update_stages_a_proposed_version_and_leaves_the_node(fresh_db):
     _, note = _graph()
-    version = service.update_node(note.id, content="Rewritten by the bot.", actor=AGENT)
+    version = service.update_node(note.id, content="Rewritten by the bot.", principal=agent(AGENT))
 
     assert version.state == "proposed"
     assert version.node_id == note.id
@@ -38,7 +39,7 @@ def test_agent_update_stages_a_proposed_version_and_leaves_the_node(fresh_db):
 
 def test_agent_update_emits_version_propose(fresh_db):
     _, note = _graph()
-    version = service.update_node(note.id, title="Bot title", actor=AGENT)
+    version = service.update_node(note.id, title="Bot title", principal=agent(AGENT))
 
     events = service.list_events(limit=1)
     assert events[0].op == "version.propose"
@@ -58,7 +59,7 @@ def test_human_update_still_applies_in_place(fresh_db):
 
 def test_history_marks_proposed_versions(fresh_db):
     _, note = _graph()
-    service.update_node(note.id, content="v2", actor=AGENT)
+    service.update_node(note.id, content="v2", principal=agent(AGENT))
     states = [v.state for v in service.history(note.id)]
     assert states == ["applied", "proposed"]
 
@@ -69,7 +70,10 @@ def test_history_marks_proposed_versions(fresh_db):
 def test_accept_applies_the_version(fresh_db):
     _, note = _graph()
     version = service.update_node(
-        note.id, title="Better title", content="See [[Graph Theory]] deeply.", actor=AGENT
+        note.id,
+        title="Better title",
+        content="See [[Graph Theory]] deeply.",
+        principal=agent(AGENT),
     )
     accepted = service.transition(str(version.id), "accept")
 
@@ -80,7 +84,7 @@ def test_accept_applies_the_version(fresh_db):
 
     event = service.list_events(limit=1)[0]
     assert event.op == "node.update"
-    assert event.actor == "human"
+    assert event.actor == OWNER_ACTOR
     assert event.payload["applied_version_id"] == version.id
     assert event.payload["proposed_event_seq"] == version.event_seq
 
@@ -88,7 +92,9 @@ def test_accept_applies_the_version(fresh_db):
 def test_accept_rematerializes_wikilinks(fresh_db):
     concept, note = _graph()
     other = service.create_node(type="concept", title="Topology")
-    version = service.update_node(note.id, content="Now about [[Topology]] only.", actor=AGENT)
+    version = service.update_node(
+        note.id, content="Now about [[Topology]] only.", principal=agent(AGENT)
+    )
     service.transition(str(version.id), "accept")
 
     mentions = service.list_edges(node_id=note.id, type="mentions", state="active")
@@ -99,7 +105,9 @@ def test_accept_rematerializes_wikilinks(fresh_db):
 
 def test_accepted_update_is_indexed_for_search(fresh_db):
     _, note = _graph()
-    version = service.update_node(note.id, content="quixotic uniqueness token", actor=AGENT)
+    version = service.update_node(
+        note.id, content="quixotic uniqueness token", principal=agent(AGENT)
+    )
     from nodum import search as search_module
 
     assert search_module.search("quixotic").hits == []
@@ -110,7 +118,7 @@ def test_accepted_update_is_indexed_for_search(fresh_db):
 
 def test_accept_of_applied_version_fails(fresh_db):
     _, note = _graph()
-    version = service.update_node(note.id, content="v2", actor=AGENT)
+    version = service.update_node(note.id, content="v2", principal=agent(AGENT))
     service.transition(str(version.id), "accept")
     with pytest.raises(InvalidTransition):
         service.transition(str(version.id), "accept")
@@ -118,7 +126,7 @@ def test_accept_of_applied_version_fails(fresh_db):
 
 def test_applied_update_is_undoable(fresh_db):
     _, note = _graph()
-    version = service.update_node(note.id, content="Bot rewrite.", actor=AGENT)
+    version = service.update_node(note.id, content="Bot rewrite.", principal=agent(AGENT))
     service.transition(str(version.id), "accept")
     # The accept's node.update is undoable like any other update. (Accepting
     # also archives the wikilink the rewrite dropped, so the latest event is
@@ -139,7 +147,7 @@ def test_accept_does_not_revert_edits_made_after_the_proposal(fresh_db):
     proposal was staged.
     """
     _, note = _graph()
-    version = service.update_node(note.id, content="Bot rewrite.", actor=AGENT)
+    version = service.update_node(note.id, content="Bot rewrite.", principal=agent(AGENT))
     service.update_node(note.id, title="Human-corrected title")
 
     service.transition(str(version.id), "accept")
@@ -151,8 +159,8 @@ def test_accept_does_not_revert_edits_made_after_the_proposal(fresh_db):
 
 def test_two_queued_proposals_do_not_clobber_each_other(fresh_db):
     _, note = _graph()
-    content_proposal = service.update_node(note.id, content="New body.", actor=AGENT)
-    title_proposal = service.update_node(note.id, title="New title", actor="agent:other")
+    content_proposal = service.update_node(note.id, content="New body.", principal=agent(AGENT))
+    title_proposal = service.update_node(note.id, title="New title", principal=agent("other"))
 
     service.transition(str(content_proposal.id), "accept")
     service.transition(str(title_proposal.id), "accept")
@@ -163,7 +171,7 @@ def test_two_queued_proposals_do_not_clobber_each_other(fresh_db):
 
 def test_props_proposal_leaves_title_and_content_alone(fresh_db):
     _, note = _graph()
-    version = service.update_node(note.id, props={"reviewed": True}, actor=AGENT)
+    version = service.update_node(note.id, props={"reviewed": True}, principal=agent(AGENT))
     service.update_node(note.id, content="Human body.")
 
     service.transition(str(version.id), "accept")
@@ -175,7 +183,7 @@ def test_props_proposal_leaves_title_and_content_alone(fresh_db):
 
 def test_proposal_records_the_fields_it_names(fresh_db):
     _, note = _graph()
-    version = service.update_node(note.id, content="v2", actor=AGENT)
+    version = service.update_node(note.id, content="v2", principal=agent(AGENT))
     assert version.proposed_fields == ["content"]
     # The unnamed fields are still snapshotted as reviewer context.
     assert version.title == "My note"
@@ -191,7 +199,7 @@ def test_proposal_records_the_fields_it_names(fresh_db):
 
 def test_accept_event_records_the_fields_it_applied(fresh_db):
     _, note = _graph()
-    version = service.update_node(note.id, title="T2", props={"k": 1}, actor=AGENT)
+    version = service.update_node(note.id, title="T2", props={"k": 1}, principal=agent(AGENT))
     service.transition(str(version.id), "accept")
     event = service.list_events(limit=1)[0]
     assert event.op == "node.update"
@@ -202,7 +210,7 @@ def test_a_proposal_predating_the_column_still_applies_whole(fresh_db):
     """`proposed_fields` NULL means "staged before migration 0008" — apply all."""
     _, note = _graph()
     version = service.update_node(
-        note.id, title="Legacy title", content="Legacy body.", actor=AGENT
+        note.id, title="Legacy title", content="Legacy body.", principal=agent(AGENT)
     )
     conn = db.connect()
     try:
@@ -221,7 +229,7 @@ def test_a_proposal_predating_the_column_still_applies_whole(fresh_db):
 
 def test_reject_archives_the_version_and_records_reason(fresh_db):
     _, note = _graph()
-    version = service.update_node(note.id, content="Bot rewrite.", actor=AGENT)
+    version = service.update_node(note.id, content="Bot rewrite.", principal=agent(AGENT))
     rejected = service.transition(str(version.id), "reject")
 
     assert rejected.state == "archived"
@@ -232,7 +240,7 @@ def test_reject_archives_the_version_and_records_reason(fresh_db):
 
 def test_archive_action_does_not_apply_to_versions(fresh_db):
     _, note = _graph()
-    version = service.update_node(note.id, content="v2", actor=AGENT)
+    version = service.update_node(note.id, content="v2", principal=agent(AGENT))
     with pytest.raises(InvalidTransition):
         service.transition(str(version.id), "archive")
 
@@ -247,7 +255,7 @@ def test_unknown_version_id(fresh_db):
 
 def test_update_proposals_appear_in_the_queue(fresh_db):
     _, note = _graph()
-    version = service.update_node(note.id, content="v2", actor=AGENT)
+    version = service.update_node(note.id, content="v2", principal=agent(AGENT))
     proposals = service.list_proposals()
 
     assert len(proposals) == 1
@@ -263,8 +271,8 @@ def test_update_proposals_appear_in_the_queue(fresh_db):
 
 def test_queue_kind_and_actor_filters_cover_updates(fresh_db):
     _, note = _graph()
-    service.update_node(note.id, content="v2", actor=AGENT)
-    service.update_node(note.id, content="v3", actor="agent:other")
+    service.update_node(note.id, content="v2", principal=agent(AGENT))
+    service.update_node(note.id, content="v3", principal=agent("other"))
 
     assert len(service.list_proposals(kind="update")) == 2
     assert len(service.list_proposals(kind="node")) == 0
@@ -275,7 +283,7 @@ def test_queue_kind_and_actor_filters_cover_updates(fresh_db):
 
 def test_batch_accept_applies_updates(fresh_db):
     _, note = _graph()
-    version = service.update_node(note.id, content="v2", actor=AGENT)
+    version = service.update_node(note.id, content="v2", principal=agent(AGENT))
     result = service.accept_proposals([str(version.id), "missing-id"])
 
     assert result.transitioned == [str(version.id)]
@@ -285,7 +293,7 @@ def test_batch_accept_applies_updates(fresh_db):
 
 def test_batch_reject_by_filter_covers_updates(fresh_db):
     _, note = _graph()
-    service.update_node(note.id, content="v2", actor=AGENT)
+    service.update_node(note.id, content="v2", principal=agent(AGENT))
     result = service.reject_matching(reason="not good enough", created_by=AGENT)
 
     assert len(result.transitioned) == 1
