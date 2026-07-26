@@ -165,6 +165,9 @@ degrades to BM25 + graph expansion. `NODUM_EMBED_MODEL` switches the model
   edge lands in the state the writer's grant earns, so a `suggest`-grant
   agent's wikilink is a *proposed*
   edge — writing `[[Your Concept]]` never attaches such an agent to a live node.
+  Both directions are grant-bound: retiring a `mentions` edge needs `edit` on
+  **both** endpoint spaces, so a writer cannot prune links into a space it
+  cannot read — where, by definition, it cannot tell a link disappeared.
 - **State machine.** Nodes and edges are `proposed`, `active`, or `archived`.
   Human (CLI) writes land `active`; an agent's writes land per its grant on
   the space — `proposed` on `suggest`, `active` on `edit` — and the proposed
@@ -175,7 +178,9 @@ degrades to BM25 + graph expansion. `NODUM_EMBED_MODEL` switches the model
   named** to the node as it stands now (an ordinary, undoable `node.update`),
   rejecting archives the version. An edit made while the proposal waited is
   therefore never reverted by accepting it. Accepting a proposed node also
-  brings the pending `mentions` edges its wikilinks materialized to `active`.
+  brings the pending `mentions` edges its wikilinks materialized to `active` —
+  those the acceptor could have reviewed directly, that is; a mention into a
+  space they hold nothing on stays queued for someone who can.
 - **Live state is the human's, structurally.** Review (`accept`, `reject`, `archive`)
   requires a human principal or an agent holding `edit` on the item's space;
   `undo` is human-only. Either way is refused with `GrantNotPermitted`.

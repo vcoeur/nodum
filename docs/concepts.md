@@ -24,7 +24,10 @@ evolve at runtime without a release.
 
 Node content is Markdown, and `[[wikilinks]]` inside it are **materialised as
 real edges** — the prose and the graph cannot disagree, because one derives
-from the other.
+from the other. A link only becomes (or stops being) an edge as far as the
+writer's grants reach: a mention into a space they may only suggest in stays
+`proposed`, and one into a space they cannot read at all is left exactly as it
+is, since an unresolvable link is not a deleted one.
 
 ## The state machine
 

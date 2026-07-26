@@ -105,7 +105,10 @@ including every parameter.
 ### Accounts, grants, and spaces
 
 - `human create/list/passwd/disable/enable` — Manage human accounts (passwordless
-  until `passwd`; argon2id).
+  until `passwd`; argon2id, six characters minimum, and setting one ends that
+  human's live sessions). The last enabled human cannot be disabled: with none
+  enabled, no surface can mint a principal at all, the CLI's trusted-local path
+  included.
 - `agent create/list/token-rotate/disable/enable` — Manage agent accounts
   (`create`/`token-rotate` print the show-once token to stderr).
 - `grant <agent> <space> <level>` / `revoke <agent> <space>` / `grants [--agent]` —
@@ -122,10 +125,15 @@ including every parameter.
 ### Assets
 
 - `asset register` — Register a file as a content-addressed asset (idempotent dedup by sha256).
-- `asset get` — Show one asset's metadata (never its bytes).
-- `asset list` — List every registered asset.
-- `asset rendition` — Fetch an image rendition, generating and caching it on first request.
+- `asset get` — Show one asset's metadata (never its bytes). Takes `--as`.
+- `asset list` — List every registered asset. Takes `--as`.
+- `asset rendition` — Fetch an image rendition, generating and caching it on first
+  request. Takes `--as`.
 - `asset purge` — Evict stored renditions (they rebuild on next request).
+
+The three reads carry `--as` because they read through the graph — an
+`asset_ref` node id is a valid handle, and it resolves only in a space the
+caller can read. `register` and `purge` touch the blob store alone.
 
 ### Servers
 
@@ -138,7 +146,8 @@ including every parameter.
 Every `/api` route but `POST /api/login` needs a valid session — log in with
 a human name and password (`nodum human passwd` sets one). A non-loopback
 bind is allowed: login, not the bind, is the boundary, and the session cookie
-gains `Secure` there. `serve` prints the database path on stderr and
+gains `Secure` there — `serve` warns on stderr that it speaks plain HTTP, so
+put TLS in front of it or the password crosses the network in the clear. `serve` prints the database path on stderr and
 translates a port already in use into the contract's exit 1.
 
 Account and grant administration is on the API as well: `GET /api/me` returns

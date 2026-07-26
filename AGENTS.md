@@ -92,7 +92,13 @@ node for exactly this reason.
 - **`nodum.mcp_server`** — the MCP adapter (stdio, official Python SDK
   FastMCP), the **external-agent** surface. Registers the design §8.1 read +
   additive tiers and nothing else, each tool a thin delegate to a
-  service/search function. Auth is the agent token in `NODUM_AGENT_TOKEN` —
+  service/search function. Annotations state each tool's **worst case**:
+  reads are `readOnlyHint`, the additive tools are `destructiveHint=False`
+  (they only ever add state, whatever grant the caller holds), and
+  `update_node` is `destructiveHint=True` because under an `edit` grant it
+  overwrites the node in place — MCP hosts auto-approve on that flag, so it
+  must not lie. Every write tool's description says what an `edit` grant
+  changes rather than promising `proposed`. Auth is the agent token in `NODUM_AGENT_TOKEN` —
   an `ndm_…` token minted by `nodum agent create` / `token-rotate`, shown
   once and stored hashed — carried in the environment, never a flag (a flag
   leaks into `ps` and shell history). At startup it is verified against the
@@ -109,7 +115,8 @@ node for exactly this reason.
   `/api`, the built UI at `/`, launched by `nodum serve` (loopback, port
   8600). Auth is password login: `POST /api/login` (name + password, argon2id,
   constant-time on failure) creates a server-side session row (30-day sliding
-  expiry) and sets an `HttpOnly; SameSite=Strict` cookie;
+  expiry, the row keyed by the cookie's sha-256 so the table never holds a
+  live credential) and sets an `HttpOnly; SameSite=Strict` cookie;
   `SessionMiddleware` resolves it to the session's human principal on every
   `/api` request — reads included; only `/healthz`, `/api/login` and the
   static UI stay open. Every write is attributed to that principal and **no
@@ -173,7 +180,10 @@ node for exactly this reason.
   needs a new migration — the vec0 table is fixed at 384). Tests inject a
   deterministic hashing fake via `embeddings.set_provider`.
 - **`nodum.assets`** — content-addressed binaries and their derived
-  renditions (design §5.5/§5.7). **Bytes live in the database, not on the
+  renditions (design §5.5/§5.7). Reads take a principal: asset rows carry no
+  `space_id` until Phase 4, so the interim rule is "readable to any principal
+  holding at least one grant", and a node id offered as a handle resolves only
+  inside the caller's read set. **Bytes live in the database, not on the
   filesystem**: `assets` holds metadata, `asset_blobs` holds the bytes under
   the same sha256 key, so the whole system is one file and disaster recovery
   is `DB = everything`. Registration is idempotent sha256 dedup with no
@@ -204,9 +214,16 @@ node for exactly this reason.
   resolution, the migration runner. Each migration's script and its
   `schema_migrations` row are one transaction (`apply_migration`), so an
   interrupted upgrade rolls back whole and retries cleanly instead of wedging
-  the database half-migrated.
+  the database half-migrated. A migration runs with **`foreign_keys=OFF`** and
+  is checked with `PRAGMA foreign_key_check` before its commit: deferring the
+  constraints instead cannot work for a table rebuild, because dropping a
+  populated parent leaves a deferred-violation counter the rename does not
+  clear — 0009 could not upgrade a database holding a single node and its
+  version row. The schema-consistency check runs **before** the apply loop, so
+  a database whose only cure is deletion never gets a new (possibly
+  irreversible) migration committed onto it first.
 - **`nodum.migrations`** — the append-only migration list (`0001_core` …
-  `0008_version_proposed_fields`). Never edit a shipped migration; append a
+  `0011_actor_strings`). Never edit a shipped migration; append a
   new one. A migration must never leave data readable only through a store a
   later migration replaces: introduce a table where its bytes already belong
   (this is why asset bytes are part of `0007` and there is no `path` column
@@ -315,7 +332,11 @@ Phase-1 decision log.
   stands then (so a human edit made while the proposal waited is not
   reverted), `reject` archives it. A `[[wikilink]]` written by an agent
   materialises a `proposed` `mentions` edge; accepting the node brings it to
-  `active`.
+  `active` — but only for the edges the acceptor could review directly, so a
+  mention into a space they hold nothing on stays queued. Re-materialisation
+  is gated the same way: retiring a `mentions` edge needs `edit` on **both**
+  endpoint spaces, and a target the writer cannot read is never treated as a
+  link that disappeared.
 - **Review authority is a human, or `edit` on the item's space** (Q13):
   `accept`, `reject`, `archive`, and every `review` subcommand. `undo` stays
   human-only — restoring an event's payload can write `state = 'active'`
@@ -343,8 +364,13 @@ Phase-1 decision log.
   `traverse`, `subgraph <root-id>`, `suggest-links <prefix>`, `find-path`,
   `diff`, `projector run/status/rebuild`,
   `review queue/accept/reject/accept-all/reject-all`,
-  `asset register/get/list/rendition/purge`,
-  `human create/list/passwd/disable/enable`,
+  `asset register/get/list/rendition/purge` (`get`/`list`/`rendition` read
+  through the graph and so take `--as`; `register`/`purge` touch the blob
+  store alone),
+  `human create/list/passwd/disable/enable` (a password is at least
+  `service.MIN_PASSWORD_LENGTH` characters, and the last enabled human cannot
+  be disabled — no enabled human means no principal on any surface, including
+  the CLI's own trusted-local path),
   `agent create/list/token-rotate/disable/enable` (create and rotate print
   the show-once `ndm_…` token to stderr; only the hash is stored),
   `grant <agent> <space> <level>` / `revoke <agent> <space>` / `grants [--agent]`
@@ -356,8 +382,10 @@ Phase-1 decision log.
   [--db PATH]`. `serve` prints the database path on stderr and translates
   uvicorn's own startup failure (a port already in use) into the contract's
   exit 1 — it used to escape as uvicorn's exit 3. A non-loopback bind is
-  allowed (password login, not the bind, is the boundary) and marks the
-  session cookie `Secure` there.
+  allowed (password login, not the bind, is the boundary), marks the session
+  cookie `Secure` there, and warns on stderr that uvicorn speaks plain HTTP —
+  the cookie fails closed without TLS, but the login body has already crossed
+  the network by then.
 - Reads are not state-filtered by default beyond edge traversal: `node get`,
   `node children`, `node list`, and `history` return `proposed` rows, and
   `search --state any` includes them. Only *traversals* (`node get --depth`,
