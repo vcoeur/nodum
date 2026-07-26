@@ -35,6 +35,78 @@ def test_disabled_human_cannot_log_in(fresh_db):
         auth.verify_password("owner", "secret")
 
 
+# ── HTTP login (name + password) ──────────────────────────────────────────────
+
+
+def test_verify_login_resolves_the_name_to_the_account(fresh_db):
+    """The login handle is the name; the principal carries the (random) id."""
+    human = service.create_human("second", principal=owner())
+    service.set_human_password(human.id, "pw", principal=owner())
+
+    principal = auth.verify_login("second", "pw")
+
+    assert principal.kind == "human"
+    assert principal.id == human.id
+    assert principal.actor_string == f"human:{human.id}"
+
+
+@pytest.mark.parametrize(
+    ("name", "password"),
+    [
+        ("owner", "wrong"),  # right name, wrong password
+        ("nobody", "pw"),  # unknown name
+    ],
+)
+def test_verify_login_failures_are_all_invalid_credentials(fresh_db, name, password):
+    service.set_human_password("owner", "pw", principal=owner())
+    with pytest.raises(auth.InvalidCredentials):
+        auth.verify_login(name, password)
+
+
+def test_verify_login_refuses_a_passwordless_account(fresh_db):
+    with pytest.raises(auth.InvalidCredentials):
+        auth.verify_login("owner", "anything")
+
+
+def test_verify_login_refuses_an_ambiguous_name(fresh_db):
+    """Two accounts sharing a name can neither log in: which human would it be?"""
+    human = service.create_human("owner", principal=owner())
+    service.set_human_password("owner", "first-pw", principal=owner())
+    service.set_human_password(human.id, "second-pw", principal=owner())
+
+    for password in ("first-pw", "second-pw"):
+        with pytest.raises(auth.InvalidCredentials):
+            auth.verify_login("owner", password)
+
+
+def test_a_failed_login_still_pays_the_argon2_work_factor(fresh_db, monkeypatch):
+    """Constant-time discipline: a failure must time like a success.
+
+    Otherwise the response time discloses which login names exist — an
+    account enumeration primitive against exactly the surface that asks for
+    passwords. Asserted as "one verification ran", not as a wall-clock
+    comparison, so the test is never flaky.
+    """
+    verifications = 0
+    real_hasher = auth._HASHER
+
+    class SpyHasher:
+        def hash(self, password: str) -> str:
+            return real_hasher.hash(password)
+
+        def verify(self, hash: str, password: str) -> bool:
+            nonlocal verifications
+            verifications += 1
+            return real_hasher.verify(hash, password)
+
+    monkeypatch.setattr(auth, "_HASHER", SpyHasher())
+
+    for name in ("nobody", "owner"):  # unknown, then passwordless
+        with pytest.raises(auth.InvalidCredentials):
+            auth.verify_login(name, "pw")
+    assert verifications == 2
+
+
 # ── Agent tokens (show-once, sha-256 at rest) ─────────────────────────────────
 
 

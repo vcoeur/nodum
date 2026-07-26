@@ -6,7 +6,7 @@
   access is the trust boundary, exactly as before accounts — the operator
   names their human with ``--as`` for attribution, and no password is asked
   on this path.
-- **Password login** (:func:`verify_password` → :func:`create_session` →
+- **Password login** (:func:`verify_login` → :func:`create_session` →
   :func:`principal_for_session`): the HTTP surface's path, argon2id-hashed
   passwords and server-side session rows (30-day sliding expiry).
 - **Agent token** (:func:`verify_agent_token`): the MCP surface's path.
@@ -169,6 +169,59 @@ def verify_password(human_id: str, password: str, *, path: str | Path | None = N
         if row["disabled"]:
             raise InvalidCredentials("invalid credentials")
         return Principal(kind="human", id=human_id)
+    finally:
+        conn.close()
+
+
+#: Throwaway hash for the constant-time login path — computed lazily on the
+#: first failed lookup, so importing this module never pays the work factor.
+_DUMMY_HASH: str | None = None
+
+
+def _dummy_verify(password: str) -> None:
+    """Spend the argon2 work factor against a throwaway hash, discarding the result."""
+    global _DUMMY_HASH
+    if _DUMMY_HASH is None:
+        _DUMMY_HASH = _HASHER.hash("nodum constant-time dummy")
+    try:
+        _HASHER.verify(_DUMMY_HASH, password)
+    except (VerifyMismatchError, VerificationError):
+        pass
+
+
+def verify_login(name: str, password: str, *, path: str | Path | None = None) -> Principal:
+    """Verify a login name + password and mint the human's principal (HTTP login).
+
+    The login handle is the account *name*: ids of CLI-created humans are
+    random, and nobody types one at a login prompt. A name shared by two
+    accounts resolves to no one — refusing keeps "which human is behind this
+    session?" unambiguous, and the operator disambiguates from the CLI.
+
+    Timing discipline: an unknown, ambiguous, or passwordless name runs the
+    same argon2 verification against a dummy hash, so the failure path costs
+    what the success path costs and response time discloses nothing about
+    which names exist.
+
+    Raises:
+        InvalidCredentials: If the name matches no single enabled account, or
+            the password does not match.
+    """
+    conn = _connect(path)
+    try:
+        rows = conn.execute(
+            "SELECT id, credential_hash, disabled FROM humans WHERE name = ?", (name,)
+        ).fetchall()
+        if len(rows) != 1 or rows[0]["credential_hash"] is None:
+            _dummy_verify(password)
+            raise InvalidCredentials("invalid credentials")
+        row = rows[0]
+        try:
+            _HASHER.verify(row["credential_hash"], password)
+        except (VerifyMismatchError, VerificationError):
+            raise InvalidCredentials("invalid credentials") from None
+        if row["disabled"]:
+            raise InvalidCredentials("invalid credentials")
+        return Principal(kind="human", id=row["id"])
     finally:
         conn.close()
 
