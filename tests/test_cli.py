@@ -441,6 +441,45 @@ def test_agent_update_proposes_and_review_accepts(fresh_db):
 # ── mcp serve: the actor is validated before anything is served ───────────────
 
 
+def test_human_and_agent_admin_over_the_cli(fresh_db):
+    _run_json("human", "create", "alice", "--as", "owner")
+    humans = _run_json("human", "list", "--as", "owner")
+    assert humans["count"] == 2
+    assert {h["name"] for h in humans["humans"]} == {"owner", "alice"}
+
+    result = runner.invoke(app, ["agent", "create", "researcher", "--as", "owner"])
+    assert result.exit_code == 0, result.output
+    assert "ndm_" in result.stderr  # the token prints once, to stderr
+    agents = _run_json("agent", "list", "--as", "owner")
+    assert agents["agents"][0]["has_token"] is True
+
+    result = runner.invoke(app, ["agent", "token-rotate", "researcher", "--as", "owner"])
+    assert result.exit_code == 0, result.output
+    assert "ndm_" in result.stderr
+
+    _run_json("grant", "researcher", "main", "suggest", "--as", "owner")
+    listed = _run_json("grants", "--agent", "researcher", "--as", "owner")
+    assert listed["grants"][0]["level"] == "suggest"
+    _run_json("revoke", "researcher", "main", "--as", "owner")
+    # What remains is the creation-time template row (read on meta).
+    remaining = _run_json("grants", "--agent", "researcher", "--as", "owner")
+    assert [(g["space_id"], g["level"]) for g in remaining["grants"]] == [("meta", "read")]
+
+    _run_json("agent", "disable", "researcher", "--as", "owner")
+    assert _run_json("agent", "list", "--as", "owner")["agents"][0]["disabled"] is True
+
+
+def test_space_admin_over_the_cli(fresh_db):
+    created = _run_json("space-create", "sandbox", "--as", "owner")
+    assert created["type"] == "space"
+    assert created["space_id"] == "meta"
+    spaces = _run_json("space-list", "--as", "owner")
+    assert {s["title"] for s in spaces["spaces"]} == {"main", "meta", "sandbox"}
+    _run_json("space-archive", created["id"], "--as", "owner")
+    spaces = _run_json("space-list", "--as", "owner")
+    assert {s["title"] for s in spaces["spaces"]} == {"main", "meta"}
+
+
 def test_mcp_serve_requires_an_agent_token(fresh_db, monkeypatch):
     monkeypatch.delenv("NODUM_AGENT_TOKEN", raising=False)
     result = runner.invoke(app, ["mcp", "serve"])

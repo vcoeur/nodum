@@ -926,7 +926,7 @@ def human_passwd(
 ) -> None:
     """Set or change a human's password (prompted, never echoed)."""
     _run(service.set_human_password, human_id, password, principal=_principal(as_human))
-    _emit(_run(lambda: {"ok": True, "human_id": human_id}))
+    _print_json({"ok": True, "human_id": human_id})
 
 
 @human_app.command("disable")
@@ -936,7 +936,7 @@ def human_disable(
 ) -> None:
     """Disable a human (its sessions and its agents' tokens die; proposals stay)."""
     _run(service.disable_human, human_id, principal=_principal(as_human))
-    _emit(_run(lambda: {"ok": True, "human_id": human_id, "disabled": True}))
+    _print_json({"ok": True, "human_id": human_id, "disabled": True})
 
 
 @human_app.command("enable")
@@ -946,7 +946,7 @@ def human_enable(
 ) -> None:
     """Re-enable a disabled human."""
     _run(service.enable_human, human_id, principal=_principal(as_human))
-    _emit(_run(lambda: {"ok": True, "human_id": human_id, "disabled": False}))
+    _print_json({"ok": True, "human_id": human_id, "disabled": False})
 
 
 @agent_app.command("create")
@@ -986,7 +986,7 @@ def agent_token_rotate(
     """Replace an agent's token (the old one dies now; the new one shows once)."""
     token = _run(service.rotate_agent_token, agent_id, principal=_principal(as_human))
     typer.echo(f"token (shown once — store it now): {token}", err=True)
-    _emit(_run(lambda: {"ok": True, "agent_id": agent_id}))
+    _print_json({"ok": True, "agent_id": agent_id})
 
 
 @agent_app.command("disable")
@@ -996,7 +996,7 @@ def agent_disable(
 ) -> None:
     """Disable an agent (its token dies immediately; its proposals stay, reviewable)."""
     _run(service.disable_agent, agent_id, principal=_principal(as_human))
-    _emit(_run(lambda: {"ok": True, "agent_id": agent_id, "disabled": True}))
+    _print_json({"ok": True, "agent_id": agent_id, "disabled": True})
 
 
 @agent_app.command("enable")
@@ -1006,7 +1006,7 @@ def agent_enable(
 ) -> None:
     """Re-enable a disabled agent."""
     _run(service.enable_agent, agent_id, principal=_principal(as_human))
-    _emit(_run(lambda: {"ok": True, "agent_id": agent_id, "disabled": False}))
+    _print_json({"ok": True, "agent_id": agent_id, "disabled": False})
 
 
 @app.command()
@@ -1028,7 +1028,7 @@ def revoke(
 ) -> None:
     """Revoke an agent's grant on a space; event-logged."""
     _run(service.revoke, agent_id, space, principal=_principal(as_human))
-    _emit(_run(lambda: {"ok": True, "agent_id": agent_id, "space": space}))
+    _print_json({"ok": True, "agent_id": agent_id, "space": space})
 
 
 @app.command()
@@ -1056,7 +1056,11 @@ def space_create(
 def space_list(as_human: str = AS_OPTION) -> None:
     """List spaces."""
     nodes = _run(
-        service.list_nodes, type="space", include_meta=True, principal=_principal(as_human)
+        service.list_nodes,
+        type="space",
+        state="active",
+        include_meta=True,
+        principal=_principal(as_human),
     )
     _emit_list("spaces", nodes)
 
