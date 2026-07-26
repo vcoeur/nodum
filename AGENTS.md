@@ -13,8 +13,7 @@ logged in an append-only event log with full before/after payloads, versioned
 as `mentions` edges on write. The Typer CLI is a thin adapter emitting exactly
 one JSON object per command.
 
-Phase 1 (core) landed; Phase 2 (agent-native) is underway. Built so far in
-Phase 2: **event-log projectors** (`nodum.projectors`) with per-projector
+Phase 1 (core) and Phase 2 (agent-native) have landed: **event-log projectors** (`nodum.projectors`) with per-projector
 checkpoints and rebuild mechanics, the **`fts` projector** (FTS5 over node
 title + content), the **`vec` projector** (sqlite-vec chunk embeddings,
 local in-process fastembed model — migration 0006), **hybrid search**
@@ -22,7 +21,8 @@ local in-process fastembed model — migration 0006), **hybrid search**
 fusion, then one-hop graph-expansion re-ranking, with a per-signal `signals`
 breakdown, **principals, spaces and grants** (Q13: `humans`/`agents`/
 `grants` tables, a scope-bound store, `read`/`suggest`/`edit` per
-(agent, space)), the **review/accept API** (proposal listing with reviewer
+(agent, space) — no policies, no auto-accept anywhere), the
+**review/accept API** (proposal listing with reviewer
 context, batch accept/reject by id or filter — a human, or `edit` on the
 item's space; `undo` stays human-only), **proposed updates** (agent `update_node` stages a
 `proposed` version recording which fields it named; accept applies exactly
@@ -35,13 +35,14 @@ evictable `thumb`/`preview` WebP renditions (design §5.7), exposed over MCP
 as `get_asset` (metadata + rendition image block — never the original).
 Phase 3 (human UI) has landed: the **HTTP API** (`nodum.http_api`, `nodum
 serve`) is the human surface — a Starlette app serving the JSON API under
-`/api` and the built web UI at `/`, with every write forced to `actor =
-human` and no request field able to say otherwise — the shared **envelope**
+`/api` and the built web UI at `/`, gated on password-login sessions with
+every write attributed to the session's human and no request field able to
+say otherwise — the shared **envelope**
 module (`nodum.envelope`) both the CLI and the API render through, and the
 **web UI** itself (`web/`, React 19 + TypeScript, built into `nodum/_web/` by
 `make web-build`; gitignored, shipped in the wheel as a hatchling artifact):
-six views — Markdown editor, hybrid search, review queue,
-graph, assets, per-node version history.
+eight views — login, Markdown editor, hybrid search, review queue,
+graph, assets, an accounts-and-grants admin, per-node version history.
 **Deliberately not built yet** (later phases — do not add): the
 Phase-4 ingestion pipeline (text extraction, chunking, source/claim
 proposals, `ingest_file`/`ingest_url`), `page:<n>` PDF rasters,
@@ -91,10 +92,13 @@ node for exactly this reason.
 - **`nodum.mcp_server`** — the MCP adapter (stdio, official Python SDK
   FastMCP), the **external-agent** surface. Registers the design §8.1 read +
   additive tiers and nothing else, each tool a thin delegate to a
-  service/search function; one configured `--actor` per server names the
-  agent, whose principal is loaded with its grant set — every write and read
-  is confined to those grants (INTERIM: unauthenticated until token
-  verification lands). The review tools
+  service/search function. Auth is the agent token in `NODUM_AGENT_TOKEN` —
+  an `ndm_…` token minted by `nodum agent create` / `token-rotate`, shown
+  once and stored hashed — carried in the environment, never a flag (a flag
+  leaks into `ps` and shell history). At startup it is verified against the
+  `agents` table (an unknown or disabled agent is a startup error), the
+  verified agent's principal is loaded with its grant set, and every read
+  and write is confined to those grants. The review tools
   (`accept`, `reject` — the §8.1 "write (human)" tier) and the
   curative tools (`merge_nodes`, `retype`, `supersede_edge`, `bulk_relink`,
   `consolidate` — §8.2) are **never registered**: structural enforcement, not
@@ -137,8 +141,8 @@ node for exactly this reason.
   `GET /api/nodes/{id}` is byte-identical to `nodum node get <id>` on stdout.
   New list output goes through `list_envelope`, never a hand-built dict.
 - **`web/`** — the human UI (React 19 + TypeScript + Vite), built into
-  `nodum/_web/` by `make web-build` and served by `nodum serve`. Seven routes
-  over six views, each lazily loaded so CodeMirror, Mermaid, and Cytoscape stay
+  `nodum/_web/` by `make web-build` and served by `nodum serve`. Nine routes
+  over eight views, each lazily loaded so CodeMirror, Mermaid, and Cytoscape stay
   out of the initial bundle. `src/api/client.ts` is the only `fetch` in the
   app and has **no identity parameter anywhere** — the server's structural
   rule, mirrored in the client. It sends `Content-Type: application/json` on every
@@ -300,8 +304,9 @@ Phase-1 decision log.
   commands to that shape.
 - DB path resolution: `--db` flag → `NODUM_DB` env var →
   `~/.local/share/nodum/nodum.db`.
-- **The CLI is human-only, and every write command names its human** with a
-  required `--as human:<id>` (or the bare id): attribution is explicit, always
+- **The CLI is human-only, and every command that touches the graph names its
+  human** with a required `--as human:<id>` (or the bare id) — reads included,
+  since reads are grant-scoped like writes: attribution is explicit, always
   (there is no `--actor` — agents drive MCP, never the CLI). A write by a
   human lands `active`. An agent's write (over MCP) lands per its grants:
   `suggest` → `proposed`, `edit` → `active`. An agent `node update` with
@@ -339,7 +344,14 @@ Phase-1 decision log.
   `diff`, `projector run/status/rebuild`,
   `review queue/accept/reject/accept-all/reject-all`,
   `asset register/get/list/rendition/purge`,
-  `mcp serve --actor agent:<name>`,
+  `human create/list/passwd/disable/enable`,
+  `agent create/list/token-rotate/disable/enable` (create and rotate print
+  the show-once `ndm_…` token to stderr; only the hash is stored),
+  `grant <agent> <space> <level>` / `revoke <agent> <space>` / `grants [--agent]`
+  (`read`/`suggest`/`edit`, event-logged),
+  `space-create`/`space-list`/`space-archive` (a space is a node of builtin
+  type `space` in the meta space),
+  `mcp serve` (the agent token comes from `NODUM_AGENT_TOKEN`, never a flag),
   `serve [--host 127.0.0.1] [--port 8600] [--allow-host NAME]
   [--db PATH]`. `serve` prints the database path on stderr and translates
   uvicorn's own startup failure (a port already in use) into the contract's
@@ -380,24 +392,30 @@ Phase-1 decision log.
 
 ## HTTP contract (for agents touching `nodum serve`)
 
-- **The HTTP surface is the human's.** Every write it makes is `actor =
-  human`; the actor is never read from a request. Do not add an "actor"
+- **The HTTP surface is the human's.** Every write it makes is attributed to
+  the session's human principal; the identity is never read from a request.
+  Do not add an "actor"
   parameter, header, or override "for testing" — the MCP surface is where
   agent identity lives, and the inversion is the whole point.
 - Route handlers are thin delegates: one service/search/assets call each, no
   behaviour the service lacks. Writes go through `_write(service.fn, …)`,
-  which is the only place the actor is bound. **Never import a service function
-  that takes an `actor` into `http_api`** — an alias hides it from every
+  which is the only place the principal is bound for a write. **Never import a
+  service function that takes a `principal` into `http_api`** — an alias hides
+  it from every
   source-level check, and `test_no_write_service_function_is_reachable_under_
   any_name` fails on the import itself. Never splat request data into a call
   either: `**` may only unpack a dict an allowlisting helper built, and any new
   one fails `test_no_call_splats_anything_but_an_allowlisting_helper` until it
   is reviewed.
 - **The test that actually holds the boundary is the runtime sweep**
-  (`test_no_endpoint_can_attribute_a_write_to_an_agent`): it drives every
-  state-changing method of every route in `app.routes` with actor-carrying
+  (`test_writes_are_attributed_to_the_sessions_human_and_nothing_else`): it
+  drives every
+  state-changing method of every route in `app.routes` — behind a real
+  session, re-logging in when the sweep hits `/api/logout` — with
+  actor-carrying
   bodies, query strings and headers, then asserts nothing written during the
-  sweep names anything but `human`. The AST properties beside it are a belt —
+  sweep is attributed to anything but the session's human. The AST properties
+  beside it are a belt —
   all of them were evadable by a handler that forwarded a body it never
   inspected, which is how a rogue endpoint once produced
   `created_by: "agent:evil"` on a fully green suite.
