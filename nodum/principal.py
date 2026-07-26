@@ -5,7 +5,8 @@ It is minted **only** by :mod:`nodum.auth` — from a verified credential (HTTP
 session, MCP token) or from the trusted-local path (the CLI, where local
 access is the trust boundary and ``--as`` names the human for attribution).
 Service code never constructs one and never re-derives identity from a
-string; a test (the AST properties over the adapters) keeps it that way.
+string; ``tests/test_principal_guards.py`` keeps it that way, as AST
+properties over every module in the package.
 
 Human principals are unfiltered: human accounts are identity, credentials
 and attribution, never a permission scope — the file is the only isolation

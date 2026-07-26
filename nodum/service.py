@@ -125,6 +125,10 @@ class VersionNotFound(RecordNotFound):
     """Raised when a version id does not resolve."""
 
 
+class AccountExists(ValueError):
+    """Raised when an account id is already taken (a duplicate ``agent create``)."""
+
+
 class InvalidTransition(ValueError):
     """Raised when a state transition is not allowed from the current state."""
 
@@ -2514,6 +2518,10 @@ def diff_versions(
 #: Grant levels accepted by :func:`grant` (hierarchical: read ⊂ suggest ⊂ edit).
 GRANT_LEVEL_NAMES = ("read", "suggest", "edit")
 
+#: Shortest password :func:`set_human_password` accepts. A floor, not a policy:
+#: the empty string used to be storable over both surfaces and logged in fine.
+MIN_PASSWORD_LENGTH = 6
+
 
 def _admin_actor(conn: sqlite3.Connection, principal: Principal) -> str:
     """Gate account/grant administration to humans; return the actor string."""
@@ -2573,7 +2581,19 @@ def create_human(name: str, *, principal: Principal, path: str | Path | None = N
 def set_human_password(
     human_id: str, password: str, *, principal: Principal, path: str | Path | None = None
 ) -> None:
-    """Set or change a human's password (argon2id). The hash never enters a payload."""
+    """Set or change a human's password (argon2id). The hash never enters a payload.
+
+    Changing a password ends that human's live sessions (Q13 review S10): a
+    password change is how a human reacts to a stolen cookie, and a cookie
+    that outlives it makes the reaction useless.
+
+    Raises:
+        ValueError: If the password is shorter than
+            :data:`MIN_PASSWORD_LENGTH`.
+        RecordNotFound: If the account does not exist.
+    """
+    if len(password) < MIN_PASSWORD_LENGTH:
+        raise ValueError(f"password must be at least {MIN_PASSWORD_LENGTH} characters")
     conn = _connect(path)
     try:
         actor = _admin_actor(conn, principal)
@@ -2583,6 +2603,7 @@ def set_human_password(
         )
         if cursor.rowcount == 0:
             raise RecordNotFound(f"no humans row with id: {human_id}")
+        conn.execute("DELETE FROM sessions WHERE human_id = ?", (human_id,))
         _emit(conn, actor, "human.password", {"human_id": human_id})
         conn.commit()
     finally:
@@ -2597,10 +2618,28 @@ def _set_disabled(table: str, row_id: str, disabled: bool, *, conn: sqlite3.Conn
 
 def disable_human(human_id: str, *, principal: Principal, path: str | Path | None = None) -> None:
     """Disable a human: its sessions die, and its external agents' tokens with
-    them (verification-time cascade — R3). In-flight proposals are untouched."""
+    them (verification-time cascade — R3). In-flight proposals are untouched.
+
+    The last enabled human is refused (Q13 review S13): disabling it locks
+    every surface out of the file for good — ``auth.owner_principal`` refuses
+    disabled humans too, so even the trusted-local CLI cannot re-enable it,
+    and recovery means hand SQL.
+
+    Raises:
+        GrantNotPermitted: If ``human_id`` is the only enabled human.
+        RecordNotFound: If the account does not exist.
+    """
     conn = _connect(path)
     try:
         actor = _admin_actor(conn, principal)
+        enabled = [
+            row["id"] for row in conn.execute("SELECT id FROM humans WHERE disabled = 0").fetchall()
+        ]
+        if enabled == [human_id]:
+            raise GrantNotPermitted(
+                f"cannot disable {human_id!r}: it is the last enabled human, and a file with "
+                "none can only be recovered by hand"
+            )
         _set_disabled("humans", human_id, True, conn=conn)
         conn.execute("DELETE FROM sessions WHERE human_id = ?", (human_id,))
         _emit(conn, actor, "human.disable", {"human_id": human_id})
@@ -2649,10 +2688,10 @@ def create_agent(
     set, ``read`` on meta (an agent that cannot read the vocabulary cannot
     resolve a type). Everything beyond that is an explicit ``grant`` call.
     """
-    if kind == "external" and not owner_human_id:
-        raise ValueError("an external agent needs an owner_human_id")
     if kind not in ("external", "internal"):
         raise ValueError(f"kind must be 'external' or 'internal', got {kind!r}")
+    if kind == "external" and not owner_human_id:
+        raise ValueError("an external agent needs an owner_human_id")
     template = {"meta": "read"} if grants is None else grants
     for level in template.values():
         if level not in GRANT_LEVEL_NAMES:
@@ -2661,6 +2700,19 @@ def create_agent(
     try:
         actor = _admin_actor(conn, principal)
         agent_id = name
+        # Everything the schema would otherwise refuse mid-INSERT, checked
+        # first so the answer is a 409/404 and not a bare IntegrityError
+        # surfacing as a 500 (Q13 review S14).
+        if conn.execute("SELECT 1 FROM agents WHERE id = ?", (agent_id,)).fetchone():
+            raise AccountExists(f"an agent named {agent_id!r} already exists")
+        if (
+            owner_human_id is not None
+            and not conn.execute("SELECT 1 FROM humans WHERE id = ?", (owner_human_id,)).fetchone()
+        ):
+            raise RecordNotFound(f"no humans row with id: {owner_human_id}")
+        template = {
+            _resolve_space(conn, space, principal): level for space, level in template.items()
+        }
         token, token_hash = auth.generate_token()
         conn.execute(
             "INSERT INTO agents (id, kind, name, owner_human_id, credential_hash)"
@@ -2689,10 +2741,27 @@ def create_agent(
 def rotate_agent_token(
     agent_id: str, *, principal: Principal, path: str | Path | None = None
 ) -> str:
-    """Replace an agent's token: the old one dies now; the new one shows once."""
+    """Replace an agent's token: the old one dies now; the new one shows once.
+
+    Internal agents are refused (Q13 review N3): they authenticate by being
+    in-process and are minted without a token, so rotating one would hand out
+    a working external credential for an identity that is not supposed to
+    have one.
+
+    Raises:
+        ValueError: If the agent is internal.
+        RecordNotFound: If the account does not exist.
+    """
     conn = _connect(path)
     try:
         actor = _admin_actor(conn, principal)
+        row = conn.execute("SELECT kind FROM agents WHERE id = ?", (agent_id,)).fetchone()
+        if row is None:
+            raise RecordNotFound(f"no agents row with id: {agent_id}")
+        if row["kind"] == "internal":
+            raise ValueError(
+                f"agent {agent_id!r} is internal: it authenticates in-process and holds no token"
+            )
         token, token_hash = auth.generate_token()
         cursor = conn.execute(
             "UPDATE agents SET credential_hash = ? WHERE id = ?", (token_hash, agent_id)
@@ -2707,7 +2776,14 @@ def rotate_agent_token(
 
 
 def disable_agent(agent_id: str, *, principal: Principal, path: str | Path | None = None) -> None:
-    """Disable an agent: its token dies immediately; its proposals stay, flagged."""
+    """Disable an agent: its token stops verifying; its proposals stay, flagged.
+
+    Revocation is verification-time, so *when* it bites depends on the
+    surface (Q13 review S8): HTTP re-checks every request, but an MCP server
+    verifies its token once at launch and holds the principal for the life of
+    the process — a running ``nodum mcp serve`` keeps working until it exits.
+    Kill the process to be sure.
+    """
     conn = _connect(path)
     try:
         actor = _admin_actor(conn, principal)
@@ -2738,12 +2814,20 @@ def grant(
     principal: Principal,
     path: str | Path | None = None,
 ) -> GrantOut:
-    """Grant (or re-level) an agent's access to a space; event-logged."""
+    """Grant (or re-level) an agent's access to a space; event-logged.
+
+    Raises:
+        ValueError: If ``level`` is not one of :data:`GRANT_LEVEL_NAMES`.
+        RecordNotFound: If the agent does not exist.
+        TypeNotFound: If the space does not resolve.
+    """
     if level not in GRANT_LEVEL_NAMES:
         raise ValueError(f"level must be one of {GRANT_LEVEL_NAMES}, got {level!r}")
     conn = _connect(path)
     try:
         actor = _admin_actor(conn, principal)
+        if not conn.execute("SELECT 1 FROM agents WHERE id = ?", (agent_id,)).fetchone():
+            raise RecordNotFound(f"no agents row with id: {agent_id}")
         space_id = _resolve_space(conn, space, principal)
         before = conn.execute(
             "SELECT * FROM grants WHERE agent_id = ? AND space_id = ?", (agent_id, space_id)

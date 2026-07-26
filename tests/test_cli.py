@@ -18,9 +18,17 @@ runner = CliRunner()
 #: requires an explicit `--as` — reads included, since reads take a principal.
 NO_AS_GROUPS = {"init", "schema-dump", "projector", "asset", "mcp", "serve"}
 
+#: The asset commands that read through the graph — they carry ``--as`` like
+#: every other read. ``register``/``purge`` touch the blob store alone.
+AS_ASSET_COMMANDS = {"get", "list", "rendition"}
+
 
 def _needs_as(args) -> bool:
-    return bool(args) and args[0] not in NO_AS_GROUPS and "--as" not in args
+    if not args or "--as" in args:
+        return False
+    if args[0] == "asset":
+        return len(args) > 1 and args[1] in AS_ASSET_COMMANDS
+    return args[0] not in NO_AS_GROUPS
 
 
 def _run_json(*args, input_text=None):
@@ -539,7 +547,7 @@ def test_asset_rendition_rejects_non_images(fresh_db, tmp_path):
     text_file.write_text("not an image")
     asset = _run_json("asset", "register", str(text_file))
 
-    result = runner.invoke(app, ["asset", "rendition", asset["hash"]])
+    result = runner.invoke(app, ["asset", "rendition", asset["hash"], "--as", "owner"])
     assert result.exit_code == 1
     assert "only supported for image assets" in result.stderr
 

@@ -2,37 +2,42 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 
 import pytest
 from helpers import OWNER_ACTOR, agent, owner
 
-from nodum import auth, service
+from nodum import auth, db, service
+from nodum.store import GrantNotPermitted
+
+#: Cookie by session-row id, so a test can key the table and still present the
+#: cookie the caller was handed (the row holds only the hash — review S9).
+_cookies: dict[str, str] = {}
+
+
+def _session_row_id(cookie: str) -> str:
+    """The ``sessions.id`` for a cookie, remembering the cookie for later use."""
+    row_id = hashlib.sha256(cookie.encode()).hexdigest()
+    _cookies[row_id] = cookie
+    return row_id
+
 
 # ── Passwords (argon2id) ──────────────────────────────────────────────────────
 
 
-def test_password_set_and_verify(fresh_db):
+def test_password_is_stored_as_an_argon2id_hash(fresh_db):
+    """Never the password itself, and never a bare digest."""
     service.set_human_password("owner", "correct horse", principal=owner())
-    assert auth.verify_password("owner", "correct horse").actor_string == OWNER_ACTOR
-
-
-def test_wrong_password_is_invalid_credentials(fresh_db):
-    service.set_human_password("owner", "right", principal=owner())
-    with pytest.raises(auth.InvalidCredentials):
-        auth.verify_password("owner", "wrong")
-
-
-def test_passwordless_account_cannot_log_in(fresh_db):
-    with pytest.raises(auth.InvalidCredentials):
-        auth.verify_password("owner", "anything")
-
-
-def test_disabled_human_cannot_log_in(fresh_db):
-    service.set_human_password("owner", "secret", principal=owner())
-    service.disable_human("owner", principal=owner())
-    with pytest.raises(auth.InvalidCredentials):
-        auth.verify_password("owner", "secret")
+    stored = service.list_humans(principal=owner())
+    assert [human.has_password for human in stored if human.id == "owner"] == [True]
+    conn = db.connect()
+    try:
+        digest = conn.execute("SELECT credential_hash FROM humans WHERE id = 'owner'").fetchone()[0]
+    finally:
+        conn.close()
+    assert digest.startswith("$argon2id$")
+    assert "correct horse" not in digest
 
 
 # ── HTTP login (name + password) ──────────────────────────────────────────────
@@ -41,9 +46,9 @@ def test_disabled_human_cannot_log_in(fresh_db):
 def test_verify_login_resolves_the_name_to_the_account(fresh_db):
     """The login handle is the name; the principal carries the (random) id."""
     human = service.create_human("second", principal=owner())
-    service.set_human_password(human.id, "pw", principal=owner())
+    service.set_human_password(human.id, "second-pw", principal=owner())
 
-    principal = auth.verify_login("second", "pw")
+    principal = auth.verify_login("second", "second-pw")
 
     assert principal.kind == "human"
     assert principal.id == human.id
@@ -53,12 +58,12 @@ def test_verify_login_resolves_the_name_to_the_account(fresh_db):
 @pytest.mark.parametrize(
     ("name", "password"),
     [
-        ("owner", "wrong"),  # right name, wrong password
-        ("nobody", "pw"),  # unknown name
+        ("owner", "wrong password"),  # right name, wrong password
+        ("nobody", "owner-pw"),  # unknown name
     ],
 )
 def test_verify_login_failures_are_all_invalid_credentials(fresh_db, name, password):
-    service.set_human_password("owner", "pw", principal=owner())
+    service.set_human_password("owner", "owner-pw", principal=owner())
     with pytest.raises(auth.InvalidCredentials):
         auth.verify_login(name, password)
 
@@ -79,14 +84,41 @@ def test_verify_login_refuses_an_ambiguous_name(fresh_db):
             auth.verify_login("owner", password)
 
 
-def test_a_failed_login_still_pays_the_argon2_work_factor(fresh_db, monkeypatch):
-    """Constant-time discipline: a failure must time like a success.
+def _seed_login_failure(case: str) -> tuple[str, str]:
+    """Set the database up for one ``verify_login`` failure path; return the attempt."""
+    if case == "unknown name":
+        return "nobody", "some-pw"
+    if case == "passwordless":
+        return "owner", "some-pw"
+    if case == "ambiguous name":
+        twin = service.create_human("owner", principal=owner())
+        service.set_human_password("owner", "first-pw", principal=owner())
+        service.set_human_password(twin.id, "second-pw", principal=owner())
+        return "owner", "first-pw"
+    if case == "wrong password":
+        service.set_human_password("owner", "right-pw", principal=owner())
+        return "owner", "wrong-pw"
+    # A disabled account, with the right password: the verify still runs.
+    service.create_human("second", principal=owner())  # the owner is not the last one
+    service.set_human_password("owner", "owner-pw", principal=owner())
+    service.disable_human("owner", principal=owner())
+    return "owner", "owner-pw"
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["unknown name", "passwordless", "ambiguous name", "wrong password", "disabled account"],
+)
+def test_every_failed_login_pays_the_argon2_work_factor_exactly_once(fresh_db, monkeypatch, case):
+    """Constant-time discipline: every failure must time like a success.
 
     Otherwise the response time discloses which login names exist — an
     account enumeration primitive against exactly the surface that asks for
     passwords. Asserted as "one verification ran", not as a wall-clock
-    comparison, so the test is never flaky.
+    comparison, so the test is never flaky. All five failure paths are
+    covered: the spy used to see two of them (review N6).
     """
+    name, password = _seed_login_failure(case)
     verifications = 0
     real_hasher = auth._HASHER
 
@@ -101,10 +133,9 @@ def test_a_failed_login_still_pays_the_argon2_work_factor(fresh_db, monkeypatch)
 
     monkeypatch.setattr(auth, "_HASHER", SpyHasher())
 
-    for name in ("nobody", "owner"):  # unknown, then passwordless
-        with pytest.raises(auth.InvalidCredentials):
-            auth.verify_login(name, "pw")
-    assert verifications == 2
+    with pytest.raises(auth.InvalidCredentials):
+        auth.verify_login(name, password)
+    assert verifications == 1
 
 
 # ── Agent tokens (show-once, sha-256 at rest) ─────────────────────────────────
@@ -160,6 +191,7 @@ def test_disabling_an_agent_kills_its_token_and_keeps_its_proposals(fresh_db):
 
 def test_disabling_the_owner_cascades_to_external_agents_tokens(fresh_db):
     created = service.create_agent("bot", owner_human_id="owner", principal=owner())
+    service.create_human("second", principal=owner())  # the owner is not the last one
     service.disable_human("owner", principal=owner())
     with pytest.raises(auth.InvalidCredentials):
         auth.verify_agent_token(created.token)
@@ -168,8 +200,40 @@ def test_disabling_the_owner_cascades_to_external_agents_tokens(fresh_db):
 # ── Sessions (server-side, 30-day sliding) ────────────────────────────────────
 
 
+def test_the_session_table_never_holds_the_live_cookie(fresh_db):
+    """S9: a database read leak must not hand out usable sessions."""
+    cookie = auth.create_session("owner")
+    conn = db.connect()
+    try:
+        stored = [row["id"] for row in conn.execute("SELECT id FROM sessions")]
+    finally:
+        conn.close()
+    assert cookie not in stored
+    assert stored == [hashlib.sha256(cookie.encode()).hexdigest()]
+
+
+def test_login_sweeps_expired_sessions(fresh_db):
+    """N7: expiry was only ever noticed when a dead cookie was presented."""
+    stale = auth.create_session("owner")
+    conn = db.connect()
+    conn.execute("UPDATE sessions SET expires_at = datetime('now', '-1 day')")
+    conn.commit()
+    conn.close()
+
+    auth.create_session("owner")
+
+    conn = db.connect()
+    try:
+        remaining = conn.execute("SELECT count(*) AS n FROM sessions").fetchone()["n"]
+    finally:
+        conn.close()
+    assert remaining == 1
+    with pytest.raises(auth.InvalidCredentials):
+        auth.principal_for_session(stale)
+
+
 def test_session_resolves_and_slides_expiry(fresh_db):
-    session_id = auth.create_session("owner")
+    session_id = _session_row_id(auth.create_session("owner"))
     conn = service.db.connect()
     first = conn.execute("SELECT expires_at FROM sessions WHERE id = ?", (session_id,)).fetchone()[
         "expires_at"
@@ -180,7 +244,7 @@ def test_session_resolves_and_slides_expiry(fresh_db):
         (session_id,),
     )
     conn.commit()
-    assert auth.principal_for_session(session_id).actor_string == OWNER_ACTOR
+    assert auth.principal_for_session(_cookies[session_id]).actor_string == OWNER_ACTOR
     slid = conn.execute("SELECT expires_at FROM sessions WHERE id = ?", (session_id,)).fetchone()[
         "expires_at"
     ]
@@ -188,7 +252,8 @@ def test_session_resolves_and_slides_expiry(fresh_db):
 
 
 def test_an_expired_session_is_dead_and_deleted(fresh_db):
-    session_id = auth.create_session("owner")
+    cookie = auth.create_session("owner")
+    session_id = _session_row_id(cookie)
     conn = service.db.connect()
     conn.execute(
         "UPDATE sessions SET expires_at = datetime('now', '-1 day') WHERE id = ?",
@@ -196,7 +261,7 @@ def test_an_expired_session_is_dead_and_deleted(fresh_db):
     )
     conn.commit()
     with pytest.raises(auth.InvalidCredentials):
-        auth.principal_for_session(session_id)
+        auth.principal_for_session(cookie)
     assert (
         conn.execute("SELECT count(*) AS n FROM sessions WHERE id = ?", (session_id,)).fetchone()[
             "n"
@@ -213,10 +278,37 @@ def test_logout_deletes_the_session(fresh_db):
 
 
 def test_disabling_a_human_deletes_its_sessions(fresh_db):
-    session_id = auth.create_session("owner")
-    service.disable_human("owner", principal=owner())
+    second = service.create_human("second", principal=owner())
+    cookie = auth.create_session(second.id)
+    service.disable_human(second.id, principal=owner())
     with pytest.raises(auth.InvalidCredentials):
-        auth.principal_for_session(session_id)
+        auth.principal_for_session(cookie)
+
+
+def test_changing_a_password_ends_that_humans_sessions(fresh_db):
+    """S10: a password change is how a human answers a stolen cookie."""
+    cookie = auth.create_session("owner")
+    service.set_human_password("owner", "new password", principal=owner())
+    with pytest.raises(auth.InvalidCredentials):
+        auth.principal_for_session(cookie)
+
+
+def test_a_password_under_the_floor_is_refused(fresh_db):
+    """S11: the empty string was storable over both surfaces, and logged in."""
+    for password in ("", "short"):
+        with pytest.raises(ValueError, match="at least 6"):
+            service.set_human_password("owner", password, principal=owner())
+
+
+def test_the_last_enabled_human_cannot_disable_itself(fresh_db):
+    """S13: no enabled human means no principal at all — not even from the CLI."""
+    with pytest.raises(GrantNotPermitted, match="last enabled human"):
+        service.disable_human("owner", principal=owner())
+
+    second = service.create_human("second", principal=owner())
+    service.disable_human("owner", principal=owner())  # a second one exists now
+    with pytest.raises(GrantNotPermitted, match="last enabled human"):
+        service.disable_human(second.id, principal=auth.owner_principal(second.id))
 
 
 # ── Grant administration (human-only, event-logged) ───────────────────────────

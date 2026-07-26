@@ -14,11 +14,12 @@ import random
 import sqlite3
 
 import pytest
-from helpers import owner
+from helpers import agent, owner, seed_space
 from PIL import Image
 
 from nodum import assets, db, service
 from nodum.assets import AssetNotFound, UnsupportedRendition
+from nodum.store import GrantNotPermitted
 
 
 def _decode(rendition, path=None):
@@ -87,7 +88,7 @@ def test_register_streams_bytes_into_the_database(fresh_db, tmp_path):
 def test_register_writes_nothing_beside_the_database(fresh_db, tmp_path):
     """The single-file promise: no asset directory, no rendition cache on disk."""
     asset = _register_image(fresh_db, tmp_path)
-    assets.get_rendition(asset.hash, profile="thumb")
+    assets.get_rendition(asset.hash, profile="thumb", principal=owner())
     beside = {child.name for child in fresh_db.parent.iterdir()}
     assert not {name for name in beside if name in ("assets", "renditions")}
 
@@ -97,7 +98,7 @@ def test_zero_byte_asset_registers(fresh_db, tmp_path):
     empty.write_bytes(b"")
     asset = assets.register_asset(empty)
     assert asset.size_bytes == 0
-    assert assets.get_asset(asset.hash).hash == asset.hash
+    assert assets.get_asset(asset.hash, principal=owner()).hash == asset.hash
 
 
 def test_register_dedups_identical_content(fresh_db, tmp_path):
@@ -105,14 +106,14 @@ def test_register_dedups_identical_content(fresh_db, tmp_path):
     second = assets.register_asset(tmp_path / "photo.png", name="renamed.png")
     assert second.hash == first.hash
     assert second.original_name == "photo.png"  # the existing row wins
-    assert len(assets.list_assets()) == 1
+    assert len(assets.list_assets(principal=owner())) == 1
 
 
 def test_register_distinct_content_gets_distinct_hashes(fresh_db, tmp_path):
     one = _register_image(fresh_db, tmp_path, name="a.png")
     other = _register_image(fresh_db, tmp_path, name="b.png", size=(10, 10))
     assert one.hash != other.hash
-    assert len(assets.list_assets()) == 2
+    assert len(assets.list_assets(principal=owner())) == 2
 
 
 # ── Metadata resolution: by hash or by asset-reference node ──────────────────
@@ -120,7 +121,7 @@ def test_register_distinct_content_gets_distinct_hashes(fresh_db, tmp_path):
 
 def test_get_asset_by_hash_and_by_node_id(fresh_db, tmp_path):
     asset = _register_image(fresh_db, tmp_path)
-    assert assets.get_asset(asset.hash).hash == asset.hash
+    assert assets.get_asset(asset.hash, principal=owner()).hash == asset.hash
 
     node = service.create_node(
         type="asset_ref",
@@ -128,12 +129,12 @@ def test_get_asset_by_hash_and_by_node_id(fresh_db, tmp_path):
         props={"asset_hash": asset.hash},
         principal=owner(),
     )
-    assert assets.get_asset(node.id).hash == asset.hash
+    assert assets.get_asset(node.id, principal=owner()).hash == asset.hash
 
 
 def test_get_asset_unknown_raises(fresh_db):
     with pytest.raises(AssetNotFound):
-        assets.get_asset("missing")
+        assets.get_asset("missing", principal=owner())
 
 
 # ── Geometry: downscale to the profile cap, never upscale ────────────────────
@@ -141,7 +142,7 @@ def test_get_asset_unknown_raises(fresh_db):
 
 def test_thumb_downscales_to_256_max_edge(fresh_db, tmp_path):
     asset = _register_image(fresh_db, tmp_path, size=(2000, 1000))
-    rendition = assets.get_rendition(asset.hash, profile="thumb")
+    rendition = assets.get_rendition(asset.hash, profile="thumb", principal=owner())
     assert (rendition.width, rendition.height) == (256, 128)
     with _decode(rendition) as decoded:
         assert decoded.format == "WEBP"
@@ -150,20 +151,20 @@ def test_thumb_downscales_to_256_max_edge(fresh_db, tmp_path):
 
 def test_preview_downscales_to_1024_max_edge(fresh_db, tmp_path):
     asset = _register_image(fresh_db, tmp_path, size=(2000, 1000))
-    rendition = assets.get_rendition(asset.hash, profile="preview")
+    rendition = assets.get_rendition(asset.hash, profile="preview", principal=owner())
     assert (rendition.width, rendition.height) == (1024, 512)
 
 
 def test_small_images_are_never_upscaled(fresh_db, tmp_path):
     asset = _register_image(fresh_db, tmp_path, size=(100, 50))
     for profile, expected in (("thumb", (100, 50)), ("preview", (100, 50))):
-        rendition = assets.get_rendition(asset.hash, profile=profile)
+        rendition = assets.get_rendition(asset.hash, profile=profile, principal=owner())
         assert (rendition.width, rendition.height) == expected
 
 
 def test_rgba_alpha_survives_rendition(fresh_db, tmp_path):
     asset = _register_image(fresh_db, tmp_path, mode="RGBA", size=(800, 800))
-    rendition = assets.get_rendition(asset.hash, profile="preview")
+    rendition = assets.get_rendition(asset.hash, profile="preview", principal=owner())
     with _decode(rendition) as decoded:
         assert decoded.mode == "RGBA"
 
@@ -175,7 +176,8 @@ def test_thumb_is_encoded_at_the_profiles_nominal_quality(fresh_db, tmp_path):
     re-encode the same prepared image here and compare bytes.
     """
     asset = _register_image(fresh_db, tmp_path, size=(600, 300), noise=True)
-    stored = assets.read_rendition_bytes(assets.get_rendition(asset.hash, profile="thumb"))
+    rendition = assets.get_rendition(asset.hash, profile="thumb", principal=owner())
+    stored = assets.read_rendition_bytes(rendition)
 
     prepared = _prepared(fresh_db, asset.hash, "thumb")
     assert assets.PROFILES["thumb"].quality == 75
@@ -186,7 +188,8 @@ def test_thumb_is_encoded_at_the_profiles_nominal_quality(fresh_db, tmp_path):
 def test_preview_encodes_at_q80_when_it_already_fits_the_target(fresh_db, tmp_path):
     """A target profile also starts at its nominal quality; steps are the fallback."""
     asset = _register_image(fresh_db, tmp_path, size=(400, 400))
-    stored = assets.read_rendition_bytes(assets.get_rendition(asset.hash, profile="preview"))
+    rendition = assets.get_rendition(asset.hash, profile="preview", principal=owner())
+    stored = assets.read_rendition_bytes(rendition)
 
     prepared = _prepared(fresh_db, asset.hash, "preview")
     assert len(stored) <= assets.PROFILES["preview"].target_bytes
@@ -197,7 +200,7 @@ def test_preview_respects_the_300kb_target(fresh_db, tmp_path):
     # Noise compresses badly: q80 WebP of this is far above 300 KB, forcing
     # the quality-stepping loop to fit the target.
     asset = _register_image(fresh_db, tmp_path, size=(1600, 1600), noise=True)
-    rendition = assets.get_rendition(asset.hash, profile="preview")
+    rendition = assets.get_rendition(asset.hash, profile="preview", principal=owner())
     assert rendition.size_bytes <= 300_000
     assert (rendition.width, rendition.height) == (1024, 1024)
     # The nominal quality really was too big — the ladder is what fit it.
@@ -224,7 +227,7 @@ def test_non_rgb_originals_are_converted_before_encoding(fresh_db, tmp_path, mod
         assert reopened.mode == mode  # the mode really survived the round-trip
 
     asset = assets.register_asset(source)
-    rendition = assets.get_rendition(asset.hash, profile="thumb")
+    rendition = assets.get_rendition(asset.hash, profile="thumb", principal=owner())
     assert (rendition.width, rendition.height) == (256, 128)
     with _decode(rendition) as decoded:
         assert decoded.format == "WEBP"
@@ -244,7 +247,7 @@ def test_palette_transparency_becomes_alpha(fresh_db, tmp_path):
     image.save(source, transparency=0)
 
     asset = assets.register_asset(source)
-    with _decode(assets.get_rendition(asset.hash, profile="thumb")) as decoded:
+    with _decode(assets.get_rendition(asset.hash, profile="thumb", principal=owner())) as decoded:
         assert decoded.mode == "RGBA"
         assert decoded.convert("RGBA").getpixel((10, 10))[3] == 0  # still transparent
 
@@ -254,7 +257,7 @@ def test_palette_transparency_becomes_alpha(fresh_db, tmp_path):
 
 def test_rendition_id_is_sha256_of_hash_and_profile(fresh_db, tmp_path):
     asset = _register_image(fresh_db, tmp_path)
-    rendition = assets.get_rendition(asset.hash, profile="thumb")
+    rendition = assets.get_rendition(asset.hash, profile="thumb", principal=owner())
     expected = hashlib.sha256(f"{asset.hash}:thumb".encode()).hexdigest()
     assert rendition.id == expected
     assert rendition.mime == "image/webp"
@@ -262,23 +265,25 @@ def test_rendition_id_is_sha256_of_hash_and_profile(fresh_db, tmp_path):
 
 def test_lazy_generation_then_cache_hit(fresh_db, tmp_path):
     asset = _register_image(fresh_db, tmp_path)
-    generated = assets.get_rendition(asset.hash, profile="preview")
+    generated = assets.get_rendition(asset.hash, profile="preview", principal=owner())
     assert generated.cached is False
-    hit = assets.get_rendition(asset.hash, profile="preview")
+    hit = assets.get_rendition(asset.hash, profile="preview", principal=owner())
     assert hit.cached is True
     assert hit.id == generated.id
 
 
 def test_include_data_embeds_base64_webp(fresh_db, tmp_path):
     asset = _register_image(fresh_db, tmp_path, size=(10, 10))
-    rendition = assets.get_rendition(asset.hash, profile="thumb", include_data=True)
+    rendition = assets.get_rendition(
+        asset.hash, profile="thumb", include_data=True, principal=owner()
+    )
     raw = assets.read_rendition_bytes(rendition)
     assert raw[:4] == b"RIFF" and raw[8:12] == b"WEBP"
 
 
 def test_metadata_only_fetch_reads_bytes_from_the_database(fresh_db, tmp_path):
     asset = _register_image(fresh_db, tmp_path, size=(10, 10))
-    rendition = assets.get_rendition(asset.hash, profile="thumb")
+    rendition = assets.get_rendition(asset.hash, profile="thumb", principal=owner())
     assert rendition.data_base64 is None
     raw = assets.read_rendition_bytes(rendition)
     assert raw[:4] == b"RIFF" and len(raw) == rendition.size_bytes
@@ -286,8 +291,8 @@ def test_metadata_only_fetch_reads_bytes_from_the_database(fresh_db, tmp_path):
 
 def test_purge_evicts_stored_renditions(fresh_db, tmp_path):
     asset = _register_image(fresh_db, tmp_path)
-    assets.get_rendition(asset.hash, profile="thumb")
-    assets.get_rendition(asset.hash, profile="preview")
+    assets.get_rendition(asset.hash, profile="thumb", principal=owner())
+    assets.get_rendition(asset.hash, profile="preview", principal=owner())
 
     result = assets.purge_renditions()
     assert result.purged == 2
@@ -299,18 +304,18 @@ def test_purge_evicts_stored_renditions(fresh_db, tmp_path):
     finally:
         conn.close()
     # Derived data regenerates on the next request.
-    assert assets.get_rendition(asset.hash, profile="thumb").cached is False
+    assert assets.get_rendition(asset.hash, profile="thumb", principal=owner()).cached is False
 
 
 def test_purge_scoped_to_one_asset(fresh_db, tmp_path):
     one = _register_image(fresh_db, tmp_path, name="a.png")
     other = _register_image(fresh_db, tmp_path, name="b.png", size=(10, 10))
-    assets.get_rendition(one.hash, profile="thumb")
-    assets.get_rendition(other.hash, profile="thumb")
+    assets.get_rendition(one.hash, profile="thumb", principal=owner())
+    assets.get_rendition(other.hash, profile="thumb", principal=owner())
 
     result = assets.purge_renditions(asset_hash=one.hash)
     assert result.purged == 1
-    assert assets.get_rendition(other.hash, profile="thumb").cached is True
+    assert assets.get_rendition(other.hash, profile="thumb", principal=owner()).cached is True
 
 
 # ── Calling convention ────────────────────────────────────────────────────────
@@ -323,18 +328,63 @@ def test_options_including_the_db_path_are_keyword_only(fresh_db, tmp_path):
     `y` as a database path where `service.get_node(x, y, principal=owner())` is a TypeError.
     """
     asset = _register_image(fresh_db, tmp_path)
-    rendition = assets.get_rendition(asset.hash, profile="thumb")
+    rendition = assets.get_rendition(asset.hash, profile="thumb", principal=owner())
     for call in (
         lambda: assets.register_asset(tmp_path / "photo.png", "renamed.png"),
-        lambda: assets.get_asset(asset.hash, "not-a-database"),
-        lambda: assets.list_assets(fresh_db),
-        lambda: assets.get_rendition(asset.hash, "thumb"),
+        lambda: assets.get_asset(asset.hash, "not-a-database", principal=owner()),
+        lambda: assets.list_assets(fresh_db, principal=owner()),
+        lambda: assets.get_rendition(asset.hash, "thumb", principal=owner()),
         lambda: assets.read_rendition_bytes(rendition, fresh_db),
         lambda: assets.purge_renditions(asset.hash),
         lambda: assets.copy_rendition(rendition, tmp_path / "out.webp", fresh_db),
     ):
         with pytest.raises(TypeError, match="positional"):
             call()
+
+
+# ── Access (interim, until Phase 4 gives assets a space) ──────────────────────
+
+
+def test_a_zero_grant_agent_cannot_touch_the_asset_store(fresh_db, tmp_path):
+    """S2: the asset path took no principal, so every agent read every asset."""
+    asset = _register_image(fresh_db, tmp_path)
+    blind = agent("blind", grants={})
+
+    for call in (
+        lambda: assets.list_assets(principal=blind),
+        lambda: assets.get_asset(asset.hash, principal=blind),
+        lambda: assets.get_rendition(asset.hash, profile="thumb", principal=blind),
+    ):
+        with pytest.raises(GrantNotPermitted):
+            call()
+
+
+def test_an_agent_holding_any_grant_may_read_assets(fresh_db, tmp_path):
+    asset = _register_image(fresh_db, tmp_path)
+    reader = agent("reader", grants={"main": "read"})
+
+    assert assets.get_asset(asset.hash, principal=reader).hash == asset.hash
+    assert [row.hash for row in assets.list_assets(principal=reader)] == [asset.hash]
+
+
+def test_an_asset_ref_node_in_an_unreadable_space_does_not_resolve(fresh_db, tmp_path):
+    """The node-id handle must not become an existence oracle either."""
+    asset = _register_image(fresh_db, tmp_path)
+    seed_space("b")
+    node = service.create_node(
+        type="asset_ref",
+        title="Scan",
+        space="b",
+        props={"asset_hash": asset.hash},
+        principal=owner(),
+    )
+    reader = agent("reader", grants={"main": "read"})
+
+    with pytest.raises(AssetNotFound):
+        assets.get_asset(node.id, principal=reader)
+    # The same handle resolves for a principal that can read space b.
+    granted = agent("granted", grants={"b": "read"})
+    assert assets.get_asset(node.id, principal=granted).hash == asset.hash
 
 
 # ── Clean rejection ───────────────────────────────────────────────────────────
@@ -345,7 +395,7 @@ def test_non_image_assets_are_rejected(fresh_db, tmp_path):
     text_file.write_text("plain text, not an image")
     asset = assets.register_asset(text_file)
     with pytest.raises(UnsupportedRendition, match="only supported for image assets"):
-        assets.get_rendition(asset.hash)
+        assets.get_rendition(asset.hash, principal=owner())
 
 
 def test_unreadable_image_bytes_are_rejected(fresh_db, tmp_path):
@@ -353,18 +403,18 @@ def test_unreadable_image_bytes_are_rejected(fresh_db, tmp_path):
     fake.write_bytes(b"definitely not a png")
     asset = assets.register_asset(fake)
     with pytest.raises(UnsupportedRendition, match="not a raster image"):
-        assets.get_rendition(asset.hash)
+        assets.get_rendition(asset.hash, principal=owner())
 
 
 def test_unknown_profile_is_rejected(fresh_db, tmp_path):
     asset = _register_image(fresh_db, tmp_path)
     with pytest.raises(UnsupportedRendition, match="unknown rendition profile"):
-        assets.get_rendition(asset.hash, profile="page:1")
+        assets.get_rendition(asset.hash, profile="page:1", principal=owner())
 
 
 def test_rendition_of_missing_asset_raises(fresh_db):
     with pytest.raises(AssetNotFound):
-        assets.get_rendition("missing")
+        assets.get_rendition("missing", principal=owner())
 
 
 # ── Streaming and the single-file promise ─────────────────────────────────────
@@ -398,7 +448,7 @@ def test_open_original_of_missing_asset_raises(fresh_db):
 def test_vacuum_into_snapshot_carries_originals_and_renditions(fresh_db, tmp_path, monkeypatch):
     """DB = everything: a one-file backup restores the binaries with the graph."""
     asset = _register_image(fresh_db, tmp_path)
-    rendition = assets.get_rendition(asset.hash, profile="thumb")
+    rendition = assets.get_rendition(asset.hash, profile="thumb", principal=owner())
     original = (tmp_path / "photo.png").read_bytes()
 
     snapshot = tmp_path / "backup" / "graph.db"
@@ -411,7 +461,7 @@ def test_vacuum_into_snapshot_carries_originals_and_renditions(fresh_db, tmp_pat
 
     # Nothing but the one file is carried over.
     monkeypatch.setenv("NODUM_DB", str(snapshot))
-    assert assets.get_asset(asset.hash).hash == asset.hash
+    assert assets.get_asset(asset.hash, principal=owner()).hash == asset.hash
     restored = db.connect(snapshot)
     try:
         with assets.open_original(restored, asset.hash) as blob:
@@ -443,7 +493,7 @@ def test_register_refuses_a_source_that_shrank_between_passes(fresh_db, tmp_path
         assets.register_asset(source)
 
     monkeypatch.undo()
-    assert assets.list_assets() == []
+    assert assets.list_assets(principal=owner()) == []
     conn = db.connect(fresh_db)
     try:
         assert conn.execute("SELECT count(*) AS n FROM asset_blobs").fetchone()["n"] == 0
@@ -472,7 +522,7 @@ def test_register_refuses_a_source_that_grew_between_passes(fresh_db, tmp_path, 
         assets.register_asset(source)
 
     monkeypatch.undo()
-    assert assets.list_assets() == []
+    assert assets.list_assets(principal=owner()) == []
     conn = db.connect(fresh_db)
     try:
         assert conn.execute("SELECT count(*) AS n FROM asset_blobs").fetchone()["n"] == 0
@@ -500,7 +550,7 @@ def test_oversized_asset_is_refused_with_a_clear_message(fresh_db, tmp_path, mon
 
     with pytest.raises(assets.AssetTooLarge, match="cannot exceed SQLite's 16-byte blob limit"):
         assets.register_asset(source)
-    assert assets.list_assets() == []
+    assert assets.list_assets(principal=owner()) == []
 
 
 def test_register_missing_file_raises_file_not_found(fresh_db, tmp_path):
@@ -520,7 +570,7 @@ def test_registration_rolls_back_when_the_blob_write_fails(fresh_db, tmp_path, m
         assets.register_asset(source)
 
     monkeypatch.undo()
-    assert assets.list_assets() == []
+    assert assets.list_assets(principal=owner()) == []
     conn = db.connect(fresh_db)
     try:
         assert conn.execute("SELECT count(*) AS n FROM asset_blobs").fetchone()["n"] == 0

@@ -31,6 +31,15 @@ about to be rendered (:func:`_prepare_image`). :func:`sniff_image_mime` is the
 matching "what is this really" helper: registration records the MIME
 ``mimetypes`` derives from the *name*, which is fine for a local file the
 operator chose and useless against a network upload.
+
+**Access, until Phase 4 gives assets a space.** Asset rows carry no
+``space_id``, so the grant model cannot scope them yet; the interim rule from
+the Q13 design pass is that an asset is readable to any principal holding at
+least one read grant (:func:`_require_any_read`), and a node id offered as a
+handle resolves only inside the caller's read set (:func:`_resolve_hash`).
+Every read below therefore takes a principal — without one a zero-grant agent
+read every asset in the file, and could probe node existence by id through the
+``asset_hash`` prop lookup (Q13 review S2).
 """
 
 from __future__ import annotations
@@ -48,6 +57,8 @@ from PIL import Image, ImageOps, UnidentifiedImageError
 
 from nodum import db
 from nodum.models import AssetOut, PurgeResult, RenditionOut
+from nodum.principal import Principal
+from nodum.store import GrantNotPermitted, Store
 
 #: MIME type every rendition is encoded as (design §5.7).
 RENDITION_MIME = "image/webp"
@@ -373,13 +384,34 @@ def _stream_into_blob(
         )
 
 
-def _resolve_hash(conn: sqlite3.Connection, id_or_hash: str) -> str:
-    """Resolve an asset hash directly or through an asset-reference node's props."""
+def _require_any_read(principal: Principal) -> None:
+    """Gate the asset store: a human, or an agent holding at least one grant.
+
+    Assets are not space-scoped until Phase 4, so this is the whole check —
+    but it is not nothing: an agent with no grant at all has no business in
+    the asset store either.
+
+    Raises:
+        GrantNotPermitted: If the principal holds no grant whatsoever.
+    """
+    if principal.is_human or principal.grants:
+        return
+    raise GrantNotPermitted(f"{principal.actor_string} holds no grant: assets are out of reach")
+
+
+def _resolve_hash(conn: sqlite3.Connection, id_or_hash: str, principal: Principal) -> str:
+    """Resolve an asset hash directly or through an asset-reference node's props.
+
+    The node branch is scoped: a node in a space the principal cannot read
+    does not resolve, so this is not an existence oracle for node ids.
+    """
     row = conn.execute("SELECT hash FROM assets WHERE hash = ?", (id_or_hash,)).fetchone()
     if row is not None:
         return row["hash"]
+    scope, params = Store(conn, principal).node_scope()
     node = conn.execute(
-        "SELECT props FROM nodes WHERE id = ? AND state != 'archived'", (id_or_hash,)
+        f"SELECT props FROM nodes WHERE id = ? AND state != 'archived'{scope}",
+        (id_or_hash, *params),
     ).fetchone()
     if node is not None:
         asset_hash = json.loads(node["props"]).get("asset_hash")
@@ -391,24 +423,31 @@ def _resolve_hash(conn: sqlite3.Connection, id_or_hash: str) -> str:
     raise AssetNotFound(f"asset not found: {id_or_hash}")
 
 
-def get_asset(id_or_hash: str, *, path: str | Path | None = None) -> AssetOut:
+def get_asset(id_or_hash: str, *, principal: Principal, path: str | Path | None = None) -> AssetOut:
     """Fetch one asset's metadata by hash or by an asset-reference node's id.
 
     Raises:
-        AssetNotFound: If neither an asset nor a node with an ``asset_hash``
-            prop resolves.
+        GrantNotPermitted: If the principal holds no read grant at all.
+        AssetNotFound: If neither an asset nor a readable node with an
+            ``asset_hash`` prop resolves.
     """
+    _require_any_read(principal)
     conn = _connect(path)
     try:
-        asset_hash = _resolve_hash(conn, id_or_hash)
+        asset_hash = _resolve_hash(conn, id_or_hash, principal)
         row = conn.execute("SELECT * FROM assets WHERE hash = ?", (asset_hash,)).fetchone()
         return _asset_out(row)
     finally:
         conn.close()
 
 
-def list_assets(*, path: str | Path | None = None) -> list[AssetOut]:
-    """List every registered asset in registration order."""
+def list_assets(*, principal: Principal, path: str | Path | None = None) -> list[AssetOut]:
+    """List every registered asset in registration order.
+
+    Raises:
+        GrantNotPermitted: If the principal holds no read grant at all.
+    """
+    _require_any_read(principal)
     conn = _connect(path)
     try:
         rows = conn.execute("SELECT * FROM assets ORDER BY created_at, hash").fetchall()
@@ -512,6 +551,7 @@ def get_rendition(
     *,
     profile: str = "preview",
     include_data: bool = False,
+    principal: Principal,
     path: str | Path | None = None,
 ) -> RenditionOut:
     """Fetch an image rendition, generating and caching it on first request.
@@ -522,6 +562,7 @@ def get_rendition(
         include_data: Embed the WebP bytes as base64 in the result (the MCP
             path); otherwise only metadata is returned and the stored bytes
             are never read.
+        principal: The reader (see the module docstring's access note).
         path: Explicit database path; defaults to ``NODUM_DB`` resolution.
 
     Returns:
@@ -529,10 +570,12 @@ def get_rendition(
         stored rendition or (re)generated the image.
 
     Raises:
+        GrantNotPermitted: If the principal holds no read grant at all.
         AssetNotFound: If the asset does not resolve.
         UnsupportedRendition: If the profile is unknown or the asset is not a
             raster image Pillow can read.
     """
+    _require_any_read(principal)
     spec = PROFILES.get(profile)
     if spec is None:
         raise UnsupportedRendition(
@@ -541,7 +584,7 @@ def get_rendition(
 
     conn = _connect(path)
     try:
-        asset_hash = _resolve_hash(conn, id_or_hash)
+        asset_hash = _resolve_hash(conn, id_or_hash, principal)
         asset = conn.execute("SELECT * FROM assets WHERE hash = ?", (asset_hash,)).fetchone()
         if not asset["mime"].startswith("image/"):
             raise UnsupportedRendition(

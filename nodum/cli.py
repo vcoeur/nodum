@@ -645,15 +645,16 @@ def asset_register(
 @asset_app.command("get")
 def asset_get(
     id_or_hash: str = typer.Argument(..., help="Asset hash or asset-reference node id."),
+    as_human: str = AS_OPTION,
 ) -> None:
     """Show one asset's metadata (never its bytes)."""
-    _emit(_run(assets.get_asset, id_or_hash))
+    _emit(_run(assets.get_asset, id_or_hash, principal=_principal(as_human)))
 
 
 @asset_app.command("list")
-def asset_list() -> None:
+def asset_list(as_human: str = AS_OPTION) -> None:
     """List every registered asset."""
-    rows = _run(assets.list_assets)
+    rows = _run(assets.list_assets, principal=_principal(as_human))
     _emit_list("assets", rows)
 
 
@@ -664,13 +665,16 @@ def asset_rendition(
     out: str | None = typer.Option(
         None, "--out", "-o", help="Also write the WebP bytes to this path."
     ),
+    as_human: str = AS_OPTION,
 ) -> None:
     """Fetch an image rendition, generating and caching it on first request.
 
     Prints the rendition metadata; image bytes stay in the database and are
     never inlined into the JSON output — use ``--out`` to extract them.
     """
-    rendition = _run(assets.get_rendition, id_or_hash, profile=profile)
+    rendition = _run(
+        assets.get_rendition, id_or_hash, profile=profile, principal=_principal(as_human)
+    )
     if out is not None:
         _run(assets.copy_rendition, rendition, out)
     _emit(rendition)
@@ -745,12 +749,22 @@ def serve(
     from nodum import http_api
 
     resolved_db = Path(db_path) if db_path is not None else db.db_path()
+    loopback = http_api.bare_host(host) in http_api.LOOPBACK_BIND_ADDRESSES
     typer.echo(f"nodum serve → http://{host}:{port}  (database: {resolved_db})", err=True)
     typer.echo(
         "auth: password login — any process that can reach this port may attempt one, "
         "so every /api request still needs a human password (nodum human passwd).",
         err=True,
     )
+    if not loopback:
+        # uvicorn serves plain HTTP. The session cookie is marked Secure on a
+        # non-loopback bind and so fails closed without TLS, but the login body
+        # itself has already crossed the network by then (Q13 review S12).
+        typer.echo(
+            f"warning: {host} is not loopback and this server speaks plain HTTP — "
+            "passwords cross the network in the clear unless a TLS proxy fronts it.",
+            err=True,
+        )
 
     try:
         _run(
@@ -760,7 +774,7 @@ def serve(
                 allowed_hosts=http_api.resolve_allowed_hosts(host, allow_host),
                 # Loopback is plain HTTP, where a Secure cookie would never be
                 # stored; a LAN bind fronts TLS, where it must be.
-                secure_cookies=http_api.bare_host(host) not in http_api.LOOPBACK_BIND_ADDRESSES,
+                secure_cookies=not loopback,
             ),
             host=host,
             port=port,

@@ -18,7 +18,14 @@ from mcp.shared.memory import create_connected_server_and_client_session
 from PIL import Image
 
 from nodum import assets, auth, service
-from nodum.mcp_server import ADDITIVE_TOOLS, CURATIVE_TOOLS, READ_TOOLS, REVIEW_TOOLS, create_server
+from nodum.mcp_server import (
+    ADDITIVE_TOOLS,
+    CURATIVE_TOOLS,
+    OVERWRITING_TOOLS,
+    READ_TOOLS,
+    REVIEW_TOOLS,
+    create_server,
+)
 
 AGENT = "agent:tester"
 TOKEN = "ndm_test_token_for_the_mcp_suite"
@@ -74,11 +81,27 @@ def test_tool_annotations(fresh_db):
     for name in READ_TOOLS:
         assert by_name[name].annotations.readOnlyHint is True
         assert by_name[name].annotations.destructiveHint is False
-    # Everything writable on this surface is additive, so `destructiveHint`
-    # false is honest — the one destructive op (accept) is not registered.
+    # Additive tools only ever add state, whatever grant the agent holds, so
+    # `destructiveHint=False` is honest under `edit` as well as `suggest`.
+    # `update_node` is not: with `edit` it overwrites the node in place, and
+    # hosts auto-approve on that flag (review S15).
     for name in ADDITIVE_TOOLS:
         assert by_name[name].annotations.readOnlyHint is False
-        assert by_name[name].annotations.destructiveHint is False
+        assert by_name[name].annotations.destructiveHint is (name in OVERWRITING_TOOLS)
+    assert set(OVERWRITING_TOOLS) <= set(ADDITIVE_TOOLS)
+
+
+def test_write_tool_docstrings_state_what_an_edit_grant_changes(fresh_db):
+    """The tier is additive by *policy*, not by grant: the docs must say so.
+
+    A `suggest` agent's writes queue; an `edit` agent's land live. Tool
+    descriptions are what an agent reads before calling, and they used to
+    promise `proposed` unconditionally (review S15).
+    """
+    tools = _run(lambda session: session.list_tools()).tools
+    for tool in tools:
+        if tool.name in ADDITIVE_TOOLS:
+            assert "edit" in tool.description, tool.name
 
 
 # ── Token authentication: the MCP surface verifies before it serves ───────────
@@ -98,6 +121,7 @@ def test_create_server_rejects_a_disabled_agents_token(fresh_db):
 
 def test_create_server_rejects_a_token_whose_owner_is_disabled(fresh_db):
     created = service.create_agent("bot", owner_human_id="owner", principal=owner())
+    service.create_human("second", principal=owner())  # the owner is not the last one
     service.disable_human("owner", principal=owner())
     with pytest.raises(auth.InvalidCredentials):
         create_server(token=created.token)

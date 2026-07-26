@@ -8,7 +8,9 @@
   on this path.
 - **Password login** (:func:`verify_login` → :func:`create_session` →
   :func:`principal_for_session`): the HTTP surface's path, argon2id-hashed
-  passwords and server-side session rows (30-day sliding expiry).
+  passwords and server-side session rows (30-day sliding expiry). Session
+  cookies are stored as their sha-256, like agent tokens — the cookie is a
+  live credential, so the table must not hold a usable copy of one.
 - **Agent token** (:func:`verify_agent_token`): the MCP surface's path.
   Tokens are generated show-once; only their sha-256 is stored (sha-256 is
   enough for high-entropy tokens — argon2's work factor buys nothing against
@@ -148,31 +150,6 @@ def set_password(human_id: str, password: str, *, path: str | Path | None = None
         conn.close()
 
 
-def verify_password(human_id: str, password: str, *, path: str | Path | None = None) -> Principal:
-    """Verify a human's password and mint their principal (the login path).
-
-    Raises:
-        InvalidCredentials: If the account does not exist, has no password
-            set, is disabled, or the password does not match.
-    """
-    conn = _connect(path)
-    try:
-        row = conn.execute(
-            "SELECT credential_hash, disabled FROM humans WHERE id = ?", (human_id,)
-        ).fetchone()
-        if row is None or row["credential_hash"] is None:
-            raise InvalidCredentials("invalid credentials")
-        try:
-            _HASHER.verify(row["credential_hash"], password)
-        except (VerifyMismatchError, VerificationError):
-            raise InvalidCredentials("invalid credentials") from None
-        if row["disabled"]:
-            raise InvalidCredentials("invalid credentials")
-        return Principal(kind="human", id=human_id)
-    finally:
-        conn.close()
-
-
 #: Throwaway hash for the constant-time login path — computed lazily on the
 #: first failed lookup, so importing this module never pays the work factor.
 _DUMMY_HASH: str | None = None
@@ -295,28 +272,45 @@ def verify_agent_token(token: str, *, path: str | Path | None = None) -> Princip
 # ── Sessions (server-side, 30-day sliding) ────────────────────────────────────
 
 
+def _session_hash(cookie: str) -> str:
+    """What the ``sessions`` table stores: the cookie's sha-256, never the cookie."""
+    return hashlib.sha256(cookie.encode()).hexdigest()
+
+
 def create_session(human_id: str, *, path: str | Path | None = None) -> str:
-    """Create a session row for a (password-verified) human; return its id."""
-    session_id = secrets.token_urlsafe(32)
+    """Create a session row for a (password-verified) human; return the cookie.
+
+    Only the cookie's sha-256 is stored, for the same reason agent tokens are
+    stored hashed: a database read leak must not hand out live credentials
+    (Q13 review S9). The value returned here is the only copy — it goes to
+    the browser and is never recoverable from the file.
+
+    Expired rows are swept on the way in: expiry is otherwise only noticed
+    when a dead cookie is presented, so a session nobody comes back for was
+    never deleted at all (review N7).
+    """
+    cookie = secrets.token_urlsafe(32)
     conn = _connect(path)
     try:
+        conn.execute("DELETE FROM sessions WHERE expires_at <= datetime('now')")
         conn.execute(
             "INSERT INTO sessions (id, human_id, expires_at) VALUES (?, ?, datetime('now', ?))",
-            (session_id, human_id, f"+{SESSION_DAYS} days"),
+            (_session_hash(cookie), human_id, f"+{SESSION_DAYS} days"),
         )
         conn.commit()
-        return session_id
+        return cookie
     finally:
         conn.close()
 
 
-def principal_for_session(session_id: str, *, path: str | Path | None = None) -> Principal:
+def principal_for_session(cookie: str, *, path: str | Path | None = None) -> Principal:
     """Resolve a session cookie to a principal, sliding the expiry forward.
 
     Raises:
         InvalidCredentials: If the session is unknown, expired, or its human
             is disabled.
     """
+    session_id = _session_hash(cookie)
     conn = _connect(path)
     try:
         row = conn.execute(
@@ -346,11 +340,11 @@ def principal_for_session(session_id: str, *, path: str | Path | None = None) ->
         conn.close()
 
 
-def delete_session(session_id: str, *, path: str | Path | None = None) -> None:
+def delete_session(cookie: str, *, path: str | Path | None = None) -> None:
     """Log out: drop the session row (idempotent)."""
     conn = _connect(path)
     try:
-        conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+        conn.execute("DELETE FROM sessions WHERE id = ?", (_session_hash(cookie),))
         conn.commit()
     finally:
         conn.close()

@@ -504,6 +504,13 @@ def _swept_requests(
     The client drives behind a real session for ``name`` — and re-logs in
     whenever a request kills it (``POST /api/logout`` is in the table too),
     so every route is reached authenticated.
+
+    Every method is swept, reads included: a ``GET`` handler that writes (the
+    rendition cache is one) is exactly the case an attribution guarantee must
+    not assume away. Each write method is also fired as **multipart** with a
+    real image part, because ``POST /api/assets`` is the one route a JSON body
+    cannot reach — the origin guard 415s it before the handler, which used to
+    leave ``upload_asset`` outside the sweep entirely (Q13 review N9).
     """
     client = Client(app, session=_login(app, name, password))
     bodies = [
@@ -538,7 +545,27 @@ def _swept_requests(
         )
         for method in sorted(route.methods or set()):
             if method in ("GET", "HEAD", "OPTIONS"):
+                response = client.request(
+                    method, f"{path}?actor={AGENT}", headers={"X-Actor": AGENT}
+                )
+                if response.status_code == 401:
+                    client = Client(app, session=_login(app, name, password))
+                    response = client.request(
+                        method, f"{path}?actor={AGENT}", headers={"X-Actor": AGENT}
+                    )
+                fired.append((method, path, response.status_code))
                 continue
+            # One part only: the upload handler caps multipart fields at one,
+            # so the actor claim rides the filename, the query and the header.
+            multipart_kwargs = {
+                "files": {"file": (f"{AGENT}.png", _png_bytes(), "image/png")},
+                "headers": {"X-Actor": AGENT},
+            }
+            multipart = client.request(method, f"{path}?actor={AGENT}", **multipart_kwargs)
+            if multipart.status_code == 401:
+                client = Client(app, session=_login(app, name, password))
+                multipart = client.request(method, f"{path}?actor={AGENT}", **multipart_kwargs)
+            fired.append((method, f"{path} (multipart)", multipart.status_code))
             for body in bodies:
                 response = client.request(
                     method, f"{path}?actor={AGENT}", json=body, headers={"X-Actor": AGENT}
@@ -597,6 +624,9 @@ def test_writes_are_attributed_to_the_sessions_human_and_nothing_else(fresh_db):
     # A sweep that never reached a handler would pass vacuously.
     assert len(fired) >= 40, fired
     assert sum(1 for _, _, status in fired if status < 300) >= 5, fired
+    # And the multipart pass really did register an asset, rather than 415ing
+    # at the guard the way the JSON bodies do (review N9).
+    assert any(path.endswith("(multipart)") and status < 300 for _, path, status in fired), fired
 
     new_events = [
         event for event in service.list_events(owner(), limit=5000) if event.seq > before_seq
@@ -756,7 +786,6 @@ def test_the_only_credential_path_is_the_session():
         "owner_principal",
         "agent_principal",
         "verify_agent_token",
-        "verify_password",
         "set_password",
         "store_token",
     }
@@ -1083,6 +1112,7 @@ def test_a_dead_session_cookie_is_cleared_on_the_401(fresh_db):
 
 
 def test_disabling_the_human_kills_the_session_at_the_next_request(client, fresh_db):
+    service.create_human("second", principal=owner())  # the owner is not the last one
     service.disable_human("owner", principal=owner())
 
     assert client.get("/api/types").status_code == 401
@@ -1345,7 +1375,7 @@ def test_an_oversized_upload_is_refused_before_it_is_buffered(fresh_db, tmp_path
         content=chunks(),
     )
     assert streamed.status_code == 413
-    assert assets.list_assets() == []
+    assert assets.list_assets(principal=owner()) == []
 
 
 def test_the_body_cap_covers_json_routes_too(fresh_db):
@@ -1373,7 +1403,7 @@ def test_only_real_images_can_be_uploaded(client, fresh_db, name, payload):
 
     assert response.status_code == 400, response.text
     assert response.json()["error"]["type"] == "UnsupportedRendition"
-    assert assets.list_assets() == []
+    assert assets.list_assets(principal=owner()) == []
 
 
 def test_a_decompression_bomb_is_refused_at_upload_and_at_rendering(client, fresh_db, tmp_path):
@@ -1768,14 +1798,21 @@ def test_human_password_disable_enable(client, fresh_db):
     second = service.create_human("second", principal=owner())
 
     assert client.post(f"/api/humans/{second.id}/password", json={}).status_code == 400
-    assert client.post("/api/humans/nope/password", json={"password": "pw2"}).status_code == 404
+    missing = client.post("/api/humans/nope/password", json={"password": "second-pw"})
+    assert missing.status_code == 404
+    # A password under the floor, and one that is not even a string.
+    for refused in ("pw", 12):
+        response = client.post(f"/api/humans/{second.id}/password", json={"password": refused})
+        assert response.status_code == 400
 
-    assert _ok(client.post(f"/api/humans/{second.id}/password", json={"password": "pw2"})) == {
+    assert _ok(
+        client.post(f"/api/humans/{second.id}/password", json={"password": "second-pw"})
+    ) == {
         "ok": True,
         "human_id": second.id,
     }
     # The new password logs the account in by name.
-    session = _login(client.app, "second", "pw2")
+    session = _login(client.app, "second", "second-pw")
 
     assert _ok(client.post(f"/api/humans/{second.id}/disable")) == {
         "ok": True,
@@ -1791,7 +1828,7 @@ def test_human_password_disable_enable(client, fresh_db):
         "human_id": second.id,
         "disabled": False,
     }
-    _login(client.app, "second", "pw2")
+    _login(client.app, "second", "second-pw")
 
 
 def test_agents_create_list_rotate_disable_enable(client, fresh_db):

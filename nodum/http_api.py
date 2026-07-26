@@ -115,6 +115,7 @@ from nodum.assets import (
 from nodum.envelope import envelope, list_envelope, render_json
 from nodum.principal import Principal
 from nodum.service import (
+    AccountExists,
     EventNotFound,
     GrantNotPermitted,
     InvalidTransition,
@@ -368,8 +369,11 @@ EXCEPTION_STATUS: dict[type[Exception], int] = {
     # only, and humans are unfiltered, so this is unreachable from this
     # surface by construction; mapped so it could never surface as a 500.
     GrantNotPermitted: 403,
-    # 409 — the graph has grown past the event being undone.
+    # 409 — the graph has grown past the event being undone, or the account
+    # name is taken. AccountExists derives from ValueError; the more specific
+    # entry wins (Starlette walks the exception's MRO).
     UndoNotPossible: 409,
+    AccountExists: 409,
     # 413 — the body passed the ceiling this server is willing to read.
     PayloadTooLarge: 413,
     # 499 — the client hung up mid-body (a cancelled upload). Nothing will read
@@ -831,6 +835,21 @@ def _required(body: dict[str, Any], key: str) -> Any:
     return value
 
 
+def _required_str(body: dict[str, Any], key: str) -> str:
+    """Return a required body field that must be a string.
+
+    Credentials and account names reach SQLite directly, where a JSON number
+    or object is a 500 rather than a 400 (Q13 review S14).
+
+    Raises:
+        ValueError: If the key is missing, null, or not a string.
+    """
+    value = _required(body, key)
+    if not isinstance(value, str):
+        raise ValueError(f"field {key!r} must be a string")
+    return value
+
+
 def _param(params: QueryParams, *names: str) -> str | None:
     """Return the first of ``names`` present in the query string.
 
@@ -1139,10 +1158,8 @@ def create_app(
         between "no such name" and "wrong password".
         """
         body = await _json_body(request)
-        name = _required(body, "name")
-        password = _required(body, "password")
-        if not isinstance(name, str) or not isinstance(password, str):
-            raise ValueError("'name' and 'password' must be strings")
+        name = _required_str(body, "name")
+        password = _required_str(body, "password")
         principal = auth.verify_login(name, password, path=db_path)
         session_id = auth.create_session(principal.id, path=db_path)
         response = EnvelopeResponse({"human": principal.id})
@@ -1451,11 +1468,18 @@ def create_app(
 
     async def list_assets(request: Request) -> Response:
         """Registered assets, metadata only — the bytes stay in the database."""
-        return EnvelopeResponse(list_envelope("assets", assets.list_assets(path=db_path)))
+        return EnvelopeResponse(
+            list_envelope(
+                "assets",
+                assets.list_assets(principal=_session_principal(request), path=db_path),
+            )
+        )
 
     async def get_asset(request: Request) -> Response:
         """One asset's metadata, by hash or by asset-reference node id."""
-        asset = assets.get_asset(request.path_params["id"], path=db_path)
+        asset = assets.get_asset(
+            request.path_params["id"], principal=_session_principal(request), path=db_path
+        )
         return EnvelopeResponse(envelope(asset))
 
     async def get_rendition(request: Request) -> Response:
@@ -1465,7 +1489,10 @@ def create_app(
         vocabulary, and originals are never served — here or anywhere else.
         """
         rendition = assets.get_rendition(
-            request.path_params["id"], profile=request.path_params["profile"], path=db_path
+            request.path_params["id"],
+            profile=request.path_params["profile"],
+            principal=_session_principal(request),
+            path=db_path,
         )
         payload = assets.read_rendition_bytes(rendition, path=db_path)
         return Response(payload, media_type=assets.RENDITION_MIME)
@@ -1521,7 +1548,7 @@ def create_app(
     async def create_human(request: Request) -> Response:
         """Create a human account (passwordless until its password is set)."""
         body = await _json_body(request)
-        human = _write(request, service.create_human, _required(body, "name"), path=db_path)
+        human = _write(request, service.create_human, _required_str(body, "name"), path=db_path)
         return EnvelopeResponse(envelope(human))
 
     async def set_human_password(request: Request) -> Response:
@@ -1529,7 +1556,11 @@ def create_app(
         body = await _json_body(request)
         human_id = request.path_params["id"]
         _write(
-            request, service.set_human_password, human_id, _required(body, "password"), path=db_path
+            request,
+            service.set_human_password,
+            human_id,
+            _required_str(body, "password"),
+            path=db_path,
         )
         return EnvelopeResponse({"ok": True, "human_id": human_id})
 
@@ -1560,7 +1591,7 @@ def create_app(
         created = _write(
             request,
             service.create_agent,
-            _required(body, "name"),
+            _required_str(body, "name"),
             kind="external",
             owner_human_id=_session_principal(request).id,
             path=db_path,
@@ -1600,9 +1631,9 @@ def create_app(
         granted = _write(
             request,
             service.grant,
-            _required(body, "agent"),
-            _required(body, "space"),
-            _required(body, "level"),
+            _required_str(body, "agent"),
+            _required_str(body, "space"),
+            _required_str(body, "level"),
             path=db_path,
         )
         return EnvelopeResponse(envelope(granted))
@@ -1610,8 +1641,8 @@ def create_app(
     async def revoke_grant(request: Request) -> Response:
         """Revoke an agent's grant on a space."""
         body = await _json_body(request)
-        agent_id = _required(body, "agent")
-        space = _required(body, "space")
+        agent_id = _required_str(body, "agent")
+        space = _required_str(body, "space")
         _write(request, service.revoke, agent_id, space, path=db_path)
         return EnvelopeResponse({"ok": True, "agent": agent_id, "space": space})
 

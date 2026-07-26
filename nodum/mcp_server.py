@@ -45,13 +45,22 @@ from pydantic import BaseModel
 from nodum import assets, auth, service
 from nodum import search as search_module
 
-#: Tool annotations per registered tier (design §8): reads are read-only;
-#: additive writes are non-destructive — they only ever *add* state (even an
-#: auto-accepted write adds an edge), never archive or overwrite existing
-#: state, and everything is reversible via undo. No annotation exists for a
-#: destructive tool because no destructive tool is registered.
+#: Tool annotations per registered tier (design §8). Reads are read-only.
+#: Additive writes only ever *add* state — a node, an edge, a proposed
+#: version — whatever grant the agent holds, so ``destructiveHint=False``
+#: stays true under ``edit`` as well as ``suggest``.
+#:
+#: ``update_node`` is the exception (Q13 review S15): under an ``edit`` grant
+#: it overwrites the node's fields in place and can retire the mentions its
+#: old content carried. MCP hosts auto-approve on ``destructiveHint=False``,
+#: so annotating it that way was a lie told to the approval prompt — it is
+#: marked destructive, and the cost is that an ``edit``-granted agent's
+#: updates get a confirmation an additive tool's do not. Nothing here is
+#: annotated by what the *current* agent may do: annotations are static
+#: registry metadata, so each one states the worst case its grant allows.
 _READ = ToolAnnotations(readOnlyHint=True, destructiveHint=False)
 _ADDITIVE = ToolAnnotations(readOnlyHint=False, destructiveHint=False)
+_OVERWRITING = ToolAnnotations(readOnlyHint=False, destructiveHint=True)
 
 #: Curative tools (design §8.2) — asserted absent from the registry in tests.
 CURATIVE_TOOLS = ("merge_nodes", "retype", "supersede_edge", "bulk_relink", "consolidate")
@@ -76,6 +85,10 @@ READ_TOOLS = (
     "get_asset",
 )
 ADDITIVE_TOOLS = ("create_node", "update_node", "link", "propose_edges")
+
+#: The write tools whose worst case (under an ``edit`` grant) overwrites live
+#: state rather than adding to it — annotated ``destructiveHint=True``.
+OVERWRITING_TOOLS = ("update_node",)
 
 
 def _dump(result: BaseModel | list[BaseModel]) -> dict[str, Any] | list[dict[str, Any]]:
@@ -229,11 +242,15 @@ def create_server(*, token: str, db_path: str | Path | None = None) -> FastMCP:
                 f"unsupported rendition {rendition!r}: MCP serves "
                 f"{', '.join(sorted(assets.PROFILES))} only — originals never"
             )
-        asset = assets.get_asset(id_or_hash, path=db_path)
+        asset = assets.get_asset(id_or_hash, principal=principal, path=db_path)
         metadata: dict[str, Any] = {"asset": asset.model_dump(mode="json")}
         try:
             rend = assets.get_rendition(
-                id_or_hash, profile=rendition, include_data=True, path=db_path
+                id_or_hash,
+                profile=rendition,
+                include_data=True,
+                principal=principal,
+                path=db_path,
             )
         except assets.UnsupportedRendition:
             # Not a renderable image: metadata (+ extracted text) only, per §5.7.
@@ -252,10 +269,15 @@ def create_server(*, token: str, db_path: str | Path | None = None) -> FastMCP:
         parent: str | None = None,
         props: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Create a node — always `proposed`, awaiting human review.
+        """Create a node. Where it lands depends on your grant on the space.
 
-        Any `[[wikilinks]]` in `content` materialise as `proposed` `mentions`
-        edges; they go live only when a human accepts this node.
+        With a `suggest` grant the node is `proposed` and waits for review;
+        with `edit` it lands `active` immediately — the grant is the whole
+        difference, and nothing on this surface reports which you hold.
+
+        Any `[[wikilinks]]` in `content` materialise as `mentions` edges in
+        the same way, and a link into a space you may only suggest in stays
+        `proposed` even when the node itself is live.
         """
         return _dump(
             service.create_node(
@@ -269,20 +291,24 @@ def create_server(*, token: str, db_path: str | Path | None = None) -> FastMCP:
             )
         )
 
-    @server.tool(annotations=_ADDITIVE)
+    @server.tool(annotations=_OVERWRITING)
     def update_node(
         id: str,
         title: str | None = None,
         content: str | None = None,
         props: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Propose an update to a node: stages a new `proposed` version (design §8.1).
+        """Update a node — staged as a proposal, or applied in place under `edit`.
 
-        Only the given fields change — the proposal records which ones, and
-        accepting applies just those to the node as it stands then, so
-        anything edited while your proposal waited is preserved. The node
-        itself is untouched until a human reviewer accepts the proposed
-        version — there is no tool on this surface that can accept it.
+        With a `suggest` grant this stages a new `proposed` version (design
+        §8.1): only the given fields are recorded, and accepting applies just
+        those to the node as it stands then, so anything edited while your
+        proposal waited is preserved. The node itself is untouched until a
+        reviewer accepts — there is no tool on this surface that can accept.
+
+        **With an `edit` grant the node is overwritten immediately**, its old
+        content replaced and the mentions that content carried retired. That
+        is why this tool is annotated destructive while the others are not.
         """
         kwargs: dict[str, Any] = {}
         if title is not None:
@@ -301,7 +327,10 @@ def create_server(*, token: str, db_path: str | Path | None = None) -> FastMCP:
         props: dict[str, Any] | None = None,
         confidence: float | None = None,
     ) -> dict[str, Any]:
-        """Create a typed, directed edge; lands `proposed` for human review.
+        """Create a typed, directed edge; `proposed` under `suggest`, live under `edit`.
+
+        The landing state needs the matching grant on **both** endpoint
+        spaces: `edit` on one and `suggest` on the other stages the edge.
 
         `confidence` is your own estimate and is recorded as such — it is
         indicative data for the reviewer and triggers nothing on its own.
@@ -320,9 +349,11 @@ def create_server(*, token: str, db_path: str | Path | None = None) -> FastMCP:
 
     @server.tool(annotations=_ADDITIVE)
     def propose_edges(suggestions: list[dict[str, Any]]) -> dict[str, Any]:
-        """Propose a batch of edges: each suggestion is {src, dst, edge_type, props?, confidence?}.
+        """Write a batch of edges: each suggestion is {src, dst, edge_type, props?, confidence?}.
 
-        Bad suggestions are reported in `failed` by index; the rest still write.
+        Each edge lands exactly as `link` would — `proposed` under `suggest`,
+        live under `edit` on both endpoint spaces. Bad suggestions are
+        reported in `failed` by index; the rest still write.
         """
         return _dump(service.propose_edges(suggestions, principal=principal, path=db_path))
 
