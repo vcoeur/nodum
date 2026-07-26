@@ -308,10 +308,15 @@ SPACES_AND_TYPE_NODES_DDL = """
 -- `graph_id` becomes `space_id` on nodes only; types and edge types stop
 -- being tables and become ordinary nodes living in the meta space, keeping
 -- their ids so every existing `type_id` value stays valid across the rewire.
--- The whole rebuild runs with foreign-key enforcement deferred to COMMIT:
--- the bootstrap is mutually referential (the metaclass root is its own type,
--- meta's space is itself), and the table rebuilds transiently drop tables
--- that other tables reference.
+-- The rebuild needs foreign-key enforcement out of the way: the bootstrap is
+-- mutually referential (the metaclass root is its own type, meta's space is
+-- itself), and create-copy-drop-rename transiently drops tables that others
+-- reference. `nodum.db.apply_migration` runs every migration with
+-- `PRAGMA foreign_keys=OFF` and runs `foreign_key_check` over the whole
+-- database before committing — deferring instead is not enough, because
+-- dropping a populated parent leaves a deferred-violation counter that the
+-- rename does not clear. This line keeps the script self-describing if it is
+-- ever replayed by hand with enforcement on.
 PRAGMA defer_foreign_keys = ON;
 
 CREATE TABLE nodes_new (
@@ -413,11 +418,37 @@ CREATE INDEX idx_edges_dst ON edges(dst_id, state);
 DROP TABLE types;
 DROP TABLE edge_types;
 
--- One describing asset_ref node per (hash, space) — guards the shape before
--- Phase 4 writes any (design-pass note 04).
+-- Nothing enforced the (hash, space) rule before this migration — not even
+-- for proposed rows — so a pre-0009 database can hold duplicates that make
+-- the index below fail with a bare IntegrityError, rolling the upgrade back
+-- with no way forward but hand SQL. Dedupe first: keep the earliest live
+-- describing node per (hash, space), archive the rest. Archiving (rather
+-- than deleting) keeps the rows and their history, and the index skips
+-- archived rows, so retiring an asset_ref also frees its hash for a new one.
+UPDATE nodes
+SET state = 'archived', updated_at = datetime('now')
+WHERE type_id = 'asset_ref'
+  AND state != 'archived'
+  AND json_extract(props,'$.asset_hash') IS NOT NULL
+  AND rowid NOT IN (
+      SELECT rowid FROM (
+          SELECT rowid, ROW_NUMBER() OVER (
+              PARTITION BY json_extract(props,'$.asset_hash'), space_id
+              ORDER BY created_at, rowid
+          ) AS rank
+          FROM nodes
+          WHERE type_id = 'asset_ref'
+            AND state != 'archived'
+            AND json_extract(props,'$.asset_hash') IS NOT NULL
+      )
+      WHERE rank = 1
+  );
+
+-- One live describing asset_ref node per (hash, space) — guards the shape
+-- before Phase 4 writes any (design-pass note 04).
 CREATE UNIQUE INDEX idx_asset_ref_per_space ON nodes(
     json_extract(props,'$.asset_hash'), space_id
-) WHERE type_id = 'asset_ref';
+) WHERE type_id = 'asset_ref' AND state != 'archived';
 """
 
 
@@ -441,10 +472,13 @@ CREATE TABLE agents (
     id              TEXT PRIMARY KEY,
     kind            TEXT NOT NULL CHECK (kind IN ('internal','external')),
     name            TEXT NOT NULL,
-    owner_human_id  TEXT REFERENCES humans(id),  -- NOT NULL for external; NULL for internal
+    owner_human_id  TEXT REFERENCES humans(id),
     credential_hash TEXT,                -- sha-256 of the current token; NULL for internal
     disabled        INTEGER NOT NULL DEFAULT 0,
-    created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    -- An external agent answers to a human (that is what cascading
+    -- revocation walks); an internal one is the graph's own, and has none.
+    CHECK (kind = 'internal' OR owner_human_id IS NOT NULL)
 );
 
 CREATE TABLE grants (
@@ -469,15 +503,21 @@ INSERT INTO humans (id, name) VALUES ('owner', 'owner');
 -- One agents row per agent identity the log already knows (event actors,
 -- version actors, created_by columns, and the dying policies table), all
 -- external, owned by the first human, with no token — they cannot
--- authenticate until one is minted.
+-- authenticate until one is minted. Every source is the *bare* name: an
+-- agent id is what `verify_agent_token` looks up and what `agent:` is
+-- prefixed to, so a row seeded as 'agent:x' would be unusable and would
+-- attribute writes to 'agent:agent:x'. `policies.agent` is the one column
+-- that stored the full actor string, hence its own strip.
 INSERT INTO agents (id, kind, name, owner_human_id)
 SELECT DISTINCT name, 'external', name, 'owner' FROM (
     SELECT substr(actor, 7) AS name FROM events WHERE actor LIKE 'agent:%'
     UNION SELECT substr(actor, 7) FROM versions WHERE actor LIKE 'agent:%'
     UNION SELECT substr(created_by, 7) FROM nodes WHERE created_by LIKE 'agent:%'
     UNION SELECT substr(created_by, 7) FROM edges WHERE created_by LIKE 'agent:%'
-    UNION SELECT agent FROM policies
-);
+    UNION SELECT substr(agent, 7) FROM policies WHERE agent LIKE 'agent:%'
+)
+-- A bare 'agent:' actor would otherwise seed an empty-id row.
+WHERE name IS NOT NULL AND length(name) > 0;
 
 -- Parity grants: exactly today's behaviour (read everything, propose
 -- anywhere) so migration changes no agent's effective reach. The owner
