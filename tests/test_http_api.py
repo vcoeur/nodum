@@ -206,6 +206,9 @@ def test_node_get_is_byte_identical_to_the_cli(client, fresh_db):
         ("/api/nodes", ["node", "list", "--as", "owner"]),
         ("/api/edges", ["edge", "list", "--as", "owner"]),
         ("/api/events", ["events", "--as", "owner"]),
+        ("/api/humans", ["human", "list", "--as", "owner"]),
+        ("/api/agents", ["agent", "list", "--as", "owner"]),
+        ("/api/grants", ["grants", "--as", "owner"]),
     ],
 )
 def test_list_envelopes_are_byte_identical_to_the_cli(client, fresh_db, http_path, cli_args):
@@ -242,6 +245,9 @@ def test_every_list_endpoint_uses_the_named_key_plus_count(client, fresh_db):
         ("/api/review/queue", "proposals"),
         ("/api/assets", "assets"),
         ("/api/events", "events"),
+        ("/api/humans", "humans"),
+        ("/api/agents", "agents"),
+        ("/api/grants", "grants"),
     ]:
         payload = _ok(client.get(path))
         assert set(payload) == {key, "count"}, path
@@ -468,6 +474,17 @@ WRITE_FUNCTIONS = {
     "reject_proposals",
     "accept_matching",
     "reject_matching",
+    # Account and grant administration (the /api/humans|agents|grants writers).
+    "create_human",
+    "set_human_password",
+    "disable_human",
+    "enable_human",
+    "create_agent",
+    "rotate_agent_token",
+    "disable_agent",
+    "enable_agent",
+    "grant",
+    "revoke",
 }
 
 
@@ -1718,6 +1735,155 @@ def test_export_downloads_the_node_as_json(client, fresh_db):
     payload = json.loads(response.text)
     assert payload["root"] == hub.id
     assert len(payload["nodes"]) == 2
+
+
+def test_me_is_the_sessions_human(client, fresh_db):
+    me = _ok(client.get("/api/me"))
+    assert me["id"] == "owner"
+    assert me["name"] == "owner"
+    assert me["has_password"] is True
+    assert me["disabled"] is False
+
+
+def test_humans_list_and_create(client, fresh_db):
+    listed = _ok(client.get("/api/humans"))
+    assert [(human["id"], human["name"]) for human in listed["humans"]] == [("owner", "owner")]
+    assert listed["count"] == 1
+
+    created = _ok(client.post("/api/humans", json={"name": "second"}))
+    assert created["name"] == "second"
+    assert created["has_password"] is False
+
+    assert _ok(client.get("/api/humans"))["count"] == 2
+    event = _events("human.create")[0]
+    assert event.actor == OWNER_ACTOR
+    assert event.payload["after"] == {"id": created["id"], "name": "second"}
+
+    assert client.post("/api/humans", json={}).status_code == 400
+
+
+def test_human_password_disable_enable(client, fresh_db):
+    second = service.create_human("second", principal=owner())
+
+    assert client.post(f"/api/humans/{second.id}/password", json={}).status_code == 400
+    assert client.post("/api/humans/nope/password", json={"password": "pw2"}).status_code == 404
+
+    assert _ok(client.post(f"/api/humans/{second.id}/password", json={"password": "pw2"})) == {
+        "ok": True,
+        "human_id": second.id,
+    }
+    # The new password logs the account in by name.
+    session = _login(client.app, "second", "pw2")
+
+    assert _ok(client.post(f"/api/humans/{second.id}/disable")) == {
+        "ok": True,
+        "human_id": second.id,
+        "disabled": True,
+    }
+    # Its sessions die at the next request.
+    assert Client(client.app, session=session).get("/api/me").status_code == 401
+    assert client.post("/api/humans/nope/disable").status_code == 404
+
+    assert _ok(client.post(f"/api/humans/{second.id}/enable")) == {
+        "ok": True,
+        "human_id": second.id,
+        "disabled": False,
+    }
+    _login(client.app, "second", "pw2")
+
+
+def test_agents_create_list_rotate_disable_enable(client, fresh_db):
+    created = _ok(client.post("/api/agents", json={"name": "researcher"}))
+    token = created["token"]
+    assert token.startswith("ndm_")
+    agent_row = created["agent"]
+    assert agent_row["id"] == "researcher"
+    assert agent_row["kind"] == "external"
+    assert agent_row["owner_human_id"] == "owner"
+    assert agent_row["has_token"] is True
+
+    # The creation template grants read on meta — and nothing else.
+    grants = _ok(client.get("/api/grants?agent=researcher"))
+    assert [(row["space_id"], row["level"]) for row in grants["grants"]] == [("meta", "read")]
+
+    # The shown token authenticates; it never reappears in a later body.
+    assert auth.verify_agent_token(token).id == "researcher"
+    listed = _ok(client.get("/api/agents"))
+    assert listed["count"] == 1
+    assert "token" not in listed["agents"][0]
+
+    rotated = _ok(client.post("/api/agents/researcher/token-rotate"))
+    new_token = rotated["token"]
+    assert rotated == {"agent_id": "researcher", "token": new_token}
+    with pytest.raises(auth.InvalidCredentials):
+        auth.verify_agent_token(token)
+    assert auth.verify_agent_token(new_token).id == "researcher"
+    assert client.post("/api/agents/nope/token-rotate").status_code == 404
+
+    assert _ok(client.post("/api/agents/researcher/disable")) == {
+        "ok": True,
+        "agent_id": "researcher",
+        "disabled": True,
+    }
+    with pytest.raises(auth.InvalidCredentials):
+        auth.verify_agent_token(new_token)
+    assert _ok(client.post("/api/agents/researcher/enable")) == {
+        "ok": True,
+        "agent_id": "researcher",
+        "disabled": False,
+    }
+    assert auth.verify_agent_token(new_token).id == "researcher"
+    assert client.post("/api/agents/nope/disable").status_code == 404
+    assert client.post("/api/agents", json={}).status_code == 400
+
+
+def test_grants_grant_list_and_revoke(client, fresh_db):
+    service.create_agent("researcher", owner_human_id="owner", principal=owner())
+
+    granted = _ok(
+        client.post("/api/grants", json={"agent": "researcher", "space": "main", "level": "edit"})
+    )
+    assert granted["agent_id"] == "researcher"
+    assert granted["space_id"] == "main"
+    assert granted["level"] == "edit"
+
+    everything = _ok(client.get("/api/grants"))
+    assert everything["count"] == 2  # the creation-template meta read, plus this one
+    filtered = _ok(client.get("/api/grants?agent=researcher"))
+    assert filtered["count"] == 2
+    assert _ok(client.get("/api/grants?agent=nobody")) == {"grants": [], "count": 0}
+
+    bad_level = client.post(
+        "/api/grants", json={"agent": "researcher", "space": "main", "level": "own"}
+    )
+    assert bad_level.status_code == 400
+    unknown_space = client.post(
+        "/api/grants", json={"agent": "researcher", "space": "nope", "level": "read"}
+    )
+    assert unknown_space.status_code == 404
+    assert client.post("/api/grants", json={"agent": "researcher"}).status_code == 400
+
+    revoked = _ok(client.post("/api/grants/revoke", json={"agent": "researcher", "space": "main"}))
+    assert revoked == {"ok": True, "agent": "researcher", "space": "main"}
+    remaining = _ok(client.get("/api/grants?agent=researcher"))
+    assert [(row["space_id"], row["level"]) for row in remaining["grants"]] == [("meta", "read")]
+    again = client.post("/api/grants/revoke", json={"agent": "researcher", "space": "main"})
+    assert again.status_code == 404
+
+
+def test_the_agent_token_never_reaches_an_event_payload(client, fresh_db):
+    """The HTTP layer must not break the service's show-once guarantee.
+
+    The service keeps credential hashes out of event payloads; this asserts
+    the routes added above don't reintroduce the token anywhere downstream —
+    neither the creation token nor the rotated one appears in any event.
+    """
+    created = _ok(client.post("/api/agents", json={"name": "researcher"}))
+    rotated = _ok(client.post("/api/agents/researcher/token-rotate"))
+
+    payloads = json.dumps([event.payload for event in _events()])
+    assert created["token"] not in payloads
+    assert rotated["token"] not in payloads
 
 
 def test_a_cancelled_upload_is_a_mapped_outcome_not_a_traceback(fresh_db):

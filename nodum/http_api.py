@@ -1501,6 +1501,120 @@ def create_app(
         response.headers["content-disposition"] = f'attachment; filename="nodum-{safe_id}.json"'
         return response
 
+    # ── Accounts and grants (the human administering their file) ──────────
+
+    async def get_me(request: Request) -> Response:
+        """The session's own human account (id, name, credential state)."""
+        principal = _session_principal(request)
+        me = next(
+            human
+            for human in service.list_humans(principal=_session_principal(request), path=db_path)
+            if human.id == principal.id
+        )
+        return EnvelopeResponse(envelope(me))
+
+    async def list_humans(request: Request) -> Response:
+        """Every human account."""
+        humans = service.list_humans(principal=_session_principal(request), path=db_path)
+        return EnvelopeResponse(list_envelope("humans", humans))
+
+    async def create_human(request: Request) -> Response:
+        """Create a human account (passwordless until its password is set)."""
+        body = await _json_body(request)
+        human = _write(request, service.create_human, _required(body, "name"), path=db_path)
+        return EnvelopeResponse(envelope(human))
+
+    async def set_human_password(request: Request) -> Response:
+        """Set or change a human's password; the hash never leaves the service."""
+        body = await _json_body(request)
+        human_id = request.path_params["id"]
+        _write(
+            request, service.set_human_password, human_id, _required(body, "password"), path=db_path
+        )
+        return EnvelopeResponse({"ok": True, "human_id": human_id})
+
+    async def disable_human(request: Request) -> Response:
+        """Disable a human — its sessions die, and its agents' tokens with them."""
+        human_id = request.path_params["id"]
+        _write(request, service.disable_human, human_id, path=db_path)
+        return EnvelopeResponse({"ok": True, "human_id": human_id, "disabled": True})
+
+    async def enable_human(request: Request) -> Response:
+        """Re-enable a disabled human."""
+        human_id = request.path_params["id"]
+        _write(request, service.enable_human, human_id, path=db_path)
+        return EnvelopeResponse({"ok": True, "human_id": human_id, "disabled": False})
+
+    async def list_agents(request: Request) -> Response:
+        """Every agent account."""
+        agents = service.list_agents(principal=_session_principal(request), path=db_path)
+        return EnvelopeResponse(list_envelope("agents", agents))
+
+    async def create_agent(request: Request) -> Response:
+        """Create an external agent owned by the session's human.
+
+        The token comes back in this body — the one and only place it is ever
+        shown (HTTP has no stderr to print it to, as the CLI does).
+        """
+        body = await _json_body(request)
+        created = _write(
+            request,
+            service.create_agent,
+            _required(body, "name"),
+            kind="external",
+            owner_human_id=_session_principal(request).id,
+            path=db_path,
+        )
+        return EnvelopeResponse(envelope(created))
+
+    async def rotate_agent_token(request: Request) -> Response:
+        """Replace an agent's token; the new one is in this body and nowhere else."""
+        agent_id = request.path_params["id"]
+        token = _write(request, service.rotate_agent_token, agent_id, path=db_path)
+        return EnvelopeResponse({"agent_id": agent_id, "token": token})
+
+    async def disable_agent(request: Request) -> Response:
+        """Disable an agent — its token dies immediately."""
+        agent_id = request.path_params["id"]
+        _write(request, service.disable_agent, agent_id, path=db_path)
+        return EnvelopeResponse({"ok": True, "agent_id": agent_id, "disabled": True})
+
+    async def enable_agent(request: Request) -> Response:
+        """Re-enable a disabled agent."""
+        agent_id = request.path_params["id"]
+        _write(request, service.enable_agent, agent_id, path=db_path)
+        return EnvelopeResponse({"ok": True, "agent_id": agent_id, "disabled": False})
+
+    async def list_grants(request: Request) -> Response:
+        """Grant rows, optionally one agent's (``?agent=``)."""
+        grants = service.list_grants(
+            request.query_params.get("agent"),
+            principal=_session_principal(request),
+            path=db_path,
+        )
+        return EnvelopeResponse(list_envelope("grants", grants))
+
+    async def set_grant(request: Request) -> Response:
+        """Grant (or re-level) an agent's access to a space."""
+        body = await _json_body(request)
+        granted = _write(
+            request,
+            service.grant,
+            _required(body, "agent"),
+            _required(body, "space"),
+            _required(body, "level"),
+            path=db_path,
+        )
+        return EnvelopeResponse(envelope(granted))
+
+    async def revoke_grant(request: Request) -> Response:
+        """Revoke an agent's grant on a space."""
+        body = await _json_body(request)
+        agent_id = _required(body, "agent")
+        space = _required(body, "space")
+        _write(request, service.revoke, agent_id, space, path=db_path)
+        return EnvelopeResponse({"ok": True, "agent": agent_id, "space": space})
+
     # ── Fallbacks ─────────────────────────────────────────────────────────
 
     async def api_not_found(request: Request) -> Response:
@@ -1589,6 +1703,20 @@ def create_app(
         Route("/api/events", list_events),
         Route("/api/undo", undo, methods=["POST"]),
         Route("/api/export/node/{id}", export_node),
+        Route("/api/me", get_me),
+        Route("/api/humans", list_humans),
+        Route("/api/humans", create_human, methods=["POST"]),
+        Route("/api/humans/{id}/password", set_human_password, methods=["POST"]),
+        Route("/api/humans/{id}/disable", disable_human, methods=["POST"]),
+        Route("/api/humans/{id}/enable", enable_human, methods=["POST"]),
+        Route("/api/agents", list_agents),
+        Route("/api/agents", create_agent, methods=["POST"]),
+        Route("/api/agents/{id}/token-rotate", rotate_agent_token, methods=["POST"]),
+        Route("/api/agents/{id}/disable", disable_agent, methods=["POST"]),
+        Route("/api/agents/{id}/enable", enable_agent, methods=["POST"]),
+        Route("/api/grants", list_grants),
+        Route("/api/grants", set_grant, methods=["POST"]),
+        Route("/api/grants/revoke", revoke_grant, methods=["POST"]),
     ]
 
     routes = [
