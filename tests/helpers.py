@@ -27,12 +27,17 @@ def agent(
     *,
     grants: dict[str, str] | None = None,
     kind: str = "external",
+    token: str | None = None,
 ) -> Principal:
     """Seed (idempotently) an agent account plus grants; return its Principal.
 
     Accepts the id with or without the ``agent:`` prefix. Default grants are
-    the migration's parity set: read meta, suggest main.
+    the migration's parity set: read meta, suggest main. With ``token``, the
+    account's credential hash is set to that token's sha-256, so the MCP
+    path can verify it.
     """
+    import hashlib
+
     agent_id = name.removeprefix("agent:")
     grants = {"meta": "read", "main": "suggest"} if grants is None else grants
     conn = db.connect()
@@ -43,6 +48,11 @@ def agent(
             " VALUES (?, ?, ?, 'owner')",
             (agent_id, kind, agent_id),
         )
+        if token is not None:
+            conn.execute(
+                "UPDATE agents SET credential_hash = ? WHERE id = ?",
+                (hashlib.sha256(token.encode()).hexdigest(), agent_id),
+            )
         for space_id, level in grants.items():
             conn.execute(
                 "INSERT OR REPLACE INTO grants (agent_id, space_id, level) VALUES (?, ?, ?)",

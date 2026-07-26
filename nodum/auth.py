@@ -1,15 +1,19 @@
-"""Principal construction — the only place :class:`Principal` is minted (Q13 R1).
+"""Principal construction and credential verification (Q13 R1/R3).
 
-Three paths in, one per surface:
+:class:`~nodum.principal.Principal` objects are minted **only** here:
 
 - **Trusted-local** (:func:`owner_principal`): the CLI and scripts. Local
-  access is the trust boundary here, exactly as it was before accounts —
-  the operator names their human with ``--as`` for attribution, and no
-  password is asked on this path.
-- **HTTP session** (surfaces task): a verified password login mints through
-  the same loader, keyed by the session row.
-- **MCP token** (surfaces task): a verified bearer token mints through
-  :func:`agent_principal`.
+  access is the trust boundary, exactly as before accounts — the operator
+  names their human with ``--as`` for attribution, and no password is asked
+  on this path.
+- **Password login** (:func:`verify_password` → :func:`create_session` →
+  :func:`principal_for_session`): the HTTP surface's path, argon2id-hashed
+  passwords and server-side session rows (30-day sliding expiry).
+- **Agent token** (:func:`verify_agent_token`): the MCP surface's path.
+  Tokens are generated show-once; only their sha-256 is stored (sha-256 is
+  enough for high-entropy tokens — argon2's work factor buys nothing against
+  a random 256-bit secret, and a database read leak must not hand out live
+  credentials either way).
 
 Nothing else may construct a :class:`~nodum.principal.Principal`; identity
 is never re-derived from a string deeper in the stack.
@@ -17,8 +21,13 @@ is never re-derived from a string deeper in the stack.
 
 from __future__ import annotations
 
+import hashlib
+import secrets
 import sqlite3
 from pathlib import Path
+
+from argon2 import PasswordHasher
+from argon2.exceptions import VerificationError, VerifyMismatchError
 
 from nodum import db
 from nodum.principal import Principal
@@ -31,6 +40,14 @@ DEFAULT_HUMAN_ID = "owner"
 #: attribution.
 OWNER_ACTOR = f"human:{DEFAULT_HUMAN_ID}"
 
+#: Agent token format: ``ndm_`` + 32 url-safe random bytes (~256 bits).
+TOKEN_PREFIX = "ndm_"
+
+#: Session lifetime, sliding — every verified use pushes expiry out again.
+SESSION_DAYS = 30
+
+_HASHER = PasswordHasher()  # argon2id, library-default parameters
+
 
 class UnknownPrincipal(LookupError):
     """Raised when a named human or agent account does not exist."""
@@ -38,6 +55,10 @@ class UnknownPrincipal(LookupError):
 
 class PrincipalDisabled(PermissionError):
     """Raised when a named account exists but is disabled."""
+
+
+class InvalidCredentials(PermissionError):
+    """Raised when a password, token, or session does not verify."""
 
 
 def _connect(path: str | Path | None) -> sqlite3.Connection:
@@ -73,12 +94,10 @@ def owner_principal(
 def agent_principal(agent_id: str, *, path: str | Path | None = None) -> Principal:
     """Load an agent principal with its grant set.
 
-    .. warning::
-
-        INTERIM (Q13 surfaces task): this loads identity and grants **without
-        verifying a credential** — the MCP surface currently authenticates
-        nothing. Token verification lands in the surfaces task; until then
-        this must not back any network surface's authentication decision.
+    This is the **loader**, not a verification: it answers "what may this
+    agent do?" once identity is established. Callers that authenticate (MCP)
+    must go through :func:`verify_agent_token` instead; only the
+    trusted-local path and tests call this directly.
 
     Raises:
         UnknownPrincipal: If the account does not exist.
@@ -98,5 +117,187 @@ def agent_principal(agent_id: str, *, path: str | Path | None = None) -> Princip
             ).fetchall()
         }
         return Principal(kind=row["kind"], id=agent_id, grants=grants)
+    finally:
+        conn.close()
+
+
+# ── Passwords (argon2id) ──────────────────────────────────────────────────────
+
+
+def hash_password(password: str) -> str:
+    """Hash a password for storage (argon2id, library-default parameters)."""
+    return _HASHER.hash(password)
+
+
+def set_password(human_id: str, password: str, *, path: str | Path | None = None) -> None:
+    """Set or change a human's password.
+
+    Raises:
+        UnknownPrincipal: If the account does not exist.
+    """
+    conn = _connect(path)
+    try:
+        cursor = conn.execute(
+            "UPDATE humans SET credential_hash = ? WHERE id = ?",
+            (hash_password(password), human_id),
+        )
+        conn.commit()
+        if cursor.rowcount == 0:
+            raise UnknownPrincipal(f"unknown human account: {human_id}")
+    finally:
+        conn.close()
+
+
+def verify_password(human_id: str, password: str, *, path: str | Path | None = None) -> Principal:
+    """Verify a human's password and mint their principal (the login path).
+
+    Raises:
+        InvalidCredentials: If the account does not exist, has no password
+            set, is disabled, or the password does not match.
+    """
+    conn = _connect(path)
+    try:
+        row = conn.execute(
+            "SELECT credential_hash, disabled FROM humans WHERE id = ?", (human_id,)
+        ).fetchone()
+        if row is None or row["credential_hash"] is None:
+            raise InvalidCredentials("invalid credentials")
+        try:
+            _HASHER.verify(row["credential_hash"], password)
+        except (VerifyMismatchError, VerificationError):
+            raise InvalidCredentials("invalid credentials") from None
+        if row["disabled"]:
+            raise InvalidCredentials("invalid credentials")
+        return Principal(kind="human", id=human_id)
+    finally:
+        conn.close()
+
+
+# ── Agent tokens (show-once, sha-256 stored) ──────────────────────────────────
+
+
+def _token_hash(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+def generate_token() -> tuple[str, str]:
+    """Generate ``(token, hash)``: shown once, only the hash is stored."""
+    token = TOKEN_PREFIX + secrets.token_urlsafe(32)
+    return token, _token_hash(token)
+
+
+def store_token(agent_id: str, token_hash: str, *, path: str | Path | None = None) -> None:
+    """Store a token hash as an agent's current credential (rotation: replace).
+
+    Raises:
+        UnknownPrincipal: If the account does not exist.
+    """
+    conn = _connect(path)
+    try:
+        cursor = conn.execute(
+            "UPDATE agents SET credential_hash = ? WHERE id = ?", (token_hash, agent_id)
+        )
+        conn.commit()
+        if cursor.rowcount == 0:
+            raise UnknownPrincipal(f"unknown agent account: {agent_id}")
+    finally:
+        conn.close()
+
+
+def verify_agent_token(token: str, *, path: str | Path | None = None) -> Principal:
+    """Verify an agent token and mint the agent's principal (the MCP path).
+
+    Revocation is verification-time (R3): a disabled agent's token is dead,
+    and a disabled owning human cascades — the external agents' tokens die
+    with it. In-flight proposals are untouched rows in the queue.
+
+    Raises:
+        InvalidCredentials: If the token matches no enabled agent whose
+            owner (for external agents) is also enabled.
+    """
+    conn = _connect(path)
+    try:
+        row = conn.execute(
+            """
+            SELECT a.id, a.kind, a.disabled AS agent_disabled,
+                   h.disabled AS owner_disabled
+            FROM agents a LEFT JOIN humans h ON h.id = a.owner_human_id
+            WHERE a.credential_hash = ?
+            """,
+            (_token_hash(token),),
+        ).fetchone()
+        if row is None or row["agent_disabled"] or row["owner_disabled"]:
+            raise InvalidCredentials("invalid credentials")
+        grants = {
+            grant["space_id"]: grant["level"]
+            for grant in conn.execute(
+                "SELECT space_id, level FROM grants WHERE agent_id = ?", (row["id"],)
+            ).fetchall()
+        }
+        return Principal(kind=row["kind"], id=row["id"], grants=grants)
+    finally:
+        conn.close()
+
+
+# ── Sessions (server-side, 30-day sliding) ────────────────────────────────────
+
+
+def create_session(human_id: str, *, path: str | Path | None = None) -> str:
+    """Create a session row for a (password-verified) human; return its id."""
+    session_id = secrets.token_urlsafe(32)
+    conn = _connect(path)
+    try:
+        conn.execute(
+            "INSERT INTO sessions (id, human_id, expires_at) VALUES (?, ?, datetime('now', ?))",
+            (session_id, human_id, f"+{SESSION_DAYS} days"),
+        )
+        conn.commit()
+        return session_id
+    finally:
+        conn.close()
+
+
+def principal_for_session(session_id: str, *, path: str | Path | None = None) -> Principal:
+    """Resolve a session cookie to a principal, sliding the expiry forward.
+
+    Raises:
+        InvalidCredentials: If the session is unknown, expired, or its human
+            is disabled.
+    """
+    conn = _connect(path)
+    try:
+        row = conn.execute(
+            """
+            SELECT s.id, s.human_id, s.expires_at, h.disabled
+            FROM sessions s JOIN humans h ON h.id = s.human_id
+            WHERE s.id = ?
+            """,
+            (session_id,),
+        ).fetchone()
+        if row is None or row["disabled"]:
+            raise InvalidCredentials("invalid session")
+        expired = conn.execute(
+            "SELECT ? <= datetime('now') AS expired", (row["expires_at"],)
+        ).fetchone()["expired"]
+        if expired:
+            conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+            conn.commit()
+            raise InvalidCredentials("invalid session")
+        conn.execute(
+            "UPDATE sessions SET expires_at = datetime('now', ?) WHERE id = ?",
+            (f"+{SESSION_DAYS} days", session_id),
+        )
+        conn.commit()
+        return Principal(kind="human", id=row["human_id"])
+    finally:
+        conn.close()
+
+
+def delete_session(session_id: str, *, path: str | Path | None = None) -> None:
+    """Log out: drop the session row (idempotent)."""
+    conn = _connect(path)
+    try:
+        conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+        conn.commit()
     finally:
         conn.close()

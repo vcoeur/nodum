@@ -350,3 +350,41 @@ class PurgeResult(BaseModel):
 
     purged: int
     bytes_freed: int
+
+
+class HumanOut(BaseModel):
+    """A human account (identity + credentials + attribution, never a scope)."""
+
+    id: str
+    name: str
+    has_password: bool
+    disabled: bool
+    created_at: str
+
+
+class AgentOut(BaseModel):
+    """An agent account. ``has_token`` is all anyone ever learns of the token."""
+
+    id: str
+    kind: str
+    name: str
+    owner_human_id: str | None
+    has_token: bool
+    disabled: bool
+    created_at: str
+
+
+class AgentCreatedOut(BaseModel):
+    """A new agent plus its token — the one and only time the token is shown."""
+
+    agent: AgentOut
+    token: str
+
+
+class GrantOut(BaseModel):
+    """One (agent, space) grant row."""
+
+    agent_id: str
+    space_id: str
+    level: str
+    created_at: str

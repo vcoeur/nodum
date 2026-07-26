@@ -21,14 +21,18 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from nodum import db
+from nodum import auth, db
 from nodum.migrations import MAIN_SPACE_ID, META_SPACE_ID
 from nodum.models import (
+    AgentCreatedOut,
+    AgentOut,
     BatchTransitionOut,
     DiffOut,
     EdgeOut,
     EdgeTypeOut,
     EventOut,
+    GrantOut,
+    HumanOut,
     InitResult,
     ItemFailure,
     NodeOut,
@@ -2451,5 +2455,321 @@ def diff_versions(
             changed_fields=changed,
             diff=diff,
         )
+    finally:
+        conn.close()
+
+
+# ── Account and grant administration (Q13; human-only, event-logged) ──────────
+
+#: Grant levels accepted by :func:`grant` (hierarchical: read ⊂ suggest ⊂ edit).
+GRANT_LEVEL_NAMES = ("read", "suggest", "edit")
+
+
+def _admin_actor(conn: sqlite3.Connection, principal: Principal) -> str:
+    """Gate account/grant administration to humans; return the actor string."""
+    Store(conn, principal).require_human("administer accounts and grants")
+    return principal.actor_string
+
+
+def _human_out(row: sqlite3.Row) -> HumanOut:
+    return HumanOut(
+        id=row["id"],
+        name=row["name"],
+        has_password=row["credential_hash"] is not None,
+        disabled=bool(row["disabled"]),
+        created_at=row["created_at"],
+    )
+
+
+def _agent_out(row: sqlite3.Row) -> AgentOut:
+    return AgentOut(
+        id=row["id"],
+        kind=row["kind"],
+        name=row["name"],
+        owner_human_id=row["owner_human_id"],
+        has_token=row["credential_hash"] is not None,
+        disabled=bool(row["disabled"]),
+        created_at=row["created_at"],
+    )
+
+
+def list_humans(*, principal: Principal, path: str | Path | None = None) -> list[HumanOut]:
+    """List human accounts (human-only)."""
+    conn = _connect(path)
+    try:
+        Store(conn, principal).require_human("list humans")
+        return [_human_out(row) for row in conn.execute("SELECT * FROM humans ORDER BY id")]
+    finally:
+        conn.close()
+
+
+def create_human(name: str, *, principal: Principal, path: str | Path | None = None) -> HumanOut:
+    """Create a human account (passwordless until ``human passwd`` sets one)."""
+    conn = _connect(path)
+    try:
+        actor = _admin_actor(conn, principal)
+        human_id = uuid.uuid4().hex[:12]
+        conn.execute("INSERT INTO humans (id, name) VALUES (?, ?)", (human_id, name))
+        row = conn.execute("SELECT * FROM humans WHERE id = ?", (human_id,)).fetchone()
+        _emit(conn, actor, "human.create", {"before": None, "after": {"id": human_id, "name": name}})
+        conn.commit()
+        return _human_out(row)
+    finally:
+        conn.close()
+
+
+def set_human_password(
+    human_id: str, password: str, *, principal: Principal, path: str | Path | None = None
+) -> None:
+    """Set or change a human's password (argon2id). The hash never enters a payload."""
+    conn = _connect(path)
+    try:
+        actor = _admin_actor(conn, principal)
+        cursor = conn.execute(
+            "UPDATE humans SET credential_hash = ? WHERE id = ?",
+            (auth.hash_password(password), human_id),
+        )
+        if cursor.rowcount == 0:
+            raise RecordNotFound(f"no humans row with id: {human_id}")
+        _emit(conn, actor, "human.password", {"human_id": human_id})
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _set_disabled(
+    table: str, row_id: str, disabled: bool, *, conn: sqlite3.Connection
+) -> None:
+    cursor = conn.execute(
+        f"UPDATE {table} SET disabled = ? WHERE id = ?", (int(disabled), row_id)
+    )
+    if cursor.rowcount == 0:
+        raise RecordNotFound(f"no {table} row with id: {row_id}")
+
+
+def disable_human(
+    human_id: str, *, principal: Principal, path: str | Path | None = None
+) -> None:
+    """Disable a human: its sessions die, and its external agents' tokens with
+    them (verification-time cascade — R3). In-flight proposals are untouched."""
+    conn = _connect(path)
+    try:
+        actor = _admin_actor(conn, principal)
+        _set_disabled("humans", human_id, True, conn=conn)
+        conn.execute("DELETE FROM sessions WHERE human_id = ?", (human_id,))
+        _emit(conn, actor, "human.disable", {"human_id": human_id})
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def enable_human(human_id: str, *, principal: Principal, path: str | Path | None = None) -> None:
+    """Re-enable a disabled human (its agents' tokens verify again)."""
+    conn = _connect(path)
+    try:
+        actor = _admin_actor(conn, principal)
+        _set_disabled("humans", human_id, False, conn=conn)
+        _emit(conn, actor, "human.enable", {"human_id": human_id})
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def list_agents(*, principal: Principal, path: str | Path | None = None) -> list[AgentOut]:
+    """List agent accounts (human-only)."""
+    conn = _connect(path)
+    try:
+        Store(conn, principal).require_human("list agents")
+        return [_agent_out(row) for row in conn.execute("SELECT * FROM agents ORDER BY id")]
+    finally:
+        conn.close()
+
+
+def create_agent(
+    name: str,
+    *,
+    kind: str = "external",
+    owner_human_id: str | None = None,
+    grants: dict[str, str] | None = None,
+    principal: Principal,
+    path: str | Path | None = None,
+) -> AgentCreatedOut:
+    """Create an agent account and mint its token — shown this once, hashed at rest.
+
+    External agents must name their owning human; internal agents (Phase 5)
+    have none and get no token (they authenticate by being in-process).
+    ``grants`` is the creation-time template (Q13 note 03 Q6): rows copied
+    verbatim at birth, leaving no trace — the default is the minimal viable
+    set, ``read`` on meta (an agent that cannot read the vocabulary cannot
+    resolve a type). Everything beyond that is an explicit ``grant`` call.
+    """
+    if kind == "external" and not owner_human_id:
+        raise ValueError("an external agent needs an owner_human_id")
+    if kind not in ("external", "internal"):
+        raise ValueError(f"kind must be 'external' or 'internal', got {kind!r}")
+    template = {"meta": "read"} if grants is None else grants
+    for level in template.values():
+        if level not in GRANT_LEVEL_NAMES:
+            raise ValueError(f"level must be one of {GRANT_LEVEL_NAMES}, got {level!r}")
+    conn = _connect(path)
+    try:
+        actor = _admin_actor(conn, principal)
+        agent_id = name
+        token, token_hash = auth.generate_token()
+        conn.execute(
+            "INSERT INTO agents (id, kind, name, owner_human_id, credential_hash)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (agent_id, kind, name, owner_human_id, token_hash if kind == "external" else None),
+        )
+        for space_id, level in template.items():
+            conn.execute(
+                "INSERT INTO grants (agent_id, space_id, level) VALUES (?, ?, ?)",
+                (agent_id, space_id, level),
+            )
+        row = conn.execute("SELECT * FROM agents WHERE id = ?", (agent_id,)).fetchone()
+        _emit(
+            conn,
+            actor,
+            "agent.create",
+            {"before": None, "after": {"id": agent_id, "kind": kind, "name": name}},
+        )
+        conn.commit()
+        out = _agent_out(row)
+        return AgentCreatedOut(agent=out, token=token if kind == "external" else "")
+    finally:
+        conn.close()
+
+
+def rotate_agent_token(
+    agent_id: str, *, principal: Principal, path: str | Path | None = None
+) -> str:
+    """Replace an agent's token: the old one dies now; the new one shows once."""
+    conn = _connect(path)
+    try:
+        actor = _admin_actor(conn, principal)
+        token, token_hash = auth.generate_token()
+        cursor = conn.execute(
+            "UPDATE agents SET credential_hash = ? WHERE id = ?", (token_hash, agent_id)
+        )
+        if cursor.rowcount == 0:
+            raise RecordNotFound(f"no agents row with id: {agent_id}")
+        _emit(conn, actor, "agent.token_rotate", {"agent_id": agent_id})
+        conn.commit()
+        return token
+    finally:
+        conn.close()
+
+
+def disable_agent(agent_id: str, *, principal: Principal, path: str | Path | None = None) -> None:
+    """Disable an agent: its token dies immediately; its proposals stay, flagged."""
+    conn = _connect(path)
+    try:
+        actor = _admin_actor(conn, principal)
+        _set_disabled("agents", agent_id, True, conn=conn)
+        _emit(conn, actor, "agent.disable", {"agent_id": agent_id})
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def enable_agent(agent_id: str, *, principal: Principal, path: str | Path | None = None) -> None:
+    """Re-enable a disabled agent (its current token verifies again)."""
+    conn = _connect(path)
+    try:
+        actor = _admin_actor(conn, principal)
+        _set_disabled("agents", agent_id, False, conn=conn)
+        _emit(conn, actor, "agent.enable", {"agent_id": agent_id})
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def grant(
+    agent_id: str,
+    space: str,
+    level: str,
+    *,
+    principal: Principal,
+    path: str | Path | None = None,
+) -> GrantOut:
+    """Grant (or re-level) an agent's access to a space; event-logged."""
+    if level not in GRANT_LEVEL_NAMES:
+        raise ValueError(f"level must be one of {GRANT_LEVEL_NAMES}, got {level!r}")
+    conn = _connect(path)
+    try:
+        actor = _admin_actor(conn, principal)
+        space_id = _resolve_space(conn, space)
+        before = conn.execute(
+            "SELECT * FROM grants WHERE agent_id = ? AND space_id = ?", (agent_id, space_id)
+        ).fetchone()
+        conn.execute(
+            "INSERT OR REPLACE INTO grants (agent_id, space_id, level) VALUES (?, ?, ?)",
+            (agent_id, space_id, level),
+        )
+        row = conn.execute(
+            "SELECT * FROM grants WHERE agent_id = ? AND space_id = ?", (agent_id, space_id)
+        ).fetchone()
+        _emit(
+            conn,
+            actor,
+            "grant.set",
+            {
+                "before": dict(before) if before else None,
+                "after": {"agent_id": agent_id, "space_id": space_id, "level": level},
+            },
+        )
+        conn.commit()
+        return GrantOut(
+            agent_id=row["agent_id"],
+            space_id=row["space_id"],
+            level=row["level"],
+            created_at=row["created_at"],
+        )
+    finally:
+        conn.close()
+
+
+def revoke(agent_id: str, space: str, *, principal: Principal, path: str | Path | None = None) -> None:
+    """Revoke an agent's grant on a space; event-logged."""
+    conn = _connect(path)
+    try:
+        actor = _admin_actor(conn, principal)
+        space_id = _resolve_space(conn, space)
+        before = conn.execute(
+            "SELECT * FROM grants WHERE agent_id = ? AND space_id = ?", (agent_id, space_id)
+        ).fetchone()
+        if before is None:
+            raise RecordNotFound(f"no grant for {agent_id!r} on space {space_id!r}")
+        conn.execute(
+            "DELETE FROM grants WHERE agent_id = ? AND space_id = ?", (agent_id, space_id)
+        )
+        _emit(conn, actor, "grant.revoke", {"before": dict(before), "after": None})
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def list_grants(
+    agent_id: str | None = None, *, principal: Principal, path: str | Path | None = None
+) -> list[GrantOut]:
+    """List grant rows, optionally for one agent (human-only)."""
+    conn = _connect(path)
+    try:
+        Store(conn, principal).require_human("list grants")
+        if agent_id is not None:
+            rows = conn.execute(
+                "SELECT * FROM grants WHERE agent_id = ? ORDER BY space_id", (agent_id,)
+            ).fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM grants ORDER BY agent_id, space_id").fetchall()
+        return [
+            GrantOut(
+                agent_id=row["agent_id"],
+                space_id=row["space_id"],
+                level=row["level"],
+                created_at=row["created_at"],
+            )
+            for row in rows
+        ]
     finally:
         conn.close()
