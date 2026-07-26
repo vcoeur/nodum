@@ -128,6 +128,21 @@ including every parameter.
   space's **live node count** (`active` + `proposed`; archived rows are retired,
   not territory) and the **agents granted on it**. These are all human-only.
 
+  Two rules are enforced in the service, so every surface has them:
+
+  - **`main` and `meta` cannot be archived** — by `space-archive` or by the
+    generic `archive <id>`. Archiving `main` would hide it from every listing
+    while every write that names no space kept landing there (that default
+    resolves by id, whatever state the row is in), and archiving `meta` would
+    retire the space every other space lives in. Nothing un-archives, so a
+    *rename* of either is fine: it moves the title and leaves the id alone.
+  - **Two live spaces cannot share a name.** A space reference resolves as
+    `id = ? OR title = ?`, so a duplicate would make `--space research` mean
+    whichever row SQLite reached first. Names are compared exactly, as the
+    lookup does — `Research` and `research` are two spaces. Archiving frees a
+    name: an archived space stops resolving, so holding its title would reserve
+    it for good.
+
   A space is used in two independent ways, and they are two controls rather
   than one mode: `--space` on a *read* (`node list`, `search`) narrows the view
   and defaults to every space in scope, while `--space` on a *write*

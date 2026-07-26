@@ -25,21 +25,24 @@
  * edit-granted space with an empty queue, and the emptiness is the point rather
  * than a reason to leave it out.
  *
- * ## Where a proposal's space comes from — and where it does not
+ * ## Where a proposal's space comes from
  *
- * A **node** proposal carries its own (`node.space_id`). An **edge** and an
- * **update** do not: `service._edge_context` and `service._update_context`
- * build the reviewer context out of endpoint and target *id and title only*, so
- * the wire says nothing about their space. {@link proposalSpace} therefore
- * resolves those against an index of node → space that the caller supplies,
- * and a proposal it cannot place goes to an explicit *space not reported*
- * section rather than being filed under a guess. The right fix is one field on
- * each of those two context builders; until then, misfiling a proposal into a
- * space it does not belong to would be worse than admitting the gap.
+ * The server states it, for every kind. A **node** proposal carries its own
+ * (`node.space_id`); an **edge** and an **update** carry theirs in the reviewer
+ * context, where `service._node_ref` puts a `space_id` on every referenced node
+ * beside its id and title. Nothing is looked up from here.
+ *
+ * The *space not reported* section survives that, and is not vestigial: a
+ * referenced node that no longer resolves — `undo` took its creation back after
+ * an edge to it was proposed — comes back as an id with no title and no space,
+ * and there is genuinely nothing to file it under. It is a section that should
+ * now be empty on a healthy graph, which is exactly why it must stay honest
+ * rather than be deleted.
  */
 
 import type { ProposalOut, SpaceOut } from "../../api/types";
 import { timestampMs } from "../../lib";
+import { contextRef } from "./proposalText";
 
 /** The three things an agent can propose. `ProposalOut.kind` is a bare string. */
 export type ProposalKind = "node" | "edge" | "update";
@@ -182,14 +185,19 @@ export function groupProposals(
 /* Spaces: the outer grouping level (D4)                                */
 /* ------------------------------------------------------------------ */
 
-/** The bucket for proposals whose space the queue does not report. */
+/**
+ * The bucket for proposals whose space the queue does not report.
+ *
+ * Reachable only through a referenced node that no longer resolves, so on a
+ * healthy graph it stays empty — see the module docblock.
+ */
 export const UNREPORTED_SPACE = "";
 
 /** Why a space section is on screen. */
 export type SpaceSectionKind =
   /** It holds proposals. */
   | "queue"
-  /** It holds proposals whose space could not be determined. */
+  /** It holds proposals whose referenced node no longer resolves. */
   | "unreported"
   /** It holds none, and never will: every agent on it writes `active` directly. */
   | "self-governing";
@@ -234,80 +242,33 @@ export function editGrantedAgents(space: SpaceOut): string[] {
 }
 
 /**
- * Node ids a proposal's space would have to be read off, but which the proposal
- * itself does not carry.
+ * Which space a proposal belongs to, or null when the server did not say.
  *
- * Only edges and updates produce any: a proposed node states its own space.
- * The caller resolves these however it can and hands the answers back through
- * {@link groupProposalsBySpace}'s `nodeSpaces`.
+ * - A **node** states its own on the row, always.
+ * - An **update** takes the space of the node it targets, off `context.node`.
+ * - An **edge** takes its **source**'s space, off `context.src`, and its
+ *   target's only when the source no longer resolves. An edge is stored as
+ *   `src → dst` and the assertion originates at the subject; note that
+ *   reviewing a cross-space edge in fact needs authority on *both* endpoint
+ *   spaces (`Store.edge_landing_state`), so filing it under one is a
+ *   simplification the section header should not pretend otherwise about.
  *
- * @param proposals The queue.
- * @returns Distinct node ids, in first-seen order.
- */
-export function referencedNodeIds(proposals: readonly ProposalOut[]): string[] {
-  const ids: string[] = [];
-  const seen = new Set<string>();
-  const add = (id: string | null | undefined) => {
-    if (!id || seen.has(id)) return;
-    seen.add(id);
-    ids.push(id);
-  };
-  for (const proposal of proposals) {
-    if (proposal.edge) {
-      add(proposal.edge.src_id);
-      add(proposal.edge.dst_id);
-    }
-    if (proposal.version) add(proposal.version.node_id);
-  }
-  return ids;
-}
-
-/**
- * Node → space for every node the queue itself states one for.
- *
- * Free, and it covers the commonest case on its own: an agent run that proposes
- * nodes and the `mentions` edges its `[[wikilinks]]` materialised files those
- * edges from a node that is right here in the queue.
- *
- * @param proposals The queue.
- * @returns Space id per node id, for the nodes the queue carries.
- */
-export function spacesFromProposals(proposals: readonly ProposalOut[]): Map<string, string> {
-  const index = new Map<string, string>();
-  for (const proposal of proposals) {
-    if (proposal.node?.space_id) index.set(proposal.node.id, proposal.node.space_id);
-  }
-  return index;
-}
-
-/**
- * Which space a proposal belongs to, or null when nothing says.
- *
- * - A **node** states its own, always.
- * - An **update** takes the space of the node it targets.
- * - An **edge** takes its **source**'s space, and its target's only when the
- *   source is unknown. An edge is stored as `src → dst` and the assertion
- *   originates at the subject; note that reviewing a cross-space edge in fact
- *   needs authority on *both* endpoint spaces (`Store.edge_landing_state`), so
- *   filing it under one is a simplification the section header should not
- *   pretend otherwise about.
+ * Null means the referenced node did not come back — undone, or otherwise gone
+ * — which is the whole of what {@link UNREPORTED_SPACE} now covers.
  *
  * @param proposal One queue entry.
- * @param nodeSpaces Space id per node id, for the endpoints and targets the
- *   proposal itself does not carry.
- * @returns The space id, or null when it cannot be determined.
+ * @returns The space id, or null when the queue reports none.
  */
-export function proposalSpace(
-  proposal: ProposalOut,
-  nodeSpaces: ReadonlyMap<string, string> = new Map(),
-): string | null {
+export function proposalSpace(proposal: ProposalOut): string | null {
   if (proposal.node) return proposal.node.space_id;
   if (proposal.edge) {
     return (
-      nodeSpaces.get(proposal.edge.src_id) ?? nodeSpaces.get(proposal.edge.dst_id) ?? null
+      contextRef(proposal.context, "src")?.spaceId ??
+      contextRef(proposal.context, "dst")?.spaceId ??
+      null
     );
   }
-  if (proposal.version) return nodeSpaces.get(proposal.version.node_id) ?? null;
+  if (proposal.version) return contextRef(proposal.context, "node")?.spaceId ?? null;
   return null;
 }
 
@@ -315,11 +276,6 @@ export function proposalSpace(
 export interface SpaceGroupingOptions {
   /** Gap that ends a batch; defaults to {@link BATCH_GAP_MS}. */
   gapMs?: number;
-  /**
-   * Space id per node id, for the edge endpoints and update targets the queue
-   * does not carry itself. Merged under what the queue does state.
-   */
-  nodeSpaces?: ReadonlyMap<string, string>;
 }
 
 /**
@@ -352,14 +308,9 @@ export function groupProposalsBySpace(
   spaces: readonly SpaceOut[] | null,
   options: SpaceGroupingOptions = {},
 ): SpaceSection[] {
-  const index = spacesFromProposals(proposals);
-  for (const [nodeId, spaceId] of options.nodeSpaces ?? []) {
-    if (!index.has(nodeId)) index.set(nodeId, spaceId);
-  }
-
   const buckets = new Map<string, ProposalOut[]>();
   for (const proposal of proposals) {
-    const spaceId = proposalSpace(proposal, index) ?? UNREPORTED_SPACE;
+    const spaceId = proposalSpace(proposal) ?? UNREPORTED_SPACE;
     const bucket = buckets.get(spaceId);
     if (bucket) bucket.push(proposal);
     else buckets.set(spaceId, [proposal]);

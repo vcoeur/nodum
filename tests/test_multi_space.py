@@ -9,10 +9,12 @@ and the "unreadable does not exist" rule into something a test can fail.
 
 from __future__ import annotations
 
+import sqlite3
+
 import pytest
 from helpers import agent, owner, seed_space
 
-from nodum import search, service
+from nodum import db, search, service
 from nodum.store import GrantNotPermitted
 
 
@@ -391,3 +393,171 @@ def test_search_excludes_meta_by_default_and_finds_it_when_narrowed_to_it(fresh_
     assert [
         hit.title for hit in search.search("territory", space="meta", principal=owner()).hits
     ] == ["territory-kind"]
+
+
+# ── The structural spaces are not archivable, on any surface ──────────────────
+
+
+@pytest.mark.parametrize("structural", ["main", "meta"])
+def test_a_structural_space_cannot_be_archived(fresh_db, structural):
+    """Archiving `main` is destructive in the quietest way there is.
+
+    `list_spaces` returns active spaces only, so it vanishes from every picker,
+    while `resolve_space_id(None)` keeps returning `main` without ever reading
+    the row's state — writes go on landing in a space the human can no longer
+    see or name. Archiving `meta` retires the space that holds every space.
+    Neither is reversible: there is no `active ← archived` transition anywhere.
+    """
+    _three_spaces()
+
+    with pytest.raises(service.InvalidTransition, match=f"cannot archive the '{structural}' space"):
+        service.archive_space(structural, principal=owner())
+
+    # Still active, still resolving, still taking writes.
+    assert structural in {space.id for space in service.list_spaces(principal=owner())}
+    assert service.resolve_space_id(structural, principal=owner()) == structural
+    assert service.resolve_space_id(None, principal=owner()) == "main"
+
+
+def test_an_ordinary_space_is_still_archivable(fresh_db):
+    """The guard is two ids, not a ban on archiving."""
+    _three_spaces()
+
+    archived = service.archive_space("b", principal=owner())
+
+    assert archived.state == "archived"
+    assert "b" not in {space.id for space in service.list_spaces(principal=owner())}
+
+
+@pytest.mark.parametrize("structural", ["main", "meta"])
+def test_renaming_a_structural_space_is_still_allowed(fresh_db, structural):
+    """Rename touches the title; it is the **id** everything structural depends on."""
+    renamed = service.rename_space(structural, f"{structural}-renamed", principal=owner())
+
+    assert renamed.id == structural
+    assert renamed.title == f"{structural}-renamed"
+    assert service.resolve_space_id(None, principal=owner()) == "main"
+    # Resolvable by the new name and, since ids are unchanged, by the old string
+    # too — which for these two happens to be the id.
+    assert service.resolve_space_id(f"{structural}-renamed", principal=owner()) == structural
+    assert service.resolve_space_id(structural, principal=owner()) == structural
+
+
+def test_a_principal_that_cannot_read_main_meets_unknown_space_not_the_refusal(fresh_db):
+    """Resolution first, refusal second — the guard must not become an oracle.
+
+    The scout reads `main` but not `c`; an agent granted neither reads neither,
+    and for it `main` has to answer exactly as a space that is not there does.
+    """
+    _three_spaces()
+    outsider = agent("outsider", grants={"b": "read"})
+
+    with pytest.raises(service.TypeNotFound, match="unknown space: main"):
+        service.archive_space("main", principal=outsider)
+    with pytest.raises(service.TypeNotFound, match="unknown space: nope"):
+        service.archive_space("nope", principal=outsider)
+    # And the fixture is not vacuous: `b` *does* resolve for this principal, and
+    # is then refused on its own merits — a space node lives in meta, which the
+    # outsider cannot read, so the transition answers "no such record".
+    with pytest.raises(service.RecordNotFound):
+        service.archive_space("b", principal=outsider)
+
+
+# ── One live space per name, enforced where every surface inherits it ─────────
+
+
+def test_a_second_space_cannot_take_a_live_space_name(fresh_db):
+    """`_resolve_space` matches `id = ? OR title = ?`; two matches is ambiguity."""
+    _three_spaces()
+
+    with pytest.raises(ValueError, match="a space already answers to 'b'"):
+        service.create_space("b", principal=owner())
+    with pytest.raises(ValueError, match="a space already answers to 'main'"):
+        service.create_space("main", principal=owner())
+
+
+def test_a_rename_cannot_collide_with_another_space_either(fresh_db):
+    _three_spaces()
+
+    with pytest.raises(ValueError, match="a space already answers to 'c'"):
+        service.rename_space("b", "c", principal=owner())
+    # Renaming a space to a name it already holds is a no-op, not a self-clash.
+    assert service.rename_space("b", "b", principal=owner()).title == "b"
+
+
+def test_the_generic_node_path_cannot_route_around_the_name_rule(fresh_db):
+    """`create_space`/`rename_space` are conveniences; `node create` is the bypass."""
+    _three_spaces()
+
+    with pytest.raises(ValueError, match="a space already answers to 'b'"):
+        service.create_node(type="space", title="b", space="meta", principal=owner())
+    space_b = service.resolve_space_id("b", principal=owner())
+    with pytest.raises(ValueError, match="a space already answers to 'c'"):
+        service.update_node(space_b, title="c", principal=owner())
+
+
+def test_the_schema_holds_the_rule_under_the_service(fresh_db):
+    """Migration 0013's unique index, checked where no Python guard can run."""
+    _three_spaces()
+    conn = db.connect()
+    try:
+        with pytest.raises(sqlite3.IntegrityError, match="UNIQUE"):
+            conn.execute(
+                "INSERT INTO nodes (id, space_id, type_id, title, created_by)"
+                " VALUES ('sneaky', 'meta', 'space', 'b', 'human:owner')"
+            )
+    finally:
+        conn.close()
+
+
+def test_archiving_a_space_frees_its_name(fresh_db):
+    """Decided, not incidental: an archived space stops resolving, so it must.
+
+    `_resolve_space` matches `state = 'active'`, so an archived title can never
+    be reached again — and there is no un-archive. Holding the name would
+    reserve it for good on the strength of a row nothing can reach.
+    """
+    _three_spaces()
+    service.archive_space("b", principal=owner())
+
+    fresh = service.create_space("b", principal=owner())
+
+    assert fresh.title == "b"
+    assert service.resolve_space_id("b", principal=owner()) == fresh.id
+    # The archived row is still there, still archived, and no longer the answer.
+    assert fresh.id != "b"
+
+
+def test_two_names_differing_only_in_case_are_two_names(fresh_db):
+    """The constraint is exactly as tight as the lookup, and no tighter.
+
+    `title = ?` compares under SQLite's BINARY collation, so `Research` and
+    `research` genuinely resolve to different rows. Refusing the pair would be
+    refusing a name that works.
+    """
+    _three_spaces()
+
+    upper = service.create_space("B", principal=owner())
+
+    assert service.resolve_space_id("B", principal=owner()) == upper.id
+    assert service.resolve_space_id("b", principal=owner()) == "b"
+
+
+def test_the_name_check_tells_a_meta_writer_nothing_it_cannot_already_list(fresh_db):
+    """The refusal names a space; the only principals that meet it already see it.
+
+    `_require_space_name_free` is not scope-filtered, so in principle it could
+    confirm a space exists to someone who cannot read it (Q13 review S3). It
+    cannot in practice: creating a space means writing meta, every space node
+    lives in meta, and reading meta lists all of them. The premise is asserted
+    here rather than assumed, because a future grant shape could break it.
+    """
+    _three_spaces()
+    gardener = agent("gardener", grants={"meta": "edit", "main": "read"})
+
+    listed = {node.title for node in service.list_nodes(space="meta", principal=gardener)}
+    assert {"main", "b", "c"} <= listed, "a meta reader already sees every space"
+
+    # So the refusal below reveals nothing: `c` was in the list it just read.
+    with pytest.raises(ValueError, match="a space already answers to 'c'"):
+        service.create_space("c", principal=gardener)

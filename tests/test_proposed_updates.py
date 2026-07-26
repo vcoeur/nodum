@@ -281,7 +281,7 @@ def test_update_proposals_appear_in_the_queue(fresh_db):
     assert proposal.created_by == AGENT
     assert proposal.version is not None
     assert proposal.version.content == "v2"
-    assert proposal.context["node"] == {"id": note.id, "title": "My note"}
+    assert proposal.context["node"] == {"id": note.id, "title": "My note", "space_id": "main"}
 
 
 def test_queue_kind_and_actor_filters_cover_updates(fresh_db):

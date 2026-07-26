@@ -196,9 +196,13 @@ class ProposalOut(BaseModel):
 
     ``kind`` is ``node`` (a proposed node), ``edge`` (a proposed edge), or
     ``update`` (a proposed new version of an existing node). ``context``
-    carries what a reviewer needs beyond the row itself — for an edge, the
-    source/target node ids and titles; for a node, its parent's id/title when
-    it has one; for an update, the current node's id/title/content.
+    carries what a reviewer needs beyond the row itself, as one entry per
+    referenced node — ``src``/``dst`` for an edge, ``parent`` for a node that
+    has one, ``node`` for an update. Every entry is ``{id, title, space_id}``,
+    and the space is what lets the review queue group by space (human-UI D4):
+    a proposed node states its own, and an edge or an update would otherwise
+    state none. A referenced node that no longer resolves comes back as ``{id}``
+    alone, so read the other two as optional.
     """
 
     kind: str

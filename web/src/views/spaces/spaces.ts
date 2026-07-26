@@ -4,23 +4,24 @@
  *
  * Four responsibilities, and none of them is presentation:
  *
- * - **`main` and `meta` are structural, and the server does not know it.**
- *   `POST /api/spaces/main/archive` succeeds; every write that names no space
- *   still lands in `main` afterwards, because `resolve_space_id(None)` returns
- *   the id without reading the row's state — so the space would vanish from
- *   every picker while nodes kept arriving in it. Archiving `meta` retires the
- *   space that spaces themselves live in. Neither is reversible: the state
- *   machine has no `active ← archived` transition anywhere. So the refusal is
- *   here, with its reason attached, rather than a server error the human meets
- *   after the fact.
+ * - **`main` and `meta` are structural.** `service.archive_space` refuses both
+ *   (`STRUCTURAL_SPACE_IDS`), so every surface inherits the rule; this module
+ *   states the *reason* at the point of the action, so the human reads it
+ *   instead of meeting a 400 after clicking. Archiving `main` would leave every
+ *   write that names no space still landing there, because
+ *   `resolve_space_id(None)` returns the id without reading the row's state, and
+ *   archiving `meta` retires the space that spaces themselves live in. Neither
+ *   is reversible: the state machine has no `active ← archived` transition
+ *   anywhere.
  * - **Archiving is not deleting**, and the confirm has to say so in the same
  *   breath as it asks. {@link archiveConsequences} is that copy, counted from
  *   the row rather than written in the abstract.
  * - **Two spaces must not end up sharing a name.** Every space reference on
- *   every nodum surface resolves as `id = ? OR title = ?`, and nothing in the
- *   schema stops two spaces carrying the same title — after which `--space
- *   research` means whichever row SQLite reached first. {@link validateSpaceName}
- *   is the only thing standing in front of that.
+ *   every nodum surface resolves as `id = ? OR title = ?`, so a duplicate makes
+ *   `--space research` mean whichever row SQLite reached first. The server
+ *   enforces it (`service._require_space_name_free`, and migration
+ *   `0013_unique_space_titles` under it); {@link validateSpaceName} is the same
+ *   rule said before the request, so the human is told while still typing.
  * - **No failure may claim a space does not exist.** The server answers a space
  *   that is not there and a space the caller cannot read with the same words on
  *   purpose (Q13 review S3); copy that resolved the ambiguity would turn the
@@ -83,6 +84,9 @@ export interface SpaceRow {
 
 /**
  * Why a structural space cannot be archived, or null when it is an ordinary one.
+ *
+ * The refusal itself is `service.archive_space`'s; this is the reason, written
+ * where the human can read it before acting rather than after.
  *
  * @param spaceId The space's id.
  * @returns One sentence naming the consequence, for the disabled action's title.
@@ -227,12 +231,14 @@ export function renameConsequence(row: SpaceRow, name: string): string {
  * Check a proposed space name, or null when it is fine.
  *
  * Two spaces sharing a name is the failure this guards: a space reference
- * resolves as `id = ? OR title = ?` on every nodum surface and no index stops
- * the collision, so a second `research` would make `--space research`,
- * `grant … research`, and the space filter all mean whichever row the query
- * reached first. The check is exact rather than case-insensitive because exact
- * is what the server compares — refusing `Research` beside `research` would be
- * refusing a name that genuinely resolves.
+ * resolves as `id = ? OR title = ?` on every nodum surface, so a second
+ * `research` would make `--space research`, `grant … research`, and the space
+ * filter all mean whichever row the query reached first. The server refuses it
+ * — `service._require_space_name_free` on exactly this predicate, over a unique
+ * index — and this is that rule said one round-trip earlier, not the only thing
+ * standing in front of it. The check is exact rather than case-insensitive
+ * because exact is what the server compares: refusing `Research` beside
+ * `research` would be refusing a name that genuinely resolves.
  *
  * @param name The name as typed.
  * @param spaces Every active space.

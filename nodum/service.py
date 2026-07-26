@@ -89,6 +89,27 @@ MAX_SUBGRAPH_LIMIT = 2000
 #: argument still describes the size of the whole result.
 SUBGRAPH_EDGE_FACTOR = 8
 
+#: The spaces the schema creates and the system depends on, mapped to why
+#: archiving one is refused. Both are refused *here*, in the service, so every
+#: surface inherits it: a disabled button on one screen leaves the CLI and the
+#: API wide open, and archiving `main` is destructive in the quietest possible
+#: way — `list_spaces` returns active spaces only, so it disappears from every
+#: picker, while `resolve_space_id(None)` keeps returning `main` without ever
+#: reading the row's state, so writes go on landing in a space the human can
+#: no longer see or name. Neither is reversible: the state machine has no
+#: `active ← archived` transition anywhere.
+STRUCTURAL_SPACE_IDS: dict[str, str] = {
+    MAIN_SPACE_ID: (
+        "it is where every write that names no space lands, and that default resolves by id "
+        "whatever state the row is in — archiving it would hide the space while nodes kept "
+        "arriving in it"
+    ),
+    META_SPACE_ID: (
+        "it is the space that spaces themselves live in, along with the whole type vocabulary — "
+        "archiving it would retire the space holding every other space"
+    ),
+}
+
 #: Sentinel distinguishing "argument not given" from an explicit ``None``.
 _UNSET: Any = object()
 
@@ -303,6 +324,46 @@ def _resolve_space(conn: sqlite3.Connection, space_ref: str, principal: Principa
     if row is None or principal.level_on(row["id"]) < READ:
         raise TypeNotFound(f"unknown space: {space_ref}")
     return row["id"]
+
+
+def _require_space_name_free(
+    conn: sqlite3.Connection, name: str | None, *, exclude_id: str | None = None
+) -> None:
+    """Refuse a space name a live space already answers to.
+
+    The predicate is :func:`_resolve_space`'s own — ``id = ? OR title = ?`` over
+    live space nodes — because that is what makes a duplicate harmful: two rows
+    answering to one reference means ``--space research`` resolves to whichever
+    one SQLite reached first. Archived spaces are excluded: they stop resolving,
+    so their titles are free again.
+
+    Migration ``0013_unique_space_titles`` is the structural half of this and
+    holds every path, including a raw ``update_node`` on a space node; this
+    check is what turns the collision into one sentence instead of an
+    ``IntegrityError``, and it additionally catches the half an index cannot
+    express — a title equal to some *other* space's id.
+
+    Args:
+        conn: Open connection.
+        name: The proposed name; ``None`` (an untitled space) is always free.
+        exclude_id: The space being renamed, so it never clashes with itself.
+
+    Raises:
+        ValueError: If another live space already answers to ``name``.
+    """
+    if name is None:
+        return
+    # `IS NOT` rather than `!=` so a None exclusion compares against NULL.
+    row = conn.execute(
+        "SELECT id FROM nodes WHERE type_id = 'space' AND state != 'archived'"
+        " AND (id = ? OR title = ?) AND id IS NOT ?",
+        (name, name, exclude_id),
+    ).fetchone()
+    if row is not None:
+        raise ValueError(
+            f"a space already answers to {name!r}: a space reference resolves by id or by "
+            "title, so the two could not be told apart"
+        )
 
 
 def _create_op(state: str) -> str:
@@ -745,6 +806,12 @@ def create_node(
                 )
         node_id = uuid.uuid4().hex
         state = store.landing_state(target_space)
+        # A space is an ordinary node, so this is the path a raw
+        # `node create --type space` takes past `create_space` — the name rule
+        # has to sit here or that path is the way around it. After the grant
+        # check, so a caller with no authority here is refused for that first.
+        if type_id == "space":
+            _require_space_name_free(conn, title)
         if parent_id is None:
             row = conn.execute(
                 "SELECT COALESCE(MAX(position), 0) + 1.0 AS pos FROM nodes WHERE parent_id IS NULL"
@@ -842,6 +909,12 @@ def update_node(
         before = _row_dict(before_row)
         if not principal.is_human and principal.level_on(before["space_id"]) < SUGGEST:
             raise GrantNotPermitted(f"{actor} has no write grant on space {before['space_id']!r}")
+        # Renaming a space is renaming a node, so the name rule belongs here too:
+        # `rename_space` delegates to this function, and `node update` reaches it
+        # directly. Refused at propose time as well as at apply time, so an agent
+        # learns now rather than the reviewer learning at accept.
+        if before["type_id"] == "space" and title is not _UNSET and title != before["title"]:
+            _require_space_name_free(conn, title, exclude_id=node_id)
         new_title = before["title"] if title is _UNSET else title
         new_content = before["content"] if content is _UNSET else content
         new_props = before["props"] if props is _UNSET else json.dumps(props, ensure_ascii=False)
@@ -1390,6 +1463,13 @@ def _transition_row(
     ):
         raise RecordNotFound(f"no node, edge, or version with id: {record_id}")
     store.require_review(spaces, action)
+    # The structural spaces are not archivable by any spelling. This sits here
+    # rather than in `archive_space` because `archive <id>` and
+    # `POST /api/nodes/{id}/archive` reach the same row without going near it.
+    if action == "archive" and kind == "node" and record_id in STRUCTURAL_SPACE_IDS:
+        raise InvalidTransition(
+            f"cannot archive the {record_id!r} space: {STRUCTURAL_SPACE_IDS[record_id]}"
+        )
     if before["state"] != from_state:
         raise InvalidTransition(
             f"cannot {action} a {kind} in state {before['state']!r} (requires state {from_state!r})"
@@ -1615,29 +1695,47 @@ def _proposal_rows(
     return results
 
 
+def _node_ref(conn: sqlite3.Connection, node_id: str) -> dict[str, Any]:
+    """One node as reviewer context: its id, title and space.
+
+    The **space** is what makes the review queue groupable: the human UI's D4
+    puts space at the outer level, and a proposed node states its own while an
+    edge and an update state nothing but the row itself. Without this field
+    every edge proposal — which is every ``mentions`` edge a ``[[wikilink]]``
+    materialised, the commonest thing an agent files — reaches the queue with
+    nothing to group on.
+
+    A node that no longer resolves (an ``undo`` took it back) comes out as its
+    id alone, with neither a title nor a space, which is the one case a queue
+    genuinely cannot report a space for.
+    """
+    row = conn.execute("SELECT id, title, space_id FROM nodes WHERE id = ?", (node_id,)).fetchone()
+    if row is None:
+        return {"id": node_id}
+    return {"id": row["id"], "title": row["title"], "space_id": row["space_id"]}
+
+
 def _node_context(conn: sqlite3.Connection, node: dict[str, Any]) -> dict[str, Any]:
-    """Reviewer context for a proposed node: its parent's id/title, if any."""
+    """Reviewer context for a proposed node: its parent, if any."""
     if node["parent_id"] is None:
         return {}
-    row = conn.execute("SELECT id, title FROM nodes WHERE id = ?", (node["parent_id"],)).fetchone()
-    parent = {"id": row["id"], "title": row["title"]} if row else {"id": node["parent_id"]}
-    return {"parent": parent}
+    return {"parent": _node_ref(conn, node["parent_id"])}
 
 
 def _edge_context(conn: sqlite3.Connection, edge: dict[str, Any]) -> dict[str, Any]:
-    """Reviewer context for a proposed edge: endpoint ids and titles."""
-    context: dict[str, Any] = {}
-    for key, column in (("src", "src_id"), ("dst", "dst_id")):
-        row = conn.execute("SELECT id, title FROM nodes WHERE id = ?", (edge[column],)).fetchone()
-        context[key] = {"id": row["id"], "title": row["title"]} if row else {"id": edge[column]}
-    return context
+    """Reviewer context for a proposed edge: both endpoints.
+
+    An edge is only listed when **both** endpoints are readable
+    (:meth:`Store.edge_scope`), so this reports nothing the reviewer could not
+    already read directly.
+    """
+    endpoints = (("src", "src_id"), ("dst", "dst_id"))
+    return {key: _node_ref(conn, edge[column]) for key, column in endpoints}
 
 
 def _update_context(conn: sqlite3.Connection, version: dict[str, Any]) -> dict[str, Any]:
-    """Reviewer context for a proposed update: the current node's id/title."""
-    row = conn.execute("SELECT id, title FROM nodes WHERE id = ?", (version["node_id"],)).fetchone()
-    node = {"id": row["id"], "title": row["title"]} if row else {"id": version["node_id"]}
-    return {"node": node}
+    """Reviewer context for a proposed update: the node it targets."""
+    return {"node": _node_ref(conn, version["node_id"])}
 
 
 def list_proposals(
@@ -3166,6 +3264,12 @@ def archive_space(space: str, *, principal: Principal, path: str | Path | None =
     there) while every node already in it keeps its ``space_id`` and stays
     exactly as readable as it was.
 
+    The two structural spaces are refused (:data:`STRUCTURAL_SPACE_IDS`), by
+    the transition itself so that no spelling of archive misses it. A *rename*
+    of either stays allowed, and the asymmetry is the point: a rename touches
+    the title, and it is the **id** the schema and the default write target
+    depend on.
+
     Args:
         space: Space id or name.
         principal: Who is writing.
@@ -3176,9 +3280,12 @@ def archive_space(space: str, *, principal: Principal, path: str | Path | None =
 
     Raises:
         TypeNotFound: If ``space`` resolves to no space the principal can see.
+        InvalidTransition: If ``space`` is ``main`` or ``meta``.
     """
     space_id = resolve_space_id(space, principal=principal, path=path)
-    # A resolved space id is always a node id, so this transition is a node's.
+    # A resolved space id is always a node id, so this transition is a node's —
+    # including the structural refusal, which `_transition_row` owns so that
+    # `archive <id>` cannot route around it.
     archived = transition(space_id, "archive", principal=principal, path=path)
     return archived
 

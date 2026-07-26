@@ -2199,6 +2199,28 @@ def test_review_queue_filters_and_batch_forms(client, fresh_db):
     assert reject_event.payload["reason"] == "no"
 
 
+def test_the_review_queue_reports_a_space_for_every_kind_over_the_wire(client, fresh_db):
+    """What the queue's space grouping (D4) actually consumes.
+
+    The screen used to backfill this with a capped, chunked pass of `getNode`
+    calls because only a proposed *node* stated a space. Every kind states one
+    now, so a section header has its proposals under it without the client
+    asking the server anything twice.
+    """
+    research = _ok(client.post("/api/spaces", json={"name": "research"}))["id"]
+    near = service.create_node(type="concept", title="Near", principal=owner())
+    far = service.create_node(type="concept", title="Far", space="research", principal=owner())
+    proposer = agent(AGENT, grants={"meta": "read", "main": "suggest", research: "suggest"})
+    service.create_edge(near.id, far.id, "supports", principal=proposer)
+    service.update_node(near.id, content="revised", principal=proposer)
+
+    queue = {row["kind"]: row for row in _ok(client.get("/api/review/queue"))["proposals"]}
+
+    assert queue["edge"]["context"]["src"]["space_id"] == "main"
+    assert queue["edge"]["context"]["dst"]["space_id"] == research
+    assert queue["update"]["context"]["node"]["space_id"] == "main"
+
+
 def test_asset_upload_list_get_and_rendition(client, fresh_db):
     payload = _png_bytes()
     uploaded = _ok(client.post("/api/assets", files={"file": ("photo.png", payload, "image/png")}))
@@ -2398,9 +2420,60 @@ def test_spaces_lists_active_spaces_only(client, fresh_db):
         ("main", "space"),
     ]
 
-    service.transition("main", "archive", principal=owner())
+    space = _ok(client.post("/api/spaces", json={"name": "scratch"}))
+    assert [row["id"] for row in _ok(client.get("/api/spaces"))["spaces"]] == [
+        "meta",
+        "main",
+        space["id"],
+    ]
+
+    service.transition(space["id"], "archive", principal=owner())
     remaining = _ok(client.get("/api/spaces"))
-    assert [space["id"] for space in remaining["spaces"]] == ["meta"]
+    assert [row["id"] for row in remaining["spaces"]] == ["meta", "main"]
+
+
+def test_a_structural_space_cannot_be_archived_over_http(client, fresh_db):
+    """The refusal lives in the service, so both spellings of archive inherit it.
+
+    The `/spaces` screen disables the button; that is copy, not a guard. This
+    is the guard — and the generic node route is checked too, because a route
+    that reaches the same row is the same hole.
+    """
+    for path in ("/api/spaces/main/archive", "/api/nodes/main/archive"):
+        refused = client.post(path)
+        assert refused.status_code == 400, path
+        assert "cannot archive the 'main' space" in refused.json()["error"]["message"]
+
+    assert client.post("/api/spaces/meta/archive").status_code == 400
+    assert [row["id"] for row in _ok(client.get("/api/spaces"))["spaces"]] == ["meta", "main"]
+
+    # Rename stays allowed: it moves the title, not the id everything depends on.
+    renamed = _ok(client.post("/api/spaces/main/rename", json={"name": "trunk"}))
+    assert (renamed["id"], renamed["title"]) == ("main", "trunk")
+    landed = _ok(client.post("/api/nodes", json={"type": "note", "title": "still lands"}))
+    assert landed["space_id"] == "main"
+
+
+def test_two_spaces_cannot_share_a_name_over_http(client, fresh_db):
+    """A space resolves by id *or* title, so a duplicate makes `?space=` ambiguous."""
+    _ok(client.post("/api/spaces", json={"name": "research"}))
+
+    clash = client.post("/api/spaces", json={"name": "research"})
+    assert clash.status_code == 400
+    assert "a space already answers to 'research'" in clash.json()["error"]["message"]
+    # A name equal to another space's *id* is the same ambiguity, and is the half
+    # no unique index can express.
+    assert client.post("/api/spaces", json={"name": "main"}).status_code == 400
+
+    other = _ok(client.post("/api/spaces", json={"name": "draft"}))
+    rename = client.post(f"/api/spaces/{other['id']}/rename", json={"name": "research"})
+    assert rename.status_code == 400
+    assert [row["title"] for row in _ok(client.get("/api/spaces"))["spaces"]] == [
+        "meta",
+        "main",
+        "research",
+        "draft",
+    ]
 
 
 def test_spaces_carry_the_node_count_and_grant_holders(client, fresh_db):
@@ -2504,7 +2577,11 @@ def test_the_listing_and_search_space_filters_narrow_the_read(client, fresh_db):
     searched = _ok(client.get("/api/search?q=territory&space=research"))
     assert [hit["node_id"] for hit in searched["hits"]] == [filed["id"]]
 
-    # An unknown space is the same 404 everywhere, and never a 500.
+    # An unknown space is a 404 from the listing and a 400 from search, never a
+    # 500. The split is pre-existing and the `type` filter behaves identically:
+    # the listing raises the service's `TypeNotFound`, while `nodum.search`
+    # raises a plain `ValueError` rather than importing the service's exception
+    # vocabulary. A client handles both.
     assert client.get("/api/nodes?space=nope").status_code == 404
     assert client.get("/api/search?q=territory&space=nope").status_code == 400
 

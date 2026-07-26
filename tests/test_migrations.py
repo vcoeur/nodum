@@ -265,7 +265,7 @@ def test_0012_applies_to_a_populated_database_already_at_0011(tmp_path, monkeypa
     monkeypatch.setattr(db, "MIGRATIONS", MIGRATIONS)
     conn = db.connect()
     try:
-        assert db.init_db(conn) == ["0012_url_tokens"]
+        assert db.init_db(conn) == ["0012_url_tokens", "0013_unique_space_titles"]
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
         conn.execute(
             "INSERT INTO url_tokens (id, token_hash, kind, asset_hash, created_by, expires_at)"
@@ -325,6 +325,97 @@ def test_one_token_hash_cannot_be_shared_by_two_rows(fresh_db):
             else:
                 with pytest.raises(sqlite3.IntegrityError, match="UNIQUE"):
                     conn.execute(insert)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# ── 0013: one live space per title ───────────────────────────────────────────
+
+
+def test_0013_applies_to_a_populated_database_holding_duplicate_space_titles(tmp_path, monkeypatch):
+    """The failure mode 0009 was bitten by: an index that cannot be created.
+
+    Nothing enforced this before 0013, so a real database can hold two spaces
+    called `research` — and `CREATE UNIQUE INDEX` over them fails with a bare
+    IntegrityError, rolling the whole upgrade back with no way forward but hand
+    SQL. The migration dedupes first, and it **renames** rather than archives:
+    archiving retires a space from the vocabulary permanently, which a
+    duplicate title does not deserve.
+    """
+    monkeypatch.setenv("NODUM_DB", str(tmp_path / "at0012.db"))
+    monkeypatch.setattr(db, "MIGRATIONS", _prefix_through("0012_url_tokens"))
+    service.init()
+    conn = db.connect()
+    try:
+        conn.executescript(
+            "INSERT INTO nodes (id, space_id, type_id, title, state, created_by, created_at)"
+            " VALUES"
+            "  ('sp-first',  'meta', 'space', 'research', 'active',   'human:owner', '2026-01-01'),"
+            "  ('sp-second', 'meta', 'space', 'research', 'active',   'human:owner', '2026-01-02'),"
+            "  ('sp-third',  'meta', 'space', 'research', 'proposed', 'agent:x',     '2026-01-03'),"
+            "  ('sp-gone',   'meta', 'space', 'research', 'archived', 'human:owner', '2026-01-04');"
+            "INSERT INTO nodes (id, space_id, type_id, title, created_by)"
+            " VALUES ('n-in-second', 'sp-second', 'note', 'lives in the loser', 'human:owner');"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    monkeypatch.setattr(db, "MIGRATIONS", MIGRATIONS)
+    conn = db.connect()
+    try:
+        assert db.init_db(conn) == ["0013_unique_space_titles"]
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+        titles = dict(
+            conn.execute("SELECT id, title FROM nodes WHERE id LIKE 'sp-%' ORDER BY id").fetchall()
+        )
+    finally:
+        conn.close()
+
+    # The earliest live space keeps the name; the later ones are renamed to
+    # something unique and self-explaining, and stay perfectly usable.
+    assert titles["sp-first"] == "research"
+    assert titles["sp-second"] == "research (sp-second)"
+    assert titles["sp-third"] == "research (sp-third)"
+    # An archived duplicate is left alone: it does not resolve, so it collides
+    # with nothing and its history stays as it was written.
+    assert titles["sp-gone"] == "research"
+
+    # The graph the index was created over still reads and still writes.
+    assert service.get_node("n-in-second", principal=owner()).space_id == "sp-second"
+    assert service.resolve_space_id("research", principal=owner()) == "sp-first"
+    assert (
+        service.create_node(
+            type="note", title="after", space="research (sp-second)", principal=owner()
+        ).space_id
+        == "sp-second"
+    )
+
+
+def test_0013_guards_the_titles_it_deduped(fresh_db):
+    conn = db.connect()
+    try:
+        conn.execute(
+            "INSERT INTO nodes (id, space_id, type_id, title, created_by)"
+            " VALUES ('sp-a', 'meta', 'space', 'research', 'human:owner')"
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="UNIQUE"):
+            conn.execute(
+                "INSERT INTO nodes (id, space_id, type_id, title, created_by)"
+                " VALUES ('sp-b', 'meta', 'space', 'research', 'human:owner')"
+            )
+        # An archived one is outside the index, so a retired name is free again.
+        conn.execute(
+            "INSERT INTO nodes (id, space_id, type_id, title, state, created_by)"
+            " VALUES ('sp-c', 'meta', 'space', 'research', 'archived', 'human:owner')"
+        )
+        # And an untitled space is not one of a kind — NULLs are not in the index.
+        for space_id in ("sp-d", "sp-e"):
+            conn.execute(
+                "INSERT INTO nodes (id, space_id, type_id, created_by)"
+                f" VALUES ('{space_id}', 'meta', 'space', 'human:owner')"
+            )
         conn.commit()
     finally:
         conn.close()

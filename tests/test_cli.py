@@ -507,6 +507,34 @@ def test_space_admin_over_the_cli(fresh_db):
     assert {s["title"] for s in spaces["spaces"]} == {"main", "meta"}
 
 
+def test_the_cli_inherits_the_space_guards_from_the_service(fresh_db):
+    """Neither guard is a screen's job: the CLI has no screen and needs both."""
+    _run_json("space-create", "research", "--as", "owner")
+
+    for command in (
+        ["space-archive", "main", "--as", "owner"],
+        ["space-archive", "meta", "--as", "owner"],
+        # The generic node archive reaches the same row, so it is the same hole.
+        ["archive", "main", "--as", "owner"],
+        # And one name per space, whichever command spells the write.
+        ["space-create", "research", "--as", "owner"],
+        ["space-rename", "research", "main", "--as", "owner"],
+        ["node", "create", "--type", "space", "--title", "research", "--as", "owner"],
+    ):
+        result = runner.invoke(app, command)
+        assert result.exit_code == 1, command
+        assert "Traceback" not in result.output
+
+    assert {s["title"] for s in _run_json("space-list", "--as", "owner")["spaces"]} == {
+        "main",
+        "meta",
+        "research",
+    }
+    # Renaming a structural space is still fine — the id is what things depend on.
+    renamed = _run_json("space-rename", "main", "trunk", "--as", "owner")
+    assert (renamed["id"], renamed["title"]) == ("main", "trunk")
+
+
 def test_space_list_reports_live_counts_and_grant_holders(fresh_db):
     _run_json("space-create", "research", "--as", "owner")
     _run_json(

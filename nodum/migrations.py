@@ -599,6 +599,64 @@ CREATE INDEX idx_url_tokens_expires ON url_tokens(expires_at);
 """
 
 
+UNIQUE_SPACE_TITLES_DDL = """
+-- One live space per title (human-UI phase, gap 2). Every space reference on
+-- every surface resolves as `id = ? OR title = ?` (`service._resolve_space`),
+-- and nothing stopped two spaces carrying the same title — after which
+-- `--space research` meant whichever row SQLite reached first, silently, and
+-- differently depending on the query plan. Spaces became creatable from a
+-- screen in this phase, so the collision went from theoretical to likely.
+--
+-- The index covers exactly the set the resolver searches, and no more:
+--
+--   * `type_id = 'space'`, the resolver's own predicate. Deliberately *not*
+--     also scoped to the meta space: the resolver does not care which space a
+--     space node lives in, so a `space`-typed node created anywhere resolves,
+--     and an index scoped to meta would leave that hole open.
+--   * `state != 'archived'`. An archived space stops resolving (the resolver
+--     matches `active` only), so its title must not reserve a name for good —
+--     and it would be for good, because the state machine has no un-archive
+--     anywhere. `proposed` is inside the index, though: a proposal is a promise
+--     to become active, and two proposed spaces sharing a title would both
+--     accept cleanly and collide only afterwards, where a partial index keyed
+--     on state never fires because the accept does not change membership. This
+--     is 0009's `(hash, space)` shape, for the same reasons.
+--   * Exact, never case-folded. `title = ?` compares under SQLite's default
+--     BINARY collation, so `Research` and `research` are two names that tell
+--     themselves apart perfectly; a NOCASE index would refuse a pair the
+--     resolver handles. The constraint is exactly as tight as the lookup.
+--
+-- A NULL title is left out of the index entirely: a space with no title cannot
+-- be named by one, so no two of them are ambiguous.
+--
+-- Dedupe first, or this fails with a bare IntegrityError on any database that
+-- already holds a collision — 0009 was bitten by exactly that, and this is its
+-- lesson applied. The losers are **renamed, not archived**: archiving retires a
+-- space from the vocabulary permanently, which is far more than a duplicate
+-- title deserves, while `<title> (<id>)` leaves every space usable and is
+-- unique because the id is. Titles change here without an event or a version,
+-- as every migration's data repair does.
+UPDATE nodes
+SET title = title || ' (' || id || ')', updated_at = datetime('now')
+WHERE type_id = 'space'
+  AND state != 'archived'
+  AND title IS NOT NULL
+  AND rowid NOT IN (
+      SELECT rowid FROM (
+          SELECT rowid, ROW_NUMBER() OVER (
+              PARTITION BY title ORDER BY created_at, rowid
+          ) AS rank
+          FROM nodes
+          WHERE type_id = 'space' AND state != 'archived' AND title IS NOT NULL
+      )
+      WHERE rank = 1
+  );
+
+CREATE UNIQUE INDEX idx_space_title ON nodes(title)
+WHERE type_id = 'space' AND state != 'archived' AND title IS NOT NULL;
+"""
+
+
 #: Ordered (name, SQL) migrations. Append-only — never edit a shipped entry.
 MIGRATIONS: list[tuple[str, str]] = [
     ("0001_core", CORE_DDL),
@@ -613,4 +671,5 @@ MIGRATIONS: list[tuple[str, str]] = [
     ("0010_principals", PRINCIPALS_DDL),
     ("0011_actor_strings", ACTOR_STRINGS_DDL),
     ("0012_url_tokens", URL_TOKENS_DDL),
+    ("0013_unique_space_titles", UNIQUE_SPACE_TITLES_DDL),
 ]

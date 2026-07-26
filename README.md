@@ -244,7 +244,14 @@ degrades to BM25 + graph expansion. `NODUM_EMBED_MODEL` switches the model
   holds no grant on does not resolve at all, reading exactly like one that does
   not exist. Meta-space nodes (the type vocabulary, the spaces themselves) stay
   out of content reads unless `--include-meta` says otherwise, or the read is
-  narrowed to `meta` by name.
+  narrowed to `meta` by name. Two rules keep the vocabulary unambiguous, and
+  both live in the service so every surface has them: **two live spaces may not
+  share a name** (a reference resolves as `id = ? OR title = ?`, compared
+  exactly — and archiving a space frees its name, because it stops resolving),
+  and **`main` and `meta` cannot be archived** (every unnamed write still lands
+  in `main` whatever state the row is in; `meta` holds the spaces themselves).
+  Renaming either is fine: a rename moves the title, and the id is what
+  everything structural depends on.
 - **MCP server.** `nodum mcp serve` runs a stdio MCP server (the official
   Python SDK's FastMCP). The agent authenticates with its token in
   `NODUM_AGENT_TOKEN` (minted by `nodum agent create`, shown once, stored

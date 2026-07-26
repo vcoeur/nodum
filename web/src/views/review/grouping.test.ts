@@ -27,9 +27,13 @@
  * - it appearing when the space list is unknown, which would state a fact the
  *   view is in no position to know.
  *
- * The other half is honesty about what the wire *does not* say: only a proposed
- * node carries a space, so an edge or an update that cannot be placed must land
- * in an explicit unreported bucket rather than being filed under a guess.
+ * The other half is where a space comes from. The server states one for every
+ * kind — a node on its row, an edge and an update in the reviewer context, where
+ * `service._node_ref` carries `space_id` beside id and title — so the only thing
+ * that lands in the unreported bucket is a proposal whose referenced node no
+ * longer resolves at all. That bucket is tested *because* it should now be
+ * empty: a queue that quietly filed such a proposal under a guess would be worse
+ * than one that admits it.
  */
 
 import { describe, expect, it } from "vitest";
@@ -43,8 +47,6 @@ import {
   PROPOSAL_KINDS,
   proposalKind,
   proposalSpace,
-  referencedNodeIds,
-  spacesFromProposals,
   UNREPORTED_SPACE,
 } from "./grouping";
 
@@ -101,11 +103,29 @@ function nodeProposal(agent: string, ms: number, nodeId: string, spaceId: string
   return { ...proposal(agent, ms, "node"), node: node(nodeId, spaceId) };
 }
 
-/** A proposed edge — the wire carries endpoint ids and no space at all. */
-function edgeProposal(agent: string, ms: number, src: string, dst: string): ProposalOut {
+/**
+ * One referenced node as `service._node_ref` renders it into `context`.
+ *
+ * A null space is the shape a node that no longer resolves comes back as: the
+ * id alone, with neither a title nor a space.
+ */
+function ref(id: string, spaceId: string | null) {
+  return spaceId === null ? { id } : { id, title: id, space_id: spaceId };
+}
+
+/** A proposed edge; the server reports each endpoint's space in `context`. */
+function edgeProposal(
+  agent: string,
+  ms: number,
+  src: string,
+  dst: string,
+  srcSpace: string | null = null,
+  dstSpace: string | null = null,
+): ProposalOut {
   const base = proposal(agent, ms, "edge");
   return {
     ...base,
+    context: { src: ref(src, srcSpace), dst: ref(dst, dstSpace) },
     edge: {
       id: base.id,
       src_id: src,
@@ -122,8 +142,13 @@ function edgeProposal(agent: string, ms: number, src: string, dst: string): Prop
   };
 }
 
-/** A proposed version update — likewise no space on the wire. */
-function updateProposal(agent: string, ms: number, targetNodeId: string): ProposalOut {
+/** A proposed version update; the target node's space rides in `context`. */
+function updateProposal(
+  agent: string,
+  ms: number,
+  targetNodeId: string,
+  targetSpace: string | null = null,
+): ProposalOut {
   const base = proposal(agent, ms, "update");
   const version: VersionOut = {
     id: sequence,
@@ -137,7 +162,7 @@ function updateProposal(agent: string, ms: number, targetNodeId: string): Propos
     proposed_fields: ["content"],
     created_at: base.created_at,
   };
-  return { ...base, version };
+  return { ...base, version, context: { node: ref(targetNodeId, targetSpace) } };
 }
 
 /** One `(agent, space, level)` grant row. */
@@ -323,73 +348,38 @@ describe("editGrantedAgents", () => {
   });
 });
 
-describe("referencedNodeIds", () => {
-  it("names the endpoints of an edge and the target of an update", () => {
-    const ids = referencedNodeIds([
-      edgeProposal("agent:a", 0, "n-src", "n-dst"),
-      updateProposal("agent:a", 1_000, "n-target"),
-    ]);
-    expect(ids).toEqual(["n-src", "n-dst", "n-target"]);
-  });
-
-  it("names nothing for a proposed node, which states its own space", () => {
-    expect(referencedNodeIds([nodeProposal("agent:a", 0, "n-1", "sp-a")])).toEqual([]);
-  });
-
-  it("deduplicates, so a hub is not looked up once per edge", () => {
-    const ids = referencedNodeIds([
-      edgeProposal("agent:a", 0, "hub", "n-1"),
-      edgeProposal("agent:a", 1_000, "hub", "n-2"),
-    ]);
-    expect(ids).toEqual(["hub", "n-1", "n-2"]);
-  });
-});
-
-describe("spacesFromProposals", () => {
-  it("indexes the nodes the queue itself states a space for", () => {
-    const index = spacesFromProposals([
-      nodeProposal("agent:a", 0, "n-1", "sp-a"),
-      nodeProposal("agent:a", 1_000, "n-2", "sp-b"),
-      edgeProposal("agent:a", 2_000, "n-1", "n-2"),
-    ]);
-    expect([...index]).toEqual([
-      ["n-1", "sp-a"],
-      ["n-2", "sp-b"],
-    ]);
-  });
-
-  it("skips a node with no space rather than indexing an empty one", () => {
-    expect(spacesFromProposals([nodeProposal("agent:a", 0, "n-1", null)]).size).toBe(0);
-  });
-});
-
 describe("proposalSpace", () => {
   it("takes a proposed node's own space", () => {
     expect(proposalSpace(nodeProposal("agent:a", 0, "n-1", "sp-a"))).toBe("sp-a");
   });
 
-  it("returns null for an edge nothing has placed", () => {
-    // The wire genuinely does not say: `service._edge_context` carries endpoint
-    // id and title only. Guessing here would misfile a real proposal.
-    expect(proposalSpace(edgeProposal("agent:a", 0, "n-1", "n-2"))).toBeNull();
+  it("takes an edge's space from the source endpoint the server reported", () => {
+    expect(proposalSpace(edgeProposal("agent:a", 0, "n-src", "n-dst", "sp-a", "sp-b"))).toBe(
+      "sp-a",
+    );
   });
 
-  it("takes an edge's source space when the index knows it", () => {
-    const index = new Map([
-      ["n-src", "sp-a"],
-      ["n-dst", "sp-b"],
-    ]);
-    expect(proposalSpace(edgeProposal("agent:a", 0, "n-src", "n-dst"), index)).toBe("sp-a");
+  it("files a cross-space edge under its source, deliberately", () => {
+    // An edge is stored `src → dst` and the assertion originates at the subject.
+    // Reviewing it in fact needs `edit` on *both* endpoint spaces, so this is a
+    // simplification — pinned here so it is a decision and not a drift.
+    expect(proposalSpace(edgeProposal("agent:a", 0, "n-src", "n-dst", "sp-a", "sp-b"))).not.toBe(
+      "sp-b",
+    );
   });
 
-  it("falls back to an edge's target when only that end is known", () => {
-    const index = new Map([["n-dst", "sp-b"]]);
-    expect(proposalSpace(edgeProposal("agent:a", 0, "n-src", "n-dst"), index)).toBe("sp-b");
+  it("falls back to an edge's target when the source no longer resolves", () => {
+    expect(proposalSpace(edgeProposal("agent:a", 0, "n-src", "n-dst", null, "sp-b"))).toBe("sp-b");
   });
 
   it("takes an update's space from the node it targets", () => {
-    const index = new Map([["n-target", "sp-a"]]);
-    expect(proposalSpace(updateProposal("agent:a", 0, "n-target"), index)).toBe("sp-a");
+    expect(proposalSpace(updateProposal("agent:a", 0, "n-target", "sp-a"))).toBe("sp-a");
+  });
+
+  it("returns null only when the referenced node no longer resolves", () => {
+    // The one case the server genuinely cannot report: an `undo` took the
+    // endpoint's creation back, so the context is an id with nothing on it.
+    expect(proposalSpace(edgeProposal("agent:a", 0, "n-1", "n-2"))).toBeNull();
     expect(proposalSpace(updateProposal("agent:a", 0, "n-target"))).toBeNull();
   });
 });
@@ -514,41 +504,31 @@ describe("groupProposalsBySpace", () => {
     expect(sections.filter((section) => section.kind === "queue")).toEqual([]);
   });
 
-  it("places an edge from the node the same run proposed, for free", () => {
-    // The commonest agent run: propose a node, and the `mentions` edge its
-    // `[[wikilink]]` materialised starts from that very node.
+  it("places every kind from what the server reported, with no lookups", () => {
+    // The commonest agent run: a proposed node, the `mentions` edge its
+    // `[[wikilink]]` materialised, and an edit to something already there. All
+    // three land in one section, and none of it needed a `getNode`.
     const sections = groupProposalsBySpace(
       [
         nodeProposal("agent:a", 0, "n-1", "sp-research"),
-        edgeProposal("agent:a", 1_000, "n-1", "n-existing"),
+        edgeProposal("agent:a", 1_000, "n-1", "n-existing", "sp-research", "sp-research"),
+        updateProposal("agent:a", 2_000, "n-existing", "sp-research"),
       ],
       spaces,
     );
     const research_ = sections.find((section) => section.spaceId === "sp-research")!;
-    expect(research_.total).toBe(2);
-    expect(research_.counts).toEqual({ node: 1, edge: 1, update: 0 });
+    expect(research_.total).toBe(3);
+    expect(research_.counts).toEqual({ node: 1, edge: 1, update: 1 });
     expect(sections.some((section) => section.kind === "unreported")).toBe(false);
   });
 
-  it("uses the caller's index for what the queue cannot place itself", () => {
+  it("sends a cross-space edge to its source's section, not to both", () => {
     const sections = groupProposalsBySpace(
-      [updateProposal("agent:a", 0, "n-target")],
+      [edgeProposal("agent:a", 0, "n-src", "n-dst", "sp-research", "sp-journal")],
       spaces,
-      { nodeSpaces: new Map([["n-target", "sp-research"]]) },
     );
-    expect(sections[0]!.spaceId).toBe("sp-research");
-    expect(sections[0]!.kind).toBe("queue");
-  });
-
-  it("prefers what the queue states over what the caller supplied", () => {
-    // The proposal's own `space_id` is the server's answer; a cached lookup is
-    // a client-side approximation and must never override it.
-    const sections = groupProposalsBySpace(
-      [nodeProposal("agent:a", 0, "n-1", "sp-research")],
-      spaces,
-      { nodeSpaces: new Map([["n-1", "sp-journal"]]) },
-    );
-    expect(sections[0]!.spaceId).toBe("sp-research");
+    const queues = sections.filter((section) => section.kind === "queue");
+    expect(queues.map((section) => section.spaceId)).toEqual(["sp-research"]);
   });
 
   it("sorts the unreported bucket among the queues by age, not to the bottom", () => {

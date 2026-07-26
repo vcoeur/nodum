@@ -98,6 +98,18 @@ node writes, each event-logged, versioned and undoable. `nodum space-list`
 reports every active space with its live node count and the agents granted on
 it.
 
+Two spaces may not share a name, because every space reference resolves as
+`id = ? OR title = ?` and a duplicate would make `--space research` mean
+whichever row the database reached first. The comparison is exact — `Research`
+and `research` are two spaces, and both resolve — and an **archived** space
+frees its name, since it no longer resolves at all.
+
+`main` and `meta` cannot be archived. Every write that names no space lands in
+`main`, and that default resolves by id whatever state the row is in, so
+archiving it would hide the space while nodes kept arriving there; `meta` is the
+space that spaces themselves live in. Renaming either is fine — a rename moves
+the title, and it is the id everything structural depends on.
+
 A space is used two ways, and they are deliberately two separate controls:
 
 - **Reading** — an optional filter (`--space` on `node list` and `search`,

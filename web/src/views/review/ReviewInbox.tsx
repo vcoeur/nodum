@@ -51,7 +51,6 @@ import type { AgentGroup, ProposalBatch, ProposalKind, SpaceSection } from "./gr
 import { formatAbsolute, formatRelative } from "../../lib";
 import { plural } from "./format";
 import { classifyFailure, failureMessage, useReviewQueue } from "./useReviewQueue";
-import { useProposalSpaces } from "./useProposalSpaces";
 import { useSpaces } from "./useSpaces";
 
 /** A destructive action waiting on confirmation. */
@@ -103,8 +102,6 @@ export function ReviewInbox() {
   // list never re-orders under a pointer that is about to click it.
   const queue = useReviewQueue(pending !== null || busy);
   const spaceList = useSpaces();
-  // The spaces the queue itself does not report — see `useProposalSpaces`.
-  const nodeSpaces = useProposalSpaces(queue.proposals);
 
   const agents = useMemo(
     () => [...new Set(queue.proposals.map((proposal) => proposal.created_by))].sort(),
@@ -122,8 +119,8 @@ export function ReviewInbox() {
   );
 
   const sections = useMemo(
-    () => groupProposalsBySpace(visible, spaceList.spaces, { nodeSpaces }),
-    [visible, spaceList.spaces, nodeSpaces],
+    () => groupProposalsBySpace(visible, spaceList.spaces),
+    [visible, spaceList.spaces],
   );
   // Sections that hold something. A self-governing section is not "content" —
   // it is a statement about an absence, so it must not make an empty queue look
@@ -448,10 +445,10 @@ function SpacePanel({
         </p>
         {unreported ? (
           <p className="nd-meta">
-            The review queue states a space for a proposed <em>node</em> and for nothing else, so
-            an edge or a version update arrives without one. These are ordinary proposals and can
-            be reviewed normally — they are grouped apart rather than filed under a space they
-            might not belong to.
+            The queue reports a space for every proposal whose subject still exists, so these
+            reference a node that does not — undone, most likely, after the proposal was filed.
+            They are ordinary proposals and can be reviewed normally; they are grouped apart
+            rather than filed under a space nothing says they belong to.
           </p>
         ) : null}
         {!unreported && section.editAgents.length > 0 ? (

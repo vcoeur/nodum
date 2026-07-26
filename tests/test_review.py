@@ -5,10 +5,10 @@ from __future__ import annotations
 import json
 
 import pytest
-from helpers import OWNER_ACTOR, agent, owner
+from helpers import OWNER_ACTOR, agent, owner, seed_space
 from typer.testing import CliRunner
 
-from nodum import service
+from nodum import db, service
 from nodum.cli import app
 
 runner = CliRunner()
@@ -66,8 +66,8 @@ def test_list_proposals_edge_context_has_endpoints(fresh_db):
     a, b, _, edge = _seed_proposals()
     (proposal,) = service.list_proposals(kind="edge", principal=owner())
     assert proposal.id == edge.id
-    assert proposal.context["src"] == {"id": a.id, "title": "Alpha"}
-    assert proposal.context["dst"] == {"id": b.id, "title": "Beta"}
+    assert proposal.context["src"] == {"id": a.id, "title": "Alpha", "space_id": "main"}
+    assert proposal.context["dst"] == {"id": b.id, "title": "Beta", "space_id": "main"}
 
 
 def test_list_proposals_node_context_has_parent(fresh_db):
@@ -77,7 +77,7 @@ def test_list_proposals_node_context_has_parent(fresh_db):
     )
     (proposal,) = service.list_proposals(kind="node", principal=owner())
     assert proposal.id == child.id
-    assert proposal.context["parent"] == {"id": page.id, "title": "Page"}
+    assert proposal.context["parent"] == {"id": page.id, "title": "Page", "space_id": "main"}
 
 
 def test_list_proposals_filters(fresh_db):
@@ -105,6 +105,65 @@ def test_accepted_proposals_leave_the_queue(fresh_db):
     _, _, note, edge = _seed_proposals()
     service.transition(note.id, "accept", principal=owner())
     assert [p.id for p in service.list_proposals(principal=owner())] == [edge.id]
+
+
+# ── Every proposal reports a space, which is what D4 groups the queue by ──────
+
+
+def test_every_kind_of_proposal_reports_a_space(fresh_db):
+    """Human-UI D4 makes space the queue's outer grouping level.
+
+    A proposed node states its own on the row; an edge and an update stated
+    nothing at all before ``_node_ref``, and an edge is the commonest thing an
+    agent files (every ``mentions`` a ``[[wikilink]]`` materialises). A queue
+    where those arrive unplaceable is a section header with the work under it.
+    """
+    seed_space("b")
+    far = service.create_node(type="concept", title="Far", space="b", principal=owner())
+    near = service.create_node(type="concept", title="Near", principal=owner())
+    researcher = agent("researcher", grants={"meta": "read", "main": "suggest", "b": "suggest"})
+    service.create_edge(near.id, far.id, "supports", principal=researcher)
+    service.update_node(near.id, content="revised", principal=researcher)
+    service.create_node(type="note", title="Bot note", space="b", principal=researcher)
+
+    spaces = {}
+    for proposal in service.list_proposals(principal=owner()):
+        if proposal.kind == "node":
+            spaces["node"] = proposal.node.space_id
+        elif proposal.kind == "edge":
+            spaces["edge"] = proposal.context["src"]["space_id"]
+            spaces["edge_dst"] = proposal.context["dst"]["space_id"]
+        else:
+            spaces["update"] = proposal.context["node"]["space_id"]
+
+    # Every kind placed, and the cross-space edge reports *both* ends honestly —
+    # the queue files it under the source, but the far side is on the wire, so
+    # the fact that reviewing it needs authority on two spaces is not hidden.
+    assert spaces == {"node": "b", "edge": "main", "edge_dst": "b", "update": "main"}
+
+
+def test_a_referenced_node_that_no_longer_resolves_reports_no_space(fresh_db):
+    """The one case that genuinely cannot be placed, and must not be guessed at.
+
+    An ``undo`` can take a node's creation back after something referenced it.
+    The context then has an id and nothing else, which is what keeps the
+    queue's *space not reported* section honest instead of vestigial.
+    """
+    _, b, _, _ = _seed_proposals()
+    conn = db.connect()
+    try:
+        # Foreign keys off for the surgery: what an undo leaves behind is an
+        # edge naming a node that is no longer there, and there is no supported
+        # way to reach that state on purpose.
+        conn.execute("PRAGMA foreign_keys = OFF")
+        conn.execute("DELETE FROM nodes WHERE id = ?", (b.id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+    (proposal,) = service.list_proposals(kind="edge", principal=owner())
+    assert proposal.context["src"]["space_id"] == "main"
+    assert proposal.context["dst"] == {"id": b.id}
 
 
 # ── Batch accept/reject by id ─────────────────────────────────────────────────

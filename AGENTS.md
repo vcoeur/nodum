@@ -23,7 +23,9 @@ breakdown, **principals, spaces and grants** (Q13: `humans`/`agents`/
 `grants` tables, a scope-bound store, `read`/`suggest`/`edit` per
 (agent, space) — no policies, no auto-accept anywhere), the
 **review/accept API** (proposal listing with reviewer
-context, batch accept/reject by id or filter — a human, or `edit` on the
+context, where every referenced node is reported as `{id, title, space_id}` so
+the human UI's queue can group by space without chasing ids, plus batch
+accept/reject by id or filter — a human, or `edit` on the
 item's space; `undo` stays human-only), **proposed updates** (agent `update_node` stages a
 `proposed` version recording which fields it named; accept applies exactly
 those, reject archives it — migrations 0005/0008), the **MCP server**
@@ -110,6 +112,32 @@ node for exactly this reason.
   aggregation — thin delegates to `create_node` / `update_node` / `transition`
   that own the "a space is a node of type `space` in meta" rule so that neither
   adapter has to restate it, and no new SQL path exists for a space write.
+  Two space rules are enforced **here** rather than on a screen, because a
+  disabled button leaves the CLI and the API wide open. **`main` and `meta`
+  cannot be archived** (`STRUCTURAL_SPACE_IDS`): the check sits in
+  `_transition_row`, not in `archive_space`, since `archive <id>` and
+  `POST /api/nodes/{id}/archive` reach the same row without going near the
+  lifecycle helper. Archiving `main` is destructive in the quietest way there
+  is — it vanishes from `list_spaces` and every picker, while
+  `resolve_space_id(None)` keeps returning it without reading the row's state,
+  so writes go on landing in a space the human can no longer see. A *rename*
+  of either stays allowed: it moves the title, and the **id** is what the
+  schema and the default write target depend on. **Two live spaces may not
+  answer to one name** (`_require_space_name_free`): a reference resolves as
+  `id = ? OR title = ?`, so a duplicate makes `--space research` mean whichever
+  row SQLite reached first. The check runs in `create_node` and `update_node`
+  (conditioned on the node being a space), because those are the paths that
+  bypass the lifecycle helpers, and migration `0013_unique_space_titles` is the
+  structural half under it — a partial unique index over `nodes(title)` where
+  `type_id = 'space' AND state != 'archived'`, which is exactly the set the
+  resolver searches. Archived titles are free again (an archived space stops
+  resolving, and there is no un-archive, so holding the name would reserve it
+  for good); `proposed` ones are held, because two proposals sharing a title
+  would both accept cleanly and collide where a state-keyed partial index never
+  re-fires. Comparison is BINARY, like the lookup's — `Research` beside
+  `research` is two names that genuinely tell themselves apart. The service
+  check additionally catches the half no index can express: a title equal to
+  another space's *id*.
   Each public function opens its own short-lived connection
   (applying pending migrations idempotently) and commits. New behaviour and
   validation go here first; adapters must not add behaviour the service lacks.
@@ -400,7 +428,7 @@ node for exactly this reason.
   a database whose only cure is deletion never gets a new (possibly
   irreversible) migration committed onto it first.
 - **`nodum.migrations`** — the append-only migration list (`0001_core` …
-  `0012_url_tokens`). Never edit a shipped migration; append a
+  `0013_unique_space_titles`). Never edit a shipped migration; append a
   new one. A migration must never leave data readable only through a store a
   later migration replaces: introduce a table where its bytes already belong
   (this is why asset bytes are part of `0007` and there is no `path` column
@@ -783,7 +811,11 @@ Phase-1 decision log.
   node that is not one. `GET /api/spaces` carries per space the live node count
   and the agents holding grants on it (the `/spaces` screen's read) and is
   byte-identical to `nodum space-list`, as every list endpoint is to its
-  command.
+  command. The two space rules are the service's, so both archive routes
+  (`/api/spaces/{id}/archive` and `/api/nodes/{id}/archive`) answer 400 for
+  `main` and `meta`, and both writers answer 400 for a name a live space
+  already holds. Do not re-implement either in a handler or in the UI: the
+  screen may say *why* before the click, but the refusal is the server's.
 - **Account and grant administration is on the API too.** `GET /api/me`
   returns the session's human; `/api/humans`, `/api/agents` and `/api/grants`
   mirror the CLI's `human`/`agent`/`grant`/`revoke`/`grants` commands — thin
