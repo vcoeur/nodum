@@ -165,12 +165,16 @@ def test_diff_versions(fresh_db):
 def test_diff_versions_rejects_cross_node(fresh_db):
     x = service.create_node(type="note", title="x", principal=owner())
     y = service.create_node(type="note", title="y", principal=owner())
-    with pytest.raises(ValueError, match="different nodes"):
+    with pytest.raises(service.VersionNotFound) as excinfo:
         service.diff_versions(
             service.history(x.id, principal=owner())[0].id,
             service.history(y.id, principal=owner())[0].id,
             principal=owner(),
         )
+    # The refusal names neither node id: version ids are sequential, so the
+    # message must not turn a diff into an enumeration oracle (review S1).
+    assert x.id not in str(excinfo.value)
+    assert y.id not in str(excinfo.value)
 
 
 # ── propose_edges ─────────────────────────────────────────────────────────────

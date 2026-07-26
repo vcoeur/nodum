@@ -28,7 +28,7 @@ import sqlite_vec
 from nodum import db, embeddings, projectors
 from nodum.migrations import META_SPACE_ID
 from nodum.models import SearchHit, SearchResult
-from nodum.principal import Principal
+from nodum.principal import READ, Principal
 
 #: bm25() column weights for (node_id, title, content, extracted_text): node_id
 #: is unindexed (weight ignored); a title hit outranks a body hit.
@@ -385,11 +385,13 @@ def search(
         type_id = None
         if type is not None:
             row = conn.execute(
-                "SELECT id FROM nodes WHERE (id = ? OR title = ?) AND type_id = 'type'"
+                "SELECT id, space_id FROM nodes WHERE (id = ? OR title = ?) AND type_id = 'type'"
                 " AND json_extract(props, '$.type_kind') = 'node' AND state = 'active'",
                 (type, type),
             ).fetchone()
-            if row is None:
+            # A type in an unreadable space does not resolve — the catalog is
+            # not an existence oracle for the search filter either (review N1).
+            if row is None or principal.level_on(row["space_id"]) < READ:
                 raise ValueError(f"unknown node type: {type}")
             type_id = row["id"]
         bm25_rows = _search_bm25(

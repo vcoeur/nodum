@@ -243,29 +243,27 @@ def _proposed_fields(version: dict[str, Any]) -> list[str]:
     return [name for name in json.loads(raw) if name in VERSION_FIELDS]
 
 
-def _resolve_node_type(
-    conn: sqlite3.Connection, type_ref: str, principal: Principal | None = None
-) -> str:
+def _resolve_node_type(conn: sqlite3.Connection, type_ref: str, principal: Principal) -> str:
     """Resolve a node-type id or name to its id, or raise :class:`TypeNotFound`.
 
     Types are nodes (Q13, migration ``0009``): a node type is an active node
     whose own type is the ``type`` metaclass root, distinguished from edge
-    types by ``type_kind`` in props. With ``principal``, a type in a space
-    the principal cannot read does not resolve — the catalog is not a leak
-    channel either.
+    types by ``type_kind`` in props. A type in a space the principal cannot
+    read does not resolve — the catalog is not a leak channel either, which
+    is why the principal is required rather than optional (Q13 review N1).
     """
     row = conn.execute(
         "SELECT id, space_id FROM nodes WHERE (id = ? OR title = ?) AND type_id = 'type'"
         " AND json_extract(props, '$.type_kind') = 'node' AND state = 'active'",
         (type_ref, type_ref),
     ).fetchone()
-    if row is None or (principal is not None and principal.level_on(row["space_id"]) < READ):
+    if row is None or principal.level_on(row["space_id"]) < READ:
         raise TypeNotFound(f"unknown node type: {type_ref}")
     return row["id"]
 
 
 def _resolve_edge_type(
-    conn: sqlite3.Connection, type_ref: str, principal: Principal | None = None
+    conn: sqlite3.Connection, type_ref: str, principal: Principal
 ) -> tuple[str, str | None]:
     """Resolve an edge-type id or name to ``(id, space_id)``, or raise.
 
@@ -278,22 +276,26 @@ def _resolve_edge_type(
         " AND json_extract(props, '$.type_kind') = 'edge' AND state = 'active'",
         (type_ref, type_ref),
     ).fetchone()
-    if row is None or (principal is not None and principal.level_on(row["space_id"]) < READ):
+    if row is None or principal.level_on(row["space_id"]) < READ:
         raise TypeNotFound(f"unknown edge type: {type_ref}")
     return row["id"], row["space_id"]
 
 
-def _resolve_space(conn: sqlite3.Connection, space_ref: str) -> str:
+def _resolve_space(conn: sqlite3.Connection, space_ref: str, principal: Principal) -> str:
     """Resolve a space id or name to its id, or raise :class:`TypeNotFound`.
 
-    Spaces are nodes of builtin type ``space`` (Q13 note 03 Q7).
+    Spaces are nodes of builtin type ``space`` (Q13 note 03 Q7). A space the
+    principal holds no grant on does not resolve, so an existing-but-ungranted
+    space and a nonexistent one answer identically (Q13 review S3) — the
+    default-deny rule in :mod:`nodum.store`. ``GrantNotPermitted`` is then
+    reserved for spaces the principal can genuinely see.
     """
     row = conn.execute(
-        "SELECT id FROM nodes WHERE (id = ? OR title = ?) AND type_id = 'space'"
+        "SELECT id, space_id FROM nodes WHERE (id = ? OR title = ?) AND type_id = 'space'"
         " AND state = 'active'",
         (space_ref, space_ref),
     ).fetchone()
-    if row is None:
+    if row is None or principal.level_on(row["id"]) < READ:
         raise TypeNotFound(f"unknown space: {space_ref}")
     return row["id"]
 
@@ -393,6 +395,13 @@ def _materialize_mentions(
     pending edge goes live when a reviewer accepts the proposing node
     (:func:`_activate_pending_mentions`) or the edge itself.
 
+    **Archival is authority-gated the same way** (Q13 review B2): an existing
+    edge is only retired when the writer holds ``edit`` on *both* endpoint
+    spaces. Without it the edge is left untouched — a writer who cannot see
+    the far endpoint cannot tell the link "disappeared" (its target does not
+    resolve for them), and must not be able to strip another principal's
+    cross-space mentions out of a node it may otherwise edit.
+
     Idempotent: re-running on unchanged content changes nothing, whichever
     state the existing edges are in — pending edges count as already
     materialised, so a later human write never duplicates them.
@@ -436,14 +445,39 @@ def _materialize_mentions(
             cycle_id=cycle_id,
         )
     for dst_id, edge in current_by_dst.items():
-        if dst_id not in resolved:
-            # A pending edge leaves `proposed`, so its op is `reject`, not
-            # `archive` — the state machine allows only one of the two.
-            action = "archive" if edge["state"] == "active" else "reject"
-            _set_edge_state(conn, dict(edge), "archived", action, actor, cycle_id=cycle_id)
+        if dst_id in resolved:
+            continue
+        if not _may_retire_mention(conn, node["space_id"], dst_id, store):
+            continue
+        # A pending edge leaves `proposed`, so its op is `reject`, not
+        # `archive` — the state machine allows only one of the two.
+        action = "archive" if edge["state"] == "active" else "reject"
+        _set_edge_state(conn, dict(edge), "archived", action, actor, cycle_id=cycle_id)
 
 
-def _activate_pending_mentions(conn: sqlite3.Connection, node: dict[str, Any], actor: str) -> None:
+def _may_retire_mention(
+    conn: sqlite3.Connection, src_space: str | None, dst_id: str, store: Store
+) -> bool:
+    """May this writer archive/reject a ``mentions`` edge into ``dst_id``?
+
+    Retiring an edge is a state-machine action on both endpoint spaces, so it
+    needs ``edit`` on both — the same bar :meth:`Store.require_review` sets
+    for reviewing the edge directly. Unreadable far endpoints fail it too
+    (no grant, no level), which is what keeps an under-granted writer from
+    silently pruning links it cannot see.
+    """
+    row = conn.execute("SELECT space_id FROM nodes WHERE id = ?", (dst_id,)).fetchone()
+    if row is None:
+        return False
+    return (
+        store.principal.level_on(src_space) >= EDIT
+        and store.principal.level_on(row["space_id"]) >= EDIT
+    )
+
+
+def _activate_pending_mentions(
+    conn: sqlite3.Connection, node: dict[str, Any], actor: str, store: Store
+) -> None:
     """Bring an accepted node's own pending ``mentions`` edges to ``active``.
 
     An agent's ``[[wikilinks]]`` materialise as ``proposed`` edges, so
@@ -452,6 +486,12 @@ def _activate_pending_mentions(conn: sqlite3.Connection, node: dict[str, Any], a
     an unrelated agent's proposed ``mentions`` edge out of the same node stays
     in the queue on its own merits. Each transition is its own event,
     attributed to the accepting reviewer.
+
+    Each edge is gated on the acceptor's own review authority over both
+    endpoint spaces (Q13 review B1): accepting the node must not be a way to
+    land an edge into a space the acceptor could not review the edge in
+    directly. An edge the acceptor lacks authority over stays ``proposed``
+    for someone who has it.
     """
     rows = conn.execute(
         """
@@ -462,7 +502,12 @@ def _activate_pending_mentions(conn: sqlite3.Connection, node: dict[str, Any], a
         (node["id"], node["created_by"]),
     ).fetchall()
     for row in rows:
-        _set_edge_state(conn, _row_dict(row), "active", "accept", actor)
+        edge = _row_dict(row)
+        try:
+            store.require_review(_item_spaces(conn, "edge", edge), "accept")
+        except GrantNotPermitted:
+            continue
+        _set_edge_state(conn, edge, "active", "accept", actor)
 
 
 # ── Internal edge writers (shared by public ops and wikilink materialisation) ─
@@ -607,7 +652,9 @@ def create_node(
         store = Store(conn, principal)
         actor = principal.actor_string
         type_id = _resolve_node_type(conn, type, principal)
-        target_space = _resolve_space(conn, space) if space is not None else MAIN_SPACE_ID
+        target_space = (
+            _resolve_space(conn, space, principal) if space is not None else MAIN_SPACE_ID
+        )
         if parent_id is not None:
             parent = _get_node_row(conn, parent_id)
             if not store.node_visible(parent):
@@ -809,7 +856,7 @@ def list_nodes(
             params.append(META_SPACE_ID)
         if type is not None:
             clauses.append("type_id = ?")
-            params.append(_resolve_node_type(conn, type))
+            params.append(_resolve_node_type(conn, type, principal))
         if state is not None:
             if state not in STATES:
                 raise ValueError(f"state must be one of {STATES}, got {state!r}")
@@ -1108,7 +1155,7 @@ def list_edges(
             params.extend([node_id, node_id])
         if type is not None:
             clauses.append("type_id = ?")
-            params.append(_resolve_edge_type(conn, type)[0])
+            params.append(_resolve_edge_type(conn, type, principal)[0])
         if state is not None:
             if state not in STATES:
                 raise ValueError(f"state must be one of {STATES}, got {state!r}")
@@ -1254,7 +1301,7 @@ def _transition_row(
         seq = _emit(conn, actor, f"node.{action}", payload)
         _write_version(conn, after, actor, seq)
         if action == "accept":
-            _activate_pending_mentions(conn, after, actor)
+            _activate_pending_mentions(conn, after, actor, store)
         return kind, after
     return kind, _set_edge_state(conn, before, to_state, action, actor, reason=reason)
 
@@ -1314,6 +1361,7 @@ def transition(
 
 def _proposal_filters(
     conn: sqlite3.Connection,
+    principal: Principal,
     *,
     created_by: str | None,
     type: str | None,
@@ -1338,11 +1386,13 @@ def _proposal_filters(
     node_type_id = edge_type_id = None
     if type is not None:
         row = conn.execute(
-            "SELECT id, json_extract(props, '$.type_kind') AS kind FROM nodes"
+            "SELECT id, space_id, json_extract(props, '$.type_kind') AS kind FROM nodes"
             " WHERE (id = ? OR title = ?) AND type_id = 'type' AND state = 'active'",
             (type, type),
         ).fetchall()
         for r in row:
+            if principal.level_on(r["space_id"]) < READ:
+                continue  # an unreadable type does not resolve (review N1)
             if r["kind"] == "node":
                 node_type_id = r["id"]
             elif r["kind"] == "edge":
@@ -1401,7 +1451,7 @@ def _update_proposal_filter(
 
 def _proposal_rows(
     conn: sqlite3.Connection,
-    store: Store | None = None,
+    store: Store,
     *,
     kind: str | None = None,
     **filters: Any,
@@ -1412,13 +1462,9 @@ def _proposal_rows(
     ``rowid``); timestamps have one-second resolution, so same-second rows of
     different kinds may interleave.
     """
-    node_filter, edge_filter, node_type_id = _proposal_filters(conn, **filters)
-    node_scope = edge_scope = ""
-    scope_params: list[Any] = []
-    edge_scope_params: list[Any] = []
-    if store is not None:
-        node_scope, scope_params = store.node_scope()
-        edge_scope, edge_scope_params = store.edge_scope()
+    node_filter, edge_filter, node_type_id = _proposal_filters(conn, store.principal, **filters)
+    node_scope, scope_params = store.node_scope()
+    edge_scope, edge_scope_params = store.edge_scope()
     results: list[tuple[str, sqlite3.Row]] = []
     if kind in (None, "node") and node_filter is not None:
         where, params = node_filter
@@ -1581,10 +1627,11 @@ def _transition_many(
 ) -> BatchTransitionOut:
     """Transition many ids in one connection; bad ids are skipped, not fatal.
 
-    A refused reviewer is *not* a per-id failure: the whole batch raises
-    before any id is touched, so an agent never gets a partially applied
-    review. Grant-refusals on individual items land in ``failed`` like any
-    other per-id error.
+    Grants are per-item, so a refusal is per-item too: an id the principal
+    may not review lands in ``failed`` beside unknown ids and invalid
+    transitions, and the rest of the batch still applies. A batch may
+    therefore be partially applied — the documented semantics since the
+    grant model replaced the all-or-nothing human tier.
     """
     conn = _connect(path)
     try:
@@ -1614,12 +1661,8 @@ def accept_proposals(
     Accepting an update (a proposed version id, given as a string) applies
     its staged fields to the node. Accepting a node also brings the pending
     ``mentions`` edges its wikilinks materialised to ``active``. Ids that are
-    unknown or not ``proposed`` are collected in ``failed``; the rest still
-    transition.
-
-    Raises:
-        GrantNotPermitted: If the principal may not review — review is the
-            human tier, whoever filed the proposal.
+    unknown, not ``proposed``, or outside the principal's review authority
+    are collected in ``failed``; the rest still transition.
     """
     return _transition_many(ids, "accept", principal=principal, reason=None, path=path)
 
@@ -1634,19 +1677,23 @@ def reject_proposals(
     """Reject proposed nodes/edges/updates by id, one event each.
 
     The ``reason`` is recorded in every reject event's payload (design §8.1).
-    Ids that are unknown or not ``proposed`` are collected in ``failed``.
-
-    Raises:
-        GrantNotPermitted: If the principal may not review an item — an agent
-            may not reject another agent's proposal any more than its own,
-            outside its edit-granted spaces.
+    Ids that are unknown, not ``proposed``, or outside the principal's review
+    authority are collected in ``failed`` — an agent may not reject another
+    agent's proposal any more than its own, outside its edit-granted spaces.
     """
     return _transition_many(ids, "reject", principal=principal, reason=reason, path=path)
 
 
-def _matching_ids(conn: sqlite3.Connection, *, kind: str | None, **filters: Any) -> list[str]:
-    """Resolve a proposal filter to concrete ids (the batch-by-filter input)."""
-    return [str(row["id"]) for _, row in _proposal_rows(conn, kind=kind, **filters)]
+def _matching_ids(
+    conn: sqlite3.Connection, store: Store, *, kind: str | None, **filters: Any
+) -> list[str]:
+    """Resolve a proposal filter to concrete ids (the batch-by-filter input).
+
+    Scoped by the caller's store (Q13 review S4): an unscoped scan refuses
+    out-of-scope items per-item, but their ids still come back in ``failed``
+    — the id itself is the leak.
+    """
+    return [str(row["id"]) for _, row in _proposal_rows(conn, store, kind=kind, **filters)]
 
 
 def accept_matching(
@@ -1661,11 +1708,10 @@ def accept_matching(
 ) -> BatchTransitionOut:
     """Accept every proposal matching the filters (e.g. one agent's whole run).
 
-    The filter resolves to concrete ids first, then each id transitions with
-    its own event — the batch is a convenience, never a silent bulk update.
-
-    Raises:
-        GrantNotPermitted: If the principal may not review an item.
+    The filter resolves to concrete ids first — inside the principal's read
+    scope, so an unreviewable item is never even named — then each id
+    transitions with its own event: the batch is a convenience, never a
+    silent bulk update.
     """
     if kind not in (None, "node", "edge", "update"):
         raise ValueError(f"kind must be 'node', 'edge', or 'update', got {kind!r}")
@@ -1673,6 +1719,7 @@ def accept_matching(
     try:
         ids = _matching_ids(
             conn,
+            Store(conn, principal),
             kind=kind,
             created_by=created_by,
             type=type,
@@ -1697,11 +1744,9 @@ def reject_matching(
 ) -> BatchTransitionOut:
     """Reject every proposal matching the filters, recording ``reason``.
 
-    The filter resolves to concrete ids first, then each id transitions with
-    its own event carrying the reason.
-
-    Raises:
-        GrantNotPermitted: If the principal may not review an item.
+    The filter resolves to concrete ids first — inside the principal's read
+    scope, so an unreviewable item is never even named — then each id
+    transitions with its own event carrying the reason.
     """
     if kind not in (None, "node", "edge", "update"):
         raise ValueError(f"kind must be 'node', 'edge', or 'update', got {kind!r}")
@@ -1709,6 +1754,7 @@ def reject_matching(
     try:
         ids = _matching_ids(
             conn,
+            Store(conn, principal),
             kind=kind,
             created_by=created_by,
             type=type,
@@ -2105,7 +2151,7 @@ def traverse(
     try:
         store = Store(conn, principal)
         type_ids = (
-            [_resolve_edge_type(conn, edge_type)[0] for edge_type in edge_types]
+            [_resolve_edge_type(conn, edge_type, principal)[0] for edge_type in edge_types]
             if edge_types
             else None
         )
@@ -2225,7 +2271,9 @@ def subgraph(
             edge_clauses.append(scope.removeprefix(" AND "))
             edge_params += scope_params
         if edge_types:
-            type_ids = [_resolve_edge_type(conn, edge_type)[0] for edge_type in edge_types]
+            type_ids = [
+                _resolve_edge_type(conn, edge_type, principal)[0] for edge_type in edge_types
+            ]
             edge_clauses.append(f"type_id IN ({','.join('?' * len(type_ids))})")
             edge_params += type_ids
         if min_confidence is not None:
@@ -2235,7 +2283,7 @@ def subgraph(
             edge_clauses.append("created_by = ?")
             edge_params.append(created_by)
         admissible_types = (
-            {_resolve_node_type(conn, node_type) for node_type in node_types}
+            {_resolve_node_type(conn, node_type, principal) for node_type in node_types}
             if node_types
             else None
         )
@@ -2418,24 +2466,26 @@ def diff_versions(
 ) -> DiffOut:
     """Diff two versions of one node (design §8.1 ``diff(a, b)``).
 
+    Both versions are visibility-checked, and every refusal is the same
+    :class:`VersionNotFound` naming only the id the caller passed (Q13 review
+    S1): version ids are sequential integers, so a distinguishable "wrong
+    node" or "unreadable" answer would enumerate the store — and the old
+    cross-node message named the other node's id outright.
+
     Raises:
-        VersionNotFound: If either version id does not resolve.
-        NodeNotFound: If the node is not readable by the principal.
-        ValueError: If the versions belong to different nodes.
+        VersionNotFound: If either version id does not resolve, sits on a node
+            the principal cannot read, or the two belong to different nodes.
     """
     conn = _connect(path)
     try:
         store = Store(conn, principal)
         version_a = _row_dict(_get_version_row(conn, a))
         version_b = _row_dict(_get_version_row(conn, b))
-        node = _get_node_row(conn, version_a["node_id"])
-        if not store.node_visible(node):
-            raise NodeNotFound(f"node not found: {version_a['node_id']}")
+        for version_id, version in ((a, version_a), (b, version_b)):
+            if not store.node_visible(_get_node_row(conn, version["node_id"])):
+                raise VersionNotFound(f"version not found: {version_id}")
         if version_a["node_id"] != version_b["node_id"]:
-            raise ValueError(
-                f"versions {a} and {b} belong to different nodes "
-                f"({version_a['node_id']} vs {version_b['node_id']})"
-            )
+            raise VersionNotFound(f"versions {a} and {b} do not belong to the same node")
         changed = [
             field for field in ("title", "content", "props") if version_a[field] != version_b[field]
         ]
@@ -2694,7 +2744,7 @@ def grant(
     conn = _connect(path)
     try:
         actor = _admin_actor(conn, principal)
-        space_id = _resolve_space(conn, space)
+        space_id = _resolve_space(conn, space, principal)
         before = conn.execute(
             "SELECT * FROM grants WHERE agent_id = ? AND space_id = ?", (agent_id, space_id)
         ).fetchone()
@@ -2732,7 +2782,7 @@ def revoke(
     conn = _connect(path)
     try:
         actor = _admin_actor(conn, principal)
-        space_id = _resolve_space(conn, space)
+        space_id = _resolve_space(conn, space, principal)
         before = conn.execute(
             "SELECT * FROM grants WHERE agent_id = ? AND space_id = ?", (agent_id, space_id)
         ).fetchone()
