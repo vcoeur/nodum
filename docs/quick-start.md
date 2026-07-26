@@ -30,7 +30,44 @@ edge:
 nodum edge list --type mentions --as owner
 ```
 
+## Drop in a folder of documents
+
+Point `ingest` at a directory and every file directly inside it is registered,
+read, and described. Check first what this install can read:
+
+```sh
+nodum ingest handlers
+```
+
+Plain text, Markdown, JSON, and HTML always work. PDF text needs the `pdf`
+extra, image OCR the `ocr` extra (plus the `tesseract` binary), and audio
+transcription the `audio` extra — a handler that cannot run says so, and names
+what to install.
+
+```sh
+nodum ingest file ~/papers --as owner              # the files directly inside
+nodum ingest file ~/papers --recursive --as owner  # and the ones below them
+nodum ingest url https://example.com/paper.pdf --as owner
+```
+
+Each document becomes an `asset_ref` node for the bytes, a `source` node
+holding the extracted text, a `derived_from` edge between them, and one `block`
+child per page. A single file prints one JSON object; a folder prints
+`{"ingestions": [...], "count": n}`.
+
+A batch never loses its successes: a file that fails prints its reason to
+stderr and the rest carry on, so a non-zero exit means "read stderr for what is
+missing", not "nothing happened". Running it again is safe — ingestion is
+idempotent per (hash, space), and what already landed comes back with
+`"created": false` rather than a duplicate.
+
+Missing an extra is not fatal either. The asset is still registered and still
+described; the result just reports that no text came out.
+
 ## Search it
+
+Everything ingested is searchable immediately — the full extracted text through
+the `asset_ref` node, and each page through its own block:
 
 ```sh
 nodum search "graph theory" --as owner

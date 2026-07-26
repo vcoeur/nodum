@@ -43,10 +43,28 @@ module (`nodum.envelope`) both the CLI and the API render through, and the
 `make web-build`; gitignored, shipped in the wheel as a hatchling artifact):
 eight views — login, Markdown editor, hybrid search, review queue,
 graph, assets, an accounts-and-grants admin, per-node version history.
-**Deliberately not built yet** (later phases — do not add): the
-Phase-4 ingestion pipeline (text extraction, chunking, source/claim
-proposals, `ingest_file`/`ingest_url`), `page:<n>` PDF rasters,
-`get_download_url`/`request_upload_url`, the internal agent runtime and
+Phase 4 (ingestion) has landed: **text extraction** (`nodum.extract` — a
+registry of optional handlers keyed by MIME family, where an absent dependency
+is a returned result and never an exception), the **ingestion pipeline**
+(`nodum.ingest` — `ingest_file`/`ingest_url`/`ingest_upload`: bytes become an
+asset, an `asset_ref` node describing them in one space, a `source` node
+carrying the extracted text, a `derived_from` edge, and one `block` per page,
+all through the public service API and therefore landing per the writer's
+grant; idempotent per `(hash, space)`), **`page:<n>` PDF rasters** beside
+`thumb`/`preview`, the `fts` projector's join of `assets.extracted_text` onto
+`asset_ref` nodes, and **capability URLs** (`nodum.urls`, migration
+`0012_url_tokens` — short-lived, single-use, event-logged download and upload
+grants for a host that shares no filesystem with the graph). The surfaces:
+CLI `ingest file|url|handlers` and `asset download-url|upload-url`, MCP
+`ingest_file`/`ingest_url`/`request_upload_url`/`get_download_url`, and HTTP
+`POST /api/ingest`, `POST /api/assets/{id}/download-url`, `POST /api/uploads`,
+`GET /api/download/{token}`, `PUT /api/uploads/{token}`.
+**Deliberately not built yet** (later phases — do not add): **claim
+proposals**, which moved to Phase 5 deliberately rather than being forgotten —
+deciding that a sentence *is* a claim is a judgement call and belongs to the
+research agent in design §3, and splitting prose into sentences would fill the
+review queue with noise instead of knowledge, so ingestion proposes sources and
+structure and stops; the internal agent runtime and
 consolidation cycle, **Markdown Mirror** and any whole-graph export (the only
 export that exists is the thin per-node snapshot,
 `GET /api/export/node/{id}?depth=`, which is `get_neighborhood` with a
@@ -54,8 +72,8 @@ export that exists is the thin per-node snapshot,
 (`merge_nodes`, `retype`, `supersede_edge`, `bulk_relink`, `consolidate`),
 and the **dream-journal view**, which Phase 3 deferred to Phase 5 on purpose —
 it belongs with the consolidation cycle that gives it something to show. The
-schema reserves room for them (`space_id`, `merge_redirects`, `cycle_id`,
-`assets.extracted_text`); each lands as its own append-only migration.
+schema reserves room for them (`merge_redirects`, `cycle_id`); each lands as
+its own append-only migration.
 A node's `type` is likewise **fixed at creation by design**, not by omission:
 `service.update_node` takes `title`/`content`/`props` only, and retyping is a
 curative operation (§8.2 `retype`). Do not add a `type` field to
@@ -92,13 +110,31 @@ node for exactly this reason.
 - **`nodum.mcp_server`** — the MCP adapter (stdio, official Python SDK
   FastMCP), the **external-agent** surface. Registers the design §8.1 read +
   additive tiers and nothing else, each tool a thin delegate to a
-  service/search function. Annotations state each tool's **worst case**:
-  reads are `readOnlyHint`, the additive tools are `destructiveHint=False`
-  (they only ever add state, whatever grant the caller holds), and
-  `update_node` is `destructiveHint=True` because under an `edit` grant it
-  overwrites the node in place — MCP hosts auto-approve on that flag, so it
-  must not lie. Every write tool's description says what an `edit` grant
-  changes rather than promising `proposed`. Auth is the agent token in `NODUM_AGENT_TOKEN` —
+  service/search/ingest function. Phase 4 adds `ingest_file`, `ingest_url` and
+  `request_upload_url` (additive) plus `get_download_url` (read — where §8.1's
+  own table puts it), and `get_asset` now carries the **extracted text**
+  (capped at the `source` node's own cap, with the real length and a
+  truncation flag reported) and serves **`page:<n>` PDF rasters** beside
+  `preview`/`thumb`; an unknown profile is still refused and originals still
+  never cross this surface. Ingestion is **by reference** (§5.7 rule 2): the
+  tool takes a path the server can read or a URL it can fetch — an
+  `http`/`https` value routes to `ingest_url`, anything else is a local path —
+  and **no base64 ever crosses MCP**; a host sharing no filesystem with the
+  server asks `request_upload_url` for somewhere to PUT instead.
+  `get_download_url` is the design's one documented exception to "LLMs never
+  receive original binaries" (§5.7 rule 4): a single-use, minutes-long URL
+  built on `NODUM_PUBLIC_URL`, with the mint and the redemption both in the
+  event log. Annotations state each tool's **worst case**: reads are
+  `readOnlyHint` — `get_download_url` included, since it writes an expiring
+  capability row and an audit entry but no node, edge, or version — the
+  additive tools are `destructiveHint=False` (they only ever add state,
+  whatever grant the caller holds: every graph write ingestion makes is a
+  `create_node` / `create_edge`, so an `edit` grant's worst case is a subgraph
+  landing `active` instead of `proposed`, which is more state and not state
+  replaced), and `update_node` is `destructiveHint=True` because under an
+  `edit` grant it overwrites the node in place — MCP hosts auto-approve on
+  that flag, so it must not lie. Every write tool's description says what an
+  `edit` grant changes rather than promising `proposed`. Auth is the agent token in `NODUM_AGENT_TOKEN` —
   an `ndm_…` token minted by `nodum agent create` / `token-rotate`, shown
   once and stored hashed — carried in the environment, never a flag (a flag
   leaks into `ps` and shell history). At startup it is verified against the
@@ -164,6 +200,21 @@ node for exactly this reason.
   `rebuild_projector` (reset derived state, replay from event 0). The `fts`
   projector maintains `node_fts`; the `vec` projector maintains `chunks` +
   `node_vec` (rebuild = the model-change re-embed path, design D6). The
+  `fts` projector also joins `assets.extracted_text` into the index row —
+  **for `asset_ref` nodes only**, and that restriction is load-bearing, not
+  tidiness. Ingestion records `asset_hash` on the `source` node and on every
+  per-page `block` too, but those nodes already carry their own text: joining
+  on the prop alone gave every page of a document the *whole document's* text,
+  so a word on page 3 matched pages 1, 2 and 4 just as strongly, and the
+  `source` node got its text twice — in `content` and again here —
+  double-weighting it in BM25. The `asset_ref` node is the one whose own
+  `content` is empty, so without the join a PDF's text would be findable
+  through nothing at all. It is a read of *live* state inside an event replay,
+  deliberately: `assets` is not event-logged (there is nothing to undo about
+  content-addressed bytes), so text stored after a node was projected is not
+  indexed until that node is projected again or `projector rebuild fts` runs —
+  which is exactly why the pipeline calls `assets.set_extracted_text` **before**
+  it creates the `asset_ref` node. The
   service layer never calls projectors — the event log is the only coupling.
   A projector whose requirements are unmet (`vec` without a usable embedding
   provider) reports itself unavailable in `projector status` and its runs
@@ -188,7 +239,10 @@ node for exactly this reason.
   0009's unique index is already `(asset_hash, space_id)` over those nodes.
   Bytes nobody has described are visible to humans only — the right default for
   freshly registered bytes whose ingestion has not run. **Bytes live in the database, not on the
-  filesystem**: `assets` holds metadata, `asset_blobs` holds the bytes under
+  filesystem**: `assets` holds metadata (including the `extracted_text`
+  ingestion writes through `set_extracted_text`, which takes no principal and
+  logs no event — content-addressed base state, like registration itself),
+  `asset_blobs` holds the bytes under
   the same sha256 key, so the whole system is one file and disaster recovery
   is `DB = everything`. Registration is idempotent sha256 dedup with no
   event-log entry (there is nothing to undo), and streams through
@@ -202,10 +256,123 @@ node for exactly this reason.
   q75, `preview` ≤1024px WebP q80 with a 300 KB quality-stepping target) are
   keyed by `sha256(asset_hash + ':' + profile)`, generated lazily with Pillow
   on first request, stored as blobs, and evicted by `purge_renditions` (CLI
-  `asset purge`) — fully regenerable. Non-image assets are rejected cleanly;
-  `page:<n>` rasters are Phase 4. Pillow reads originals through
+  `asset purge`) — fully regenerable. Non-image assets are rejected cleanly for
+  those two profiles. **`page:<n>` is the third profile shape**
+  (`resolve_profile`): a 1-based page of a PDF rasterised by `pypdfium2` at
+  `PAGE_DPI` (144 — exactly 2× the PDF canvas unit, so a text page is legible
+  without a resample), then encoded down the *same* WebP path, so a page and a
+  photograph share their quality stepping, their id scheme, their cache, and
+  their eviction. `pypdfium2` won on licence: PyMuPDF renders at least as well
+  and is AGPL, which would reach anything embedding nodum, while PDFium ships
+  permissive wheels needing no system package. The import is lazy and the
+  dependency sits behind the `pdf` extra, so an install without it still serves
+  image renditions and answers a page request with an `UnsupportedRendition`
+  naming the extra rather than an `ImportError` at startup. A raster has no
+  image header to read, so its pixel budget is arithmetic (page geometry × the
+  DPI scale) — PDF permits a 200×200 inch page, which is 829 MP at 144 DPI.
+  Pillow reads originals through
   `_BlobReader`, which restores the file-style tolerant seeks that
   `sqlite3.Blob` refuses and Pillow's format probing depends on.
+- **`nodum.extract`** — MIME → text, through handlers that degrade instead of
+  failing. A registry shaped exactly like the embedding provider seam: each
+  handler declares the MIME families it claims and whether it can run, and
+  **an absent dependency is a returned `Extraction`, never an exception** —
+  `extract()` on a machine with no OCR still returns a result, so ingestion
+  still registers the asset, still writes the describing node, and says in
+  `detail` that no text came out. The same rule covers a broken input: a
+  corrupt PDF is a `detail` string, not a traceback climbing out of the
+  pipeline. Registry order is `text`, `html`, `pdf`, `image`, `audio` and the
+  first handler claiming the MIME wins; `text` claims `text/*` plus JSON but
+  stands aside for the two HTML types, which the next handler parses properly
+  (otherwise markup lands in the graph as literal tags). `text` and `html` are
+  stdlib-only and therefore **always available**, which is what makes the
+  pipeline end-to-end on a bare install; `pdf` (`pypdf`), `image`
+  (`pytesseract` *and* the tesseract binary — two conditions, reported apart,
+  because "install the extra" is the wrong advice for a missing binary) and
+  `audio` (`faster-whisper`) sit behind the `pdf`/`ocr`/`audio` extras and
+  report themselves unavailable until installed. `NODUM_AUDIO_MODEL` and
+  `NODUM_AUDIO_DOWNLOAD` mirror the embeddings posture exactly: without the
+  download flag faster-whisper is held to its local cache, so an uncached model
+  is an unavailable handler rather than a few hundred megabytes off the network
+  because someone ingested an `.mp3`. `video/*` is deliberately **unclaimed** —
+  pulling text out of one means demuxing with ffmpeg, a non-Python binary this
+  project does not otherwise need, to transcribe a file whose visual content is
+  usually the point. Every result is capped at `MAX_TEXT_CHARS` (2 M, ~600
+  pages) because the text becomes a database row, and a cap that bit is
+  reported in `detail` — truncation is never silent. Paginated formats also
+  return per-page text (`pages[n - 1]` is page *n*, empty pages kept so the
+  numbering holds), and pages are capped rather than the joined text so a
+  caller writing one block per page is never handed page text the capped `text`
+  dropped.
+- **`nodum.ingest`** — the pipeline (design §5.5–§5.7): bytes in, reviewable
+  subgraph out. `ingest_file`, `ingest_url`, `ingest_upload` all converge on
+  one path — register the asset, extract, then write an `asset_ref` node
+  (the description that makes the bytes reachable *in one space*), a `source`
+  node whose content is the extracted text, a `derived_from` edge from source
+  to bytes, and one `block` child per page that carries text. **Every graph
+  write goes through the public `nodum.service` API**: ingestion adds no
+  authority of its own, so a `suggest` grant gets the whole subgraph
+  `proposed` and an `edit` grant gets it live. Extracted text lives in **two**
+  places on purpose — the full text on `assets.extracted_text`, where the FTS
+  projector joins it and BM25 reaches every word, and a capped copy
+  (`SOURCE_CONTENT_CHARS`, marked when cut) as the `source` node's content,
+  which is what the vec projector chunks and embeds, since semantic search only
+  ever sees node text. One store would have cost one of the two signals.
+  **Idempotent per `(hash, space)`** — registration is content-addressed and
+  0009's unique index allows one live `asset_ref` per pair, so a re-run finds
+  the describing node instead of tripping the index, and a run interrupted
+  between the two node writes is repaired by running it again. Blank pages are
+  skipped (a scanned PDF with no OCR handler would otherwise propose a hundred
+  empty nodes) while the page number stays in props, so numbering is honestly
+  sparse rather than quietly renumbered, and `MAX_PAGE_BLOCKS` (100) stops a
+  900-page scan from becoming a 900-item review queue — the overflow is
+  reported through `pages_truncated`, never dropped silently. `ingest_url` is
+  `http`/`https` only, one bounded read with a timeout, redirects confined to
+  the same two schemes (urllib would otherwise follow one to `ftp:`); it does
+  **not** block loopback or private ranges, because the server is itself a
+  loopback service and its own test fixture is one — anything that can call it
+  already has the machine's network position, and that is stated rather than
+  half-defended. `ingest_upload` exists because the upload hatch would
+  otherwise dead-end: it re-mints the principal from the token row's
+  `created_by` (the account that authorised the upload, while it was still
+  authenticated), which is why it lives here and not in the HTTP adapter — that
+  adapter is structurally forbidden from minting an identity. A disabled
+  account fails there, so a capability cannot outlive its principal's
+  revocation. **Claim extraction is deliberately absent** (Phase 5).
+- **`nodum.urls`** — short-lived, single-use capability URLs (design §5.7
+  rule 4), the escape hatch for an agent host that shares no filesystem with
+  the graph: `mint_download` hands out a URL for an asset's original,
+  `mint_upload` a place to PUT bytes exactly once. They are escape hatches, so
+  both ends of both are event-logged (`asset.download_url`/`asset.upload_url`
+  on the mint, `asset.download`/`asset.upload` on the redemption) — audit
+  records only, which `service.undo` refuses by name, and **no payload ever
+  carries bytes or the secret**; a payload names the token's public id. **A
+  token is a capability, not a signature**: 256 bits from `secrets`, only its
+  sha-256 stored, the same treatment `nodum.auth` gives an agent token. An
+  HMAC-signed URL would move the authority into a key to generate, store,
+  rotate and keep out of every backup — and would still need a table the moment
+  anyone wanted a URL spent or revoked, because a signature is valid until it
+  expires and not one moment less. Here the row *is* the authority: expiry,
+  single use and revocation are one `UPDATE` on it. Single use is enforced by
+  **rowcount, not by reading first** — redemption is one
+  `UPDATE … WHERE used_at IS NULL AND expires_at > datetime('now')` and the
+  token is spent iff that matched a row, so two concurrent redemptions cannot
+  both win. **No Python clock is involved anywhere in the module**: every
+  timestamp is SQLite's `datetime('now')`, because the stored strings carry no
+  zone marker and a naive `datetime.now()` comparison would honour expired
+  tokens for the length of the host's UTC offset — and pass every test run in
+  UTC. TTL defaults to five minutes and is bounded at one hour; it is checked
+  when the request *starts*, so a slow transfer is never cut off by it.
+  `MAX_UPLOAD_BYTES` is deliberately equal to `http_api.MAX_REQUEST_BYTES` and
+  must never exceed it (a grant promising more than the server will read fails
+  halfway through the transfer); the value is duplicated rather than imported,
+  because a domain module has no business importing an adapter. `TokenInvalid`
+  is one class with one message for unknown, expired, spent, and wrong-kind —
+  telling them apart is free intelligence for whoever is guessing. Both mints
+  resolve their asset through `assets.get_asset`, so an asset the principal
+  cannot read answers *not found*; the upload dedup shortcut is scoped the same
+  way, since answering "that already exists" for anything else would turn the
+  endpoint into an existence oracle over every byte in the file.
 - **`nodum.search`** — the query path (design §7). BM25 over the `fts`
   projector's index and vector ANN over the `vec` projector's chunks
   (closest chunk per node wins), fused by reciprocal rank fusion (K=60) with
@@ -227,7 +394,7 @@ node for exactly this reason.
   a database whose only cure is deletion never gets a new (possibly
   irreversible) migration committed onto it first.
 - **`nodum.migrations`** — the append-only migration list (`0001_core` …
-  `0011_actor_strings`). Never edit a shipped migration; append a
+  `0012_url_tokens`). Never edit a shipped migration; append a
   new one. A migration must never leave data readable only through a store a
   later migration replaces: introduce a table where its bytes already belong
   (this is why asset bytes are part of `0007` and there is no `path` column
@@ -368,9 +535,11 @@ Phase-1 decision log.
   `traverse`, `subgraph <root-id>`, `suggest-links <prefix>`, `find-path`,
   `diff`, `projector run/status/rebuild`,
   `review queue/accept/reject/accept-all/reject-all`,
-  `asset register/get/list/rendition/purge` (`get`/`list`/`rendition` read
-  through the graph and so take `--as`; `register`/`purge` touch the blob
-  store alone),
+  `asset register/get/list/rendition/purge/download-url/upload-url`
+  (everything except `register`/`purge` reads through the graph and so takes
+  `--as`; those two touch the blob store alone),
+  `ingest file <path>… / url <url> / handlers` (`handlers` takes no `--as` —
+  it reports the install's extraction handlers, not the graph),
   `human create/list/passwd/disable/enable` (a password is at least
   `service.MIN_PASSWORD_LENGTH` characters, and the last enabled human cannot
   be disabled — no enabled human means no principal on any surface, including
@@ -421,6 +590,44 @@ Phase-1 decision log.
   inlined into the JSON (`--out <file>` is how you extract them); the MCP
   `get_asset` tool returns metadata + a WebP image block of the requested
   rendition — originals are never served over MCP (design §5.7).
+  `--profile` takes `thumb` or `preview` for an image asset and `page:<n>` for
+  a 1-based page of a PDF; a page raster is an ordinary rendition otherwise
+  (same lazy generation, same cache, same eviction by `asset purge`) and needs
+  the `pdf` extra, which it names rather than failing at import time.
+- **`ingest file` takes one or more paths, and a directory argument ingests the
+  files directly inside it** (`--recursive` walks deeper). Dot-names and
+  anything that is not a regular file are skipped, and the rest are ingested in
+  sorted order, so the same folder ingests the same way twice. One path naming
+  a *file* prints that ingestion as a single JSON object; anything else —
+  several paths, or a directory, whatever it happens to contain — is a batch
+  and prints `{"ingestions": [...], "count": n}`. `--name` and `--title`
+  describe one document and are refused for a batch; `--space` applies to all
+  of it.
+- **A batch never loses its successes.** Each file is ingested on its own; one
+  that fails prints the same one-line reason a single-file run would, followed
+  by `  skipped <path>`, and the batch carries on. Every file that landed is in
+  the envelope on stdout, printed before the exit code is decided. **The exit
+  code is 1 if any file failed**, so a non-zero exit from `ingest file` means
+  "read stderr for what is missing", not "nothing happened". Re-running the
+  same batch is safe: ingestion is idempotent per `(hash, space)`, so what
+  already landed comes back with `created: false` instead of being duplicated.
+- `ingest url` fetches `http`/`https` only, once, with a timeout and a size
+  ceiling, and refuses a redirect that leaves those two schemes. It does *not*
+  block loopback or private ranges — this is itself a loopback service — so
+  granting ingestion grants the server's network position.
+- `ingest handlers` is the answer to "my PDF produced no text": it lists every
+  extraction handler with its MIME families, `available`, and — when a handler
+  cannot run — a `detail` naming the extra to install. It needs no principal
+  and no database.
+- The two capability-URL commands are the escape hatch for a host that shares
+  no filesystem with the graph (design §5.7 rule 4). `asset download-url <id>`
+  and `asset upload-url --name --mime --size` mint a short-lived, single-use
+  URL, print the token **once** (only its sha256 is stored), and log both the
+  mint and the later redemption. `--ttl` is bounded (1 s to 1 h). An
+  `upload-url` whose `--sha256` this graph already holds answers with the
+  existing `asset` and **no** `grant` — the bytes are here, so no bytes move.
+  The URLs resolve against `nodum serve`; set `NODUM_PUBLIC_URL` when that
+  server is not on the default address.
 
 ## HTTP contract (for agents touching `nodum serve`)
 
@@ -429,9 +636,11 @@ Phase-1 decision log.
   Do not add an "actor"
   parameter, header, or override "for testing" — the MCP surface is where
   agent identity lives, and the inversion is the whole point.
-- Route handlers are thin delegates: one service/search/assets call each, no
-  behaviour the service lacks. Writes go through `_write(service.fn, …)`,
-  which is the only place the principal is bound for a write. **Never import a
+- Route handlers are thin delegates: one service/search/assets/ingest/urls call
+  each, no behaviour the domain lacks. Writes go through `_write(service.fn, …)`
+  — including `ingest.ingest_file`/`ingest_url` and `urls.mint_*`, which take a
+  `principal` like any service write —
+  and that is the only place the principal is bound for a write. **Never import a
   service function that takes a `principal` into `http_api`** — an alias hides
   it from every
   source-level check, and `test_no_write_service_function_is_reachable_under_
@@ -470,15 +679,67 @@ Phase-1 decision log.
   protects *reads*: after a rebind the attacker's page is same-origin by every
   other measure. Host names are compared without ports, which is what keeps the
   `make web-dev` proxy (`Host: localhost:5700`) working.
-- **The session gate is one rule: every `/api` route but `/api/login` needs a
-  valid session, reads included.** A single-human file has nothing an
+- **The session gate is one rule: every `/api` route `_needs_a_session` claims
+  needs a valid session, reads included.** A single-human file has nothing an
   anonymous caller should see, and one rule is the one no future endpoint can
   forget. The cookie is `HttpOnly; SameSite=Strict` over a server-side row
   with a 30-day sliding expiry; logout, expiry, and `human disable` all kill
   it at the next request (verification-time, no cache). Any local process can
   satisfy every origin check with three curl headers, so it may *attempt* a
   login — the human's password is the whole defence there, and the `serve`
-  banner says so.
+  banner says so. The predicate has exactly two exemptions — `/api/login`,
+  which *makes* sessions, and the two capability-URL routes below — and
+  `test_the_only_api_routes_outside_the_session_gate_are_login_and_the_
+  capability_urls` reads them off the live route table, so a third one cannot
+  arrive quietly. **Add an exemption to the predicate, never to a call site**:
+  the string used to be compared inline, and three inline comparisons is how a
+  gate and its exemption drift apart.
+- **The two capability-URL routes are the one thing here that is not a
+  session.** `GET /api/download/{token}` streams an asset's original bytes and
+  `PUT /api/uploads/{token}` stores a raw body; both are redeemed by an agent
+  host that has no filesystem in common with this server and no account here.
+  They sit outside the session gate **and** outside the origin/content-type
+  gate, and that is deliberate: those gates exist because a browser attaches
+  the session cookie by itself, which is what CSRF rides. A capability URL
+  carries no ambient credential — the single-use, minutes-long token in the
+  path *is* the authorisation, minted by `nodum.urls` against a principal the
+  session gate already checked — so a cross-origin page has nothing to ride,
+  and demanding `Content-Type: application/json` on a raw-bytes upload is
+  incoherent anyway. Both exemptions key on one predicate,
+  `_is_capability_path`, whose docstring carries the argument; read it before
+  touching either gate. **What is *not* exempt**: the `Host` check (rebinding
+  is about which server was reached, which a capability changes nothing about)
+  and the body ceiling (`urls.MAX_UPLOAD_BYTES` is deliberately equal to
+  `MAX_REQUEST_BYTES`, so a grant can never promise more than this server will
+  read). Neither route may call `_session_principal` — there is no session to
+  read, so it would raise — and neither writes to the graph; the redemption is
+  attributed inside `urls.consume`, to the token row's own `created_by`, which
+  is stored state rather than anything the request said.
+- **A downloaded original is served as `application/octet-stream`, never as
+  its stored MIME**, with `nosniff`, `attachment`, `no-store` and a filename
+  built from the content hash. Serving a stranger's `text/html` back from this
+  origin — the origin that may write to this API — is stored XSS, and
+  `CONTENT_SECURITY_POLICY` does not reach this route (it is set by the static
+  handler). The bytes stream out of the blob in 1 MiB chunks; never read an
+  original into memory to send it.
+- **`PUT /api/uploads/{token}` registers bytes and stops there.** Registration
+  is content-addressed base state and needs no identity, which is why it can
+  happen without a session at all. The `asset_ref`/`source`/`derived_from`
+  subgraph is a *graph* write, needs a live principal with a grant on the
+  space, and this request has none — so freshly uploaded bytes have no
+  describing node until someone ingests them behind a session, which Phase 4's
+  plan calls the correct default for an ingestion that has not finished.
+  Closing that gap belongs in the domain layer, where the token row's
+  principal can legitimately be loaded; it must not be closed by an adapter
+  inventing a principal.
+- **`POST /api/ingest` takes exactly one of `path` and `url`** (plus optional
+  `name`/`space`/`title`); both or neither is a 400 rather than a precedence
+  rule nobody remembers. Note what it hands the session's human, deliberately:
+  `path` is read *by the server*, so it reaches any file the server's user
+  can, and `url` is fetched *by the server*, which `nodum.ingest` states
+  blocks neither loopback nor private ranges. Both are properties of a
+  human-only surface behind a password — which is exactly why this route is
+  inside the session gate and the two token routes are not.
 - **Account and grant administration is on the API too.** `GET /api/me`
   returns the session's human; `/api/humans`, `/api/agents` and `/api/grants`
   mirror the CLI's `human`/`agent`/`grant`/`revoke`/`grants` commands — thin
@@ -523,8 +784,13 @@ Phase-1 decision log.
   204 otherwise — never an HTML document under a 200, which a client asking for
   an image has no way to detect. Any other path a browser requests on its own
   belongs in that same exemption list, not in the catch-all.
-- Asset originals are never served — only `thumb`/`preview` renditions, as
-  WebP bytes at `/api/assets/{id}/rendition/{profile}` (design §5.7).
+- Renditions are WebP bytes at `/api/assets/{id}/rendition/{profile}`, where
+  `{profile}` is `thumb`, `preview`, or `page:<n>` for a PDF page raster — the
+  colon needs no routing change, since Starlette's default path convertor is
+  `[^/]+` (asserted end to end, because a colon is the kind of character a
+  router or a proxy can decide is special). Originals are served on **one**
+  route only, `GET /api/download/{token}`, and only against a capability URL
+  minted through `POST /api/assets/{id}/download-url` (design §5.7).
 
 ## Frontend contract (for agents touching `web/`)
 

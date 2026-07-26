@@ -28,7 +28,13 @@ every write is attributed to the session's human and no request field can say
 otherwise — and serves the **web UI** from the same process: a login view,
 an accounts-and-grants admin view, a Markdown editor, hybrid
 search, the review queue, a graph view, an asset browser,
-and per-node version history. Still to come: the ingestion pipeline and the
+and per-node version history. **Phase 4 (ingestion)** landed: `nodum ingest`
+turns a file, a folder, or a URL into a reviewable subgraph — text extraction
+through optional per-format handlers (PDF, OCR, audio; a missing one is
+reported, never fatal), an `asset_ref` node for the bytes, a `source` node
+carrying the extracted text, and one block per page — plus `page:<n>` PDF page
+rasters and short-lived, single-use capability URLs for hosts that share no
+filesystem with the graph. Still to come: claim proposals and the
 consolidation cycle.
 
 ## Install
@@ -44,7 +50,10 @@ nodum schema-dump      # the whole command surface, as JSON
 
 The local embedding model is an optional extra
 (`pipx install 'nodum[embeddings]'`); without it, search falls back to BM25
-keyword ranking.
+keyword ranking. The extraction handlers are extras too — `pdf` (PDF text plus
+`page:<n>` rasters), `ocr` (which also needs the `tesseract` binary on PATH),
+and `audio` — and `nodum ingest handlers` reports which of them this install
+can actually run. Plain text, Markdown, JSON, and HTML need no extra at all.
 
 > The web UI (`nodum serve`) ships from v0.2.1 onward. **v0.1.0 and v0.2.0
 > serve an "UI not built" placeholder** — their CLI, HTTP API, and MCP server
@@ -109,8 +118,23 @@ uv run nodum suggest-links "Grap" --limit 20 --as owner
 
 # Assets: register a file into the database, derive stored WebP renditions
 uv run nodum asset register ./photo.jpg
-uv run nodum asset rendition <hash> --profile preview --out preview.webp
+uv run nodum asset rendition <hash> --profile preview --out preview.webp --as owner
+uv run nodum asset rendition <hash> --profile page:2 --out page2.webp --as owner
 uv run nodum asset purge                      # evict the stored renditions
+
+# Ingestion: a file, a whole folder, or a URL becomes a reviewable subgraph —
+# an asset_ref node for the bytes, a source node holding the extracted text,
+# a derived_from edge, and one block per page.
+uv run nodum ingest handlers                  # which formats this install can read
+uv run nodum ingest file ./paper.pdf --as owner
+uv run nodum ingest file ~/papers --recursive --as owner   # batch: {"ingestions": […]}
+uv run nodum ingest url https://example.com/paper.pdf --as owner
+
+# Capability URLs for a host with no filesystem in common with the graph:
+# single-use, minutes-long, and both the mint and the redemption are logged.
+uv run nodum asset download-url <hash> --as owner
+uv run nodum asset upload-url --name scan.pdf --mime application/pdf \
+    --size 120000 --as owner
 
 # MCP server (stdio) for external agents — read + additive tiers only, no
 # review tools, no curative tools. The agent authenticates with its token in
@@ -201,8 +225,12 @@ degrades to BM25 + graph expansion. `NODUM_EMBED_MODEL` switches the model
   hashed) and is verified at startup; every write is confined to its grants.
   The registry is the design §8.1 read tier (`get_node`, `get_children`,
   `search`, `traverse`, `list_types`, `get_schema`, `find_path`, `history`,
-  `diff`, `get_asset`) and additive tier (`create_node`, `update_node`, `link`,
-  `propose_edges`). That is the entire registry: the review tools
+  `diff`, `get_asset`, `get_download_url`) and additive tier (`create_node`,
+  `update_node`, `link`, `propose_edges`, `ingest_file`, `ingest_url`,
+  `request_upload_url`). Ingestion is **by reference** — the tool takes a path
+  the server can read or a URL it can fetch, and no base64 ever crosses MCP; a
+  host with no filesystem in common asks `request_upload_url` for somewhere to
+  PUT instead. That is the entire registry: the review tools
   (`accept`/`reject`) and the curative tools (`merge_nodes`, `retype`, …) are
   **never registered** — structural enforcement of §8.1/§8.2.
 - **HTTP API + web UI.** `nodum serve` runs one process that answers the JSON
@@ -240,11 +268,23 @@ degrades to BM25 + graph expansion. `NODUM_EMBED_MODEL` switches the model
   `/api/humans`, `/api/agents` (the show-once token comes back in the
   create/token-rotate body) and `/api/grants` mirror the CLI's
   `human`/`agent`/`grant`/`revoke`/`grants` commands.
-- **Uploads are images only, and bounded.** `POST /api/assets` caps the request
+- **Uploads are images only, and bounded.** `POST /api/assets` — the editor's
+  drag-drop route — caps the request
   body before anything buffers it (32 MiB), identifies the type from the bytes
   rather than the filename, and refuses an image whose pixel count would make
   decoding it expensive. There is no delete route, so what lands stays until the
-  file is managed out of band.
+  file is managed out of band. `PUT /api/uploads/{token}` is the other way in
+  and takes any format, because it is not anonymous: it spends a capability
+  minted by an authenticated human, is capped by that grant's own declared size
+  as it streams, and ingests under the principal who authorised it.
+- **Ingesting over HTTP.** `POST /api/ingest` takes exactly one of `path` and
+  `url` (both or neither is a 400 rather than a precedence rule nobody
+  remembers). Note what it hands the session's human: `path` is read *by the
+  server*, so it reaches any file the server's user can, and `url` is fetched
+  by the server, which blocks neither loopback nor private ranges. Both are
+  properties of a human-only surface behind a password, which is exactly why
+  this route sits inside the session gate while the two capability-URL routes
+  do not — those carry no ambient credential to ride.
 - **The eight views.** `/login` is the session gate: password login with
   argon2id. `/editor` is a CodeMirror-6 Markdown editor with slash commands,
   `[[` autocomplete, live Mermaid preview, drag-drop asset upload, and
@@ -271,7 +311,43 @@ degrades to BM25 + graph expansion. `NODUM_EMBED_MODEL` switches the model
   directory beside it, so **the database file is the whole system**: back it
   up and you have backed up the graph, its history, and its binaries. Over
   MCP, `get_asset` returns metadata plus a rendition image block: **LLMs never
-  receive original binaries** (design §5.7).
+  receive original binaries** (design §5.7). `--profile page:<n>` rasterises a
+  1-based page of a PDF at 144 DPI — an ordinary rendition otherwise, with the
+  same lazy generation, cache, and eviction — which is how an agent *looks at*
+  a document whose layout, tables, or figures carry the meaning.
+- **Ingestion turns bytes into a reviewable subgraph.** `nodum ingest file`
+  takes one or more paths — a directory ingests the files inside it,
+  `--recursive` goes deeper — and `nodum ingest url` fetches an `http`/`https`
+  URL and does the same. Each document becomes an asset, an `asset_ref` node
+  describing those bytes in one space, a `source` node whose content is the
+  extracted text, a `derived_from` edge between them, and one `block` child per
+  page of text. Every write goes through the ordinary service API, so the
+  subgraph lands in the state the writer's grant earns. Ingestion is
+  **idempotent per (hash, space)**: re-running the same folder returns
+  `created: false` rather than a second copy, so a batch that failed halfway is
+  simply run again. A batch never loses its successes — a file that fails
+  prints its reason to stderr and the rest carry on — but the exit code is 1 if
+  any file failed, so a non-zero exit means "read stderr for what is missing",
+  not "nothing happened".
+- **Extraction handlers degrade instead of failing.** Text, Markdown, JSON, and
+  HTML are handled by the standard library and always work. PDF text
+  (`pdf` extra), image OCR (`ocr`, which also needs the `tesseract` binary),
+  and audio transcription (`audio`) are optional, and an absent one is a
+  *reported result*, not an error: the asset is still registered, the nodes are
+  still written, and the answer says plainly that no text came out. A corrupt
+  file is treated the same way. `nodum ingest handlers` lists every handler,
+  its MIME families, and — when it cannot run — what to install. Nothing is
+  ever downloaded implicitly: as with the embedding model, the transcription
+  model is confined to its local cache unless `NODUM_AUDIO_DOWNLOAD=1` says
+  otherwise.
+- **Capability URLs are the escape hatch, and they are logged.** An agent host
+  that shares no filesystem with the graph can ask for a single-use,
+  minutes-long URL to fetch an asset's original (`asset download-url`) or to
+  PUT bytes exactly once (`asset upload-url`). The token is 256 random bits
+  shown once and stored only as a sha-256, the row is the whole authority — so
+  expiry, single use, and revocation are one update — and both the mint and the
+  redemption are written to the event log. A download URL never widens the
+  caller's reach: an asset they cannot read mints nothing.
 - **Bounded reads for interactive clients.** `nodum subgraph` is `traverse`
   with the filters a graph view needs — edge type, edge state, confidence
   floor, edge author, node type — composed as one conjunction in SQL, plus a
@@ -299,8 +375,10 @@ degrades to BM25 + graph expansion. `NODUM_EMBED_MODEL` switches the model
   message instead of half-done.
 - **Derived indexes are projectors.** The event log feeds checkpointed,
   independently rebuildable projectors (`nodum projector run/status/rebuild`).
-  `fts` maintains an FTS5 index over node title + content (+ extracted asset
-  text once assets land); `vec` maintains sqlite-vec embeddings of
+  `fts` maintains an FTS5 index over node title + content, joining an
+  ingested asset's full extracted text onto the `asset_ref` node that stands
+  for its bytes — and onto that node only, so a word on page 3 does not match
+  every other page just as strongly; `vec` maintains sqlite-vec embeddings of
   fixed-window text chunks (512 words, ~15% overlap, `model_id` recorded per
   chunk). `nodum search` fuses both — BM25 and vector lists merged by
   reciprocal rank fusion, then one-hop graph expansion along `active` edges —

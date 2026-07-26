@@ -64,7 +64,9 @@ search fuses BM25 and vector results by reciprocal rank fusion, then re-ranks
 by graph expansion.
 
 The embedding model is an optional extra; without it, search falls back to
-BM25 keyword ranking.
+BM25 keyword ranking. An ingested document's full extracted text is joined onto
+the `asset_ref` node that stands for its bytes, so BM25 reaches every word of a
+long PDF while its per-page blocks keep their own precision.
 
 ## Status
 
@@ -84,4 +86,12 @@ field can say otherwise — and serves the web UI from the same process: a Markd
 editor, hybrid search, the review queue, a graph view, an asset browser, an
 accounts-and-grants admin view, and per-node version history.
 
-Still to come: the ingestion pipeline and the consolidation cycle.
+**Phase 4 (ingestion)** landed: `nodum ingest` turns a file, a folder, or a URL
+into a reviewable subgraph — an `asset_ref` node for the bytes, a `source` node
+holding the extracted text, and one block per page. Text extraction runs
+through optional per-format handlers (PDF, image OCR, audio), and a missing one
+is reported rather than fatal. Also: `page:<n>` PDF page rasters, and
+short-lived, single-use capability URLs for agent hosts that share no
+filesystem with the graph.
+
+Still to come: claim proposals and the consolidation cycle.

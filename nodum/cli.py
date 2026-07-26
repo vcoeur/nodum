@@ -20,7 +20,7 @@ from pathlib import Path
 import typer
 from pydantic import BaseModel
 
-from nodum import __version__, assets, db, projectors, service
+from nodum import __version__, assets, db, extract, ingest, projectors, service, urls
 from nodum import search as search_module
 from nodum.assets import AssetNotFound, AssetSourceChanged, AssetTooLarge, UnsupportedRendition
 from nodum.cli_schema import build_cli_schema
@@ -57,6 +57,9 @@ mcp_app = typer.Typer(
 asset_app = typer.Typer(
     no_args_is_help=True, help="Content-addressed assets and derived image renditions."
 )
+ingest_app = typer.Typer(
+    no_args_is_help=True, help="Ingestion: files and URLs in, reviewable subgraphs out."
+)
 app.add_typer(node_app, name="node")
 app.add_typer(edge_app, name="edge")
 app.add_typer(projector_app, name="projector")
@@ -65,6 +68,7 @@ app.add_typer(human_app, name="human")
 app.add_typer(agent_app, name="agent")
 app.add_typer(mcp_app, name="mcp")
 app.add_typer(asset_app, name="asset")
+app.add_typer(ingest_app, name="ingest")
 
 
 @app.callback(invoke_without_command=True)
@@ -148,12 +152,18 @@ def _run(func, *args, **kwargs):
     file, a database another writer is holding — is a message on stderr and
     exit 1, never a traceback: the CLI's contract is one JSON object on
     success and a readable line on failure.
+
+    The except clauses are the literal list on purpose: ``test_http_api``
+    AST-parses them to prove the HTTP surface maps every one of them, so
+    hoisting them into a named tuple would silently retire that check.
     """
     try:
         return func(*args, **kwargs)
     except (
         # RecordNotFound covers node/edge/version ids and the transition
-        # entry points that accept all three.
+        # entry points that accept all three. `ingest.IngestError` and
+        # `urls.TokenInvalid` are ValueError subclasses and so are already
+        # here — naming them again would be noise, not coverage.
         RecordNotFound,
         TypeNotFound,
         EventNotFound,
@@ -661,7 +671,12 @@ def asset_list(as_human: str = AS_OPTION) -> None:
 @asset_app.command("rendition")
 def asset_rendition(
     id_or_hash: str = typer.Argument(..., help="Asset hash or asset-reference node id."),
-    profile: str = typer.Option("preview", "--profile", "-p", help="'thumb' or 'preview'."),
+    profile: str = typer.Option(
+        "preview",
+        "--profile",
+        "-p",
+        help="'thumb' or 'preview' for an image, or 'page:<n>' for a 1-based page of a PDF.",
+    ),
     out: str | None = typer.Option(
         None, "--out", "-o", help="Also write the WebP bytes to this path."
     ),
@@ -671,6 +686,11 @@ def asset_rendition(
 
     Prints the rendition metadata; image bytes stay in the database and are
     never inlined into the JSON output — use ``--out`` to extract them.
+
+    ``page:<n>`` rasterises page *n* of a PDF and is an ordinary rendition
+    otherwise: same lazy generation, same cache, same eviction by
+    ``asset purge``. It needs the ``pdf`` extra; without it the request is
+    refused by name rather than failing at import time.
     """
     rendition = _run(
         assets.get_rendition, id_or_hash, profile=profile, principal=_principal(as_human)
@@ -678,6 +698,79 @@ def asset_rendition(
     if out is not None:
         _run(assets.copy_rendition, rendition, out)
     _emit(rendition)
+
+
+@asset_app.command("download-url")
+def asset_download_url(
+    id_or_hash: str = typer.Argument(..., help="Asset hash or asset-reference node id."),
+    ttl: int = typer.Option(
+        urls.DEFAULT_TTL_SECONDS,
+        "--ttl",
+        help=f"Lifetime in seconds (1 to {urls.MAX_TTL_SECONDS}).",
+    ),
+    as_human: str = AS_OPTION,
+) -> None:
+    """Mint a short-lived, single-use URL for an asset's original bytes.
+
+    The escape hatch for a host that shares no filesystem with the graph. The
+    token is printed once and only its sha256 is stored, the URL is spent by
+    the first request that redeems it, and both the mint and the redemption are
+    event-logged. An asset this human cannot reach answers *not found* and
+    nothing is minted.
+
+    The URL points at ``nodum serve``, which has to be running for it to
+    resolve; set ``NODUM_PUBLIC_URL`` when that server is not on the default
+    address.
+    """
+    _emit(
+        _run(
+            urls.mint_download,
+            id_or_hash,
+            ttl_seconds=ttl,
+            principal=_principal(as_human),
+        )
+    )
+
+
+@asset_app.command("upload-url")
+def asset_upload_url(
+    name: str = typer.Option(..., "--name", help="Original name the bytes will arrive under."),
+    mime: str = typer.Option(..., "--mime", help="Declared content type of the bytes."),
+    size: int = typer.Option(
+        ..., "--size", help=f"Declared size in bytes (at most {urls.MAX_UPLOAD_BYTES})."
+    ),
+    sha256: str | None = typer.Option(
+        None, "--sha256", help="Declared content hash (lowercase hex) — enables the dedup skip."
+    ),
+    space: str | None = typer.Option(
+        None, "--space", help="Space the describing node lands in (default: the 'main' space)."
+    ),
+    ttl: int = typer.Option(
+        urls.DEFAULT_TTL_SECONDS,
+        "--ttl",
+        help=f"Lifetime in seconds (1 to {urls.MAX_TTL_SECONDS}).",
+    ),
+    as_human: str = AS_OPTION,
+) -> None:
+    """Mint a short-lived, single-use URL to PUT one file to.
+
+    A ``--sha256`` this graph already holds is answered with the existing
+    ``asset`` and **no** ``grant`` — the bytes are here, so no bytes move.
+    Exactly one of the two is ever filled. The grant's ``max_bytes`` is the
+    ``--size`` declared here, and the upload route enforces it.
+    """
+    _emit(
+        _run(
+            urls.mint_upload,
+            name,
+            mime,
+            size,
+            sha256=sha256,
+            space=space,
+            ttl_seconds=ttl,
+            principal=_principal(as_human),
+        )
+    )
 
 
 @asset_app.command("purge")
@@ -688,6 +781,168 @@ def asset_purge(
 ) -> None:
     """Evict stored renditions (regenerable — they rebuild on next request)."""
     _emit(_run(assets.purge_renditions, asset_hash=asset))
+
+
+# ── Ingestion ─────────────────────────────────────────────────────────────────
+
+
+def _files_in(directory: Path, *, recursive: bool) -> list[Path]:
+    """Return the regular files inside ``directory``, sorted, dotfiles skipped.
+
+    Sorted so the same folder ingests in the same order twice, and dot-names
+    are skipped whole: a folder of PDFs is not an invitation to ingest its
+    ``.DS_Store`` or to walk into its ``.git``.
+    """
+    found: list[Path] = []
+    for entry in sorted(directory.iterdir()):
+        if entry.name.startswith("."):
+            continue
+        if entry.is_dir():
+            if recursive:
+                found.extend(_files_in(entry, recursive=True))
+        elif entry.is_file():
+            found.append(entry)
+    return found
+
+
+def _ingest_sources(paths: Sequence[str], *, recursive: bool) -> list[Path]:
+    """Expand the path arguments into the files a batch will ingest, in order."""
+    found: list[Path] = []
+    for raw in paths:
+        candidate = Path(raw).expanduser()
+        if candidate.is_dir():
+            found.extend(_files_in(candidate, recursive=recursive))
+        else:
+            # Not a directory: pass it through as given, so a missing or
+            # unreadable path reports itself in `ingest_file`'s own words
+            # rather than being silently dropped by this expansion.
+            found.append(candidate)
+    return found
+
+
+@ingest_app.command("file")
+def ingest_file(
+    paths: list[str] = typer.Argument(
+        ..., help="Files to ingest; a directory ingests the files directly inside it."
+    ),
+    name: str | None = typer.Option(
+        None, "--name", help="Original name to record (default: the file's own) — one file only."
+    ),
+    space: str | None = typer.Option(
+        None, "--space", help="Target space id or name (default: the 'main' space)."
+    ),
+    title: str | None = typer.Option(
+        None, "--title", help="Title for the source node (default: --name) — one file only."
+    ),
+    recursive: bool = typer.Option(
+        False, "--recursive", "-r", help="Descend into subdirectories of a directory argument."
+    ),
+    as_human: str = AS_OPTION,
+) -> None:
+    """Ingest local files: register the bytes, extract text, describe, propose.
+
+    One path naming a file prints that ingestion as a single JSON object.
+    Anything else — several paths, or a directory — is a batch and prints
+    `{"ingestions": [...], "count": n}`; `--name` and `--title` describe one
+    document and are refused there. A directory contributes the files directly
+    inside it and `--recursive` the ones below it too, skipping dot-names and
+    anything that is not a regular file, in sorted order.
+
+    A batch never loses its successes: each file is ingested on its own, a file
+    that fails prints its reason and then `  skipped <path>` on stderr and the
+    batch carries on, and every file that landed is in the envelope on stdout.
+    **The exit code is 1 if any file failed** — so a non-zero exit here means
+    "read stderr for what is missing", not "nothing happened". Re-running is
+    safe: ingestion is idempotent, so the files that already landed are found
+    rather than duplicated.
+    """
+    principal = _principal(as_human)
+    if len(paths) == 1 and not Path(paths[0]).expanduser().is_dir():
+        _emit(
+            _run(
+                ingest.ingest_file,
+                paths[0],
+                name=name,
+                space=space,
+                title=title,
+                principal=principal,
+            )
+        )
+        return
+
+    if name is not None or title is not None:
+        typer.echo(
+            "--name and --title describe one document; drop them to ingest several files",
+            err=True,
+        )
+        raise typer.Exit(1)
+    sources = _ingest_sources(paths, recursive=recursive)
+    if not sources:
+        typer.echo(f"no files to ingest in {', '.join(paths)}", err=True)
+        raise typer.Exit(1)
+
+    ingested: list = []
+    failures = 0
+    for source in sources:
+        try:
+            ingested.append(_run(ingest.ingest_file, source, space=space, principal=principal))
+        except typer.Exit:
+            # Reported through `_run`, so a batch and a single-file run explain
+            # a failure in identical words; a batch then names the file the
+            # explanation belongs to and carries on, since "not a file" alone
+            # does not say which of twenty it was.
+            failures += 1
+            typer.echo(f"  skipped {source}", err=True)
+    # Printed before the exit code is decided: the successes are the point of
+    # not aborting, and a caller must be able to read them off stdout whether
+    # or not a sibling file failed.
+    _emit_list("ingestions", ingested)
+    if failures:
+        raise typer.Exit(1)
+
+
+@ingest_app.command("url")
+def ingest_url(
+    url: str = typer.Argument(..., help="An http or https URL to fetch and ingest."),
+    name: str | None = typer.Option(
+        None, "--name", help="Original name to record (default: the URL's own filename)."
+    ),
+    space: str | None = typer.Option(
+        None, "--space", help="Target space id or name (default: the 'main' space)."
+    ),
+    title: str | None = typer.Option(None, "--title", help="Title for the source node."),
+    as_human: str = AS_OPTION,
+) -> None:
+    """Fetch a URL into the blob store and ingest it exactly like a local file.
+
+    `http` and `https` only, one bounded read with a timeout, and a redirect
+    that leaves those two schemes is refused. The URL is recorded on both
+    written nodes as provenance. Loopback and private addresses are *not*
+    blocked — this is itself a loopback service — so granting ingestion grants
+    the server's network position.
+    """
+    _emit(
+        _run(
+            ingest.ingest_url,
+            url,
+            name=name,
+            space=space,
+            title=title,
+            principal=_principal(as_human),
+        )
+    )
+
+
+@ingest_app.command("handlers")
+def ingest_handlers() -> None:
+    """List every extraction handler, its MIME families, and whether it can run.
+
+    This is where "my PDF produced no text" gets its answer: a handler whose
+    optional dependency is absent reports `available: false` with a `detail`
+    naming the extra to install. No `--as` — availability is a property of this
+    install, not of the graph.
+    """
+    _emit_list("handlers", _run(extract.availability))
 
 
 # ── MCP server ────────────────────────────────────────────────────────────────

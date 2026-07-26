@@ -188,6 +188,30 @@ def test_a_node_carrying_an_asset_hash_indexes_that_assets_text(fresh_db, tmp_pa
     assert _fts_rows(fresh_db)[node.id] == ("Paper", "")
 
 
+def test_only_an_asset_ref_node_gets_the_join(fresh_db, tmp_path):
+    """Ingestion records `asset_hash` on the source node and on every per-page
+    block as well — provenance, and what lets a page id resolve to a raster.
+    Joining on the prop alone therefore gave every page of a document the whole
+    document's text, so a word from one page matched all of them equally."""
+    asset = _register_bytes(tmp_path, "paper.pdf")
+    assets.set_extracted_text(asset.hash, "the quokka is a small macropod")
+    describing = service.create_node(
+        type="asset_ref", props={"asset_hash": asset.hash}, principal=owner()
+    )
+    page = service.create_node(
+        type="block",
+        title="Page 1",
+        content="its own page text",
+        props={"asset_hash": asset.hash, "page": 1},
+        principal=owner(),
+    )
+    projectors.run_projectors()
+
+    indexed = _fts_extracted(fresh_db)
+    assert indexed[describing.id] == "the quokka is a small macropod"
+    assert indexed[page.id] == ""
+
+
 def test_a_word_only_in_the_extracted_text_finds_the_node(fresh_db, tmp_path):
     """The point of the join: an asset's body text is searchable through its node.
 

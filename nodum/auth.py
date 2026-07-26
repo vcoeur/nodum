@@ -69,6 +69,47 @@ def _connect(path: str | Path | None) -> sqlite3.Connection:
     return conn
 
 
+def principal_from_actor(actor: str, *, path: str | Path | None = None) -> Principal:
+    """Re-mint the principal an actor string names — **from stored state only**.
+
+    A capability URL carries no ambient credential: whoever holds the token
+    presents nothing else. So when an upload is redeemed and the bytes have to
+    be ingested as somebody, the only truthful answer is the principal who
+    *authorised* the capability, recorded on the token row's ``created_by`` at
+    mint time — by which point they had already authenticated.
+
+    **The argument must come from a database column, never from a request.**
+    An actor string taken off the wire and passed here would be an identity
+    supplied by the caller, which is the one thing every surface in this system
+    refuses. It stays in :mod:`nodum.auth` for that reason: principals are
+    minted here and nowhere else, so this rule has exactly one place to live
+    and one place to be audited. The HTTP adapter never calls it (an AST
+    property in ``tests/test_http_api.py`` keeps it that way) — the domain does,
+    on a row it just read.
+
+    Args:
+        actor: A stored actor string — ``human:<id>`` or ``agent:<id>``.
+        path: Explicit database path.
+
+    Returns:
+        The principal, with an agent's grant set loaded.
+
+    Raises:
+        UnknownPrincipal: If the string is malformed or names no account.
+        PrincipalDisabled: If the account is disabled — revocation applies
+            here exactly as it does at the front door, so a capability minted
+            before an agent was disabled cannot outlive it.
+    """
+    kind, separator, account_id = actor.partition(":")
+    if not separator or not account_id:
+        raise UnknownPrincipal(f"not an actor string: {actor!r}")
+    if kind == "human":
+        return owner_principal(account_id, path=path)
+    if kind == "agent":
+        return agent_principal(account_id, path=path)
+    raise UnknownPrincipal(f"unknown actor kind: {kind!r}")
+
+
 def owner_principal(
     human_id: str = DEFAULT_HUMAN_ID, *, path: str | Path | None = None
 ) -> Principal:

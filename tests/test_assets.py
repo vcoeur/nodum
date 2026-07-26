@@ -469,16 +469,34 @@ def test_archiving_the_last_description_takes_the_asset_out_of_reach(fresh_db, t
         assets.get_asset(asset.hash, principal=reader)
 
 
-def test_a_proposed_description_does_not_grant_reach_yet(fresh_db, tmp_path):
-    """Only an *active* describing node counts — a proposal is not yet structure."""
+def test_a_proposed_description_grants_reach_like_any_other_readable_node(fresh_db, tmp_path):
+    """A proposed node is readable everywhere else in this system — search
+    filters it out at query time, reads do not hide it — so an asset must not
+    be the one thing with a stricter rule than the node describing it. It is
+    also what lets a `suggest` agent re-read the bytes it just ingested."""
     asset = _register_image(fresh_db, tmp_path)
     proposer = agent("proposer", grants={"meta": "read", "main": "suggest"})
     node = _describe(asset, principal=proposer)
     assert node.state == "proposed"
 
-    assert assets.list_assets(principal=proposer) == []
+    assert [row.hash for row in assets.list_assets(principal=proposer)] == [asset.hash]
+    assert assets.get_asset(asset.hash, principal=proposer).hash == asset.hash
+
+    # Accepting changes nothing about reach — it was already reachable.
     service.transition(node.id, "accept", principal=owner())
     assert [row.hash for row in assets.list_assets(principal=proposer)] == [asset.hash]
+
+
+def test_an_archived_description_stops_granting_reach(fresh_db, tmp_path):
+    """Archived is the state that revokes reach, and the only one."""
+    asset = _register_image(fresh_db, tmp_path)
+    reader = agent("archiver", grants={"meta": "read", "main": "edit"})
+    node = _describe(asset, principal=reader)
+    assert [row.hash for row in assets.list_assets(principal=reader)] == [asset.hash]
+
+    service.transition(node.id, "archive", principal=owner())
+
+    assert assets.list_assets(principal=reader) == []
 
 
 def test_an_asset_ref_node_in_an_unreadable_space_does_not_resolve(fresh_db, tmp_path):

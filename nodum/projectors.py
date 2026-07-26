@@ -26,6 +26,11 @@ import sqlite_vec
 from nodum import db, embeddings
 from nodum.models import ProjectorRun, ProjectorStatus
 
+#: The node type whose FTS row carries its asset's extracted text. Spelled here
+#: rather than imported from :mod:`nodum.ingest`: a projector is derived state
+#: over the event log and must not depend on the pipeline that produced it.
+ASSET_REF_TYPE = "asset_ref"
+
 
 class Projector:
     """Base class for derived-state consumers of the event log.
@@ -127,12 +132,21 @@ class FtsProjector(Projector):
         )
 
     def _extracted_text(self, conn: sqlite3.Connection, node: dict[str, Any]) -> str:
-        """The extracted text of the asset a node describes, or ``""``.
+        """The extracted text of the asset an ``asset_ref`` node describes, or ``""``.
 
-        A node carrying an ``asset_hash`` prop contributes that asset's
-        ``assets.extracted_text`` to its own FTS row, which is how the full
-        text of a PDF becomes findable through the node that stands for it —
-        the node's own ``content`` only ever holds a capped excerpt.
+        The ``asset_ref`` node is the one that *stands for* the bytes: its own
+        ``content`` is empty, so without this join the full text of a PDF would
+        be findable through nothing at all.
+
+        **Only that node type gets it**, and the restriction is load-bearing
+        rather than tidiness. Ingestion also records ``asset_hash`` on the
+        ``source`` node and on every per-page ``block`` — useful provenance,
+        and what lets a page's id resolve to a ``page:<n>`` raster — but those
+        nodes already carry their own text. Joining on the prop alone gave
+        every page of a document the *whole document's* text, so searching a
+        word that appears on page 3 returned pages 1, 2 and 4 just as strongly
+        and destroyed per-page precision; the ``source`` node got the same text
+        twice, in ``content`` and here, double-weighting it in BM25.
 
         **This read is of live state inside an event replay, and deliberately
         so.** ``assets`` is not event-logged (there is nothing to undo about
@@ -150,6 +164,8 @@ class FtsProjector(Projector):
         referencing a hash that was never registered simply contributes
         nothing.
         """
+        if node.get("type_id") != ASSET_REF_TYPE:
+            return ""
         props = node.get("props")
         if isinstance(props, str):
             try:

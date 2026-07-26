@@ -48,15 +48,17 @@ here rather than half-defended.
 from __future__ import annotations
 
 import mimetypes
+import sqlite3
 import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Mapping
 from email.message import Message
 from pathlib import Path
 from typing import Any
 
-from nodum import assets, extract, service
+from nodum import assets, auth, extract, service
 from nodum.models import AssetOut, ExtractionOut, IngestOut, NodeOut
 from nodum.principal import Principal
 
@@ -217,6 +219,49 @@ def ingest_url(
             principal=principal,
             path=path,
         )
+
+
+def ingest_upload(
+    token_row: Mapping[str, Any] | sqlite3.Row,
+    source_file: str | Path,
+    *,
+    path: str | Path | None = None,
+) -> IngestOut:
+    """Ingest bytes delivered through a redeemed upload capability.
+
+    Design §5.7 rule 4 ends "normal ingestion runs after the PUT", and this is
+    that step. Without it the upload hatch dead-ends: an agent host with no
+    shared filesystem could deliver bytes that no surface could then turn into
+    a subgraph, since :func:`ingest_file` takes a path on the *server*.
+
+    It lives here rather than in the HTTP adapter because it needs a principal,
+    and that adapter is structurally forbidden from minting one — identity
+    there comes from a verified session or not at all. The capability has no
+    session by design, so the principal is re-minted from the token row's
+    ``created_by``: the account that authorised the upload, recorded when it
+    was still authenticated. A disabled account fails here, so a capability
+    cannot outlive the revocation of the principal behind it.
+
+    Args:
+        token_row: The ``url_tokens`` row :func:`nodum.urls.consume` returned.
+        source_file: The delivered bytes, already spooled to disk.
+        path: Explicit database path.
+
+    Returns:
+        The same result shape as :func:`ingest_file`.
+
+    Raises:
+        UnknownPrincipal: If the row names no account.
+        PrincipalDisabled: If that account has since been disabled.
+    """
+    principal = auth.principal_from_actor(token_row["created_by"], path=path)
+    return ingest_file(
+        source_file,
+        name=token_row["original_name"],
+        space=token_row["space_id"],
+        principal=principal,
+        path=path,
+    )
 
 
 def _ingest(

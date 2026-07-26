@@ -4,9 +4,12 @@ The ``assets`` table holds metadata and ``asset_blobs`` holds the bytes, both
 in the one database file — disaster recovery is ``DB = everything``. Keeping
 bytes in a separate table from metadata means metadata queries and FTS never
 scan blob overflow pages. Content addressing by sha256 is what makes
-registration idempotent, and it is unaffected by where the bytes live. This is
-the thinnest registration needed to make renditions real — the full ingestion
-pipeline (text extraction, chunking, source/claim proposals) is Phase 4.
+registration idempotent, and it is unaffected by where the bytes live. This
+module owns *storage* only: registering bytes, deriving renditions, and
+answering who may read them. Turning bytes into graph structure — extraction,
+the describing node, the source node and its provenance edge — is
+:mod:`nodum.ingest`, which composes this module with :mod:`nodum.extract` and
+the service layer rather than writing anything itself.
 
 Originals are streamed in and out through :meth:`sqlite3.Connection.blobopen`,
 so neither registration nor rendering ever holds a whole file in memory. The
@@ -479,17 +482,36 @@ def _readable_hashes(conn: sqlite3.Connection, store: Store) -> frozenset[str] |
     """The asset hashes this principal's describing nodes reach; ``None`` = all.
 
     A human gets ``None`` — unfiltered, like every other read. An agent gets
-    the hashes carried by the active ``asset_ref`` nodes inside its read set,
+    the hashes carried by the live ``asset_ref`` nodes inside its read set,
     which is what "an asset is as reachable as its describing nodes" means in
     SQL. An agent with no grants therefore reaches nothing at all, without a
     separate check for that case.
+
+    **A ``proposed`` description counts.** Everywhere else in this system a
+    proposed node is *readable* and merely filtered out of search at query
+    time (``search`` defaults to ``state="active"``, and the FTS projector
+    indexes every state) — so requiring ``active`` here would have made assets
+    the one read in the graph with a stricter rule than the nodes describing
+    them, and :func:`_resolve_hash` already admitted proposed rows on its
+    node-id branch, leaving the two halves of one lookup disagreeing.
+
+    It also has to count for ingestion to work at all: an agent holding
+    ``suggest`` lands its describing node ``proposed``, and under the stricter
+    reading it could not re-read the bytes it had just ingested — page rasters
+    of its own PDF included — until a human accepted.
+
+    The residual is an existence oracle, and a thin one: proposing an
+    ``asset_ref`` for a hash reveals whether those bytes are already stored.
+    Reaching them needs the sha256, which is unguessable and which a caller
+    can only compute from bytes it already holds — and content-addressed
+    registration answers the same question anyway by deduplicating.
     """
     if store.principal.read_spaces is None:
         return None
     scope, params = store.node_scope()
     rows = conn.execute(
         "SELECT DISTINCT json_extract(props,'$.asset_hash') AS hash FROM nodes"
-        f" WHERE type_id = 'asset_ref' AND state = 'active'{scope}",
+        f" WHERE type_id = 'asset_ref' AND state != 'archived'{scope}",
         params,
     ).fetchall()
     return frozenset(row["hash"] for row in rows if row["hash"])

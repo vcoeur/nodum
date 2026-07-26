@@ -96,6 +96,31 @@ def test_extracted_text_reaches_search(fresh_db):
     assert hits.hits, f"{PDF_WORD!r} should be findable after ingestion"
 
 
+@pytest.mark.skipif(
+    not extract.PdfHandler().availability()[0], reason="the pdf extra is not installed"
+)
+def test_a_word_on_one_page_does_not_match_every_other_page(fresh_db):
+    """The extracted-text join belongs to the `asset_ref` node alone.
+
+    Ingestion records `asset_hash` on the source and on every page block too —
+    real provenance, and what lets a page id resolve to a `page:<n>` raster —
+    so a join keyed on the prop alone gave every page of a document the whole
+    document's text. A word from page 1 then matched pages 1 and 2 equally and
+    per-page precision was gone.
+    """
+    result = ingest.ingest_file(FIXTURE_PDF, principal=owner())
+    projectors.run_projectors(names=["fts"])
+    page_one, page_two = result.pages
+
+    hits = {hit.node_id for hit in search.search(PDF_WORD, principal=owner()).hits}
+
+    assert page_one.id in hits, "the page carrying the word must match"
+    assert page_two.id not in hits, "a page that does not carry the word must not"
+    # The document-level nodes still match: the asset_ref through the join,
+    # the source through its own content.
+    assert {result.asset_ref.id, result.source.id} <= hits
+
+
 # ── Idempotency and repair ───────────────────────────────────────────────────
 
 

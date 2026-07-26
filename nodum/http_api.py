@@ -55,6 +55,21 @@ Everything else is convention, shared rather than re-stated:
   cross-origin request a browser can make without a preflight — and this app
   answers no preflight — can reach a write. See the class docstring for the
   full rule and what it deliberately does not cover.
+* **The two capability-URL routes are the one thing on this surface that is
+  not a session** (:func:`_is_capability_path`, and note the *why* written
+  there before touching either gate). ``GET /api/download/{token}`` and
+  ``PUT /api/uploads/{token}`` are redeemed by an agent host that has no
+  filesystem in common with this server and no account here at all: the
+  unguessable token in the path *is* the authorisation, minted by
+  :mod:`nodum.urls` against a principal the session gate already checked,
+  single-use, and expiring in minutes. They therefore sit outside the
+  session gate *and* outside the origin and content-type gates, while the
+  ``Host`` check and the body ceiling still apply to them exactly as to
+  everything else. Neither of them ever calls :func:`_session_principal`,
+  and neither writes to the graph: the identity a redemption is recorded
+  under is the token row's own ``created_by``, applied inside
+  :func:`nodum.urls.consume` where it is stored state rather than anything
+  the request said.
 * **Static hosting** — the built Vite bundle at ``nodum/_web/`` is served at
   ``/``, with unknown non-API paths falling through to its ``index.html`` so
   client-side routes survive a reload. When the bundle is absent (a source
@@ -88,7 +103,7 @@ import json
 import re
 import sqlite3
 import tempfile
-from collections.abc import Iterable, Sequence
+from collections.abc import AsyncIterator, Iterable, Sequence
 from http import HTTPStatus
 from importlib import metadata
 from pathlib import Path
@@ -99,11 +114,11 @@ from starlette.datastructures import Headers, QueryParams, UploadFile
 from starlette.exceptions import HTTPException
 from starlette.middleware import Middleware
 from starlette.requests import ClientDisconnect, Request
-from starlette.responses import FileResponse, JSONResponse, Response
+from starlette.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from starlette.routing import Match, Route
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from nodum import assets, auth, service
+from nodum import assets, auth, db, ingest, service, urls
 from nodum import search as search_module
 from nodum.assets import (
     AssetNotFound,
@@ -134,10 +149,21 @@ SESSION_COOKIE = "nodum_session"
 #: reads it and nothing else, so request data can never become an identity.
 SESSION_SCOPE_KEY = "nodum.session_principal"
 
-#: The one ``/api`` route outside the session gate (it *makes* sessions).
-#: ``/healthz`` sits outside ``/api`` entirely: a liveness probe that needs
-#: credentials is not a liveness probe.
+#: The one ``/api`` route outside the session gate that takes a password (it
+#: *makes* sessions). ``/healthz`` sits outside ``/api`` entirely: a liveness
+#: probe that needs credentials is not a liveness probe.
 LOGIN_PATH = "/api/login"
+
+#: Path prefixes of the capability-URL routes, taken from
+#: :data:`nodum.urls.TOKEN_PATHS` rather than spelled again here — the minted
+#: URL and the route that redeems it must not be able to drift apart.
+#:
+#: The trailing slash is load-bearing: it is what separates
+#: ``PUT /api/uploads/{token}`` (redeeming a grant, no session) from
+#: ``POST /api/uploads`` (*minting* one, session required like every other
+#: write). One character is all that stands between the two, so it is a
+#: constant with a reason rather than an inline literal.
+TOKEN_PATH_PREFIXES = tuple(sorted(f"{prefix}/" for prefix in urls.TOKEN_PATHS.values()))
 
 
 def _session_principal(request: Request) -> Principal:
@@ -217,9 +243,30 @@ CONTENT_SECURITY_POLICY = "; ".join(
     )
 )
 
-#: Read size for spooling a multipart upload to disk — the same 1 MiB chunk
-#: :mod:`nodum.assets` streams blobs with, so a large file is never held whole.
+#: Read size for every streamed transfer on this surface — spooling a multipart
+#: upload to disk, and reading an original back out of its blob. The same 1 MiB
+#: chunk :mod:`nodum.assets` streams blobs with, so a large file is never held
+#: whole in either direction.
 UPLOAD_CHUNK_BYTES = 1 << 20
+
+#: Content type every downloaded original is served as, whatever the stored
+#: ``assets.mime`` says.
+#:
+#: The bytes came from outside: a stranger's upload, or a URL an agent asked
+#: this server to fetch. Echoing their MIME back is how a file host turns into
+#: a stored-XSS vector — one ``text/html`` original, served from this origin,
+#: runs script *on the origin that may write to this API*, and
+#: :data:`CONTENT_SECURITY_POLICY` does not cover it: that header is set by the
+#: static-hosting route only, and adding it here would be a second-order fix
+#: for a problem this line removes outright.
+#:
+#: The headers :func:`_original_response` sends with it matter as much as the
+#: type. ``nosniff`` stops a browser deciding for itself that an
+#: ``application/octet-stream`` body looks like HTML, and
+#: ``Content-Disposition: attachment`` makes the response a download rather
+#: than a document. The caller that minted the URL already knows what it asked
+#: for, so nothing truthful is lost.
+DOWNLOAD_CONTENT_TYPE = "application/octet-stream"
 
 #: Hard ceiling on a request body, enforced *before* anything buffers it
 #: (:class:`RequestGuardMiddleware`). It bounds the multipart upload path, which
@@ -355,6 +402,13 @@ EXCEPTION_STATUS: dict[type[Exception], int] = {
     # the driver as a Python bignum and surfaced as a 500 before it was mapped.
     ValueError: 400,
     InvalidTransition: 400,
+    # Both derive from ValueError and would land on 400 through it; they are
+    # named so the table shows the two failures a Phase-4 caller actually
+    # meets. `TokenInvalid` deliberately carries one message for unknown,
+    # expired, spent and wrong-kind alike — the status must not tell them
+    # apart either, which is why it is not split into 404/410.
+    urls.TokenInvalid: 400,
+    ingest.IngestError: 400,
     AssetTooLarge: 400,
     AssetSourceChanged: 400,
     UnsupportedRendition: 400,
@@ -420,7 +474,9 @@ def _write(request: Request, operation: Any, /, *args: Any, **kwargs: Any) -> An
 
     Args:
         request: The incoming request, carrying the verified session principal.
-        operation: The :mod:`nodum.service` function to invoke.
+        operation: The :mod:`nodum.service` (or :mod:`nodum.ingest` /
+            :mod:`nodum.urls`) function to invoke — anything that takes a
+            ``principal`` and writes.
         *args: Positional arguments for it.
         **kwargs: Keyword arguments for it, never including ``principal``.
 
@@ -520,6 +576,62 @@ def _is_api_path(path: str) -> bool:
     reason.
     """
     return path == API_PREFIX or path.startswith(f"{API_PREFIX}/")
+
+
+def _is_capability_path(path: str) -> bool:
+    """Is this a route whose *URL itself* is the credential?
+
+    **Read this before "tidying up" either gate.** The session gate and the
+    origin/content-type gate exist for one specific reason: a browser attaches
+    the session cookie to any request it is talked into making, so a page on
+    another origin can spend the human's identity without ever seeing the
+    reply. That is what CSRF *is*, and both gates are built around it.
+
+    A capability URL carries no ambient credential. The token in the path is
+    the whole authorisation: :mod:`nodum.urls` minted it against a principal
+    that had already passed the session gate, it is single-use, it expires in
+    minutes, and nothing about a browser ever attaches it — a cross-origin
+    page that does not already hold the URL has nothing to ride, and one that
+    *does* hold it could equally well have used ``curl``. Requiring
+    ``Content-Type: application/json`` on a raw-bytes upload is incoherent on
+    top of that, and requiring a session would defeat the point of the hatch:
+    it exists precisely for an agent host that has no account here and no
+    filesystem in common with this server.
+
+    Two things that are **not** exempt, on purpose:
+
+    * the ``Host`` check — DNS rebinding is about which *server* a request
+      reached, which a capability changes nothing about, and a rebound page
+      that guessed a token would otherwise be handed the bytes; and
+    * the body ceiling — :data:`nodum.urls.MAX_UPLOAD_BYTES` is deliberately
+      equal to :data:`MAX_REQUEST_BYTES`, so a grant can never promise more
+      than this server is willing to read.
+
+    Args:
+        path: The normalised request path.
+
+    Returns:
+        Whether the path redeems a capability token.
+    """
+    return path.startswith(TOKEN_PATH_PREFIXES)
+
+
+def _needs_a_session(path: str) -> bool:
+    """Does this path require the session gate to have verified a human?
+
+    The single expression of "every ``/api`` route but the exemptions", so a
+    second exemption is a name in one predicate rather than a string compared
+    in three places. The exemptions are the route that *makes* a session and
+    the routes that carry their own credential — nothing else, which
+    ``tests/test_http_api.py`` asserts over the live route table.
+
+    Args:
+        path: The normalised request path.
+
+    Returns:
+        Whether a request for this path must present a valid session.
+    """
+    return _is_api_path(path) and path != LOGIN_PATH and not _is_capability_path(path)
 
 
 def _normalise_path(scope: Scope) -> None:
@@ -624,6 +736,12 @@ class RequestGuardMiddleware:
        the stream is then capped mid-read regardless of what that header
        claimed.
 
+    Checks 2 and 3 are skipped for the capability-URL routes, and only those
+    two: they are the checks that assume an ambient credential the request
+    would be spending, and a capability URL has none — see
+    :func:`_is_capability_path`. Checks 1 and 4 apply to every request this
+    server answers, those routes included.
+
     What it does **not** do: authenticate. Any local process can satisfy every
     check above with three ``curl`` headers. That is what the password session
     is for — this guard decides which requests may *reach* the credential
@@ -650,6 +768,17 @@ class RequestGuardMiddleware:
             )
 
         if scope["method"] in SAFE_METHODS:
+            return None
+
+        if _is_capability_path(scope["path"]):
+            # The CSRF checks below and the content-type check under them both
+            # assume the request would arrive carrying an ambient credential.
+            # A capability URL has none: the token in the path is the entire
+            # authorisation, so there is nothing for a cross-origin page to
+            # ride and nothing a same-origin proof would add. See
+            # `_is_capability_path` for the full argument — and note that the
+            # `Host` check above has already run, and the body cap below still
+            # runs, because neither of those is about ambient credentials.
             return None
 
         origin = headers.get("origin")
@@ -753,11 +882,15 @@ def _cookie_value(scope: Scope, name: str) -> str | None:
 class SessionMiddleware:
     """Resolve the session cookie to a verified principal on every ``/api`` request.
 
-    The gate is simple because the model is: every ``/api`` route but
-    :data:`LOGIN_PATH` needs a valid session — reads included (single-human
-    app; one rule, no per-route memory). ``/healthz`` is outside ``/api`` and
-    the static UI is not an API path, so the probe and the login page's
-    bundle stay open.
+    The gate is simple because the model is: every ``/api`` route
+    :func:`_needs_a_session` claims needs a valid session — reads included
+    (single-human app; one rule, no per-route memory). ``/healthz`` is outside
+    ``/api`` and the static UI is not an API path, so the probe and the login
+    page's bundle stay open. The two exemptions inside ``/api`` are
+    :data:`LOGIN_PATH`, which *makes* sessions, and the capability-URL routes,
+    which carry their own single-use credential in the path
+    (:func:`_is_capability_path`) and would be pointless behind a session gate
+    — their whole reason to exist is an agent host with no account here.
 
     Resolution goes through :func:`auth.principal_for_session`, which checks
     the row exists, has not expired (sliding the expiry forward on success),
@@ -778,7 +911,7 @@ class SessionMiddleware:
             await self.app(scope, receive, send)
             return
         path = scope["path"]
-        if not _is_api_path(path) or path == LOGIN_PATH:
+        if not _needs_a_session(path):
             await self.app(scope, receive, send)
             return
         session_id = _cookie_value(scope, SESSION_COOKIE)
@@ -846,6 +979,41 @@ def _required_str(body: dict[str, Any], key: str) -> str:
     """
     value = _required(body, key)
     if not isinstance(value, str):
+        raise ValueError(f"field {key!r} must be a string")
+    return value
+
+
+def _required_int(body: dict[str, Any], key: str) -> int:
+    """Return a required body field that must be an integer.
+
+    ``bool`` is refused because it *is* an ``int`` in Python and ``True`` as a
+    byte count is a caller mistake, not a size. The declared size reaches
+    SQLite and a comparison in :func:`nodum.urls.mint_upload`, where a string
+    would be a ``TypeError`` (a 500) rather than the 400 it plainly is.
+
+    Raises:
+        ValueError: If the key is missing, null, not an integer, or does not
+            fit in a signed 64-bit integer.
+    """
+    value = _required(body, key)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"field {key!r} must be an integer")
+    return _bounded_int(value, key)
+
+
+def _optional_str(body: dict[str, Any], key: str) -> str | None:
+    """Return an optional body field that must be a string when it is present.
+
+    Absent and null both read as "not given". The same reasoning as
+    :func:`_required_str`, for the fields that have a default: a JSON number
+    where a name or a hash belongs is a 400, not a traceback three layers
+    down.
+
+    Raises:
+        ValueError: If the key is present, non-null, and not a string.
+    """
+    value = body.get(key)
+    if value is not None and not isinstance(value, str):
         raise ValueError(f"field {key!r} must be a string")
     return value
 
@@ -1046,6 +1214,83 @@ def _refuse_unsupported_upload(spooled: Path, original_name: str) -> None:
             f"images only ({', '.join(sorted(UPLOAD_MIME_ALLOWLIST))})"
         )
     assets.check_image_pixel_budget(spooled)
+
+
+# ── Serving original bytes ────────────────────────────────────────────────────
+
+
+async def _blob_chunks(conn: sqlite3.Connection, blob: sqlite3.Blob) -> AsyncIterator[bytes]:
+    """Yield an open blob's bytes in bounded chunks, closing both handles after.
+
+    The point of the generator: an original may be a gigabyte, and reading it
+    into a ``bytes`` to hand to a ``Response`` would put all of it in the
+    server's memory to send a copy the client reads at its own pace. The
+    connection outlives the handler that opened it — a blob handle is only
+    valid while its connection is — so this owns the close, including the one
+    that matters, when a client hangs up mid-transfer and Starlette closes the
+    generator instead of draining it.
+
+    Args:
+        conn: The connection the blob was opened on; closed on the way out.
+        blob: An open, readable blob handle positioned at its start.
+
+    Yields:
+        Successive chunks of at most :data:`UPLOAD_CHUNK_BYTES`.
+    """
+    try:
+        with blob:
+            while chunk := blob.read(UPLOAD_CHUNK_BYTES):
+                yield chunk
+    finally:
+        conn.close()
+
+
+def _original_response(asset_hash: str, path: str | Path | None) -> Response:
+    """Stream one asset's stored original bytes as a download.
+
+    Everything about the response says "bytes, saved to disk, interpreted by
+    nobody": :data:`DOWNLOAD_CONTENT_TYPE` rather than the stored MIME,
+    ``nosniff`` so a browser does not overrule it, and ``attachment`` so it is
+    never rendered as a document in this origin (see the constant for why that
+    is the whole game on a file host). The filename is the content address run
+    through :data:`_SAFE_FILENAME_RE` — the one name attached to these bytes
+    that no stranger chose.
+
+    ``no-store`` keeps a shared proxy from retaining a private document that
+    was reachable for one request under a URL that is now spent.
+
+    Args:
+        asset_hash: The asset whose original to stream.
+        path: Explicit database path, as every other call here takes.
+
+    Returns:
+        The streaming response, with an accurate ``Content-Length``.
+
+    Raises:
+        AssetNotFound: If the blob store holds no bytes for that hash.
+    """
+    # `db.connect` rather than the migrating open every other module uses: the
+    # only caller reached this through `urls.consume`, which just read and
+    # updated a row in this database, so the schema is present by construction
+    # and a migration pass on a download would be a second writer for nothing.
+    conn = db.connect(path)
+    try:
+        blob = assets.open_original(conn, asset_hash)
+        size = len(blob)
+    except Exception:
+        conn.close()
+        raise
+    filename = f"nodum-{_SAFE_FILENAME_RE.sub('-', asset_hash)[:64]}"
+    return StreamingResponse(
+        _blob_chunks(conn, blob),
+        media_type=DOWNLOAD_CONTENT_TYPE,
+        headers={
+            "content-length": str(size),
+            "content-disposition": f'attachment; filename="{filename}"',
+            "x-content-type-options": "nosniff",
+            "cache-control": "no-store",
+        },
+    )
 
 
 # ── Routing ───────────────────────────────────────────────────────────────────
@@ -1497,6 +1742,167 @@ def create_app(
         payload = assets.read_rendition_bytes(rendition, path=db_path)
         return Response(payload, media_type=assets.RENDITION_MIME)
 
+    # ── Ingestion ─────────────────────────────────────────────────────────
+
+    async def ingest_source(request: Request) -> Response:
+        """Ingest one local file **or** one URL: register, extract, describe, propose.
+
+        Exactly one of ``path`` and ``url``. Both named, or neither, is a 400
+        — a precedence rule between the two would be a coin flip nobody
+        remembers reading. ``name``, ``space`` and ``title`` are optional and
+        mean what they mean everywhere else.
+
+        Two things this route hands the session's human, deliberately, and
+        worth saying out loud rather than discovering: ``path`` is read *by
+        the server*, so it reaches any file the server's own user can read
+        (design §5.7's ingestion by reference — the reason no base64 ever
+        crosses a surface), and ``url`` is fetched *by the server*, from
+        wherever this machine can reach; :mod:`nodum.ingest` states plainly
+        that it blocks neither loopback nor private ranges, because the server
+        is itself a loopback service. Both are properties of a human-only
+        surface behind a password, and they are exactly why this route is
+        inside the session gate while the two token routes below are not.
+        """
+        body = await _json_body(request)
+        by_url = body.get("url") is not None
+        if by_url == (body.get("path") is not None):
+            raise ValueError("ingest takes exactly one of 'path' and 'url'")
+        operation = ingest.ingest_url if by_url else ingest.ingest_file
+        result = _write(
+            request,
+            operation,
+            _required_str(body, "url" if by_url else "path"),
+            name=_optional_str(body, "name"),
+            space=_optional_str(body, "space"),
+            title=_optional_str(body, "title"),
+            path=db_path,
+        )
+        return EnvelopeResponse(envelope(result))
+
+    # ── Capability URLs: minting (session) and redeeming (token) ──────────
+
+    async def mint_asset_download_url(request: Request) -> Response:
+        """Mint a single-use, short-lived URL for one asset's original bytes.
+
+        ``POST`` because minting is a state change: it writes a token row and
+        an event, and doing that on a ``GET`` would mean a link preview could
+        spend a grant. It takes no body — the lifetime is
+        :data:`nodum.urls.DEFAULT_TTL_SECONDS`, and the address the URL is
+        built on is the server's configured public one (``NODUM_PUBLIC_URL``)
+        rather than the ``Host`` this request happened to arrive with: a
+        minted URL outlives its request, so it is configuration, not an echo
+        of a header.
+
+        Refuses, as *not found*, any asset this session cannot already reach
+        through a describing node: minting resolves the asset through the same
+        scoped accessor every other read uses, so a token can never widen
+        anyone's reach.
+        """
+        grant = _write(request, urls.mint_download, request.path_params["id"], path=db_path)
+        return EnvelopeResponse(envelope(grant))
+
+    async def request_upload_url(request: Request) -> Response:
+        """Mint a single-use URL to PUT one file to — or answer with a dedup hit.
+
+        ``name``, ``mime`` and ``size`` are required; ``sha256`` and ``space``
+        are optional. A declared ``sha256`` this file already holds comes back
+        as the existing asset with **no grant at all** and no bytes moved
+        (design §5.7 rule 4). ``size`` is the ceiling the redemption route
+        then enforces on the body, and the service refuses one above
+        :data:`nodum.urls.MAX_UPLOAD_BYTES`, which is deliberately equal to
+        :data:`MAX_REQUEST_BYTES` — a grant promising more than this server
+        will read is a grant that fails halfway through a transfer.
+
+        Refuses a ``space`` the session cannot write, at mint time rather than
+        after the bytes have crossed the network.
+        """
+        body = await _json_body(request)
+        grant = _write(
+            request,
+            urls.mint_upload,
+            _required_str(body, "name"),
+            _required_str(body, "mime"),
+            _required_int(body, "size"),
+            sha256=_optional_str(body, "sha256"),
+            space=_optional_str(body, "space"),
+            path=db_path,
+        )
+        return EnvelopeResponse(envelope(grant))
+
+    async def download_original(request: Request) -> Response:
+        """Spend a download token and stream that asset's original bytes.
+
+        **Outside the session gate and outside the origin/content-type gate,
+        on purpose** — :func:`_is_capability_path` carries the argument, and
+        this handler is the reason it exists: no session is consulted and none
+        is required, because the unguessable token in the path *is* the
+        authorisation. It is spent exactly once here, and
+        :func:`nodum.urls.consume` records the redemption against the identity
+        stored on the token row, which is the only truthful one available —
+        this request carries no identity of its own and this module may not
+        invent one.
+
+        The ``Host`` check and the body ceiling still apply, like everywhere
+        else: neither has anything to do with ambient credentials.
+
+        Refuses — one status, one message, no way to tell the cases apart — a
+        token that is unknown, expired, already spent, or minted for the
+        upload route. Distinguishing them would tell whoever is guessing which
+        of the four they just achieved.
+
+        The bytes are streamed out of the blob rather than read whole, and
+        served as an opaque attachment nothing will render: see
+        :data:`DOWNLOAD_CONTENT_TYPE`.
+        """
+        row = urls.consume(request.path_params["token"], kind="download", path=db_path)
+        return _original_response(row["asset_hash"], db_path)
+
+    async def upload_original(request: Request) -> Response:
+        """Spend an upload token and store the raw request body as an asset.
+
+        Outside both gates for the same reason as the download route above,
+        and with the same two exceptions: the ``Host`` check ran before this,
+        and the body is capped twice — by :data:`MAX_REQUEST_BYTES` in the
+        middleware, and by the grant's own ``max_bytes`` here. The second cap
+        is enforced **while the body streams**, at the byte that passes it,
+        not after the whole thing has been spooled to disk: a grant that
+        promised 4 KB must not cost 32 MB of ``/tmp`` to refuse.
+
+        The stored name is the one the grant recorded, reduced to its last
+        path segment, so nothing a name says can place a file outside the
+        temporary directory it is spooled into.
+
+        **The describing nodes are written by the domain, not by this route.**
+        Design §5.7 rule 4 ends "normal ingestion runs after the PUT", and
+        without that step the hatch dead-ends: bytes no surface could turn into
+        a subgraph, since ``ingest_file`` takes a path on the *server*. But a
+        graph write needs a live principal, and this request has none by
+        construction — it presented a URL, not a credential, and this module
+        may not load one from stored state (``tests/test_principal_guards.py``
+        pins every adapter's identity source, and this one's is the session).
+        So the route hands the spooled file and the token row to
+        :func:`nodum.ingest.ingest_upload`, which re-mints the principal that
+        *authorised* the grant from the row's own ``created_by``. The identity
+        never passes through this module, and a grant whose account has since
+        been disabled fails there rather than here.
+        """
+        row = urls.consume(request.path_params["token"], kind="upload", path=db_path)
+        max_bytes = row["max_bytes"]
+        original_name = row["original_name"] or "upload"
+        with tempfile.TemporaryDirectory(prefix="nodum-upload-") as directory:
+            spooled = Path(directory) / (Path(original_name).name or "upload")
+            received = 0
+            with spooled.open("wb") as handle:
+                async for chunk in request.stream():
+                    received += len(chunk)
+                    if received > max_bytes:
+                        raise PayloadTooLarge(
+                            f"this upload grant is for {max_bytes} bytes and the body is larger"
+                        )
+                    handle.write(chunk)
+            result = ingest.ingest_upload(row, spooled, path=db_path)
+        return EnvelopeResponse(envelope(result))
+
     # ── Event log, undo, export ───────────────────────────────────────────
 
     async def list_events(request: Request) -> Response:
@@ -1748,6 +2154,18 @@ def create_app(
         Route("/api/assets", upload_asset, methods=["POST"]),
         Route("/api/assets/{id}", get_asset),
         Route("/api/assets/{id}/rendition/{profile}", get_rendition),
+        Route("/api/assets/{id}/download-url", mint_asset_download_url, methods=["POST"]),
+        Route("/api/ingest", ingest_source, methods=["POST"]),
+        Route("/api/uploads", request_upload_url, methods=["POST"]),
+        # The two capability-URL routes, and the only ``/api`` paths outside
+        # the session gate other than login: the token in the path is the
+        # credential (`_is_capability_path`), so neither a session nor a
+        # same-origin proof nor a content type is required — while the `Host`
+        # check and the body ceiling apply to them exactly as to the rest.
+        # Their paths come from `nodum.urls.TOKEN_PATHS`, which is also what
+        # the minted URLs are built from, so the two cannot drift apart.
+        Route(f"{urls.TOKEN_PATHS['download']}/{{token}}", download_original),
+        Route(f"{urls.TOKEN_PATHS['upload']}/{{token}}", upload_original, methods=["PUT"]),
         Route("/api/events", list_events),
         Route("/api/undo", undo, methods=["POST"]),
         Route("/api/export/node/{id}", export_node),

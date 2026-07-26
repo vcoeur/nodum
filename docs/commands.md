@@ -127,13 +127,77 @@ including every parameter.
 - `asset register` — Register a file as a content-addressed asset (idempotent dedup by sha256).
 - `asset get` — Show one asset's metadata (never its bytes). Takes `--as`.
 - `asset list` — List every registered asset. Takes `--as`.
-- `asset rendition` — Fetch an image rendition, generating and caching it on first
-  request. Takes `--as`.
+- `asset rendition` — Fetch a rendition, generating and caching it on first
+  request. `--profile` takes `thumb` or `preview` for an image, or `page:<n>`
+  for a 1-based page of a PDF. Takes `--as`.
+- `asset download-url` — Mint a short-lived, single-use URL for an asset's
+  original bytes. Takes `--as`.
+- `asset upload-url` — Mint a short-lived, single-use URL to PUT one file to
+  (`--name`, `--mime`, `--size` required). Takes `--as`.
 - `asset purge` — Evict stored renditions (they rebuild on next request).
 
-The three reads carry `--as` because they read through the graph — an
+The reads carry `--as` because they read through the graph — an
 `asset_ref` node id is a valid handle, and it resolves only in a space the
 caller can read. `register` and `purge` touch the blob store alone.
+
+A `page:<n>` raster is an ordinary rendition: same lazy generation, same cache,
+same eviction by `asset purge`. It needs the `pdf` extra, which it names rather
+than failing at import time.
+
+The two capability-URL commands are the escape hatch for a host that shares no
+filesystem with the graph. Both print the token **once** — only its sha256 is
+stored — and log both the mint and the later redemption. `--ttl` is bounded
+(1 second to 1 hour, 5 minutes by default). An `upload-url` whose `--sha256`
+this graph already holds answers with the existing `asset` and **no** `grant`:
+the bytes are here, so no bytes move. The URLs resolve against `nodum serve`,
+which has to be running; set `NODUM_PUBLIC_URL` when that server is not on the
+default address.
+
+### Ingestion
+
+- `ingest file <path>…` — Ingest local files: register the bytes, extract text,
+  describe, propose. Takes `--as`.
+- `ingest url <url>` — Fetch an `http`/`https` URL into the blob store and
+  ingest it exactly like a local file. Takes `--as`.
+- `ingest handlers` — List every extraction handler, its MIME families, and
+  whether it can run. No `--as`, and no database.
+
+Each document becomes an asset, an `asset_ref` node describing those bytes in
+one space, a `source` node whose content is the extracted text, a
+`derived_from` edge between them, and one `block` child per page of text. Every
+write goes through the ordinary service API, so the subgraph lands in the state
+the writer's grant earns.
+
+**`ingest file` takes one or more paths, and a directory argument ingests the
+files directly inside it** (`--recursive` walks deeper). Dot-names and anything
+that is not a regular file are skipped, and the rest are ingested in sorted
+order, so the same folder ingests the same way twice. One path naming a *file*
+prints that ingestion as a single JSON object; anything else — several paths,
+or a directory — is a batch and prints `{"ingestions": [...], "count": n}`.
+`--name` and `--title` describe one document and are refused for a batch;
+`--space` applies to all of it.
+
+**A batch never loses its successes.** Each file is ingested on its own; one
+that fails prints its reason and then `skipped <path>` on stderr, and the batch
+carries on. Every file that landed is in the envelope on stdout. **The exit
+code is 1 if any file failed**, so a non-zero exit from `ingest file` means
+"read stderr for what is missing", not "nothing happened". Re-running is safe:
+ingestion is idempotent per `(hash, space)`, so what already landed comes back
+with `created: false` instead of being duplicated.
+
+`ingest url` fetches `http`/`https` only, once, with a timeout and a size
+ceiling, and refuses a redirect that leaves those two schemes. It does *not*
+block loopback or private ranges — nodum is itself a loopback service — so
+granting ingestion grants the server's network position.
+
+`ingest handlers` is the answer to "my PDF produced no text": it reports every
+handler with its MIME families, whether it is `available`, and — when it is not
+— a `detail` naming the extra to install. Plain text, Markdown, JSON, and HTML
+are handled by the standard library and always work; PDF text (`pdf`), image
+OCR (`ocr`, which also needs the `tesseract` binary on PATH) and audio
+transcription (`audio`) are optional extras. A missing handler is never fatal:
+the asset is still registered and still described, and the result says plainly
+that no text came out.
 
 ### Servers
 
@@ -154,6 +218,11 @@ Account and grant administration is on the API as well: `GET /api/me` returns
 the session's human, and `/api/humans`, `/api/agents` and `/api/grants`
 mirror the CLI's `human`/`agent`/`grant`/`revoke`/`grants` commands — the
 show-once agent token comes back in the create/token-rotate response body.
+`POST /api/ingest` mirrors `nodum ingest`, taking exactly one of `path` and
+`url`. The two capability-URL redemption routes — `GET /api/download/{token}`
+and `PUT /api/uploads/{token}` — are the only `/api` routes outside the session
+gate: the single-use token in the path *is* the authorisation, so there is no
+ambient cookie for a cross-origin page to ride.
 
 ```sh
 nodum serve [--host 127.0.0.1] [--port 8600] [--allow-host NAME] [--db PATH]

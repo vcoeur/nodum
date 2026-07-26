@@ -362,7 +362,9 @@ function AssetMetadata({ asset }: { asset: AssetOut }) {
 
       <dt>extracted text</dt>
       <dd className="nd-meta">
-        {asset.extracted_text ? `${asset.extracted_text.length} characters` : "none — Phase 4"}
+        {asset.extracted_text
+          ? `${asset.extracted_text.length} characters`
+          : "none — no handler for this type, or nothing came out"}
       </dd>
     </dl>
   );
