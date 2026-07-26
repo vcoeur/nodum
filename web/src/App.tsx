@@ -28,6 +28,7 @@ const VIEWS = [
   { to: "/review", label: "Review" },
   { to: "/graph", label: "Graph" },
   { to: "/assets", label: "Assets" },
+  { to: "/spaces", label: "Spaces" },
   { to: "/admin", label: "Admin" },
 ] as const;
 

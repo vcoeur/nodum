@@ -56,6 +56,7 @@ import type {
   SearchFilters,
   SearchResult,
   SetGrantBody,
+  SpaceOut,
   SubgraphOut,
   SubgraphParams,
   TypeOut,
@@ -97,6 +98,73 @@ export class ApiError extends Error {
   get isRetryable(): boolean {
     return this.status === 503;
   }
+}
+
+/**
+ * A space filter the server would not resolve — the one failure both
+ * space-filtered reads collapse to.
+ *
+ * The wire is inconsistent, by accretion rather than by design. `GET /api/nodes`
+ * resolves the filter through `nodum.service`, which raises `TypeNotFound` →
+ * **404**; `GET /api/search` resolves it inside `nodum.search`, which raises a
+ * bare `ValueError` → **400**, because a domain module does not import the
+ * service's exception vocabulary. The split is pre-existing (the `type` filter
+ * behaves identically) and inverting the layering to fix it is not worth it —
+ * so it is absorbed here instead, once, and no view has to know which endpoint
+ * it happened to ask.
+ *
+ * The normalised `status` is 404 so that `describeFailure` gives *one* answer
+ * for the same user-visible event; `wireStatus` keeps what the server actually
+ * said, for anyone debugging the round trip.
+ *
+ * **This never means "no such space".** The server answers a space that does
+ * not exist and a space the principal holds no grant on with the same words on
+ * purpose — a refusal that leaked the difference would be an existence oracle
+ * over the whole file. Copy built on this error must not claim the space is
+ * missing.
+ */
+export class UnknownSpaceError extends ApiError {
+  /** The space id or name the caller asked for. */
+  readonly space: string;
+  /** What the endpoint really answered: 404 from the listing, 400 from search. */
+  readonly wireStatus: number;
+
+  constructor(space: string, wireStatus: number, message: string) {
+    super(404, "UnknownSpace", message);
+    this.name = "UnknownSpaceError";
+    this.space = space;
+    this.wireStatus = wireStatus;
+  }
+}
+
+/**
+ * Whether a caught value is the space filter being refused.
+ *
+ * @param error The caught value.
+ */
+export function isUnknownSpace(error: unknown): error is UnknownSpaceError {
+  return error instanceof UnknownSpaceError;
+}
+
+/** Both endpoints raise this literal text; the status alone cannot discriminate. */
+const UNKNOWN_SPACE_MESSAGE = /^unknown space:/i;
+
+/**
+ * Recognise an unknown-space refusal and re-shape it; pass anything else through.
+ *
+ * Keyed on the message rather than the status, because neither status is
+ * specific enough on its own: a 404 from `/api/nodes` is equally an unknown
+ * `type` filter, and a 400 from `/api/search` is any bad parameter at all.
+ *
+ * @param error The caught value.
+ * @param space The space the call asked for, if it asked for one.
+ */
+function asUnknownSpace(error: unknown, space: string | undefined): unknown {
+  if (!space) return error;
+  if (!(error instanceof ApiError)) return error;
+  if (error.status !== 404 && error.status !== 400) return error;
+  if (!UNKNOWN_SPACE_MESSAGE.test(error.message)) return error;
+  return new UnknownSpaceError(space, error.status, error.message);
 }
 
 /**
@@ -339,14 +407,81 @@ export function revokeGrant(
   });
 }
 
+/* ------------------------------------------------------------------ */
+/* Spaces                                                               */
+/* ------------------------------------------------------------------ */
+
 /**
- * `GET /api/spaces` — every active space, as `NodeOut` rows.
+ * `GET /api/spaces` — every active space, with its live node count and the
+ * agents holding grants on it.
  *
- * Spaces are nodes in the meta space, which `/api/nodes` excludes; this is the
- * grant-admin space picker's vocabulary.
+ * Spaces are nodes in the meta space, which `/api/nodes` excludes by default,
+ * so this is the only listing that has them: the vocabulary behind every space
+ * picker and the `/spaces` screen's whole read. Human-only server-side, like
+ * `/api/grants` — an agent learning the shape of the delegation around it is
+ * precisely what the grant model withholds.
+ *
+ * Archived spaces are absent, and there is no un-archive: the state machine has
+ * no `active ← archived` transition, so a listed archived space could offer
+ * nothing.
  */
-export function listSpaces(signal?: AbortSignal): Promise<NodeOut[]> {
-  return requestList<NodeOut>("spaces", "/spaces", signal ? { signal } : {});
+export function listSpaces(signal?: AbortSignal): Promise<SpaceOut[]> {
+  return requestList<SpaceOut>("spaces", "/spaces", signal ? { signal } : {});
+}
+
+/**
+ * `POST /api/spaces` — create a space.
+ *
+ * A space is an ordinary node (builtin type `space`, living in meta), so this
+ * is event-logged, versioned and undoable like any other write.
+ *
+ * @param name The space's name, which is the node's title.
+ */
+export function createSpace(name: string, signal?: AbortSignal): Promise<NodeOut> {
+  return request<NodeOut>("/spaces", {
+    method: "POST",
+    body: { name },
+    ...(signal ? { signal } : {}),
+  });
+}
+
+/**
+ * `POST /api/spaces/{id}/rename` — rename a space.
+ *
+ * A space is a node, so a rename is a node-title update. The path segment
+ * resolves as a **space**, so this route cannot be used to rename a node that
+ * is not one. Returns the updated node: the HTTP surface writes as `human`, so
+ * the rename always lands rather than staging a proposed version.
+ *
+ * @param space The space's id **or** its current name.
+ * @param name The new name.
+ */
+export function renameSpace(
+  space: string,
+  name: string,
+  signal?: AbortSignal,
+): Promise<NodeOut> {
+  return request<NodeOut>(`/spaces/${encodeURIComponent(space)}/rename`, {
+    method: "POST",
+    body: { name },
+    ...(signal ? { signal } : {}),
+  });
+}
+
+/**
+ * `POST /api/spaces/{id}/archive` — retire a space.
+ *
+ * Its nodes keep their `space_id` and grants on it go inert; nothing is
+ * deleted. There is no way back — the state machine has no `active ←
+ * archived` transition — so treat this as final in the interface.
+ *
+ * @param space The space's id **or** its name.
+ */
+export function archiveSpace(space: string, signal?: AbortSignal): Promise<NodeOut> {
+  return request<NodeOut>(`/spaces/${encodeURIComponent(space)}/archive`, {
+    method: "POST",
+    ...(signal ? { signal } : {}),
+  });
 }
 
 /* ------------------------------------------------------------------ */
@@ -380,16 +515,35 @@ export function getSchema(type: string, signal?: AbortSignal): Promise<TypeOut |
 /* Nodes                                                                */
 /* ------------------------------------------------------------------ */
 
-/** `GET /api/nodes` — list nodes, optionally filtered by type/state/parent. */
-export function listNodes(filters?: NodeFilters, signal?: AbortSignal): Promise<NodeOut[]> {
-  return requestList<NodeOut>(
-    "nodes",
-    `/nodes${query(filters)}`,
-    signal ? { signal } : {},
-  );
+/**
+ * `GET /api/nodes` — list nodes, optionally filtered by type/state/parent/space.
+ *
+ * `space` narrows to one space and `include_meta` opts into the meta space;
+ * both are off by default, which is the whole file minus meta. A space the
+ * server will not resolve throws {@link UnknownSpaceError}.
+ */
+export async function listNodes(
+  filters?: NodeFilters,
+  signal?: AbortSignal,
+): Promise<NodeOut[]> {
+  try {
+    return await requestList<NodeOut>(
+      "nodes",
+      `/nodes${query(filters)}`,
+      signal ? { signal } : {},
+    );
+  } catch (error) {
+    throw asUnknownSpace(error, filters?.space);
+  }
 }
 
-/** `POST /api/nodes` — create a node. The server attributes it to `human`. */
+/**
+ * `POST /api/nodes` — create a node. The server attributes it to `human`.
+ *
+ * `body.space` is the write target — where the node lands, by id or name,
+ * `main` when absent. It says nothing about *who* wrote it: identity stays
+ * server-side, as it does on every call in this file.
+ */
 export function createNode(body: CreateNodeBody, signal?: AbortSignal): Promise<NodeOut> {
   return request<NodeOut>("/nodes", { method: "POST", body, ...(signal ? { signal } : {}) });
 }
@@ -491,16 +645,26 @@ export function createEdge(body: CreateEdgeBody, signal?: AbortSignal): Promise<
  *
  * Each hit carries a `signals` breakdown naming the contributing signals; the
  * vector signal is silently absent when no embedding provider is configured.
+ *
+ * `filters.space` and `filters.include_meta` are the same two read-side
+ * controls the node listing takes, and a space the server will not resolve
+ * throws the same {@link UnknownSpaceError} here as it does there — which is
+ * the point of that class, since the two endpoints answer with different
+ * statuses.
  */
-export function search(
+export async function search(
   q: string,
   filters?: SearchFilters,
   signal?: AbortSignal,
 ): Promise<SearchResult> {
-  return request<SearchResult>(
-    `/search${query({ q, ...filters })}`,
-    signal ? { signal } : {},
-  );
+  try {
+    return await request<SearchResult>(
+      `/search${query({ q, ...filters })}`,
+      signal ? { signal } : {},
+    );
+  } catch (error) {
+    throw asUnknownSpace(error, filters?.space);
+  }
 }
 
 /**
@@ -687,6 +851,9 @@ export const api = {
   setGrant,
   revokeGrant,
   listSpaces,
+  createSpace,
+  renameSpace,
+  archiveSpace,
   getHealth,
   getTypes,
   getSchema,

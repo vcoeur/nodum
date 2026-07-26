@@ -7,9 +7,9 @@ import { EmptyState, Spinner } from "./components";
 /**
  * Every route in the app, registered up front.
  *
- * Thirteen routes over eight views: login, editor (blank and per-node),
+ * Fourteen routes over nine views: login, editor (blank and per-node),
  * search, review, graph (root picker and per-root), assets, per-node history,
- * and admin. `/` redirects to `/search`, and anything unmatched renders
+ * admin, and spaces. `/` redirects to `/search`, and anything unmatched renders
  * {@link NotFoundView} rather than a blank screen.
  *
  * `/login` stands **outside** the app-shell route: the shell is the session
@@ -41,6 +41,7 @@ const ReviewView = lazy(() => import("./views/review/ReviewView"));
 const GraphView = lazy(() => import("./views/graph/GraphView"));
 const AssetsView = lazy(() => import("./views/assets/AssetsView"));
 const HistoryView = lazy(() => import("./views/history/HistoryView"));
+const SpacesView = lazy(() => import("./views/spaces/SpacesView"));
 
 /** Shown while a view's chunk loads. */
 function ViewLoading() {
@@ -91,6 +92,12 @@ export const router = createBrowserRouter([
       { path: "graph/:rootId", element: lazyView(<GraphView />) },
 
       { path: "assets", element: lazyView(<AssetsView />) },
+
+      // Spaces — the lifecycle screen: what territory exists, its node counts,
+      // and which agents hold grants on it (design D2). Deliberately its own
+      // top-level view rather than a panel in /admin, which is the *grants*
+      // screen and would frame a space as pure governance.
+      { path: "spaces", element: lazyView(<SpacesView />) },
 
       // Admin — accounts and grants; replaces the removed policy editor.
       { path: "admin", element: lazyView(<AdminView />) },
