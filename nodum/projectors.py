@@ -65,10 +65,15 @@ class FtsProjector(Projector):
     """Maintain the ``node_fts`` FTS5 index from node events.
 
     Every node state (``proposed``/``active``/``archived``) is indexed; the
-    search layer filters by state at query time. Indexing is driven purely by
-    event payloads: node creates/updates/transitions upsert the ``after``
-    (or restored) row; undoing a node create deletes the row from the index.
-    Edge events do not affect the index.
+    search layer filters by state at query time. *Which* node to index is
+    driven purely by event payloads: node creates/updates/transitions upsert
+    the ``after`` (or restored) row; undoing a node create deletes the row
+    from the index. Edge events do not affect the index.
+
+    The one thing the payload does not carry is a described asset's extracted
+    text, which is joined from the live ``assets`` table (see
+    :meth:`_extracted_text` for why that table is outside the log and what it
+    costs).
     """
 
     name = "fts"
@@ -113,16 +118,55 @@ class FtsProjector(Projector):
         conn.execute("DELETE FROM node_fts WHERE node_id = ?", (node["id"],))
         conn.execute(
             "INSERT INTO node_fts (node_id, title, content, extracted_text) VALUES (?, ?, ?, ?)",
-            (node["id"], node["title"] or "", node["content"], self._extracted_text(node)),
+            (
+                node["id"],
+                node["title"] or "",
+                node["content"],
+                self._extracted_text(conn, node),
+            ),
         )
 
-    def _extracted_text(self, node: dict[str, Any]) -> str:
-        """Extracted asset text for an ``asset_ref`` node — always empty today.
+    def _extracted_text(self, conn: sqlite3.Connection, node: dict[str, Any]) -> str:
+        """The extracted text of the asset a node describes, or ``""``.
 
-        The seam for Phase 4: once the asset store lands, asset nodes carry an
-        ``asset_hash`` prop and this joins against ``assets.extracted_text``.
+        A node carrying an ``asset_hash`` prop contributes that asset's
+        ``assets.extracted_text`` to its own FTS row, which is how the full
+        text of a PDF becomes findable through the node that stands for it —
+        the node's own ``content`` only ever holds a capped excerpt.
+
+        **This read is of live state inside an event replay, and deliberately
+        so.** ``assets`` is not event-logged (there is nothing to undo about
+        content-addressed bytes), so the value read here is whatever the row
+        holds *at projection time* rather than at event time. The practical
+        consequence: text stored after a node was projected is not indexed
+        until that node is projected again or ``projector rebuild fts`` runs.
+        The ingestion pipeline is written to call
+        :func:`nodum.assets.set_extracted_text` **before** it creates the
+        ``asset_ref`` node precisely so the first projection already sees it.
+
+        The props value comes from an event payload, where it is the raw JSON
+        *string* of the ``nodes.props`` column, so it is decoded defensively:
+        a replay must not be stopped by one malformed row, and a node
+        referencing a hash that was never registered simply contributes
+        nothing.
         """
-        return ""
+        props = node.get("props")
+        if isinstance(props, str):
+            try:
+                props = json.loads(props)
+            except ValueError:
+                return ""
+        if not isinstance(props, dict):
+            return ""
+        asset_hash = props.get("asset_hash")
+        if not isinstance(asset_hash, str) or not asset_hash:
+            return ""
+        row = conn.execute(
+            "SELECT extracted_text FROM assets WHERE hash = ?", (asset_hash,)
+        ).fetchone()
+        if row is None or row["extracted_text"] is None:
+            return ""
+        return str(row["extracted_text"])
 
 
 class VecProjector(Projector):

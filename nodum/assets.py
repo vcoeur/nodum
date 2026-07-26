@@ -19,18 +19,36 @@ whole duration, so a very large registration blocks other writers.
 Renditions (§5.7) are derived, regenerable WebP images keyed by
 ``sha256(asset_hash + ':' + profile)``, lazily generated on first request,
 stored as bytes in the ``renditions`` table, and evictable via
-:func:`purge_renditions`. Two profiles exist (``thumb``, ``preview``);
-``page:<n>`` PDF rasters are Phase 4. **LLMs never receive original
-binaries** — the MCP server serves renditions and metadata only.
+:func:`purge_renditions`. Three profile shapes resolve (:func:`resolve_profile`):
+the static ``thumb`` and ``preview``, which require an image asset, and
+``page:<n>`` — a 1-based page of a PDF, rasterised at :data:`PAGE_DPI` and
+then encoded down the *same* WebP path, so a page and a photograph share
+their quality-stepping and size behaviour. A raster is an ordinary rendition
+row: same id scheme, same lazy generation, same cache, same eviction.
+**LLMs never receive original binaries** — the MCP server serves renditions
+and metadata only.
+
+``pypdfium2`` is the rasteriser because it is the maintained Python binding to
+a production PDF engine (PDFium, the one in Chrome) that ships permissively
+licensed wheels — Apache-2.0/BSD, no system package to install anywhere.
+PyMuPDF renders at least as well and was rejected on its licence alone: AGPL
+would reach anything that embeds nodum. The import happens lazily inside
+:func:`_render_pdf_page` and the dependency sits behind the ``pdf`` extra, so
+an install without it still serves image renditions and answers a page request
+with an :class:`UnsupportedRendition` naming the extra rather than an
+``ImportError`` at startup.
 
 Rendering is bounded by pixel count, not just by file size: a decompression
 bomb is a small file whose *decode* is enormous, so :data:`MAX_IMAGE_PIXELS`
 is checked from the image header — before any decoding — both when a caller
 offers bytes (:func:`check_image_pixel_budget`) and when a stored original is
-about to be rendered (:func:`_prepare_image`). :func:`sniff_image_mime` is the
-matching "what is this really" helper: registration records the MIME
-``mimetypes`` derives from the *name*, which is fine for a local file the
-operator chose and useless against a network upload.
+about to be rendered (:func:`_prepare_image`). A page raster has no header to
+read, so its budget is arithmetic instead: the bitmap PDFium allocates is the
+page geometry times the DPI scale, and PDF permits a 200×200 inch page, which
+is 829 megapixels at 144 DPI. :func:`sniff_image_mime` is the matching "what
+is this really" helper: registration records the MIME ``mimetypes`` derives
+from the *name*, which is fine for a local file the operator chose and useless
+against a network upload.
 
 **Access: an asset is as reachable as its describing nodes.** Asset rows are
 keyed by sha256 and deduped globally, so a ``space_id`` column here could only
@@ -55,6 +73,7 @@ import hashlib
 import io
 import json
 import mimetypes
+import re
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
@@ -105,7 +124,13 @@ class AssetNotFound(LookupError):
 
 
 class UnsupportedRendition(ValueError):
-    """Raised when a rendition cannot be produced (unknown profile or non-image asset)."""
+    """Raised when a rendition cannot be produced.
+
+    Covers every "this request has no answer" case: an unknown profile name, a
+    profile that does not match the asset's kind, a page past the end of a PDF,
+    unreadable bytes, and the absent ``pypdfium2`` backend — all of which are
+    the caller's request being unserviceable, not the server failing.
+    """
 
 
 class AssetTooLarge(ValueError):
@@ -146,18 +171,78 @@ class Profile:
     target_bytes: int | None = None
 
 
-#: The Phase-2 rendition profiles (design §5.7). ``page:<n>`` rasters are
-#: Phase 4; ``full`` is never a rendition — originals are HTTP-API-only.
+#: The static rendition profiles (design §5.7), the ones that name a whole
+#: asset. ``page:<n>`` is the parameterised third (:data:`PAGE_PROFILE`) and
+#: cannot live here because its page number is part of the name; ``full`` is
+#: never a rendition — originals are HTTP-API-only.
 PROFILES = {
     "thumb": Profile(max_edge=256, quality=75),
     "preview": Profile(max_edge=1024, quality=80, target_bytes=300_000),
 }
+
+#: The ``page:<n>`` rendition name, capturing a **1-based** page number.
+#: ``page:0`` is not a page and deliberately fails to match, as does
+#: ``page:01`` — one spelling per page, or two names would key two rendition
+#: rows onto the same bitmap.
+PAGE_PROFILE_RE = re.compile(r"^page:([1-9]\d*)$")
+
+#: Rasterisation resolution for ``page:<n>`` (design §5.7).
+#:
+#: A PDF canvas unit is 1/72 inch, so 144 DPI is exactly 2× the page's own
+#: coordinate space: 9 pt body text lands ~18 px tall, which is about the floor
+#: at which a vision model reads a page rather than merely recognising its
+#: layout. 216 DPI would buy legibility very little and cost 2.25× the pixels,
+#: and every one of those pixels is paid for again as tokens.
+PAGE_DPI = 144
+
+#: Geometry and encoding for every ``page:<n>`` raster.
+#:
+#: ``max_edge`` 1568 — at :data:`PAGE_DPI` a US-Letter page renders 1224×1584
+#: and A4 1191×1684, so the cap sits right at the long edge of an ordinary
+#: page and barely bites; above it, current vision models downscale the image
+#: themselves, so the extra pixels are transferred and then thrown away.
+#: An outsized page is shrunk to fit rather than refused (only the pixel budget
+#: refuses).
+#: ``quality`` 85, one notch above ``preview``'s 80 — a page is hard-edged
+#: glyphs on white, which is the first thing WebP's chroma handling smears.
+#: ``target_bytes`` 500 KB ≈ ``preview``'s 300 KB scaled by the pixel ratio
+#: (a letter page at the cap is ~1.9 MP against ``preview``'s ~1.05 MP), so
+#: bytes-per-pixel stays comparable across profiles; a photographic scan walks
+#: the same quality ladder down that an oversized ``preview`` does.
+PAGE_PROFILE = Profile(max_edge=1568, quality=85, target_bytes=500_000)
 
 #: Fallback qualities tried *below* a profile's nominal quality when its
 #: ``target_bytes`` cap is not met. The ladder an encode actually walks always
 #: starts at the profile's own quality (see :func:`_encode_webp`), so a nominal
 #: value absent from this tuple is still the first encode attempted.
 _QUALITY_STEPS = (80, 70, 60, 50, 40, 30, 20)
+
+
+def resolve_profile(name: str) -> tuple[Profile, int | None]:
+    """Resolve a rendition profile name to its spec and, for a raster, its page.
+
+    Args:
+        name: ``thumb``, ``preview``, or ``page:<n>`` with a 1-based ``n``.
+
+    Returns:
+        ``(spec, None)`` for a static profile and ``(spec, n)`` for a page
+        raster. The page number is returned separately because it is the one
+        thing about the request a :class:`Profile` cannot carry — every page
+        of every PDF shares :data:`PAGE_PROFILE`.
+
+    Raises:
+        UnsupportedRendition: If the name is neither a static profile nor a
+            well-formed ``page:<n>``.
+    """
+    static = PROFILES.get(name)
+    if static is not None:
+        return (static, None)
+    match = PAGE_PROFILE_RE.match(name)
+    if match is not None:
+        return (PAGE_PROFILE, int(match.group(1)))
+    raise UnsupportedRendition(
+        f"unknown rendition profile: {name!r} (have: {', '.join(sorted(PROFILES))}, page:<n>)"
+    )
 
 
 def _connect(path: str | Path | None) -> sqlite3.Connection:
@@ -456,6 +541,43 @@ def get_asset(id_or_hash: str, *, principal: Principal, path: str | Path | None 
         conn.close()
 
 
+def set_extracted_text(
+    asset_hash: str, text: str | None, *, path: str | Path | None = None
+) -> None:
+    """Store (or clear) the text an extraction handler pulled out of an asset.
+
+    Takes no principal and writes no event, for the same reason registration
+    does neither (migration ``0007``'s comment): an asset row is
+    content-addressed base state, not graph state. There is nothing to undo —
+    the same bytes always resolve to the same row, and re-extracting them lands
+    the same text — and there is nobody to authorise against here, because
+    access to an asset is decided one level up, by the ``asset_ref`` nodes that
+    describe the hash (see the module docstring's access note). The ingestion
+    pipeline that calls this emits the single ``asset.ingest`` event covering
+    the whole run, of which the extraction is one step; a second event would
+    only say the same thing again, with bytes-derived text in its payload.
+
+    Args:
+        asset_hash: The asset's sha256.
+        text: The extracted text, or ``None`` to clear it (an extraction that
+            produced nothing is not the same as one that never ran).
+        path: Explicit database path; defaults to ``NODUM_DB`` resolution.
+
+    Raises:
+        AssetNotFound: If no asset row carries that hash.
+    """
+    conn = _connect(path)
+    try:
+        cursor = conn.execute(
+            "UPDATE assets SET extracted_text = ? WHERE hash = ?", (text, asset_hash)
+        )
+        if cursor.rowcount == 0:
+            raise AssetNotFound(f"asset not found: {asset_hash}")
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def list_assets(*, principal: Principal, path: str | Path | None = None) -> list[AssetOut]:
     """List the assets this principal can reach, in registration order."""
     conn = _connect(path)
@@ -530,9 +652,88 @@ def _prepare_image(original: sqlite3.Blob, profile: Profile) -> Image.Image:
         if transposed.mode not in ("RGB", "RGBA"):
             has_alpha = "A" in transposed.getbands() or "transparency" in transposed.info
             transposed = transposed.convert("RGBA" if has_alpha else "RGB")
-        # thumbnail() only ever shrinks — images under the cap keep their size.
-        transposed.thumbnail((profile.max_edge, profile.max_edge), Image.LANCZOS)
-        return transposed
+        return _downscale(transposed, profile)
+
+
+def _downscale(image: Image.Image, profile: Profile) -> Image.Image:
+    """Shrink an image to the profile's max edge, in place, and return it.
+
+    ``thumbnail()`` only ever shrinks, so an image already inside the cap keeps
+    its size: no rendition is ever an upscale of what it was derived from. Both
+    render paths — stored image and PDF page — end here, so the "never upscale"
+    rule has one home.
+    """
+    image.thumbnail((profile.max_edge, profile.max_edge), Image.LANCZOS)
+    return image
+
+
+def _render_pdf_page(original: sqlite3.Blob, page_number: int, profile: Profile) -> Image.Image:
+    """Rasterise one page of a stored PDF and return the downscaled image.
+
+    ``pypdfium2`` is imported here rather than at module scope so that an
+    install without the ``pdf`` extra still starts, still serves ``thumb`` and
+    ``preview``, and only fails — with a message naming the extra — on the one
+    request it genuinely cannot serve.
+
+    PDFium accepts any object with ``seek``/``tell``/``read``/``readinto`` and
+    reads the file on demand, so the PDF is streamed straight out of its blob
+    through :class:`_BlobReader`: a 200 MB scan is never held in memory whole,
+    and only the pages actually asked for are parsed.
+
+    Args:
+        original: Open blob handle on the stored PDF's bytes.
+        page_number: 1-based page to render.
+        profile: Geometry and encoding spec (:data:`PAGE_PROFILE`).
+
+    Returns:
+        The rendered page, downscaled to the profile's cap.
+
+    Raises:
+        UnsupportedRendition: If ``pypdfium2`` is not installed, the page
+            number is past the end of the document, or PDFium cannot parse
+            the stored bytes as a PDF.
+        ImageTooLarge: If the render would exceed :data:`MAX_IMAGE_PIXELS`.
+    """
+    try:
+        import pypdfium2
+    except ImportError as exc:
+        raise UnsupportedRendition(
+            f"cannot rasterise page {page_number}: pypdfium2 is not installed — "
+            "install the 'pdf' extra (pip install 'nodum[pdf]') to render PDF pages"
+        ) from exc
+
+    scale = PAGE_DPI / 72  # PDFium scales the page's own 1/72-inch canvas unit.
+    try:
+        document = pypdfium2.PdfDocument(io.BufferedReader(_BlobReader(original)))
+    except pypdfium2.PdfiumError as exc:
+        raise UnsupportedRendition(f"cannot render this PDF: {exc}") from exc
+    try:
+        page_count = len(document)
+        if page_number > page_count:
+            raise UnsupportedRendition(
+                f"page {page_number} is past the end of this PDF: it has {page_count} page(s)"
+            )
+        page = document[page_number - 1]
+        width_points, height_points = page.get_size()
+        width, height = round(width_points * scale), round(height_points * scale)
+        # PDFium allocates the whole bitmap before it draws a single glyph, so
+        # the pixel budget has to be spent up front, on arithmetic — there is no
+        # header to read and no partial decode to abandon. A 200×200 inch page
+        # (PDF's maximum) is 829 MP here, i.e. ~3.3 GB resident as RGBA.
+        if width * height > MAX_IMAGE_PIXELS:
+            raise ImageTooLarge(
+                f"page {page_number} renders {width}×{height} ({width * height} pixels) "
+                f"at {PAGE_DPI} DPI; the rendition limit is {MAX_IMAGE_PIXELS}"
+            )
+        image = _downscale(page.render(scale=scale).to_pil(), profile)
+        if image.mode not in ("RGB", "RGBA"):
+            image = image.convert("RGB")
+        # to_pil() can hand back a view onto PDFium's own buffer, which closing
+        # the document frees; copy while it is still valid. Only the downscaled
+        # image is copied, so the cost is bounded by the profile, not the page.
+        return image.copy()
+    finally:
+        document.close()
 
 
 def _encode_webp(image: Image.Image, profile: Profile) -> bytes:
@@ -569,7 +770,8 @@ def get_rendition(
 
     Args:
         id_or_hash: Asset hash, or the id of a node with an ``asset_hash`` prop.
-        profile: ``thumb`` or ``preview`` (see :data:`PROFILES`).
+        profile: ``thumb`` or ``preview`` for an image asset (see
+            :data:`PROFILES`), or ``page:<n>`` for a 1-based page of a PDF.
         include_data: Embed the WebP bytes as base64 in the result (the MCP
             path); otherwise only metadata is returned and the stored bytes
             are never read.
@@ -582,22 +784,29 @@ def get_rendition(
 
     Raises:
         AssetNotFound: If no asset the principal can reach resolves.
-        UnsupportedRendition: If the profile is unknown or the asset is not a
-            raster image Pillow can read.
+        UnsupportedRendition: If the profile is unknown, the profile does not
+            match the asset's kind (a page of a JPEG, a ``thumb`` of a PDF),
+            the page is past the end of the document, ``pypdfium2`` is not
+            installed, or the bytes are not something the renderer can read.
+        ImageTooLarge: If rendering would exceed :data:`MAX_IMAGE_PIXELS`.
     """
-    spec = PROFILES.get(profile)
-    if spec is None:
-        raise UnsupportedRendition(
-            f"unknown rendition profile: {profile!r} (have: {', '.join(sorted(PROFILES))})"
-        )
+    spec, page_number = resolve_profile(profile)
 
     conn = _connect(path)
     try:
         asset_hash = _resolve_hash(conn, id_or_hash, principal)
         asset = conn.execute("SELECT * FROM assets WHERE hash = ?", (asset_hash,)).fetchone()
-        if not asset["mime"].startswith("image/"):
+        # Each profile family declares the one asset kind it can read, so a
+        # mismatch says which kind was expected rather than "not an image".
+        if page_number is not None:
+            if asset["mime"] != "application/pdf":
+                raise UnsupportedRendition(
+                    f"page rasters are only supported for PDF assets, got {asset['mime']}"
+                )
+        elif not asset["mime"].startswith("image/"):
             raise UnsupportedRendition(
-                f"renditions are only supported for image assets, got {asset['mime']}"
+                f"the {profile!r} rendition is only supported for image assets, "
+                f"got {asset['mime']} (a PDF renders through page:<n>)"
             )
 
         rid = rendition_id(asset_hash, profile)
@@ -614,7 +823,10 @@ def get_rendition(
 
         try:
             with open_original(conn, asset_hash) as original:
-                image = _prepare_image(original, spec)
+                if page_number is None:
+                    image = _prepare_image(original, spec)
+                else:
+                    image = _render_pdf_page(original, page_number, spec)
         except UnidentifiedImageError as exc:
             raise UnsupportedRendition(
                 f"cannot render {asset['mime']} ({asset['original_name']}): not a raster image"

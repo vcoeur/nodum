@@ -543,6 +543,62 @@ UPDATE edges    SET created_by = 'human:owner' WHERE created_by = 'human';
 """
 
 
+URL_TOKENS_DDL = """
+-- Short-lived capability URLs for the two escape hatches (design §5.7 rule 4,
+-- Phase 4 note 01 D4). An agent host that shares no filesystem with the graph
+-- needs a way to fetch an original and a way to hand bytes back; these rows
+-- are that authority, and the event log records every one of them.
+--
+-- A token is a **random secret whose sha-256 is stored** — a capability, not
+-- an HMAC signature, and the difference is the whole reason this table exists.
+-- A signed URL moves the authority into a key that has to be generated,
+-- stored, rotated, and kept out of every backup and log, and it is valid until
+-- it expires and not one moment less: revoking one, or spending one, means a
+-- table of ids anyway. Here the row *is* the authority. Expiry, single use and
+-- revocation are all one UPDATE on it, there is no key to manage, and a
+-- database read leak hands out no usable URL because the secret was never
+-- written down. This is exactly how `nodum.auth` stores agent tokens, and it
+-- reuses that module's generator and hash.
+--
+-- `used_at` is the single-use latch: NULL means live, and redemption is one
+-- `UPDATE … WHERE used_at IS NULL AND expires_at > datetime('now')` whose
+-- rowcount decides the outcome. Two concurrent redemptions of the same URL
+-- therefore cannot both win — a read-then-write would let them.
+--
+-- **No foreign keys, deliberately.** An upload's `asset_hash` is what the
+-- caller *declares* it is about to send, so by definition no `assets` row
+-- exists for it yet; and a FK on `space_id` would let an expiring capability
+-- block a graph write (an undo deleting a space node) minutes after anyone
+-- cared about it. These rows are transient authority, not graph structure —
+-- the event log is where a mint and a redemption are recorded for good.
+CREATE TABLE url_tokens (
+    id            TEXT PRIMARY KEY,     -- public handle; payloads name this, never the secret
+    token_hash    TEXT NOT NULL UNIQUE, -- sha-256 of the secret, which is never stored
+    kind          TEXT NOT NULL CHECK (kind IN ('download','upload')),
+    asset_hash    TEXT,                 -- download: the target; upload: the declared hash or NULL
+    original_name TEXT,                 -- upload: the name the bytes claim
+    mime          TEXT,                 -- upload: the declared type
+    max_bytes     INTEGER,              -- upload: the declared size, the ceiling on the body
+    space_id      TEXT,                 -- upload: where the describing node is meant to land
+    created_by    TEXT NOT NULL,        -- actor string; a redemption is attributed to it too
+    expires_at    TEXT NOT NULL,        -- datetime('now', …): UTC, like every other timestamp
+    used_at       TEXT,                 -- NULL until redeemed — the single-use latch
+    created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+    -- A download token with no target, or an upload with no ceiling, is a
+    -- grant to nothing in particular. Refuse it in the schema rather than
+    -- discovering it at redemption, when the caller is a stranger with bytes.
+    CHECK (kind != 'download' OR asset_hash IS NOT NULL),
+    CHECK (kind != 'upload' OR max_bytes IS NOT NULL)
+);
+
+-- Redemption keys on `token_hash`, which UNIQUE already indexes; nothing else
+-- is looked up by anything else. This index is for the sweep: a token nobody
+-- ever comes back for expires unnoticed otherwise, exactly as sessions did
+-- before `create_session` started sweeping them (Q13 review N7).
+CREATE INDEX idx_url_tokens_expires ON url_tokens(expires_at);
+"""
+
+
 #: Ordered (name, SQL) migrations. Append-only — never edit a shipped entry.
 MIGRATIONS: list[tuple[str, str]] = [
     ("0001_core", CORE_DDL),
@@ -556,4 +612,5 @@ MIGRATIONS: list[tuple[str, str]] = [
     ("0009_spaces_and_type_nodes", SPACES_AND_TYPE_NODES_DDL),
     ("0010_principals", PRINCIPALS_DDL),
     ("0011_actor_strings", ACTOR_STRINGS_DDL),
+    ("0012_url_tokens", URL_TOKENS_DDL),
 ]

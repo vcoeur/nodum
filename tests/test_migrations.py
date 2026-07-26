@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+from pathlib import Path
 
 import pytest
 from helpers import owner
@@ -21,6 +22,23 @@ CORE_TABLES = {
 
 #: The type catalogs became type-nodes in 0009 (Q13) — the tables must be gone.
 DROPPED_TABLES = {"types", "edge_types"}
+
+
+def test_no_test_can_reach_the_developers_own_database(monkeypatch):
+    """The suite migrates whatever database it resolves, so an unset `NODUM_DB`
+    is not a harmless fallback — it is an unreleased migration applied to a
+    live graph. That happened during the phase-4 build: `monkeypatch.undo()`
+    undoes the `NODUM_DB` patch `fresh_db` made along with everything else, and
+    three asset tests then asserted against `~/.local/share/nodum/nodum.db`.
+    `conftest._never_the_real_database` removes the reachable path entirely;
+    this is the assertion that it stays removed.
+    """
+    monkeypatch.delenv(db.ENV_DB_VAR, raising=False)
+
+    resolved = db.db_path()
+
+    assert resolved != Path("~/.local/share/nodum/nodum.db").expanduser()
+    assert not resolved.is_relative_to(Path.home() / ".local")
 
 
 def test_init_drops_the_type_catalog_tables(fresh_db):
@@ -197,6 +215,117 @@ def test_init_refuses_a_database_carrying_the_stale_path_based_0007(tmp_path, mo
     try:
         with pytest.raises(db.SchemaConsistencyError, match="asset_blobs"):
             db.init_db(conn)
+    finally:
+        conn.close()
+
+
+# ── 0012: the capability-token table ─────────────────────────────────────────
+
+
+def test_the_migration_list_is_ordered_and_numbered_without_gaps():
+    """Append-only means the tail is the only place a new entry may land."""
+    names = [name for name, _ in MIGRATIONS]
+    assert names == sorted(names)
+    assert [name.split("_")[0] for name in names] == [
+        f"{number:04d}" for number in range(1, len(names) + 1)
+    ]
+    assert "0012_url_tokens" in names
+
+
+def test_url_tokens_exists_on_a_database_built_from_scratch(fresh_db):
+    conn = db.connect()
+    try:
+        assert "0012_url_tokens" in db.applied_migrations(conn)
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(url_tokens)")}
+        assert columns == {
+            "id",
+            "token_hash",
+            "kind",
+            "asset_hash",
+            "original_name",
+            "mime",
+            "max_bytes",
+            "space_id",
+            "created_by",
+            "expires_at",
+            "used_at",
+            "created_at",
+        }
+    finally:
+        conn.close()
+
+
+def test_0012_applies_to_a_populated_database_already_at_0011(tmp_path, monkeypatch):
+    """The upgrade path, not just the fresh-file one: 0011 is where users are."""
+    monkeypatch.setenv("NODUM_DB", str(tmp_path / "at0011.db"))
+    monkeypatch.setattr(db, "MIGRATIONS", _prefix_through("0011_actor_strings"))
+    service.init()
+    node = service.create_node(type="note", title="before the upgrade", principal=owner())
+
+    monkeypatch.setattr(db, "MIGRATIONS", MIGRATIONS)
+    conn = db.connect()
+    try:
+        assert db.init_db(conn) == ["0012_url_tokens"]
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+        conn.execute(
+            "INSERT INTO url_tokens (id, token_hash, kind, asset_hash, created_by, expires_at)"
+            " VALUES ('t1', 'h1', 'download', 'deadbeef', 'human:owner',"
+            " datetime('now', '+300 seconds'))"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    # And the graph it was applied over is untouched.
+    assert service.get_node(node.id, principal=owner()).title == "before the upgrade"
+
+
+@pytest.mark.parametrize(
+    ("columns", "values", "match"),
+    [
+        (
+            "id, token_hash, kind, created_by, expires_at",
+            "'t', 'h', 'sideways', 'human:owner', datetime('now')",
+            "CHECK",
+        ),
+        (
+            "id, token_hash, kind, created_by, expires_at",
+            "'t', 'h', 'download', 'human:owner', datetime('now')",
+            "CHECK",
+        ),
+        (
+            "id, token_hash, kind, created_by, expires_at",
+            "'t', 'h', 'upload', 'human:owner', datetime('now')",
+            "CHECK",
+        ),
+    ],
+    ids=["unknown kind", "download without a target", "upload without a ceiling"],
+)
+def test_a_token_row_that_grants_nothing_in_particular_is_refused(fresh_db, columns, values, match):
+    """Discovering it at redemption means discovering it with a stranger waiting."""
+    conn = db.connect()
+    try:
+        with pytest.raises(sqlite3.IntegrityError, match=match):
+            conn.execute(f"INSERT INTO url_tokens ({columns}) VALUES ({values})")
+    finally:
+        conn.close()
+
+
+def test_one_token_hash_cannot_be_shared_by_two_rows(fresh_db):
+    """Redemption keys on the hash; two rows behind one secret is ambiguity."""
+    conn = db.connect()
+    try:
+        for token_id in ("t1", "t2"):
+            insert = (
+                "INSERT INTO url_tokens (id, token_hash, kind, asset_hash, created_by, expires_at)"
+                f" VALUES ('{token_id}', 'same-hash', 'download', 'deadbeef', 'human:owner',"
+                " datetime('now', '+300 seconds'))"
+            )
+            if token_id == "t1":
+                conn.execute(insert)
+            else:
+                with pytest.raises(sqlite3.IntegrityError, match="UNIQUE"):
+                    conn.execute(insert)
+        conn.commit()
     finally:
         conn.close()
 
