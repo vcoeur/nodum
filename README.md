@@ -233,6 +233,10 @@ degrades to BM25 + graph expansion. `NODUM_EMBED_MODEL` switches the model
   non-loopback bind is allowed — login, not the bind, is the boundary — and
   marks the cookie `Secure` there. `nodum human passwd` sets the password;
   logout, expiry, and `human disable` kill the session at the next request.
+  Account and grant administration is on the API too — `GET /api/me`,
+  `/api/humans`, `/api/agents` (the show-once token comes back in the
+  create/token-rotate body) and `/api/grants` mirror the CLI's
+  `human`/`agent`/`grant`/`revoke`/`grants` commands.
 - **Uploads are images only, and bounded.** `POST /api/assets` caps the request
   body before anything buffers it (32 MiB), identifies the type from the bytes
   rather than the filename, and refuses an image whose pixel count would make

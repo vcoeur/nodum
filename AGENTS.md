@@ -429,6 +429,15 @@ Phase-1 decision log.
   satisfy every origin check with three curl headers, so it may *attempt* a
   login — the human's password is the whole defence there, and the `serve`
   banner says so.
+- **Account and grant administration is on the API too.** `GET /api/me`
+  returns the session's human; `/api/humans`, `/api/agents` and `/api/grants`
+  mirror the CLI's `human`/`agent`/`grant`/`revoke`/`grants` commands — thin
+  delegates over the service's human-only admin surface, with disable/enable
+  and password/rotate as verb-POSTs (`/api/humans/{id}/password`,
+  `/api/agents/{id}/token-rotate`, …) in the `/api/nodes/{id}/archive` style.
+  Agent creation over HTTP is external-kind and owned by the session's human;
+  the show-once token comes back in the create and token-rotate response
+  bodies, since HTTP has no stderr to print it to the way the CLI does.
 - **A wrong verb on a real route is a 405 with an `Allow` header**, not the
   catch-all's 404. The catch-all claims every method so a `fetch` never gets
   HTML, which also means it out-matches a real route's 405 unless it asks the

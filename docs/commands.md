@@ -133,6 +133,11 @@ bind is allowed: login, not the bind, is the boundary, and the session cookie
 gains `Secure` there. `serve` prints the database path on stderr and
 translates a port already in use into the contract's exit 1.
 
+Account and grant administration is on the API as well: `GET /api/me` returns
+the session's human, and `/api/humans`, `/api/agents` and `/api/grants`
+mirror the CLI's `human`/`agent`/`grant`/`revoke`/`grants` commands — the
+show-once agent token comes back in the create/token-rotate response body.
+
 ```sh
 nodum serve [--host 127.0.0.1] [--port 8600] [--allow-host NAME] [--db PATH]
 ```
