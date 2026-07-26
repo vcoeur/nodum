@@ -10,7 +10,7 @@
  * - Field names are copied verbatim; do not camelCase them.
  *
  * Keep this file in lockstep with `nodum/models.py`. Mirrored against the
- * Phase-2 tree (migrations 0001–0008).
+ * principals tree (migrations 0001–0011).
  */
 
 /** Arbitrary JSON object, as `dict[str, Any]` dumps. */
@@ -316,6 +316,43 @@ export interface PurgeResult {
   bytes_freed: number;
 }
 
+/** A grant level, weakest to strongest (the server's `GRANT_LEVEL_NAMES`). */
+export type GrantLevel = "read" | "suggest" | "edit";
+
+/** A human account (identity + credentials + attribution, never a scope). */
+export interface HumanOut {
+  id: string;
+  name: string;
+  has_password: boolean;
+  disabled: boolean;
+  created_at: string;
+}
+
+/** An agent account. `has_token` is all anyone ever learns of the token. */
+export interface AgentOut {
+  id: string;
+  kind: string;
+  name: string;
+  owner_human_id: string | null;
+  has_token: boolean;
+  disabled: boolean;
+  created_at: string;
+}
+
+/** A new agent plus its token — the one and only time the token is shown. */
+export interface AgentCreatedOut {
+  agent: AgentOut;
+  token: string;
+}
+
+/** One (agent, space) grant row. */
+export interface GrantOut {
+  agent_id: string;
+  space_id: string;
+  level: string;
+  created_at: string;
+}
+
 /* ------------------------------------------------------------------ */
 /* Shapes the HTTP surface adds on top of models.py                     */
 /* ------------------------------------------------------------------ */
@@ -326,6 +363,24 @@ export interface HealthOut {
   version?: string;
   db_path?: string;
   [key: string]: unknown;
+}
+
+/** `POST /api/login` — the session's human id; the cookie does the rest. */
+export interface LoginOut {
+  human: string;
+}
+
+/** `POST /api/agents/{id}/token-rotate` — the replacement token, shown once. */
+export interface RotatedTokenOut {
+  agent_id: string;
+  token: string;
+}
+
+/** `POST /api/agents/{id}/disable|enable` — the new disabled flag. */
+export interface AgentStateOut {
+  ok: boolean;
+  agent_id: string;
+  disabled: boolean;
 }
 
 /**
@@ -455,4 +510,21 @@ export interface AcceptProposalsBody {
 export interface RejectProposalsBody {
   ids: string[];
   reason: string;
+}
+
+/**
+ * Body for `POST /api/grants` (mirrors `service.grant`).
+ *
+ * `space` accepts a space id or title — the picker sends the id.
+ */
+export interface SetGrantBody {
+  agent: string;
+  space: string;
+  level: GrantLevel;
+}
+
+/** Body for `POST /api/grants/revoke` (mirrors `service.revoke`). */
+export interface RevokeGrantBody {
+  agent: string;
+  space: string;
 }

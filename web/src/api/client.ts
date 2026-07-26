@@ -11,12 +11,14 @@
  * - errors are `{"error": {"type", "message"}}` with a non-2xx status and are
  *   raised as {@link ApiError};
  * - writes never carry an actor. The HTTP surface *is* the human surface and
- *   forces `actor="human"` server-side; a client-supplied actor would be
- *   ignored, so this client never sends one;
+ *   binds the session's principal server-side; a client-supplied identity
+ *   would be ignored, so this client never sends one;
  * - every write carries `Content-Type: application/json` (or multipart, for an
  *   upload), because the server refuses anything else — see {@link rawRequest};
- * - the optional bearer token is adopted from `#token=…` on first load — see
- *   {@link adoptToken}.
+ * - auth is the session cookie, which the browser attaches to every same-origin
+ *   request on its own — there is no token in this file. A 401 from any route
+ *   but login means the session is gone and is reported through
+ *   {@link reportUnauthorized} for the app shell to turn into a redirect.
  *
  * The endpoints themselves land with the API slice; this file is the contract
  * the view slices code against.
@@ -24,6 +26,9 @@
 
 import type {
   AcceptProposalsBody,
+  AgentCreatedOut,
+  AgentOut,
+  AgentStateOut,
   ApiErrorBody,
   AssetOut,
   BatchTransitionOut,
@@ -34,8 +39,11 @@ import type {
   EdgeOut,
   EdgeTypeOut,
   EventOut,
+  GrantOut,
   HealthOut,
+  HumanOut,
   JsonObject,
+  LoginOut,
   NodeFilters,
   NodeOut,
   PathOut,
@@ -43,8 +51,11 @@ import type {
   RejectProposalsBody,
   RenditionProfile,
   ReviewQueueFilters,
+  RevokeGrantBody,
+  RotatedTokenOut,
   SearchFilters,
   SearchResult,
+  SetGrantBody,
   SubgraphOut,
   SubgraphParams,
   TypeOut,
@@ -53,6 +64,7 @@ import type {
   UpdateNodeBody,
   VersionOut,
 } from "./types";
+import { reportUnauthorized } from "../lib/session";
 
 /** Prefix every API route carries. `/healthz` sits outside it, by design. */
 export const API_BASE = "/api";
@@ -86,61 +98,6 @@ export class ApiError extends Error {
     return this.status === 503;
   }
 }
-
-/** Where a token picked out of the URL is kept for the rest of the session. */
-const TOKEN_STORAGE_KEY = "nodum.authToken";
-
-/** Optional bearer token, for the LAN case (`nodum serve --token`). */
-let authToken: string | null = null;
-
-/**
- * Set (or clear) the bearer token sent with every request.
- *
- * @param token The token, or null to send no `Authorization` header.
- */
-export function setAuthToken(token: string | null): void {
-  authToken = token;
-  try {
-    if (token === null) sessionStorage.removeItem(TOKEN_STORAGE_KEY);
-    else sessionStorage.setItem(TOKEN_STORAGE_KEY, token);
-  } catch {
-    // Private mode, or storage disabled: the in-memory token still works for
-    // this page load, which is better than refusing to run.
-  }
-}
-
-/**
- * Adopt a token from `#token=…` in the URL, then from session storage.
- *
- * `nodum serve --token X` prints `http://host:port/#token=X`; opening that link
- * is how the token reaches the app. Before this existed `setAuthToken` had no
- * caller at all, so `--token` produced a UI in which every request was a 401
- * and no view could load — an auth mode where the product did not work.
- *
- * The token travels in the **fragment**, which browsers never put on the wire:
- * it stays out of the server's access log, out of `Referer`, and out of any
- * proxy in between — none of which is true of a query parameter. It is moved
- * into session storage (per tab, dropped when the tab closes) and stripped from
- * the address bar immediately, so a reload or a bookmark does not carry it.
- */
-function adoptToken(): void {
-  if (typeof window === "undefined") return;
-  const fragment = window.location.hash.replace(/^#/, "");
-  const fromUrl = new URLSearchParams(fragment).get("token");
-  if (fromUrl) {
-    setAuthToken(fromUrl);
-    const { pathname, search } = window.location;
-    window.history.replaceState(null, "", `${pathname}${search}`);
-    return;
-  }
-  try {
-    authToken = sessionStorage.getItem(TOKEN_STORAGE_KEY);
-  } catch {
-    authToken = null;
-  }
-}
-
-adoptToken();
 
 /**
  * Build a query string, dropping undefined/null and repeating array values.
@@ -206,7 +163,6 @@ interface RequestOptions {
  */
 async function rawRequest<T>(path: string, options: RequestOptions = {}): Promise<T> {
   const headers: Record<string, string> = { Accept: "application/json" };
-  if (authToken) headers.Authorization = `Bearer ${authToken}`;
 
   const method = options.method ?? "GET";
   let body: BodyInit | undefined;
@@ -227,7 +183,15 @@ async function rawRequest<T>(path: string, options: RequestOptions = {}): Promis
   if (body !== undefined) init.body = body;
   if (options.signal) init.signal = options.signal;
 
+  // The session cookie rides along by default (`credentials: "same-origin"` is
+  // the fetch default and the app is same-origin — the dev proxy included), so
+  // there is nothing to set here. What this client must do about auth is react
+  // to its absence: a 401 from any route but login means the session is gone,
+  // and the one correct reaction is the login view, which only the shell can
+  // navigate to. Login itself is exempt — a 401 there is a wrong password,
+  // which the login form renders.
   const response = await fetch(path, init);
+  if (response.status === 401 && path !== `${API_BASE}/login`) reportUnauthorized();
   if (!response.ok) throw await toApiError(response);
   if (response.status === 204) return undefined as T;
   return (await response.json()) as T;
@@ -264,6 +228,125 @@ async function requestList<T>(
     );
   }
   return items as T[];
+}
+
+/* ------------------------------------------------------------------ */
+/* Session + accounts                                                   */
+/* ------------------------------------------------------------------ */
+
+/**
+ * `POST /api/login` — password login, the one route outside the session gate.
+ *
+ * The response body only names the human; the credential is the `HttpOnly`
+ * cookie the server sets, which this app never reads. A wrong name or password
+ * is a 401 — and deliberately indistinguishable between the two.
+ */
+export function login(name: string, password: string, signal?: AbortSignal): Promise<LoginOut> {
+  return request<LoginOut>("/login", {
+    method: "POST",
+    body: { name, password },
+    ...(signal ? { signal } : {}),
+  });
+}
+
+/** `POST /api/logout` — drop the server-side session row and clear the cookie. */
+export function logout(signal?: AbortSignal): Promise<{ status: string }> {
+  return request<{ status: string }>("/logout", {
+    method: "POST",
+    ...(signal ? { signal } : {}),
+  });
+}
+
+/** `GET /api/me` — the session's own human account. */
+export function getMe(signal?: AbortSignal): Promise<HumanOut> {
+  return request<HumanOut>("/me", signal ? { signal } : {});
+}
+
+/** `GET /api/humans` — every human account. */
+export function listHumans(signal?: AbortSignal): Promise<HumanOut[]> {
+  return requestList<HumanOut>("humans", "/humans", signal ? { signal } : {});
+}
+
+/** `GET /api/agents` — every agent account. */
+export function listAgents(signal?: AbortSignal): Promise<AgentOut[]> {
+  return requestList<AgentOut>("agents", "/agents", signal ? { signal } : {});
+}
+
+/**
+ * `POST /api/agents` — create an external agent owned by the session's human.
+ *
+ * The token comes back in this body — the one and only place it is ever shown.
+ */
+export function createAgent(name: string, signal?: AbortSignal): Promise<AgentCreatedOut> {
+  return request<AgentCreatedOut>("/agents", {
+    method: "POST",
+    body: { name },
+    ...(signal ? { signal } : {}),
+  });
+}
+
+/**
+ * `POST /api/agents/{id}/token-rotate` — replace the token; the old one dies
+ * the moment the new one is issued. The new token is in this body and nowhere
+ * else.
+ */
+export function rotateAgentToken(id: string, signal?: AbortSignal): Promise<RotatedTokenOut> {
+  return request<RotatedTokenOut>(`/agents/${encodeURIComponent(id)}/token-rotate`, {
+    method: "POST",
+    ...(signal ? { signal } : {}),
+  });
+}
+
+/** `POST /api/agents/{id}/disable` — refuse the agent's token from now on. */
+export function disableAgent(id: string, signal?: AbortSignal): Promise<AgentStateOut> {
+  return request<AgentStateOut>(`/agents/${encodeURIComponent(id)}/disable`, {
+    method: "POST",
+    ...(signal ? { signal } : {}),
+  });
+}
+
+/** `POST /api/agents/{id}/enable` — re-admit a disabled agent's token. */
+export function enableAgent(id: string, signal?: AbortSignal): Promise<AgentStateOut> {
+  return request<AgentStateOut>(`/agents/${encodeURIComponent(id)}/enable`, {
+    method: "POST",
+    ...(signal ? { signal } : {}),
+  });
+}
+
+/** `GET /api/grants` — grant rows, optionally one agent's (`agent` filter). */
+export function listGrants(agent?: string, signal?: AbortSignal): Promise<GrantOut[]> {
+  return requestList<GrantOut>(
+    "grants",
+    `/grants${query({ agent })}`,
+    signal ? { signal } : {},
+  );
+}
+
+/** `POST /api/grants` — grant (or re-level) an agent's access to a space. */
+export function setGrant(body: SetGrantBody, signal?: AbortSignal): Promise<GrantOut> {
+  return request<GrantOut>("/grants", { method: "POST", body, ...(signal ? { signal } : {}) });
+}
+
+/** `POST /api/grants/revoke` — revoke an agent's grant on a space. */
+export function revokeGrant(
+  body: RevokeGrantBody,
+  signal?: AbortSignal,
+): Promise<{ ok: boolean; agent: string; space: string }> {
+  return request<{ ok: boolean; agent: string; space: string }>("/grants/revoke", {
+    method: "POST",
+    body,
+    ...(signal ? { signal } : {}),
+  });
+}
+
+/**
+ * `GET /api/spaces` — every active space, as `NodeOut` rows.
+ *
+ * Spaces are nodes in the meta space, which `/api/nodes` excludes; this is the
+ * grant-admin space picker's vocabulary.
+ */
+export function listSpaces(signal?: AbortSignal): Promise<NodeOut[]> {
+  return requestList<NodeOut>("spaces", "/spaces", signal ? { signal } : {});
 }
 
 /* ------------------------------------------------------------------ */
@@ -591,6 +674,19 @@ export function exportNode(
 
 /** Every endpoint, grouped for `import { api } from "../api/client"` ergonomics. */
 export const api = {
+  login,
+  logout,
+  getMe,
+  listHumans,
+  listAgents,
+  createAgent,
+  rotateAgentToken,
+  disableAgent,
+  enableAgent,
+  listGrants,
+  setGrant,
+  revokeGrant,
+  listSpaces,
   getHealth,
   getTypes,
   getSchema,

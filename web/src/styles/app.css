@@ -57,6 +57,15 @@
 
 .nd-header__status {
   margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: var(--nd-space-4);
+}
+
+/* The signed-in human's name, next to the logout button. */
+.nd-header__who {
+  font-size: var(--nd-text-xs);
+  color: var(--nd-text-muted);
 }
 
 /* --- Navigation ------------------------------------------------------- */

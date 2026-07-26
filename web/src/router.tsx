@@ -7,10 +7,14 @@ import { EmptyState, Spinner } from "./components";
 /**
  * Every route in the app, registered up front.
  *
- * Seven routes over six views: editor (blank and per-node), search, review,
- * graph (root picker and per-root), assets, and per-node history. `/` redirects
- * to `/search`, and anything unmatched renders {@link NotFoundView} rather than
- * a blank screen.
+ * Twelve routes over seven views: login, editor (blank and per-node), search,
+ * review, graph (root picker and per-root), assets, and per-node history. `/`
+ * redirects to `/search`, and anything unmatched renders {@link NotFoundView}
+ * rather than a blank screen.
+ *
+ * `/login` stands **outside** the app-shell route: the shell is the session
+ * gate that redirects to login, and a gate that contained the login page
+ * would gate it too. Everything under `/` passes the gate.
  *
  * Two properties this file is responsible for:
  *
@@ -29,6 +33,7 @@ import { EmptyState, Spinner } from "./components";
  * reload and a bookmark.
  */
 
+const LoginView = lazy(() => import("./views/login/LoginView"));
 const EditorView = lazy(() => import("./views/editor/EditorView"));
 const SearchView = lazy(() => import("./views/search/SearchView"));
 const ReviewView = lazy(() => import("./views/review/ReviewView"));
@@ -65,6 +70,8 @@ function NotFoundView() {
 }
 
 export const router = createBrowserRouter([
+  // The gate's destination. Outside the shell, which is what does the gating.
+  { path: "/login", element: lazyView(<LoginView />) },
   {
     path: "/",
     element: <App />,

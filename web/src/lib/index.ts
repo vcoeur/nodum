@@ -22,3 +22,6 @@ export {
   isUnreachable,
 } from "./failure";
 export type { FailureDescription, FailureKind } from "./failure";
+
+export { onUnauthorized, reportUnauthorized } from "./session";
+export type { UnauthorizedListener } from "./session";
