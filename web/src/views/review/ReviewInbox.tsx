@@ -21,11 +21,13 @@
  *
  * A section header therefore has to be able to name **any** space the queue
  * reports, including one that has since been archived and so left
- * `GET /api/spaces`. That name comes from `spaceNaming.ts` over two lists: the
- * shared active one and a review-local read of archived space nodes
- * (`useArchivedSpaces`), which runs only when a section actually needs it. The
- * shared endpoint stays active-only — it is the vocabulary behind every picker
- * in the app, and a retired space belongs in none of them.
+ * `GET /api/spaces`. That name comes from the shared `components/spaceNaming.ts`
+ * over two lists: the active one and a lazy read of archived space nodes
+ * (`components/useArchivedSpaces.ts`), which runs only when a section actually
+ * needs it. This queue was the first surface to need that and is no longer the
+ * only one — search, the editor and the graph inspector name spaces the same
+ * way. The shared endpoint stays active-only: it is the vocabulary behind every
+ * picker in the app, and a retired space belongs in none of them.
  *
  * Two deliberateness rules, chosen so that neither becomes a dialog people
  * learn to click through:
@@ -45,7 +47,16 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { Ref } from "react";
 import { api } from "../../api/client";
 import type { BatchTransitionOut, ProposalOut } from "../../api/types";
-import { EmptyState, Spinner, useSpaces, useToast } from "../../components";
+import {
+  EmptyState,
+  Spinner,
+  nameSpace,
+  unresolvedSpaceIds,
+  useArchivedSpaces,
+  useSpaces,
+  useToast,
+} from "../../components";
+import type { SpaceName } from "../../components";
 import { AcceptDialog } from "./AcceptDialog";
 import { RejectDialog } from "./RejectDialog";
 import { ProposalCard } from "./ProposalCard";
@@ -58,9 +69,6 @@ import {
 import type { AgentGroup, ProposalBatch, ProposalKind, SpaceSection } from "./grouping";
 import { formatAbsolute, formatRelative } from "../../lib";
 import { plural } from "./format";
-import { nameSpace, unresolvedSpaceIds } from "./spaceNaming";
-import type { SpaceName } from "./spaceNaming";
-import { useArchivedSpaces } from "./useArchivedSpaces";
 import { classifyFailure, failureMessage, useReviewQueue } from "./useReviewQueue";
 
 /** A destructive action waiting on confirmation. */
@@ -138,24 +146,27 @@ export function ReviewInbox() {
   // strip the queue to nothing.
   const withProposals = sections.filter((section) => section.total > 0);
   const selfGoverning = sections.filter((section) => section.kind === "self-governing");
-  // Stable between loads, so the memos below do not re-run on every render.
-  const knownSpaces = useMemo(() => spaceList.spaces ?? [], [spaceList.spaces]);
 
   // A section whose space no picker lists is a space that was archived while
-  // its proposals waited. The read that names it is review-local and lazy —
-  // see `useArchivedSpaces` for why the shared endpoint stays active-only.
+  // its proposals waited. The read that names it is lazy — see
+  // `useArchivedSpaces` for why the shared endpoint stays active-only.
+  //
+  // `spaceList.spaces` is passed through **null and all**: while the space list
+  // is in flight it is null, and reading that as an empty list would report
+  // every section here as unresolved and fire the archived read on a queue that
+  // needs nothing of the sort. `unresolvedSpaceIds` owns that rule.
   const unresolved = useMemo(
     () =>
       unresolvedSpaceIds(
         sections.map((section) => section.spaceId),
-        knownSpaces,
+        spaceList.spaces,
       ),
-    [sections, knownSpaces],
+    [sections, spaceList.spaces],
   );
   const archivedSpaces = useArchivedSpaces(unresolved.length > 0);
   const spaceName = useCallback(
-    (spaceId: string): SpaceName => nameSpace(spaceId, knownSpaces, archivedSpaces.spaces),
-    [knownSpaces, archivedSpaces.spaces],
+    (spaceId: string): SpaceName => nameSpace(spaceId, spaceList.spaces, archivedSpaces.spaces),
+    [spaceList.spaces, archivedSpaces.spaces],
   );
 
   const selectedProposals = useMemo(
@@ -489,7 +500,10 @@ function SpacePanel({
         <h2 className="nd-rv-space__name">
           {unreported ? (
             "Space not reported"
-          ) : name.kind === "unknown" ? (
+          ) : name.kind === "unknown" || name.kind === "pending" ? (
+            // The id is all this heading has, either because nothing names the
+            // space or because the list that would is still in flight. Mono
+            // either way; only the first of those gets a paragraph saying so.
             <span className="nd-mono" title={name.label}>
               {name.label}
             </span>

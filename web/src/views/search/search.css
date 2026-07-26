@@ -352,6 +352,13 @@
   color: var(--nd-text-faint);
 }
 
+/* The archived mark rides inside the chip, so it never becomes a second
+   column that shifts the type/state badges out of alignment down the list. */
+.nd-search-hit__space-mark {
+  margin-left: var(--nd-space-1);
+  vertical-align: baseline;
+}
+
 .nd-search-hit__title {
   font-size: var(--nd-text-md);
   font-weight: var(--nd-weight-medium);

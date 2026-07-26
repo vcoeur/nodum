@@ -21,9 +21,15 @@
  * since been archived or renamed therefore survives here and fails at the
  * write, which is the honest place for it to fail — silently rewriting it to
  * `main` would file the node somewhere the human never chose. The rule is
- * about silence rather than immutability: {@link clearWriteTarget} exists for
- * the one case where the human is the one retiring the space they are filing
- * into, and `/spaces` announces that reset both before the click and after it.
+ * about silence rather than immutability: {@link clearWriteTarget} is the one
+ * reset, and it has two callers, neither of them a correction behind anyone's
+ * back. `/spaces` calls it when the human retires the very space they are
+ * filing into — the second half of an act they just performed, announced both
+ * in the archive dialog before the click and in the toast after it. The shell
+ * calls it on **log out**, because this value is persisted per browser and not
+ * per session: without that, the next person to sign in on the same machine
+ * inherits a target they never set, which is D1a's failure across an account
+ * change rather than across a tab.
  *
  * Shaped after `session.ts`: a module-level value plus a subscriber set, so the
  * one piece of state has one owner and the shell, the editor and the `/spaces`
@@ -163,10 +169,14 @@ if (typeof window !== "undefined") {
 /**
  * Forget the stored target and fall back to `main`.
  *
- * The real caller is the `/spaces` screen: archiving the space you are
- * currently filing into leaves a target that no longer resolves, and resetting
- * it there is a visible act the human just performed rather than a silent
- * correction.
+ * Two callers, and the reason is the same both times — the human's own act, not
+ * a correction behind their back:
+ *
+ * - the `/spaces` screen, when archiving the space they are currently filing
+ *   into would otherwise leave a target that no longer resolves;
+ * - the app shell, on log out. The target is persisted in `localStorage`, which
+ *   is per browser rather than per session, so leaving it would hand the next
+ *   person to sign in on this machine a write target they never chose.
  */
 export function clearWriteTarget(): void {
   setWriteTarget(DEFAULT_WRITE_TARGET);

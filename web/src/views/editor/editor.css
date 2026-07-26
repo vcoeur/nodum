@@ -87,6 +87,13 @@
   white-space: nowrap;
 }
 
+/* Inside the "in <space>" chip rather than beside it, so the metadata line
+   keeps its reserved widths when a node turns out to live in a retired space. */
+.nd-editor__space-mark {
+  margin-left: var(--nd-space-1);
+  vertical-align: baseline;
+}
+
 .nd-editor__space-field {
   display: flex;
   align-items: center;

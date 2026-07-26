@@ -520,6 +520,23 @@ def test_the_cli_inherits_the_space_guards_from_the_service(fresh_db):
         ["space-create", "research", "--as", "owner"],
         ["space-rename", "research", "main", "--as", "owner"],
         ["node", "create", "--type", "space", "--title", "research", "--as", "owner"],
+        # A space belongs in meta; the generic create is the path that could
+        # put one anywhere else, and `--space` defaults to `main`.
+        ["node", "create", "--type", "space", "--title", "elsewhere", "--as", "owner"],
+        # fmt: off
+        [
+            "node",
+            "create",
+            "--type",
+            "space",
+            "--title",
+            "elsewhere",
+            "--space",
+            "main",
+            "--as",
+            "owner",
+        ],
+        # fmt: on
     ):
         result = runner.invoke(app, command)
         assert result.exit_code == 1, command
@@ -555,6 +572,34 @@ def test_an_archived_space_keeps_its_name_on_the_cli_too(fresh_db):
     reused = _run_json("space-create", "research", "--as", "owner")
     assert reused["title"] == "research"
     assert reused["id"] != created["id"]
+
+
+def test_a_grant_on_an_archived_space_is_inert_and_still_revocable_on_the_cli(fresh_db):
+    """`space-archive` promises the grants go inert; `grant-revoke` must reach them.
+
+    Both halves were wrong: the agent kept live authority over everything in the
+    space it could reach by node id, and `revoke` resolved active spaces only,
+    so there was no supported way to take the grant away at all.
+    """
+    created = _run_json("space-create", "research", "--as", "owner")
+    _run_json("agent", "create", "researcher", "--as", "owner")
+    _run_json("grant", "researcher", "research", "edit", "--as", "owner")
+    _run_json("space-archive", created["id"], "--as", "owner")
+
+    # The row survives so the human can see what is still delegated.
+    held = _run_json("grants", "--agent", "researcher", "--as", "owner")["grants"]
+    assert (created["id"], "edit") in {(row["space_id"], row["level"]) for row in held}
+
+    # Granting more is refused, in one line, naming the reason.
+    refused = runner.invoke(app, ["grant", "researcher", "research", "read", "--as", "owner"])
+    assert refused.exit_code == 1
+    assert "cannot grant on the archived space" in refused.output
+    assert "Traceback" not in refused.output
+
+    # And it can be revoked, by the space's name as well as by its id.
+    _run_json("revoke", "researcher", "research", "--as", "owner")
+    left = _run_json("grants", "--agent", "researcher", "--as", "owner")["grants"]
+    assert created["id"] not in {row["space_id"] for row in left}
 
 
 def test_space_list_reports_live_counts_and_grant_holders(fresh_db):

@@ -23,11 +23,21 @@ archive, with each space's live node count and grant holders.
 Reading a space and *seeing* one are different jobs, and the second has its own
 rule: **a surface states the space unless the filter already determined it.**
 Search names it per result under "Any space" and stays quiet under a narrowed
-one (`views/search/resultSpace.ts`), exactly as the state badge does. The review
-queue is where that gets harder — it has to name spaces `GET /api/spaces` does
-not list (archived, with proposals still waiting) and to admit that a
-cross-space edge filed under one space needs authority on two. It does both
-without touching the shared endpoint; see `views/review/spaceNaming.ts` and
+one (`views/search/resultSpace.ts`), exactly as the state badge does.
+
+Naming one is the harder half, because `GET /api/spaces` is **active-only by
+decision** — it is the vocabulary behind every picker, and a retired space
+belongs in none of them. Five surfaces still have to name a space that listing
+will not carry: the review queue (a space archived while its proposals waited),
+search, the editor's meta bar, the graph inspector, and `/admin`'s grant table
+(archiving makes a grant inert and keeps the row precisely so it can be
+revoked). They all go through `components/spaceNaming.ts` over two lists — the
+shared active one and `components/useArchivedSpaces.ts`, a lazy read of the
+archived space nodes in meta that fires only when something on screen actually
+needs it. `spaceLabel` is **not** that function: its fallback to the raw
+reference is a picker rule (a `<select>` must be able to render its own value)
+and prints a 32-hex id anywhere else. The review queue additionally has to admit
+that a cross-space edge filed under one space needs authority on two —
 `grouping.edgeCrossing`.
 
 ## Running it
@@ -75,20 +85,25 @@ file; the global config stays `node`.
 Covered today: `api/client.ts` (the unknown-space normalisation — the only
 logic in the file that is not a URL and a verb), `lib/time.ts`,
 `lib/failure.ts`, `lib/session.ts`, `lib/writeTarget.ts`,
-`components/spaceOptions.ts`, `views/failureRouting.ts`,
+`components/spaceOptions.ts`, `components/spaceNaming.ts`,
+`views/failureRouting.ts`,
 `views/graph/filters.ts`, `views/graph/graphElements.ts`,
 `views/graph/truncation.ts`, `views/history/unifiedDiff.ts`,
 `views/search/signals.ts`, `views/search/searchState.ts`,
 `views/search/spaceFailure.ts`, `views/review/grouping.ts`,
 `views/spaces/spaces.ts`, `views/admin/grants.ts`,
-`views/login/credentials.ts`, `views/editor/createOutcome.ts`,
+`views/search/resultSpace.ts`, `views/login/credentials.ts`,
+`views/editor/createOutcome.ts`,
 `views/editor/markdownRender.ts` + `views/editor/mermaidRender.ts` (the
 sanitising policies), and `views/editor/leftoverBuffer.ts`.
 
-`components/useSpaces.ts` is deliberately **not** in that list: it is a hook,
-and the harness renders nothing, so there is no honest way to drive it here.
-Its behaviour is verified by type-checking and in a browser, like every
-component.
+`components/useSpaces.ts` and `components/useArchivedSpaces.ts` are deliberately
+**not** in that list: they are hooks, and the harness renders nothing, so there
+is no honest way to drive them here. Their behaviour is verified by
+type-checking and in a browser, like every component — but the *rule* that
+decides whether the archived read fires at all is a plain function
+(`unresolvedSpaceIds`) with a test, precisely because getting it wrong is
+invisible until you watch the network panel.
 
 **The run pins `TZ` to `Asia/Kathmandu`, and this matters.** SQLite's
 `datetime('now')` is UTC with no zone marker, so the bug `lib/time.ts` fixes —
@@ -114,15 +129,15 @@ type-checking it and driving it in a browser.
 | `src/main.tsx`, `src/App.tsx`, `src/router.tsx` | entry, app shell (header, nav, toasts, crash boundary, health pill), route table |
 | `src/api/client.ts`, `src/api/types.ts` | the only `fetch` in the app, and the types mirroring `nodum/models.py` |
 | `src/lib/` | cross-view plain functions: timestamp parsing (`time.ts`), failure classification (`failure.ts`), the 401 broadcast (`session.ts`), and the sticky write target (`writeTarget.ts`, the one module here that also exports a hook) |
-| `src/components/` | shared React components: `NodeBadge`, `Toast`, `Spinner`, `EmptyState`, `ErrorBoundary`, `Modal`, plus the space filter and its two halves — `SpaceFilter.tsx`, `spaceOptions.ts` (the option vocabulary), `useSpaces.ts` (the `GET /api/spaces` read every space surface shares) |
+| `src/components/` | shared React components: `NodeBadge`, `Toast`, `Spinner`, `EmptyState`, `ErrorBoundary`, `Modal`, plus the whole space vocabulary — `SpaceFilter.tsx` with `spaceOptions.ts` (what a picker offers) and `useSpaces.ts` (the `GET /api/spaces` read every space surface shares), and `spaceNaming.ts` with `useArchivedSpaces.ts` (what a surface that *displays* a space calls it, including one the active listing does not carry) |
 | `src/styles/` | `tokens.css`, `base.css`, `primitives.css`, `app.css` |
 | `src/views/editor/` | CodeMirror-6 Markdown source editor, slash commands, `[[` autocomplete, live Mermaid preview, autosave, the write-target picker and the landing/refusal copy (`createOutcome.ts`) |
 | `src/views/search/` | query box, ranked hits, per-signal breakdown, signal grouping, the space filter + show-meta toggle in the URL (`searchState.ts`), refused-filter copy (`spaceFailure.ts`), when a row names its space (`resultSpace.ts`) |
-| `src/views/review/` | proposal queue grouped space → agent, per-kind cards, proposed-version diffs, self-governing space sections, cross-space edge marking (`grouping.edgeCrossing`), and naming a space the shared list cannot (`spaceNaming.ts` + `useArchivedSpaces.ts`) |
+| `src/views/review/` | proposal queue grouped space → agent, per-kind cards, proposed-version diffs, self-governing space sections, cross-space edge marking (`grouping.edgeCrossing`) |
 | `src/views/graph/` | Cytoscape subgraph render, filters, cross-space edge styling and far-endpoint dimming, path panel |
 | `src/views/assets/` | rendition grid, lightbox, uploader, thin JSON export |
 | `src/views/login/` | password login against `POST /api/login` |
-| `src/views/spaces/` | the space lifecycle: list with node counts and grant holders, create, rename, archive |
+| `src/views/spaces/` | the space lifecycle: list with node counts and grant holders, create, rename, archive — and `spaces.ts`'s `archiveConsequences`, the one place the archive dialog's promises are written, every line of which has to be something the server actually delivers |
 | `src/views/admin/` | accounts and grants administration, show-once token dialog |
 | `src/views/history/` | per-node version timeline and side-by-side diff |
 | `package.json`, `vite.config.ts`, `vitest.config.ts`, `tsconfig.json` | toolchain |
@@ -163,7 +178,12 @@ Conventions that hold across the tree:
 - **Never say a space does not exist.** Nothing user-facing may render "no such
   space", "does not exist", "unknown/missing/nonexistent space", or "not found"
   for a space failure — including by handing an `UnknownSpaceError` to
-  `describeFailure`, whose 404 body is *"The server has no record of …"*. The
+  `describeFailure` **or to `toast.showError`**, which formats an `ApiError` as
+  `type: message` and so renders the server's own *"UnknownSpace: unknown
+  space: research"* verbatim. That second trap is the easy one to miss: an
+  editor path that reports through a toast rather than an inline panel looks
+  nothing like a copy decision. `describeFailure`'s 404 body is *"The server
+  has no record of …"*. The
   server answers a space that was never created and a space the caller holds no
   grant on with **the same words on purpose**; copy that resolved the ambiguity
   would turn the filter into an existence oracle over spaces the reader cannot
@@ -182,13 +202,23 @@ Conventions that hold across the tree:
   file work into a space nobody chose if it is ever read without being
   displayed. `useWriteTarget()` is the subscription; anything calling
   `getWriteTarget()` without rendering the answer is the failure the module
-  exists to prevent.
+  exists to prevent. `clearWriteTarget()` is the one reset, with two callers:
+  `/spaces` when the human archives the space they are filing into, and the
+  shell on **log out** — the value is persisted per browser, not per session,
+  so leaving it would hand the next account a target it never chose.
 - **One space list.** `components/useSpaces.ts` is the shared
   `GET /api/spaces` read: the filter's vocabulary, the write-target picker, the
   grant picker, the review queue's self-governing sections, and `/spaces` all
   take it from there. It drops its list on failure rather than keeping a stale
   one, and exposes `error` for the one view that escalates (`/admin` cannot
   offer a grant without spaces to grant over) rather than degrades.
+  **It stays active-only.** A surface needing to name a retired space takes the
+  lazy `components/useArchivedSpaces.ts` instead; widening this endpoint would
+  put archived spaces into six pickers to fix a label on one screen. Pass
+  `spaces` to `nameSpace` / `unresolvedSpaceIds` **null and all** rather than
+  `?? []` — null means *not answered yet*, and reading it as "empty" is what
+  makes a screen claim nothing names a live space and fires the archived read
+  on a healthy file.
 - **Logic worth testing lives in a plain module, not in a component.** The
   harness is unit-only, so a rule that matters (a URL codec, a diff parser, a
   grant grid) goes in its own `.ts` with a `.test.ts` beside it, and the

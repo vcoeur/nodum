@@ -245,6 +245,10 @@ describe("a second tab", () => {
 
 describe("clearing", () => {
   it("returns to main and leaves nothing behind for the next session", async () => {
+    // The property the shell's log-out depends on: `localStorage` is per
+    // browser, not per session, so a target left behind is one the *next*
+    // person to sign in on this machine inherits and files their first note
+    // into. Reloading the module is exactly what a fresh page load does.
     const store = await freshStore();
     store.setWriteTarget("research");
 
@@ -253,6 +257,19 @@ describe("clearing", () => {
     expect(store.getWriteTarget()).toBe("main");
     expect(window.localStorage.getItem(KEY)).toBeNull();
     expect((await freshStore()).getWriteTarget()).toBe("main");
+  });
+
+  it("tells every subscriber, so nothing on screen keeps showing the old target", async () => {
+    // Clearing is announced rather than silent — the rule this module exists
+    // for is about silence, not immutability.
+    const store = await freshStore();
+    const seen: string[] = [];
+    const stop = store.onWriteTargetChange((target) => seen.push(target));
+    store.setWriteTarget("research");
+    store.clearWriteTarget();
+    stop();
+
+    expect(seen).toEqual(["research", "main"]);
   });
 });
 

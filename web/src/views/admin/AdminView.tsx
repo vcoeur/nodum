@@ -10,8 +10,15 @@
  * view adds no authority the CLI does not have.
  */
 
-import { useCallback, useEffect, useState } from "react";
-import { EmptyState, Spinner, useSpaces, useToast } from "../../components";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import {
+  EmptyState,
+  Spinner,
+  unresolvedSpaceIds,
+  useArchivedSpaces,
+  useSpaces,
+  useToast,
+} from "../../components";
 import { api } from "../../api/client";
 import type { AgentOut, GrantOut, HumanOut } from "../../api/types";
 import { describeFailure } from "../../lib";
@@ -88,6 +95,18 @@ export default function AdminView() {
   // too; a property access does not.
   const spaces = spaceList.spaces;
 
+  // A grant on an archived space is the one grant this screen is now *for*:
+  // archiving makes it inert but keeps the row precisely so a human can come
+  // here and revoke it for good, and the archive dialog says so. A row headed
+  // by a 32-hex id is that promise with the space's name filed off, so the
+  // lazy archived read names them — fired only when a grant actually points at
+  // a space `GET /api/spaces` no longer carries.
+  const unresolvedGrantSpaces = useMemo(
+    () => unresolvedSpaceIds((data?.grants ?? []).map((grant) => grant.space_id), spaces),
+    [data, spaces],
+  );
+  const archivedSpaces = useArchivedSpaces(unresolvedGrantSpaces.length > 0);
+
   const createAgent = () => {
     const name = newAgentName.trim();
     if (name === "") return;
@@ -163,6 +182,7 @@ export default function AdminView() {
                   agent={agent}
                   grants={data.grants}
                   spaces={spaces}
+                  archivedSpaces={archivedSpaces.spaces}
                   onChanged={load}
                   onToken={(agentName, token) => setFreshToken({ agentName, token })}
                 />

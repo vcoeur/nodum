@@ -18,31 +18,59 @@
  * filter, deliberately: a filtered dimension is implied, an unfiltered one is
  * rendered.
  *
+ * **And it names the space rather than printing its id.** The first version of
+ * this module ended in `spaceLabel`, whose fallback is the raw reference — so a
+ * hit in a space archived since it was written rendered as
+ * `in 4affabf6d856427886ad48570f5f6e20`, which is the sentence the exit
+ * criterion exists to prevent. It goes through the shared `nameSpace` now, over
+ * the active list *and* the lazy archived one, so an archived space is named and
+ * marked instead.
+ *
  * A hit whose `space_id` is null names nothing. The field is nullable because
  * the column is, and "space unknown" on a result row is a phrase with no
  * action behind it.
  */
 
-import { spaceLabel } from "../../components";
+import { nameSpace, spaceNameNote } from "../../components";
+import type { SpaceName } from "../../components";
 import type { NodeOut, SearchHit } from "../../api/types";
 
 /**
- * The space label a result row should show, or null when it should show none.
+ * The space a result row should name, or null when it should name none.
  *
  * @param hit One search hit, verbatim from the server.
- * @param spaces Active spaces, for resolving the id to a name; an empty list
- *   (or one still loading) falls back to the raw reference rather than
- *   rendering blank.
+ * @param active Active spaces, or null while `GET /api/spaces` is in flight —
+ *   passed through as null so the row shows the id rather than asserting that
+ *   no list names it.
+ * @param archived Archived space nodes, from the lazy read; empty until one is
+ *   needed.
  * @param spaceFilter The view's current space filter; `ANY_SPACE` (`""`) when
  *   the search spans every space in scope.
- * @returns The label to render, or null when the row states no space.
+ * @returns The resolved name, or null when the row states no space.
  */
-export function hitSpaceLabel(
+export function hitSpaceName(
   hit: SearchHit,
-  spaces: readonly NodeOut[],
+  active: readonly NodeOut[] | null,
+  archived: readonly NodeOut[],
   spaceFilter: string,
-): string | null {
+): SpaceName | null {
   if (spaceFilter !== "") return null;
   if (hit.space_id === null) return null;
-  return spaceLabel(spaces, hit.space_id);
+  return nameSpace(hit.space_id, active, archived);
+}
+
+/**
+ * The hover text for a row's space chip.
+ *
+ * A live space gets the one thing a scanner might want next — the filter that
+ * narrows to it. Anything else gets the shared note instead, because "narrow to
+ * this one" is advice the picker cannot take for a space it does not offer.
+ *
+ * @param name The row's resolved space name.
+ */
+export function hitSpaceTitle(name: SpaceName): string {
+  const note = spaceNameNote(name);
+  return note === null
+    ? `This node lives in the ${name.label} space. Narrow the space filter to read only that one.`
+    : `This node lives in ${name.label}. ${note}`;
 }

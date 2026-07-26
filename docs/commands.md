@@ -118,7 +118,11 @@ including every parameter.
 - `agent create/list/token-rotate/disable/enable` — Manage agent accounts
   (`create`/`token-rotate` print the show-once token to stderr).
 - `grant <agent> <space> <level>` / `revoke <agent> <space>` / `grants [--agent]` —
-  Event-logged grant administration, levels `read`/`suggest`/`edit`.
+  Event-logged grant administration, levels `read`/`suggest`/`edit`. `revoke`
+  reaches an **archived** space, by id or by name: archiving makes a grant
+  inert but keeps the row, and a grant with no way to remove it would be an
+  authority you cannot take back. `grant` refuses an archived space, since the
+  grant would confer nothing until someone undid the archive.
 - `space-create` / `space-list` / `space-rename` / `space-archive` — Spaces as
   nodes: a space is a node of builtin type `space` living in the meta space, so
   creating one is a node create, renaming one is a title update, and archiving
@@ -128,7 +132,7 @@ including every parameter.
   space's **live node count** (`active` + `proposed`; archived rows are retired,
   not territory) and the **agents granted on it**. These are all human-only.
 
-  Two rules are enforced in the service, so every surface has them:
+  Four rules are enforced in the service, so every surface has them:
 
   - **`main` and `meta` cannot be archived** — by `space-archive` or by the
     generic `archive <id>`. Archiving `main` would hide it from every listing
@@ -146,6 +150,18 @@ including every parameter.
     archive can never land on a name something else has taken. Reusing a
     retired name means renaming that space first (`node update <id> --title …`;
     `space-rename` resolves live spaces only).
+  - **A space lives in `meta`.** `node create --type space --space main` is
+    refused: a space nested in ordinary territory would still be listed by
+    `space-list` and still resolve as real, while the grants governing it were
+    the host space's — and renaming one is authorised by a grant on that host,
+    which is how the name check above could be turned into a way to probe for
+    spaces you cannot list. Renaming any space additionally requires a grant on
+    `meta`, so a database written before this rule cannot reopen that.
+  - **Archiving a space makes every grant on it inert.** While a space is
+    archived, an agent granted on it can read nothing, write nothing, propose
+    nothing and review nothing there — including nodes it reaches by id. The
+    grant rows survive so `grants` still shows them and `revoke` still removes
+    them, and undoing the archive restores the delegation unchanged.
 
   A space is used in two independent ways, and they are two controls rather
   than one mode: `--space` on a *read* (`node list`, `search`) narrows the view

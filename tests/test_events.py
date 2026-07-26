@@ -181,3 +181,33 @@ def test_undo_create_of_a_node_with_children_is_refused(fresh_db):
     service.undo(create_page_seq, principal=owner())
     with pytest.raises(NodeNotFound):
         service.get_node(page.id, principal=owner())
+
+
+def test_undo_create_of_a_space_that_now_holds_nodes_is_refused(fresh_db):
+    """`nodes.space_id` is the other foreign key into a node, and `/spaces` grows it.
+
+    The create-reversal branch guarded `parent_id` children and nothing else,
+    so undoing the create of a space that had since been written into hit the
+    FK: a bare `IntegrityError`, served as a **500** by `/api/undo` and as
+    `database error: FOREIGN KEY constraint failed` by the CLI — for the plain
+    "an undo the graph has grown past" case the CLI contract promises to name.
+    Creating a space is one click away on `/spaces` now.
+    """
+    space = service.create_space("temp", principal=owner())
+    create_space_seq = _events()[0].seq
+    inside = service.create_node(type="note", title="in", space=space.id, principal=owner())
+
+    with pytest.raises(UndoNotPossible, match="still holds 1 node"):
+        service.undo(create_space_seq, principal=owner())
+
+    # Nothing half-written: the rollback left the space, its occupant and the
+    # event log exactly as they were, and no `undo` event claims otherwise.
+    assert service.get_node(space.id, principal=owner()).state == "active"
+    assert service.get_node(inside.id, principal=owner()).space_id == space.id
+    assert [event for event in _events() if event.op == "undo"] == []
+
+    # Emptying the space first clears the way, exactly like the children case.
+    service.undo(principal=owner())
+    service.undo(create_space_seq, principal=owner())
+    with pytest.raises(NodeNotFound):
+        service.get_node(space.id, principal=owner())

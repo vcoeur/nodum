@@ -163,6 +163,18 @@ function joined(names: readonly string[]): string {
  * here they do not. The counts come off the row so the sentences are about this
  * space rather than about archiving in general.
  *
+ * **The grant line is the load-bearing one, and it is now true.** It was copy
+ * before it was behaviour: the service went on honouring every grant on an
+ * archived space for anything reachable by node id, so an agent kept full live
+ * `edit` authority while `/admin` stopped listing the grant and `revoke` could
+ * no longer resolve the space to take it away — hidden authority, unrevokable,
+ * under a dialog promising the opposite. `auth._grant_set` drops grants on
+ * archived spaces now, so inertness holds for reads, writes, proposals and
+ * review alike, `_resolve_space_for_admin` reaches an archived space so the row
+ * can still be revoked, and `list_grants` never stopped showing it. Cutting an
+ * agent off is *why* a human reaches for this action; do not soften the line
+ * back into "reaches nothing here".
+ *
  * @param row The space being archived.
  */
 export function archiveConsequences(row: SpaceRow): string[] {
@@ -176,24 +188,28 @@ export function archiveConsequences(row: SpaceRow): string[] {
   lines.push(
     row.nodeCount === 0
       ? "Archiving deletes nothing: a node written there later would keep its space_id and stay as readable as it is now."
-      : "Archiving deletes none of them: every one keeps its space_id and stays exactly as readable as it is now.",
+      : "Archiving deletes none of them: every one keeps its space_id and stays exactly as readable as it is now — to you.",
   );
 
   if (row.holders.length === 0) {
-    lines.push("No agent holds a grant on it.");
+    lines.push("No agent holds a grant on it, so nothing is cut off by this.");
   } else if (row.holders.length === 1) {
     lines.push(
-      `The grant held by ${row.holders[0]?.agent} goes inert — the row stays on record and reaches nothing here.`,
+      `${row.holders[0]?.agent}'s grant goes inert: it can read, write, propose and review ` +
+        "nothing here until the archive is undone. The row survives on /admin, so you can also " +
+        "revoke it for good.",
     );
   } else {
     lines.push(
-      `The ${counted(row.holders.length, "grant")} on it go inert — ` +
-        `${joined(row.holders.map((holder) => holder.agent))} keep their rows and reach nothing here.`,
+      `The ${counted(row.holders.length, "grant")} on it go inert: ` +
+        `${joined(row.holders.map((holder) => holder.agent))} can read, write, propose and ` +
+        "review nothing here until the archive is undone. The rows survive on /admin, so you " +
+        "can also revoke them for good.",
     );
   }
 
   lines.push(
-    "The space stops resolving, so nothing new can be written into it or granted on it.",
+    "The space leaves every picker and stops resolving, so nothing new can be written into it or granted on it.",
   );
   lines.push(
     `Its name goes with it and stays reserved: no new space can be called ${row.label} while this one exists, archived or not.`,

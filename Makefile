@@ -18,8 +18,8 @@ cli: ## Run the nodum CLI (pass args after --, e.g. make cli -- node list)
 init-db: ## Create the database and apply migrations
 	uv run nodum init
 
-test: ## Run pytest
-	uv run pytest
+test: ## Run pytest (with the `pdf` extra, as CI does)
+	uv run --extra pdf pytest
 
 coverage: ## Run pytest with line-coverage report
 	uv run pytest --cov=nodum --cov-report=term-missing --cov-report=html

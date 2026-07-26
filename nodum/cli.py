@@ -1348,5 +1348,10 @@ def space_archive(
     space: str = typer.Argument(..., help="Space id or name to archive."),
     as_human: str = AS_OPTION,
 ) -> None:
-    """Archive a space (nodes keep their space_id; grants on it go inert)."""
+    """Archive a space (nodes keep their space_id; every grant on it goes inert).
+
+    The grant rows survive, so `grant-list` still shows them and `grant-revoke`
+    still reaches them by the space's id or name — they simply confer nothing
+    while the space is archived, and come back if the archive is undone.
+    """
     _emit(_run(service.archive_space, space, principal=_principal(as_human)))

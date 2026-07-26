@@ -14,8 +14,8 @@ import sqlite3
 import pytest
 from helpers import agent, owner, seed_space
 
-from nodum import db, search, service
-from nodum.store import GrantNotPermitted
+from nodum import auth, db, search, service
+from nodum.store import GrantNotPermitted, Store
 
 
 def _edge_states(src_id):
@@ -334,6 +334,37 @@ def test_the_space_clause_is_anded_onto_the_scope_and_never_replaces_it(fresh_db
     assert "c" in params and set(scout.read_spaces) <= set(params)
 
 
+def test_the_listings_space_clause_is_anded_onto_the_scope_and_never_replaces_it(fresh_db):
+    """The same invariant on the other builder — `service.list_nodes`.
+
+    The sibling above pinned `search`, and `service` was left to behavioural
+    coverage alone. It was not enough: making the space filter *replace* the
+    grant scope (`if scope:` → `if scope and space_id is None:`) left the
+    entire suite green, because resolution refuses to hand an agent the id of a
+    space outside its read set and no runtime call can reach the widening. This
+    is the assertion that would have failed.
+    """
+    _three_spaces()
+    scout = _scout()
+    conn = db.connect()
+    try:
+        clauses, params = service._node_list_filters(
+            Store(conn, scout),
+            state=None,
+            type_id=None,
+            parent_id=None,
+            space_id="b",
+            include_meta=False,
+        )
+    finally:
+        conn.close()
+
+    scope = [clause for clause in clauses if "IN (" in clause]
+    assert scope, f"the principal's scope clause must survive the filter: {clauses}"
+    assert "space_id = ?" in clauses
+    assert "b" in params and set(scout.read_spaces) <= set(params)
+
+
 def test_every_search_hit_names_the_space_it_lives_in(fresh_db):
     """An unnarrowed result list spans spaces, so each hit has to say which.
 
@@ -431,7 +462,12 @@ def test_a_structural_space_cannot_be_archived(fresh_db, structural):
     while `resolve_space_id(None)` keeps returning `main` without ever reading
     the row's state — writes go on landing in a space the human can no longer
     see or name. Archiving `meta` retires the space that holds every space.
-    Neither is reversible: there is no `active ← archived` transition anywhere.
+
+    The route back exists but is not the state machine's: `TRANSITIONS` has no
+    `active ← archived` entry, and `undo` restores the `before` row with a raw
+    UPDATE regardless. That is exactly why the guard sits in `_transition_row`
+    rather than resting on irreversibility — and it is `undo` of a *human's*
+    mistake, human-only, not something any surface offers as an un-archive.
     """
     _three_spaces()
 
@@ -452,6 +488,95 @@ def test_an_ordinary_space_is_still_archivable(fresh_db):
 
     assert archived.state == "archived"
     assert "b" not in {space.id for space in service.list_spaces(principal=owner())}
+
+
+# ── Archiving a space is how a human cuts an agent off it ────────────────────
+
+
+def test_archiving_a_space_makes_every_grant_on_it_inert(fresh_db):
+    """The promise `archive_space`, the CLI and the archive dialog all make.
+
+    It used to be true only of calls that *spelled the space's name*: those
+    stopped resolving, so a write naming the space was refused. Everything
+    reachable by node id kept working — the agent still read the space's nodes
+    and `update_node` still returned `state='active'`, i.e. full live write
+    authority — while `list_spaces` stopped showing the space or its grants. A
+    human archives a space precisely to stop an agent, so the gap ran the exact
+    opposite of the promise, silently.
+    """
+    _three_spaces()
+    bot = agent("bot", grants={"meta": "read", "b": "edit"})
+    node = service.create_node(type="concept", title="B thing", space="b", principal=bot)
+    # The premise: before the archive this is real, live authority.
+    assert service.get_node(node.id, principal=bot).title == "B thing"
+    assert service.update_node(node.id, title="edited", principal=bot).state == "active"
+
+    service.archive_space("b", principal=owner())
+    bot = auth.agent_principal("bot")
+
+    assert "b" not in bot.grants, "an archived space confers nothing"
+    assert "b" not in (bot.read_spaces or ())
+    # Reachable-by-id is the half that used to survive: it is default-deny now.
+    with pytest.raises(service.NodeNotFound):
+        service.get_node(node.id, principal=bot)
+    with pytest.raises(service.NodeNotFound):
+        service.update_node(node.id, title="edited again", principal=bot)
+    assert node.id not in {row.id for row in service.list_nodes(principal=bot, limit=500)}
+    # The human still sees everything: nothing was moved or deleted.
+    assert service.get_node(node.id, principal=owner()).title == "edited"
+
+
+def test_an_archived_spaces_grant_survives_so_it_can_be_seen_and_revoked(fresh_db):
+    """Inert, not destroyed — and revocable, which is the part that was missing.
+
+    `grant`/`revoke` resolved through `_resolve_space`, which matches active
+    spaces only, so archiving a space left its grants with **no supported route
+    to removal at all**: `revoke` answered `unknown space` by id and by name
+    alike, and raw SQL or undoing the archive were the only ways out. An
+    authority that cannot be taken away is a bug whichever way inertness goes.
+    """
+    _three_spaces()
+    agent("bot", grants={"meta": "read", "b": "edit"})
+    service.archive_space("b", principal=owner())
+
+    # The row survives, so the human can still see what is delegated.
+    held = {(g.space_id, g.level) for g in service.list_grants("bot", principal=owner())}
+    assert ("b", "edit") in held
+    # Granting more is refused, and says why rather than "unknown space".
+    with pytest.raises(ValueError, match="cannot grant on the archived space 'b'"):
+        service.grant("bot", "b", "read", principal=owner())
+
+    service.revoke("bot", "b", principal=owner())
+
+    assert "b" not in {g.space_id for g in service.list_grants("bot", principal=owner())}
+    # And by id as well as by name — both spellings reach an archived space.
+    agent("bot2", grants={"b": "edit"})
+    service.revoke("bot2", "b", principal=owner())
+    assert service.list_grants("bot2", principal=owner()) == []
+
+
+def test_undoing_an_archive_brings_the_delegation_back_with_the_space(fresh_db):
+    """Why the grant rows are kept rather than deleted on archive.
+
+    `undo` of a `node.archive` is the route back, and it must restore the state
+    that was there — including who could write the space. Deleting the grants
+    would make archiving a one-way door that silently ate delegation.
+    """
+    _three_spaces()
+    bot = agent("bot", grants={"meta": "read", "b": "edit"})
+    node = service.create_node(type="concept", title="B thing", space="b", principal=bot)
+    service.archive_space("b", principal=owner())
+    archive_seq = next(
+        event.seq
+        for event in service.list_events(limit=50, principal=owner())
+        if event.op == "node.archive"
+    )
+
+    service.undo(archive_seq, principal=owner())
+    bot = auth.agent_principal("bot")
+
+    assert bot.grants["b"] == "edit"
+    assert service.get_node(node.id, principal=bot).title == "B thing"
 
 
 @pytest.mark.parametrize("structural", ["main", "meta"])
@@ -678,3 +803,88 @@ def test_the_name_check_tells_a_meta_writer_nothing_it_cannot_already_list(fresh
         service.create_space("b", principal=gardener)
     with pytest.raises(service.SpaceNameTaken, match="archived space already answers to 'c'"):
         service.create_space("c", principal=gardener)
+
+
+def test_a_space_cannot_be_created_outside_meta(fresh_db):
+    """The precondition that turned the name refusal into an existence oracle.
+
+    `POST /api/nodes {"type": "space", "space": "main"}` answered 200, and
+    `space` sits in the editor's type picker, so a human could put a space
+    inside ordinary territory by accident. `GET /api/spaces` then listed it and
+    `_resolve_space` resolved it as real territory, while the grants governing
+    it were the *host* space's — and the rename path's grant check is on the
+    host space, which is what let a principal holding nothing but `main` reach
+    the unscoped name check. A space belongs in meta, which is what every
+    adapter is already written against.
+    """
+    _three_spaces()
+
+    with pytest.raises(ValueError, match="a space must live in the 'meta' space, not 'main'"):
+        service.create_node(type="space", title="scratch", space="main", principal=owner())
+    with pytest.raises(ValueError, match="a space must live in the 'meta' space, not 'b'"):
+        service.create_node(type="space", title="scratch", space="b", principal=owner())
+
+    # Nothing was created, and aiming at meta still works — this is a rule about
+    # where a space lands, not a ban on the generic path.
+    listed = [space.id for space in service.list_spaces(principal=owner())]
+    assert listed == ["meta", "main", "b", "c"]
+    landed = service.create_node(type="space", title="scratch", space="meta", principal=owner())
+    assert landed.space_id == "meta"
+    assert service.resolve_space_id("scratch", principal=owner()) == landed.id
+
+
+def test_naming_a_space_tells_a_principal_that_cannot_read_meta_nothing(fresh_db):
+    """The oracle itself, on the `update_node` path the create-path premise missed.
+
+    `_require_space_name_free` searches every space in the file and names the
+    holder — including an archived one, which no listing shows. That is safe
+    only for a principal that can already list every space, i.e. one that reads
+    meta. `create_node` gets there by construction (resolving the `space` type
+    needs READ on meta), but a rename is gated on `suggest` on the space the
+    node *lives in*, so a `space`-typed node sitting in `main` let an agent
+    holding nothing but `main` read a confirm/deny — plus the id — for a space
+    it cannot list.
+
+    Both halves are asserted, because a refusal is only not an oracle if the
+    taken name and a free one are **indistinguishable**: it was the free name
+    being accepted that made the refusal a clean signal.
+    """
+    _three_spaces()
+    secret = service.create_space("classified", principal=owner())
+    service.archive_space(secret.id, principal=owner())
+    # A legacy row: the service refuses to create this now, but a database
+    # written before that guard — or by raw SQL — can still hold one.
+    conn = db.connect()
+    try:
+        conn.execute(
+            "INSERT INTO nodes (id, space_id, type_id, title, props, state, created_by)"
+            " VALUES ('decoy', 'main', 'space', 'scratch', '{}', 'active', 'human:owner')"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    outsider = agent("outsider", grants={"main": "suggest"})
+
+    # The premise: this principal genuinely cannot see the space it is probing.
+    with pytest.raises(GrantNotPermitted):
+        service.list_spaces(principal=outsider)
+    with pytest.raises(service.NodeNotFound):
+        service.get_node(secret.id, principal=outsider)
+
+    with pytest.raises(GrantNotPermitted) as taken:
+        service.update_node("decoy", title="classified", principal=outsider)
+    with pytest.raises(GrantNotPermitted) as free:
+        service.update_node("decoy", title="definitely-free", principal=outsider)
+
+    # Word for word the same refusal, and neither names a space or an id. The
+    # gate is on the grant, so it cannot depend on whether the name is taken.
+    assert str(taken.value) == str(free.value)
+    assert "no read grant on space 'meta'" in str(taken.value)
+    assert secret.id not in str(taken.value)
+    assert "classified" not in str(taken.value)
+    # And the useful refusal survives for the principal it was written for.
+    gardener = agent("gardener", grants={"meta": "edit", "main": "edit"})
+    with pytest.raises(service.SpaceNameTaken) as refused:
+        service.update_node("decoy", title="classified", principal=gardener)
+    assert "archived space already answers to 'classified'" in str(refused.value)
+    assert secret.id in str(refused.value)

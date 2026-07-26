@@ -51,9 +51,13 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { api } from "../../api/client";
 import type { NodeOut, UpdateNodeBody } from "../../api/types";
-import { spaceLabel, useToast } from "../../components";
+import { useToast } from "../../components";
 import { describeError, isNotFound } from "../../lib";
-import { describeLanding, describeWriteFailure } from "./createOutcome";
+import {
+  describeDetachedWriteFailure,
+  describeLanding,
+  describeWriteFailure,
+} from "./createOutcome";
 
 /** How the node itself loaded. */
 export type LoadStatus = "loading" | "ready" | "missing" | "unavailable";
@@ -83,6 +87,21 @@ export interface LeftoverBuffer {
   space: string;
 }
 
+/** What a detached flush wrote. */
+export interface FlushOutcome {
+  /** The node id that was written. */
+  id: string;
+  /**
+   * The node `POST /api/nodes` returned, when this flush *created* one.
+   *
+   * Carried rather than reduced to an id because the confirmation has to name
+   * the space **the server filed it in**, which only the response knows: the
+   * requested target is what was asked for, and `describeLanding` exists to
+   * keep those two apart.
+   */
+  created: NodeOut | null;
+}
+
 /**
  * Write a buffer the editor has stopped holding.
  *
@@ -93,11 +112,11 @@ export interface LeftoverBuffer {
  * describing something the reader is not looking at.
  *
  * @param leftover The buffer, captured before it was replaced.
- * @returns The id written, or null when there was nothing to write.
+ * @returns What was written, or null when there was nothing to write.
  * @throws Error If a never-saved buffer has text but no type to create it under
  *   — silently dropping it would be the loss this hook exists to prevent.
  */
-export async function flushLeftover(leftover: LeftoverBuffer): Promise<string | null> {
+export async function flushLeftover(leftover: LeftoverBuffer): Promise<FlushOutcome | null> {
   const { id, title, content, saved, createType, space } = leftover;
 
   if (id === null) {
@@ -116,7 +135,7 @@ export async function flushLeftover(leftover: LeftoverBuffer): Promise<string | 
       content,
       space,
     });
-    return created.id;
+    return { id: created.id, created };
   }
 
   const body: UpdateNodeBody = {};
@@ -124,7 +143,7 @@ export async function flushLeftover(leftover: LeftoverBuffer): Promise<string | 
   if (content !== saved.content) body.content = content;
   if (Object.keys(body).length === 0) return null;
   await api.updateNode(id, body);
-  return id;
+  return { id, created: null };
 }
 
 interface UseNodeDocumentOptions {
@@ -349,7 +368,19 @@ export function useNodeDocument({
         navigateRef.current(`/editor/${created.id}`, { replace: true });
       } catch (error) {
         if (!stillCurrent()) {
-          toastRef.current.showError(error, "The new note could not be saved");
+          // Not `showError`: the shared classifier renders an `ApiError` as
+          // `type: message`, which for a refused space is the literal
+          // "UnknownSpace: unknown space: research" — the one wording nothing
+          // user-facing may use. The in-place branch below has always routed
+          // through `createOutcome`; this one is the same refusal after the
+          // reader moved on, and it also owes them the sentence that says what
+          // to do next, because their text is gone.
+          const refused = describeDetachedWriteFailure(error, target, spacesRef.current);
+          if (refused === null) {
+            toastRef.current.showError(error, "The new note could not be saved");
+          } else {
+            toastRef.current.show("error", "The new note could not be saved", refused);
+          }
           return;
         }
         // A write target naming a space that has since been archived or renamed
@@ -476,15 +507,36 @@ export function useNodeDocument({
           // A create the reader has already navigated away from is still a node
           // filed into a space, and D1a allows no silent ones. Only a create
           // gets this: an update went to the space its node already lived in.
-          if (written === null || leftover.id !== null) return;
+          if (written === null || written.created === null) return;
+          // Through `describeLanding`, like the in-place create: the
+          // confirmation names the space **the server** filed the node in, off
+          // the response, rather than echoing back the target that was asked
+          // for. Naming the request would confirm nothing, and would go on
+          // reading plausibly the day the two stop agreeing.
+          const landing = describeLanding(written.created, leftover.space, spacesRef.current);
           toastRef.current.show(
             "success",
-            `Created in ${spaceLabel(spacesRef.current, leftover.space)}`,
-            "Written from the note that was open a moment ago.",
+            landing.title,
+            `Written from the note that was open a moment ago. ${landing.detail}`,
           );
         },
         (error: unknown) => {
-          toastRef.current.showError(error, "Unsaved changes to the previous note were lost");
+          // Same reason as the detached create above: an unresolved space
+          // handed to the shared classifier prints the forbidden wording.
+          const refused = describeDetachedWriteFailure(
+            error,
+            leftover.space,
+            spacesRef.current,
+          );
+          if (refused === null) {
+            toastRef.current.showError(error, "Unsaved changes to the previous note were lost");
+          } else {
+            toastRef.current.show(
+              "error",
+              "Unsaved changes to the previous note were lost",
+              refused,
+            );
+          }
         },
       );
     };
@@ -567,7 +619,12 @@ export function useNodeDocument({
     setSaveState("clean");
     setSaveError(null);
     setSavedAt(null);
-  }, [cancelTimer]);
+    // `flushBuffer`, not `cancelTimer`: this callback calls the first and never
+    // the second. Both happen to be permanently stable today, so the wrong
+    // dependency is inert — and there is no ESLint here to notice if one of
+    // them ever stops being, at which point `openBlank` would go on flushing
+    // through a closure over a buffer that has already moved on.
+  }, [flushBuffer]);
 
   useEffect(() => {
     if (nodeId === undefined) {

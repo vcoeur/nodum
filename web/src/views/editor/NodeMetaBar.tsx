@@ -25,8 +25,10 @@ import {
   ANY_SPACE,
   NodeBadge,
   Spinner,
+  nameSpace,
   resolveSpaceValue,
   spaceLabel,
+  spaceNameNote,
   spaceOptions,
 } from "../../components";
 import { formatAbsolute } from "../../lib";
@@ -47,6 +49,11 @@ interface NodeMetaBarProps {
   onTypeChange(typeId: string): void;
   /** Active spaces from `GET /api/spaces`; null while loading or after a failure. */
   spaces: readonly NodeOut[] | null;
+  /**
+   * Archived space nodes, for naming the space of a node written into one that
+   * has since been retired. Empty until the lazy read is needed.
+   */
+  archivedSpaces: readonly NodeOut[];
   /** True once the space list request failed — the picker says so. */
   spacesFailed: boolean;
   /** The sticky write target: the space the first save will land in. */
@@ -70,6 +77,7 @@ export function NodeMetaBar({
   selectedType,
   onTypeChange,
   spaces,
+  archivedSpaces,
   spacesFailed,
   writeTarget,
   onWriteTargetChange,
@@ -118,7 +126,7 @@ export function NodeMetaBar({
         {node ? (
           <>
             <NodeBadge type={node.type} state={node.state} />
-            <NodeSpace node={node} spaces={spaces} />
+            <NodeSpace node={node} spaces={spaces} archivedSpaces={archivedSpaces} />
             <span className="nd-mono" title="Node id">
               {node.id}
             </span>
@@ -213,8 +221,21 @@ function NewNodeType({
  * CLI. It is deliberately read-only: a node's space is fixed at creation, like
  * its type, so a picker here would offer something `PATCH /api/nodes/{id}`
  * cannot do.
+ *
+ * It resolves through the shared `nameSpace` rather than `spaceLabel`, because
+ * a node whose space has since been archived is exactly the case a human opens
+ * the editor to understand — and `spaceLabel`'s picker fallback rendered it as
+ * `in 4affabf6d856427886ad48570f5f6e20`.
  */
-function NodeSpace({ node, spaces }: { node: NodeOut; spaces: readonly NodeOut[] | null }) {
+function NodeSpace({
+  node,
+  spaces,
+  archivedSpaces,
+}: {
+  node: NodeOut;
+  spaces: readonly NodeOut[] | null;
+  archivedSpaces: readonly NodeOut[];
+}) {
   if (node.space_id === null) {
     return (
       <span className="nd-meta" title="The server reported no space for this node.">
@@ -223,15 +244,24 @@ function NodeSpace({ node, spaces }: { node: NodeOut; spaces: readonly NodeOut[]
     );
   }
 
-  // Falls back to the raw reference while the space list is still loading, so
-  // the line never renders empty and never renders a bare id twice.
-  const label = spaceLabel(spaces ?? [], node.space_id);
+  const name = nameSpace(node.space_id, spaces, archivedSpaces);
+  const note = spaceNameNote(name);
   return (
     <span
       className="nd-meta nd-editor__space"
-      title={`This node lives in the ${label} space. A node's space is fixed at creation, like its type.`}
+      title={
+        note === null
+          ? `This node lives in the ${name.label} space. A node's space is fixed at creation, like its type.`
+          : `This node lives in ${name.label}. ${note}`
+      }
     >
-      in <span className="nd-mono">{label}</span>
+      in <span className="nd-mono">{name.label}</span>
+      {name.kind === "archived" ? (
+        <span className="nd-badge nd-badge--archived nd-editor__space-mark">
+          <span className="nd-badge__dot" aria-hidden="true" />
+          archived
+        </span>
+      ) : null}
     </span>
   );
 }

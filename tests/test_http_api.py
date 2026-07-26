@@ -2529,6 +2529,77 @@ def test_undoing_a_rename_onto_a_taken_name_is_a_409_not_a_500(client, fresh_db)
     assert f"a space already answers to 'scratch' (id {replacement['id']})" in message
 
 
+def test_posting_a_space_typed_node_outside_meta_is_a_400(client, fresh_db):
+    """This answered 200, and `space` is in the editor's type picker.
+
+    So a human could nest a space inside ordinary territory with one click —
+    `GET /api/spaces` then listed it and every space reference resolved it,
+    while the grants governing it were the host space's. That is also what let
+    the name refusal become an existence oracle on the rename path.
+    """
+    refused = client.post("/api/nodes", json={"type": "space", "title": "scratch", "space": "main"})
+
+    assert refused.status_code == 400
+    assert "a space must live in the 'meta' space" in refused.json()["error"]["message"]
+    assert [row["id"] for row in _ok(client.get("/api/spaces"))["spaces"]] == ["meta", "main"]
+
+    # Aimed at meta it is an ordinary space create, exactly as `POST /api/spaces` is.
+    landed = _ok(client.post("/api/nodes", json={"type": "space", "title": "s", "space": "meta"}))
+    assert landed["space_id"] == "meta"
+    assert landed["id"] in [row["id"] for row in _ok(client.get("/api/spaces"))["spaces"]]
+
+
+def test_undoing_a_space_create_that_now_holds_nodes_is_a_409_not_a_500(client, fresh_db):
+    """`/spaces` put this one click away, and it answered with a server error.
+
+    The create-reversal guarded `parent_id` children but not `nodes.space_id`,
+    so the FK surfaced as `sqlite3.Error` → 500 for the ordinary "the graph has
+    grown past this" case — the class of failure `/api/undo` was cleaned of.
+    """
+    space = _ok(client.post("/api/spaces", json={"name": "temp"}))
+    create_seq = max(event["seq"] for event in _ok(client.get("/api/events?limit=50"))["events"])
+    _ok(client.post("/api/nodes", json={"type": "note", "title": "n", "space": "temp"}))
+
+    refused = client.post("/api/undo", json={"seq": create_seq})
+
+    assert refused.status_code == 409
+    assert refused.json()["error"]["type"] == "UndoNotPossible"
+    assert "still holds 1 node" in refused.json()["error"]["message"]
+    assert space["id"] in [row["id"] for row in _ok(client.get("/api/spaces"))["spaces"]]
+
+
+def test_archiving_a_space_over_http_leaves_its_grant_inert_but_revocable(client, fresh_db):
+    """The archive dialog's promise, end to end on the surface that makes it.
+
+    `GET /api/spaces` stops carrying the space and its grant holders, so
+    `/admin` is the only screen left that can show the delegation — and it must
+    still be able to take it away.
+    """
+    space = _ok(client.post("/api/spaces", json={"name": "research"}))
+    _ok(client.post("/api/agents", json={"name": "researcher"}))
+    _ok(
+        client.post(
+            "/api/grants", json={"agent": "researcher", "space": "research", "level": "edit"}
+        )
+    )
+
+    _ok(client.post(f"/api/spaces/{space['id']}/archive"))
+
+    assert [row["id"] for row in _ok(client.get("/api/spaces"))["spaces"]] == ["meta", "main"]
+    held = _ok(client.get("/api/grants?agent=researcher"))["grants"]
+    assert (space["id"], "edit") in {(row["space_id"], row["level"]) for row in held}
+    # Granting more on it is refused rather than silently conferring nothing.
+    refused = client.post(
+        "/api/grants", json={"agent": "researcher", "space": space["id"], "level": "read"}
+    )
+    assert refused.status_code == 400
+    assert "cannot grant on the archived space" in refused.json()["error"]["message"]
+    # And the grant can be taken away for good, which it could not before.
+    _ok(client.post("/api/grants/revoke", json={"agent": "researcher", "space": space["id"]}))
+    left = _ok(client.get("/api/grants?agent=researcher"))["grants"]
+    assert space["id"] not in {row["space_id"] for row in left}
+
+
 def test_spaces_carry_the_node_count_and_grant_holders(client, fresh_db):
     """What the ``/spaces`` screen reads: territory, not just a name."""
     space = _ok(client.post("/api/spaces", json={"name": "research"}))

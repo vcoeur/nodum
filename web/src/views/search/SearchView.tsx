@@ -4,7 +4,14 @@ import { useNavigate, useSearchParams } from "react-router-dom";
 import { api } from "../../api/client";
 import { describeError, describeFailure } from "../../lib";
 import type { SearchFilters, SearchHit, SearchResult, TypeOut } from "../../api/types";
-import { ANY_SPACE, EmptyState, Spinner, useSpaces } from "../../components";
+import {
+  ANY_SPACE,
+  EmptyState,
+  Spinner,
+  unresolvedSpaceIds,
+  useArchivedSpaces,
+  useSpaces,
+} from "../../components";
 import { ResultRow } from "./ResultRow";
 import { SearchFilterBar } from "./SearchFilterBar";
 import { SignalLegend } from "./SignalBreakdown";
@@ -15,7 +22,7 @@ import {
   toSearchParams,
 } from "./searchState";
 import type { SearchState } from "./searchState";
-import { hitSpaceLabel } from "./resultSpace";
+import { hitSpaceName } from "./resultSpace";
 import { describeSpaceFilterFailure } from "./spaceFailure";
 import type { SpaceFilterFailure } from "./spaceFailure";
 import { SIGNAL_HELP, SIGNAL_KEYS, describeSignals, readVectorEvidence } from "./signals";
@@ -222,6 +229,19 @@ export default function SearchView() {
   const hits = result?.hits ?? [];
   const terms = useMemo(() => queryTerms(query), [query]);
 
+  // A hit in a space `GET /api/spaces` does not list is a hit in a space that
+  // was archived after it was written — and the row would otherwise read
+  // `in 4affabf6…`. One extra listing names all of them, fired only when a
+  // result actually carries such a space, which under a narrowed filter cannot
+  // happen at all (the filter's own vocabulary is the active list).
+  const unresolvedHitSpaces = useMemo(
+    () => unresolvedSpaceIds(hits.map((each) => each.space_id ?? ""), spaces),
+    [hits, spaces],
+  );
+  const archivedSpaces = useArchivedSpaces(
+    space === ANY_SPACE && unresolvedHitSpaces.length > 0,
+  );
+
   const groups = useMemo<DisplayGroup[]>(() => {
     if (hits.length === 0) return [];
     if (group === "score") {
@@ -356,10 +376,6 @@ export default function SearchView() {
   const showDegradedNote = vector.missing && !vector.seen;
   // Every hit carries the filtered state; under "any" it is genuinely unknown.
   const knownState = stateFilter === "any" ? null : stateFilter;
-  // Names for the per-row space, which follows the same rule one dimension
-  // over — `hitSpaceLabel` owns it. Falls back to the raw id while the list
-  // loads rather than leaving the row silent about where it lives.
-  const knownSpaces = spaces ?? [];
 
   return (
     <div className="nd-view nd-search">
@@ -505,7 +521,7 @@ export default function SearchView() {
                       hit={hit}
                       index={index}
                       knownState={knownState}
-                      spaceName={hitSpaceLabel(hit, knownSpaces, space)}
+                      spaceName={hitSpaceName(hit, spaces, archivedSpaces.spaces, space)}
                       terms={terms}
                       linkRef={(element) => {
                         linkRefs.current[index] = element;

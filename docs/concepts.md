@@ -114,6 +114,16 @@ archiving it would hide the space while nodes kept arriving there; `meta` is the
 space that spaces themselves live in. Renaming either is fine — a rename moves
 the title, and it is the id everything structural depends on.
 
+**Archiving a space cuts every agent off it.** That is usually the reason to
+reach for it, so it is what it does: while a space is archived, a grant on it
+confers nothing — no reads, no writes, no proposals, no review — whether the
+call names the space or reaches a node inside it by id. The grant *rows* are
+kept rather than deleted, so `nodum grants` still lists them and
+`nodum revoke <agent> <space>` still takes one away (by the space's id or its
+name, archived or not), and undoing the archive puts the delegation back exactly
+as it was. Granting on an archived space is refused: it would confer nothing
+until someone undid the archive, which is delegation by accident.
+
 A space is used two ways, and they are deliberately two separate controls:
 
 - **Reading** — an optional filter (`--space` on `node list` and `search`,

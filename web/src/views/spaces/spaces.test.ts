@@ -176,12 +176,47 @@ describe("archiveConsequences", () => {
     expect(lines).toContain("archivist");
   });
 
+  it("says what inert means, in the four verbs the grant levels are made of", () => {
+    // Cutting an agent off is *why* a human archives a space, and this line was
+    // copy before it was behaviour: the service kept honouring every grant on
+    // an archived space for anything reachable by node id. It is true now
+    // (`auth._grant_set` drops them), so the dialog states it rather than
+    // hedging with "reaches nothing here".
+    for (const subject of [busy, space("s4", "solo", 0, [grant("scout", "s4", "read")])]) {
+      const lines = archiveConsequences(rowFor(subject)).join(" ");
+      expect(lines).toMatch(/read, write, propose and review nothing here/);
+      expect(lines).toMatch(/until the archive is undone/);
+    }
+  });
+
+  it("says the grant row survives, because revoking it for good is the other half", () => {
+    // Inert is not gone. `/admin` still lists the row and `revoke` still
+    // reaches an archived space, which is what makes "cut this agent off
+    // permanently" an action the human can take without the CLI.
+    const lines = archiveConsequences(rowFor(busy)).join(" ");
+    expect(lines).toMatch(/rows survive on \/admin/);
+    expect(lines).toMatch(/revoke them for good/);
+  });
+
   it("says a single grant in the singular, and says so when there is none", () => {
     const one = space("s4", "solo", 0, [grant("scout", "s4", "read")]);
-    expect(archiveConsequences(rowFor(one)).join(" ")).toContain("The grant held by scout");
+    const single = archiveConsequences(rowFor(one)).join(" ");
+    expect(single).toContain("scout's grant goes inert");
+    expect(single).toMatch(/row survives on \/admin/);
     expect(archiveConsequences(rowFor(space("s5", "none"))).join(" ")).toContain(
       "No agent holds a grant on it",
     );
+  });
+
+  it("says the space leaves the pickers, not merely that it stops resolving", () => {
+    // "Stops resolving" is the mechanism; "you will not be offered it again" is
+    // what the human will actually notice five minutes later.
+    expect(archiveConsequences(rowFor(busy)).join(" ")).toContain("leaves every picker");
+  });
+
+  it("never claims the space or its content is gone", () => {
+    const lines = archiveConsequences(rowFor(busy)).join(" ");
+    expect(lines).not.toMatch(/no such space|does not exist|nonexistent|deleted\b/i);
   });
 
   it("says the archive is final here, and that the name goes with it", () => {

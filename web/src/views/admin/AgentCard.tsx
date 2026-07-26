@@ -8,7 +8,7 @@
  */
 
 import { useState } from "react";
-import { spaceLabel, useToast } from "../../components";
+import { nameSpace, spaceNameNote, useToast } from "../../components";
 import { api } from "../../api/client";
 import type { AgentOut, GrantLevel, GrantOut, NodeOut } from "../../api/types";
 import { GRANT_LEVELS, grantableSpaces, grantsForAgent, LEVEL_SUMMARY } from "./grants";
@@ -28,6 +28,14 @@ interface AgentCardProps {
   grants: readonly GrantOut[];
   /** Every active space. */
   spaces: readonly NodeOut[];
+  /**
+   * Archived space nodes, for the grants that point at one.
+   *
+   * Archiving a space makes every grant on it inert and keeps the row so a
+   * human can revoke it for good — which is this table. Naming those rows off
+   * the active list alone would head them with a bare id.
+   */
+  archivedSpaces: readonly NodeOut[];
   /** Reload the view's data after a mutation lands. */
   onChanged: () => Promise<void>;
   /** Hand a freshly minted token to the show-once dialog. */
@@ -35,7 +43,14 @@ interface AgentCardProps {
 }
 
 /** One agent account: lifecycle actions plus its grants. */
-export function AgentCard({ agent, grants, spaces, onChanged, onToken }: AgentCardProps) {
+export function AgentCard({
+  agent,
+  grants,
+  spaces,
+  archivedSpaces,
+  onChanged,
+  onToken,
+}: AgentCardProps) {
   const toast = useToast();
   const [confirm, setConfirm] = useState<PendingConfirm | null>(null);
   const [newSpace, setNewSpace] = useState("");
@@ -94,13 +109,20 @@ export function AgentCard({ agent, grants, spaces, onChanged, onToken }: AgentCa
     });
   };
 
-  const revoke = (grant: GrantOut) =>
+  const grantSpace = (grant: GrantOut) => nameSpace(grant.space_id, spaces, archivedSpaces);
+
+  const revoke = (grant: GrantOut) => {
+    const name = grantSpace(grant);
     setConfirm({
-      title: `Revoke ${spaceLabel(spaces, grant.space_id)} from ${agent.name}`,
-      body: `The agent loses its ${grant.level} access to the space immediately. Its rows stay in the graph; only its reach changes.`,
+      title: `Revoke ${name.label} from ${agent.name}`,
+      body:
+        name.kind === "archived"
+          ? `The space is archived, so this grant already reaches nothing — revoking removes the row for good, so undoing the archive would not bring the ${grant.level} access back with it.`
+          : `The agent loses its ${grant.level} access to the space immediately. Its rows stay in the graph; only its reach changes.`,
       confirmLabel: "Revoke",
       run: () => api.revokeGrant({ agent: agent.id, space: grant.space_id }).then(() => onChanged()),
     });
+  };
 
   return (
     <section className="nd-card nd-ad-agent">
@@ -144,9 +166,19 @@ export function AgentCard({ agent, grants, spaces, onChanged, onToken }: AgentCa
           </tr>
         </thead>
         <tbody>
-          {own.map((grant) => (
+          {own.map((grant) => {
+            const name = grantSpace(grant);
+            return (
             <tr key={grant.space_id}>
-              <td>{spaceLabel(spaces, grant.space_id)}</td>
+              <td title={spaceNameNote(name) ?? undefined}>
+                {name.label}
+                {name.kind === "archived" ? (
+                  <span className="nd-badge nd-badge--archived nd-ad-grants__mark">
+                    <span className="nd-badge__dot" aria-hidden="true" />
+                    archived
+                  </span>
+                ) : null}
+              </td>
               <td>
                 <span className="nd-badge nd-badge--type nd-mono">{grant.level}</span>
               </td>
@@ -161,7 +193,8 @@ export function AgentCard({ agent, grants, spaces, onChanged, onToken }: AgentCa
                 </button>
               </td>
             </tr>
-          ))}
+            );
+          })}
           {own.length === 0 ? (
             <tr>
               <td colSpan={3} className="nd-meta">

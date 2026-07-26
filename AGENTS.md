@@ -113,7 +113,7 @@ node for exactly this reason.
   aggregation — thin delegates to `create_node` / `update_node` / `transition`
   that own the "a space is a node of type `space` in meta" rule so that neither
   adapter has to restate it, and no new SQL path exists for a space write.
-  Two space rules are enforced **here** rather than on a screen, because a
+  Four space rules are enforced **here** rather than on a screen, because a
   disabled button leaves the CLI and the API wide open. **`main` and `meta`
   cannot be archived** (`STRUCTURAL_SPACE_IDS`): the check sits in
   `_transition_row`, not in `archive_space`, since `archive <id>` and
@@ -146,6 +146,35 @@ node for exactly this reason.
   `Research` beside `research` is two names that genuinely tell themselves
   apart. The service check additionally catches the half no index can express:
   a title equal to another space's *id*.
+  **A space lives in `meta`, and `create_node` enforces it**
+  (`_require_space_lives_in_meta`). It is the model every adapter is already
+  written against — `create_space` hardcodes it — but the generic path could
+  put a `space`-typed node in ordinary territory, where `GET /api/spaces`
+  listed it and `_resolve_space` resolved it as real while the grants governing
+  it were the *host* space's. That is also what made the name check an
+  existence oracle: the check is deliberately unscoped, on the premise that
+  only a principal who can read `meta` reaches it (and such a principal can
+  already list every space). The premise held for creates — resolving the
+  `space` type needs READ on `meta` — but a rename is gated on `suggest` on the
+  space the node **lives in**, so a space node in `main` let an agent holding
+  nothing but `main` rename it onto a name and read a confirm/deny, plus the
+  holder's id, for a space it cannot list. `update_node` therefore requires
+  READ on `meta` before the name check as well, so a legacy or raw-SQL row
+  cannot reopen it; the refusal is on the *grant*, identical for a taken and a
+  free name. Migration `0013`'s index stays unscoped to meta on purpose — it is
+  the backstop for writers that never pass through the service.
+  **Archiving a space makes every grant on it inert** — enforced where grants
+  become a principal (`auth._grant_set`), so reads, writes, proposals and
+  review all inherit it rather than only the calls that spell the space's name.
+  Cutting an agent off is *why* a human archives a space, and it used to be
+  true only of those name-spelling calls: everything reachable by node id kept
+  full live authority while `list_spaces` stopped showing the space or its
+  grants — hidden authority, and unrevokable, since `grant`/`revoke` resolved
+  active spaces only. The grant **rows** survive on purpose, so `list_grants`
+  still shows them and `revoke` still reaches them (`_resolve_space_for_admin`,
+  human-only, resolves a space in any state), and undoing the archive restores
+  exactly the delegation that was there. Inert, not destroyed. `grant` on an
+  archived space is refused and says why.
   Each public function opens its own short-lived connection
   (applying pending migrations idempotently) and commits. New behaviour and
   validation go here first; adapters must not add behaviour the service lacks.
@@ -611,7 +640,9 @@ Phase-1 decision log.
   `agent create/list/token-rotate/disable/enable` (create and rotate print
   the show-once `ndm_…` token to stderr; only the hash is stored),
   `grant <agent> <space> <level>` / `revoke <agent> <space>` / `grants [--agent]`
-  (`read`/`suggest`/`edit`, event-logged),
+  (`read`/`suggest`/`edit`, event-logged; `revoke` reaches an **archived**
+  space by id or name, since archiving makes a grant inert but leaves the row
+  for the human to take away, while `grant` refuses one and says why),
   `space-create`/`space-list`/`space-rename`/`space-archive` (a space is a node
   of builtin type `space` in the meta space, so its whole lifecycle is an
   ordinary node's — create, a title update, a state transition — and every one
@@ -829,13 +860,18 @@ Phase-1 decision log.
   and the agents holding grants on it (the `/spaces` screen's read) and is
   byte-identical to `nodum space-list`, as every list endpoint is to its
   command — **active spaces only**, which is why the name refusal below has to
-  explain itself in words. The two space rules are the service's, so both
+  explain itself in words. The space rules are the service's, so both
   archive routes (`/api/spaces/{id}/archive` and `/api/nodes/{id}/archive`)
-  answer 400 for `main` and `meta`, and both writers answer **409
+  answer 400 for `main` and `meta`; both writers answer **409
   `SpaceNameTaken`** for a name any space already holds — including an archived
-  one, whose message says so, since this listing does not carry it. Do not
-  re-implement either in a handler or in the UI: the screen may say *why*
-  before the click, but the refusal is the server's.
+  one, whose message says so, since this listing does not carry it; and
+  `POST /api/nodes` answers 400 for `{"type": "space"}` aimed anywhere but
+  `meta` (it used to answer 200, and `space` is in the editor's type picker, so
+  a human could nest a space inside ordinary territory with one click).
+  Archiving a space through either route makes every grant on it inert, which is
+  what the archive confirm has to say, and `/api/grants` can still revoke one
+  afterwards. Do not re-implement any of it in a handler or in the UI: the
+  screen may say *why* before the click, but the refusal is the server's.
 - **Account and grant administration is on the API too.** `GET /api/me`
   returns the session's human; `/api/humans`, `/api/agents` and `/api/grants`
   mirror the CLI's `human`/`agent`/`grant`/`revoke`/`grants` commands — thin
@@ -921,7 +957,12 @@ Phase-1 decision log.
 - **Nothing user-facing may say a space does not exist.** Not "no such space",
   not "does not exist", not "unknown/missing/nonexistent space", not "not
   found" — and not by handing an `UnknownSpaceError` to `describeFailure`,
-  whose 404 body is *"The server has no record of …"*. The server answers a
+  whose 404 body is *"The server has no record of …"*, nor to `toast.showError`,
+  which renders `` `${type}: ${message}` `` and so emits *"UnknownSpace: unknown
+  space: research"* verbatim. That second trap is the one that actually bit, on
+  the detached editor saves, because reaching for the error toast reads as a
+  reporting choice rather than a copy decision. It is a copy decision. The
+  server answers a
   space that was never created and a space the caller holds no grant on with
   **word-for-word identical text on purpose** (Q13 review S3): a refusal that
   told them apart would be an existence oracle over every space in the file, and
@@ -945,12 +986,18 @@ Phase-1 decision log.
   `components/useSpaces.ts`. Do not add a seventh copy of that fetch or a second
   `spaceLabel`. `GET /api/spaces` is **active-only and stays that way** — it is
   the vocabulary behind every picker, and a retired space belongs in none of
-  them. The review queue is the one surface that must name a space this listing
-  cannot (a space archived while its proposals waited), and it does that with a
-  *view-local* read of archived space nodes (`views/review/useArchivedSpaces.ts`,
-  resolved by `views/review/spaceNaming.ts`) rather than by widening the shared
-  one. A second view needing the same thing is the moment to reconsider — not a
-  reason to change this endpoint.
+  them. Naming a space that listing cannot (one archived while its proposals
+  waited, or holding a node you are reading) goes through
+  `components/spaceNaming.ts` and its lazy `components/useArchivedSpaces.ts`,
+  which five surfaces now share — review, search, editor, graph and the grant
+  table. That resolution was once view-local to the review queue; when four more
+  views needed it the answer was to **promote the read, not widen the endpoint**,
+  and that stays the answer. `spaceLabel`'s `?? spaceRef` fallback is correct
+  only for a picker, which must render its own value — every *display* surface
+  goes through `spaceNaming` instead, or it prints 32 hex characters at a human.
+  `nameSpace` has four answers, and `pending` is not `unknown`: a space list
+  still in flight is not an unresolvable space, so `?? []` at a call site is the
+  bug — pass the `null` through.
 - **Every surface that displays a node says which space it is in** — the exit
   criterion of the spaces phase, and search is the surface where it matters
   most, because a result list is *scanned*. The rule for how loudly:
@@ -972,18 +1019,31 @@ Phase-1 decision log.
   then says nothing is asserting, by omission, that reviewing it is a
   single-space act. The same applies to a section for an archived space: it is
   named and marked, never left as a bare id.
+- **The archive confirmation states consequences the server actually delivers.**
+  `views/spaces/spaces.ts`'s `archiveConsequences` is the one place that copy
+  lives, and every line in it has to be a fact: the space leaves every picker
+  and stops resolving; its nodes keep their `space_id` and stay readable to the
+  human; its **name stays reserved**, so no new space may take it; and **every
+  grant on it goes inert** — an agent granted there can read, write, propose and
+  review nothing until the archive is undone, though the grant row survives on
+  `/admin` so it can be revoked for good. That last line was copy before it was
+  behaviour: the service kept the agent's authority over everything reachable by
+  node id, so the dialog promised the opposite of what happened. Do not soften
+  it back — a human archiving a space to cut an agent off now gets exactly that.
 - **The write target is app-wide, sticky, and must be visible** (design decision
   D1a). `src/lib/writeTarget.ts` owns it: one module-level value, persisted in
   `localStorage`, synchronised across tabs through the `storage` event, and
   **never changed without the human being told** — a target naming a space
   archived from somewhere else (the CLI, another session) survives and fails at
   the write, because filing a node somewhere the human did not choose is worse
-  than a refusal they can read. The one reset is `clearWriteTarget()`, which
-  `/spaces` calls when the human archives the very space they are filing into:
-  that is the second half of an act they just performed, not a correction behind
-  their back, and it is announced in both the archive confirmation (before) and
-  the toast (after). The rule is about *silence*, not about immutability.
-  `useWriteTarget()` is the subscription;
+  than a refusal they can read. The one reset is `clearWriteTarget()`, and it has
+  two callers. `/spaces` calls it when the human archives the very space they are
+  filing into: that is the second half of an act they just performed, not a
+  correction behind their back, and it is announced in both the archive
+  confirmation (before) and the toast (after). Logout calls it too — the value is
+  persisted per browser, not per session, so a second human signing in on the
+  same machine would otherwise inherit the first one's target. The rule is about
+  *silence*, not about immutability. `useWriteTarget()` is the subscription;
   a surface that creates a node **shows** the current target, and the post-create
   confirmation names the space the server actually filed it in. Calling
   `getWriteTarget()` without rendering the answer is the failure this module

@@ -13,6 +13,11 @@
  * pin the two silences it must not keep — an empty new document (which would
  * litter the graph) and a failed write (which is the loss the editor is built
  * around).
+ *
+ * They also pin what it hands *back*. A create's confirmation has to name the
+ * space the server filed the node in (`describeLanding`), which only the
+ * response knows — so this returns the created node rather than reducing it to
+ * an id, and the caller cannot fall back to echoing the requested target.
  */
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -45,7 +50,7 @@ function leftover(overrides: Partial<LeftoverBuffer> = {}): LeftoverBuffer {
 
 beforeEach(() => {
   vi.clearAllMocks();
-  createNode.mockResolvedValue({ id: "node-new" } as never);
+  createNode.mockResolvedValue({ id: "node-new", space_id: "sp-main" } as never);
   updateNode.mockResolvedValue({ id: "node-a" } as never);
 });
 
@@ -92,7 +97,28 @@ describe("a document that was never saved", () => {
       content: "typed and left",
       space: "main",
     });
-    expect(written).toBe("node-new");
+    expect(written?.id).toBe("node-new");
+  });
+
+  it("hands back the server's node, so the toast can name where it really landed", () => {
+    // The confirmation must name the landing space off the *response*, not off
+    // the target that was requested — `describeLanding` is the enforcer and it
+    // needs the node. Returning a bare id left the caller echoing the request
+    // back, which reads plausibly right up to the day the two disagree.
+    createNode.mockResolvedValue({ id: "node-new", space_id: "sp-research" } as never);
+    return flushLeftover(
+      leftover({ id: null, content: "typed and left", saved: { title: "", content: "" } }),
+    ).then((written) => {
+      expect(written?.created?.space_id).toBe("sp-research");
+    });
+  });
+
+  it("reports an update as having created nothing, so it gets no landing toast", () => {
+    // An update went to the space its node already lived in; a "created in …"
+    // for one would be an outright lie about what just happened.
+    return flushLeftover(leftover()).then((written) => {
+      expect(written).toEqual({ id: "node-a", created: null });
+    });
   });
 
   it("files it into the write target the editor was showing, not today's default", async () => {

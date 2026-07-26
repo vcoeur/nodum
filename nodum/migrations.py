@@ -645,26 +645,76 @@ UNIQUE_SPACE_TITLES_DDL = """
 -- lesson applied. The losers are **renamed, not archived**: archiving retires a
 -- space from the vocabulary permanently, which is far more than a duplicate
 -- title deserves, while `<title> (<id>)` leaves every space usable and is
--- unique because the id is. A live row always wins the tie-break over an
--- archived one (`state = 'archived'` sorts last), even when the archived one is
--- older: the name a reference resolves to today must go on resolving to the
--- same space after the upgrade, so it is the retired duplicate that gets
--- renamed. Titles change here without an event or a version, as every
--- migration's data repair does.
+-- unique because the id is. Titles change here without an event or a version,
+-- as every migration's data repair does.
+--
+-- Three properties the dedupe has to have, each one a defect it was found
+-- without:
+--
+--   1. **An `active` row keeps the name**, whatever else shares it. The
+--      tie-break demotes every non-active state at once (`state != 'active'`),
+--      not just `archived`: a `proposed` duplicate used to sort level with a
+--      live one and win on `created_at`, so an older proposal took the name off
+--      a live space — `--space research` stopped resolving at all, and started
+--      resolving to a *different* space the moment the proposal was accepted.
+--      An agent with `suggest` on meta can file proposed spaces, and nothing
+--      enforced uniqueness before this migration, so that state is reachable.
+--      What a reference resolves to today must go on resolving to the same
+--      space after the upgrade.
+--   2. **The rename cannot itself collide.** `<title> (<id>)` is unique among
+--      losers because ids are, but a database can already hold a space
+--      literally titled `research (sp-b)` — and then deduping two spaces called
+--      `research` produced that very string, the index refused it, and the
+--      whole upgrade rolled back with the bare IntegrityError this migration
+--      exists to prevent. So the name is searched rather than assumed: the base
+--      `<title> (<id>)`, then `<base> 1`, `<base> 2`, … until one is free. The
+--      search only has to dodge names that survive the statement (titles no
+--      loser is vacating, and every space id — see 3), because two losers can
+--      never land on one string: distinct ids make the bases distinct, a base
+--      always ends in `)` while a suffixed name always ends in a digit, and two
+--      suffixed names split unambiguously at that trailing digit.
+--   3. **The id/title ambiguity is deduped too.** `_resolve_space` matches
+--      `id = ? OR title = ?`, so a space *titled* `sp-x` while another space is
+--      *identified* `sp-x` is the same ambiguity as two equal titles — and one
+--      no index can express, which is why `service._require_space_name_free`
+--      refuses to create it. The migration left it standing, so a database
+--      could carry it past the upgrade and resolve `sp-x` plan-dependently
+--      forever, invisibly. The row holding the *title* loses: an id is
+--      immutable and is the reference of last resort.
+WITH RECURSIVE
+ranked AS (
+    SELECT rowid AS rid, id, title, ROW_NUMBER() OVER (
+        PARTITION BY title ORDER BY state != 'active', created_at, rowid
+    ) AS rank
+    FROM nodes
+    WHERE type_id = 'space' AND title IS NOT NULL
+),
+space_ids AS (SELECT id FROM nodes WHERE type_id = 'space'),
+losers AS (
+    SELECT r.rid, r.title || ' (' || r.id || ')' AS base
+    FROM ranked r
+    WHERE r.rank > 1
+       OR EXISTS (SELECT 1 FROM space_ids s WHERE s.id = r.title AND s.id <> r.id)
+),
+keepers AS (
+    SELECT title FROM ranked WHERE rid NOT IN (SELECT rid FROM losers)
+),
+candidates(rid, base, suffix, name) AS (
+    SELECT rid, base, 0, base FROM losers
+    UNION ALL
+    SELECT rid, base, suffix + 1, base || ' ' || (suffix + 1)
+    FROM candidates
+    WHERE name IN (SELECT title FROM keepers) OR name IN (SELECT id FROM space_ids)
+),
+resolved AS (
+    SELECT rid, name FROM candidates
+    WHERE name NOT IN (SELECT title FROM keepers)
+      AND name NOT IN (SELECT id FROM space_ids)
+)
 UPDATE nodes
-SET title = title || ' (' || id || ')', updated_at = datetime('now')
-WHERE type_id = 'space'
-  AND title IS NOT NULL
-  AND rowid NOT IN (
-      SELECT rowid FROM (
-          SELECT rowid, ROW_NUMBER() OVER (
-              PARTITION BY title ORDER BY state = 'archived', created_at, rowid
-          ) AS rank
-          FROM nodes
-          WHERE type_id = 'space' AND title IS NOT NULL
-      )
-      WHERE rank = 1
-  );
+SET title = (SELECT name FROM resolved WHERE resolved.rid = nodes.rowid),
+    updated_at = datetime('now')
+WHERE rowid IN (SELECT rid FROM resolved);
 
 CREATE UNIQUE INDEX idx_space_title ON nodes(title)
 WHERE type_id = 'space' AND title IS NOT NULL;

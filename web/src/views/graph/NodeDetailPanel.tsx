@@ -15,7 +15,7 @@
  */
 
 import { Link } from "react-router-dom";
-import { NodeBadge, spaceLabel } from "../../components";
+import { NodeBadge, nameSpace, spaceNameNote } from "../../components";
 import type { NodeOut } from "../../api/types";
 import { formatAbsolute, formatTimestampLong } from "../../lib";
 import type { IncidentEdge } from "./graphElements";
@@ -26,8 +26,14 @@ interface NodeDetailPanelProps {
   isRoot: boolean;
   /** True when a node-type filter is on and this root would not have passed it. */
   rootExemptFromTypeFilter: boolean;
-  /** Active spaces, for naming this node's; empty before the list loads. */
-  spaces: readonly NodeOut[];
+  /** Active spaces, for naming this node's; null before the list answers. */
+  spaces: readonly NodeOut[] | null;
+  /**
+   * Archived space nodes, from the lazy read: a subgraph reaches nodes written
+   * into a space that has since been retired, and the panel names those rather
+   * than printing the 32-hex id it used to.
+   */
+  archivedSpaces: readonly NodeOut[];
   /** The space the view is narrowed to, resolved to an id; `""` for no filter. */
   filteredSpace: string;
   incident: IncidentEdge[];
@@ -64,6 +70,7 @@ export function NodeDetailPanel({
   isRoot,
   rootExemptFromTypeFilter,
   spaces,
+  archivedSpaces,
   filteredSpace,
   incident,
   rerootTo,
@@ -75,6 +82,11 @@ export function NodeDetailPanel({
   const preview = excerpt(node.content);
   const outsideFilter = filteredSpace !== "" && node.space_id !== filteredSpace;
   const crossings = incident.filter(({ crossing }) => crossing).length;
+  // Through `nameSpace`, not `spaceLabel`: a subgraph reaches nodes in a space
+  // archived since they were written, and the picker fallback rendered those as
+  // `space  ab30b069e18a42288bb0749c2169251d`.
+  const spaceName = node.space_id === null ? null : nameSpace(node.space_id, spaces, archivedSpaces);
+  const spaceNote = spaceName === null ? null : spaceNameNote(spaceName);
 
   return (
     <section className="nd-graph__panel-section" aria-label="Selected node">
@@ -114,8 +126,14 @@ export function NodeDetailPanel({
         <dt>id</dt>
         <dd className="nd-mono">{node.id}</dd>
         <dt>space</dt>
-        <dd className="nd-mono">
-          {node.space_id ? spaceLabel(spaces, node.space_id) : "—"}
+        <dd className="nd-mono" title={spaceNote ?? undefined}>
+          {spaceName === null ? "—" : spaceName.label}
+          {spaceName?.kind === "archived" ? (
+            <span className="nd-badge nd-badge--archived nd-graph__space-mark">
+              <span className="nd-badge__dot" aria-hidden="true" />
+              archived
+            </span>
+          ) : null}
         </dd>
         <dt>created by</dt>
         <dd className="nd-mono">{node.created_by}</dd>
@@ -207,7 +225,11 @@ export function NodeDetailPanel({
                   <span className="nd-graph__crossing-mark">
                     {crossing ? (
                       <span
-                        title={`Crosses into ${other?.space_id ? spaceLabel(spaces, other.space_id) : "another space"}`}
+                        title={`Crosses into ${
+                          other?.space_id
+                            ? nameSpace(other.space_id, spaces, archivedSpaces).label
+                            : "another space"
+                        }`}
                       >
                         crossing
                       </span>

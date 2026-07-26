@@ -504,6 +504,13 @@
   overflow-wrap: anywhere;
 }
 
+/* The space row's archived mark, inside the value cell so the two-column
+   grid keeps its shape. */
+.nd-graph__space-mark {
+  margin-left: var(--nd-space-2);
+  vertical-align: baseline;
+}
+
 .nd-graph__excerpt {
   font-size: var(--nd-text-xs);
   line-height: var(--nd-leading-prose);

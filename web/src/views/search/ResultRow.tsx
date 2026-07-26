@@ -1,7 +1,9 @@
 import type { KeyboardEvent } from "react";
 import { Link } from "react-router-dom";
 import { NodeBadge } from "../../components";
+import type { SpaceName } from "../../components";
 import type { SearchHit } from "../../api/types";
+import { hitSpaceTitle } from "./resultSpace";
 import { SignalBreakdown } from "./SignalBreakdown";
 import { describeSignals } from "./signals";
 import { renderSnippet } from "./snippet";
@@ -35,14 +37,16 @@ interface ResultRowProps {
    */
   knownState: string | null;
   /**
-   * What to call this hit's space, or null when the row states none.
+   * This hit's space, resolved, or null when the row states none.
    *
-   * Computed by `hitSpaceLabel` (`resultSpace.ts`), which follows the same rule as
-   * `knownState` one dimension over: an active space filter determines every
+   * Computed by `hitSpaceName` (`resultSpace.ts`), which follows the same rule
+   * as `knownState` one dimension over: an active space filter determines every
    * hit's space, so the row names it only when the search spanned more than
-   * one.
+   * one. It carries *how* the name resolved as well as the name, because a hit
+   * in a space archived since it was written is a fact the row has to show —
+   * the alternative is the 32-hex id this once rendered.
    */
-  spaceName: string | null;
+  spaceName: SpaceName | null;
   /** Query terms to mark in the snippet. */
   terms: string[];
   /** Registers the title link so the view can move focus to this row. */
@@ -96,11 +100,16 @@ export function ResultRow({
         </Link>
         <span className="nd-row nd-search-hit__marks">
           {spaceName === null ? null : (
-            <span
-              className="nd-meta nd-search-hit__space"
-              title={`This node lives in the ${spaceName} space. Narrow the space filter to read only that one.`}
-            >
-              in <span className="nd-mono">{spaceName}</span>
+            <span className="nd-meta nd-search-hit__space" title={hitSpaceTitle(spaceName)}>
+              in <span className="nd-mono">{spaceName.label}</span>
+              {/* Marked, not merely named: a hit in a retired space is worth a
+                  second's pause, and the filter cannot narrow to it. */}
+              {spaceName.kind === "archived" ? (
+                <span className="nd-badge nd-badge--archived nd-search-hit__space-mark">
+                  <span className="nd-badge__dot" aria-hidden="true" />
+                  archived
+                </span>
+              ) : null}
             </span>
           )}
           <NodeBadge type={hit.type} state={knownState} />

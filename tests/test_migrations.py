@@ -345,9 +345,11 @@ def test_0013_applies_to_a_populated_database_holding_duplicate_space_titles(tmp
 
     Archived duplicates are deduped too, because the index covers them: a title
     is reserved by every space that ever carried it. The tie-break is what that
-    makes load-bearing — a live row must keep the name even when an archived
+    makes load-bearing — a live row must keep the name even when a **non-active**
     row is older, or the upgrade would silently change what `--space research`
-    resolves to.
+    resolves to. Both non-active states are seeded older than the winner here,
+    because a tie-break that only demoted `archived` let an older *proposed* row
+    take the name off a live space and passed a fixture that seeded it last.
     """
     monkeypatch.setenv("NODUM_DB", str(tmp_path / "at0012.db"))
     monkeypatch.setattr(db, "MIGRATIONS", _prefix_through("0012_url_tokens"))
@@ -357,11 +359,13 @@ def test_0013_applies_to_a_populated_database_holding_duplicate_space_titles(tmp
         conn.executescript(
             "INSERT INTO nodes (id, space_id, type_id, title, state, created_by, created_at)"
             " VALUES"
+            # The tie-break cases: both non-active duplicates are *older* than
+            # the live rows they share a title with, so a tie-break that ranked
+            # either of them level with `active` would hand them the name.
+            "  ('sp-third',  'meta', 'space', 'research', 'proposed', 'agent:x',     '2025-11-01'),"
+            "  ('sp-gone',   'meta', 'space', 'research', 'archived', 'human:owner', '2025-11-02'),"
             "  ('sp-first',  'meta', 'space', 'research', 'active',   'human:owner', '2026-01-01'),"
             "  ('sp-second', 'meta', 'space', 'research', 'active',   'human:owner', '2026-01-02'),"
-            "  ('sp-third',  'meta', 'space', 'research', 'proposed', 'agent:x',     '2026-01-03'),"
-            "  ('sp-gone',   'meta', 'space', 'research', 'archived', 'human:owner', '2026-01-04'),"
-            # The tie-break case: the archived row is the *older* one here.
             "  ('sp-retired','meta', 'space', 'reading',  'archived', 'human:owner', '2025-12-01'),"
             "  ('sp-live',   'meta', 'space', 'reading',  'active',   'human:owner', '2026-01-05');"
             "INSERT INTO nodes (id, space_id, type_id, title, created_by)"
@@ -386,6 +390,9 @@ def test_0013_applies_to_a_populated_database_holding_duplicate_space_titles(tmp
     # something unique and self-explaining, and stay perfectly usable.
     assert titles["sp-first"] == "research"
     assert titles["sp-second"] == "research (sp-second)"
+    # Neither non-active row takes the name off a live space, though both are
+    # older than it. A `proposed` duplicate is the one the tie-break used to
+    # miss — it sorted level with `active` and won on `created_at`.
     assert titles["sp-third"] == "research (sp-third)"
     # An archived duplicate is renamed like any other: its title is inside the
     # index now, so leaving it would be leaving the index uncreatable.
@@ -405,6 +412,106 @@ def test_0013_applies_to_a_populated_database_holding_duplicate_space_titles(tmp
         ).space_id
         == "sp-second"
     )
+    # And accepting the proposal cannot move the name either — the harm the
+    # tie-break used to do surfaced only once the proposed row went active.
+    service.transition("sp-third", "accept", principal=owner())
+    assert service.resolve_space_id("research", principal=owner()) == "sp-first"
+
+
+def test_0013_finds_a_free_name_when_the_deduping_rename_would_itself_collide(
+    tmp_path, monkeypatch
+):
+    """`<title> (<id>)` is unique among losers, but not against what is there.
+
+    A database holding two spaces called `research` plus one literally titled
+    `research (sp-b)` made the dedupe generate a name the index then refused —
+    an `IntegrityError` that rolled the whole upgrade back, which is the exact
+    0009 failure mode this migration exists to prevent. So the free name is
+    searched, not assumed.
+    """
+    monkeypatch.setenv("NODUM_DB", str(tmp_path / "at0012.db"))
+    monkeypatch.setattr(db, "MIGRATIONS", _prefix_through("0012_url_tokens"))
+    service.init()
+    conn = db.connect()
+    try:
+        conn.executescript(
+            "INSERT INTO nodes (id, space_id, type_id, title, state, created_by, created_at)"
+            " VALUES"
+            "  ('sp-a','meta','space','research',        'active','human:owner','2026-01-01'),"
+            "  ('sp-b','meta','space','research',        'active','human:owner','2026-01-02'),"
+            "  ('sp-c','meta','space','research (sp-b)', 'active','human:owner','2026-01-03'),"
+            "  ('sp-d','meta','space','research (sp-b) 1','active','human:owner','2026-01-04');"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    monkeypatch.setattr(db, "MIGRATIONS", MIGRATIONS)
+    conn = db.connect()
+    try:
+        assert db.init_db(conn) == ["0013_unique_space_titles"]
+        titles = dict(
+            conn.execute("SELECT id, title FROM nodes WHERE id LIKE 'sp-%' ORDER BY id").fetchall()
+        )
+    finally:
+        conn.close()
+
+    # The base and the first suffix are both taken, so the search walks past
+    # them rather than generating a name the index refuses.
+    assert titles["sp-a"] == "research"
+    assert titles["sp-b"] == "research (sp-b) 2"
+    assert titles["sp-c"] == "research (sp-b)"
+    assert titles["sp-d"] == "research (sp-b) 1"
+    assert service.resolve_space_id("research", principal=owner()) == "sp-a"
+    assert service.resolve_space_id("research (sp-b) 2", principal=owner()) == "sp-b"
+
+
+def test_0013_deduplicates_a_title_that_is_another_spaces_id(tmp_path, monkeypatch):
+    """The ambiguity no index can express, and the one the service refuses to create.
+
+    `_resolve_space` matches `id = ? OR title = ?`, so a space *titled* `sp-x`
+    while another is *identified* `sp-x` is exactly as ambiguous as two equal
+    titles — `service._require_space_name_free` refuses to create it for that
+    reason. The migration used to apply cleanly straight over it, leaving
+    `--space sp-x` plan-dependent forever and invisibly. The row holding the
+    title loses: an id is immutable and is the reference of last resort.
+    """
+    monkeypatch.setenv("NODUM_DB", str(tmp_path / "at0012.db"))
+    monkeypatch.setattr(db, "MIGRATIONS", _prefix_through("0012_url_tokens"))
+    service.init()
+    conn = db.connect()
+    try:
+        conn.executescript(
+            "INSERT INTO nodes (id, space_id, type_id, title, state, created_by, created_at)"
+            " VALUES"
+            "  ('sp-x', 'meta', 'space', 'research', 'active', 'human:owner', '2026-01-01'),"
+            "  ('sp-y', 'meta', 'space', 'sp-x',     'active', 'human:owner', '2026-01-02');"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    monkeypatch.setattr(db, "MIGRATIONS", MIGRATIONS)
+    conn = db.connect()
+    try:
+        assert db.init_db(conn) == ["0013_unique_space_titles"]
+        titles = dict(
+            conn.execute("SELECT id, title FROM nodes WHERE id LIKE 'sp-%' ORDER BY id").fetchall()
+        )
+        answering = [
+            row[0]
+            for row in conn.execute(
+                "SELECT id FROM nodes WHERE type_id = 'space' AND (id = 'sp-x' OR title = 'sp-x')"
+            )
+        ]
+    finally:
+        conn.close()
+
+    assert titles["sp-x"] == "research"
+    assert titles["sp-y"] == "sp-x (sp-y)"
+    # Exactly one row answers to `sp-x` now, so resolution is not plan-dependent.
+    assert answering == ["sp-x"]
+    assert service.resolve_space_id("sp-x", principal=owner()) == "sp-x"
 
 
 def test_0013_guards_the_titles_it_deduped(fresh_db):

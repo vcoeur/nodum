@@ -40,6 +40,8 @@ import {
   Spinner,
   resolveSpaceValue,
   spaceLabel,
+  unresolvedSpaceIds,
+  useArchivedSpaces,
   useSpaces,
 } from "../../components";
 import type { NodeOut } from "../../api/types";
@@ -182,6 +184,22 @@ export default function GraphView() {
     [data, resolvedSpace, spaceResolved],
   );
   const spaceName = spaceLabel(knownSpaces, filters.space);
+
+  // The inspector names the space of the node it is showing, and of the far end
+  // of every crossing — including a space archived since those nodes were
+  // written, which the shared active-only list cannot name. One lazy listing
+  // covers the whole subgraph. It is deliberately **not** also gated on a node
+  // being selected: `needed` going false on every deselect and true again on
+  // the next select would re-issue the request on each click.
+  const unresolvedNodeSpaces = useMemo(
+    () =>
+      unresolvedSpaceIds(
+        (data?.nodes ?? []).map((node) => node.space_id ?? ""),
+        spaceList.spaces,
+      ),
+    [data, spaceList.spaces],
+  );
+  const archivedSpaces = useArchivedSpaces(unresolvedNodeSpaces.length > 0);
 
   const nodesById = useMemo(() => {
     const index = new Map<string, NodeOut>();
@@ -549,7 +567,8 @@ export default function GraphView() {
               node={selectedNode}
               isRoot={selectedNode.id === data.root}
               rootExemptFromTypeFilter={rootExempt && selectedNode.id === data.root}
-              spaces={knownSpaces}
+              spaces={spaceList.spaces}
+              archivedSpaces={archivedSpaces.spaces}
               filteredSpace={spaceResolved ? resolvedSpace : ""}
               incident={incidentEdges(data, selectedNode.id)}
               rerootTo={rerootHref(selectedNode.id)}

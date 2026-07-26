@@ -97,7 +97,7 @@ uv run nodum node create --type note --title "Filed" --space reference --as owne
 uv run nodum node list --space reference --as owner
 uv run nodum search "graph theory" --space reference --as owner
 uv run nodum node list --include-meta --as owner    # the type vocabulary, off by default
-uv run nodum space-archive reference --as owner     # nodes keep their space_id
+uv run nodum space-archive reference --as owner     # nodes keep their space_id; grants go inert
 
 uv run nodum undo --as owner                        # reverse the latest event
 uv run nodum types --as owner                       # the seeded type catalog
@@ -246,15 +246,22 @@ degrades to BM25 + graph expansion. `NODUM_EMBED_MODEL` switches the model
   holds no grant on does not resolve at all, reading exactly like one that does
   not exist. Meta-space nodes (the type vocabulary, the spaces themselves) stay
   out of content reads unless `--include-meta` says otherwise, or the read is
-  narrowed to `meta` by name. Two rules keep the vocabulary unambiguous, and
-  both live in the service so every surface has them: **no two spaces may share
+  narrowed to `meta` by name. Four rules keep the vocabulary unambiguous, and
+  all live in the service so every surface has them: **no two spaces may share
   a name** (a reference resolves as `id = ? OR title = ?`, compared exactly —
   and a space keeps its name when it is archived, so a retired name stays
-  reserved and restoring the space can never collide),
-  and **`main` and `meta` cannot be archived** (every unnamed write still lands
-  in `main` whatever state the row is in; `meta` holds the spaces themselves).
-  Renaming either is fine: a rename moves the title, and the id is what
-  everything structural depends on.
+  reserved and restoring the space can never collide);
+  **`main` and `meta` cannot be archived** (every unnamed write still lands
+  in `main` whatever state the row is in; `meta` holds the spaces themselves) —
+  renaming either is fine, since a rename moves the title and the id is what
+  everything structural depends on;
+  **a space lives in `meta`** (one nested in ordinary territory would be listed
+  and resolved as real while governed by its host's grants);
+  and **archiving a space makes every grant on it inert** — cutting an agent
+  off is what archiving is usually for, so while the space is archived a grant
+  on it confers nothing at all, including on nodes reached by id. The grant rows
+  are kept rather than deleted, so `grants` still lists them, `revoke` still
+  removes them, and undoing the archive restores the delegation unchanged.
 - **MCP server.** `nodum mcp serve` runs a stdio MCP server (the official
   Python SDK's FastMCP). The agent authenticates with its token in
   `NODUM_AGENT_TOKEN` (minted by `nodum agent create`, shown once, stored

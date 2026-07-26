@@ -19,12 +19,12 @@
  */
 
 import { NodeBadge } from "../../components";
+import type { SpaceName } from "../../components";
 import type { ProposalOut } from "../../api/types";
 import { formatAbsolute, formatRelative } from "../../lib";
 import { formatConfidence, formatProps, shortId, truncate } from "./format";
 import { edgeCrossing, proposalKind } from "./grouping";
 import type { EdgeCrossing } from "./grouping";
-import type { SpaceName } from "./spaceNaming";
 import { UpdateDiff } from "./UpdateDiff";
 import {
   acceptConsequence,

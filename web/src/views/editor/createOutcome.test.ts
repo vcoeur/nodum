@@ -17,7 +17,11 @@
 
 import { describe, expect, it } from "vitest";
 import { ApiError, UnknownSpaceError } from "../../api/client";
-import { describeLanding, describeWriteFailure } from "./createOutcome";
+import {
+  describeDetachedWriteFailure,
+  describeLanding,
+  describeWriteFailure,
+} from "./createOutcome";
 import type { NodeOut } from "../../api/types";
 
 /** A space as `GET /api/spaces` renders it — a node of type `space` in meta. */
@@ -151,5 +155,68 @@ describe("a write target the server refused", () => {
     // Losing the buffer is the editor's cardinal failure; the panel says it did
     // not happen.
     expect(message).toMatch(/still here/i);
+  });
+});
+
+describe("a refused write the editor has already let go of", () => {
+  /**
+   * The scenario: the write target is `research`; it is archived from another
+   * tab or the CLI; the human types in `/editor` and clicks another node before
+   * the 1200 ms debounce fires. `flushBuffer` → `flushLeftover` →
+   * `createNode({space:"research"})` → `UnknownSpaceError`, reported through
+   * the toast because the buffer it belonged to is no longer on screen.
+   *
+   * Both of those paths called `toast.showError`, which formats an `ApiError`
+   * as `type: message` — so the toast read, verbatim,
+   * **"UnknownSpace: unknown space: research"**. The copy rule forbids exactly
+   * that: the server's wording is identical for a space that was never created
+   * and one the caller holds no grant on, so any surface that renders it is an
+   * existence oracle over the whole file.
+   */
+  it("recognises the same refusal the in-place path does", () => {
+    expect(describeDetachedWriteFailure(refusedTarget(), "research", SPACES)).not.toBeNull();
+    expect(describeDetachedWriteFailure(refusedTarget(400), "research", SPACES)).not.toBeNull();
+  });
+
+  it("never renders the server's own wording, which is what the toast used to show", () => {
+    const message = describeDetachedWriteFailure(refusedTarget(), "research", SPACES) ?? "";
+    expect(message).not.toMatch(/unknown space/i);
+    expect(message).not.toMatch(/UnknownSpace/);
+    expect(message).not.toMatch(/no such space/i);
+    expect(message).not.toMatch(/does not exist/i);
+    expect(message).not.toMatch(/not found/i);
+  });
+
+  it("says what changed, and names the space it changed about", () => {
+    const message = describeDetachedWriteFailure(refusedTarget(), "research", SPACES) ?? "";
+    expect(message).toContain("research");
+    expect(message).toMatch(/archived/i);
+    expect(message).toMatch(/renamed/i);
+  });
+
+  it("does not promise the text is still there, because it is not", () => {
+    // The in-place panel's last sentence is "your text is still here" — true of
+    // a buffer on screen, false of one the next document replaced. This path is
+    // the only place in the editor where work is genuinely lost, and saying
+    // otherwise would send the human back to look for it.
+    const message = describeDetachedWriteFailure(refusedTarget(), "research", SPACES) ?? "";
+    expect(message).not.toMatch(/still here/i);
+    expect(message).toMatch(/could not be kept/i);
+  });
+
+  it("declines everything else, so the shared classifier still describes it", () => {
+    expect(
+      describeDetachedWriteFailure(new ApiError(503, "DatabaseBusy", "database is locked"), "main", SPACES),
+    ).toBeNull();
+    expect(describeDetachedWriteFailure(new TypeError("Failed to fetch"), "main", SPACES)).toBeNull();
+    // Same inverse assertion as the in-place path: a bare `ApiError` carrying
+    // the message means the client stopped normalising, and the fix is there.
+    expect(
+      describeDetachedWriteFailure(
+        new ApiError(404, "TypeNotFound", "unknown space: research"),
+        "research",
+        SPACES,
+      ),
+    ).toBeNull();
   });
 });

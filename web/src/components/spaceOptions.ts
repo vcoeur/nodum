@@ -16,10 +16,19 @@
  * surface. Options key on the id, so a selection expressed as a name has to be
  * resolved to one before it can match — {@link resolveSpaceValue}. Without that
  * step, filtering by `research` and filtering by `research`'s id would render
- * as two different spaces in the same list.
+ * as two different spaces in the same list. The match itself is
+ * {@link findSpace}, in `spaceNaming.ts`, which is the one owner of it.
+ *
+ * This is the **picker** half of naming a space, and it stops where a picker
+ * does: {@link spaceLabel} falls back to the raw reference, because an option
+ * that renders blank is an option a controlled `<select>` cannot represent. A
+ * surface that *displays* a space rather than offering it wants `nameSpace`
+ * (`spaceNaming.ts`) instead — the fallback is right for a picker and is a bare
+ * 32-hex id everywhere else.
  */
 
 import type { NodeOut } from "../api/types";
+import { findSpace } from "./spaceNaming";
 
 /** The "no space filter" value: read every space in scope. The default. */
 export const ANY_SPACE = "";
@@ -39,24 +48,18 @@ export interface SpaceOption {
 }
 
 /**
- * Find a space by id or by name.
+ * A picker's label for a space: its title, or the bare reference when it has
+ * none — or when the reference is not in the list at all.
  *
- * @param spaces Every active space.
- * @param spaceRef A space id or name.
- */
-function findSpace(spaces: readonly NodeOut[], spaceRef: string): NodeOut | undefined {
-  return spaces.find(
-    (candidate) => candidate.id === spaceRef || candidate.title === spaceRef,
-  );
-}
-
-/**
- * How to name a space: its title, or the bare reference when it has none — or
- * when the reference is not in the list at all.
+ * A filter or a write target can name a space that has since been archived and
+ * so left `GET /api/spaces`, and a controlled `<select>` still has to be able
+ * to render its own value: an option with no label renders blank and the next
+ * change event silently rewrites the caller's state.
  *
- * A grant, a filter, or a write target can name a space that has since been
- * archived and so left `GET /api/spaces`, and it must still render as
- * something a human recognises rather than as nothing.
+ * **That fallback is a picker rule, not a naming rule.** Outside a `<select>`
+ * it prints a 32-hex id at a reader — use `nameSpace` (`spaceNaming.ts`), which
+ * keeps *archived* apart from *nothing names this* instead of collapsing both
+ * into the id.
  *
  * @param spaces Every active space.
  * @param spaceRef A space id or name.
