@@ -1,44 +1,56 @@
 """The HTTP adapter (design §9) — a thin Starlette front over the service layer.
 
 This surface is for the **human**, and it is the exact inverse of
-:mod:`nodum.mcp_server`. The MCP server forces an ``agent:<name>`` actor and
-refuses ``human``; here every write is attributed to the session's human
-principal — and *nothing a request carries can change that*.
+:mod:`nodum.mcp_server`. The MCP server authenticates an agent token and
+forces an ``agent:<name>`` principal; here the identity is the human behind
+an authenticated **session** — and *nothing a request carries can change
+that*.
 
-**How the actor boundary is structural.** There is exactly one expression in
-this module that binds a service function's ``actor`` argument, and it lives in
-:func:`_write`, where it binds the module constant. Route handlers never name
-an actor at all — they cannot read one from a body, a header, or a query
-string, because none of them mentions the concept — and request data is never
-forwarded wholesale: every handler picks the fields it uses by name. A new
-endpoint inherits the guarantee by construction. ``tests/test_http_api.py``
-enforces it from two directions: an adversarial sweep that drives **every route
-in the live route table** with actor-carrying bodies and then asserts the event
-log and every row written during the sweep name ``human`` — which catches a
-rogue endpoint however it reaches the service — and AST properties over this
-module (one ``actor=`` binding, no import of an actor-taking service function
-under any name, no ``getattr`` on an adapter module, no unreviewed ``**``
-unpack). The service layer's own human tier (``_require_human_reviewer`` over
-``HUMAN_ONLY_ACTIONS``) then applies as it does to every other surface — this
-module re-implements none of it.
+**How the identity boundary is structural.** There is exactly one expression
+in this module that binds a service function's ``principal`` argument for a
+write, and it lives in :func:`_write`; read handlers bind theirs through the
+same :func:`_session_principal`. That function reads only what
+:class:`SessionMiddleware` verified into the request scope and raises when
+it is absent — so there is no principal without a verified session, and no
+route handler can read an identity from a body, a header, or a query string,
+because none of them mentions the concept. Request data is never forwarded
+wholesale either: every handler picks the fields it uses by name, and a new
+endpoint inherits the guarantee by construction.
+``tests/test_http_api.py`` enforces it from two directions: an adversarial
+sweep that drives **every route in the live route table** with
+actor-carrying bodies behind a second human's session and then asserts the
+event log and every row written during the sweep name that human — which
+catches a rogue endpoint however it reaches the service — and AST properties
+over this module (every ``principal=`` mints through
+``_session_principal(request)``, no import of a write service function under
+any name, no ``getattr`` on an adapter module, no unreviewed ``**`` unpack,
+no trusted-local ``auth`` entry point). The service layer's own grant
+enforcement then applies as it does to every other surface — this module
+re-implements none of it.
 
 Everything else is convention, shared rather than re-stated:
 
 * **Envelope** — :mod:`nodum.envelope`, the same helper the CLI prints
-  through, so ``GET /api/nodes/{id}`` and ``nodum node get <id>`` emit the same
-  bytes.
+  through, so ``GET /api/nodes/{id}`` and ``nodum node get <id>`` emit the
+  same bytes.
 * **Errors** — one :data:`EXCEPTION_STATUS` table installed as Starlette
   exception handlers. It covers every class ``cli._run`` catches (``sqlite3``
   failures and ``OSError`` included, by base class) plus the ones only a
   network surface can meet, and echoes the CLI's one-line message as
-  ``{"error": {"type", "message"}}``. Anything unmapped is a 500 with a generic
-  message; the traceback goes to the server log, never into a response body.
-* **Auth is not the same thing as origin control.** ``nodum serve`` binds
-  loopback and an optional static bearer token gates ``/api/*``; but loopback
-  is reachable from every page the browser loads, so a bind is no defence
-  against a *browser*. :class:`RequestGuardMiddleware` is: it validates the
-  ``Host`` header against the names this server answers to (DNS rebinding),
-  proves a state-changing request is same-origin before it can reach a handler
+  ``{"error": {"type", "message"}}``. Anything unmapped is a 500 with a
+  generic message; the traceback goes to the server log, never into a
+  response body.
+* **Auth is not the same thing as origin control.** Password login
+  (``POST /api/login``) verifies an argon2id hash, creates a server-side
+  session row (30-day sliding expiry) and sets an ``HttpOnly;
+  SameSite=Strict`` cookie; :class:`SessionMiddleware` resolves that cookie
+  to the human's principal on every ``/api`` request, and only ``/healthz``,
+  ``/api/login`` and the static UI stay open. Sessions stop *processes*
+  without the password; they do nothing against a *browser* on another
+  origin reaching for this port, which is what
+  :class:`RequestGuardMiddleware` is: it validates the ``Host`` header
+  against the names this server answers to (DNS rebinding), proves a
+  state-changing request is same-origin before it can reach a handler
   (CSRF), and enforces the content type each route class accepts, so that no
   cross-origin request a browser can make without a preflight — and this app
   answers no preflight — can reach a write. See the class docstring for the
@@ -57,13 +69,11 @@ Everything else is convention, shared rather than re-stated:
   is written by agents and rendered in this origin, which is also the origin
   that may write to the API.
 
-**What this surface still does not defend against, on purpose.** Every local
-process shares the loopback interface, so anything that can open a socket on
-this port can drive this API *as the human* — including an MCP server launched
-with ``--actor agent:x``, which would thereby regain the ``accept`` the MCP
-tool list structurally withholds. Origin control stops browsers, not
-processes; only ``--token`` (a secret the local agent does not hold) does.
-``nodum serve`` says so out loud at startup rather than leaving it implicit.
+**What this surface still does not defend against, on purpose.** Login is
+the whole boundary: any process that can open a socket on this port may
+*attempt* one, so the strength of the human's password is the strength of
+the defence. ``nodum serve`` says so at startup rather than leaving it
+implicit.
 
 Handlers call the service inline rather than through a thread pool: the service
 opens one short-lived connection per call and SQLite has a single writer
@@ -73,9 +83,9 @@ stays much easier to reason about.
 
 from __future__ import annotations
 
+import http.cookies
 import json
 import re
-import secrets
 import sqlite3
 import tempfile
 from collections.abc import Iterable, Sequence
@@ -113,13 +123,38 @@ from nodum.service import (
     UndoNotPossible,
 )
 
+#: The session cookie's name: an opaque id for a server-side ``sessions`` row
+#: (30-day sliding expiry), set by ``POST /api/login`` as ``HttpOnly;
+#: SameSite=Strict; Path=/``.
+SESSION_COOKIE = "nodum_session"
 
-#: INTERIM (Q13 surfaces task): the principal every write on this surface is
-#: attributed to — the owner, until password sessions land and the session
-#: middleware resolves the *actual* human per request. As before, it is a
-#: module-level binding rather than anything a request can influence.
-def _http_principal() -> Principal:
-    return auth.owner_principal()
+#: Scope key :class:`SessionMiddleware` stores the verified principal under.
+#: The *only* source of identity on this surface — :func:`_session_principal`
+#: reads it and nothing else, so request data can never become an identity.
+SESSION_SCOPE_KEY = "nodum.session_principal"
+
+#: The one ``/api`` route outside the session gate (it *makes* sessions).
+#: ``/healthz`` sits outside ``/api`` entirely: a liveness probe that needs
+#: credentials is not a liveness probe.
+LOGIN_PATH = "/api/login"
+
+
+def _session_principal(request: Request) -> Principal:
+    """The principal the session middleware verified for this request.
+
+    Every ``principal=`` binding in this module is a call to this (an AST
+    property in ``tests/test_http_api.py`` keeps it so), and this reads only
+    what :class:`SessionMiddleware` put in the scope — never the request's
+    own data. Absence is a programming error (a route reached without the
+    middleware), not an authentication failure, so it raises rather than
+    minting anything: no principal without a verified session.
+    """
+    principal = request.scope.get(SESSION_SCOPE_KEY)
+    if principal is None:
+        raise RuntimeError(
+            "no session principal in scope: this route ran outside SessionMiddleware"
+        )
+    return principal
 
 
 #: Prefix every API route carries. ``/healthz`` deliberately sits outside it:
@@ -256,7 +291,9 @@ LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "0.0.0.0"})
 #: Addresses whose *bind* reaches only this machine. Not the same set as
 #: :data:`LOOPBACK_HOSTS`: ``http://0.0.0.0:8600`` typed into a browser resolves
 #: to loopback and is a fine ``Host`` value, while ``--host 0.0.0.0`` binds
-#: every interface and puts the API on the network.
+#: every interface and puts the API on the network. ``nodum serve`` uses this
+#: to decide the session cookie's ``Secure`` flag: loopback is plain HTTP (a
+#: ``Secure`` cookie would never be stored), a LAN bind fronts TLS.
 LOOPBACK_BIND_ADDRESSES = frozenset({"localhost", "127.0.0.1", "::1"})
 
 #: ``--allow-host`` value that turns the ``Host``/``Origin`` check off. Explicit
@@ -322,7 +359,13 @@ EXCEPTION_STATUS: dict[type[Exception], int] = {
     UnsupportedRendition: 400,
     ImageTooLarge: 400,
     OverflowError: 400,
-    # 403 — the human tier refused a non-human actor. Unreachable from this
+    # 401 — the login itself failed (bad name or password). The *absence* of
+    # a session on any other route is answered by SessionMiddleware directly.
+    # Listed explicitly because InvalidCredentials derives from OSError via
+    # PermissionError and would otherwise inherit the 500 below.
+    auth.InvalidCredentials: 401,
+    # 403 — the grant model refused a write. Sessions mint human principals
+    # only, and humans are unfiltered, so this is unreachable from this
     # surface by construction; mapped so it could never surface as a 500.
     GrantNotPermitted: 403,
     # 409 — the graph has grown past the event being undone.
@@ -360,17 +403,19 @@ except metadata.PackageNotFoundError:  # pragma: no cover - uninstalled source c
 # ── The actor boundary ────────────────────────────────────────────────────────
 
 
-def _write(operation: Any, /, *args: Any, **kwargs: Any) -> Any:
-    """Call a service write as the HTTP principal — the only one this surface has.
+def _write(request: Request, operation: Any, /, *args: Any, **kwargs: Any) -> Any:
+    """Call a service write as the session's principal — the only one this surface has.
 
     Every write, review, archive, and undo handler goes through here,
-    and this is the **one** place in the module that binds ``principal`` at
-    all. A caller cannot supply one: a ``principal`` (or legacy ``actor``)
-    keyword arriving here would mean a handler forwarded request data
-    wholesale, so it is refused rather than honoured and no request field can
-    ever reach the service as an identity.
+    and this is the **one** place in the module that binds ``principal`` for
+    a write at all — to whatever :class:`SessionMiddleware` verified into
+    the request's scope. A caller cannot supply one: a ``principal`` (or
+    legacy ``actor``) keyword arriving here would mean a handler forwarded
+    request data wholesale, so it is refused rather than honoured and no
+    request field can ever reach the service as an identity.
 
     Args:
+        request: The incoming request, carrying the verified session principal.
         operation: The :mod:`nodum.service` function to invoke.
         *args: Positional arguments for it.
         **kwargs: Keyword arguments for it, never including ``principal``.
@@ -386,7 +431,7 @@ def _write(operation: Any, /, *args: Any, **kwargs: Any) -> Any:
             "the HTTP surface never takes a principal from a caller: "
             "identity comes from the authenticated session, never the request"
         )
-    return operation(*args, principal=_http_principal(), **kwargs)
+    return operation(*args, principal=_session_principal(request), **kwargs)
 
 
 # ── Responses ─────────────────────────────────────────────────────────────────
@@ -419,8 +464,12 @@ def _failure_message(exc: Exception) -> str:
     ``database error: …`` is what the CLI prints for a SQLite failure. An
     ``OSError`` is the one deliberate divergence: ``cli._run`` appends the
     filename, and this surface must not — the path is the operator's on a
-    terminal and a stranger's over a socket.
+    terminal and a stranger's over a socket. ``auth.InvalidCredentials``
+    derives from ``OSError`` (via ``PermissionError``) and is checked first:
+    it is a credential failure, never a storage one.
     """
+    if isinstance(exc, auth.InvalidCredentials):
+        return str(exc)
     if isinstance(exc, sqlite3.Error):
         return f"database error: {exc}"
     if isinstance(exc, OSError):
@@ -541,8 +590,8 @@ def resolve_allowed_hosts(host: str, extra: Iterable[str] | None = None) -> froz
 class RequestGuardMiddleware:
     """Reject requests a browser on another origin could have made, and cap body size.
 
-    ``nodum serve`` binds loopback with no token by default, and **loopback is
-    reachable from every page the user visits**. Nothing about the bind stops
+    ``nodum serve`` binds loopback by default, and **loopback is reachable
+    from every page the user visits**. Nothing about the bind stops
     ``https://evil.example`` from posting to ``http://127.0.0.1:8600``; the
     absence of CORS headers only stops it *reading the reply*, which a CSRF
     attacker does not need. This middleware is what stops the write landing.
@@ -572,8 +621,9 @@ class RequestGuardMiddleware:
        claimed.
 
     What it does **not** do: authenticate. Any local process can satisfy every
-    check above with three ``curl`` headers. That is what ``--token`` is for,
-    and ``nodum serve`` says so at startup.
+    check above with three ``curl`` headers. That is what the password session
+    is for — this guard decides which requests may *reach* the credential
+    check, not who passes it.
     """
 
     def __init__(self, app: ASGIApp, *, allowed_hosts: frozenset[str], max_body_bytes: int) -> None:
@@ -678,35 +728,73 @@ class RequestGuardMiddleware:
         await self.app(scope, self._limited(receive), send)
 
 
-class BearerTokenMiddleware:
-    """Require ``Authorization: Bearer <token>`` on ``/api/*``.
+def _cookie_value(scope: Scope, name: str) -> str | None:
+    """Read one cookie out of the request headers, or ``None``.
 
-    Installed only when a token is configured (``nodum serve --token``), which
-    is the LAN case and the only defence against *local* processes; the default
-    loopback bind has no auth at all. ``/healthz`` and the static UI stay open
-    either way — a liveness probe that needs credentials is not a liveness
-    probe, and the page that *holds* the token cannot itself require it.
+    Malformed cookie headers parse to nothing rather than raising — a garbage
+    ``Cookie`` line is an unauthenticated request, not a 500.
+    """
+    header = Headers(scope=scope).get("cookie")
+    if not header:
+        return None
+    jar: http.cookies.SimpleCookie = http.cookies.SimpleCookie()
+    try:
+        jar.load(header)
+    except http.cookies.CookieError:
+        return None
+    morsel = jar.get(name)
+    return morsel.value if morsel is not None else None
 
-    The comparison is over bytes. Starlette decodes headers as latin-1, and
-    ``secrets.compare_digest`` refuses two ``str`` values unless both are ASCII,
-    so ``Authorization: Bearer café`` used to raise ``TypeError`` — an
-    unauthenticated, endlessly repeatable 500 with a traceback per request, on
-    exactly the deployment that configured a token.
+
+class SessionMiddleware:
+    """Resolve the session cookie to a verified principal on every ``/api`` request.
+
+    The gate is simple because the model is: every ``/api`` route but
+    :data:`LOGIN_PATH` needs a valid session — reads included (single-human
+    app; one rule, no per-route memory). ``/healthz`` is outside ``/api`` and
+    the static UI is not an API path, so the probe and the login page's
+    bundle stay open.
+
+    Resolution goes through :func:`auth.principal_for_session`, which checks
+    the row exists, has not expired (sliding the expiry forward on success),
+    and belongs to an enabled human — so logout, expiry, and ``human
+    disable`` all kill a cookie at the next request, with no cache in
+    between. The verified principal is stored in the scope under
+    :data:`SESSION_SCOPE_KEY`, the one place :func:`_session_principal`
+    reads; the middleware never looks at anything else a request carries.
     """
 
-    def __init__(self, app: ASGIApp, token: str) -> None:
+    def __init__(self, app: ASGIApp, *, db_path: str | Path | None = None) -> None:
         self.app = app
-        self.expected = f"Bearer {token}".encode()
+        self.db_path = db_path
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        """Reject unauthenticated API requests; pass everything else through."""
-        if scope["type"] == "http" and _is_api_path(scope["path"]):
-            presented = Headers(scope=scope).get("authorization", "").encode("latin-1")
-            # Constant-time: a short shared secret compared on every request.
-            if not secrets.compare_digest(presented, self.expected):
-                response = _error(401, "Unauthorized", "missing or invalid bearer token")
-                await response(scope, receive, send)
-                return
+        """Gate ``/api`` on a valid session; pass everything else through."""
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        path = scope["path"]
+        if not _is_api_path(path) or path == LOGIN_PATH:
+            await self.app(scope, receive, send)
+            return
+        session_id = _cookie_value(scope, SESSION_COOKIE)
+        principal: Principal | None = None
+        if session_id is not None:
+            try:
+                principal = auth.principal_for_session(session_id, path=self.db_path)
+            except auth.InvalidCredentials:
+                principal = None
+        if principal is None:
+            response = _error(
+                401, "Unauthorized", "a valid session is required: POST /api/login first"
+            )
+            if session_id is not None:
+                # A presented-but-dead cookie is cleared, so the client stops
+                # offering it instead of being 401'd on every request.
+                response.delete_cookie(SESSION_COOKIE, path="/")
+            await response(scope, receive, send)
+            return
+        scope[SESSION_SCOPE_KEY] = principal
         await self.app(scope, receive, send)
 
 
@@ -999,50 +1087,92 @@ def _web_file(relative: str) -> Path | None:
 def create_app(
     *,
     db_path: str | Path | None = None,
-    token: str | None = None,
     allowed_hosts: Sequence[str] | frozenset[str] | None = None,
     max_body_bytes: int | None = None,
+    secure_cookies: bool = False,
 ) -> Starlette:
     """Build the nodum HTTP app: the JSON API plus the human web UI.
 
     Args:
         db_path: Explicit database path; defaults to ``NODUM_DB`` resolution,
             exactly as every other adapter resolves it.
-        token: Optional static bearer token. When set, every ``/api/*`` request
-            must carry ``Authorization: Bearer <token>``; when ``None`` there is
-            no auth at all, which is the loopback default.
         allowed_hosts: Host names this server answers to (see
             :func:`resolve_allowed_hosts`). Defaults to the loopback set, which
             is what the default bind serves.
         max_body_bytes: Ceiling on a request body; defaults to
             :data:`MAX_REQUEST_BYTES`.
+        secure_cookies: Mark the session cookie ``Secure``. ``nodum serve``
+            sets it for a non-loopback bind (a LAN hostname will be served
+            over TLS in front); loopback stays plain HTTP, where a ``Secure``
+            cookie would never be stored at all.
 
     Returns:
-        The configured Starlette application. Bind it to loopback unless a
-        token is set: there are no accounts, sessions, or roles here, by design
-        (single-user, design §9), and origin control keeps *browsers* out, not
-        other processes on the machine.
+        The configured Starlette application. Every ``/api`` route but
+        ``POST /api/login`` requires a valid session (``/healthz`` and the
+        static UI stay open); origin control keeps *browsers* out, and the
+        human's password is what keeps other local *processes* out.
     """
     hosts = frozenset(allowed_hosts) if allowed_hosts is not None else resolve_allowed_hosts("")
     body_limit = MAX_REQUEST_BYTES if max_body_bytes is None else max_body_bytes
 
-    # ── Health and catalog ────────────────────────────────────────────────
+    # ── Health, login, and catalog ────────────────────────────────────────
 
     async def healthz(request: Request) -> Response:
-        """Liveness probe — open even when a bearer token is configured.
+        """Liveness probe — open even with the session gate on.
 
         Reports liveness and nothing else. It used to report the absolute
         database path, which is unauthenticated disclosure of a username and a
-        filesystem layout on exactly the deployment that set ``--token`` to
-        avoid disclosing anything. ``nodum serve`` prints the path at startup,
-        where the operator is the only reader.
+        filesystem layout. ``nodum serve`` prints the path at startup, where
+        the operator is the only reader.
         """
         return EnvelopeResponse({"status": "ok", "version": VERSION})
+
+    async def login(request: Request) -> Response:
+        """Password login — the one ``/api`` route outside the session gate.
+
+        Verifies name + password through :func:`auth.verify_login` (argon2id,
+        constant-time on failure), creates a server-side session row (30-day
+        sliding expiry), and sets the cookie ``HttpOnly; SameSite=Strict`` —
+        JavaScript cannot read it and a cross-site request never carries it,
+        which is what lets the origin guard and the session gate each do
+        their own job. Failure is a 401 with no cookie, indistinguishable
+        between "no such name" and "wrong password".
+        """
+        body = await _json_body(request)
+        name = _required(body, "name")
+        password = _required(body, "password")
+        if not isinstance(name, str) or not isinstance(password, str):
+            raise ValueError("'name' and 'password' must be strings")
+        principal = auth.verify_login(name, password, path=db_path)
+        session_id = auth.create_session(principal.id, path=db_path)
+        response = EnvelopeResponse({"human": principal.id})
+        response.set_cookie(
+            SESSION_COOKIE,
+            session_id,
+            path="/",
+            httponly=True,
+            samesite="strict",
+            secure=secure_cookies,
+        )
+        return response
+
+    async def logout(request: Request) -> Response:
+        """Log out: drop the server-side session row and clear the cookie.
+
+        The session gate ran first, so the cookie this resolves was valid a
+        moment ago; deleting is idempotent regardless.
+        """
+        session_id = request.cookies.get(SESSION_COOKIE)
+        if session_id is not None:
+            auth.delete_session(session_id, path=db_path)
+        response = EnvelopeResponse({"status": "ok"})
+        response.delete_cookie(SESSION_COOKIE, path="/")
+        return response
 
     async def get_types(request: Request) -> Response:
         """The live type catalog (node types and edge types)."""
         return EnvelopeResponse(
-            envelope(service.list_types(principal=_http_principal(), path=db_path))
+            envelope(service.list_types(principal=_session_principal(request), path=db_path))
         )
 
     async def get_schema(request: Request) -> Response:
@@ -1050,7 +1180,7 @@ def create_app(
         return EnvelopeResponse(
             envelope(
                 service.get_schema(
-                    request.path_params["type"], principal=_http_principal(), path=db_path
+                    request.path_params["type"], principal=_session_principal(request), path=db_path
                 )
             )
         )
@@ -1064,7 +1194,7 @@ def create_app(
             type=params.get("type"),
             state=params.get("state"),
             parent_id=_param(params, "parent_id", "parent"),
-            principal=_http_principal(),
+            principal=_session_principal(request),
             limit=_int_param(params, "limit", default=500),
             path=db_path,
         )
@@ -1074,6 +1204,7 @@ def create_app(
         """Create a node. It lands ``active``: this is the human surface."""
         body = await _json_body(request)
         node = _write(
+            request,
             service.create_node,
             type=_required(body, "type"),
             title=body.get("title"),
@@ -1092,10 +1223,10 @@ def create_app(
             # Mirrors `nodum node get --depth`: 0 (and absent) is the bare
             # node, and a negative depth reaches the service, which rejects it.
             result = service.get_neighborhood(
-                node_id, depth=depth, principal=_http_principal(), path=db_path
+                node_id, depth=depth, principal=_session_principal(request), path=db_path
             )
         else:
-            result = service.get_node(node_id, principal=_http_principal(), path=db_path)
+            result = service.get_node(node_id, principal=_session_principal(request), path=db_path)
         return EnvelopeResponse(envelope(result))
 
     async def update_node(request: Request) -> Response:
@@ -1106,26 +1237,30 @@ def create_app(
             raise ValueError(
                 f"nothing to update: send one of {', '.join(repr(f) for f in PATCHABLE_FIELDS)}"
             )
-        node = _write(service.update_node, request.path_params["id"], path=db_path, **fields)
+        node = _write(
+            request, service.update_node, request.path_params["id"], path=db_path, **fields
+        )
         return EnvelopeResponse(envelope(node))
 
     async def list_children(request: Request) -> Response:
         """A node's children in ``position`` order (the document tree)."""
         nodes = service.list_children(
-            request.path_params["id"], principal=_http_principal(), path=db_path
+            request.path_params["id"], principal=_session_principal(request), path=db_path
         )
         return EnvelopeResponse(list_envelope("nodes", nodes))
 
     async def node_history(request: Request) -> Response:
         """A node's version snapshots, chronological."""
         versions = service.history(
-            request.path_params["id"], principal=_http_principal(), path=db_path
+            request.path_params["id"], principal=_session_principal(request), path=db_path
         )
         return EnvelopeResponse(list_envelope("versions", versions))
 
     async def archive_node(request: Request) -> Response:
         """Retire a node (``active`` → ``archived``) — the service's human tier."""
-        node = _write(service.transition, request.path_params["id"], "archive", path=db_path)
+        node = _write(
+            request, service.transition, request.path_params["id"], "archive", path=db_path
+        )
         return EnvelopeResponse(envelope(node))
 
     # ── Edges ─────────────────────────────────────────────────────────────
@@ -1137,7 +1272,7 @@ def create_app(
             node_id=_param(params, "node_id", "node"),
             type=params.get("type"),
             state=params.get("state"),
-            principal=_http_principal(),
+            principal=_session_principal(request),
             limit=_int_param(params, "limit", default=500),
             path=db_path,
         )
@@ -1147,6 +1282,7 @@ def create_app(
         """Create a typed, directed edge between two nodes."""
         body = await _json_body(request)
         edge = _write(
+            request,
             service.create_edge,
             str(_required(body, "src_id")),
             str(_required(body, "dst_id")),
@@ -1171,7 +1307,7 @@ def create_app(
             created_after=params.get("created_after"),
             created_before=params.get("created_before"),
             expand=_bool_param(params, "expand"),
-            principal=_http_principal(),
+            principal=_session_principal(request),
             path=db_path,
         )
         return EnvelopeResponse(envelope(result))
@@ -1181,7 +1317,7 @@ def create_app(
         params = request.query_params
         nodes = service.suggest_links(
             params.get("prefix", ""),
-            principal=_http_principal(),
+            principal=_session_principal(request),
             limit=_int_param(params, "limit", default=20),
             path=db_path,
         )
@@ -1200,7 +1336,7 @@ def create_app(
             min_confidence=_float_param(params, "min_confidence"),
             created_by=params.get("created_by"),
             node_types=_list_param(params, "node_type", "node_types"),
-            principal=_http_principal(),
+            principal=_session_principal(request),
             limit=_int_param(params, "limit", default=200),
             path=db_path,
         )
@@ -1212,7 +1348,7 @@ def create_app(
         result = service.find_path(
             _required_param(params, "a"),
             _required_param(params, "b"),
-            principal=_http_principal(),
+            principal=_session_principal(request),
             path=db_path,
         )
         return EnvelopeResponse(envelope(result))
@@ -1224,7 +1360,7 @@ def create_app(
         params = request.query_params
         proposals = service.list_proposals(
             **_proposal_filters(params),
-            principal=_http_principal(),
+            principal=_session_principal(request),
             limit=_int_param(params, "limit", default=500),
             path=db_path,
         )
@@ -1234,10 +1370,10 @@ def create_app(
         """Accept proposals by id, or every proposal matching a filter."""
         body = await _json_body(request)
         if "ids" in body:
-            result = _write(service.accept_proposals, _id_list(body["ids"]), path=db_path)
+            result = _write(request, service.accept_proposals, _id_list(body["ids"]), path=db_path)
         else:
             result = _write(
-                service.accept_matching, **_selective_filters(body, "accept"), path=db_path
+                request, service.accept_matching, **_selective_filters(body, "accept"), path=db_path
             )
         return EnvelopeResponse(envelope(result))
 
@@ -1247,10 +1383,15 @@ def create_app(
         reason = _reject_reason(body)
         if "ids" in body:
             result = _write(
-                service.reject_proposals, _id_list(body["ids"]), reason=reason, path=db_path
+                request,
+                service.reject_proposals,
+                _id_list(body["ids"]),
+                reason=reason,
+                path=db_path,
             )
         else:
             result = _write(
+                request,
                 service.reject_matching,
                 reason=reason,
                 **_selective_filters(body, "reject"),
@@ -1265,9 +1406,8 @@ def create_app(
         b = _int_param(params, "b")
         if a is None or b is None:
             raise ValueError("diff needs two version ids: ?a=<id>&b=<id>")
-        return EnvelopeResponse(
-            envelope(service.diff_versions(a, b, principal=_http_principal(), path=db_path))
-        )
+        diff = service.diff_versions(a, b, principal=_session_principal(request), path=db_path)
+        return EnvelopeResponse(envelope(diff))
 
     # ── Assets ────────────────────────────────────────────────────────────
 
@@ -1335,11 +1475,8 @@ def create_app(
     async def list_events(request: Request) -> Response:
         """The append-only event log, newest first."""
         limit = _int_param(request.query_params, "limit", default=50)
-        return EnvelopeResponse(
-            list_envelope(
-                "events", service.list_events(_http_principal(), limit=limit, path=db_path)
-            )
-        )
+        events = service.list_events(_session_principal(request), limit=limit, path=db_path)
+        return EnvelopeResponse(list_envelope("events", events))
 
     async def undo(request: Request) -> Response:
         """Reverse one event (default: the latest reversible one) — human tier."""
@@ -1349,7 +1486,7 @@ def create_app(
             if isinstance(seq, bool) or not isinstance(seq, int):
                 raise ValueError(f"'seq' must be an event seq (integer), got {seq!r}")
             _bounded_int(seq, "seq")
-        result = _write(service.undo, seq, path=db_path)
+        result = _write(request, service.undo, seq, path=db_path)
         return EnvelopeResponse(envelope(result))
 
     async def export_node(request: Request) -> Response:
@@ -1357,7 +1494,7 @@ def create_app(
         node_id = request.path_params["id"]
         depth = _int_param(request.query_params, "depth", default=0)
         result = service.get_neighborhood(
-            node_id, depth=depth, principal=_http_principal(), path=db_path
+            node_id, depth=depth, principal=_session_principal(request), path=db_path
         )
         response = EnvelopeResponse(envelope(result))
         safe_id = _SAFE_FILENAME_RE.sub("-", node_id)[:64] or "node"
@@ -1424,6 +1561,8 @@ def create_app(
         )
 
     api_routes = [
+        Route("/api/login", login, methods=["POST"]),
+        Route("/api/logout", logout, methods=["POST"]),
         Route("/api/types", get_types),
         Route("/api/schema/{type}", get_schema),
         Route("/api/nodes", list_nodes),
@@ -1473,11 +1612,11 @@ def create_app(
     # Outermost first: the guard normalises the path every inner layer keys on,
     # and refuses cross-origin and oversized requests before auth even looks at
     # them. An unauthenticated attacker learning "wrong origin" instead of
-    # "wrong token" tells them nothing they did not already know.
+    # "wrong password" tells them nothing they did not already know. The
+    # session gate runs second and resolves the identity every handler reads.
     middleware = [
-        Middleware(RequestGuardMiddleware, allowed_hosts=hosts, max_body_bytes=body_limit)
+        Middleware(RequestGuardMiddleware, allowed_hosts=hosts, max_body_bytes=body_limit),
+        Middleware(SessionMiddleware, db_path=db_path),
     ]
-    if token is not None:
-        middleware.append(Middleware(BearerTokenMiddleware, token=token))
 
     return Starlette(routes=routes, middleware=middleware, exception_handlers=exception_handlers)

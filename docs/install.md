@@ -79,8 +79,9 @@ project's clean-install smoke test asserts before any release is published.
 nodum serve                       # http://127.0.0.1:8600
 ```
 
-`serve` refuses a non-loopback bind without `--token` and prints the database
-path plus the `#token=…` URL on stderr.
+`serve` prints the database path on stderr and gates every `/api` route on a
+password-login session (`nodum human passwd` sets a password first); a
+non-loopback bind is allowed — login, not the bind, is the boundary.
 
 !!! note
     The web UI ships only in wheels whose build ran the frontend build step.

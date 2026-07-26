@@ -122,14 +122,17 @@ including every parameter.
 ### Servers
 
 - `serve` — Serve the human web UI and its JSON API.
-- `mcp serve --actor agent:<name>` — Launch the MCP server on stdio (read + additive tiers).
+- `mcp serve` — Launch the MCP server on stdio (read + additive tiers); the
+  agent token comes from `NODUM_AGENT_TOKEN`.
 
 ## Serving
 
-`serve` refuses a non-loopback bind without `--token` (exit 1), prints the
-database path and the `#token=…` UI URL on stderr, and translates a port
-already in use into the contract's exit 1.
+Every `/api` route but `POST /api/login` needs a valid session — log in with
+a human name and password (`nodum human passwd` sets one). A non-loopback
+bind is allowed: login, not the bind, is the boundary, and the session cookie
+gains `Secure` there. `serve` prints the database path on stderr and
+translates a port already in use into the contract's exit 1.
 
 ```sh
-nodum serve [--host 127.0.0.1] [--port 8600] [--token TOKEN] [--allow-host NAME] [--db PATH]
+nodum serve [--host 127.0.0.1] [--port 8600] [--allow-host NAME] [--db PATH]
 ```

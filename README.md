@@ -112,19 +112,21 @@ uv run nodum asset rendition <hash> --profile preview --out preview.webp
 uv run nodum asset purge                      # evict the stored renditions
 
 # MCP server (stdio) for external agents — read + additive tiers only, no
-# review tools, no curative tools. Every write is attributed to --actor and
-# lands proposed unless policy auto-accepts. --actor must be agent:<name>.
-uv run nodum mcp serve --actor agent:researcher
+# review tools, no curative tools. The agent authenticates with its token in
+# NODUM_AGENT_TOKEN (minted by `nodum agent create`, shown once).
+NODUM_AGENT_TOKEN=ndm_… uv run nodum mcp serve
 
 # HTTP server for the human: JSON API under /api plus the web UI at /.
-# Loopback by default and no accounts — which means every process on this
-# machine can drive it as the human. A non-loopback bind needs --token.
+# Every /api route needs a session — log in with a human name and password
+# (`nodum human passwd` sets one). Loopback or LAN, the password is the
+# boundary.
 uv run nodum serve                      # http://127.0.0.1:8600
-uv run nodum serve --token s3cret --host 0.0.0.0   # then open the /#token=… URL it prints
-curl -s localhost:8600/api/nodes/<id>   # identical bytes to `nodum node get <id>`
+uv run nodum serve --host 0.0.0.0       # allowed: login, not the bind, is the boundary
+curl -s localhost:8600/api/nodes/<id> -b nodum_session=…   # identical bytes to `nodum node get <id>`
 
-# Reads need nothing. A write from a non-browser client says it is one:
+# A write from a non-browser client says it is one:
 curl -s -X POST localhost:8600/api/nodes \
+  -b nodum_session=… \
   -H 'Content-Type: application/json' -H 'X-Nodum-Client: curl' \
   -d '{"type":"note","title":"From curl"}'
 ```
@@ -222,13 +224,15 @@ degrades to BM25 + graph expansion. `NODUM_EMBED_MODEL` switches the model
   the `Host` header is checked against the names the server answers to, which
   is what stops DNS rebinding. Reads need none of it. `--allow-host` names an
   extra host for a reverse proxy.
-- **Auth is `--token`, and only `--token`.** It gates `/api` only — `/healthz`
-  and the UI stay open, and `/healthz` reports liveness and nothing else.
-  **Without it, any process on this machine can drive the API as the human**,
-  including a local agent: origin control stops browsers, not processes. A
-  non-loopback bind without a token is refused outright. `nodum serve --token X`
-  prints a `#token=X` URL; opening it hands the token to the UI (in the
-  fragment, so it never reaches a log) for the rest of that browser tab.
+- **Auth is password login + server-side sessions.** `POST /api/login` with a
+  human name and password (argon2id, constant-time on failure) creates a
+  30-day sliding session row and sets an `HttpOnly; SameSite=Strict` cookie;
+  every `/api` route but login needs it — reads included — while `/healthz`
+  (liveness and nothing else) and the static UI stay open. Origin control
+  stops browsers; the password stops other processes on the machine. A
+  non-loopback bind is allowed — login, not the bind, is the boundary — and
+  marks the cookie `Secure` there. `nodum human passwd` sets the password;
+  logout, expiry, and `human disable` kill the session at the next request.
 - **Uploads are images only, and bounded.** `POST /api/assets` caps the request
   body before anything buffers it (32 MiB), identifies the type from the bytes
   rather than the filename, and refuses an image whose pixel count would make

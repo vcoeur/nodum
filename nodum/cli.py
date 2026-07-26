@@ -717,9 +717,6 @@ DEFAULT_HTTP_PORT = 8600
 def serve(
     host: str = typer.Option("127.0.0.1", "--host", help="Interface to bind (loopback default)."),
     port: int = typer.Option(DEFAULT_HTTP_PORT, "--port", help="TCP port to listen on."),
-    token: str | None = typer.Option(
-        None, "--token", help="Require 'Authorization: Bearer <token>' on /api (LAN case)."
-    ),
     allow_host: list[str] = typer.Option(
         None,
         "--allow-host",
@@ -732,48 +729,38 @@ def serve(
     """Serve the human web UI and its JSON API (design §9).
 
     The inverse of ``mcp serve``: every write this surface makes is attributed
-    to the ``human`` actor and no request field can change that. Binds loopback
-    by default; ``--token`` adds a static bearer token on ``/api`` only
-    (``/healthz`` and the UI stay open). Unbuilt frontend? The API still serves;
-    the UI is a "run make web-build" placeholder.
+    to the human behind an authenticated session, and no request field can
+    change that. Auth is password login (``POST /api/login``) backed by
+    server-side sessions; ``/healthz`` and the static UI stay open. Unbuilt
+    frontend? The API still serves; the UI is a "run make web-build"
+    placeholder.
 
-    Two things this command refuses to do quietly. A non-loopback bind without
-    ``--token`` is an unauthenticated write API on the network, so it exits 1
-    rather than starting. And a loopback bind without ``--token`` is reachable
-    by **every process on this machine**, including an MCP server launched with
-    ``--actor agent:x``, which could then accept its own proposals over HTTP —
-    so it says so at startup instead of leaving the operator to work it out.
+    A non-loopback bind is allowed — login is the boundary, not the bind —
+    and the session cookie gains ``Secure`` there. Either way, any process
+    that can reach the port may *attempt* a login, so the human's password
+    is the whole defence; the banner says so rather than leaving it implicit.
     """
     import uvicorn
 
     from nodum import http_api
 
-    if token is None and http_api.bare_host(host) not in http_api.LOOPBACK_BIND_ADDRESSES:
-        typer.echo(
-            f"refusing to bind {host} with no --token: that is an unauthenticated write API "
-            "reachable from the network. Pass --token, or bind 127.0.0.1.",
-            err=True,
-        )
-        raise typer.Exit(1)
-
     resolved_db = Path(db_path) if db_path is not None else db.db_path()
     typer.echo(f"nodum serve → http://{host}:{port}  (database: {resolved_db})", err=True)
-    if token is None:
-        typer.echo(
-            "no --token: any process on this machine can drive this API as the 'human' actor, "
-            "including local agents. Do not run it alongside agents you do not trust.",
-            err=True,
-        )
-    else:
-        typer.echo(f"open the UI at http://{host}:{port}/#token={token}", err=True)
+    typer.echo(
+        "auth: password login — any process that can reach this port may attempt one, "
+        "so every /api request still needs a human password (nodum human passwd).",
+        err=True,
+    )
 
     try:
         _run(
             uvicorn.run,
             http_api.create_app(
                 db_path=db_path,
-                token=token,
                 allowed_hosts=http_api.resolve_allowed_hosts(host, allow_host),
+                # Loopback is plain HTTP, where a Secure cookie would never be
+                # stored; a LAN bind fronts TLS, where it must be.
+                secure_cookies=http_api.bare_host(host) not in http_api.LOOPBACK_BIND_ADDRESSES,
             ),
             host=host,
             port=port,

@@ -6,22 +6,25 @@ exact handlers a browser would.
 
 Two properties carry the file.
 
-**The human-only guarantee.** ``test_no_endpoint_can_attribute_a_write_to_an
-_agent`` drives *every route in the live route table* with actor-carrying
-bodies and then asserts that nothing written during the sweep names anything
-but ``human``. It knows no endpoint by name, tests no mechanism, and needs no
-list to maintain — a rogue handler added tomorrow is swept because it is in
-``app.routes``. The AST properties beside it are the belt to that braces: one
-``actor=`` binding, no import of an actor-taking service function under any
-name or alias, no ``getattr`` on an adapter module, no unreviewed ``**`` unpack.
-The earlier versions of those AST tests were all evadable — a handler doing
-``service_create_node(**body, path=db_path)`` passed every one of them — which
-is why the runtime sweep, not the AST, is now the load-bearing test.
+**The session-attribution guarantee.** ``test_writes_are_attributed_to_the
+_sessions_human_and_nothing_else`` drives *every route in the live route
+table* with actor-carrying bodies behind a second human's session and then
+asserts that nothing written during the sweep names anything but that human.
+It knows no endpoint by name, tests no mechanism, and needs no list to
+maintain — a rogue handler added tomorrow is swept because it is in
+``app.routes``. The AST properties beside it are the belt to that braces:
+every ``principal=`` mints through ``_session_principal(request)``, no
+import of a write service function under any name or alias, no ``getattr``
+on an adapter module, no unreviewed ``**`` unpack, no trusted-local ``auth``
+entry point. The earlier versions of those AST tests were all evadable — a
+handler doing ``service_create_node(**body, path=db_path)`` passed every one
+of them — which is why the runtime sweep, not the AST, is now the
+load-bearing test.
 
-**Origin control.** ``nodum serve`` binds loopback with no token, and loopback
-is reachable from every page the browser loads. The tests in §4 replay the
-cross-origin form post, the ``Host``-rebinding read, and the oversized upload
-that a reviewer landed against the unguarded app.
+**Origin control.** ``nodum serve`` binds loopback, and loopback is reachable
+from every page the browser loads. The tests in §4b replay the cross-origin
+form post, the ``Host``-rebinding read, and the oversized upload that a
+reviewer landed against the unguarded app.
 """
 
 from __future__ import annotations
@@ -41,9 +44,12 @@ from PIL import Image
 from starlette.requests import ClientDisconnect
 from typer.testing import CliRunner
 
-from nodum import assets, cli, http_api, service
+from nodum import assets, auth, cli, http_api, service
+from nodum.principal import Principal
 
 AGENT = "agent:researcher"
+#: The login the default client authenticates with (set on the seeded owner).
+OWNER_PASSWORD = "correct horse battery"
 #: The tests are a non-browser client on the loopback interface, which is what
 #: the ``Host`` allowlist answers to.
 BASE_URL = "http://127.0.0.1:8600"
@@ -75,15 +81,17 @@ class Client:
     want the *unguarded* request pass ``guard=False``.
     """
 
-    def __init__(self, app, token: str | None = None) -> None:
+    def __init__(self, app, session: str | None = None) -> None:
         self.app = app
-        # Bytes, not str: httpx encodes a str header as ASCII, and a token is
-        # allowed to hold anything a byte string can.
-        self.headers = {"Authorization": f"Bearer {token}".encode()} if token else {}
+        self.session = session
 
     def request(self, method: str, path: str, guard: bool = True, **kwargs) -> httpx.Response:
         """Issue one request and return the response."""
-        headers = {**self.headers}
+        headers = {}
+        if self.session is not None:
+            # A logged-in client offers the session cookie on every request,
+            # exactly as a browser would.
+            headers["Cookie"] = f"{http_api.SESSION_COOKIE}={self.session}"
         if guard and method not in ("GET", "HEAD", "OPTIONS"):
             headers.update(CLIENT_HEADERS)
             # A bodyless write still has to declare JSON: that is the whole
@@ -118,8 +126,27 @@ class Client:
 
 @pytest.fixture()
 def client(fresh_db):
-    """A client over an app bound to the fresh test database (no auth)."""
-    return Client(http_api.create_app())
+    """A client with a logged-in owner session over the fresh test database."""
+    return _session_client(http_api.create_app())
+
+
+def _login(app, name: str = "owner", password: str = OWNER_PASSWORD) -> str:
+    """Log in over HTTP and return the new session id."""
+    response = Client(app).post("/api/login", json={"name": name, "password": password})
+    assert response.status_code == 200, response.text
+    return response.cookies[http_api.SESSION_COOKIE]
+
+
+def _session_client(
+    app, name: str = "owner", password: str = OWNER_PASSWORD, human_id: str | None = None
+) -> Client:
+    """A logged-in client over ``app`` (setting the account's password first).
+
+    ``human_id`` defaults to the login name — right for the seeded owner, and
+    named explicitly for CLI-created humans whose ids are random.
+    """
+    service.set_human_password(human_id or name, password, principal=owner())
+    return Client(app, session=_login(app, name, password))
 
 
 @pytest.fixture()
@@ -256,11 +283,22 @@ def test_a_hostile_parameter_is_a_400_from_the_real_endpoint(
     assert "Traceback" not in response.text
 
 
-def test_a_database_that_is_not_a_database_is_not_a_500(tmp_path, fresh_db):
-    """``sqlite3.DatabaseError`` was unmapped; the CLI prints it and exits 1."""
+def test_a_database_that_is_not_a_database_is_not_a_500(tmp_path, fresh_db, monkeypatch):
+    """``sqlite3.DatabaseError`` was unmapped; the CLI prints it and exits 1.
+
+    The session is stubbed at the auth boundary (a verified principal without
+    a database round-trip): there is no logging in against a file that is not
+    a database, and the mapping under test is the service layer's failure,
+    not the middleware's.
+    """
+    monkeypatch.setattr(
+        auth,
+        "principal_for_session",
+        lambda session_id, *, path=None: Principal(kind="human", id="owner"),
+    )
     not_a_db = tmp_path / "notes.txt"
     not_a_db.write_text("this is not a SQLite file", encoding="utf-8")
-    client = Client(http_api.create_app(db_path=not_a_db))
+    client = Client(http_api.create_app(db_path=not_a_db), session="any")
 
     response = client.get("/api/nodes")
 
@@ -433,7 +471,9 @@ WRITE_FUNCTIONS = {
 }
 
 
-def _swept_requests(app, ids: dict[str, str]) -> list[tuple[str, str, int]]:
+def _swept_requests(
+    app, ids: dict[str, str], name: str, password: str
+) -> list[tuple[str, str, int]]:
     """Fire an actor-carrying request at every method of every route in ``app``.
 
     The route table is the input, so a handler added later is swept without
@@ -441,8 +481,12 @@ def _swept_requests(app, ids: dict[str, str]) -> list[tuple[str, str, int]]:
     handler's signature is unknown: a bare ``{"actor": …}`` reaches one that
     forwards a whole body, and the fuller shapes reach one that also needs a
     type or a title before it will do any work.
+
+    The client drives behind a real session for ``name`` — and re-logs in
+    whenever a request kills it (``POST /api/logout`` is in the table too),
+    so every route is reached authenticated.
     """
-    client = Client(app)
+    client = Client(app, session=_login(app, name, password))
     bodies = [
         {"actor": AGENT},
         {"type": "note", "title": "swept", "actor": AGENT},
@@ -464,8 +508,8 @@ def _swept_requests(app, ids: dict[str, str]) -> list[tuple[str, str, int]]:
     fired: list[tuple[str, str, int]] = []
     for route in app.routes:
         path = route.path
-        for name, value in ids.items():
-            path = path.replace(f"{{{name}}}", value)
+        for key, value in ids.items():
+            path = path.replace(f"{{{key}}}", value)
         path = (
             path.replace("{id}", ids["node"])
             .replace("{type}", "note")
@@ -480,19 +524,28 @@ def _swept_requests(app, ids: dict[str, str]) -> list[tuple[str, str, int]]:
                 response = client.request(
                     method, f"{path}?actor={AGENT}", json=body, headers={"X-Actor": AGENT}
                 )
+                if response.status_code == 401:
+                    # The sweep just hit /api/logout (or expired its own
+                    # session): log back in and fire again, so the route
+                    # after it is still reached authenticated.
+                    client = Client(app, session=_login(app, name, password))
+                    response = client.request(
+                        method, f"{path}?actor={AGENT}", json=body, headers={"X-Actor": AGENT}
+                    )
                 fired.append((method, path, response.status_code))
     return fired
 
 
-def test_no_endpoint_can_attribute_a_write_to_an_agent(fresh_db):
-    """The human-only guarantee, as one property over the whole route table.
+def test_writes_are_attributed_to_the_sessions_human_and_nothing_else(fresh_db):
+    """The session-attribution guarantee, as one property over the route table.
 
     This is the load-bearing test, and it knows nothing about how the boundary
-    is implemented — not ``_write``, not ``HTTP_ACTOR``, not which endpoints
-    exist. It drives every state-changing method of every route with bodies,
-    query strings and headers that all claim an agent identity, and then asks
-    the database one question: did anything written during that sweep end up
-    attributed to something other than the human?
+    is implemented — not ``_write``, not the middleware, not which endpoints
+    exist. It drives every state-changing method of every route behind a
+    **second human's** session with bodies, query strings and headers that
+    all claim an agent identity, and then asks the database one question:
+    did anything written during that sweep end up attributed to something
+    other than the session's human?
 
     Every AST test in this file was evadable. A handler as short as::
 
@@ -500,14 +553,17 @@ def test_no_endpoint_can_attribute_a_write_to_an_agent(fresh_db):
         async def quick_create(request):
             return EnvelopeResponse(envelope(_service_create_node(**body, path=db_path)))
 
-    named no actor (so the source scan passed), bound no ``actor=`` keyword
-    (a ``**`` unpack has ``arg=None``, so the binding count passed), and called
-    no ``service.<name>`` attribute (so the direct-call scan passed) — while
-    ``POST`` with ``{"actor": "agent:evil"}`` produced ``created_by:
-    "agent:evil"``. This test fails on it, because the row it writes is in the
-    same database the assertion reads.
+    named no actor (so the source scan passed), bound no ``principal=``
+    keyword (a ``**`` unpack has ``arg=None``, so the binding count passed),
+    and called no ``service.<name>`` attribute (so the direct-call scan
+    passed) — while ``POST`` with ``{"actor": "agent:evil"}`` produced
+    ``created_by: "agent:evil"``. This test fails on it, because the row it
+    writes is in the same database the assertion reads.
     """
     app = http_api.create_app()
+    second = service.create_human("second", principal=owner())
+    service.set_human_password(second.id, "second-pw", principal=owner())
+    second_actor = f"human:{second.id}"
     node = service.create_node(type="concept", title="Sweep target", principal=owner())
     other = service.create_node(type="concept", title="Sweep other", principal=owner())
     proposal = service.create_node(type="note", title="Sweep proposal", principal=agent(AGENT))
@@ -517,7 +573,7 @@ def test_no_endpoint_can_attribute_a_write_to_an_agent(fresh_db):
     before_nodes = {row.id for row in service.list_nodes(principal=owner(), limit=5000)}
     before_edges = {row.id for row in service.list_edges(principal=owner(), limit=5000)}
 
-    fired = _swept_requests(app, ids)
+    fired = _swept_requests(app, ids, "second", "second-pw")
 
     # A sweep that never reached a handler would pass vacuously.
     assert len(fired) >= 40, fired
@@ -528,9 +584,9 @@ def test_no_endpoint_can_attribute_a_write_to_an_agent(fresh_db):
     ]
     assert new_events, "the sweep wrote nothing, so it proves nothing"
     offenders = [
-        (event.op, event.seq, event.actor) for event in new_events if event.actor != OWNER_ACTOR
+        (event.op, event.seq, event.actor) for event in new_events if event.actor != second_actor
     ]
-    assert offenders == [], f"writes attributed to a non-human actor: {offenders}"
+    assert offenders == [], f"writes attributed outside the session's human: {offenders}"
 
     written_nodes = [
         row
@@ -542,8 +598,59 @@ def test_no_endpoint_can_attribute_a_write_to_an_agent(fresh_db):
         for row in service.list_edges(principal=owner(), limit=5000)
         if row.id not in before_edges
     ]
-    assert {row.created_by for row in written_nodes} <= {OWNER_ACTOR}
-    assert {row.created_by for row in written_edges} <= {OWNER_ACTOR}
+    assert {row.created_by for row in written_nodes} <= {second_actor}
+    assert {row.created_by for row in written_edges} <= {second_actor}
+
+
+def test_every_api_route_but_login_refuses_a_request_without_a_session(fresh_db):
+    """The no-session sweep: one 401 per method per route, from the live table.
+
+    Reads included — the plan leaves the choice and this app takes the simple
+    one: a single-human file has nothing an anonymous caller should see, and
+    one rule ("every ``/api`` route but login") is the one no future endpoint
+    can forget. The route table is the input, so a route added tomorrow is
+    gated or this fails.
+    """
+    app = http_api.create_app()
+    anonymous = Client(app)
+
+    outcomes: list[tuple[str, str, int]] = []
+    for route in app.routes:
+        path = route.path
+        if not path.startswith("/api/") or path == "/api/login":
+            continue
+        concrete = (
+            path.replace("{id}", "x")
+            .replace("{type}", "note")
+            .replace("{profile}", "thumb")
+            .replace("{path:path}", "x")
+        )
+        for method in sorted(route.methods or set()):
+            if method in ("HEAD", "OPTIONS"):
+                continue
+            if concrete == "/api/assets" and method == "POST":
+                # The one multipart route: anything else the origin guard
+                # refuses (415) before the session gate even runs.
+                response = anonymous.post(
+                    concrete, files={"file": ("x.png", _png_bytes(), "image/png")}
+                )
+            elif method == "GET":
+                response = anonymous.get(concrete)
+            else:
+                response = anonymous.request(method, concrete, json={})
+            outcomes.append((method, concrete, response.status_code))
+
+    assert len(outcomes) >= 30, outcomes
+    not_refused = [(method, path, status) for method, path, status in outcomes if status != 401]
+    assert not_refused == [], f"routes reachable without a session: {not_refused}"
+
+    # The open set, asserted positively: the probe, the login route, and the
+    # page that holds the login form.
+    assert anonymous.get("/healthz").status_code == 200
+    assert anonymous.get("/").status_code == 200
+    bad_login = anonymous.post("/api/login", json={"name": "owner", "password": "nope"})
+    assert bad_login.status_code == 401  # refused by the handler, not the gate
+    assert bad_login.json()["error"]["type"] == "InvalidCredentials"
 
 
 def test_the_route_table_holds_only_endpoints_the_sweep_can_reach(fresh_db):
@@ -571,11 +678,8 @@ def test_the_installed_middleware_is_exactly_what_this_file_reviewed(fresh_db):
     also act on a *read*. Pinning the list means a new layer cannot arrive
     unreviewed: adding one is a test failure until someone writes down why.
     """
-    plain = [entry.cls for entry in http_api.create_app().user_middleware]
-    with_token = [entry.cls for entry in http_api.create_app(token="x").user_middleware]
-
-    assert plain == [http_api.RequestGuardMiddleware]
-    assert with_token == [http_api.RequestGuardMiddleware, http_api.BearerTokenMiddleware]
+    classes = [entry.cls for entry in http_api.create_app().user_middleware]
+    assert classes == [http_api.RequestGuardMiddleware, http_api.SessionMiddleware]
 
 
 def test_no_route_handler_can_read_an_actor_from_a_request(fresh_db):
@@ -593,14 +697,14 @@ def test_no_route_handler_can_read_an_actor_from_a_request(fresh_db):
     assert offenders == [], f"route handlers must never name an actor: {offenders}"
 
 
-def test_every_principal_binding_mints_through_auth():
-    """Every ``principal=`` in the module comes from auth — never the request.
+def test_every_principal_binding_mints_through_the_session():
+    """Every ``principal=`` in the module is ``_session_principal(request)``.
 
-    Writes bind once (``_write``); reads bind per handler during the INTERIM
-    owner phase. The rule either way: the value is always
-    ``_http_principal()``, so identity can only ever come from the auth path
-    (the session, once sessions land), and a handler that tried to bind
-    request data as an identity fails here.
+    Writes bind once (``_write``); reads bind per handler. The rule either
+    way: the value is always the principal the session middleware verified
+    into this request's scope, so identity can only ever come from a session,
+    and a handler that tried to bind request data — or a trusted-local
+    principal — as an identity fails here.
     """
     bindings = [
         keyword
@@ -614,8 +718,40 @@ def test_every_principal_binding_mints_through_auth():
         assert (
             isinstance(value, ast.Call)
             and isinstance(value.func, ast.Name)
-            and value.func.id == "_http_principal"
-        ), "every principal= binding must mint through _http_principal()"
+            and value.func.id == "_session_principal"
+            and len(value.args) == 1
+            and isinstance(value.args[0], ast.Name)
+            and value.args[0].id == "request"
+        ), "every principal= binding must be _session_principal(request)"
+
+
+def test_the_only_credential_path_is_the_session():
+    """The trusted-local and agent-token entries must never mint an HTTP identity.
+
+    ``auth.owner_principal`` is the CLI's no-credential path and
+    ``auth.verify_agent_token`` is the MCP one; either in this module would be
+    a principal without a verified session. The allowed set is exactly the
+    session lifecycle: login, resolve, delete.
+    """
+    forbidden = {
+        "owner_principal",
+        "agent_principal",
+        "verify_agent_token",
+        "verify_password",
+        "set_password",
+        "store_token",
+    }
+    calls = {
+        node.func.attr
+        for node in ast.walk(_module_ast())
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "auth"
+    }
+    assert calls & forbidden == set(), (
+        f"the HTTP surface must not mint a principal without a session: {sorted(calls & forbidden)}"
+    )
 
 
 #: Values that may be splatted into a call in ``nodum.http_api``. Each one is
@@ -719,7 +855,7 @@ def test_no_write_service_function_is_reachable_under_any_name():
 def test_the_write_helper_refuses_a_caller_supplied_principal(fresh_db):
     """The backstop: even a wholesale kwargs forward cannot smuggle an identity."""
     with pytest.raises(RuntimeError, match="never takes a principal"):
-        http_api._write(service.create_node, type="note", principal=agent(AGENT))
+        http_api._write(None, service.create_node, type="note", principal=agent(AGENT))
 
 
 @pytest.mark.parametrize(
@@ -847,54 +983,93 @@ def test_a_bodyless_review_refuses_to_touch_the_whole_queue(client, fresh_db):
     assert len(service.list_proposals(principal=owner())) == 1
 
 
-# ── 4. Auth ───────────────────────────────────────────────────────────────────
+# ── 4. Password sessions ─────────────────────────────────────────────────────
 
 
-def test_a_configured_token_gates_the_api_and_nothing_else(fresh_db):
-    app = http_api.create_app(token="s3cret")
-    anonymous, wrong, right = Client(app), Client(app, token="nope"), Client(app, token="s3cret")
+def test_login_sets_an_httponly_strict_session_cookie(fresh_db):
+    service.set_human_password("owner", OWNER_PASSWORD, principal=owner())
+    anonymous = Client(http_api.create_app())
 
-    refused = anonymous.get("/api/types")
-    assert refused.status_code == 401
-    assert refused.json()["error"]["type"] == "Unauthorized"
-    assert wrong.get("/api/types").status_code == 401
-    assert right.get("/api/types").status_code == 200
+    response = anonymous.post("/api/login", json={"name": "owner", "password": OWNER_PASSWORD})
 
-    # A liveness probe that needs credentials is not a liveness probe, and the
-    # page that holds the token cannot itself require it.
-    assert anonymous.get("/healthz").status_code == 200
-    assert anonymous.get("/").status_code == 200
-
-
-def test_no_token_means_no_auth_at_all(client, fresh_db):
-    assert client.get("/api/types").status_code == 200
-    assert client.get("/healthz").status_code == 200
+    assert response.status_code == 200, response.text
+    assert response.json() == {"human": "owner"}
+    cookie = response.headers["set-cookie"]
+    assert f"{http_api.SESSION_COOKIE}=" in cookie
+    assert "httponly" in cookie.lower()
+    assert "samesite=strict" in cookie.lower()
+    assert "path=/" in cookie.lower()
+    # Loopback is plain HTTP: a Secure cookie would never be stored at all.
+    assert "secure" not in cookie.lower()
 
 
-def test_a_non_ascii_bearer_header_is_a_401_not_a_500(fresh_db):
-    """``secrets.compare_digest`` refuses non-ASCII ``str``; headers are latin-1.
+def test_a_lan_bind_marks_the_session_cookie_secure(fresh_db):
+    service.set_human_password("owner", OWNER_PASSWORD, principal=owner())
+    app = http_api.create_app(secure_cookies=True)
 
-    ``Authorization: Bearer café`` raised ``TypeError`` inside the middleware —
-    an unauthenticated, endlessly repeatable 500 with a full traceback per
-    request, on exactly the deployment that configured a token. Comparing bytes
-    makes it the 401 it always was.
-    """
-    client = Client(http_api.create_app(token="s3cret"))
+    response = Client(app).post("/api/login", json={"name": "owner", "password": OWNER_PASSWORD})
 
-    # Raw bytes on the wire: a header is not required to be ASCII, which is the
-    # whole problem — Starlette decodes it as latin-1 and hands over a str that
-    # `compare_digest` refuses.
-    for header in (b"Bearer caf\xe9", b"Bearer \xff\xfe", b"Bearer " + b"\xfc" * 64):
-        response = client.get("/api/types", headers={"Authorization": header})
-        assert response.status_code == 401, header
+    assert "secure" in response.headers["set-cookie"].lower()
+
+
+def test_login_failures_are_indistinguishable_401s(fresh_db):
+    """Unknown name, wrong password: same status, same body, no cookie."""
+    service.set_human_password("owner", OWNER_PASSWORD, principal=owner())
+    anonymous = Client(http_api.create_app())
+
+    bodies = []
+    for credentials in (
+        {"name": "owner", "password": "wrong"},
+        {"name": "nobody", "password": OWNER_PASSWORD},
+    ):
+        response = anonymous.post("/api/login", json=credentials)
+        assert response.status_code == 401
+        assert "set-cookie" not in response.headers
+        bodies.append(response.json())
+    assert bodies[0] == bodies[1]
+    assert bodies[0]["error"]["type"] == "InvalidCredentials"
+
+
+def test_a_garbage_session_cookie_is_a_401_not_a_500(fresh_db):
+    anonymous = Client(http_api.create_app())
+
+    for cookie in ("no-such-session", "", "x" * 500):
+        response = anonymous.get(
+            "/api/types", headers={"Cookie": f"{http_api.SESSION_COOKIE}={cookie}"}
+        )
+        assert response.status_code == 401, cookie
         assert response.json()["error"]["type"] == "Unauthorized"
 
-    # A correct token that is itself non-ASCII still authenticates.
-    utf8 = Client(http_api.create_app(token="clé-café"), token="clé-café")
-    assert utf8.get("/api/types").status_code == 200
+
+def test_logout_kills_the_session_and_clears_the_cookie(client, fresh_db):
+    session = client.session
+
+    response = client.post("/api/logout")
+
+    assert response.status_code == 200
+    cleared = response.headers["set-cookie"]
+    assert http_api.SESSION_COOKIE in cleared
+    assert "max-age=0" in cleared.lower() or "expires=" in cleared.lower()
+    # The row is gone server-side: the same cookie is now worthless.
+    assert client.get("/api/types").status_code == 401
+    assert Client(http_api.create_app(), session=session).get("/api/types").status_code == 401
 
 
-def test_the_auth_gate_and_the_router_agree_on_what_an_api_path_is(fresh_db):
+def test_a_dead_session_cookie_is_cleared_on_the_401(fresh_db):
+    """A client offering an expired/deleted cookie should stop offering it."""
+    response = Client(http_api.create_app(), session="no-such-session").get("/api/types")
+
+    assert response.status_code == 401
+    assert http_api.SESSION_COOKIE in response.headers["set-cookie"]
+
+
+def test_disabling_the_human_kills_the_session_at_the_next_request(client, fresh_db):
+    service.disable_human("owner", principal=owner())
+
+    assert client.get("/api/types").status_code == 401
+
+
+def test_the_session_gate_and_the_router_agree_on_what_an_api_path_is(fresh_db):
     """``//api/nodes`` used to be an API path to the gate and a SPA path to the router.
 
     Nothing leaked — both spellings fell through to the SPA — but a gate and a
@@ -902,20 +1077,20 @@ def test_the_auth_gate_and_the_router_agree_on_what_an_api_path_is(fresh_db):
     normalised once, at the outermost layer, so ``//api/nodes`` is now an API
     path to *both* and is gated like one.
     """
-    client = Client(http_api.create_app(token="s3cret"))
+    anonymous = Client(http_api.create_app())
     # Absolute, because httpx reads a leading `//` in a relative URL as
     # scheme-relative and would rewrite the host out from under the test.
     doubled = f"{BASE_URL}//api/nodes"
 
-    assert client.get(doubled).status_code == 401
-    assert client.get(f"{BASE_URL}/api//nodes").status_code == 401
+    assert anonymous.get(doubled).status_code == 401
+    assert anonymous.get(f"{BASE_URL}/api//nodes").status_code == 401
     # A different case is a different path to the router, so it is not an API
     # path to either side — it falls through to the SPA, consistently.
-    assert client.get("/API/nodes").status_code == 200
-    assert client.get("/api/nodes").status_code == 401
+    assert anonymous.get("/API/nodes").status_code == 200
+    assert anonymous.get("/api/nodes").status_code == 401
 
-    authorised = Client(http_api.create_app(token="s3cret"), token="s3cret")
-    assert authorised.get(doubled).status_code == 200
+    logged_in = _session_client(http_api.create_app())
+    assert logged_in.get(doubled).status_code == 200
 
 
 # ── 4b. Origin control: the browser cannot drive this API ─────────────────────
@@ -1099,13 +1274,13 @@ def test_dns_rebinding_is_refused_on_reads_and_writes(client, fresh_db):
 
 def test_an_operator_can_name_the_host_this_server_answers_to(fresh_db):
     """A reverse proxy or a LAN name is configuration, not a hole to leave open."""
-    named = Client(
+    named = _session_client(
         http_api.create_app(allowed_hosts=http_api.resolve_allowed_hosts("0.0.0.0", ["nodum.lan"]))
     )
     assert named.get("/api/types", headers={"Host": "nodum.lan"}).status_code == 200
     assert named.get("/api/types", headers={"Host": "elsewhere.example"}).status_code == 400
 
-    anywhere = Client(
+    anywhere = _session_client(
         http_api.create_app(allowed_hosts=http_api.resolve_allowed_hosts("0.0.0.0", ["*"]))
     )
     assert anywhere.get("/api/types", headers={"Host": "elsewhere.example"}).status_code == 200
@@ -1123,7 +1298,7 @@ def test_an_oversized_upload_is_refused_before_it_is_buffered(fresh_db, tmp_path
     tripping the real 1 GB blob limit needed more than 2 GB of it first.
     """
     limit = 64 * 1024
-    client = Client(http_api.create_app(max_body_bytes=limit))
+    client = _session_client(http_api.create_app(max_body_bytes=limit))
     oversized = b"\x00" * (limit * 4)
 
     declared = client.post("/api/assets", files={"file": ("big.png", oversized, "image/png")})
@@ -1156,7 +1331,7 @@ def test_an_oversized_upload_is_refused_before_it_is_buffered(fresh_db, tmp_path
 
 def test_the_body_cap_covers_json_routes_too(fresh_db):
     """One ceiling on what this server will read, not one per route."""
-    client = Client(http_api.create_app(max_body_bytes=4096))
+    client = _session_client(http_api.create_app(max_body_bytes=4096))
     response = client.post("/api/nodes", json={"type": "note", "content": "x" * 8192})
     assert response.status_code == 413
 
@@ -1247,16 +1422,14 @@ def test_healthz_reports_liveness_and_not_the_database_path(fresh_db):
 
     ``/healthz`` sits outside auth on purpose, so anything it says is said to
     everyone — and it used to say the absolute database path, disclosing a
-    username and a layout even on the ``--token`` deployment that set a token
-    precisely to disclose nothing. ``nodum serve`` prints the path at startup
+    username and a layout. ``nodum serve`` prints the path at startup
     instead, where the operator is the only reader.
     """
-    for app in (http_api.create_app(), http_api.create_app(token="s3cret")):
-        payload = _ok(Client(app).get("/healthz"))
-        assert payload["status"] == "ok"
-        assert "version" in payload
-        assert "db_path" not in payload
-        assert "/" not in json.dumps(payload)
+    payload = _ok(Client(http_api.create_app()).get("/healthz"))
+    assert payload["status"] == "ok"
+    assert "version" in payload
+    assert "db_path" not in payload
+    assert "/" not in json.dumps(payload)
 
 
 # ── 5. Static hosting ─────────────────────────────────────────────────────────
@@ -1556,6 +1729,7 @@ def test_a_cancelled_upload_is_a_mapped_outcome_not_a_traceback(fresh_db):
     reproduce faithfully.
     """
     app = http_api.create_app()
+    session = _session_client(app).session
     scope = {
         "type": "http",
         "asgi": {"version": "3.0"},
@@ -1569,6 +1743,7 @@ def test_a_cancelled_upload_is_a_mapped_outcome_not_a_traceback(fresh_db):
         "headers": [
             (b"host", b"127.0.0.1:8600"),
             (b"content-type", b"multipart/form-data; boundary=x"),
+            (b"cookie", f"{http_api.SESSION_COOKIE}={session}".encode()),
             (http_api.CLIENT_HEADER.encode(), b"nodum-tests"),
         ],
         "client": ("127.0.0.1", 51000),
@@ -1607,42 +1782,42 @@ def test_the_cli_serve_command_wires_the_app(fresh_db, monkeypatch):
     assert Client(captured["app"]).get("/healthz").status_code == 200
 
 
-def test_serve_says_out_loud_that_local_processes_can_drive_it(fresh_db, monkeypatch):
-    """The local-process exposure is real and unfixable without a token.
+def test_serve_announces_that_login_is_the_boundary(fresh_db, monkeypatch):
+    """Any process may *attempt* a login; the password is the whole defence.
 
-    Any process on this machine can satisfy every origin check with three curl
-    headers — including an MCP server launched with ``--actor agent:x``, which
-    would thereby regain over HTTP the ``accept`` the MCP tool list structurally
-    withholds. That cannot be closed by origin control, so it is *stated*.
+    That cannot be closed by origin control, so it is *stated* — the same
+    philosophy as the banner it replaces, with the static bearer gone.
     """
     monkeypatch.setattr("uvicorn.run", lambda app, **kwargs: None)
 
-    open_server = runner.invoke(cli.app, ["serve"])
-    assert open_server.exit_code == 0
-    assert "any process on this machine" in open_server.output
-    assert "agents you do not trust" in open_server.output
+    result = runner.invoke(cli.app, ["serve"])
 
-    with_token = runner.invoke(cli.app, ["serve", "--token", "s3cret"])
-    assert with_token.exit_code == 0
-    assert "any process on this machine" not in with_token.output
-    # The token has to reach the UI somehow, and the fragment is the one place
-    # it does not end up in a log.
-    assert "#token=s3cret" in with_token.output
+    assert result.exit_code == 0, result.output
+    assert "password login" in result.output
+    assert "human password" in result.output
+    assert "#token" not in result.output
 
 
-def test_serve_refuses_a_public_bind_with_no_token(fresh_db, monkeypatch):
-    """``--host 0.0.0.0`` with no token was accepted silently — an open write API."""
-    started: list = []
-    monkeypatch.setattr("uvicorn.run", lambda app, **kwargs: started.append(kwargs))
+def test_serve_allows_a_non_loopback_bind(fresh_db, monkeypatch):
+    """Decided 2026-07-25: login is the boundary, so a LAN bind is allowed.
 
-    refused = runner.invoke(cli.app, ["serve", "--host", "0.0.0.0"])
-    assert refused.exit_code == 1
-    assert "refusing to bind" in refused.output
-    assert started == []
+    The old ``--token``-gated refusal is gone with the flag. The one thing
+    the bind still decides is the session cookie's ``Secure`` flag: loopback
+    is plain HTTP (a ``Secure`` cookie would never be stored), a LAN bind
+    fronts TLS.
+    """
+    captured: dict = {}
+    monkeypatch.setattr("uvicorn.run", lambda app, **kwargs: captured.update(app=app))
 
-    allowed = runner.invoke(cli.app, ["serve", "--host", "0.0.0.0", "--token", "s3cret"])
-    assert allowed.exit_code == 0
-    assert started
+    result = runner.invoke(cli.app, ["serve", "--host", "0.0.0.0"])
+
+    assert result.exit_code == 0, result.output
+    service.set_human_password("owner", OWNER_PASSWORD, principal=owner())
+    response = Client(captured["app"]).post(
+        "/api/login", json={"name": "owner", "password": OWNER_PASSWORD}
+    )
+    assert response.status_code == 200, response.text
+    assert "secure" in response.headers["set-cookie"].lower()
 
 
 def test_serve_exits_1_when_the_port_is_in_use(fresh_db, monkeypatch):
@@ -1665,10 +1840,10 @@ def test_serve_allows_extra_hosts_on_the_command_line(fresh_db, monkeypatch):
 
     result = runner.invoke(
         cli.app,
-        ["serve", "--host", "0.0.0.0", "--token", "x", "--allow-host", "nodum.lan"],
+        ["serve", "--host", "0.0.0.0", "--allow-host", "nodum.lan"],
     )
 
     assert result.exit_code == 0, result.output
-    client = Client(captured["app"], token="x")
+    client = _session_client(captured["app"])
     assert client.get("/api/types", headers={"Host": "nodum.lan"}).status_code == 200
     assert client.get("/api/types", headers={"Host": "other.example"}).status_code == 400

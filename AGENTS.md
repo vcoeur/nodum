@@ -100,16 +100,22 @@ node for exactly this reason.
   `consolidate` — §8.2) are **never registered**: structural enforcement, not
   a runtime check. Launched by `nodum mcp serve`.
 - **`nodum.http_api`** — the HTTP adapter (design §9), the **human** surface
-  and the exact inverse of the MCP server. `create_app(*, db_path, token)`
-  builds a Starlette app: the JSON API under `/api`, the built UI at `/`,
-  launched by `nodum serve` (loopback, port 8600). Every write is attributed
-  to the session's human principal (INTERIM: the owner, until password
-  sessions land) and **no request field, header, or query parameter can set
-  an identity** — a body carrying `{"actor": "agent:x"}` is ignored, not
-  honoured. That absence is structural, not a filter: the module binds
-  `principal` in exactly one expression (inside `_write`, minted through
-  `auth`), handlers forward only fields they name, and `_write` refuses a
-  caller-supplied principal outright. Three tests in `tests/test_http_api.py`
+  and the exact inverse of the MCP server. `create_app(*, db_path,
+  allowed_hosts, secure_cookies)` builds a Starlette app: the JSON API under
+  `/api`, the built UI at `/`, launched by `nodum serve` (loopback, port
+  8600). Auth is password login: `POST /api/login` (name + password, argon2id,
+  constant-time on failure) creates a server-side session row (30-day sliding
+  expiry) and sets an `HttpOnly; SameSite=Strict` cookie;
+  `SessionMiddleware` resolves it to the session's human principal on every
+  `/api` request — reads included; only `/healthz`, `/api/login` and the
+  static UI stay open. Every write is attributed to that principal and **no
+  request field, header, or query parameter can set an identity** — a body
+  carrying `{"actor": "agent:x"}` is ignored, not honoured. That absence is
+  structural, not a filter: every `principal=` binding in the module is
+  `_session_principal(request)`, which reads only what the middleware
+  verified into the scope (no principal without a verified session), handlers
+  forward only fields they name, and `_write` refuses a caller-supplied
+  principal outright. Tests in `tests/test_http_api.py`
   enforce it over the *live route table* and the module's AST, so a new
   endpoint is covered without being added to a list — if you add an endpoint,
   route its writes through `_write` and never mention an identity in a handler.
@@ -334,12 +340,12 @@ Phase-1 decision log.
   `review queue/accept/reject/accept-all/reject-all`,
   `asset register/get/list/rendition/purge`,
   `mcp serve --actor agent:<name>`,
-  `serve [--host 127.0.0.1] [--port 8600] [--token TOKEN] [--allow-host NAME]
+  `serve [--host 127.0.0.1] [--port 8600] [--allow-host NAME]
   [--db PATH]`. `serve` prints the database path on stderr and translates
   uvicorn's own startup failure (a port already in use) into the contract's
-  exit 1 — it used to escape as uvicorn's exit 3. (Account/grant/space admin
-  commands land with the surfaces step; `--token` and the non-loopback
-  refusal die when password sessions land.)
+  exit 1 — it used to escape as uvicorn's exit 3. A non-loopback bind is
+  allowed (password login, not the bind, is the boundary) and marks the
+  session cookie `Secure` there.
 - Reads are not state-filtered by default beyond edge traversal: `node get`,
   `node children`, `node list`, and `history` return `proposed` rows, and
   `search --state any` includes them. Only *traversals* (`node get --depth`,
@@ -414,12 +420,15 @@ Phase-1 decision log.
   protects *reads*: after a rebind the attacker's page is same-origin by every
   other measure. Host names are compared without ports, which is what keeps the
   `make web-dev` proxy (`Host: localhost:5700`) working.
-- **INTERIM (Q13 surfaces step): `--token` is still the only defence against a
-  local process, and it is dying.** Any process on the machine can satisfy
-  every origin check with three curl headers; password sessions replace the
-  static bearer in the surfaces step, at which point this bullet becomes
-  "a local process needs a human password". Until then the banner still
-  warns when no token is set.
+- **The session gate is one rule: every `/api` route but `/api/login` needs a
+  valid session, reads included.** A single-human file has nothing an
+  anonymous caller should see, and one rule is the one no future endpoint can
+  forget. The cookie is `HttpOnly; SameSite=Strict` over a server-side row
+  with a 30-day sliding expiry; logout, expiry, and `human disable` all kill
+  it at the next request (verification-time, no cache). Any local process can
+  satisfy every origin check with three curl headers, so it may *attempt* a
+  login — the human's password is the whole defence there, and the `serve`
+  banner says so.
 - **A wrong verb on a real route is a 405 with an `Allow` header**, not the
   catch-all's 404. The catch-all claims every method so a `fetch` never gets
   HTML, which also means it out-matches a real route's 405 unless it asks the
