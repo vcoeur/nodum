@@ -498,9 +498,76 @@ def test_space_admin_over_the_cli(fresh_db):
     assert created["space_id"] == "meta"
     spaces = _run_json("space-list", "--as", "owner")
     assert {s["title"] for s in spaces["spaces"]} == {"main", "meta", "sandbox"}
+
+    renamed = _run_json("space-rename", "sandbox", "scratch", "--as", "owner")
+    assert (renamed["id"], renamed["title"]) == (created["id"], "scratch")
+
     _run_json("space-archive", created["id"], "--as", "owner")
     spaces = _run_json("space-list", "--as", "owner")
     assert {s["title"] for s in spaces["spaces"]} == {"main", "meta"}
+
+
+def test_space_list_reports_live_counts_and_grant_holders(fresh_db):
+    _run_json("space-create", "research", "--as", "owner")
+    _run_json(
+        "node", "create", "--type", "note", "--title", "n", "--space", "research", "--as", "owner"
+    )
+    runner.invoke(app, ["agent", "create", "researcher", "--as", "owner"])
+    _run_json("grant", "researcher", "research", "suggest", "--as", "owner")
+
+    listed = {s["title"]: s for s in _run_json("space-list", "--as", "owner")["spaces"]}
+
+    assert listed["research"]["node_count"] == 1
+    assert [(g["agent_id"], g["level"]) for g in listed["research"]["grants"]] == [
+        ("researcher", "suggest")
+    ]
+
+
+def test_the_space_filter_and_meta_toggle_over_the_cli(fresh_db):
+    """The two read-side controls, independent of the write target."""
+    _run_json("space-create", "research", "--as", "owner")
+    _run_json(
+        "node",
+        "create",
+        "--type",
+        "note",
+        "--title",
+        "main memo",
+        "-c",
+        "territory",
+        "--as",
+        "owner",
+    )
+    _run_json(
+        "node",
+        "create",
+        "--type",
+        "note",
+        "--title",
+        "filed",
+        "-c",
+        "territory",
+        "--space",
+        "research",
+        "--as",
+        "owner",
+    )
+
+    everything = _run_json("node", "list", "--as", "owner")
+    assert {row["title"] for row in everything["nodes"]} == {"main memo", "filed"}
+    narrowed = _run_json("node", "list", "--space", "research", "--as", "owner")
+    assert [row["title"] for row in narrowed["nodes"]] == ["filed"]
+
+    # Meta is out of a content listing until it is asked for by name or by flag.
+    assert {row["space_id"] for row in everything["nodes"]} == {
+        "main",
+        narrowed["nodes"][0]["space_id"],
+    }
+    with_meta = _run_json("node", "list", "--include-meta", "--as", "owner")
+    assert "meta" in {row["space_id"] for row in with_meta["nodes"]}
+
+    hits = _run_json("search", "territory", "--space", "research", "--as", "owner")
+    assert [hit["title"] for hit in hits["hits"]] == ["filed"]
 
 
 def test_mcp_serve_requires_an_agent_token(fresh_db, monkeypatch):

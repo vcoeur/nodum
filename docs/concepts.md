@@ -88,6 +88,31 @@ grant queues everything for review; an `edit` grant writes live and carries
 in-space review authority. There is deliberately no auto-accept machinery: an
 agent earns `edit`, or it waits.
 
+### Spaces
+
+A space is the second axis beside the type graph: `main` and `meta` are seeded,
+and `nodum space-create` adds more. A space is itself a **node** — builtin type
+`space`, living in the meta space — so creating, renaming
+(`nodum space-rename`) and archiving (`nodum space-archive`) one are ordinary
+node writes, each event-logged, versioned and undoable. `nodum space-list`
+reports every active space with its live node count and the agents granted on
+it.
+
+A space is used two ways, and they are deliberately two separate controls:
+
+- **Reading** — an optional filter (`--space` on `node list` and `search`,
+  `?space=` on the HTTP reads) that defaults to *every space in scope*.
+- **Writing** — a target (`--space` on `node create` and `ingest`, `space` in
+  the `POST /api/nodes` body) that defaults to `main`.
+
+Reading one space while still filing into another is the ordinary case, which
+is why a single "current space" switch would not do. The read filter is a
+convenience and **not** a permission boundary: an agent stays confined to its
+grants underneath it, and a space it holds no grant on does not resolve at all
+— answering exactly as a space that does not exist would, so the filter is
+never an existence oracle. Archiving a space retires it from the vocabulary;
+nothing moves, and every node in it keeps its `space_id`.
+
 ## Projectors and derived indexes
 
 Search indexes are **projections of the event log**, not a second source of

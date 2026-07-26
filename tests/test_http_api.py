@@ -501,6 +501,12 @@ WRITE_FUNCTIONS = {
     "enable_agent",
     "grant",
     "revoke",
+    # Space lifecycle (the /api/spaces writers). Thin delegates in the service,
+    # but writes all the same: each one ends in a node create, update, or
+    # transition attributed to whoever called it.
+    "create_space",
+    "rename_space",
+    "archive_space",
 }
 
 
@@ -2395,6 +2401,136 @@ def test_spaces_lists_active_spaces_only(client, fresh_db):
     service.transition("main", "archive", principal=owner())
     remaining = _ok(client.get("/api/spaces"))
     assert [space["id"] for space in remaining["spaces"]] == ["meta"]
+
+
+def test_spaces_carry_the_node_count_and_grant_holders(client, fresh_db):
+    """What the ``/spaces`` screen reads: territory, not just a name."""
+    space = _ok(client.post("/api/spaces", json={"name": "research"}))
+    assert (space["type"], space["space_id"]) == ("space", "meta")
+
+    _ok(client.post("/api/nodes", json={"type": "note", "title": "n", "space": "research"}))
+    _ok(client.post("/api/agents", json={"name": "researcher"}))
+    _ok(
+        client.post(
+            "/api/grants", json={"agent": "researcher", "space": "research", "level": "suggest"}
+        )
+    )
+
+    listed = {row["title"]: row for row in _ok(client.get("/api/spaces"))["spaces"]}
+    assert listed["research"]["node_count"] == 1
+    assert [(g["agent_id"], g["level"]) for g in listed["research"]["grants"]] == [
+        ("researcher", "suggest")
+    ]
+    assert listed["main"]["node_count"] == 0
+    assert listed["main"]["grants"] == []
+
+
+def test_the_space_lifecycle_round_trips_over_http(client, fresh_db):
+    space = _ok(client.post("/api/spaces", json={"name": "draft"}))
+
+    renamed = _ok(client.post(f"/api/spaces/{space['id']}/rename", json={"name": "reference"}))
+    assert (renamed["id"], renamed["title"]) == (space["id"], "reference")
+    # Resolvable by name as well as by id — the same rule `--space` follows.
+    assert (
+        _ok(client.post("/api/spaces/reference/rename", json={"name": "library"}))["id"]
+        == (space["id"])
+    )
+
+    archived = _ok(client.post(f"/api/spaces/{space['id']}/archive"))
+    assert archived["state"] == "archived"
+    assert [row["title"] for row in _ok(client.get("/api/spaces"))["spaces"]] == ["meta", "main"]
+    assert client.post("/api/spaces", json={}).status_code == 400
+
+
+def test_the_space_routes_refuse_a_node_that_is_not_a_space(client, fresh_db):
+    """The URL says space, so it must not be a second way to edit any node."""
+    note = service.create_node(type="note", title="not a space", principal=owner())
+
+    assert client.post(f"/api/spaces/{note.id}/rename", json={"name": "x"}).status_code == 404
+    assert client.post(f"/api/spaces/{note.id}/archive").status_code == 404
+    assert service.get_node(note.id, principal=owner()).title == "not a space"
+
+
+def test_a_node_create_lands_in_the_space_the_body_names(client, fresh_db):
+    """B2: the write target. Absent, it is ``main`` — the service's own default."""
+    _ok(client.post("/api/spaces", json={"name": "research"}))
+
+    default = _ok(client.post("/api/nodes", json={"type": "note", "title": "default"}))
+    targeted = _ok(
+        client.post("/api/nodes", json={"type": "note", "title": "filed", "space": "research"})
+    )
+
+    assert default["space_id"] == "main"
+    assert targeted["space_id"] != "main"
+    assert targeted["created_by"] == OWNER_ACTOR  # a space is a place, never an identity
+    assert (
+        client.post("/api/nodes", json={"type": "note", "title": "x", "space": "nope"}).status_code
+        == 404
+    )
+    assert (
+        client.post("/api/nodes", json={"type": "note", "title": "x", "space": 7}).status_code
+        == 400
+    )
+
+
+def test_the_listing_and_search_space_filters_narrow_the_read(client, fresh_db):
+    _ok(client.post("/api/spaces", json={"name": "research"}))
+    main = _ok(
+        client.post(
+            "/api/nodes", json={"type": "note", "title": "main memo", "content": "territory"}
+        )
+    )
+    filed = _ok(
+        client.post(
+            "/api/nodes",
+            json={
+                "type": "note",
+                "title": "research memo",
+                "content": "territory",
+                "space": "research",
+            },
+        )
+    )
+
+    everything = _ok(client.get("/api/nodes"))
+    assert {row["id"] for row in everything["nodes"]} == {main["id"], filed["id"]}
+    narrowed = _ok(client.get("/api/nodes?space=research"))
+    assert [row["id"] for row in narrowed["nodes"]] == [filed["id"]]
+
+    assert {hit["node_id"] for hit in _ok(client.get("/api/search?q=territory"))["hits"]} == {
+        main["id"],
+        filed["id"],
+    }
+    searched = _ok(client.get("/api/search?q=territory&space=research"))
+    assert [hit["node_id"] for hit in searched["hits"]] == [filed["id"]]
+
+    # An unknown space is the same 404 everywhere, and never a 500.
+    assert client.get("/api/nodes?space=nope").status_code == 404
+    assert client.get("/api/search?q=territory&space=nope").status_code == 400
+
+
+def test_include_meta_is_off_by_default_on_both_reads(client, fresh_db):
+    """B3/D3: the type vocabulary stays out of content listings until asked for."""
+    service.create_node(
+        type="type",
+        title="territory-kind",
+        content="territory vocabulary",
+        space="meta",
+        props={"type_kind": "node"},
+        principal=owner(),
+    )
+    _ok(client.post("/api/nodes", json={"type": "note", "title": "memo", "content": "territory"}))
+
+    listed = _ok(client.get("/api/nodes"))
+    assert [row for row in listed["nodes"] if row["space_id"] == "meta"] == []
+    with_meta = _ok(client.get("/api/nodes?include_meta=true"))
+    assert [row for row in with_meta["nodes"] if row["space_id"] == "meta"] != []
+
+    assert [hit["title"] for hit in _ok(client.get("/api/search?q=territory"))["hits"]] == ["memo"]
+    assert "territory-kind" in {
+        hit["title"] for hit in _ok(client.get("/api/search?q=territory&include_meta=1"))["hits"]
+    }
+    assert client.get("/api/nodes?include_meta=maybe").status_code == 400
 
 
 def test_the_agent_token_never_reaches_an_event_payload(client, fresh_db):

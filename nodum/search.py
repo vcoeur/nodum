@@ -72,6 +72,25 @@ def _match_query(query: str) -> str:
     return " AND ".join(terms)
 
 
+def _resolve_space(conn: sqlite3.Connection, space_ref: str, principal: Principal) -> str:
+    """Resolve a space id or name to its id for the filter, or raise.
+
+    The same rule the service applies (``service._resolve_space``): a space the
+    principal holds no grant on does not resolve, so an existing-but-ungranted
+    space and a nonexistent one answer identically and the filter is not an
+    existence oracle. ``ValueError`` rather than the service's ``TypeNotFound``,
+    matching how this module already refuses an unknown ``type`` filter.
+    """
+    row = conn.execute(
+        "SELECT id FROM nodes WHERE (id = ? OR title = ?) AND type_id = 'space'"
+        " AND state = 'active'",
+        (space_ref, space_ref),
+    ).fetchone()
+    if row is None or principal.level_on(row["id"]) < READ:
+        raise ValueError(f"unknown space: {space_ref}")
+    return row["id"]
+
+
 def _node_filters(
     state: str | None,
     type_id: str | None,
@@ -79,12 +98,20 @@ def _node_filters(
     created_after: str | None,
     created_before: str | None,
     include_meta: bool,
+    space_id: str | None,
     principal: Principal | None,
 ) -> tuple[list[str], list]:
     """Build the shared ``nodes``-table WHERE clauses (alias ``n``) and params.
 
     An agent principal is confined to its read set (Q13); a human (or the
     trusted-local default) just skips the meta space unless ``include_meta``.
+
+    ``space_id`` narrows further and never wider: it is ANDed onto whichever
+    of those two clauses applies, so an agent asking for a space outside its
+    read set would match nothing even if the id reached here — which it cannot,
+    since :func:`_resolve_space` refuses to resolve one. Naming the meta space
+    is itself the ``include_meta`` opt-in, so the default exclusion applies only
+    to an unnarrowed search.
     """
     clauses: list[str] = []
     params: list = []
@@ -95,9 +122,12 @@ def _node_filters(
         else:
             clauses.append(f"n.space_id IN ({','.join('?' * len(spaces))})")
             params.extend(spaces)
-    elif not include_meta:
+    elif not include_meta and space_id is None:
         clauses.append("n.space_id != ?")
         params.append(META_SPACE_ID)
+    if space_id is not None:
+        clauses.append("n.space_id = ?")
+        params.append(space_id)
     if state is not None:
         clauses.append("n.state = ?")
         params.append(state)
@@ -139,11 +169,12 @@ def _search_bm25(
     created_after: str | None,
     created_before: str | None,
     include_meta: bool,
+    space_id: str | None,
     principal: Principal | None,
 ) -> list[_RankedRow]:
     """Run the BM25-ranked FTS query, best (most-negative bm25) first."""
     filters, params = _node_filters(
-        state, type_id, created_by, created_after, created_before, include_meta, principal
+        state, type_id, created_by, created_after, created_before, include_meta, space_id, principal
     )
     clauses = ["node_fts MATCH ?", *filters]
     weights = ", ".join(str(w) for w in _BM25_WEIGHTS)
@@ -181,6 +212,7 @@ def _search_vector(
     created_after: str | None,
     created_before: str | None,
     include_meta: bool,
+    space_id: str | None,
     principal: Principal | None,
 ) -> list[_RankedRow]:
     """Run the sqlite-vec ANN query, aggregating chunks to nodes (best chunk wins).
@@ -192,7 +224,7 @@ def _search_vector(
     with a small contribution.
     """
     filters, params = _node_filters(
-        state, type_id, created_by, created_after, created_before, include_meta, principal
+        state, type_id, created_by, created_after, created_before, include_meta, space_id, principal
     )
     clauses = filters or ["1=1"]
     rows = conn.execute(
@@ -283,6 +315,7 @@ def _expand_hits(
     state: str | None,
     type_id: str | None,
     include_meta: bool,
+    space_id: str | None,
     principal: Principal | None,
 ) -> list[SearchHit]:
     """One-hop graph expansion: active-edge neighbors of the fused hits.
@@ -291,6 +324,13 @@ def _expand_hits(
     weight × confidence, design §7) and its ``signals`` carries only the
     ``graph`` signal, so expansion hits are distinguishable from direct
     matches. Fused hits are never re-emitted. Capped at ``k`` extra hits.
+
+    Every filter the fused query applied applies here too, ``space_id``
+    included: a search narrowed to one space does not reach back out of it
+    one hop later. (What the *graph view* does with a cross-space edge is a
+    different question — there the far endpoint is drawn dimmed rather than
+    dropped, because a graph asserting a connection ends is asserting
+    something false. A ranked list asserts nothing of the sort.)
     """
     seen = {hit.node_id for hit in hits}
     weights: dict[str, float] = {}
@@ -314,7 +354,9 @@ def _expand_hits(
         if principal is not None and not principal.is_human:
             if row["space_id"] not in (principal.read_spaces or ()):
                 continue
-        elif not include_meta and row["space_id"] == META_SPACE_ID:
+        elif not include_meta and space_id is None and row["space_id"] == META_SPACE_ID:
+            continue
+        if space_id is not None and row["space_id"] != space_id:
             continue
         if state is not None and row["state"] != state:
             continue
@@ -343,6 +385,7 @@ def search(
     created_after: str | None = None,
     created_before: str | None = None,
     include_meta: bool = False,
+    space: str | None = None,
     expand: bool = False,
     principal: Principal,
     path: str | Path | None = None,
@@ -364,6 +407,13 @@ def search(
         created_by: Optional writer filter (e.g. ``agent:researcher``).
         created_after: Only nodes created after this timestamp.
         created_before: Only nodes created before this timestamp.
+        include_meta: Include meta-space nodes (the type vocabulary, the
+            spaces themselves) in an unnarrowed search.
+        space: Optional space id or name to narrow the search to. It composes
+            with the principal's scope — an agent is still confined to its
+            grants, and a space it holds none on does not resolve — so this is
+            the human's convenience filter, never a boundary. Naming the meta
+            space is itself the ``include_meta`` opt-in.
         expand: Append one-hop active-edge neighbors of the fused hits
             (design §7 graph expansion), scored by edge type weight ×
             confidence.
@@ -375,7 +425,8 @@ def search(
         ``vector``, ``graph``).
 
     Raises:
-        ValueError: If the query has no terms or the type does not resolve.
+        ValueError: If the query has no terms, or the type or space does not
+            resolve — an ungranted space and a nonexistent one read alike.
     """
     match = _match_query(query)
     # Derived indexes first: the projectors are incremental, so this is cheap.
@@ -394,6 +445,7 @@ def search(
             if row is None or principal.level_on(row["space_id"]) < READ:
                 raise ValueError(f"unknown node type: {type}")
             type_id = row["id"]
+        space_id = _resolve_space(conn, space, principal) if space is not None else None
         bm25_rows = _search_bm25(
             conn,
             match,
@@ -404,6 +456,7 @@ def search(
             created_after=created_after,
             created_before=created_before,
             include_meta=include_meta,
+            space_id=space_id,
             principal=principal,
         )
         vector_rows: list[_RankedRow] = []
@@ -420,6 +473,7 @@ def search(
                 created_after=created_after,
                 created_before=created_before,
                 include_meta=include_meta,
+                space_id=space_id,
                 principal=principal,
             )
         hits = _fuse(bm25_rows, vector_rows, k=k)
@@ -431,6 +485,7 @@ def search(
                 state=state,
                 type_id=type_id,
                 include_meta=include_meta,
+                space_id=space_id,
                 principal=principal,
             )
         return SearchResult(query=query, k=k, hits=hits)

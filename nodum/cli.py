@@ -207,6 +207,16 @@ def _principal(as_human: str) -> Principal:
 
 SET_OPTION = typer.Option(None, "--set", help="Repeatable key=value props (values parsed as JSON).")
 
+#: The two read-side space controls, shared by `node list` and `search`. They
+#: are independent of the write target (`--space` on `node create`): reading one
+#: space while still filing into another is the ordinary case.
+SPACE_FILTER_OPTION = typer.Option(
+    None, "--space", help="Only this space (id or name); default: every space in scope."
+)
+INCLUDE_META_OPTION = typer.Option(
+    False, "--include-meta", help="Include meta-space nodes (types, spaces) in an unnarrowed read."
+)
+
 
 @app.command()
 def init() -> None:
@@ -223,6 +233,9 @@ def node_create(
         None, "--content-file", help="Read the Markdown body from a file ('-' = stdin)."
     ),
     parent: str | None = typer.Option(None, "--parent", help="Parent node id."),
+    space: str | None = typer.Option(
+        None, "--space", help="Target space id or name (default: the 'main' space)."
+    ),
     set_props: list[str] | None = SET_OPTION,
     as_human: str = AS_OPTION,
 ) -> None:
@@ -234,6 +247,7 @@ def node_create(
         content=_read_content(content, content_file) or "",
         parent_id=parent,
         props=_parse_set(set_props),
+        space=space,
         principal=_principal(as_human),
     )
     _emit(node)
@@ -285,6 +299,8 @@ def node_list(
     type: str | None = typer.Option(None, "--type", "-t", help="Filter by node type."),
     state: str | None = typer.Option(None, "--state", help="Filter by state."),
     parent: str | None = typer.Option(None, "--parent", help="Filter by parent node id."),
+    space: str | None = SPACE_FILTER_OPTION,
+    include_meta: bool = INCLUDE_META_OPTION,
     limit: int = typer.Option(500, "--limit", help="Maximum rows."),
     as_human: str = AS_OPTION,
 ) -> None:
@@ -294,6 +310,8 @@ def node_list(
         type=type,
         state=state,
         parent_id=parent,
+        space=space,
+        include_meta=include_meta,
         principal=_principal(as_human),
         limit=limit,
     )
@@ -466,6 +484,8 @@ def search(
     created_before: str | None = typer.Option(
         None, "--created-before", help="Only nodes created before this timestamp."
     ),
+    space: str | None = SPACE_FILTER_OPTION,
+    include_meta: bool = INCLUDE_META_OPTION,
     expand: bool = typer.Option(
         False, "--expand", help="Append one-hop active-edge neighbors of the hits."
     ),
@@ -486,6 +506,8 @@ def search(
         created_by=created_by,
         created_after=created_after,
         created_before=created_before,
+        include_meta=include_meta,
+        space=space,
         expand=expand,
         principal=_principal(as_human),
     )
@@ -1302,29 +1324,29 @@ def space_create(
     as_human: str = AS_OPTION,
 ) -> None:
     """Create a space (a node of builtin type 'space' in meta; edit there is human-tier)."""
-    node = _run(
-        service.create_node, type="space", title=name, space="meta", principal=_principal(as_human)
-    )
-    _emit(node)
+    _emit(_run(service.create_space, name, principal=_principal(as_human)))
 
 
 @app.command(name="space-list")
 def space_list(as_human: str = AS_OPTION) -> None:
-    """List spaces."""
-    nodes = _run(
-        service.list_nodes,
-        type="space",
-        state="active",
-        include_meta=True,
-        principal=_principal(as_human),
-    )
-    _emit_list("spaces", nodes)
+    """List active spaces with their live node counts and the agents granted on them."""
+    _emit_list("spaces", _run(service.list_spaces, principal=_principal(as_human)))
+
+
+@app.command(name="space-rename")
+def space_rename(
+    space: str = typer.Argument(..., help="Space id or name to rename."),
+    name: str = typer.Argument(..., help="New title for the space."),
+    as_human: str = AS_OPTION,
+) -> None:
+    """Rename a space (a space is a node, so this is a node-title update)."""
+    _emit(_run(service.rename_space, space, name, principal=_principal(as_human)))
 
 
 @app.command(name="space-archive")
 def space_archive(
-    space_id: str = typer.Argument(..., help="Space node id to archive."),
+    space: str = typer.Argument(..., help="Space id or name to archive."),
     as_human: str = AS_OPTION,
 ) -> None:
     """Archive a space (nodes keep their space_id; grants on it go inert)."""
-    _emit(_run(service.transition, space_id, "archive", principal=_principal(as_human)))
+    _emit(_run(service.archive_space, space, principal=_principal(as_human)))

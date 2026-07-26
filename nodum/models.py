@@ -470,3 +470,22 @@ class GrantOut(BaseModel):
     space_id: str
     level: str
     created_at: str
+
+
+class SpaceOut(NodeOut):
+    """A space node plus what makes it *territory* rather than a name.
+
+    A space is a node of builtin type ``space``, so every :class:`NodeOut`
+    field is here unchanged and a client that only wants the node keeps
+    reading it as one.
+
+    ``node_count`` counts the space's **live** nodes — ``active`` plus
+    ``proposed``, since a space holding nothing but proposals is not empty —
+    and excludes ``archived`` ones, which are retired rather than territory.
+    ``grants`` lists the agents holding a grant on the space, which is how a
+    human sees delegated territory at a glance (an ``edit``-granted space
+    governs itself and never reaches the review queue).
+    """
+
+    node_count: int
+    grants: list[GrantOut]

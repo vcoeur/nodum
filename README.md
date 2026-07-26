@@ -84,6 +84,19 @@ uv run nodum projector rebuild vec            # the model-change re-embed path
 
 uv run nodum node list --type note --as owner
 uv run nodum history <node-id> --as owner           # version snapshots
+
+# Spaces: a second axis beside the type graph. Reading and writing are two
+# independent controls — `--space` filters a read, and `--space` targets a
+# write — so you can read one space while still filing into another.
+uv run nodum space-create research --as owner
+uv run nodum space-list --as owner                  # + live node counts and grant holders
+uv run nodum space-rename research reference --as owner
+uv run nodum node create --type note --title "Filed" --space reference --as owner
+uv run nodum node list --space reference --as owner
+uv run nodum search "graph theory" --space reference --as owner
+uv run nodum node list --include-meta --as owner    # the type vocabulary, off by default
+uv run nodum space-archive reference --as owner     # nodes keep their space_id
+
 uv run nodum undo --as owner                        # reverse the latest event
 uv run nodum types --as owner                       # the seeded type catalog
 
@@ -219,6 +232,19 @@ degrades to BM25 + graph expansion. `NODUM_EMBED_MODEL` switches the model
   as `proposed`, and `edit` writes `active` and carries review authority inside
   that space. There is deliberately no auto-accept machinery: an agent earns
   `edit`, or it waits.
+- **Spaces: a filter for reading, a target for writing.** A space is a node of
+  builtin type `space`, so its whole lifecycle is an ordinary node's
+  (`space-create` / `space-rename` / `space-archive`, each event-logged,
+  versioned and undoable), and `space-list` reports each one's live node count
+  and the agents granted on it. The two uses are deliberately separate
+  controls: `--space` on a read **narrows** the view (default: every space in
+  scope), `--space` on a write **targets** where the node lands (default:
+  `main`). The read filter is a convenience, never a boundary — the boundary is
+  the grant set, which is still applied underneath it, and a space a principal
+  holds no grant on does not resolve at all, reading exactly like one that does
+  not exist. Meta-space nodes (the type vocabulary, the spaces themselves) stay
+  out of content reads unless `--include-meta` says otherwise, or the read is
+  narrowed to `meta` by name.
 - **MCP server.** `nodum mcp serve` runs a stdio MCP server (the official
   Python SDK's FastMCP). The agent authenticates with its token in
   `NODUM_AGENT_TOKEN` (minted by `nodum agent create`, shown once, stored
@@ -268,6 +294,14 @@ degrades to BM25 + graph expansion. `NODUM_EMBED_MODEL` switches the model
   `/api/humans`, `/api/agents` (the show-once token comes back in the
   create/token-rotate body) and `/api/grants` mirror the CLI's
   `human`/`agent`/`grant`/`revoke`/`grants` commands.
+- **Spaces are on the API as both controls.** `GET /api/nodes` and
+  `GET /api/search` take `?space=` and `?include_meta=` (the read filter and
+  the meta toggle, both off by default); `POST /api/nodes` takes `space` in the
+  body (the write target, `main` when absent — a place, never an identity).
+  The lifecycle mirrors the CLI: `POST /api/spaces`,
+  `POST /api/spaces/{id}/rename`, `POST /api/spaces/{id}/archive`, and
+  `GET /api/spaces` listing every active space with its live node count and
+  grant holders.
 - **Uploads are images only, and bounded.** `POST /api/assets` — the editor's
   drag-drop route — caps the request
   body before anything buffers it (32 MiB), identifies the type from the bytes

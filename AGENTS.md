@@ -104,7 +104,13 @@ node for exactly this reason.
   drawn with gaps, and a `truncated` flag saying whether **either** cap bit —
   and **`suggest_links`**, a title-prefix lookup for a `[[` autocomplete that
   reads `nodes` directly, so it answers on a database whose projectors have
-  never run. Each public function opens its own short-lived connection
+  never run. **Spaces** live here too: the read-side `space` filter on
+  `list_nodes` (and its twin in `nodum.search`), and the lifecycle trio
+  `create_space` / `rename_space` / `archive_space` plus the `list_spaces`
+  aggregation — thin delegates to `create_node` / `update_node` / `transition`
+  that own the "a space is a node of type `space` in meta" rule so that neither
+  adapter has to restate it, and no new SQL path exists for a space write.
+  Each public function opens its own short-lived connection
   (applying pending migrations idempotently) and commits. New behaviour and
   validation go here first; adapters must not add behaviour the service lacks.
 - **`nodum.mcp_server`** — the MCP adapter (stdio, official Python SDK
@@ -527,6 +533,19 @@ Phase-1 decision log.
   `scripts/smoke-install.sh` asserts against a freshly built wheel. Note
   `schema-dump` (the CLI adapter's own surface) is a different thing from
   `schema <type>` (one node/edge type's catalog entry from the database).
+- **A space is two independent controls, not a mode** (the human-UI phase's
+  D1): reads take an optional `--space` **filter** that defaults to *every
+  space in scope*, and writes take a `--space` **target** that defaults to
+  `main`. Reading `research` while still filing into `main` is the ordinary
+  case, so one switch could not serve both. The filter **narrows** and never
+  widens: it resolves through the same rule every other space reference does
+  (a space the principal holds no grant on does not resolve, and reads
+  identically to a nonexistent one), and the principal's scope clause is still
+  ANDed underneath it — an agent is confined by its grants whatever it asks
+  for. `--include-meta` is the other read-side control, off by default;
+  naming the meta space with `--space meta` is the same opt-in said precisely,
+  since `meta` is itself in the space list and a filter that silently returned
+  nothing there would be a trap.
 - Surface: `init`, `node create/get/update/list/children`, `edge
   create/list/create-batch`, `accept <id>` / `reject <id> --reason` /
   `archive <id>` (each takes a node, edge, or proposed-version id), `undo [seq]`,
@@ -548,8 +567,17 @@ Phase-1 decision log.
   the show-once `ndm_…` token to stderr; only the hash is stored),
   `grant <agent> <space> <level>` / `revoke <agent> <space>` / `grants [--agent]`
   (`read`/`suggest`/`edit`, event-logged),
-  `space-create`/`space-list`/`space-archive` (a space is a node of builtin
-  type `space` in the meta space),
+  `space-create`/`space-list`/`space-rename`/`space-archive` (a space is a node
+  of builtin type `space` in the meta space, so its whole lifecycle is an
+  ordinary node's — create, a title update, a state transition — and every one
+  is event-logged, versioned and undoable like any other write; the three
+  mutating commands go through `service.create_space`/`rename_space`/
+  `archive_space`, which own the "a space is a node in meta" rule so no adapter
+  has to, and refuse a node that is not a space rather than editing it under a
+  space-shaped name. `space-list` (`service.list_spaces`) carries each space's
+  **live node count** — `active` + `proposed`, since a space holding only
+  proposals is not empty — and the **agents granted on it**, which is human-only
+  for the same reason `grants` is),
   `mcp serve` (the agent token comes from `NODUM_AGENT_TOKEN`, never a flag),
   `serve [--host 127.0.0.1] [--port 8600] [--allow-host NAME]
   [--db PATH]`. `serve` prints the database path on stderr and translates
@@ -740,6 +768,22 @@ Phase-1 decision log.
   blocks neither loopback nor private ranges. Both are properties of a
   human-only surface behind a password — which is exactly why this route is
   inside the session gate and the two token routes are not.
+- **Spaces reach the human over HTTP as a filter, a target, and a lifecycle.**
+  `GET /api/nodes` and `GET /api/search` take `?space=` (narrow to one space)
+  and `?include_meta=` (off by default) — the CLI's two read-side controls,
+  same names, same rules. `POST /api/nodes` takes `space` in the body: the
+  **write target**, optional, `main` when absent. A space names *where a node
+  goes*, never *who wrote it* — the session's human is still the only writer,
+  and `space` is an ordinary service parameter rather than a new concept, which
+  is exactly the test "do not invent request fields the domain has no
+  representation for" asks for. The lifecycle is `POST /api/spaces` (create),
+  `POST /api/spaces/{id}/rename` and `POST /api/spaces/{id}/archive`, in the
+  `/api/nodes/{id}/archive` verb-POST style; `{id}` is a space id *or name* and
+  resolves as a **space**, so neither route can be used to rename or retire a
+  node that is not one. `GET /api/spaces` carries per space the live node count
+  and the agents holding grants on it (the `/spaces` screen's read) and is
+  byte-identical to `nodum space-list`, as every list endpoint is to its
+  command.
 - **Account and grant administration is on the API too.** `GET /api/me`
   returns the session's human; `/api/humans`, `/api/agents` and `/api/grants`
   mirror the CLI's `human`/`agent`/`grant`/`revoke`/`grants` commands — thin

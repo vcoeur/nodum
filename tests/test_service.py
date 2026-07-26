@@ -14,6 +14,7 @@ from nodum.service import (
     TypeNotFound,
     VersionNotFound,
 )
+from nodum.store import GrantNotPermitted
 
 
 def test_create_node_defaults_active_for_human(fresh_db):
@@ -205,3 +206,77 @@ def test_transition_unknown_action(fresh_db):
     node = service.create_node(type="note", title="x", principal=owner())
     with pytest.raises(ValueError, match="unknown transition"):
         service.transition(node.id, "explode", principal=owner())
+
+
+# ── Space lifecycle: a space is a node, so its lifecycle is a node's ──────────
+
+
+def test_create_space_is_a_node_of_type_space_in_meta(fresh_db):
+    space = service.create_space("research", principal=owner())
+
+    assert space.type == "space"
+    assert space.space_id == "meta"
+    assert space.title == "research"
+    assert space.state == "active"
+    # And it is immediately usable as a write target, by name or by id.
+    written = service.create_node(type="note", title="n", space="research", principal=owner())
+    assert written.space_id == space.id
+
+
+def test_rename_and_archive_round_trip_by_name_or_id(fresh_db):
+    space = service.create_space("draft", principal=owner())
+
+    renamed = service.rename_space("draft", "reference", principal=owner())
+    assert renamed.id == space.id
+    assert renamed.title == "reference"
+    # The rename is an ordinary node update, so it is versioned and logged.
+    assert [version.title for version in service.history(space.id, principal=owner())] == [
+        "draft",
+        "reference",
+    ]
+
+    archived = service.archive_space(space.id, principal=owner())
+    assert archived.state == "archived"
+    assert [row.title for row in service.list_spaces(principal=owner())] == ["meta", "main"]
+    # An archived space has left the vocabulary: it no longer resolves at all.
+    with pytest.raises(TypeNotFound):
+        service.create_node(type="note", title="n", space="reference", principal=owner())
+
+
+def test_the_lifecycle_refuses_a_node_that_is_not_a_space(fresh_db):
+    """The route/command says "space", so a note id must not be renamed by it."""
+    note = service.create_node(type="note", title="not a space", principal=owner())
+
+    with pytest.raises(TypeNotFound):
+        service.rename_space(note.id, "hijacked", principal=owner())
+    with pytest.raises(TypeNotFound):
+        service.archive_space(note.id, principal=owner())
+    assert service.get_node(note.id, principal=owner()).title == "not a space"
+
+
+def test_list_spaces_carries_live_node_counts_and_grant_holders(fresh_db):
+    space = service.create_space("research", principal=owner())
+    service.create_node(type="note", title="live", space="research", principal=owner())
+    proposed = service.create_node(type="note", title="draft", space="research", principal=owner())
+    service.transition(proposed.id, "archive", principal=owner())
+    researcher = agent("researcher", grants={"meta": "read"})
+    service.grant(researcher.id, "research", "suggest", principal=owner())
+
+    listed = {row.title: row for row in service.list_spaces(principal=owner())}
+
+    # One live node: the archived one is retired, not territory.
+    assert listed["research"].node_count == 1
+    assert listed["research"].id == space.id
+    assert [(g.agent_id, g.level) for g in listed["research"].grants] == [
+        (researcher.id, "suggest")
+    ]
+    # A space nobody was granted reports an empty list rather than omitting the key.
+    assert listed["main"].grants == []
+
+
+def test_list_spaces_is_human_only(fresh_db):
+    """Which agent holds what is governance information, exactly as `grants` is."""
+    service.create_space("research", principal=owner())
+
+    with pytest.raises(GrantNotPermitted):
+        service.list_spaces(principal=agent("researcher"))

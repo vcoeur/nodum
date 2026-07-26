@@ -39,6 +39,7 @@ from nodum.models import (
     PathOut,
     ProposalOut,
     ProposeEdgesOut,
+    SpaceOut,
     SubgraphOut,
     TransitionFailure,
     TypeOut,
@@ -907,31 +908,60 @@ def list_nodes(
     type: str | None = None,
     state: str | None = None,
     parent_id: str | None = None,
+    space: str | None = None,
     include_meta: bool = False,
     principal: Principal,
     limit: int = 500,
     path: str | Path | None = None,
 ) -> list[NodeOut]:
-    """List nodes, optionally filtered by type name/id, state, or parent.
+    """List nodes, optionally filtered by type name/id, state, parent, or space.
 
     Ordered by ``created_at``; ``limit`` caps the result (default 500).
     Meta-space nodes (the type vocabulary, spaces) are excluded unless
     ``include_meta`` — content listings are not the type catalog. An agent
     principal is additionally confined to its read set (which may include
     meta, e.g. for the type vocabulary).
+
+    ``space`` **narrows** that read set and can never widen it: it resolves
+    through :func:`_resolve_space`, so a space the principal holds no grant on
+    does not resolve at all, and the scope clause is still ANDed underneath it.
+    It is a convenience for the human (who is unfiltered and sees the whole
+    file), not a boundary — the boundary is the grant set.
+
+    Args:
+        type: Node-type id or name.
+        state: One of :data:`STATES`.
+        parent_id: Only this node's children.
+        space: Space id or name; ``None`` spans every space in scope. Naming
+            the meta space explicitly is itself the ``include_meta`` opt-in —
+            the default exclusion only applies to an unnarrowed listing.
+        include_meta: Include meta-space nodes in an unnarrowed listing.
+        principal: Who is asking.
+        limit: Maximum rows.
+        path: Explicit database path.
+
+    Raises:
+        TypeNotFound: If ``type`` or ``space`` resolves to nothing the
+            principal can read — an ungranted space and a nonexistent one
+            answer identically (Q13 review S3).
+        ValueError: If ``state`` is not a known state.
     """
     conn = _connect(path)
     try:
         store = Store(conn, principal)
         clauses: list[str] = []
         params: list[Any] = []
+        space_id = _resolve_space(conn, space, principal) if space is not None else None
         scope, scope_params = store.node_scope()
         if scope:
             clauses.append(scope.removeprefix(" AND "))
             params.extend(scope_params)
-        elif not include_meta:
+        elif not include_meta and space_id is None:
             clauses.append("space_id != ?")
             params.append(META_SPACE_ID)
+        if space_id is not None:
+            clauses.append("space_id = ?")
+            params.append(space_id)
         if type is not None:
             clauses.append("type_id = ?")
             params.append(_resolve_node_type(conn, type, principal))
@@ -3065,6 +3095,144 @@ def list_grants(
                 space_id=row["space_id"],
                 level=row["level"],
                 created_at=row["created_at"],
+            )
+            for row in rows
+        ]
+    finally:
+        conn.close()
+
+
+# ── Space lifecycle (a space is a node of builtin type 'space' in meta) ───────
+#
+# These three are deliberately thin: each delegates to the ordinary node
+# operation so a space create, rename and archive are event-logged, versioned
+# and undoable exactly like any other node write. What they add is the one
+# piece of knowledge that would otherwise be copied into every adapter — that a
+# space *is* a node, of type `space`, living in meta — plus the resolution rule
+# that makes a name usable everywhere an id is, and that refuses to touch a
+# node that is not a space at all.
+
+
+def create_space(name: str, *, principal: Principal, path: str | Path | None = None) -> NodeOut:
+    """Create a space: a node of builtin type ``space``, living in the meta space.
+
+    Args:
+        name: The space's title — what ``--space``, a grant, and the space
+            filter may name it by, alongside its generated id.
+        principal: Who is writing. Writing meta is the human tier in practice,
+            so this is a human operation unless an agent was granted meta.
+        path: Explicit database path.
+
+    Returns:
+        The created space node.
+
+    Raises:
+        GrantNotPermitted: If the principal may not write the meta space.
+    """
+    return create_node(
+        type="space", title=name, space=META_SPACE_ID, principal=principal, path=path
+    )
+
+
+def rename_space(
+    space: str, name: str, *, principal: Principal, path: str | Path | None = None
+) -> NodeOut | VersionOut:
+    """Rename a space — a space is a node, so its name is a node title.
+
+    Args:
+        space: Space id or name; one the principal cannot read does not
+            resolve, and neither does a node that is not a space.
+        name: The new title.
+        principal: Who is writing.
+        path: Explicit database path.
+
+    Returns:
+        The renamed space node — or, on the ``suggest`` path, the proposed
+        version staging the new title, exactly as :func:`update_node` does for
+        any other node.
+
+    Raises:
+        TypeNotFound: If ``space`` resolves to no space the principal can see.
+    """
+    space_id = resolve_space_id(space, principal=principal, path=path)
+    return update_node(space_id, title=name, principal=principal, path=path)
+
+
+def archive_space(space: str, *, principal: Principal, path: str | Path | None = None) -> NodeOut:
+    """Archive a space; its nodes keep their ``space_id`` and grants on it go inert.
+
+    Nothing is moved or deleted: archiving retires the space from the
+    vocabulary (it stops resolving, so nothing new can be written or granted
+    there) while every node already in it keeps its ``space_id`` and stays
+    exactly as readable as it was.
+
+    Args:
+        space: Space id or name.
+        principal: Who is writing.
+        path: Explicit database path.
+
+    Returns:
+        The archived space node.
+
+    Raises:
+        TypeNotFound: If ``space`` resolves to no space the principal can see.
+    """
+    space_id = resolve_space_id(space, principal=principal, path=path)
+    # A resolved space id is always a node id, so this transition is a node's.
+    archived = transition(space_id, "archive", principal=principal, path=path)
+    return archived
+
+
+def list_spaces(*, principal: Principal, path: str | Path | None = None) -> list[SpaceOut]:
+    """Every active space, with its live node count and the agents granted on it.
+
+    The ``/spaces`` screen's read, and the CLI's ``space-list``: the space
+    nodes plus the two facts that make a space territory rather than a name —
+    how much lives there, and who else may touch it.
+
+    Human-only for the same reason :func:`list_grants` is: which agent holds
+    what is governance information, and an agent learning the shape of the
+    delegation around it is precisely what the grant model withholds.
+
+    Args:
+        principal: Who is asking; must be a human.
+        path: Explicit database path.
+
+    Returns:
+        One :class:`SpaceOut` per active space, in creation order.
+
+    Raises:
+        GrantNotPermitted: If the principal is not a human.
+    """
+    conn = _connect(path)
+    try:
+        Store(conn, principal).require_human("list spaces")
+        rows = conn.execute(
+            "SELECT * FROM nodes WHERE type_id = 'space' AND state = 'active'"
+            " ORDER BY created_at, rowid"
+        ).fetchall()
+        counts = {
+            row["space_id"]: row["live_nodes"]
+            for row in conn.execute(
+                "SELECT space_id, COUNT(*) AS live_nodes FROM nodes"
+                " WHERE state != 'archived' GROUP BY space_id"
+            )
+        }
+        grants: dict[str, list[GrantOut]] = {}
+        for row in conn.execute("SELECT * FROM grants ORDER BY agent_id"):
+            grants.setdefault(row["space_id"], []).append(
+                GrantOut(
+                    agent_id=row["agent_id"],
+                    space_id=row["space_id"],
+                    level=row["level"],
+                    created_at=row["created_at"],
+                )
+            )
+        return [
+            SpaceOut(
+                **_node_out(row).model_dump(),
+                node_count=counts.get(row["id"], 0),
+                grants=grants.get(row["id"], []),
             )
             for row in rows
         ]

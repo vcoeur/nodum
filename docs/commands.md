@@ -67,9 +67,13 @@ including every parameter.
 ### Graph
 
 - `init` — Create the database (if needed) and apply pending migrations.
-- `node create` — Create a node (`active` for a human; over MCP, per the agent's grant).
+- `node create` — Create a node (`active` for a human; over MCP, per the
+  agent's grant). `--space` is the **write target** — the space the node lands
+  in, `main` when absent.
 - `node get` — Fetch one node by id (plus its neighborhood when `--depth > 0`).
-- `node list` — List nodes in creation order, optionally filtered.
+- `node list` — List nodes in creation order, optionally filtered. `--space`
+  narrows to one space (default: every space in scope) and `--include-meta`
+  adds the meta space (off by default).
 - `node update` — Update a node (applies for a human or an `edit` grant; stages a proposed version on `suggest`).
 - `node children` — List a node's children in position order.
 - `edge create` — Create a typed, directed edge between two nodes.
@@ -80,7 +84,9 @@ including every parameter.
 
 ### Traversal and search
 
-- `search <query>` — Hybrid-search node title + content (BM25 + vector, RRF-fused).
+- `search <query>` — Hybrid-search node title + content (BM25 + vector,
+  RRF-fused). Takes the same two read-side space controls as `node list`:
+  `--space` and `--include-meta`.
 - `traverse` — Walk the subgraph reachable from a node over active edges.
 - `subgraph <root-id>` — Bounded, filtered neighborhood of a node — node and edge caps stop the walk.
 - `find-path` — Find the shortest path between two nodes over active edges.
@@ -113,8 +119,23 @@ including every parameter.
   (`create`/`token-rotate` print the show-once token to stderr).
 - `grant <agent> <space> <level>` / `revoke <agent> <space>` / `grants [--agent]` —
   Event-logged grant administration, levels `read`/`suggest`/`edit`.
-- `space-create` / `space-list` / `space-archive` — Spaces as nodes. These are
-  all human-only.
+- `space-create` / `space-list` / `space-rename` / `space-archive` — Spaces as
+  nodes: a space is a node of builtin type `space` living in the meta space, so
+  creating one is a node create, renaming one is a title update, and archiving
+  one is a state transition — each event-logged, versioned, and undoable like
+  any other write. `space-rename` and `space-archive` take a space id **or**
+  name and refuse anything that is not a space. `space-list` reports each
+  space's **live node count** (`active` + `proposed`; archived rows are retired,
+  not territory) and the **agents granted on it**. These are all human-only.
+
+  A space is used in two independent ways, and they are two controls rather
+  than one mode: `--space` on a *read* (`node list`, `search`) narrows the view
+  and defaults to every space in scope, while `--space` on a *write*
+  (`node create`, `ingest`) targets where the node lands and defaults to `main`
+  — reading one space while filing into another is the ordinary case. The read
+  filter is a convenience, not a boundary: an agent stays confined to its
+  grants underneath it, and a space it holds no grant on does not resolve at
+  all, answering exactly as a nonexistent one does.
 
 ### Derived indexes
 
@@ -218,6 +239,11 @@ Account and grant administration is on the API as well: `GET /api/me` returns
 the session's human, and `/api/humans`, `/api/agents` and `/api/grants`
 mirror the CLI's `human`/`agent`/`grant`/`revoke`/`grants` commands — the
 show-once agent token comes back in the create/token-rotate response body.
+Spaces mirror their commands the same way: `GET /api/nodes` and
+`GET /api/search` take `?space=` and `?include_meta=`, `POST /api/nodes` takes
+`space` in the body, and the lifecycle is `POST /api/spaces`,
+`POST /api/spaces/{id}/rename` and `POST /api/spaces/{id}/archive`, with
+`GET /api/spaces` returning exactly what `nodum space-list` prints.
 `POST /api/ingest` mirrors `nodum ingest`, taking exactly one of `path` and
 `url`. The two capability-URL redemption routes — `GET /api/download/{token}`
 and `PUT /api/uploads/{token}` — are the only `/api` routes outside the session
