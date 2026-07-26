@@ -3,14 +3,22 @@
 from __future__ import annotations
 
 import json
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 
-from helpers import agent
+import pytest
+from helpers import agent, seed_space
 from typer.testing import CliRunner
 
-from nodum import db, service
+from nodum import db, extract, service
 from nodum.cli import app
 
 runner = CliRunner()
+
+#: The committed two-page PDF `tests/test_ingest.py` ingests end to end; here it
+#: is the only asset a `page:<n>` rendition can be asked of.
+FIXTURE_PDF = Path(__file__).parent / "fixtures" / "sample.pdf"
 
 
 #: Commands that never touch a principal: init, schema-dump, --version,
@@ -20,7 +28,11 @@ NO_AS_GROUPS = {"init", "schema-dump", "projector", "asset", "mcp", "serve"}
 
 #: The asset commands that read through the graph — they carry ``--as`` like
 #: every other read. ``register``/``purge`` touch the blob store alone.
-AS_ASSET_COMMANDS = {"get", "list", "rendition"}
+AS_ASSET_COMMANDS = {"get", "list", "rendition", "download-url", "upload-url"}
+
+#: `ingest handlers` reports what this *install* can extract, not what the graph
+#: holds, so it is the one ingest command with no principal.
+NO_AS_INGEST_COMMANDS = {"handlers"}
 
 
 def _needs_as(args) -> bool:
@@ -28,6 +40,8 @@ def _needs_as(args) -> bool:
         return False
     if args[0] == "asset":
         return len(args) > 1 and args[1] in AS_ASSET_COMMANDS
+    if args[0] == "ingest":
+        return len(args) > 1 and args[1] not in NO_AS_INGEST_COMMANDS
     return args[0] not in NO_AS_GROUPS
 
 
@@ -141,6 +155,7 @@ def test_every_list_command_reports_a_count(fresh_db):
         (("events",), "events"),
         (("review", "queue"), "proposals"),
         (("asset", "list"), "assets"),
+        (("ingest", "handlers"), "handlers"),
         (("projector", "run"), "projectors"),
         (("projector", "status"), "projectors"),
     ):
@@ -550,6 +565,317 @@ def test_asset_rendition_rejects_non_images(fresh_db, tmp_path):
     result = runner.invoke(app, ["asset", "rendition", asset["hash"], "--as", "owner"])
     assert result.exit_code == 1
     assert "only supported for image assets" in result.stderr
+
+
+@pytest.mark.skipif(
+    not extract.PdfHandler().availability()[0], reason="the pdf extra is not installed"
+)
+def test_asset_rendition_rasterises_a_pdf_page(fresh_db, tmp_path):
+    """`page:<n>` is an ordinary rendition: lazily generated, then cached."""
+    asset = _run_json("asset", "register", str(FIXTURE_PDF))
+    out_file = tmp_path / "page1.webp"
+
+    rendition = _run_json(
+        "asset", "rendition", asset["hash"], "--profile", "page:1", "--out", str(out_file)
+    )
+    assert rendition["profile"] == "page:1"
+    assert rendition["mime"] == "image/webp"
+    assert rendition["cached"] is False
+    assert rendition["data_base64"] is None
+    assert out_file.read_bytes()[:4] == b"RIFF"
+
+    cached = _run_json("asset", "rendition", asset["hash"], "--profile", "page:1")
+    assert cached["cached"] is True
+    assert cached["id"] == rendition["id"]
+
+
+def test_asset_rendition_rejects_a_malformed_page_profile(fresh_db, tmp_path):
+    """Profile validation lives in `assets.resolve_profile`; the CLI just reports it."""
+    asset = _register_png(tmp_path)
+
+    result = runner.invoke(
+        app, ["asset", "rendition", asset["hash"], "--profile", "page:0", "--as", "owner"]
+    )
+    assert result.exit_code == 1
+    assert "unknown rendition profile" in result.stderr
+    assert "Traceback" not in result.stderr
+
+
+# ── Capability URLs ──────────────────────────────────────────────────────────
+
+
+def test_asset_download_url_prints_a_url_and_an_expiry(fresh_db, tmp_path):
+    asset = _register_png(tmp_path)
+
+    grant = _run_json("asset", "download-url", asset["hash"])
+
+    assert grant["kind"] == "download"
+    assert grant["asset_hash"] == asset["hash"]
+    assert grant["url"].endswith(f"/api/download/{grant['token']}")
+    assert grant["expires_at"]
+
+
+def test_asset_download_url_honours_the_ttl_ceiling(fresh_db, tmp_path):
+    """`--ttl` reaches `urls.mint_download`, bounds included."""
+    asset = _register_png(tmp_path)
+    assert _run_json("asset", "download-url", asset["hash"], "--ttl", "60")["token"]
+
+    result = runner.invoke(
+        app, ["asset", "download-url", asset["hash"], "--ttl", "999999", "--as", "owner"]
+    )
+    assert result.exit_code == 1
+    assert "ttl_seconds must be between" in result.stderr
+
+
+def test_asset_download_url_for_an_unknown_asset_exits_1(fresh_db):
+    result = runner.invoke(app, ["asset", "download-url", "nope", "--as", "owner"])
+    assert result.exit_code == 1
+    assert "asset not found" in result.stderr
+    assert "Traceback" not in result.stderr
+
+
+def test_asset_upload_url_dedups_a_hash_already_stored(fresh_db, tmp_path):
+    """Design §5.7 rule 4: a known sha256 answers with the asset and no grant."""
+    asset = _register_png(tmp_path)
+
+    deduped = _run_json(
+        "asset",
+        "upload-url",
+        "--name",
+        "cli.png",
+        "--mime",
+        "image/png",
+        "--size",
+        str(asset["size_bytes"]),
+        "--sha256",
+        asset["hash"],
+    )
+
+    assert deduped["grant"] is None
+    assert deduped["asset"]["hash"] == asset["hash"]
+
+
+def test_asset_upload_url_without_a_known_hash_mints_a_grant(fresh_db):
+    granted = _run_json(
+        "asset", "upload-url", "--name", "new.png", "--mime", "image/png", "--size", "1024"
+    )
+
+    assert granted["asset"] is None
+    assert granted["grant"]["kind"] == "upload"
+    assert granted["grant"]["max_bytes"] == 1024
+    assert granted["grant"]["url"].endswith(f"/api/uploads/{granted['grant']['token']}")
+
+
+# ── Ingestion ────────────────────────────────────────────────────────────────
+
+
+def _drop_folder(tmp_path, names, body="body of {name}"):
+    """Build a folder of small text files, plus a dotfile that must be skipped."""
+    folder = tmp_path / "drop"
+    folder.mkdir()
+    for name in names:
+        (folder / name).write_text(body.format(name=name), encoding="utf-8")
+    (folder / ".hidden.txt").write_text("never ingested", encoding="utf-8")
+    return folder
+
+
+def test_ingest_file_prints_one_object(fresh_db, tmp_path):
+    """One path naming a file: one JSON object, the whole subgraph in it."""
+    source = tmp_path / "note.txt"
+    source.write_text("xylem carries sap", encoding="utf-8")
+
+    result = _run_json("ingest", "file", str(source))
+
+    assert result["created"] is True
+    assert result["extraction"]["handler"] == "text"
+    assert result["asset"]["original_name"] == "note.txt"
+    assert result["asset_ref"]["type"] == "asset_ref"
+    assert result["source"]["content"] == "xylem carries sap"
+    assert result["edges"][0]["type"] == "derived_from"
+    assert result["event_seq"] > 0
+
+
+def test_ingest_file_takes_name_title_and_space(fresh_db, tmp_path):
+    seed_space("research")
+    source = tmp_path / "note.txt"
+    source.write_text("scoped body", encoding="utf-8")
+
+    result = _run_json(
+        "ingest",
+        "file",
+        str(source),
+        "--name",
+        "renamed.txt",
+        "--title",
+        "A Better Title",
+        "--space",
+        "research",
+    )
+
+    assert result["asset"]["original_name"] == "renamed.txt"
+    assert result["source"]["title"] == "A Better Title"
+    assert result["source"]["space_id"] == "research"
+
+
+def test_ingest_file_on_a_directory_ingests_every_file(fresh_db, tmp_path):
+    """The phase's exit criterion in miniature: drop a folder, get subgraphs."""
+    folder = _drop_folder(tmp_path, ["a.txt", "b.txt", "c.txt"])
+
+    payload = _run_json("ingest", "file", str(folder))
+
+    assert payload["count"] == 3
+    assert [item["asset"]["original_name"] for item in payload["ingestions"]] == [
+        "a.txt",
+        "b.txt",
+        "c.txt",
+    ]
+    assert all(item["created"] for item in payload["ingestions"])
+    # Every file became its own subgraph, dotfile excluded.
+    assert _run_json("node", "list", "--type", "asset_ref")["count"] == 3
+    assert _run_json("node", "list", "--type", "source")["count"] == 3
+    assert _run_json("edge", "list", "--type", "derived_from")["count"] == 3
+
+
+def test_recursive_reaches_a_nested_file_and_the_default_does_not(fresh_db, tmp_path):
+    folder = _drop_folder(tmp_path, ["top.txt"])
+    (folder / "deep").mkdir()
+    (folder / "deep" / "nested.txt").write_text("nested body", encoding="utf-8")
+
+    shallow = _run_json("ingest", "file", str(folder))
+    assert [item["asset"]["original_name"] for item in shallow["ingestions"]] == ["top.txt"]
+
+    deep = _run_json("ingest", "file", str(folder), "--recursive")
+    assert [item["asset"]["original_name"] for item in deep["ingestions"]] == [
+        "nested.txt",
+        "top.txt",
+    ]
+    # The re-run of top.txt converges instead of duplicating: ingestion is idempotent.
+    assert [item["created"] for item in deep["ingestions"]] == [True, False]
+
+
+def test_a_failing_path_does_not_lose_the_batch_successes(fresh_db, tmp_path):
+    """A batch reports the failure, keeps the successes on stdout, and exits 1."""
+    good = tmp_path / "good.txt"
+    good.write_text("kept", encoding="utf-8")
+    missing = tmp_path / "missing.txt"
+
+    result = runner.invoke(app, ["ingest", "file", str(good), str(missing), "--as", "owner"])
+
+    assert result.exit_code == 1
+    payload = json.loads(result.stdout)
+    assert payload["count"] == 1
+    assert payload["ingestions"][0]["asset"]["original_name"] == "good.txt"
+    assert "missing.txt" in result.stderr
+    assert "not a file" in result.stderr
+    assert "Traceback" not in result.stderr
+    # The success is really in the graph, not just in the envelope.
+    assert _run_json("node", "list", "--type", "source")["count"] == 1
+
+
+def test_name_and_title_are_refused_for_a_multi_file_run(fresh_db, tmp_path):
+    """They describe one document; silently stamping twenty files with one title
+    is the footgun this refusal exists for."""
+    folder = _drop_folder(tmp_path, ["a.txt", "b.txt"])
+
+    result = runner.invoke(app, ["ingest", "file", str(folder), "--title", "One", "--as", "owner"])
+
+    assert result.exit_code == 1
+    assert "--name and --title describe one document" in result.stderr
+    assert _run_json("node", "list", "--type", "source")["count"] == 0
+
+
+def test_an_empty_directory_is_reported_rather_than_silently_ingesting_nothing(fresh_db, tmp_path):
+    empty = tmp_path / "empty"
+    empty.mkdir()
+
+    result = runner.invoke(app, ["ingest", "file", str(empty), "--as", "owner"])
+
+    assert result.exit_code == 1
+    assert "no files to ingest" in result.stderr
+
+
+def test_ingest_file_missing_path_exits_1(fresh_db, tmp_path):
+    result = runner.invoke(app, ["ingest", "file", str(tmp_path / "missing.txt"), "--as", "owner"])
+    assert result.exit_code == 1
+    assert "not a file" in result.stderr
+    assert "Traceback" not in result.stderr
+
+
+class _CannedHandler(BaseHTTPRequestHandler):
+    """Serves one canned response; nothing here reaches the network."""
+
+    def do_GET(self):  # noqa: N802 - BaseHTTPRequestHandler's own naming
+        body, content_type = self.server.canned
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        return
+
+
+@pytest.fixture()
+def fixture_server():
+    """A loopback HTTP server serving one canned body — the suite never leaves the machine."""
+    server = HTTPServer(("127.0.0.1", 0), _CannedHandler)
+    server.canned = (b"", "text/plain")
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield server
+    server.shutdown()
+    server.server_close()
+
+
+def test_ingest_url_over_the_cli(fresh_db, fixture_server):
+    fixture_server.canned = (
+        b"<html><body><p>Basin hydrology</p></body></html>",
+        "text/html; charset=utf-8",
+    )
+    url = f"http://127.0.0.1:{fixture_server.server_address[1]}/article"
+
+    result = _run_json("ingest", "url", url)
+
+    assert result["created"] is True
+    assert result["extraction"]["handler"] == "html"
+    assert result["source"]["content"] == "Basin hydrology"
+    assert result["source"]["props"]["url"] == url
+    assert result["asset_ref"]["props"]["url"] == url
+
+
+def test_ingest_url_bad_scheme_exits_1(fresh_db):
+    result = runner.invoke(app, ["ingest", "url", "file:///etc/passwd", "--as", "owner"])
+    assert result.exit_code == 1
+    assert "ingest_url takes" in result.stderr
+    assert "Traceback" not in result.stderr
+
+
+def test_ingest_handlers_lists_every_handler_with_its_availability(fresh_db):
+    """How a user finds out why their PDF produced no text."""
+    payload = _run_json("ingest", "handlers")
+
+    assert [handler["name"] for handler in payload["handlers"]] == [
+        handler.name for handler in extract.REGISTRY
+    ]
+    assert all(handler["mimes"] for handler in payload["handlers"])
+    by_name = {handler["name"]: handler for handler in payload["handlers"]}
+    # text and html are stdlib-only, so they can never be unavailable.
+    assert by_name["text"]["available"] is True
+    assert by_name["html"]["available"] is True
+    # Whatever is unavailable here says why, and names the extra to install.
+    assert all(handler["detail"] for handler in payload["handlers"] if not handler["available"])
+
+
+def test_ingest_handlers_needs_no_principal_and_no_database(tmp_path, monkeypatch):
+    """Availability is a property of the install, so it answers on a bare one."""
+    monkeypatch.setenv("NODUM_DB", str(tmp_path / "never-created.db"))
+
+    result = runner.invoke(app, ["ingest", "handlers"])
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["count"] > 0
+    assert not (tmp_path / "never-created.db").exists()
 
 
 def test_version_flag_short_circuits():

@@ -279,8 +279,11 @@ export interface ProposeEdgesOut {
  * A registered content-addressed binary asset (design §5.2).
  *
  * Metadata only — the bytes live in the `asset_blobs` table of the same
- * database file, keyed by the same sha256. `extracted_text` is null until the
- * Phase-4 ingestion pipeline fills it.
+ * database file, keyed by the same sha256. `extracted_text` is what ingestion
+ * pulled out of those bytes, and stays null when no handler claimed the type
+ * or the handler produced nothing (a scanned PDF with no OCR installed, an
+ * image with no words in it) — an asset with no text is still registered and
+ * still described.
  */
 export interface AssetOut {
   hash: string;

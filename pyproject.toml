@@ -40,6 +40,21 @@ nodum = "nodum.cli:app"
 embeddings = [
     "fastembed>=0.8.0",
 ]
+# Extraction handlers (design §5.7, Phase 4). Each is optional on purpose: a
+# handler whose dependency is absent reports itself unavailable and is skipped,
+# exactly as the embedding provider does — `nodum ingest` on a bare install
+# still registers the asset and says plainly that no text came out. Keeping
+# them out of the base install is what keeps `pipx install nodum` light.
+pdf = [
+    "pypdf>=5",          # text extraction
+    "pypdfium2>=4",      # page rasters (page:<n> renditions)
+]
+ocr = [
+    "pytesseract>=0.3",  # also needs the tesseract binary on PATH
+]
+audio = [
+    "faster-whisper>=1",
+]
 
 [build-system]
 requires = ["hatchling", "hatch-vcs"]

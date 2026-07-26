@@ -3,7 +3,9 @@
 Originals and renditions both live in the one database file. Renditions are
 derived WebP images keyed by ``sha256(asset_hash + ':' + profile)``: lazily
 generated, stored, evictable, and never upscaled. Tests generate their images
-with Pillow — no network, no fixtures on disk.
+with Pillow and their PDFs byte by byte (:func:`_make_pdf`) — no network, no
+fixtures on disk, and the PDF path is exercised against a file this suite
+wrote rather than one PDFium wrote for itself.
 """
 
 from __future__ import annotations
@@ -12,14 +14,15 @@ import hashlib
 import io
 import random
 import sqlite3
+import sys
+from pathlib import Path
 
 import pytest
 from helpers import agent, owner, seed_space
 from PIL import Image
 
 from nodum import assets, db, service
-from nodum.assets import AssetNotFound, UnsupportedRendition
-from nodum.store import GrantNotPermitted
+from nodum.assets import AssetNotFound, ImageTooLarge, UnsupportedRendition
 
 
 def _decode(rendition, path=None):
@@ -45,6 +48,64 @@ def _register_image(fresh_db, tmp_path, name="photo.png", **kwargs):
     """Register a generated image and return its AssetOut."""
     source = _make_image(tmp_path / name, **kwargs)
     return assets.register_asset(source)
+
+
+def _make_pdf(path, *, pages=("alpha", "beta"), width=612, height=792):
+    """Write a minimal, valid multi-page PDF with one word drawn on each page.
+
+    Hand-assembled rather than produced by pypdfium2: the renderer under test
+    should be pointed at a file it did not write, and building the xref table
+    here keeps the fixture free of the very dependency whose absence one of
+    these tests simulates. Defaults are US Letter in PDF canvas units (1/72
+    inch), so a page renders 1224×1584 at `assets.PAGE_DPI`.
+    """
+    objects: list[bytes] = []
+
+    def add(body: bytes) -> int:
+        objects.append(body)
+        return len(objects)
+
+    catalog = add(b"")  # patched once the page tree's object number is known
+    page_tree = add(b"")
+    font = add(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+    kids = []
+    for text in pages:
+        drawing = f"BT /F1 36 Tf 72 {height - 100} Td ({text}) Tj ET".encode()
+        content = add(b"<< /Length %d >>\nstream\n%s\nendstream" % (len(drawing), drawing))
+        kids.append(
+            add(
+                b"<< /Type /Page /Parent %d 0 R /MediaBox [0 0 %d %d]"
+                b" /Resources << /Font << /F1 %d 0 R >> >> /Contents %d 0 R >>"
+                % (page_tree, width, height, font, content)
+            )
+        )
+    objects[catalog - 1] = b"<< /Type /Catalog /Pages %d 0 R >>" % page_tree
+    objects[page_tree - 1] = b"<< /Type /Pages /Kids [%s] /Count %d >>" % (
+        b" ".join(b"%d 0 R" % kid for kid in kids),
+        len(kids),
+    )
+
+    out = bytearray(b"%PDF-1.4\n")
+    offsets = []
+    for number, body in enumerate(objects, start=1):
+        offsets.append(len(out))
+        out += b"%d 0 obj\n" % number + body + b"\nendobj\n"
+    xref_at = len(out)
+    out += b"xref\n0 %d\n0000000000 65535 f \n" % (len(objects) + 1)
+    for offset in offsets:
+        out += b"%010d 00000 n \n" % offset
+    out += b"trailer\n<< /Size %d /Root %d 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (
+        len(objects) + 1,
+        catalog,
+        xref_at,
+    )
+    Path(path).write_bytes(bytes(out))
+    return Path(path)
+
+
+def _register_pdf(tmp_path, name="paper.pdf", **kwargs):
+    """Register a generated PDF and return its AssetOut."""
+    return assets.register_asset(_make_pdf(tmp_path / name, **kwargs))
 
 
 def _webp_at(image, quality):
@@ -345,26 +406,97 @@ def test_options_including_the_db_path_are_keyword_only(fresh_db, tmp_path):
 # ── Access (interim, until Phase 4 gives assets a space) ──────────────────────
 
 
-def test_a_zero_grant_agent_cannot_touch_the_asset_store(fresh_db, tmp_path):
-    """S2: the asset path took no principal, so every agent read every asset."""
+def _describe(asset, space=None, principal=None):
+    """Create the `asset_ref` node that makes an asset reachable in a space."""
+    return service.create_node(
+        type="asset_ref",
+        title=asset.original_name or asset.hash[:8],
+        space=space,
+        props={"asset_hash": asset.hash},
+        principal=principal or owner(),
+    )
+
+
+def test_an_asset_nobody_describes_is_invisible_to_every_agent(fresh_db, tmp_path):
+    """Bytes with no describing node are a human's business until ingestion runs."""
     asset = _register_image(fresh_db, tmp_path)
-    blind = agent("blind", grants={})
+    reader = agent("reader", grants={"main": "read"})
 
-    for call in (
-        lambda: assets.list_assets(principal=blind),
-        lambda: assets.get_asset(asset.hash, principal=blind),
-        lambda: assets.get_rendition(asset.hash, profile="thumb", principal=blind),
-    ):
-        with pytest.raises(GrantNotPermitted):
-            call()
+    assert assets.list_assets(principal=reader) == []
+    with pytest.raises(AssetNotFound):
+        assets.get_asset(asset.hash, principal=reader)
+    with pytest.raises(AssetNotFound):
+        assets.get_rendition(asset.hash, profile="thumb", principal=reader)
+    # The human still sees it — the bytes are registered, just undescribed.
+    assert assets.get_asset(asset.hash, principal=owner()).hash == asset.hash
 
 
-def test_an_agent_holding_any_grant_may_read_assets(fresh_db, tmp_path):
+def test_a_described_asset_is_readable_in_that_nodes_space(fresh_db, tmp_path):
     asset = _register_image(fresh_db, tmp_path)
+    _describe(asset)
     reader = agent("reader", grants={"main": "read"})
 
     assert assets.get_asset(asset.hash, principal=reader).hash == asset.hash
     assert [row.hash for row in assets.list_assets(principal=reader)] == [asset.hash]
+    assert assets.get_rendition(asset.hash, profile="thumb", principal=reader).asset_hash == (
+        asset.hash
+    )
+
+
+def test_a_description_in_another_space_does_not_reach(fresh_db, tmp_path):
+    """The describing node carries the space, so it carries the isolation too."""
+    asset = _register_image(fresh_db, tmp_path)
+    seed_space("b")
+    _describe(asset, space="b")
+    outsider = agent("outsider", grants={"main": "read"})
+    insider = agent("insider", grants={"b": "read"})
+
+    assert assets.list_assets(principal=outsider) == []
+    with pytest.raises(AssetNotFound):
+        assets.get_asset(asset.hash, principal=outsider)
+    assert assets.get_asset(asset.hash, principal=insider).hash == asset.hash
+
+
+def test_archiving_the_last_description_takes_the_asset_out_of_reach(fresh_db, tmp_path):
+    asset = _register_image(fresh_db, tmp_path)
+    node = _describe(asset)
+    reader = agent("reader", grants={"main": "read"})
+    assert assets.get_asset(asset.hash, principal=reader).hash == asset.hash
+
+    service.transition(node.id, "archive", principal=owner())
+
+    with pytest.raises(AssetNotFound):
+        assets.get_asset(asset.hash, principal=reader)
+
+
+def test_a_proposed_description_grants_reach_like_any_other_readable_node(fresh_db, tmp_path):
+    """A proposed node is readable everywhere else in this system — search
+    filters it out at query time, reads do not hide it — so an asset must not
+    be the one thing with a stricter rule than the node describing it. It is
+    also what lets a `suggest` agent re-read the bytes it just ingested."""
+    asset = _register_image(fresh_db, tmp_path)
+    proposer = agent("proposer", grants={"meta": "read", "main": "suggest"})
+    node = _describe(asset, principal=proposer)
+    assert node.state == "proposed"
+
+    assert [row.hash for row in assets.list_assets(principal=proposer)] == [asset.hash]
+    assert assets.get_asset(asset.hash, principal=proposer).hash == asset.hash
+
+    # Accepting changes nothing about reach — it was already reachable.
+    service.transition(node.id, "accept", principal=owner())
+    assert [row.hash for row in assets.list_assets(principal=proposer)] == [asset.hash]
+
+
+def test_an_archived_description_stops_granting_reach(fresh_db, tmp_path):
+    """Archived is the state that revokes reach, and the only one."""
+    asset = _register_image(fresh_db, tmp_path)
+    reader = agent("archiver", grants={"meta": "read", "main": "edit"})
+    node = _describe(asset, principal=reader)
+    assert [row.hash for row in assets.list_assets(principal=reader)] == [asset.hash]
+
+    service.transition(node.id, "archive", principal=owner())
+
+    assert assets.list_assets(principal=reader) == []
 
 
 def test_an_asset_ref_node_in_an_unreadable_space_does_not_resolve(fresh_db, tmp_path):
@@ -406,15 +538,194 @@ def test_unreadable_image_bytes_are_rejected(fresh_db, tmp_path):
         assets.get_rendition(asset.hash, principal=owner())
 
 
-def test_unknown_profile_is_rejected(fresh_db, tmp_path):
+@pytest.mark.parametrize("profile", ["banner", "page", "page:0", "page:01", "page:-1", "PAGE:1"])
+def test_unknown_profile_is_rejected(fresh_db, tmp_path, profile):
+    """Anything that is not a static profile or a well-formed `page:<n>`.
+
+    `page:0` and `page:01` are the interesting ones: page numbers are 1-based,
+    and one spelling per page keeps two names from keying two rendition rows
+    onto the same bitmap.
+    """
     asset = _register_image(fresh_db, tmp_path)
     with pytest.raises(UnsupportedRendition, match="unknown rendition profile"):
-        assets.get_rendition(asset.hash, profile="page:1", principal=owner())
+        assets.get_rendition(asset.hash, profile=profile, principal=owner())
 
 
 def test_rendition_of_missing_asset_raises(fresh_db):
     with pytest.raises(AssetNotFound):
         assets.get_rendition("missing", principal=owner())
+
+
+# ── `page:<n>` PDF rasters (design §5.7) ──────────────────────────────────────
+
+
+def test_resolve_profile_separates_static_profiles_from_pages():
+    """Pure name resolution — no database, so no fixture."""
+    assert assets.resolve_profile("thumb") == (assets.PROFILES["thumb"], None)
+    assert assets.resolve_profile("preview") == (assets.PROFILES["preview"], None)
+    assert assets.resolve_profile("page:1") == (assets.PAGE_PROFILE, 1)
+    assert assets.resolve_profile("page:42") == (assets.PAGE_PROFILE, 42)
+    with pytest.raises(UnsupportedRendition, match=r"have: preview, thumb, page:<n>"):
+        assets.resolve_profile("page:0")
+
+
+def test_page_raster_renders_a_letter_page_at_144_dpi(fresh_db, tmp_path):
+    """612×792 canvas units × (144/72) = 1224×1584, inside the 1568 cap on the
+    long edge only — so the page comes back scaled to exactly that cap."""
+    asset = _register_pdf(tmp_path)
+    rendition = assets.get_rendition(asset.hash, profile="page:1", principal=owner())
+
+    assert rendition.profile == "page:1"
+    assert rendition.height == assets.PAGE_PROFILE.max_edge == 1568
+    assert rendition.width == round(1224 * 1568 / 1584)
+    assert rendition.size_bytes <= assets.PAGE_PROFILE.target_bytes
+    with _decode(rendition) as decoded:
+        assert decoded.format == "WEBP"
+        assert decoded.size == (rendition.width, rendition.height)
+
+
+def test_each_page_renders_its_own_bitmap(fresh_db, tmp_path):
+    """Different pages must not collapse onto one another's rendition row."""
+    asset = _register_pdf(tmp_path, pages=("alpha", "beta", "gamma"))
+    stored = {}
+    for page in (1, 2, 3):
+        rendition = assets.get_rendition(asset.hash, profile=f"page:{page}", principal=owner())
+        stored[page] = assets.read_rendition_bytes(rendition)
+    assert len({value for value in stored.values()}) == 3
+
+
+def test_page_raster_is_addressed_cached_and_purged_like_any_rendition(fresh_db, tmp_path):
+    asset = _register_pdf(tmp_path)
+    generated = assets.get_rendition(asset.hash, profile="page:2", principal=owner())
+    assert generated.cached is False
+    assert generated.id == hashlib.sha256(f"{asset.hash}:page:2".encode()).hexdigest()
+    assert generated.mime == "image/webp"
+
+    hit = assets.get_rendition(asset.hash, profile="page:2", principal=owner())
+    assert hit.cached is True
+    assert hit.id == generated.id
+
+    conn = db.connect(fresh_db)
+    try:
+        row = conn.execute(
+            "SELECT profile, asset_hash, size_bytes FROM renditions WHERE id = ?",
+            (generated.id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert (row["profile"], row["asset_hash"]) == ("page:2", asset.hash)
+    assert row["size_bytes"] == generated.size_bytes
+
+    result = assets.purge_renditions(asset_hash=asset.hash)
+    assert result.purged == 1
+    assert assets.get_rendition(asset.hash, profile="page:2", principal=owner()).cached is False
+
+
+def test_page_raster_of_a_non_pdf_is_refused(fresh_db, tmp_path):
+    asset = _register_image(fresh_db, tmp_path)
+    with pytest.raises(UnsupportedRendition, match="only supported for PDF assets"):
+        assets.get_rendition(asset.hash, profile="page:1", principal=owner())
+
+
+def test_static_profile_of_a_pdf_is_refused(fresh_db, tmp_path):
+    """The inverse refusal, and it names the profile that would have worked."""
+    asset = _register_pdf(tmp_path)
+    for profile in ("thumb", "preview"):
+        with pytest.raises(UnsupportedRendition, match="page:<n>") as raised:
+            assets.get_rendition(asset.hash, profile=profile, principal=owner())
+        assert "application/pdf" in str(raised.value)
+
+
+def test_page_past_the_end_names_the_page_count(fresh_db, tmp_path):
+    asset = _register_pdf(tmp_path, pages=("alpha", "beta"))
+    with pytest.raises(UnsupportedRendition, match="it has 2 page"):
+        assets.get_rendition(asset.hash, profile="page:3", principal=owner())
+
+
+def test_a_page_that_would_blow_the_pixel_budget_is_refused_before_rendering(fresh_db, tmp_path):
+    """PDF allows a 200×200 inch page; at 144 DPI that is 829 megapixels.
+
+    The refusal is arithmetic — page geometry × the DPI scale — because PDFium
+    allocates the whole bitmap before it draws anything, so there is no header
+    to read and no partial decode to abandon.
+    """
+    asset = _register_pdf(tmp_path, name="poster.pdf", width=14400, height=14400)
+    with pytest.raises(ImageTooLarge, match="28800×28800"):
+        assets.get_rendition(asset.hash, profile="page:1", principal=owner())
+
+
+def test_unreadable_pdf_bytes_are_refused_cleanly(fresh_db, tmp_path):
+    fake = tmp_path / "broken.pdf"
+    fake.write_bytes(b"%PDF-1.4 and then nothing that parses")
+    asset = assets.register_asset(fake)
+    with pytest.raises(UnsupportedRendition, match="cannot render this PDF"):
+        assets.get_rendition(asset.hash, profile="page:1", principal=owner())
+
+
+def test_without_pypdfium2_a_page_request_names_the_extra(fresh_db, tmp_path):
+    """The branch most installs take: the `pdf` extra is optional.
+
+    `None` in `sys.modules` is what an absent module looks like to an `import`
+    statement, so this exercises the real lazy import rather than a seam
+    invented for the test. Its own MonkeyPatch context, because undoing the
+    shared one would also undo `fresh_db`'s NODUM_DB.
+    """
+    asset = _register_pdf(tmp_path)
+    with pytest.MonkeyPatch.context() as absent:
+        absent.setitem(sys.modules, "pypdfium2", None)
+        with pytest.raises(UnsupportedRendition, match="install the 'pdf' extra"):
+            assets.get_rendition(asset.hash, profile="page:1", principal=owner())
+
+    # Nothing was cached on the way out, so the extra arriving later just works.
+    assert assets.get_rendition(asset.hash, profile="page:1", principal=owner()).cached is False
+
+
+def test_a_pdf_is_as_reachable_as_its_describing_node(fresh_db, tmp_path):
+    """Page rasters obey the module's access rule like every other rendition."""
+    asset = _register_pdf(tmp_path)
+    reader = agent("pdf-reader", grants={"main": "read"})
+    with pytest.raises(AssetNotFound):
+        assets.get_rendition(asset.hash, profile="page:1", principal=reader)
+
+    _describe(asset)
+    assert (
+        assets.get_rendition(asset.hash, profile="page:1", principal=reader).asset_hash
+        == asset.hash
+    )
+
+
+def test_page_rasters_leave_image_profiles_alone(fresh_db, tmp_path):
+    """`thumb`/`preview` on an image are untouched by the new resolution path."""
+    asset = _register_image(fresh_db, tmp_path, size=(2000, 1000))
+    thumb = assets.get_rendition(asset.hash, profile="thumb", principal=owner())
+    preview = assets.get_rendition(asset.hash, profile="preview", principal=owner())
+    assert (thumb.width, thumb.height) == (256, 128)
+    assert (preview.width, preview.height) == (1024, 512)
+    assert thumb.id == hashlib.sha256(f"{asset.hash}:thumb".encode()).hexdigest()
+
+
+# ── Extracted text (the ingestion pipeline's write) ───────────────────────────
+
+
+def test_set_extracted_text_round_trips(fresh_db, tmp_path):
+    asset = _register_pdf(tmp_path)
+    assert assets.get_asset(asset.hash, principal=owner()).extracted_text is None
+
+    assets.set_extracted_text(asset.hash, "the whole text of the paper")
+    assert (
+        assets.get_asset(asset.hash, principal=owner()).extracted_text
+        == "the whole text of the paper"
+    )
+
+    # Clearing is distinct from never having run an extraction only in intent;
+    # both read back as None, and neither is an error.
+    assets.set_extracted_text(asset.hash, None)
+    assert assets.get_asset(asset.hash, principal=owner()).extracted_text is None
+
+
+def test_set_extracted_text_on_an_unknown_hash_raises(fresh_db):
+    with pytest.raises(AssetNotFound, match="asset not found"):
+        assets.set_extracted_text("missing", "text")
 
 
 # ── Streaming and the single-file promise ─────────────────────────────────────
@@ -488,11 +799,14 @@ def test_register_refuses_a_source_that_shrank_between_passes(fresh_db, tmp_path
         path.write_bytes(b"truncated")  # the writer rotates the file underneath us
         return digest_and_size
 
-    monkeypatch.setattr(assets, "_hash_file", hash_then_truncate)
-    with pytest.raises(assets.AssetSourceChanged, match="changed while it was being registered"):
-        assets.register_asset(source)
+    # Scoped, so restoring `_hash_file` cannot also undo `fresh_db`'s NODUM_DB.
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(assets, "_hash_file", hash_then_truncate)
+        with pytest.raises(
+            assets.AssetSourceChanged, match="changed while it was being registered"
+        ):
+            assets.register_asset(source)
 
-    monkeypatch.undo()
     assert assets.list_assets(principal=owner()) == []
     conn = db.connect(fresh_db)
     try:
@@ -517,11 +831,13 @@ def test_register_refuses_a_source_that_grew_between_passes(fresh_db, tmp_path, 
         path.write_bytes(b"small plus a great deal of freshly appended data")  # writer keeps going
         return digest_and_size
 
-    monkeypatch.setattr(assets, "_hash_file", hash_then_grow)
-    with pytest.raises(assets.AssetSourceChanged, match="changed while it was being registered"):
-        assets.register_asset(source)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(assets, "_hash_file", hash_then_grow)
+        with pytest.raises(
+            assets.AssetSourceChanged, match="changed while it was being registered"
+        ):
+            assets.register_asset(source)
 
-    monkeypatch.undo()
     assert assets.list_assets(principal=owner()) == []
     conn = db.connect(fresh_db)
     try:
@@ -565,11 +881,11 @@ def test_registration_rolls_back_when_the_blob_write_fails(fresh_db, tmp_path, m
     def explode(*args, **kwargs):
         raise sqlite3.OperationalError("disk gone")
 
-    monkeypatch.setattr(assets, "open_original", explode)
-    with pytest.raises(sqlite3.OperationalError):
-        assets.register_asset(source)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(assets, "open_original", explode)
+        with pytest.raises(sqlite3.OperationalError):
+            assets.register_asset(source)
 
-    monkeypatch.undo()
     assert assets.list_assets(principal=owner()) == []
     conn = db.connect(fresh_db)
     try:

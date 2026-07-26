@@ -39,8 +39,15 @@ jobs:
         uses: astral-sh/setup-uv@v7
         with:
           python-version: ${{ matrix.python-version }}
+      # The `pdf` extra is installed because PDFs are the phase-4 exit
+      # criterion ("drop a folder of PDFs, get a reviewable subgraph"), so the
+      # real extraction and page-raster paths have to run here rather than
+      # only their degraded ones. `ocr` and `audio` are deliberately left out:
+      # they need a system binary and a large model respectively, and their
+      # dependency-absent branches — the ones most installs take — are what
+      # the suite asserts.
       - name: Run test suite
-        run: uv run --locked pytest -q
+        run: uv run --locked --extra pdf pytest -q
 
   web:
     name: Frontend build

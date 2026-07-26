@@ -1,6 +1,6 @@
 ---
 title: Install · nodum
-description: Install nodum from PyPI with pipx or uv, choose the embedding extra, and point it at a database.
+description: Install nodum from PyPI with pipx or uv, choose the embedding and extraction extras, and point it at a database.
 ---
 
 # Install
@@ -41,6 +41,29 @@ pipx install 'nodum[embeddings]'
 Without it nodum runs fine — hybrid search degrades to BM25 keyword ranking,
 and `nodum projector status` reports the vector index as unavailable rather
 than failing.
+
+## The extraction extras
+
+Ingestion reads plain text, Markdown, JSON, and HTML with the standard
+library, so a bare install already ingests. The heavier formats are optional:
+
+| Extra | Adds | Also needs |
+|---|---|---|
+| `pdf` | PDF text extraction and `page:<n>` page rasters | — |
+| `ocr` | text out of images | the `tesseract` binary on your PATH |
+| `audio` | speech-to-text for audio files | — |
+
+```sh
+pipx install 'nodum[pdf]'
+nodum ingest handlers      # what this install can actually read
+```
+
+A missing handler is never fatal: the asset is still registered and still
+described, and the result says plainly that no text came out. `ingest handlers`
+names the extra to install for anything reporting `available: false`.
+Transcription models are never downloaded implicitly — like the embedding
+model, they are confined to the local cache unless `NODUM_AUDIO_DOWNLOAD=1`
+says otherwise.
 
 ## Choosing the database
 

@@ -101,7 +101,10 @@ nodum projector rebuild vec     # e.g. after an embedding-model change
 
 Two ship today:
 
-- **`fts`** — a SQLite FTS5 full-text index, giving BM25 keyword ranking.
+- **`fts`** — a SQLite FTS5 full-text index, giving BM25 keyword ranking. An
+  ingested document's full extracted text is joined onto the `asset_ref` node
+  that stands for its bytes — and onto that node only, so a word on page 3 does
+  not match every other page of the document just as strongly.
 - **`vec`** — a sqlite-vec chunk-embedding index, using a local in-process
   model. No daemon, no API key. Optional: without the `embeddings` extra it
   reports unavailable rather than failing.
@@ -116,8 +119,66 @@ graph, so one file is still the whole knowledge base. Registering the same
 bytes twice is idempotent.
 
 Derived `thumb` and `preview` renditions are generated lazily and cached; they
-can be purged and will rebuild on next request. **Agents receive renditions,
-never originals.**
+can be purged and will rebuild on next request. `page:<n>` is the third
+rendition shape — a 1-based page of a PDF, rasterised on first request and
+cached like any other. **Agents receive renditions, never originals.**
+
+**An asset is as reachable as the nodes that describe it.** A principal may
+read an asset exactly when it can read an active `asset_ref` node carrying that
+hash — so asset access is an ordinary scoped graph read rather than a rule of
+its own. Bytes nobody has described yet are visible to humans only, which is
+the right default for a file whose ingestion has not run.
+
+The one documented exception to "agents never receive originals" is a
+**capability URL**: single-use, minutes-long, minted against a principal who
+could already read the asset, and event-logged at both the mint and the
+redemption. The token is a random secret stored only as its sha-256; the row is
+the whole authority, so expiry, single use, and revocation are one update.
+
+## Ingestion
+
+`nodum ingest` is how a document becomes knowledge. A file, a folder, or a URL
+turns into a small subgraph:
+
+```mermaid
+flowchart LR
+    bytes["file · folder · URL"] --> asset["asset (sha256, bytes in-database)"]
+    asset --> ref["asset_ref node (describes the bytes in one space)"]
+    asset --> src["source node (extracted text)"]
+    src -- derived_from --> ref
+    src --> pages["block per page"]
+    style bytes fill:#e6f0ff,color:#000
+    style asset fill:#d9f2d9,color:#000
+    style ref fill:#fff3cd,color:#000
+    style src fill:#fff3cd,color:#000
+    style pages fill:#fff3cd,color:#000
+```
+
+Every one of those writes goes through the ordinary service layer, so the
+subgraph lands in the state the writer's grant earns — an agent with `suggest`
+proposes the whole thing into the review queue. Ingestion is **idempotent per
+(hash, space)**: re-running the same folder finds what already landed instead
+of duplicating it, which is what makes an interrupted run safe to repeat.
+
+Ingestion proposes *sources and structure* and stops there. Turning prose into
+**claims** is a judgement call, and it belongs to the research agent — splitting
+sentences and calling each one a claim would fill the review queue with noise
+rather than knowledge.
+
+### Extraction handlers degrade, they do not fail
+
+Text, Markdown, JSON, and HTML are read by the standard library and always
+work. PDF text, image OCR, and audio transcription are optional extras, and an
+absent one is a **reported result, not an error**: the asset is still
+registered, the nodes are still written, and the answer says plainly that no
+text came out. A corrupt file is treated the same way.
+
+```sh
+nodum ingest handlers    # every handler, its MIME families, and what to install
+```
+
+Nothing is downloaded implicitly — as with the embedding model, a transcription
+model is confined to its local cache unless you say otherwise.
 
 ## Surfaces are adapters
 

@@ -309,6 +309,80 @@ def _create_op(state: str) -> str:
     return "create" if state == "active" else "propose"
 
 
+def resolve_space_id(
+    space: str | None, *, principal: Principal, path: str | Path | None = None
+) -> str:
+    """Resolve a space id or name to its id — the public form of the write path's rule.
+
+    ``None`` is the ``main`` space, exactly as every write defaults it. The
+    asset pipeline needs this *before* it writes anything, to ask whether a
+    space already describes some bytes; without it a caller would have to
+    reimplement the resolution and would drift off the rule that an ungranted
+    space and a nonexistent one answer identically (Q13 review S3).
+
+    Args:
+        space: Space id or name; ``None`` for the default space.
+        principal: Who is asking — a space they hold no grant on does not resolve.
+        path: Explicit database path.
+
+    Returns:
+        The space's node id.
+
+    Raises:
+        TypeNotFound: If the reference resolves to no space the principal can see.
+    """
+    if space is None:
+        return MAIN_SPACE_ID
+    conn = _connect(path)
+    try:
+        return _resolve_space(conn, space, principal)
+    finally:
+        conn.close()
+
+
+def find_by_asset_hash(
+    asset_hash: str,
+    *,
+    type: str,
+    space_id: str,
+    principal: Principal,
+    path: str | Path | None = None,
+) -> NodeOut | None:
+    """Find the live node of ``type`` in ``space_id`` carrying ``asset_hash`` in props.
+
+    The idempotency lookup the ingestion pipeline runs before it writes: it is
+    what makes re-ingesting the same file converge on the existing subgraph
+    instead of tripping 0009's one-``asset_ref``-per-``(hash, space)`` index.
+
+    Archived rows are skipped deliberately, and for the same reason that index
+    skips them — retiring a describing node frees its hash for a fresh
+    ingestion of the same bytes.
+
+    Args:
+        asset_hash: The sha256 carried in the node's ``asset_hash`` prop.
+        type: Node-type id or name (``asset_ref`` or ``source`` in practice).
+        space_id: The space to look in — already resolved.
+        principal: Who is asking; a node outside the read set is not found.
+        path: Explicit database path.
+
+    Returns:
+        The matching node, or ``None``.
+    """
+    conn = _connect(path)
+    try:
+        store = Store(conn, principal)
+        scope, params = store.node_scope()
+        row = conn.execute(
+            "SELECT * FROM nodes WHERE type_id = ? AND space_id = ?"
+            " AND json_extract(props, '$.asset_hash') = ?"
+            f" AND state != 'archived'{scope} ORDER BY created_at, rowid LIMIT 1",
+            (_resolve_node_type(conn, type, principal), space_id, asset_hash, *params),
+        ).fetchone()
+        return _node_out(row) if row is not None else None
+    finally:
+        conn.close()
+
+
 # ── Event log and versions ────────────────────────────────────────────────────
 
 
@@ -1964,6 +2038,99 @@ def list_events(
         ]
     finally:
         conn.close()
+
+
+# ── Asset-pipeline events (design §5.5–§5.7): one named door into the log ─────
+
+#: The only ops :func:`record_asset_event` will write — an **allowlist**, not a
+#: ``asset.*`` prefix test. Ingestion (:mod:`nodum.ingest`) and the capability
+#: URLs (:mod:`nodum.urls`) live outside this module and need to append to the
+#: append-only log; a helper that took any dotted string would hand them the
+#: ability to forge a ``node.create`` or an ``undo``, which is a far larger
+#: door than either of them asked for.
+ASSET_EVENT_OPS = (
+    "asset.ingest",
+    "asset.download_url",
+    "asset.upload_url",
+    "asset.upload",
+    "asset.download",
+)
+
+
+def record_asset_event(
+    op: str,
+    payload: dict[str, Any],
+    *,
+    principal: Principal | None = None,
+    actor: str | None = None,
+    conn: sqlite3.Connection | None = None,
+    path: str | Path | None = None,
+) -> int:
+    """Append one asset-pipeline event to the log.
+
+    ``op`` must be named in :data:`ASSET_EVENT_OPS`; anything else is refused.
+    That allowlist is the whole point of routing these writes through a
+    function instead of exporting :func:`_emit`: the ingestion pipeline and
+    the capability URLs need to record what they did, not the ability to write
+    any event they like.
+
+    These events are **audit-only by construction**, not by convention:
+    :func:`undo` reverses ``node.*`` / ``edge.*`` events only — it skips
+    everything else when picking the latest reversible event, and refuses a
+    non-graph op by name when one is asked for explicitly — so an ``asset.*``
+    entry can be read and listed forever and never replayed into state.
+
+    Payloads are metadata only: hashes, node ids, token ids, counts, reasons.
+    Never blob bytes (an original does not belong in a log every projector
+    rebuild reads end to end) and never a live credential.
+
+    **``actor`` is not a second identity channel.** Every caller that *has* a
+    principal must pass it; the string form exists for exactly one case, the
+    redemption of a capability URL, where there is no live principal **by
+    design** — a capability carries no ambient credential — and the only
+    truthful actor is the ``created_by`` already stored on the token row. It
+    is read from the database, never from a request, and no adapter may reach
+    this argument (the HTTP surface's ``_write`` refuses a caller-supplied
+    identity before anything gets here).
+
+    **``conn`` keeps a spend and its audit entry in one transaction.** A
+    single-use token whose redemption committed while its log entry did not
+    would be precisely the gap the design's "log both ends" rule exists to
+    close, and a second connection cannot share the first's atomicity. The
+    caller owns the commit when it passes one.
+
+    Args:
+        op: The event op; must be one of :data:`ASSET_EVENT_OPS`.
+        payload: JSON-serialisable metadata describing what happened.
+        principal: Who performed it. Required unless ``actor`` is given.
+        actor: Actor string read from stored state, for the credential-free
+            redemption path only. Mutually exclusive with ``principal``.
+        conn: An open connection to write within; the caller then commits.
+            Defaults to a short-lived connection this function commits itself.
+        path: Explicit database path; defaults to ``NODUM_DB`` resolution.
+            Ignored when ``conn`` is given.
+
+    Returns:
+        The new event's ``seq``.
+
+    Raises:
+        ValueError: If ``op`` is not allowlisted, or if the caller gave both
+            an identity and none.
+    """
+    if op not in ASSET_EVENT_OPS:
+        raise ValueError(f"op must be one of {ASSET_EVENT_OPS}, got {op!r}")
+    if (principal is None) == (actor is None):
+        raise ValueError("pass exactly one of principal= or actor=")
+    actor_string = actor if actor is not None else principal.actor_string
+    if conn is not None:
+        return _emit(conn, actor_string, op, payload)
+    own_conn = _connect(path)
+    try:
+        seq = _emit(own_conn, actor_string, op, payload)
+        own_conn.commit()
+        return seq
+    finally:
+        own_conn.close()
 
 
 def _type_out(row: sqlite3.Row) -> TypeOut | EdgeTypeOut:

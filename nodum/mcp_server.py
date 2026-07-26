@@ -3,13 +3,23 @@
 This surface is for **external agents**, and external agents may only *grow*
 the graph. It exposes the design §8.1 v1 tool contract's **read tier**
 (``get_node``, ``get_children``, ``search``, ``traverse``, ``list_types``,
-``get_schema``, ``find_path``, ``history``, ``diff``, ``get_asset``) and
-**additive tier** (``create_node``, ``update_node``, ``link``,
-``propose_edges``) — nothing else.
+``get_schema``, ``find_path``, ``history``, ``diff``, ``get_asset``,
+``get_download_url``) and **additive tier** (``create_node``, ``update_node``,
+``link``, ``propose_edges``, ``ingest_file``, ``ingest_url``,
+``request_upload_url``) — nothing else.
 
 ``get_asset`` enforces the §5.7 binary policy structurally: agents receive
-metadata plus a small derived rendition (``preview``/``thumb`` WebP image
-block); original binaries are never served over MCP.
+metadata, the text extraction, and a small derived rendition
+(``preview``/``thumb``, or ``page:<n>`` for one page of a PDF — always a WebP
+image block), never the stored original. ``get_download_url`` is the design's
+own documented exception (§5.7 rule 4): a short-lived, single-use URL to the
+original bytes, for a host that has to open the real file, with the mint and
+the redemption both in the event log.
+
+Ingestion is **by reference** (§5.7 rule 2) — the server reads the path or
+fetches the URL itself, and a host that shares no filesystem with the server
+asks ``request_upload_url`` for somewhere to PUT the bytes. No base64 ever
+crosses MCP in either direction.
 
 **Neither the review tier nor the curative tier is ever registered.** The
 review tools (``accept``, ``reject``) belong to the §8.1 "write
@@ -27,13 +37,15 @@ blocks — a command-line token would leak into ``ps``). Verification mints
 the agent's principal, and its grant set confines every tool call. Transport
 is stdio — what MCP clients actually launch.
 
-Every tool delegates to :mod:`nodum.service` / :mod:`nodum.search`; there is
-no logic here beyond argument mapping and JSON shaping.
+Every tool delegates to :mod:`nodum.service`, :mod:`nodum.search`,
+:mod:`nodum.assets`, :mod:`nodum.ingest` or :mod:`nodum.urls`; there is no
+logic here beyond argument mapping and JSON shaping.
 """
 
 from __future__ import annotations
 
 import os
+import urllib.parse
 from pathlib import Path
 from typing import Any
 
@@ -42,7 +54,7 @@ from mcp.server.fastmcp.utilities.types import Image
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel
 
-from nodum import assets, auth, service
+from nodum import assets, auth, ingest, service, urls
 from nodum import search as search_module
 
 #: Tool annotations per registered tier (design §8). Reads are read-only.
@@ -58,6 +70,20 @@ from nodum import search as search_module
 #: updates get a confirmation an additive tool's do not. Nothing here is
 #: annotated by what the *current* agent may do: annotations are static
 #: registry metadata, so each one states the worst case its grant allows.
+#:
+#: **The ingestion tools are additive**, and that is a claim about their
+#: *writes*, not about how much they write: every graph write ingestion makes
+#: is a :func:`nodum.service.create_node` or :func:`~nodum.service.create_edge`
+#: — it never calls the one service function that overwrites a live node — so
+#: an ``edit`` grant's worst case is a subgraph that lands ``active`` instead
+#: of ``proposed``. That is *more* state, never state replaced. Re-ingesting
+#: bytes a space already describes reuses the existing nodes rather than
+#: rewriting them (``created: false``), and the one row ingestion does
+#: overwrite is ``assets.extracted_text``, which is content-addressed base
+#: state and not the graph: the same bytes re-extract to the same text.
+#: ``request_upload_url`` writes a capability row and hands out somewhere to
+#: PUT bytes; what arrives there is registered and described the same additive
+#: way.
 _READ = ToolAnnotations(readOnlyHint=True, destructiveHint=False)
 _ADDITIVE = ToolAnnotations(readOnlyHint=False, destructiveHint=False)
 _OVERWRITING = ToolAnnotations(readOnlyHint=False, destructiveHint=True)
@@ -72,6 +98,13 @@ CURATIVE_TOOLS = ("merge_nodes", "retype", "supersede_edge", "bulk_relink", "con
 REVIEW_TOOLS = ("accept", "reject")
 
 #: The tools this server registers, by tier (documentation + test anchor).
+#:
+#: ``get_download_url`` sits in the read tier because the design's §8.1 table
+#: puts it there, and ``readOnlyHint`` is honest for it: it writes an expiring
+#: capability row and an audit entry, but it creates no node, edge, or version
+#: and changes nothing another reader can see. What it *does* for its caller is
+#: read — it is the §5.7 rule 4 escape hatch onto bytes the caller can already
+#: reach, not a way to reach more of them.
 READ_TOOLS = (
     "get_node",
     "get_children",
@@ -83,12 +116,31 @@ READ_TOOLS = (
     "history",
     "diff",
     "get_asset",
+    "get_download_url",
 )
-ADDITIVE_TOOLS = ("create_node", "update_node", "link", "propose_edges")
+ADDITIVE_TOOLS = (
+    "create_node",
+    "update_node",
+    "link",
+    "propose_edges",
+    "ingest_file",
+    "ingest_url",
+    "request_upload_url",
+)
 
 #: The write tools whose worst case (under an ``edit`` grant) overwrites live
 #: state rather than adding to it — annotated ``destructiveHint=True``.
 OVERWRITING_TOOLS = ("update_node",)
+
+#: Most extracted characters one :func:`get_asset` result carries.
+#:
+#: Deliberately the same cap the ``source`` node's own body takes
+#: (:data:`nodum.ingest.SOURCE_CONTENT_CHARS`), so the two ways an agent can
+#: read one document's text agree on how much of it there is rather than one
+#: quietly holding more. The full text is never lost — it stays on the asset,
+#: where BM25 reaches every word of it — and ``extracted_chars`` always reports
+#: its real length, so a truncation is visible rather than inferred.
+MAX_EXTRACTED_TEXT_CHARS = ingest.SOURCE_CONTENT_CHARS
 
 
 def _dump(result: BaseModel | list[BaseModel]) -> dict[str, Any] | list[dict[str, Any]]:
@@ -120,12 +172,15 @@ def create_server(*, token: str, db_path: str | Path | None = None) -> FastMCP:
         "nodum",
         instructions=(
             "nodum knowledge graph — read tier (get_node/get_children/search/traverse/"
-            "list_types/get_schema/find_path/history/diff/get_asset) and additive tier "
-            "(create_node/update_node/link/propose_edges). You can only grow this graph: "
-            "every write lands as a proposal for human review. Reviewing (accept/reject) "
+            "list_types/get_schema/find_path/history/diff/get_asset/get_download_url) and "
+            "additive tier (create_node/update_node/link/propose_edges/ingest_file/"
+            "ingest_url/request_upload_url). Writes land as proposals for human review "
+            "under a 'suggest' grant and live under 'edit'. Reviewing (accept/reject) "
             "and curative operations are not available over MCP — they belong to the "
-            "human. Assets are served as small derived renditions — never the original "
-            "binary (design §5.7)."
+            "human. Ingest by reference: give a path or a URL this server can reach, "
+            "never bytes. Assets come back as metadata, extracted text and small derived "
+            "renditions; the original binary crosses this surface only through "
+            "get_download_url, and that is logged (design §5.7)."
         ),
     )
 
@@ -228,22 +283,44 @@ def create_server(*, token: str, db_path: str | Path | None = None) -> FastMCP:
 
     @server.tool(annotations=_READ, structured_output=False)
     def get_asset(id_or_hash: str, rendition: str = "preview") -> list[Any]:
-        """Fetch asset metadata plus a small derived rendition — NEVER the original.
+        """Fetch an asset's metadata and extracted text, plus a small derived rendition.
 
-        Design §5.7 binary policy: LLMs receive derived representations only.
-        For images the result is a metadata text block followed by a WebP
-        image block of the requested rendition (`preview` ≤1024px, the MCP
-        default for vision models; `thumb` ≤256px). For non-image assets only
-        the metadata block is returned (extracted text lands with the Phase-4
-        ingestion pipeline). `full` originals are never served over MCP.
+        **Never the original bytes** — design §5.7 binary policy: LLMs receive
+        derived representations only. The first block is always metadata JSON,
+        carrying whatever text extraction pulled out of this asset:
+        `extracted_text` (capped), `extracted_chars` (its real length) and
+        `text_truncated`, so you can tell a short document from a clipped one.
+        `extracted_text` is null when no handler could read the bytes — an
+        asset with no text is still registered and described.
+
+        `rendition` chooses the image that comes back with it: `preview`
+        (≤1024px, the default and the size vision models want), `thumb`
+        (≤256px), or `page:<n>` — a 1-based page of a PDF rasterised as an
+        image, which is how you *look at* a document whose layout, tables or
+        figures carry the meaning. Ask for the pages you need one at a time.
+
+        An asset with no renderable form for the profile asked — a text file,
+        or a PDF under `preview` — comes back as the metadata block alone with
+        `rendition: null`. A page of something that is not a PDF, a page past
+        the end of one, and any unknown profile (`full`, `original`) are all
+        errors: originals never cross this surface. `get_download_url` is the
+        one exception, and it is logged.
         """
-        if rendition not in assets.PROFILES:
+        try:
+            _spec, page_number = assets.resolve_profile(rendition)
+        except assets.UnsupportedRendition as exc:
             raise ValueError(
                 f"unsupported rendition {rendition!r}: MCP serves "
-                f"{', '.join(sorted(assets.PROFILES))} only — originals never"
-            )
+                f"{', '.join(sorted(assets.PROFILES))} and page:<n> only — originals never"
+            ) from exc
         asset = assets.get_asset(id_or_hash, principal=principal, path=db_path)
-        metadata: dict[str, Any] = {"asset": asset.model_dump(mode="json")}
+        text = asset.extracted_text
+        metadata: dict[str, Any] = {
+            "asset": asset.model_dump(mode="json", exclude={"extracted_text"}),
+            "extracted_text": None if text is None else text[:MAX_EXTRACTED_TEXT_CHARS],
+            "extracted_chars": len(text or ""),
+            "text_truncated": len(text or "") > MAX_EXTRACTED_TEXT_CHARS,
+        }
         try:
             rend = assets.get_rendition(
                 id_or_hash,
@@ -253,11 +330,58 @@ def create_server(*, token: str, db_path: str | Path | None = None) -> FastMCP:
                 path=db_path,
             )
         except assets.UnsupportedRendition:
-            # Not a renderable image: metadata (+ extracted text) only, per §5.7.
+            # A *named page* that cannot be rendered is a failed request and says
+            # so — the asset is not a PDF, or the page is past its end. The
+            # metadata-only fallback belongs to the profiles a caller gets by
+            # default (`preview` on a text file or a PDF): there the text block
+            # is the answer, and an error would be an unhelpful way to say "this
+            # is not an image".
+            if page_number is not None:
+                raise
             metadata["rendition"] = None
             return [metadata]
         metadata["rendition"] = rend.model_dump(mode="json", exclude={"data_base64"})
         return [metadata, Image(data=assets.read_rendition_bytes(rend), format="webp")]
+
+    @server.tool(annotations=_READ)
+    def get_download_url(
+        id_or_hash: str, ttl_seconds: int = urls.DEFAULT_TTL_SECONDS
+    ) -> dict[str, Any]:
+        """Mint a short-lived, single-use URL to an asset's **original bytes**.
+
+        This is the one documented exception to "LLMs never receive original
+        binaries" (design §5.7 rule 4): every other path hands you metadata,
+        extracted text, or a small derived rendition, and this one hands over
+        the real file — for a host that has to open it in a real application,
+        or hand it to a tool that reads the format itself. Both the mint and
+        the later redemption are written to the event log under your identity,
+        so reaching for the hatch is on the record. Prefer `get_asset` when a
+        page raster or the extracted text would do.
+
+        The URL is **single-use** — the first fetch spends it and a second one
+        is refused — and **short-lived**: minutes by default, `ttl_seconds`
+        raises or lowers that within an hour ceiling. It carries no credential
+        of its own, so whoever holds it can fetch those bytes once before it
+        expires: treat it as the secret it is, use it immediately, and do not
+        park it anywhere that keeps a copy.
+
+        The address is built from the server's `NODUM_PUBLIC_URL` (default
+        `http://127.0.0.1:8600`). If you reach this server on any other
+        address, that variable has to be set **on the server** or the URL you
+        get back will be unreachable from where you are — the token is fine,
+        the host in front of it is not.
+
+        An asset you cannot reach answers *not found* and mints nothing: a
+        download URL never widens your reach, it only spends it.
+        """
+        return _dump(
+            urls.mint_download(
+                id_or_hash,
+                ttl_seconds=ttl_seconds,
+                principal=principal,
+                path=db_path,
+            )
+        )
 
     # ── Additive tier ─────────────────────────────────────────────────────
 
@@ -356,6 +480,140 @@ def create_server(*, token: str, db_path: str | Path | None = None) -> FastMCP:
         reported in `failed` by index; the rest still write.
         """
         return _dump(service.propose_edges(suggestions, principal=principal, path=db_path))
+
+    @server.tool(annotations=_ADDITIVE)
+    def ingest_file(
+        path_or_url: str,
+        name: str | None = None,
+        space: str | None = None,
+        title: str | None = None,
+    ) -> dict[str, Any]:
+        """Ingest a document the server can reach — bytes in, a described subgraph out.
+
+        Give a **path on the server's own filesystem**, or an `http`/`https`
+        URL (which routes to `ingest_url`). The server reads or fetches the
+        bytes itself: that is design §5.7's "ingestion by reference", and it
+        is why there is no way to send file contents through this tool and
+        never will be. For bytes that live only on *your* host, ask
+        `request_upload_url` for somewhere to put them.
+
+        One ingestion registers the bytes (content-addressed, so the same file
+        twice moves nothing), extracts what text it can, and writes an
+        `asset_ref` node describing the bytes in `space`, a `source` node
+        carrying the extracted text, a `derived_from` edge from the source to
+        the asset, and one `block` child per page for paginated formats.
+
+        With a `suggest` grant that whole subgraph lands `proposed` and waits
+        for review; with `edit` it lands `active` immediately, exactly as a
+        hand-written node would — ingestion adds no authority of its own.
+        Re-ingesting bytes this space already describes returns the existing
+        subgraph with `created: false`: nothing is duplicated, nothing is
+        overwritten, and an interrupted run is repaired by running it again.
+
+        `extraction.handler` names what read the file and `extraction.detail`
+        says why nothing came out when nothing did — usually a handler whose
+        optional dependency is not installed on the server. An asset no
+        handler could read is still registered and still described.
+
+        `name` overrides the recorded filename, **and with it the extension
+        that picks the extraction handler**; `title` names the `source` node.
+        """
+        # Only http/https route out: a plain path has no scheme, and a `file:`
+        # URL is not silently fetched — it falls through to the path branch and
+        # is refused there as "not a file", which is the truthful answer.
+        if urllib.parse.urlparse(path_or_url).scheme in ingest.FETCHABLE_SCHEMES:
+            return _dump(
+                ingest.ingest_url(
+                    path_or_url,
+                    name=name,
+                    space=space,
+                    title=title,
+                    principal=principal,
+                    path=db_path,
+                )
+            )
+        return _dump(
+            ingest.ingest_file(
+                path_or_url,
+                name=name,
+                space=space,
+                title=title,
+                principal=principal,
+                path=db_path,
+            )
+        )
+
+    @server.tool(annotations=_ADDITIVE)
+    def ingest_url(
+        url: str,
+        name: str | None = None,
+        space: str | None = None,
+        title: str | None = None,
+    ) -> dict[str, Any]:
+        """Fetch an `http`/`https` URL into the graph and ingest it like a local file.
+
+        The **server** does the fetch — one bounded read with a timeout, and
+        redirects that may not leave http/https — and records the URL on both
+        written nodes as provenance. Everything else matches `ingest_file`:
+        the same subgraph, the same content-addressed dedup, and the same
+        landing rule — `proposed` under a `suggest` grant, live under `edit`.
+
+        A page served from an extensionless path still extracts: the
+        response's own content type picks the handler. Only the URL's bytes
+        are ingested, so a link that returns a login page ingests the login
+        page — check `extraction.chars` and the `source` content before
+        treating the result as the document you meant.
+        """
+        return _dump(
+            ingest.ingest_url(
+                url,
+                name=name,
+                space=space,
+                title=title,
+                principal=principal,
+                path=db_path,
+            )
+        )
+
+    @server.tool(annotations=_ADDITIVE)
+    def request_upload_url(
+        name: str,
+        mime: str,
+        size: int,
+        sha256: str | None = None,
+        space: str | None = None,
+    ) -> dict[str, Any]:
+        """Get a single-use URL to PUT one file to, for bytes the server cannot reach.
+
+        Reach for this only when `ingest_file` cannot do the job: the file
+        sits on your host, not on the server's filesystem, and no URL the
+        server can fetch points at it. Declare `sha256` whenever you know it —
+        if the store already holds those bytes you get the existing `asset`
+        back with **no grant and no transfer at all** (design §5.7 rule 4);
+        otherwise you get a `grant` whose `url` accepts exactly one PUT of at
+        most `size` bytes, and only for minutes.
+
+        `space` is where the node describing those bytes will land, and you
+        must be able to write it: a grant onto a space you cannot write is
+        refused **now** rather than after the upload. Under `suggest` that
+        describing node lands `proposed` like any other write; under `edit` it
+        lands live. Note that an asset is only reachable through an *active*
+        describing node, so under `suggest` you will not be able to read back
+        what you just sent until a human accepts it.
+
+        The mint is event-logged, the dedup shortcut included.
+        """
+        return _dump(
+            urls.mint_upload(
+                name,
+                mime,
+                size,
+                sha256=sha256,
+                space=space,
+                principal=principal,
+                path=db_path,
+            )
+        )
 
     # ── Review tier (§8.1 "write (human)") is deliberately absent ──
     # `accept`/`reject` are not registered here: accepting makes proposed

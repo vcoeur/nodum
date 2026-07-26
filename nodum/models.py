@@ -352,6 +352,88 @@ class PurgeResult(BaseModel):
     bytes_freed: int
 
 
+class HandlerStatus(BaseModel):
+    """One extraction handler's reach and whether it can run (design §5.7).
+
+    ``mimes`` are the MIME families the handler claims. ``available`` is
+    false when its optional dependency is absent, and ``detail`` then names
+    the extra to install — the same degradation contract the embedding
+    provider reports through :class:`ProjectorStatus`.
+    """
+
+    name: str
+    mimes: list[str]
+    available: bool
+    detail: str | None = None
+
+
+class ExtractionOut(BaseModel):
+    """What extraction got out of one asset, as reported to clients.
+
+    The text itself is not echoed here — it lands on ``assets.extracted_text``
+    and in the ``source`` node's content, and a result envelope carrying a
+    whole PDF's text would be unusable. ``chars`` and ``pages`` are how a
+    caller tells "nothing came out" from "a lot came out", and ``detail``
+    says why when the answer is nothing.
+    """
+
+    handler: str
+    chars: int
+    pages: int
+    detail: str | None = None
+
+
+class IngestOut(BaseModel):
+    """The outcome of ingesting one file or URL (design §5.5–§5.7).
+
+    ``created`` is false when this asset already had a describing node in the
+    target space: ingestion is idempotent, so a re-run after a partial
+    failure returns the existing subgraph rather than tripping the
+    one-``asset_ref``-per-(hash, space) index. ``pages`` are the per-page
+    ``block`` children created under ``source``, and ``pages_truncated`` says
+    the document had more than the cap allowed — never a silent truncation.
+    """
+
+    asset: AssetOut
+    asset_ref: NodeOut
+    source: NodeOut
+    pages: list[NodeOut] = []
+    pages_truncated: bool = False
+    edges: list[EdgeOut] = []
+    extraction: ExtractionOut
+    created: bool
+    event_seq: int
+
+
+class UrlGrantOut(BaseModel):
+    """A short-lived, single-use capability URL (design §5.7 rule 4).
+
+    ``token`` is shown once and never stored in the clear — the database
+    keeps only its sha256, exactly as an agent token is kept. ``url`` is the
+    ready-to-use address the token is embedded in.
+    """
+
+    kind: str
+    token: str
+    url: str
+    asset_hash: str | None
+    expires_at: str
+    max_bytes: int | None = None
+
+
+class UploadGrantOut(BaseModel):
+    """The answer to ``request_upload_url``: a grant, or an instant dedup hit.
+
+    When the caller declares a sha256 the store already holds, ``asset`` is
+    the existing row, ``grant`` is ``None``, and **no bytes move** — the
+    dedup shortcut the design asks the declared hash to enable. Otherwise
+    ``grant`` carries the single-use upload URL and ``asset`` is ``None``.
+    """
+
+    grant: UrlGrantOut | None = None
+    asset: AssetOut | None = None
+
+
 class HumanOut(BaseModel):
     """A human account (identity + credentials + attribution, never a scope)."""
 

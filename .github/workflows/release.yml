@@ -20,8 +20,10 @@ jobs:
         uses: astral-sh/setup-uv@v7
         with:
           python-version: ${{ matrix.python-version }}
+      # Same extra as ci.yml — a release gate that skips the PDF path would
+      # be a weaker gate than the one every pull request already passes.
       - name: Run test suite
-        run: uv run --locked pytest -q
+        run: uv run --locked --extra pdf pytest -q
 
   smoke:
     name: Clean-install smoke

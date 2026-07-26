@@ -7,7 +7,28 @@ import math
 
 import pytest
 
-from nodum import embeddings, service
+from nodum import db, embeddings, service
+
+
+@pytest.fixture(autouse=True)
+def _never_the_real_database(tmp_path_factory, monkeypatch):
+    """Make the default database path unreachable for the whole test session.
+
+    ``fresh_db`` points ``NODUM_DB`` at a temp file, but any test that unsets
+    that variable mid-run — ``monkeypatch.undo()`` undoes *every* patch the
+    fixture made, ``NODUM_DB`` included — falls back to
+    :data:`nodum.db.DEFAULT_DB_PATH` and starts working against the developer's
+    own graph. That is not hypothetical: it applied an unreleased migration to
+    a live ``~/.local/share/nodum/nodum.db`` during this phase's build.
+
+    Redirecting the constant is the structural fix rather than the local one:
+    a future test cannot reintroduce the leak by patching the environment
+    carelessly, because there is no longer a real path behind the fallback.
+    Asserting on the constant's *value* would be the weaker move — this
+    removes the reachable state instead (see the repo's own
+    "structural tests don't hold invariants" finding).
+    """
+    monkeypatch.setattr(db, "DEFAULT_DB_PATH", tmp_path_factory.mktemp("default-db") / "nodum.db")
 
 
 class HashEmbedder:

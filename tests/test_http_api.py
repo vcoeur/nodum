@@ -31,10 +31,14 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import hashlib
 import inspect
 import io
 import json
 import sqlite3
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from importlib.util import find_spec
 from pathlib import Path
 
 import httpx
@@ -44,7 +48,7 @@ from PIL import Image
 from starlette.requests import ClientDisconnect
 from typer.testing import CliRunner
 
-from nodum import assets, auth, cli, http_api, service
+from nodum import assets, auth, cli, db, http_api, service, urls
 from nodum.principal import Principal
 
 AGENT = "agent:researcher"
@@ -63,6 +67,16 @@ CROSS_ORIGIN_HEADERS = {
     "Sec-Fetch-Site": "cross-site",
     "Sec-Fetch-Mode": "no-cors",
 }
+#: The two capability-URL routes, spelled out here rather than derived, so that
+#: a third one cannot join them by accident: they are the only ``/api`` paths
+#: besides login that answer without a session, because the single-use token in
+#: the path *is* the credential (``http_api._is_capability_path``). §4e drives
+#: both of them, and
+#: ``test_the_only_api_routes_outside_the_session_gate_are_login_and_the_
+#: capability_urls`` fails if the set ever grows without this line changing.
+TOKEN_ROUTES = frozenset({"/api/download/{token}", "/api/uploads/{token}"})
+#: The committed two-page PDF, shared with ``tests/test_ingest.py``.
+PDF_FIXTURE = Path(__file__).parent / "fixtures" / "sample.pdf"
 
 runner = CliRunner()
 
@@ -659,6 +673,11 @@ def test_every_api_route_but_login_refuses_a_request_without_a_session(fresh_db)
     one rule ("every ``/api`` route but login") is the one no future endpoint
     can forget. The route table is the input, so a route added tomorrow is
     gated or this fails.
+
+    :data:`TOKEN_ROUTES` is the one deliberate hole in the rule, and it is a
+    hole in *this test* only because those two routes carry their own
+    credential — §4e drives them, unauthenticated, against every way they can
+    be refused.
     """
     app = http_api.create_app()
     anonymous = Client(app)
@@ -666,7 +685,7 @@ def test_every_api_route_but_login_refuses_a_request_without_a_session(fresh_db)
     outcomes: list[tuple[str, str, int]] = []
     for route in app.routes:
         path = route.path
-        if not path.startswith("/api/") or path == "/api/login":
+        if not path.startswith("/api/") or path == "/api/login" or path in TOKEN_ROUTES:
             continue
         concrete = (
             path.replace("{id}", "x")
@@ -1464,6 +1483,461 @@ def test_an_unknown_api_path_is_still_a_404(client, fresh_db):
         response = client.request(method, "/api/nope/at/all")
         assert response.status_code == 404
         assert response.json()["error"]["type"] == "NotFound"
+
+
+# ── 4e. Ingestion and the two capability URLs ────────────────────────────────
+#
+# `POST /api/ingest` is an ordinary session route. The two token routes are
+# not: they answer with no session, no origin proof and no content type,
+# because the single-use token in the path is the whole credential. What must
+# still hold for them is everything that is *not* about ambient credentials —
+# the Host check, the body ceiling, single use, expiry, and refusals that read
+# identically whichever of the four failures happened.
+
+
+class _FixtureHandler(BaseHTTPRequestHandler):
+    """Serves one canned response; no logging into the test output."""
+
+    def do_GET(self):  # noqa: N802 - BaseHTTPRequestHandler's own naming
+        body, content_type = self.server.canned
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        return
+
+
+@pytest.fixture()
+def fixture_server():
+    """A loopback HTTP server serving one canned body — the suite never leaves the machine.
+
+    Same shape as ``tests/test_ingest.py``'s: ``POST /api/ingest`` with a
+    ``url`` makes the *server* fetch, so the one thing this must never be is
+    the real network.
+    """
+    server = HTTPServer(("127.0.0.1", 0), _FixtureHandler)
+    server.canned = (b"", "text/plain")
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield server
+    server.shutdown()
+    server.server_close()
+
+
+def _fixture_url(server, path: str) -> str:
+    return f"http://127.0.0.1:{server.server_address[1]}{path}"
+
+
+def _expire(token: str) -> None:
+    """Backdate one capability token's expiry — the clock is never slept on."""
+    conn = db.connect()
+    try:
+        conn.execute(
+            "UPDATE url_tokens SET expires_at = datetime('now', '-1 day') WHERE token_hash = ?",
+            (hashlib.sha256(token.encode()).hexdigest(),),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _ingest_file(client, tmp_path, payload: bytes, name: str = "report.pdf") -> dict:
+    """Ingest one local file over HTTP and return the envelope."""
+    source = tmp_path / name
+    source.write_bytes(payload)
+    return _ok(client.post("/api/ingest", json={"path": str(source)}))
+
+
+def _mint_download(client, id_or_hash: str) -> dict:
+    """Mint a download URL over HTTP; assert it points at this server's own route."""
+    grant = _ok(client.post(f"/api/assets/{id_or_hash}/download-url"))
+    assert grant["url"].startswith(f"{BASE_URL}{urls.TOKEN_PATHS['download']}/")
+    assert grant["token"] in grant["url"]
+    return grant
+
+
+def _mint_upload(client, name: str, size: int, **extra) -> dict:
+    """Mint an upload grant over HTTP and return the envelope."""
+    body = {"name": name, "mime": "application/octet-stream", "size": size, **extra}
+    return _ok(client.post("/api/uploads", json=body))
+
+
+def test_ingest_registers_extracts_and_describes_a_local_file(client, fresh_db, tmp_path):
+    """The pipeline's own guarantees, reached through the API rather than the CLI."""
+    source = tmp_path / "hydrology.txt"
+    source.write_text("Vercingetorix basin hydrology", encoding="utf-8")
+
+    payload = _ok(client.post("/api/ingest", json={"path": str(source), "title": "Basin"}))
+
+    assert payload["created"] is True
+    assert payload["extraction"]["handler"] == "text"
+    assert payload["source"]["title"] == "Basin"
+    assert payload["source"]["content"] == "Vercingetorix basin hydrology"
+    assert payload["asset_ref"]["props"]["asset_hash"] == payload["asset"]["hash"]
+    assert payload["edges"][0]["type"] == "derived_from"
+    # A human write lands live, and is attributed to the session's human.
+    assert payload["source"]["state"] == "active"
+    assert payload["source"]["created_by"] == OWNER_ACTOR
+    assert _events("asset.ingest")[0].actor == OWNER_ACTOR
+
+    # Idempotent per (hash, space): a re-run finds the subgraph it wrote.
+    again = _ok(client.post("/api/ingest", json={"path": str(source)}))
+    assert again["created"] is False
+    assert again["asset_ref"]["id"] == payload["asset_ref"]["id"]
+
+
+def test_ingest_fetches_a_url_from_a_loopback_server(client, fresh_db, fixture_server):
+    """`url` makes the server fetch — asserted against a fixture, never the network."""
+    fixture_server.canned = (
+        b"<html><body><p>Basin hydrology</p></body></html>",
+        "text/html; charset=utf-8",
+    )
+
+    payload = _ok(
+        client.post("/api/ingest", json={"url": _fixture_url(fixture_server, "/article")})
+    )
+
+    assert payload["extraction"]["handler"] == "html"
+    assert payload["source"]["content"] == "Basin hydrology"
+    assert payload["asset_ref"]["props"]["url"].endswith("/article")
+    assert payload["source"]["created_by"] == OWNER_ACTOR
+
+
+def test_ingest_takes_exactly_one_of_path_and_url(client, fresh_db, tmp_path):
+    """Both or neither is a 400: a precedence rule between them is a coin flip."""
+    source = tmp_path / "note.txt"
+    source.write_text("either", encoding="utf-8")
+
+    for body in ({}, {"path": str(source), "url": "http://127.0.0.1:1/x"}):
+        response = client.post("/api/ingest", json=body)
+        assert response.status_code == 400, response.text
+        assert "exactly one" in response.json()["error"]["message"]
+
+    # And a field of the wrong type is a 400 too, not a traceback further down.
+    for body in ({"path": 12}, {"url": ["http://x"]}, {"path": str(source), "name": 7}):
+        response = client.post("/api/ingest", json=body)
+        assert response.status_code == 400, response.text
+        assert "Traceback" not in response.text
+
+    assert service.list_nodes(type="source", principal=owner()) == []
+
+
+def test_a_smuggled_identity_on_an_ingest_is_ignored_not_honored(client, fresh_db, tmp_path):
+    """The smuggling pattern of §3, applied to the surface's newest write."""
+    source = tmp_path / "note.txt"
+    source.write_text("smuggled", encoding="utf-8")
+
+    payload = _ok(
+        client.post(
+            f"/api/ingest?actor={AGENT}",
+            json={"path": str(source), "actor": AGENT, "principal": AGENT, "created_by": AGENT},
+            headers={"X-Actor": AGENT},
+        )
+    )
+
+    assert payload["source"]["created_by"] == OWNER_ACTOR
+    assert payload["asset_ref"]["created_by"] == OWNER_ACTOR
+    assert payload["source"]["state"] == "active"  # an agent write would land proposed
+    assert [event.actor for event in _events("asset.ingest")] == [OWNER_ACTOR]
+
+
+def test_a_download_url_serves_the_exact_original_bytes_once(client, fresh_db, tmp_path):
+    """The escape hatch's whole job — and it is spent by the first redemption."""
+    original = b"%PDF-1.4\nexactly these bytes\n"
+    ingested = _ingest_file(client, tmp_path, original)
+    grant = _mint_download(client, ingested["asset"]["hash"])
+
+    response = client.get(grant["url"])
+
+    assert response.status_code == 200
+    assert response.content == original
+    assert response.headers["content-length"] == str(len(original))
+
+    second = client.get(grant["url"])
+    assert second.status_code == 400
+    assert second.json()["error"]["type"] == "TokenInvalid"
+
+
+def test_a_downloaded_original_is_never_served_under_its_own_mime(client, fresh_db, tmp_path):
+    """Serving a stranger's MIME back is how a file host becomes stored XSS.
+
+    The bytes below are a script in this origin — the same origin that may
+    write to this API — and the page CSP is on the static route, not here. So
+    the response says octet-stream, says ``nosniff`` so the browser cannot
+    overrule it, and says ``attachment`` so it is saved rather than rendered.
+    """
+    ingested = _ingest_file(client, tmp_path, b"<script>alert(1)</script>", name="page.html")
+    assert ingested["asset"]["mime"] == "text/html"  # what the store recorded
+    grant = _mint_download(client, ingested["asset"]["hash"])
+
+    response = client.get(grant["url"])
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == http_api.DOWNLOAD_CONTENT_TYPE
+    assert "html" not in response.headers["content-type"]
+    assert response.headers["x-content-type-options"] == "nosniff"
+    assert response.headers["cache-control"] == "no-store"
+    disposition = response.headers["content-disposition"]
+    assert disposition.startswith("attachment; ")
+    # The one name attached to these bytes that no stranger chose.
+    assert ingested["asset"]["hash"] in disposition
+    assert "page.html" not in disposition
+
+
+def test_a_download_url_needs_no_session_but_still_needs_the_right_host(client, fresh_db, tmp_path):
+    """Both halves of the exemption, in one test.
+
+    No session at all is the point of the hatch: the holder of the URL is an
+    agent host with no account here. The ``Host`` check is *not* part of the
+    exemption — it is about which server the request reached, which a
+    capability changes nothing about — and it refuses before the handler, so
+    the token survives to be spent by its rightful holder.
+    """
+    original = b"no cookie required"
+    ingested = _ingest_file(client, tmp_path, original, name="notes.txt")
+    grant = _mint_download(client, ingested["asset"]["hash"])
+    anonymous = Client(client.app)  # no session cookie whatsoever
+    assert anonymous.get("/api/assets").status_code == 401
+
+    assert anonymous.get(grant["url"]).content == original
+
+    rebound = _mint_download(client, ingested["asset"]["hash"])
+    refused = anonymous.get(rebound["url"], headers={"Host": "attacker-rebind.example"})
+    assert refused.status_code == 400
+    assert refused.json()["error"]["type"] == "UntrustedHost"
+    assert original not in refused.content
+    # Refused by the guard, so the token was never spent.
+    assert anonymous.get(rebound["url"]).content == original
+
+
+def test_every_download_refusal_reads_identically(client, fresh_db, tmp_path):
+    """Spent, expired, unknown, malformed, wrong kind — one status, one message.
+
+    "Expired" would say a token once existed and "wrong kind" would say which
+    route to try next; both are free intelligence for whoever is guessing.
+    """
+    ingested = _ingest_file(client, tmp_path, b"secret bytes")
+    spent = _mint_download(client, ingested["asset"]["hash"])
+    assert client.get(spent["url"]).status_code == 200
+    expired = _mint_download(client, ingested["asset"]["hash"])
+    _expire(expired["token"])
+    upload = _mint_upload(client, "scan.bin", 4)["grant"]
+    download_path = urls.TOKEN_PATHS["download"]
+
+    refusals = [
+        client.get(spent["url"]),
+        client.get(expired["url"]),
+        client.get(f"{download_path}/{auth.TOKEN_PREFIX}{'a' * 43}"),
+        client.get(f"{download_path}/not-a-token-at-all"),
+        # An upload grant presented at the download route.
+        client.get(f"{download_path}/{upload['token']}"),
+    ]
+
+    assert {response.status_code for response in refusals} == {400}
+    assert len({response.text for response in refusals}) == 1
+    assert urls.INVALID_TOKEN_MESSAGE in refusals[0].text
+    assert b"secret bytes" not in refusals[0].content
+    # The stray request at the wrong route did not burn the upload grant.
+    assert urls.consume(upload["token"], kind="upload")["kind"] == "upload"
+
+
+def test_an_upload_url_ingests_the_bytes_the_grant_was_minted_for(client, fresh_db):
+    """A PUT with no cookie, no origin headers and no content type at all.
+
+    Design §5.7 rule 4 ends "normal ingestion runs after the PUT", so the
+    response is the whole ingestion, not a bare asset: without that the hatch
+    dead-ends, because no surface can turn a stored hash into a subgraph.
+    """
+    payload = b"scanned page bytes"
+    grant = _mint_upload(client, "scan.txt", len(payload))["grant"]
+    assert grant["url"].startswith(f"{BASE_URL}{urls.TOKEN_PATHS['upload']}/")
+    assert grant["max_bytes"] == len(payload)
+    anonymous = Client(client.app)
+
+    result = _ok(anonymous.put(grant["url"], guard=False, content=payload))
+
+    assert result["asset"]["hash"] == hashlib.sha256(payload).hexdigest()
+    assert result["asset"]["size_bytes"] == len(payload)
+    assert result["asset"]["original_name"] == "scan.txt"
+    assert [row.hash for row in assets.list_assets(principal=owner())] == [result["asset"]["hash"]]
+    # The bytes are described, so they are reachable — the whole point.
+    assert result["asset_ref"]["props"]["asset_hash"] == result["asset"]["hash"]
+    assert result["source"]["content"] == "scanned page bytes"
+    assert result["created"] is True
+    # Everything is attributed to the principal who minted the grant — stored
+    # state, since the request itself carries no identity.
+    assert result["asset_ref"]["created_by"] == OWNER_ACTOR
+    assert [event.actor for event in _events("asset.upload")] == [OWNER_ACTOR]
+    # Single use, exactly like the download side.
+    assert anonymous.put(grant["url"], guard=False, content=payload).status_code == 400
+
+
+def test_an_upload_grant_dies_with_the_account_that_minted_it(client, fresh_db):
+    """The principal is re-minted from the token row, so revocation reaches a
+    capability already handed out — it must not outlive the account behind it."""
+    payload = b"late delivery"
+    agent_principal = agent("courier", grants={"meta": "read", "main": "suggest"})
+    grant = urls.mint_upload(
+        "drop.txt", "text/plain", len(payload), principal=agent_principal
+    ).grant
+    service.disable_agent("courier", principal=owner())
+
+    response = Client(client.app).put(grant.url, guard=False, content=payload)
+
+    assert response.status_code >= 400
+    assert service.list_nodes(type="source", principal=owner()) == []
+
+
+def test_an_upload_over_the_grants_ceiling_is_refused_while_it_streams(client, fresh_db):
+    """The grant promised a size; the body is capped at it, not after it.
+
+    ``MAX_REQUEST_BYTES`` is the outer ceiling and it is 32 MiB — far above
+    this body. The cap being tested is the inner one the grant itself carries,
+    which is what stops a 4-byte grant costing 32 MiB of ``/tmp`` to refuse.
+    """
+    grant = _mint_upload(client, "small.bin", 8)["grant"]
+    anonymous = Client(client.app)
+
+    response = anonymous.put(grant["url"], guard=False, content=b"x" * 4096)
+
+    assert response.status_code == 413
+    assert response.json()["error"]["type"] == "PayloadTooLarge"
+    assert "8 bytes" in response.json()["error"]["message"]
+    assert assets.list_assets(principal=owner()) == []
+
+
+def test_a_capability_url_is_the_one_write_a_cross_origin_page_may_reach(client, fresh_db):
+    """The exemption, stated positively — and its boundary, one slash away.
+
+    A page on another origin that somehow holds a capability URL may spend it:
+    the token is the authorisation, and a holder could have used ``curl``
+    anyway. It may not reach the route that *hands them out*, which is an
+    ordinary session write and keeps every gate.
+    """
+    payload = b"cross-origin bytes"
+    grant = _mint_upload(client, "scan.bin", len(payload))["grant"]
+
+    spent = Client(client.app).put(
+        grant["url"], guard=False, headers=CROSS_ORIGIN_HEADERS, content=payload
+    )
+    assert spent.status_code == 200, spent.text
+
+    refused = client.post(
+        "/api/uploads",
+        guard=False,
+        headers={**CROSS_ORIGIN_HEADERS, "Content-Type": "application/json"},
+        json={"name": "scan.bin", "mime": "application/octet-stream", "size": 4},
+    )
+    assert refused.status_code == 403
+    assert refused.json()["error"]["type"] == "CrossOriginRequest"
+
+
+def test_an_upload_request_that_declares_nonsense_is_a_400_not_a_500(client, fresh_db):
+    """The body's three required fields, and the two optional ones, are typed.
+
+    A JSON string where a byte count belongs used to reach a comparison in the
+    service and a bind in SQLite; both are 500s for what is plainly the
+    caller's mistake.
+    """
+    for body in (
+        {},
+        {"name": "x.bin"},
+        {"name": "x.bin", "mime": "application/octet-stream"},
+        {"name": "x.bin", "mime": "application/octet-stream", "size": "big"},
+        {"name": "x.bin", "mime": "application/octet-stream", "size": True},
+        {"name": 7, "mime": "application/octet-stream", "size": 4},
+        {"name": "x.bin", "mime": "application/octet-stream", "size": 4, "sha256": 12},
+        {"name": "x.bin", "mime": "application/octet-stream", "size": 4, "space": ["main"]},
+        # Above nodum.urls.MAX_UPLOAD_BYTES: the service's own bound.
+        {"name": "x.bin", "mime": "application/octet-stream", "size": urls.MAX_UPLOAD_BYTES + 1},
+    ):
+        response = client.post("/api/uploads", json=body)
+        assert response.status_code == 400, (body, response.text)
+        assert "Traceback" not in response.text
+
+
+def test_a_declared_hash_this_file_already_holds_moves_no_bytes(client, fresh_db, tmp_path):
+    """Design §5.7 rule 4's dedup shortcut, over HTTP: an asset, and no grant."""
+    ingested = _ingest_file(client, tmp_path, b"already here", name="known.bin")
+
+    result = _mint_upload(client, "known.bin", 12, sha256=ingested["asset"]["hash"])
+
+    assert result["grant"] is None
+    assert result["asset"]["hash"] == ingested["asset"]["hash"]
+
+
+def test_a_download_url_cannot_be_minted_for_an_asset_the_session_cannot_reach(client, fresh_db):
+    """Minting is a scoped read, so a token can never widen anyone's reach."""
+    response = client.post("/api/assets/deadbeef/download-url")
+
+    assert response.status_code == 404
+    assert response.json()["error"]["type"] == "AssetNotFound"
+
+
+def test_the_only_api_routes_outside_the_session_gate_are_login_and_the_capability_urls(fresh_db):
+    """The exemption list, read off the live route table rather than trusted.
+
+    ``LOGIN_PATH`` used to be the only exemption and was compared inline; the
+    predicate is now the one place that decides, and this is what keeps the
+    set it answers for from quietly growing.
+    """
+    app = http_api.create_app()
+    open_paths = {
+        route.path
+        for route in app.routes
+        if route.path.startswith("/api") and not http_api._needs_a_session(route.path)
+    }
+
+    assert open_paths == {"/api/login", *TOKEN_ROUTES}
+    # The mint sits one slash away from its redemption and is *not* exempt.
+    assert http_api._needs_a_session("/api/uploads") is True
+    assert http_api._is_capability_path("/api/uploads") is False
+
+
+def test_the_capability_routes_bind_no_identity_of_their_own(fresh_db):
+    """They have no session by design, so they must not reach for one.
+
+    ``_session_principal`` raises when the scope holds no verified principal —
+    which is exactly the state these two run in — so a handler that called it
+    would be a 500 on every redemption. Neither may write to the graph either:
+    that needs a principal, and the only truthful one lives on the token row,
+    where :func:`nodum.urls.consume` uses it.
+    """
+    endpoints = dict(_route_endpoints(http_api.create_app()))
+
+    for path in TOKEN_ROUTES:
+        source = inspect.getsource(endpoints[path])
+        assert "_session_principal" not in source, path
+        assert "_write(" not in source, path
+        assert "principal=" not in source, path
+
+
+@pytest.mark.skipif(find_spec("pypdfium2") is None, reason="the pdf extra is not installed")
+def test_a_page_raster_reaches_the_rendition_route_through_its_colon(client, fresh_db):
+    """``page:3`` is one path segment: Starlette's default convertor is ``[^/]+``.
+
+    Worth an end-to-end test rather than a reading of the regex, because the
+    colon is the kind of character a router, a client, or a proxy can each
+    decide to treat as special.
+    """
+    ingested = _ok(client.post("/api/ingest", json={"path": str(PDF_FIXTURE)}))
+    base = f"/api/assets/{ingested['asset']['hash']}/rendition"
+
+    response = client.get(f"{base}/page:1")
+
+    assert response.status_code == 200, response.text
+    assert response.headers["content-type"] == assets.RENDITION_MIME
+    assert Image.open(io.BytesIO(response.content)).format == "WEBP"
+    # Page 2 renders as well, and is a different raster.
+    assert client.get(f"{base}/page:2").content != response.content
+    # `page:0` is not a page and `page:99` is past the end of this document.
+    assert client.get(f"{base}/page:0").status_code == 400
+    assert client.get(f"{base}/page:99").status_code == 400
+    # A PDF has no thumb: the profile families each name the kind they read.
+    assert client.get(f"{base}/thumb").status_code == 400
 
 
 def test_healthz_reports_liveness_and_not_the_database_path(fresh_db):
