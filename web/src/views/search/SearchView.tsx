@@ -15,6 +15,7 @@ import {
   toSearchParams,
 } from "./searchState";
 import type { SearchState } from "./searchState";
+import { hitSpaceLabel } from "./resultSpace";
 import { describeSpaceFilterFailure } from "./spaceFailure";
 import type { SpaceFilterFailure } from "./spaceFailure";
 import { SIGNAL_HELP, SIGNAL_KEYS, describeSignals, readVectorEvidence } from "./signals";
@@ -355,6 +356,10 @@ export default function SearchView() {
   const showDegradedNote = vector.missing && !vector.seen;
   // Every hit carries the filtered state; under "any" it is genuinely unknown.
   const knownState = stateFilter === "any" ? null : stateFilter;
+  // Names for the per-row space, which follows the same rule one dimension
+  // over — `hitSpaceLabel` owns it. Falls back to the raw id while the list
+  // loads rather than leaving the row silent about where it lives.
+  const knownSpaces = spaces ?? [];
 
   return (
     <div className="nd-view nd-search">
@@ -371,6 +376,7 @@ export default function SearchView() {
           <SearchGlyph />
           <input
             ref={inputRef}
+            name="q"
             type="search"
             className="nd-input nd-search__input"
             value={draft}
@@ -499,6 +505,7 @@ export default function SearchView() {
                       hit={hit}
                       index={index}
                       knownState={knownState}
+                      spaceName={hitSpaceLabel(hit, knownSpaces, space)}
                       terms={terms}
                       linkRef={(element) => {
                         linkRefs.current[index] = element;

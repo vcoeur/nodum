@@ -6,17 +6,25 @@
  * - a **node** proposal is a row that would become live, so it shows its title,
  *   its type, its parent (from the server's `context`), and its Markdown;
  * - an **edge** proposal is a claim about two nodes, so it shows both endpoints
- *   by title — the ids alone are unreviewable — plus the agent's self-reported
- *   confidence, labelled as self-reported;
+ *   by title and **by space** — the ids alone are unreviewable — plus the
+ *   agent's self-reported confidence, labelled as self-reported;
  * - an **update** proposal is a staged version, and what matters is *which
  *   fields it named*, so it defers to {@link UpdateDiff}.
+ *
+ * The endpoint spaces are not decoration. A cross-space edge is filed under one
+ * space (its source's) while accepting it needs `edit` on **both** — the queue
+ * simplifies, and a card that listed source, target, type, confidence, author
+ * and date while omitting the one dimension the filing simplified would be
+ * hiding exactly the fact the reviewer is missing.
  */
 
 import { NodeBadge } from "../../components";
 import type { ProposalOut } from "../../api/types";
 import { formatAbsolute, formatRelative } from "../../lib";
 import { formatConfidence, formatProps, shortId, truncate } from "./format";
-import { proposalKind } from "./grouping";
+import { edgeCrossing, proposalKind } from "./grouping";
+import type { EdgeCrossing } from "./grouping";
+import type { SpaceName } from "./spaceNaming";
 import { UpdateDiff } from "./UpdateDiff";
 import {
   acceptConsequence,
@@ -31,6 +39,8 @@ const PREVIEW_CHARS = 220;
 
 interface ProposalCardProps {
   proposal: ProposalOut;
+  /** Names a space id — used for both ends of a cross-space edge. */
+  spaceName: (spaceId: string) => SpaceName;
   selected: boolean;
   onToggleSelect: () => void;
   expanded: boolean;
@@ -47,6 +57,7 @@ interface ProposalCardProps {
  * A single proposal card.
  *
  * @param proposal The queue entry.
+ * @param spaceName Names a space id, for a crossing's two ends.
  * @param selected Whether it is in the multi-select set.
  * @param onToggleSelect Toggle multi-select.
  * @param expanded Whether the detail body is open.
@@ -57,6 +68,7 @@ interface ProposalCardProps {
  */
 export function ProposalCard({
   proposal,
+  spaceName,
   selected,
   onToggleSelect,
   expanded,
@@ -66,12 +78,14 @@ export function ProposalCard({
   busy,
 }: ProposalCardProps) {
   const kind = proposalKind(proposal);
+  const crossing = edgeCrossing(proposal);
 
   return (
     <article className={selected ? "nd-rv-card nd-rv-card--selected" : "nd-rv-card"}>
       <div className="nd-rv-card__bar">
         <span className="nd-rv-card__select">
           <input
+            name={`select-${proposal.id}`}
             type="checkbox"
             checked={selected}
             onChange={onToggleSelect}
@@ -84,6 +98,14 @@ export function ProposalCard({
             <span className={`nd-rv-kind nd-rv-kind--${kind ?? "unknown"}`}>
               {kind === "update" ? "version update" : (kind ?? proposal.kind)}
             </span>
+            {crossing ? (
+              <span
+                className="nd-rv-kind nd-rv-kind--crossing"
+                title={`This edge starts in ${spaceName(crossing.from).label} and ends in ${spaceName(crossing.to).label}. It is queued under its source's space; accepting it needs edit on both.`}
+              >
+                cross-space
+              </span>
+            ) : null}
             <NodeBadge type={proposal.type} state="proposed" />
           </div>
           <h3 className="nd-rv-card__title">{headline(proposal)}</h3>
@@ -130,7 +152,7 @@ export function ProposalCard({
       {expanded ? (
         <div className="nd-rv-card__body">
           {kind === "node" ? <NodeProposal proposal={proposal} /> : null}
-          {kind === "edge" ? <EdgeProposal proposal={proposal} /> : null}
+          {kind === "edge" ? <EdgeProposal proposal={proposal} spaceName={spaceName} /> : null}
           {kind === "update" && proposal.version ? (
             <UpdateDiff proposal={proposal} version={proposal.version} />
           ) : null}
@@ -143,7 +165,7 @@ export function ProposalCard({
           ) : null}
         </div>
       ) : (
-        <CollapsedSummary proposal={proposal} />
+        <CollapsedSummary proposal={proposal} crossing={crossing} spaceName={spaceName} />
       )}
     </article>
   );
@@ -166,7 +188,16 @@ function headline(proposal: ProposalOut): string {
 }
 
 /** The one-line "what is in here" shown while a card is collapsed. */
-function CollapsedSummary({ proposal }: { proposal: ProposalOut }) {
+function CollapsedSummary({
+  proposal,
+  crossing,
+  spaceName,
+}: {
+  proposal: ProposalOut;
+  /** The crossing this edge makes, or null. */
+  crossing: EdgeCrossing | null;
+  spaceName: (spaceId: string) => SpaceName;
+}) {
   if (proposal.kind === "node" && proposal.node) {
     const preview = truncate(proposal.node.content, PREVIEW_CHARS);
     return <p className="nd-rv-card__preview">{preview || "(no content)"}</p>;
@@ -175,6 +206,13 @@ function CollapsedSummary({ proposal }: { proposal: ProposalOut }) {
     return (
       <p className="nd-rv-card__preview">
         confidence {formatConfidence(proposal.edge.confidence)} (self-reported)
+        {crossing ? (
+          <>
+            {" · "}
+            <span className="nd-mono">{spaceName(crossing.from).label}</span> →{" "}
+            <span className="nd-mono">{spaceName(crossing.to).label}</span>
+          </>
+        ) : null}
       </p>
     );
   }
@@ -243,22 +281,61 @@ function NodeProposal({ proposal }: { proposal: ProposalOut }) {
   );
 }
 
-/** A proposed edge: both endpoints by title, and the self-graded confidence. */
-function EdgeProposal({ proposal }: { proposal: ProposalOut }) {
+/**
+ * A proposed edge: both endpoints by title **and space**, and the self-graded
+ * confidence.
+ *
+ * The space of each end is on the same footing as its title here. An edge is a
+ * claim about two nodes, and which spaces those nodes are in is what decides
+ * who may accept it: `Store.edge_landing_state` needs `edit` on **both**, while
+ * the queue files the proposal under the source's space alone. The panel that
+ * listed source, target, type, confidence, author and date and left the spaces
+ * out was silently endorsing that simplification.
+ */
+function EdgeProposal({
+  proposal,
+  spaceName,
+}: {
+  proposal: ProposalOut;
+  spaceName: (spaceId: string) => SpaceName;
+}) {
   const edge = proposal.edge;
   if (!edge) return <p className="nd-rv-flag nd-rv-flag--warn">The queue entry carries no edge row.</p>;
   const source = contextRef(proposal.context, "src");
   const target = contextRef(proposal.context, "dst");
+  const crossing = edgeCrossing(proposal);
 
   return (
     <div className="nd-rv-detail">
       <div className="nd-rv-edge">
-        <Endpoint label="Source" reference={source} fallbackId={edge.src_id} />
+        <Endpoint
+          label="Source"
+          reference={source}
+          fallbackId={edge.src_id}
+          spaceName={spaceName}
+        />
         <span className="nd-rv-edge__arrow" aria-hidden="true">
           —[{edge.type}]→
         </span>
-        <Endpoint label="Target" reference={target} fallbackId={edge.dst_id} />
+        <Endpoint
+          label="Target"
+          reference={target}
+          fallbackId={edge.dst_id}
+          spaceName={spaceName}
+        />
       </div>
+
+      {crossing ? (
+        <p className="nd-rv-flag nd-rv-flag--crossing">
+          This edge crosses spaces: it starts in{" "}
+          <span className="nd-mono">{spaceName(crossing.from).label}</span> and ends in{" "}
+          <span className="nd-mono">{spaceName(crossing.to).label}</span>. The queue files it under
+          the source's space, which is where you found it — but the edge lands only for a reviewer
+          with authority on <em>both</em>, so an agent holding <code>edit</code> on one of them
+          cannot accept it. As a human here you have both; the filing is a simplification of the
+          grouping, not of the rule.
+        </p>
+      ) : null}
 
       <dl className="nd-rv-facts">
         <div>
@@ -295,24 +372,32 @@ function EdgeProposal({ proposal }: { proposal: ProposalOut }) {
   );
 }
 
-/** One end of a proposed edge. */
+/** One end of a proposed edge: what it is, where it is, and which row it is. */
 function Endpoint({
   label,
   reference,
   fallbackId,
+  spaceName,
 }: {
   label: string;
-  reference: { id: string; title: string | null } | null;
+  reference: { id: string; title: string | null; spaceId: string | null } | null;
   fallbackId: string;
+  spaceName: (spaceId: string) => SpaceName;
 }) {
   const id = reference?.id ?? fallbackId;
   const title = reference?.title;
+  const space = reference?.spaceId ?? null;
   return (
     <div className="nd-rv-edge__end">
       <span className="nd-label">{label}</span>
       <span className="nd-rv-edge__title">
         {title && title.trim() !== "" ? title : <em className="nd-meta">untitled</em>}
       </span>
+      {space === null ? null : (
+        <span className="nd-meta nd-rv-edge__space">
+          in <span className="nd-mono">{spaceName(space).label}</span>
+        </span>
+      )}
       <span className="nd-mono" title={id}>
         {shortId(id, 12)}
       </span>

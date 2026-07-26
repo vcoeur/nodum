@@ -13,23 +13,14 @@
  */
 
 /*
- * The one hue this view owns.
- *
- * `styles/tokens.css` states that both global colour axes are taken — brass
- * means "you can act on this", the state ramp means the service-layer state
- * machine — and that anything else needs its own hue, kept view-local until a
- * second view names it. A cross-space edge (design decision D5) is neither an
- * affordance nor a state, so this is that hue: magenta, the emptiest slot in
- * the palette, well clear of the proposed violet it would otherwise be read as.
- *
- * It lives on `:root` rather than on `.nd-graph` because `graphStyle.ts` reads
- * the palette off `document.documentElement` — Cytoscape renders to a canvas
- * and cannot see custom properties itself. If a second view ever needs it, this
- * is the declaration to move into `tokens.css`.
+ * The crossing hue used to be declared here, view-local, per the rule in
+ * `styles/tokens.css`: a hue outside the two global axes stays in the view
+ * that needs it until a second one names it. The review queue now marks the
+ * same fact on a cross-space edge proposal, so `--nd-crossing` has moved to
+ * `tokens.css` and this view reads it from there — including `graphStyle.ts`,
+ * which pulls the palette off `document.documentElement` because Cytoscape
+ * renders to a canvas and cannot see custom properties itself.
  */
-:root {
-  --nd-graph-crossing: #c07bb5;
-}
 
 /* --- Shell ------------------------------------------------------------- */
 
@@ -391,7 +382,7 @@
 }
 
 .nd-graph__legend-item--crossing {
-  color: var(--nd-graph-crossing);
+  color: var(--nd-crossing);
 }
 
 .nd-graph__legend-sep {
@@ -579,7 +570,7 @@
 
 /* The crossing hue, same one the canvas outlines a crossing edge with. */
 .nd-graph__crossing-mark {
-  color: var(--nd-graph-crossing);
+  color: var(--nd-crossing);
   font-size: var(--nd-text-2xs);
   letter-spacing: var(--nd-tracking-label);
   text-transform: uppercase;

@@ -190,6 +190,7 @@ function NewNodeType({
     <label className="nd-editor__type-field">
       <span className="nd-label">Type</span>
       <select
+        name="node-type"
         className="nd-select nd-editor__type-select"
         value={selectedType ?? ""}
         onChange={(event) => onTypeChange(event.target.value)}
@@ -261,6 +262,7 @@ function WriteTargetPicker({
       <label className="nd-editor__space-field">
         <span className="nd-label">Space</span>
         <select
+          name="write-target"
           className="nd-select nd-editor__space-select"
           value={selected}
           disabled={spaces === null && !spacesFailed}

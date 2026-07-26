@@ -20,6 +20,16 @@ one `GET /api/spaces` read behind every one of them) and `lib/writeTarget.ts`
 (the write half). `/spaces` is where the lifecycle lives — create, rename,
 archive, with each space's live node count and grant holders.
 
+Reading a space and *seeing* one are different jobs, and the second has its own
+rule: **a surface states the space unless the filter already determined it.**
+Search names it per result under "Any space" and stays quiet under a narrowed
+one (`views/search/resultSpace.ts`), exactly as the state badge does. The review
+queue is where that gets harder — it has to name spaces `GET /api/spaces` does
+not list (archived, with proposals still waiting) and to admit that a
+cross-space edge filed under one space needs authority on two. It does both
+without touching the shared endpoint; see `views/review/spaceNaming.ts` and
+`grouping.edgeCrossing`.
+
 ## Running it
 
 ```bash
@@ -107,8 +117,8 @@ type-checking it and driving it in a browser.
 | `src/components/` | shared React components: `NodeBadge`, `Toast`, `Spinner`, `EmptyState`, `ErrorBoundary`, `Modal`, plus the space filter and its two halves — `SpaceFilter.tsx`, `spaceOptions.ts` (the option vocabulary), `useSpaces.ts` (the `GET /api/spaces` read every space surface shares) |
 | `src/styles/` | `tokens.css`, `base.css`, `primitives.css`, `app.css` |
 | `src/views/editor/` | CodeMirror-6 Markdown source editor, slash commands, `[[` autocomplete, live Mermaid preview, autosave, the write-target picker and the landing/refusal copy (`createOutcome.ts`) |
-| `src/views/search/` | query box, ranked hits, per-signal breakdown, signal grouping, the space filter + show-meta toggle in the URL (`searchState.ts`), refused-filter copy (`spaceFailure.ts`) |
-| `src/views/review/` | proposal queue grouped space → agent, per-kind cards, proposed-version diffs, self-governing space sections |
+| `src/views/search/` | query box, ranked hits, per-signal breakdown, signal grouping, the space filter + show-meta toggle in the URL (`searchState.ts`), refused-filter copy (`spaceFailure.ts`), when a row names its space (`resultSpace.ts`) |
+| `src/views/review/` | proposal queue grouped space → agent, per-kind cards, proposed-version diffs, self-governing space sections, cross-space edge marking (`grouping.edgeCrossing`), and naming a space the shared list cannot (`spaceNaming.ts` + `useArchivedSpaces.ts`) |
 | `src/views/graph/` | Cytoscape subgraph render, filters, cross-space edge styling and far-endpoint dimming, path panel |
 | `src/views/assets/` | rendition grid, lightbox, uploader, thin JSON export |
 | `src/views/login/` | password login against `POST /api/login` |
@@ -262,6 +272,18 @@ Two conventions carry the whole system:
 - **The state ramp encodes the service-layer state machine**: `proposed` violet,
   `active` sea-green, `archived` deliberately the lowest-contrast colour in the
   system. Use `<NodeBadge type state />` rather than rolling your own pill.
+
+Anything outside those two axes needs a hue of its own, kept view-local until a
+second view names it. Exactly one has: `--nd-crossing` (magenta) means *this
+edge's endpoints live in two different spaces* — neither an affordance nor a
+state. It started in the graph (design decision D5) and moved into `tokens.css`
+when the review queue had to mark the same fact on a cross-space edge proposal.
+
+Every form control carries an `id` or a `name`. There is no `<form>` submit
+anywhere here, so the value never travels; a control with neither is one the
+browser cannot address, which is what DevTools flags and what autofill and
+assistive tooling are left guessing at. `SpaceFilter` takes `name` as a prop
+(default `space`).
 
 Class names are prefixed `nd-` because Mermaid and Cytoscape inject global
 stylesheets using names like `.node`, `.label`, and `.edge`. Keep the prefix.

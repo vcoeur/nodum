@@ -131,6 +131,7 @@ export default function AdminView() {
 
             <div className="nd-row nd-ad-create">
               <input
+                name="new-agent-name"
                 className="nd-input"
                 type="text"
                 placeholder="New agent name"

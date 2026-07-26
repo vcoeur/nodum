@@ -20,8 +20,9 @@
  * `styles/tokens.css` says needs one: an edge whose endpoints live in different
  * spaces is neither a state nor an affordance. It is carried on the edge's
  * *outline* rather than on its line colour, so the state ramp keeps the line
- * and a proposed crossing still reads as proposed. The hue is view-local
- * (`--nd-graph-crossing`, defined in `graph.css`) until a second view names it.
+ * and a proposed crossing still reads as proposed. The hue is `--nd-crossing`,
+ * which started view-local here and moved into `styles/tokens.css` once the
+ * review queue had to mark the same fact on a cross-space edge proposal.
  */
 
 import type cytoscape from "cytoscape";
@@ -80,7 +81,7 @@ const TOKEN_VARIABLES: Record<keyof GraphTokens, string> = {
   proposed: "--nd-state-proposed",
   active: "--nd-state-active",
   archived: "--nd-state-archived",
-  crossing: "--nd-graph-crossing",
+  crossing: "--nd-crossing",
   fontUi: "--nd-font-ui",
   fontMono: "--nd-font-mono",
 };

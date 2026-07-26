@@ -43,6 +43,17 @@ interface SpaceFilterProps {
    * component can see it.
    */
   controlClassName?: string;
+  /**
+   * `name` on the `<select>`. Defaults to `space`.
+   *
+   * Every form control carries one: a field with neither `id` nor `name` is
+   * something a browser cannot address — it is what DevTools flags, and what
+   * autofill, a password manager, and any assistive tooling walking the form
+   * have to fall back to guessing about. There is no form here to submit, so
+   * the value is never sent anywhere; the name exists to make the control a
+   * named thing rather than an anonymous one.
+   */
+  name?: string;
 }
 
 /**
@@ -56,6 +67,7 @@ interface SpaceFilterProps {
  * @param className Extra class for the view's layout.
  * @param controlClassName Extra class for the `<select>`, for a filter row that
  *   sizes its controls.
+ * @param name `name` on the `<select>`; defaults to `space`.
  */
 export function SpaceFilter({
   value,
@@ -65,6 +77,7 @@ export function SpaceFilter({
   label = "Space",
   className,
   controlClassName,
+  name = "space",
 }: SpaceFilterProps) {
   const known = spaces ?? [];
   const options = spaceOptions(known, value, failed ? "Spaces unavailable" : "Any space");
@@ -79,6 +92,7 @@ export function SpaceFilter({
     <label className={className ? `nd-field ${className}` : "nd-field"}>
       <span className="nd-label">{label}</span>
       <select
+        name={name}
         className={controlClassName ? `nd-select ${controlClassName}` : "nd-select"}
         value={selected}
         disabled={spaces === null && !failed}

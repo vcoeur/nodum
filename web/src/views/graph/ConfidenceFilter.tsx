@@ -49,6 +49,7 @@ export function ConfidenceFilter({
     <div className="nd-graph__confidence">
       <label className="nd-graph__check">
         <input
+          name="graph-confidence-floor"
           type="checkbox"
           checked={enabled}
           onChange={(event) => onChange(event.target.checked ? INITIAL_FLOOR : null)}
@@ -60,6 +61,7 @@ export function ConfidenceFilter({
         <>
           <div className="nd-graph__slider">
             <input
+              name="graph-min-confidence"
               type="range"
               min={0}
               max={1}

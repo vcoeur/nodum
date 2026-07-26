@@ -217,6 +217,13 @@ export interface SpaceSection {
   /** This space's oldest waiting proposal; `""` when there are none. */
   oldestAt: string;
   /**
+   * How many of these proposals are edges that leave this space.
+   *
+   * Filed here under their source (see {@link edgeCrossing}), so the count is
+   * what lets the header state the simplification instead of embodying it.
+   */
+  crossings: number;
+  /**
    * Agents holding `edit` here — they land writes `active`, so nothing they do
    * reaches this queue. Populated on a queue section too: a space with both an
    * `edit` agent and waiting proposals means some *other* agent holds only
@@ -251,7 +258,9 @@ export function editGrantedAgents(space: SpaceOut): string[] {
  *   `src → dst` and the assertion originates at the subject; note that
  *   reviewing a cross-space edge in fact needs authority on *both* endpoint
  *   spaces (`Store.edge_landing_state`), so filing it under one is a
- *   simplification the section header should not pretend otherwise about.
+ *   simplification the section header must not pretend otherwise about —
+ *   {@link edgeCrossing} and {@link SpaceSection.crossings} are what stop it
+ *   pretending.
  *
  * Null means the referenced node did not come back — undone, or otherwise gone
  * — which is the whole of what {@link UNREPORTED_SPACE} now covers.
@@ -270,6 +279,41 @@ export function proposalSpace(proposal: ProposalOut): string | null {
   }
   if (proposal.version) return contextRef(proposal.context, "node")?.spaceId ?? null;
   return null;
+}
+
+/** An edge proposal whose two endpoints live in different spaces. */
+export interface EdgeCrossing {
+  /** The **source**'s space — the section this proposal is filed under. */
+  from: string;
+  /** The **target**'s space, which the filing says nothing about. */
+  to: string;
+}
+
+/**
+ * The crossing an edge proposal makes, or null when it makes none.
+ *
+ * A cross-space edge is filed under its source's space alone (see
+ * {@link proposalSpace}), while accepting it in fact needs `edit` on **both**
+ * endpoint spaces — `Store.edge_landing_state` is what decides where such an
+ * edge lands. That gap is a deliberate simplification of the grouping, and
+ * this is what keeps it from being a silent one: a queue that files a crossing
+ * under one space and then says nothing about the second is asserting, by
+ * omission, that reviewing it is a single-space act.
+ *
+ * Null for anything that is not a crossing we can see: a node or update
+ * proposal, an edge inside one space, and — deliberately — an edge with an
+ * endpoint the server could not resolve. An unresolved endpoint reports no
+ * space at all, and "no space reported" is not evidence of a different one.
+ *
+ * @param proposal One queue entry.
+ * @returns Both endpoint spaces when they differ, else null.
+ */
+export function edgeCrossing(proposal: ProposalOut): EdgeCrossing | null {
+  if (!proposal.edge) return null;
+  const from = contextRef(proposal.context, "src")?.spaceId ?? null;
+  const to = contextRef(proposal.context, "dst")?.spaceId ?? null;
+  if (from === null || to === null || from === to) return null;
+  return { from, to };
 }
 
 /** Options for {@link groupProposalsBySpace}. */
@@ -332,6 +376,7 @@ export function groupProposalsBySpace(
       total: bucket.length,
       counts,
       oldestAt: agents[0]?.oldestAt ?? "",
+      crossings: bucket.filter((proposal) => edgeCrossing(proposal) !== null).length,
       editAgents: grantsBySpace.get(spaceId) ?? [],
     });
   }
@@ -350,6 +395,7 @@ export function groupProposalsBySpace(
       total: 0,
       counts: emptyCounts(),
       oldestAt: "",
+      crossings: 0,
       editAgents,
     });
   }

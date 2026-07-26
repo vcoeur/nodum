@@ -334,6 +334,31 @@ def test_the_space_clause_is_anded_onto_the_scope_and_never_replaces_it(fresh_db
     assert "c" in params and set(scout.read_spaces) <= set(params)
 
 
+def test_every_search_hit_names_the_space_it_lives_in(fresh_db):
+    """An unnarrowed result list spans spaces, so each hit has to say which.
+
+    The human UI scans this list; without the field a ``main`` hit and a
+    ``research`` hit are indistinguishable until one is opened. Both hit
+    shapes are covered — a fused (ranked) hit and a graph-expansion one, which
+    are built in two different places.
+    """
+    nodes = _three_spaces()
+    service.create_edge(nodes["main"].id, nodes["c"].id, "relates_to", principal=owner())
+
+    result = search.search("territory", principal=owner())
+
+    assert {hit.node_id: hit.space_id for hit in result.hits} == {
+        node.id: node.space_id for node in nodes.values()
+    }
+    # And the three are genuinely different spaces, so the mapping is not vacuous.
+    assert len({node.space_id for node in nodes.values()}) == 3
+    # The expansion hit is constructed separately and must say it too.
+    expanded = search.search("main thing", expand=True, principal=owner())
+    neighbour = next(hit for hit in expanded.hits if hit.node_id == nodes["c"].id)
+    assert neighbour.signals.keys() == {"graph"}
+    assert neighbour.space_id == nodes["c"].space_id
+
+
 def test_a_filtered_search_does_not_reach_out_of_the_space_through_expansion(fresh_db):
     """One-hop expansion respects the filter: a narrowed search stays narrowed."""
     nodes = _three_spaces()

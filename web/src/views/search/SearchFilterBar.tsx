@@ -77,6 +77,7 @@ export function SearchFilterBar({
       <label className="nd-search-filters__field">
         <span className="nd-label">Type</span>
         <select
+          name="search-type"
           className="nd-select nd-search-filters__control"
           value={state.type}
           disabled={nodeTypes === null}
@@ -99,6 +100,7 @@ export function SearchFilterBar({
       <label className="nd-search-filters__field">
         <span className="nd-label">State</span>
         <select
+          name="search-state"
           className="nd-select nd-search-filters__control"
           value={state.state}
           onChange={(event) => onChange({ state: event.target.value as StateFilter })}
@@ -114,6 +116,7 @@ export function SearchFilterBar({
       <label className="nd-search-filters__field nd-search-filters__field--wide">
         <span className="nd-label">Created by</span>
         <input
+          name="search-created-by"
           className="nd-input nd-input--mono nd-search-filters__control"
           type="text"
           value={state.createdBy}
@@ -128,6 +131,7 @@ export function SearchFilterBar({
       <label className="nd-search-filters__field nd-search-filters__field--narrow">
         <span className="nd-label">Limit</span>
         <select
+          name="search-limit"
           className="nd-select nd-search-filters__control"
           value={state.limit}
           onChange={(event) => onChange({ limit: Number(event.target.value) })}
@@ -146,6 +150,7 @@ export function SearchFilterBar({
       <label className="nd-search-filters__field nd-search-filters__field--narrow">
         <span className="nd-label">Order</span>
         <select
+          name="search-order"
           className="nd-select nd-search-filters__control"
           value={state.group}
           title="Grouping only partitions the server's list — it never re-ranks it."
@@ -161,6 +166,7 @@ export function SearchFilterBar({
         title="After fusion, add the one-hop active-edge neighbours of the matches. They did not match your query — they sit next to something that did."
       >
         <input
+          name="search-expand"
           type="checkbox"
           checked={state.expand}
           onChange={(event) => onChange({ expand: event.target.checked })}
@@ -177,6 +183,7 @@ export function SearchFilterBar({
         title="Search the meta space too — node types, edge types, spaces, conventions. Off by default so content listings stay clean. Narrowing the space filter to meta does the same thing."
       >
         <input
+          name="search-include-meta"
           type="checkbox"
           checked={state.includeMeta}
           onChange={(event) => onChange({ includeMeta: event.target.checked })}

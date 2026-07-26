@@ -41,6 +41,7 @@ import type { GrantOut, NodeOut, ProposalOut, SpaceOut, VersionOut } from "../..
 import {
   BATCH_GAP_MS,
   describeCounts,
+  edgeCrossing,
   editGrantedAgents,
   groupProposals,
   groupProposalsBySpace,
@@ -384,6 +385,32 @@ describe("proposalSpace", () => {
   });
 });
 
+describe("edgeCrossing", () => {
+  it("names both spaces of an edge that leaves the one it is filed under", () => {
+    expect(edgeCrossing(edgeProposal("agent:a", 0, "n-src", "n-dst", "sp-a", "sp-b"))).toEqual({
+      from: "sp-a",
+      to: "sp-b",
+    });
+  });
+
+  it("reports no crossing for an edge inside one space", () => {
+    expect(edgeCrossing(edgeProposal("agent:a", 0, "n-src", "n-dst", "sp-a", "sp-a"))).toBeNull();
+  });
+
+  it("claims no crossing when an endpoint reported no space", () => {
+    // "No space reported" is not evidence of a *different* space: the endpoint
+    // no longer resolves, and inventing a crossing from that would tell the
+    // reviewer their accept needs authority somewhere nothing named.
+    expect(edgeCrossing(edgeProposal("agent:a", 0, "n-src", "n-dst", null, "sp-b"))).toBeNull();
+    expect(edgeCrossing(edgeProposal("agent:a", 0, "n-src", "n-dst", "sp-a", null))).toBeNull();
+  });
+
+  it("reports nothing for the kinds that have no two endpoints", () => {
+    expect(edgeCrossing(nodeProposal("agent:a", 0, "n-1", "sp-a"))).toBeNull();
+    expect(edgeCrossing(updateProposal("agent:a", 0, "n-1", "sp-a"))).toBeNull();
+  });
+});
+
 describe("groupProposalsBySpace", () => {
   const research = space("sp-research", "research", [
     grant("agent:scout", "sp-research", "suggest"),
@@ -427,6 +454,32 @@ describe("groupProposalsBySpace", () => {
     expect(byId.get("sp-research")!.total).toBe(2);
     expect(byId.get("sp-research")!.counts).toEqual({ node: 2, edge: 0, update: 0 });
     expect(byId.get("sp-main")!.total).toBe(1);
+  });
+
+  it("counts the crossings a section is hiding under its own name", () => {
+    // Two of these three are edges out of `research`; the section is the only
+    // place a human can learn that before opening every card, because the
+    // grouping filed them here under their source alone.
+    const sections = groupProposalsBySpace(
+      [
+        edgeProposal("agent:a", 0, "n-1", "n-2", "sp-research", "sp-main"),
+        edgeProposal("agent:a", 1_000, "n-3", "n-4", "sp-research", "sp-journal"),
+        edgeProposal("agent:a", 2_000, "n-5", "n-6", "sp-research", "sp-research"),
+        nodeProposal("agent:a", 3_000, "n-7", "sp-research"),
+      ],
+      spaces,
+    );
+    const research = sections.find((section) => section.spaceId === "sp-research");
+    expect(research!.total).toBe(4);
+    expect(research!.crossings).toBe(2);
+  });
+
+  it("counts no crossing where there is none to state", () => {
+    const sections = groupProposalsBySpace(
+      [nodeProposal("agent:a", 0, "n-1", "sp-research")],
+      spaces,
+    );
+    expect(sections.every((section) => section.crossings === 0)).toBe(true);
   });
 
   it("orders spaces by their oldest waiting proposal, not by volume", () => {

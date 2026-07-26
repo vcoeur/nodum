@@ -67,6 +67,7 @@ export function SpaceCard({ row, spaces, onRename, onArchive }: SpaceCardProps) 
           {renaming ? (
             <div className="nd-sp-rename">
               <input
+                name={`rename-${row.id}`}
                 className="nd-input"
                 type="text"
                 value={draftName}

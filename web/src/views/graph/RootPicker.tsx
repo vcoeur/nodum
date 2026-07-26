@@ -75,6 +75,7 @@ export function RootPicker({ onPick, compact = false, autoFocus = false }: RootP
       <label className="nd-field">
         <span className="nd-label">Root node</span>
         <input
+          name="graph-root"
           className="nd-input"
           type="search"
           value={query}

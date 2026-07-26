@@ -350,10 +350,14 @@ degrades to BM25 + graph expansion. `NODUM_EMBED_MODEL` switches the model
   every space in scope; a single app-wide *write target* (sticky across sessions
   and across tabs) says where a new node lands, and is rendered on every surface
   that creates one — a persisted target the human cannot see is how work gets
-  filed into a space nobody chose. The review queue groups proposals by space,
+  filed into a space nobody chose. Every search result names its space unless
+  the filter already determined it, so the list a human scans is readable across
+  spaces. The review queue groups proposals by space,
   then by agent, so a space that governs itself (an agent holds `edit`, its
   writes land `active` and never queue) is visible as *self-governing* rather
-  than as silence. Nothing in the UI ever reports a space as missing: the server
+  than as silence; a cross-space edge proposal is filed under its source's space
+  and **marked as a crossing**, because accepting one needs authority on both
+  endpoints. Nothing in the UI ever reports a space as missing: the server
   refuses an unknown space and an ungranted one with identical words, and the
   interface keeps that ambiguity intact.
 - **Assets and renditions.** `asset register` streams a file into the
@@ -439,7 +443,9 @@ degrades to BM25 + graph expansion. `NODUM_EMBED_MODEL` switches the model
   fixed-window text chunks (512 words, ~15% overlap, `model_id` recorded per
   chunk). `nodum search` fuses both — BM25 and vector lists merged by
   reciprocal rank fusion, then one-hop graph expansion along `active` edges —
-  and every hit carries a per-signal `signals` breakdown. With no embedding
+  and every hit carries a per-signal `signals` breakdown plus the `space_id` it
+  lives in, since a result list spans every space in scope unless `--space`
+  narrowed it. With no embedding
   provider, the vector signal drops out and search stays BM25 + graph.
 
 See [docs/architecture.md](docs/architecture.md) for the module map and

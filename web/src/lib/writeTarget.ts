@@ -20,7 +20,10 @@
  * that can say whether one still resolves. A target naming a space that has
  * since been archived or renamed therefore survives here and fails at the
  * write, which is the honest place for it to fail — silently rewriting it to
- * `main` would file the node somewhere the human never chose.
+ * `main` would file the node somewhere the human never chose. The rule is
+ * about silence rather than immutability: {@link clearWriteTarget} exists for
+ * the one case where the human is the one retiring the space they are filing
+ * into, and `/spaces` announces that reset both before the click and after it.
  *
  * Shaped after `session.ts`: a module-level value plus a subscriber set, so the
  * one piece of state has one owner and the shell, the editor and the `/spaces`

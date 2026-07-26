@@ -175,6 +175,7 @@ export function AgentCard({ agent, grants, spaces, onChanged, onToken }: AgentCa
       {available.length > 0 ? (
         <div className="nd-row nd-ad-agent__add">
           <select
+            name={`grant-space-${agent.id}`}
             className="nd-select"
             value={pick}
             onChange={(event) => setNewSpace(event.target.value)}
@@ -187,6 +188,7 @@ export function AgentCard({ agent, grants, spaces, onChanged, onToken }: AgentCa
             ))}
           </select>
           <select
+            name={`grant-level-${agent.id}`}
             className="nd-select"
             value={newLevel}
             onChange={(event) => setNewLevel(event.target.value as GrantLevel)}

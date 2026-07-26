@@ -425,7 +425,12 @@ node for exactly this reason.
   `type`/`state`/`created_by`/date filters; optional one-hop graph expansion
   over `active` edges (`--expand`) applies after fusion. Hits carry the
   fused `score` plus a per-signal `signals` breakdown (`bm25` / `vector` /
-  `graph`). With no embedding provider the vector signal is skipped —
+  `graph`) **and their `space_id`** — a result list spans every space in scope
+  unless `space` narrowed it, so a hit that did not name its own would be
+  unplaceable on the one surface a human scans rather than reads. All three
+  hit shapes carry it (both ranked lists build `_RankedRow`, graph expansion
+  builds its own `SearchHit`); adding a fourth means carrying it there too.
+  With no embedding provider the vector signal is skipped —
   search silently degrades to BM25 + graph.
 - **`nodum.db`** — connection management (WAL, foreign keys), `NODUM_DB`
   resolution, the migration runner. Each migration's script and its
@@ -938,13 +943,47 @@ Phase-1 decision log.
   `spaceLabel` — a space reference is an id *or* a name everywhere, so resolve
   before comparing); the `GET /api/spaces` read behind all of them is
   `components/useSpaces.ts`. Do not add a seventh copy of that fetch or a second
-  `spaceLabel`.
+  `spaceLabel`. `GET /api/spaces` is **active-only and stays that way** — it is
+  the vocabulary behind every picker, and a retired space belongs in none of
+  them. The review queue is the one surface that must name a space this listing
+  cannot (a space archived while its proposals waited), and it does that with a
+  *view-local* read of archived space nodes (`views/review/useArchivedSpaces.ts`,
+  resolved by `views/review/spaceNaming.ts`) rather than by widening the shared
+  one. A second view needing the same thing is the moment to reconsider — not a
+  reason to change this endpoint.
+- **Every surface that displays a node says which space it is in** — the exit
+  criterion of the spaces phase, and search is the surface where it matters
+  most, because a result list is *scanned*. The rule for how loudly:
+  **a row states a dimension the filter has not already determined.** A concrete
+  space filter is ANDed onto both ranked lists and onto graph expansion, so
+  under one every hit provably lives there and repeating it per row is the
+  filter read back; under *any space* it is the fact the scan needs.
+  `views/search/resultSpace.ts` owns that rule, beside the identical one
+  `ResultRow.knownState` follows for the state filter.
+- **Where the review queue simplifies, it says so.** A cross-space edge proposal
+  is filed under **one** space (its source's) while accepting it needs `edit` on
+  **both** endpoints (`Store.edge_landing_state`). The filing rule stays — a
+  proposal rendered under two sections, or a "crossings" section, is a grouping
+  change nothing asked for — so the honesty is carried instead by
+  `grouping.edgeCrossing`: the card is marked `cross-space`, the Inspect panel
+  names the space of each endpoint and states the both-ends rule, and the
+  section header counts how many of its proposals leave it
+  (`SpaceSection.crossings`). A header that files a crossing under one space and
+  then says nothing is asserting, by omission, that reviewing it is a
+  single-space act. The same applies to a section for an archived space: it is
+  named and marked, never left as a bare id.
 - **The write target is app-wide, sticky, and must be visible** (design decision
   D1a). `src/lib/writeTarget.ts` owns it: one module-level value, persisted in
   `localStorage`, synchronised across tabs through the `storage` event, and
-  never silently rewritten — a target naming an archived space survives and
-  fails at the write, because filing a node somewhere the human did not choose
-  is worse than a refusal they can read. `useWriteTarget()` is the subscription;
+  **never changed without the human being told** — a target naming a space
+  archived from somewhere else (the CLI, another session) survives and fails at
+  the write, because filing a node somewhere the human did not choose is worse
+  than a refusal they can read. The one reset is `clearWriteTarget()`, which
+  `/spaces` calls when the human archives the very space they are filing into:
+  that is the second half of an act they just performed, not a correction behind
+  their back, and it is announced in both the archive confirmation (before) and
+  the toast (after). The rule is about *silence*, not about immutability.
+  `useWriteTarget()` is the subscription;
   a surface that creates a node **shows** the current target, and the post-create
   confirmation names the space the server actually filed it in. Calling
   `getWriteTarget()` without rendering the answer is the failure this module
@@ -968,8 +1007,19 @@ Phase-1 decision log.
   means "you can act on this", the state ramp means the service-layer state
   machine (`proposed` violet, `active` sea-green, `archived` lowest-contrast).
   Anything else needs its own hue, kept view-local until a second view names it.
+  Exactly one has: `--nd-crossing` (magenta) means *this edge's endpoints are in
+  two different spaces*, which is neither an affordance nor a state. It began
+  view-local in the graph (D5) and moved into `styles/tokens.css` when the review
+  queue had to mark the same fact, which is the promotion rule working rather
+  than an exception to it.
   Class names are `nd-`-prefixed because Mermaid and Cytoscape inject global
   stylesheets on `.node`, `.label`, and `.edge`.
+- **A form control carries an `id` or a `name`** — a field with neither is one a
+  browser cannot address, which is what DevTools flags and what autofill and
+  assistive tooling fall back to guessing about. There is no `<form>` submit
+  anywhere here, so the value never travels; the attribute exists to make the
+  control a named thing. `SpaceFilter` takes `name` as a prop (default `space`)
+  for the same reason it takes `controlClassName`.
 - **A pure module gets a `*.test.ts` beside it** (`make web-test`, Vitest). The
   harness is unit-only by design — no component rendering — so pull the logic
   worth testing out of the component and test it there, which is what

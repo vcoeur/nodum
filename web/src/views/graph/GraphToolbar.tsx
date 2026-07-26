@@ -149,6 +149,7 @@ export function GraphToolbar({
           <span className="nd-label">Depth</span>
           <span className="nd-graph__slider">
             <input
+              name="graph-depth"
               type="range"
               min={MIN_DEPTH}
               max={MAX_DEPTH}
@@ -165,6 +166,7 @@ export function GraphToolbar({
         <label className="nd-graph__control">
           <span className="nd-label">Node limit</span>
           <input
+            name="graph-limit"
             className="nd-input nd-input--mono nd-graph__number"
             type="number"
             min={MIN_LIMIT}
@@ -188,6 +190,7 @@ export function GraphToolbar({
             {EDGE_STATES.map((state) => (
               <label key={state} className="nd-graph__check">
                 <input
+                  name={`graph-edge-state-${state}`}
                   type="checkbox"
                   checked={filters.edgeStates.includes(state)}
                   onChange={() => toggleEdgeState(state)}
@@ -230,6 +233,7 @@ export function GraphToolbar({
         <label className="nd-graph__control">
           <span className="nd-label">Edges by</span>
           <input
+            name="graph-created-by"
             className="nd-input nd-input--mono nd-graph__actor"
             type="text"
             list="nd-graph-actors"

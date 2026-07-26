@@ -149,10 +149,18 @@ def _node_filters(
 class _RankedRow:
     """One signal's ranked candidate: a node plus its display shape."""
 
-    __slots__ = ("node_id", "type", "title", "snippet")
+    __slots__ = ("node_id", "space_id", "type", "title", "snippet")
 
-    def __init__(self, node_id: str, type: str, title: str | None, snippet: str) -> None:
+    def __init__(
+        self,
+        node_id: str,
+        space_id: str | None,
+        type: str,
+        title: str | None,
+        snippet: str,
+    ) -> None:
         self.node_id = node_id
+        self.space_id = space_id
         self.type = type
         self.title = title
         self.snippet = snippet
@@ -180,7 +188,7 @@ def _search_bm25(
     weights = ", ".join(str(w) for w in _BM25_WEIGHTS)
     rows = conn.execute(
         f"""
-        SELECT n.id, n.type_id, n.title,
+        SELECT n.id, n.space_id, n.type_id, n.title,
                snippet(node_fts, 2, ?, ?, '…', 40) AS snippet
         FROM node_fts
         JOIN nodes n ON n.id = node_fts.node_id
@@ -193,6 +201,7 @@ def _search_bm25(
     return [
         _RankedRow(
             node_id=row["id"],
+            space_id=row["space_id"],
             type=row["type_id"],
             title=row["title"],
             snippet=row["snippet"] or (row["title"] or ""),
@@ -229,7 +238,8 @@ def _search_vector(
     clauses = filters or ["1=1"]
     rows = conn.execute(
         f"""
-        SELECT n.id, n.type_id, n.title, c.text AS chunk_text, MIN(knn.distance) AS distance
+        SELECT n.id, n.space_id, n.type_id, n.title, c.text AS chunk_text,
+               MIN(knn.distance) AS distance
         FROM (
             SELECT rowid AS chunk_id, distance
             FROM node_vec
@@ -252,6 +262,7 @@ def _search_vector(
     return [
         _RankedRow(
             node_id=row["id"],
+            space_id=row["space_id"],
             type=row["type_id"],
             title=row["title"],
             snippet=_chunk_snippet(row["chunk_text"]) or (row["title"] or ""),
@@ -297,6 +308,7 @@ def _fuse(
         hits.append(
             SearchHit(
                 node_id=node_id,
+                space_id=shape.space_id,
                 type=shape.type,
                 title=shape.title,
                 snippet=shape.snippet,
@@ -365,6 +377,7 @@ def _expand_hits(
         expanded.append(
             SearchHit(
                 node_id=node_id,
+                space_id=row["space_id"],
                 type=row["type_id"],
                 title=row["title"],
                 snippet=row["title"] or "",

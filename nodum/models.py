@@ -173,9 +173,16 @@ class SearchHit(BaseModel):
     carries each retrieval signal's contribution: RRF contributions for
     ``bm25`` and ``vector`` (they sum to ``score``), and the edge weight for
     ``graph`` expansion hits.
+
+    ``space_id`` is the space the node lives in. A result list spans every
+    space in scope unless ``--space`` narrowed it, so without this a reader
+    scanning results cannot tell a ``main`` hit from a ``research`` one
+    (human-UI D1: the filter is a filter, not a mode). It is nullable for the
+    same reason :class:`NodeOut` is — the column is.
     """
 
     node_id: str
+    space_id: str | None
     type: str
     title: str | None
     snippet: str

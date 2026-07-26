@@ -14,6 +14,11 @@ import { renderSnippet } from "./snippet";
  * links and Enter is the browser's own activation, not a re-implementation of
  * it. The row highlights on `:focus-within`, so focus anywhere inside it —
  * title, subgraph link — reads as "this row".
+ *
+ * The head's right-hand marks are the row's dimensions, in filter order: the
+ * space (only when the filter left it open — see `resultSpace.ts`), then type
+ * and state. They sit at one x position down the list precisely because the
+ * list is scanned rather than read.
  */
 
 interface ResultRowProps {
@@ -29,6 +34,15 @@ interface ResultRowProps {
    * rather than guessing.
    */
   knownState: string | null;
+  /**
+   * What to call this hit's space, or null when the row states none.
+   *
+   * Computed by `hitSpaceLabel` (`resultSpace.ts`), which follows the same rule as
+   * `knownState` one dimension over: an active space filter determines every
+   * hit's space, so the row names it only when the search spanned more than
+   * one.
+   */
+  spaceName: string | null;
   /** Query terms to mark in the snippet. */
   terms: string[];
   /** Registers the title link so the view can move focus to this row. */
@@ -43,6 +57,7 @@ interface ResultRowProps {
  * @param hit The hit, verbatim from the server.
  * @param index Position in the flattened display order.
  * @param knownState The state implied by the active filter, or null.
+ * @param spaceName The space to name on this row, or null.
  * @param terms Query terms to mark in the snippet.
  * @param linkRef Ref callback for the title link.
  * @param onKeyDown Row-level keyboard handler.
@@ -51,6 +66,7 @@ export function ResultRow({
   hit,
   index,
   knownState,
+  spaceName,
   terms,
   linkRef,
   onKeyDown,
@@ -78,7 +94,17 @@ export function ResultRow({
         >
           {title}
         </Link>
-        <NodeBadge type={hit.type} state={knownState} />
+        <span className="nd-row nd-search-hit__marks">
+          {spaceName === null ? null : (
+            <span
+              className="nd-meta nd-search-hit__space"
+              title={`This node lives in the ${spaceName} space. Narrow the space filter to read only that one.`}
+            >
+              in <span className="nd-mono">{spaceName}</span>
+            </span>
+          )}
+          <NodeBadge type={hit.type} state={knownState} />
+        </span>
       </div>
 
       {showPlaceholder ? (

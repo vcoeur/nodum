@@ -100,8 +100,17 @@
 }
 
 .nd-rv-space__name {
+  display: flex;
+  align-items: baseline;
+  gap: var(--nd-space-4);
   font-size: var(--nd-text-lg);
   color: var(--nd-text);
+}
+
+/* The archived mark beside a section's name: the state ramp's own lowest
+   contrast, since that is exactly what it is saying. */
+.nd-rv-space__mark {
+  font-size: var(--nd-text-2xs);
 }
 
 /*
@@ -307,6 +316,14 @@
   color: var(--nd-accent);
 }
 
+/* A crossing is neither a state nor an affordance, so it takes the third hue —
+   the same one the graph outlines a cross-space edge with. */
+.nd-rv-kind--crossing {
+  border-color: var(--nd-crossing);
+  background: var(--nd-crossing-wash);
+  color: var(--nd-crossing);
+}
+
 /* --- Proposal detail ----------------------------------------------------- */
 
 .nd-rv-detail {
@@ -372,6 +389,12 @@
   font-size: var(--nd-text-sm);
   font-weight: var(--nd-weight-medium);
   overflow-wrap: anywhere;
+}
+
+/* Which space this end lives in — the dimension that decides who may accept
+   the edge, so it sits with the endpoint rather than in the facts list. */
+.nd-rv-edge__space {
+  font-size: var(--nd-text-2xs);
 }
 
 .nd-rv-edge__arrow {
@@ -615,6 +638,13 @@
 .nd-rv-flag--danger {
   border-left-color: var(--nd-danger);
   background: var(--nd-danger-wash);
+}
+
+/* Not a warning: a cross-space edge is ordinary and reviewable. The flag says
+   which two spaces it joins, in the hue the graph uses for the same fact. */
+.nd-rv-flag--crossing {
+  border-left-color: var(--nd-crossing);
+  background: var(--nd-crossing-wash);
 }
 
 /* --- Selection bar, outcome, failure states ------------------------------- */

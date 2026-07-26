@@ -159,9 +159,15 @@ export interface ProjectorRun {
  * `signals` carries each retrieval signal's contribution: RRF contributions
  * for `bm25` and `vector` (they sum to `score`), and the edge weight for
  * `graph` expansion hits.
+ *
+ * `space_id` is where the node lives. A result list spans every space in scope
+ * unless the filter narrowed it, so without this the busiest surface in the UI
+ * cannot answer "which space is this in?" — see `views/search/resultSpace.ts`
+ * for when a row renders it.
  */
 export interface SearchHit {
   node_id: string;
+  space_id: string | null;
   type: string;
   title: string | null;
   snippet: string;

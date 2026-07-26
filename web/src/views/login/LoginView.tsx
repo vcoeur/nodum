@@ -76,6 +76,7 @@ export default function LoginView() {
         <label className="nd-field">
           <span className="nd-label">Name</span>
           <input
+            name="username"
             className="nd-input"
             type="text"
             autoComplete="username"
@@ -87,6 +88,7 @@ export default function LoginView() {
         <label className="nd-field">
           <span className="nd-label">Password</span>
           <input
+            name="current-password"
             className="nd-input"
             type="password"
             autoComplete="current-password"

@@ -86,6 +86,7 @@ export function TypeFilter({ label, options, selected, onChange, anyLabel, note 
                 <li key={type}>
                   <label className="nd-graph__check">
                     <input
+                      name={`graph-type-${type}`}
                       type="checkbox"
                       checked={selected.includes(type)}
                       onChange={() => toggle(type)}

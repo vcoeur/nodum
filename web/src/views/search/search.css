@@ -340,6 +340,18 @@
   gap: var(--nd-space-6);
 }
 
+/* The right-hand marks: space, then type and state. Kept from shrinking so the
+   title ellipses instead of the dimensions a scan is reading down. */
+.nd-search-hit__marks {
+  flex-shrink: 0;
+  --nd-row-gap: var(--nd-space-4);
+}
+
+.nd-search-hit__space {
+  white-space: nowrap;
+  color: var(--nd-text-faint);
+}
+
 .nd-search-hit__title {
   font-size: var(--nd-text-md);
   font-weight: var(--nd-weight-medium);

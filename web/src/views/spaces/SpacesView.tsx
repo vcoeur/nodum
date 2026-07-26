@@ -150,6 +150,7 @@ export default function SpacesView() {
           <section className="nd-sp-create">
             <div className="nd-row">
               <input
+                name="new-space-name"
                 className="nd-input"
                 type="text"
                 placeholder="New space name"
