@@ -15,7 +15,7 @@ class NodeOut(BaseModel):
     """A graph node as emitted to clients. ``type`` is the type id."""
 
     id: str
-    graph_id: str
+    space_id: str | None
     type: str
     parent_id: str | None
     position: float | None
@@ -32,7 +32,6 @@ class EdgeOut(BaseModel):
     """A typed, directed edge. ``type`` is the edge-type id."""
 
     id: str
-    graph_id: str
     src_id: str
     dst_id: str
     type: str
@@ -190,25 +189,6 @@ class SearchResult(BaseModel):
     query: str
     k: int
     hits: list[SearchHit]
-
-
-class PolicyOut(BaseModel):
-    """One agent's policy ruleset (design §8.3).
-
-    ``rules`` is the stored JSON ruleset verbatim: rule objects keyed by
-    ``job`` (internal-agent jobs, evaluated by the Phase-5 runtime) or
-    ``edge_type`` (evaluated on the write path), each with an ``action``
-    (``auto_accept`` / ``auto_apply`` / ``always_propose``) and an optional
-    ``min_confidence`` gate. A gate grades the agent's *self-reported*
-    confidence, so it only fires when the rule also sets
-    ``trust_self_reported_confidence: true``. Rules are validated on write;
-    unknown extra keys are preserved for forward compatibility.
-    """
-
-    agent: str
-    rules: list[dict[str, Any]]
-    updated_by: str
-    updated_at: str
 
 
 class ProposalOut(BaseModel):
@@ -370,3 +350,41 @@ class PurgeResult(BaseModel):
 
     purged: int
     bytes_freed: int
+
+
+class HumanOut(BaseModel):
+    """A human account (identity + credentials + attribution, never a scope)."""
+
+    id: str
+    name: str
+    has_password: bool
+    disabled: bool
+    created_at: str
+
+
+class AgentOut(BaseModel):
+    """An agent account. ``has_token`` is all anyone ever learns of the token."""
+
+    id: str
+    kind: str
+    name: str
+    owner_human_id: str | None
+    has_token: bool
+    disabled: bool
+    created_at: str
+
+
+class AgentCreatedOut(BaseModel):
+    """A new agent plus its token — the one and only time the token is shown."""
+
+    agent: AgentOut
+    token: str
+
+
+class GrantOut(BaseModel):
+    """One (agent, space) grant row."""
+
+    agent_id: str
+    space_id: str
+    level: str
+    created_at: str

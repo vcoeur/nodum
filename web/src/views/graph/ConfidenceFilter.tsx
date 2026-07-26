@@ -2,8 +2,9 @@
  * The confidence floor — the one control in this view that can lie to you.
  *
  * `subgraph`'s `min_confidence` drops every edge whose `confidence` is NULL:
- * unstated is not "meets the bar", the same reading the auto-accept policy gate
- * takes. Human-created edges normally carry no confidence at all, so a floor
+ * unstated is not "meets the bar", the same reading the (since-removed)
+ * auto-accept policy gate took. Human-created edges normally carry no
+ * confidence at all, so a floor
  * left on by default would quietly delete most of a personal graph and present
  * the remainder as the whole thing.
  *

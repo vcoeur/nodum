@@ -15,7 +15,7 @@ reversible.
 ```sh
 pipx install nodum
 nodum init
-nodum node create --type concept --title "Graph Theory"
+nodum node create --type concept --title "Graph Theory" --as owner
 ```
 
 ## Why one file
@@ -31,11 +31,11 @@ nodum assumes both humans and agents write to it, and gives them **different
 privileges enforced at the service layer**, not by convention:
 
 - A human write lands `active` immediately.
-- An agent write lands `proposed` and waits in a review queue — unless a
-  stored policy auto-accepts it.
+- An agent write lands `proposed` when its grant on the space is `suggest`, and
+  `active` when its grant is `edit`.
 - Anything that retires or rewrites live state (`accept`, `reject`, `archive`,
-  `undo`, every `review` subcommand, `policy set`) is **human-only** and is not
-  delegable.
+  `undo`, every `review` subcommand) is limited to a human — or, in-space, to an
+  agent holding `edit` — and `undo` is human-only.
 
 An agent edit does not overwrite: it stages a `proposed` version recording
 *which fields it named*, so accepting it applies only those fields to the node
@@ -49,7 +49,7 @@ The same service layer sits behind every surface, so they cannot drift:
 |---|---|---|
 | CLI | humans, scripts | `nodum …` — one JSON object per command |
 | HTTP API | the web UI | `nodum serve` |
-| MCP server | external agents | `nodum mcp serve --actor agent:<name>` |
+| MCP server | external agents | `nodum mcp serve` — agent token in `NODUM_AGENT_TOKEN` |
 | Web UI | humans | served by `nodum serve` |
 
 The MCP server exposes the read and additive tool tiers **and nothing else** —
@@ -73,15 +73,15 @@ log with versions and undo, Markdown-as-truth content, wikilink
 materialization, and the JSON-emitting CLI.
 
 **Phase 2 (agent-native)** landed: projectors and the two derived indexes,
-hybrid search, DB-stored agent policies with auto-accept, the review/accept
-API, proposed updates, the MCP server, and content-addressed assets with lazily
-generated `thumb`/`preview` renditions (agents get renditions, never
-originals).
+hybrid search, principals, spaces, and per-(agent, space) grants (`read`/`suggest`/`edit`),
+the review/accept API, proposed updates, the MCP server, and content-addressed
+assets with lazily generated `thumb`/`preview` renditions (agents get
+renditions, never originals).
 
-**Phase 3 (human UI)** is underway: `nodum serve` runs the HTTP API — the human
-surface, where every write is attributed to `human` and no request field can
-say otherwise — and serves the web UI from the same process: a Markdown editor,
-hybrid search, the review queue and policy editor, a graph view, an asset
-browser, and per-node version history.
+**Phase 3 (human UI)** landed: `nodum serve` runs the HTTP API — the human
+surface, where every write is attributed to the session's human and no request
+field can say otherwise — and serves the web UI from the same process: a Markdown
+editor, hybrid search, the review queue, a graph view, an asset browser, an
+accounts-and-grants admin view, and per-node version history.
 
 Still to come: the ingestion pipeline and the consolidation cycle.

@@ -90,63 +90,162 @@ def apply_migration(conn: sqlite3.Connection, name: str, sql: str) -> None:
     migration against a clean schema instead of hitting "table … already
     exists" forever on a half-applied one.
 
+    Foreign-key **enforcement is off for the duration**, and the whole
+    database is checked with ``PRAGMA foreign_key_check`` before the commit
+    — SQLite's own recipe for the create-copy-drop-rename table rebuild that
+    0009 performs. Deferring the constraints instead (what 0009 originally
+    asked for) does not work on a populated database: dropping a parent table
+    counts every referencing row as an outstanding deferred violation, and
+    renaming the replacement in does not clear that counter, so ``COMMIT``
+    fails with a bare "FOREIGN KEY constraint failed" even though the
+    resulting schema is sound. One node plus its version row was enough
+    (Q13 review B5) — an empty database, which is all the suite had, was not.
+
+    The script runs through ``executescript``, whose leading implicit commit
+    would silently commit any transaction the caller left open — so the
+    caller must not have one (asserted below).
+
     Args:
-        conn: The open connection.
+        conn: The open connection, with no transaction in flight.
         name: The migration's name, recorded in ``schema_migrations``.
         sql: The migration script (no transaction control of its own).
 
     Raises:
-        ValueError: If ``name`` is not a plain ``[0-9a-z_]`` identifier — it is
-            inlined into the script, which takes no parameters.
+        ValueError: If ``name`` is not a plain ``[0-9a-z_]`` identifier.
+        RuntimeError: If the connection has an open transaction.
+        sqlite3.IntegrityError: If the migrated database has dangling
+            references, naming them, after the rollback.
         sqlite3.Error: Whatever the script raised, after the rollback.
     """
     if not MIGRATION_NAME_RE.fullmatch(name):
         raise ValueError(f"invalid migration name {name!r}: expected {MIGRATION_NAME_RE.pattern}")
-    try:
-        conn.executescript(
-            f"BEGIN;\n{sql}\nINSERT INTO schema_migrations (name) VALUES ('{name}');\nCOMMIT;"
+    if conn.in_transaction:
+        raise RuntimeError(
+            f"cannot apply migration {name!r} with a transaction in flight: "
+            "executescript would commit it as a side effect"
         )
+    # Both pragmas are no-ops inside a transaction, hence out here.
+    conn.execute("PRAGMA foreign_keys=OFF")
+    try:
+        conn.executescript(f"BEGIN;\n{sql}")
+        violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+        if violations:
+            tables = sorted({row[0] for row in violations})
+            raise sqlite3.IntegrityError(
+                f"migration {name!r} leaves dangling references in: {', '.join(tables)}"
+            )
+        conn.execute("INSERT INTO schema_migrations (name) VALUES (?)", (name,))
+        conn.execute("COMMIT")
     except Exception:
         conn.rollback()
         raise
+    finally:
+        conn.execute("PRAGMA foreign_keys=ON")
+
+
+def _tables(conn: sqlite3.Connection) -> set[str]:
+    """Every table name in the live schema."""
+    return {
+        row["name"] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+    }
+
+
+def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    """Every column name of ``table`` (empty when the table is absent)."""
+    return {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
 
 
 def _verify_schema_consistency(conn: sqlite3.Connection) -> None:
     """Refuse a database whose live schema contradicts its recorded migrations.
 
     :func:`init_db` skips any migration whose name is already recorded, so a
-    database that applied a since-consolidated version of a migration keeps its
-    stale schema. The only such case in the shipped history is
-    ``0007_assets_and_renditions``: if the name is recorded, the assets store
-    must be the consolidated in-database one — ``asset_blobs`` present, and
-    ``renditions`` carrying ``data`` rather than the old filesystem ``path``.
+    database that applied a since-consolidated version of a migration keeps
+    its stale schema — the name matches, the schema does not, and the fix is
+    skipped forever. Each check below states what its migration's name
+    *guarantees*, and every recorded migration with a checkable guarantee has
+    one (Q13 review S6): drift in a later migration used to pass init and
+    surface much later as a missing table deep inside a write.
 
     Raises:
-        SchemaConsistencyError: If ``0007_assets_and_renditions`` is recorded
-            but the live schema is the pre-consolidation path-based one.
+        SchemaConsistencyError: If any recorded migration's guarantee does not
+            hold, naming every problem found and the migration to blame.
     """
-    if "0007_assets_and_renditions" not in set(applied_migrations(conn)):
-        return
-    tables = {
-        row["name"] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
-    }
-    rendition_columns = {row["name"] for row in conn.execute("PRAGMA table_info(renditions)")}
+    recorded = set(applied_migrations(conn))
+    for name, check in (
+        ("0007_assets_and_renditions", _assets_problems),
+        ("0009_spaces_and_type_nodes", _spaces_problems),
+        ("0010_principals", _principals_problems),
+        ("0011_actor_strings", _actor_string_problems),
+    ):
+        if name not in recorded:
+            continue
+        problems = check(conn)
+        if problems:
+            raise SchemaConsistencyError(
+                f"database schema is inconsistent with its recorded migrations "
+                f"({name}): " + "; ".join(problems) + ". This database predates the "
+                "final shape of that migration; it cannot be auto-migrated — delete "
+                "the database file and re-run 'nodum init' to recreate it."
+            )
+
+
+def _assets_problems(conn: sqlite3.Connection) -> list[str]:
+    """0007 guarantees the consolidated in-database assets store.
+
+    A dev database built from an intermediate branch commit stored asset bytes
+    on the filesystem (``renditions.path``, no ``asset_blobs``).
+    """
+    tables, rendition_columns = _tables(conn), _columns(conn, "renditions")
     problems: list[str] = []
     if "asset_blobs" not in tables:
-        problems.append("table 'asset_blobs' is missing")
+        problems.append("table 'asset_blobs' is missing (asset bytes live in the database)")
     if "data" not in rendition_columns:
         problems.append("table 'renditions' has no 'data' column")
     if "path" in rendition_columns:
         problems.append("table 'renditions' still carries a filesystem 'path' column")
-    if problems:
-        raise SchemaConsistencyError(
-            "database schema is inconsistent with its recorded migrations: "
-            + "; ".join(problems)
-            + ". This database predates the consolidation of the assets tables into "
-            "migration 0007 (bytes now live in 'asset_blobs' and 'renditions.data', never "
-            "on a filesystem path); it cannot be auto-migrated — delete the database file "
-            "and re-run 'nodum init' to recreate it."
-        )
+    return problems
+
+
+def _spaces_problems(conn: sqlite3.Connection) -> list[str]:
+    """0009 guarantees types-are-nodes: no catalogs, ``space_id``, bootstrap ids."""
+    tables, node_columns = _tables(conn), _columns(conn, "nodes")
+    problems: list[str] = []
+    if "types" in tables or "edge_types" in tables:
+        problems.append("type catalog tables still present")
+    if "space_id" not in node_columns:
+        problems.append("table 'nodes' has no 'space_id' column")
+        return problems  # the bootstrap check below would fail on the column
+    present = {
+        row["id"]
+        for row in conn.execute("SELECT id FROM nodes WHERE id IN ('type','space','meta','main')")
+    }
+    missing = sorted({"type", "space", "meta", "main"} - present)
+    if missing:
+        problems.append(f"bootstrap nodes missing: {', '.join(missing)}")
+    return problems
+
+
+def _principals_problems(conn: sqlite3.Connection) -> list[str]:
+    """0010 guarantees the principal tables exist and the policy layer is gone."""
+    tables = _tables(conn)
+    problems = [
+        f"table {table!r} is missing"
+        for table in ("humans", "agents", "grants", "sessions")
+        if table not in tables
+    ]
+    if "policies" in tables:
+        problems.append("table 'policies' still present (grants replaced it)")
+    return problems
+
+
+def _actor_string_problems(conn: sqlite3.Connection) -> list[str]:
+    """0011 guarantees no bare ``human`` actor survives in the log."""
+    problems: list[str] = []
+    for table in ("events", "versions"):
+        row = conn.execute(f"SELECT 1 FROM {table} WHERE actor = 'human' LIMIT 1").fetchone()
+        if row is not None:
+            problems.append(f"table {table!r} still carries unstructured 'human' actors")
+    return problems
 
 
 def init_db(conn: sqlite3.Connection) -> list[str]:
@@ -155,10 +254,13 @@ def init_db(conn: sqlite3.Connection) -> list[str]:
     Idempotent: a fully migrated database applies nothing and returns ``[]``.
     Each migration is applied atomically (:func:`apply_migration`), so a
     failure leaves the database exactly as the last successful migration left
-    it. After applying, the live schema is checked against the recorded
-    migrations (:func:`_verify_schema_consistency`) so a database that carries
-    a since-consolidated migration name fails loudly here rather than deep in a
-    later call.
+    it.
+
+    The live schema is checked against the recorded migrations
+    (:func:`_verify_schema_consistency`) **before** anything is applied (Q13
+    review S5): a database whose only cure is deletion must not have new —
+    and sometimes irreversible, like 0010's ``DROP TABLE policies`` —
+    migrations committed onto it on the way to being told so.
 
     Raises:
         SchemaConsistencyError: If the live schema contradicts the recorded
@@ -173,6 +275,7 @@ def init_db(conn: sqlite3.Connection) -> list[str]:
         """
     )
     conn.commit()
+    _verify_schema_consistency(conn)
     applied: list[str] = []
     already = set(applied_migrations(conn))
     for name, sql in MIGRATIONS:
@@ -180,5 +283,4 @@ def init_db(conn: sqlite3.Connection) -> list[str]:
             continue
         apply_migration(conn, name, sql)
         applied.append(name)
-    _verify_schema_consistency(conn)
     return applied

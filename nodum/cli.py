@@ -26,12 +26,12 @@ from nodum.assets import AssetNotFound, AssetSourceChanged, AssetTooLarge, Unsup
 from nodum.cli_schema import build_cli_schema
 from nodum.db import ENV_DB_VAR
 from nodum.envelope import envelope, list_envelope, render_json
+from nodum.principal import Principal
 from nodum.service import (
     EventNotFound,
+    GrantNotPermitted,
     InvalidTransition,
-    PolicyNotFound,
     RecordNotFound,
-    ReviewNotPermitted,
     TypeNotFound,
     UndoNotPossible,
 )
@@ -46,7 +46,8 @@ edge_app = typer.Typer(no_args_is_help=True, help="Edge operations.")
 projector_app = typer.Typer(
     no_args_is_help=True, help="Derived-index projectors over the event log."
 )
-policy_app = typer.Typer(no_args_is_help=True, help="Per-agent policy rulesets (auto-accept).")
+human_app = typer.Typer(no_args_is_help=True, help="Human account administration.")
+agent_app = typer.Typer(no_args_is_help=True, help="Agent account administration.")
 review_app = typer.Typer(
     no_args_is_help=True, help="The review queue: pending proposals (human actor only)."
 )
@@ -59,8 +60,9 @@ asset_app = typer.Typer(
 app.add_typer(node_app, name="node")
 app.add_typer(edge_app, name="edge")
 app.add_typer(projector_app, name="projector")
-app.add_typer(policy_app, name="policy")
 app.add_typer(review_app, name="review")
+app.add_typer(human_app, name="human")
+app.add_typer(agent_app, name="agent")
 app.add_typer(mcp_app, name="mcp")
 app.add_typer(asset_app, name="asset")
 
@@ -155,13 +157,12 @@ def _run(func, *args, **kwargs):
         RecordNotFound,
         TypeNotFound,
         EventNotFound,
-        PolicyNotFound,
         AssetNotFound,
         AssetTooLarge,
         AssetSourceChanged,
         UnsupportedRendition,
         InvalidTransition,
-        ReviewNotPermitted,
+        GrantNotPermitted,
         UndoNotPossible,
         ValueError,
     ) as exc:
@@ -179,7 +180,21 @@ def _run(func, *args, **kwargs):
         raise typer.Exit(1) from exc
 
 
-ACTOR_OPTION = typer.Option("human", "--actor", help="Write actor: 'human' or 'agent:<name>'.")
+AS_OPTION = typer.Option(
+    ...,
+    "--as",
+    help="Your human account ('human:<id>' or '<id>') — attribution is explicit, always.",
+)
+
+
+def _principal(as_human: str) -> Principal:
+    """Resolve ``--as`` to a human principal (trusted-local, no password)."""
+    from nodum import auth
+
+    human_id = as_human.removeprefix("human:")
+    return auth.owner_principal(human_id)
+
+
 SET_OPTION = typer.Option(None, "--set", help="Repeatable key=value props (values parsed as JSON).")
 
 
@@ -199,7 +214,7 @@ def node_create(
     ),
     parent: str | None = typer.Option(None, "--parent", help="Parent node id."),
     set_props: list[str] | None = SET_OPTION,
-    actor: str = ACTOR_OPTION,
+    as_human: str = AS_OPTION,
 ) -> None:
     """Create a node (active for actor 'human', proposed otherwise)."""
     node = _run(
@@ -209,7 +224,7 @@ def node_create(
         content=_read_content(content, content_file) or "",
         parent_id=parent,
         props=_parse_set(set_props),
-        actor=actor,
+        principal=_principal(as_human),
     )
     _emit(node)
 
@@ -220,12 +235,13 @@ def node_get(
     depth: int = typer.Option(
         0, "--depth", help="Include the active-edge neighborhood out to this many hops."
     ),
+    as_human: str = AS_OPTION,
 ) -> None:
     """Fetch one node by id (plus its neighborhood when --depth > 0)."""
     if depth > 0:
-        _emit(_run(service.get_neighborhood, node_id, depth=depth))
+        _emit(_run(service.get_neighborhood, node_id, depth=depth, principal=_principal(as_human)))
     else:
-        _emit(_run(service.get_node, node_id))
+        _emit(_run(service.get_node, node_id, principal=_principal(as_human)))
 
 
 @node_app.command("update")
@@ -237,10 +253,10 @@ def node_update(
         None, "--content-file", help="Read the new Markdown body from a file ('-' = stdin)."
     ),
     set_props: list[str] | None = SET_OPTION,
-    actor: str = ACTOR_OPTION,
+    as_human: str = AS_OPTION,
 ) -> None:
-    """Update a node (applies for actor 'human', stages a proposed version otherwise)."""
-    kwargs: dict = {"actor": actor}
+    """Update a node (applies with edit, stages a proposed version with suggest)."""
+    kwargs: dict = {"principal": _principal(as_human)}
     resolved = _read_content(content, content_file)
     if title is not None:
         kwargs["title"] = title
@@ -260,16 +276,27 @@ def node_list(
     state: str | None = typer.Option(None, "--state", help="Filter by state."),
     parent: str | None = typer.Option(None, "--parent", help="Filter by parent node id."),
     limit: int = typer.Option(500, "--limit", help="Maximum rows."),
+    as_human: str = AS_OPTION,
 ) -> None:
     """List nodes in creation order, optionally filtered."""
-    nodes = _run(service.list_nodes, type=type, state=state, parent_id=parent, limit=limit)
+    nodes = _run(
+        service.list_nodes,
+        type=type,
+        state=state,
+        parent_id=parent,
+        principal=_principal(as_human),
+        limit=limit,
+    )
     _emit_list("nodes", nodes)
 
 
 @node_app.command("children")
-def node_children(node_id: str = typer.Argument(..., help="Parent node id.")) -> None:
+def node_children(
+    node_id: str = typer.Argument(..., help="Parent node id."),
+    as_human: str = AS_OPTION,
+) -> None:
     """List a node's children in position order."""
-    nodes = _run(service.list_children, node_id)
+    nodes = _run(service.list_children, node_id, principal=_principal(as_human))
     _emit_list("nodes", nodes)
 
 
@@ -280,7 +307,7 @@ def edge_create(
     type: str = typer.Option(..., "--type", "-t", help="Edge type id or name."),
     confidence: float | None = typer.Option(None, "--confidence", help="Confidence in [0, 1]."),
     set_props: list[str] | None = SET_OPTION,
-    actor: str = ACTOR_OPTION,
+    as_human: str = AS_OPTION,
 ) -> None:
     """Create a typed, directed edge between two nodes."""
     edge = _run(
@@ -290,7 +317,7 @@ def edge_create(
         type,
         props=_parse_set(set_props),
         confidence=confidence,
-        actor=actor,
+        principal=_principal(as_human),
     )
     _emit(edge)
 
@@ -301,9 +328,17 @@ def edge_list(
     type: str | None = typer.Option(None, "--type", "-t", help="Filter by edge type."),
     state: str | None = typer.Option(None, "--state", help="Filter by state."),
     limit: int = typer.Option(500, "--limit", help="Maximum rows."),
+    as_human: str = AS_OPTION,
 ) -> None:
     """List edges, optionally filtered by incident node, type, or state."""
-    edges = _run(service.list_edges, node_id=node, type=type, state=state, limit=limit)
+    edges = _run(
+        service.list_edges,
+        node_id=node,
+        type=type,
+        state=state,
+        principal=_principal(as_human),
+        limit=limit,
+    )
     _emit_list("edges", edges)
 
 
@@ -312,7 +347,7 @@ def edge_create_batch(
     suggestions_file: str = typer.Argument(
         ..., help="JSON array of {src, dst, edge_type, props?, confidence?} ('-' = stdin)."
     ),
-    actor: str = ACTOR_OPTION,
+    as_human: str = AS_OPTION,
 ) -> None:
     """Propose a batch of edges; bad suggestions are reported, not fatal."""
     raw = sys.stdin.read() if suggestions_file == "-" else Path(suggestions_file).read_text()
@@ -324,72 +359,86 @@ def edge_create_batch(
     if not isinstance(suggestions, list):
         typer.echo("expected a JSON array of edge suggestions", err=True)
         raise typer.Exit(1)
-    _emit(_run(service.propose_edges, suggestions, actor=actor))
+    _emit(_run(service.propose_edges, suggestions, principal=_principal(as_human)))
 
 
 @app.command()
 def accept(
     record_id: str = typer.Argument(..., help="Node, edge, or proposed-version id."),
-    actor: str = ACTOR_OPTION,
+    as_human: str = AS_OPTION,
 ) -> None:
     """Accept a proposed node, edge, or update (proposed → active) — human actor only.
 
     A proposed-version id applies exactly the fields the proposal named to
     the node as it stands now.
     """
-    _emit(_run(service.transition, record_id, "accept", actor=actor))
+    _emit(_run(service.transition, record_id, "accept", principal=_principal(as_human)))
 
 
 @app.command()
 def reject(
     record_id: str = typer.Argument(..., help="Node, edge, or proposed-version id."),
     reason: str = typer.Option(..., "--reason", help="Recorded in the reject event."),
-    actor: str = ACTOR_OPTION,
+    as_human: str = AS_OPTION,
 ) -> None:
     """Reject a proposed node, edge, or update (proposed → archived) — human actor only.
 
     The reason is required and lands in the event payload, exactly as it does
     for the batch `review reject` — one operation, one audit guarantee.
     """
-    _emit(_run(service.transition, record_id, "reject", reason=reason, actor=actor))
+    _emit(
+        _run(
+            service.transition,
+            record_id,
+            "reject",
+            reason=reason,
+            principal=_principal(as_human),
+        )
+    )
 
 
 @app.command()
 def archive(
     record_id: str = typer.Argument(..., help="Node or edge id."),
-    actor: str = ACTOR_OPTION,
+    as_human: str = AS_OPTION,
 ) -> None:
     """Archive an active node or edge (active → archived)."""
-    _emit(_run(service.transition, record_id, "archive", actor=actor))
+    _emit(_run(service.transition, record_id, "archive", principal=_principal(as_human)))
 
 
 @app.command()
 def undo(
     seq: int | None = typer.Argument(None, help="Event seq to reverse (default: latest)."),
-    actor: str = ACTOR_OPTION,
+    as_human: str = AS_OPTION,
 ) -> None:
     """Reverse an event, restoring the prior state from its payload."""
-    _emit(_run(service.undo, seq, actor=actor))
+    _emit(_run(service.undo, seq, principal=_principal(as_human)))
 
 
 @app.command()
-def history(node_id: str = typer.Argument(..., help="Node id.")) -> None:
+def history(
+    node_id: str = typer.Argument(..., help="Node id."),
+    as_human: str = AS_OPTION,
+) -> None:
     """Show a node's version history (chronological)."""
-    versions = _run(service.history, node_id)
+    versions = _run(service.history, node_id, principal=_principal(as_human))
     _emit_list("versions", versions)
 
 
 @app.command()
-def events(limit: int = typer.Option(50, "--limit", help="Maximum rows.")) -> None:
+def events(
+    limit: int = typer.Option(50, "--limit", help="Maximum rows."),
+    as_human: str = AS_OPTION,
+) -> None:
     """Show the most recent event-log entries (newest first)."""
-    rows = _run(service.list_events, limit=limit)
+    rows = _run(service.list_events, _principal(as_human), limit=limit)
     _emit_list("events", rows)
 
 
 @app.command(name="types")
-def list_types() -> None:
+def list_types(as_human: str = AS_OPTION) -> None:
     """Show the full type catalog (node types and edge types)."""
-    _emit(_run(service.list_types))
+    _emit(_run(service.list_types, principal=_principal(as_human)))
 
 
 @app.command()
@@ -410,6 +459,7 @@ def search(
     expand: bool = typer.Option(
         False, "--expand", help="Append one-hop active-edge neighbors of the hits."
     ),
+    as_human: str = AS_OPTION,
 ) -> None:
     """Hybrid-search node title + content (BM25 + vector, RRF-fused).
 
@@ -427,6 +477,7 @@ def search(
         created_after=created_after,
         created_before=created_before,
         expand=expand,
+        principal=_principal(as_human),
     )
     _emit(result)
 
@@ -435,6 +486,7 @@ def search(
 def suggest_links(
     prefix: str = typer.Argument(..., help="Title prefix typed so far ('' matches every title)."),
     limit: int = typer.Option(20, "--limit", help="Maximum suggestions."),
+    as_human: str = AS_OPTION,
 ) -> None:
     """Suggest wikilink targets by title prefix (case-insensitive).
 
@@ -442,7 +494,7 @@ def suggest_links(
     index, so it answers on a database whose projectors have never run.
     Archived nodes are never suggested.
     """
-    nodes = _run(service.suggest_links, prefix, limit=limit)
+    nodes = _run(service.suggest_links, prefix, principal=_principal(as_human), limit=limit)
     _emit_list("nodes", nodes)
 
 
@@ -454,6 +506,7 @@ def traverse(
     ),
     depth: int = typer.Option(2, "--depth", help="Maximum hops."),
     direction: str = typer.Option("both", "--direction", help="'out', 'in', or 'both'."),
+    as_human: str = AS_OPTION,
 ) -> None:
     """Walk the subgraph reachable from a node over active edges."""
     _emit(
@@ -463,6 +516,7 @@ def traverse(
             edge_types=edge_type,
             depth=depth,
             direction=direction,
+            principal=_principal(as_human),
         )
     )
 
@@ -487,6 +541,7 @@ def subgraph(
         None, "--node-type", help="Only include nodes of these types (repeatable)."
     ),
     limit: int = typer.Option(200, "--limit", help="Maximum nodes, root included."),
+    as_human: str = AS_OPTION,
 ) -> None:
     """Bounded, filtered neighborhood of a node — node and edge caps stop the walk.
 
@@ -506,6 +561,7 @@ def subgraph(
             min_confidence=min_confidence,
             created_by=created_by,
             node_types=node_type,
+            principal=_principal(as_human),
             limit=limit,
         )
     )
@@ -515,24 +571,29 @@ def subgraph(
 def find_path(
     a: str = typer.Argument(..., help="Start node id."),
     b: str = typer.Argument(..., help="Target node id."),
+    as_human: str = AS_OPTION,
 ) -> None:
     """Find the shortest path between two nodes over active edges."""
-    _emit(_run(service.find_path, a, b))
+    _emit(_run(service.find_path, a, b, principal=_principal(as_human)))
 
 
 @app.command()
 def diff(
     a: int = typer.Argument(..., help="First version id (see `history`)."),
     b: int = typer.Argument(..., help="Second version id."),
+    as_human: str = AS_OPTION,
 ) -> None:
     """Unified diff between two versions of one node."""
-    _emit(_run(service.diff_versions, a, b))
+    _emit(_run(service.diff_versions, a, b, principal=_principal(as_human)))
 
 
 @app.command()
-def schema(type: str = typer.Argument(..., help="Node or edge type id/name.")) -> None:
+def schema(
+    type: str = typer.Argument(..., help="Node or edge type id/name."),
+    as_human: str = AS_OPTION,
+) -> None:
     """Show one type's catalog entry, including its JSON schema."""
-    _emit(_run(service.get_schema, type))
+    _emit(_run(service.get_schema, type, principal=_principal(as_human)))
 
 
 @app.command("schema-dump")
@@ -584,15 +645,16 @@ def asset_register(
 @asset_app.command("get")
 def asset_get(
     id_or_hash: str = typer.Argument(..., help="Asset hash or asset-reference node id."),
+    as_human: str = AS_OPTION,
 ) -> None:
     """Show one asset's metadata (never its bytes)."""
-    _emit(_run(assets.get_asset, id_or_hash))
+    _emit(_run(assets.get_asset, id_or_hash, principal=_principal(as_human)))
 
 
 @asset_app.command("list")
-def asset_list() -> None:
+def asset_list(as_human: str = AS_OPTION) -> None:
     """List every registered asset."""
-    rows = _run(assets.list_assets)
+    rows = _run(assets.list_assets, principal=_principal(as_human))
     _emit_list("assets", rows)
 
 
@@ -603,13 +665,16 @@ def asset_rendition(
     out: str | None = typer.Option(
         None, "--out", "-o", help="Also write the WebP bytes to this path."
     ),
+    as_human: str = AS_OPTION,
 ) -> None:
     """Fetch an image rendition, generating and caching it on first request.
 
     Prints the rendition metadata; image bytes stay in the database and are
     never inlined into the JSON output — use ``--out`` to extract them.
     """
-    rendition = _run(assets.get_rendition, id_or_hash, profile=profile)
+    rendition = _run(
+        assets.get_rendition, id_or_hash, profile=profile, principal=_principal(as_human)
+    )
     if out is not None:
         _run(assets.copy_rendition, rendition, out)
     _emit(rendition)
@@ -629,22 +694,15 @@ def asset_purge(
 
 
 @mcp_app.command("serve")
-def mcp_serve(
-    actor: str = typer.Option(
-        "agent:mcp",
-        "--actor",
-        help="External-agent identity every write is attributed to: 'agent:<name>'.",
-    ),
-) -> None:
+def mcp_serve() -> None:
     """Launch the MCP server on stdio (read + additive tiers, design §8).
 
-    The actor must be an ``agent:<name>`` identity — the MCP surface serves
-    external agents only, so ``--actor human`` (or a malformed name) exits 1
-    rather than silently writing straight into the live graph.
+    Authentication is the agent token in ``NODUM_AGENT_TOKEN`` — minted by
+    ``nodum agent create`` and carried in the MCP client config's env block.
     """
     from nodum import mcp_server
 
-    _run(mcp_server.serve, actor=actor)
+    _run(mcp_server.serve)
 
 
 # ── HTTP server (the human surface) ──────────────────────────────────────────
@@ -663,9 +721,6 @@ DEFAULT_HTTP_PORT = 8600
 def serve(
     host: str = typer.Option("127.0.0.1", "--host", help="Interface to bind (loopback default)."),
     port: int = typer.Option(DEFAULT_HTTP_PORT, "--port", help="TCP port to listen on."),
-    token: str | None = typer.Option(
-        None, "--token", help="Require 'Authorization: Bearer <token>' on /api (LAN case)."
-    ),
     allow_host: list[str] = typer.Option(
         None,
         "--allow-host",
@@ -678,48 +733,48 @@ def serve(
     """Serve the human web UI and its JSON API (design §9).
 
     The inverse of ``mcp serve``: every write this surface makes is attributed
-    to the ``human`` actor and no request field can change that. Binds loopback
-    by default; ``--token`` adds a static bearer token on ``/api`` only
-    (``/healthz`` and the UI stay open). Unbuilt frontend? The API still serves;
-    the UI is a "run make web-build" placeholder.
+    to the human behind an authenticated session, and no request field can
+    change that. Auth is password login (``POST /api/login``) backed by
+    server-side sessions; ``/healthz`` and the static UI stay open. Unbuilt
+    frontend? The API still serves; the UI is a "run make web-build"
+    placeholder.
 
-    Two things this command refuses to do quietly. A non-loopback bind without
-    ``--token`` is an unauthenticated write API on the network, so it exits 1
-    rather than starting. And a loopback bind without ``--token`` is reachable
-    by **every process on this machine**, including an MCP server launched with
-    ``--actor agent:x``, which could then accept its own proposals over HTTP —
-    so it says so at startup instead of leaving the operator to work it out.
+    A non-loopback bind is allowed — login is the boundary, not the bind —
+    and the session cookie gains ``Secure`` there. Either way, any process
+    that can reach the port may *attempt* a login, so the human's password
+    is the whole defence; the banner says so rather than leaving it implicit.
     """
     import uvicorn
 
     from nodum import http_api
 
-    if token is None and http_api.bare_host(host) not in http_api.LOOPBACK_BIND_ADDRESSES:
-        typer.echo(
-            f"refusing to bind {host} with no --token: that is an unauthenticated write API "
-            "reachable from the network. Pass --token, or bind 127.0.0.1.",
-            err=True,
-        )
-        raise typer.Exit(1)
-
     resolved_db = Path(db_path) if db_path is not None else db.db_path()
+    loopback = http_api.bare_host(host) in http_api.LOOPBACK_BIND_ADDRESSES
     typer.echo(f"nodum serve → http://{host}:{port}  (database: {resolved_db})", err=True)
-    if token is None:
+    typer.echo(
+        "auth: password login — any process that can reach this port may attempt one, "
+        "so every /api request still needs a human password (nodum human passwd).",
+        err=True,
+    )
+    if not loopback:
+        # uvicorn serves plain HTTP. The session cookie is marked Secure on a
+        # non-loopback bind and so fails closed without TLS, but the login body
+        # itself has already crossed the network by then (Q13 review S12).
         typer.echo(
-            "no --token: any process on this machine can drive this API as the 'human' actor, "
-            "including local agents. Do not run it alongside agents you do not trust.",
+            f"warning: {host} is not loopback and this server speaks plain HTTP — "
+            "passwords cross the network in the clear unless a TLS proxy fronts it.",
             err=True,
         )
-    else:
-        typer.echo(f"open the UI at http://{host}:{port}/#token={token}", err=True)
 
     try:
         _run(
             uvicorn.run,
             http_api.create_app(
                 db_path=db_path,
-                token=token,
                 allowed_hosts=http_api.resolve_allowed_hosts(host, allow_host),
+                # Loopback is plain HTTP, where a Secure cookie would never be
+                # stored; a LAN bind fronts TLS, where it must be.
+                secure_cookies=not loopback,
             ),
             host=host,
             port=port,
@@ -733,46 +788,6 @@ def serve(
             typer.echo(f"could not serve on {host}:{port}", err=True)
             raise typer.Exit(1) from exc
         raise
-
-
-# ── Policies ──────────────────────────────────────────────────────────────────
-
-
-@policy_app.command("set")
-def policy_set(
-    agent: str = typer.Argument(..., help="Actor the policy governs, e.g. 'agent:researcher'."),
-    rule: list[str] = typer.Option(
-        ...,
-        "--rule",
-        help="Repeatable JSON rule object, e.g. "
-        '\'{"edge_type":"mentions","min_confidence":0.9,"action":"auto_accept"}\'.',
-    ),
-    actor: str = ACTOR_OPTION,
-) -> None:
-    """Create or replace an agent's policy ruleset (audited as policy.set)."""
-    rules = []
-    for raw in rule:
-        try:
-            rules.append(json.loads(raw))
-        except json.JSONDecodeError:
-            typer.echo(f"--rule expects a JSON object, got {raw!r}", err=True)
-            raise typer.Exit(1) from None
-    _emit(_run(service.set_policy, agent, rules, actor=actor))
-
-
-@policy_app.command("get")
-def policy_get(
-    agent: str = typer.Argument(..., help="Actor string, e.g. 'agent:researcher'."),
-) -> None:
-    """Show one agent's policy."""
-    _emit(_run(service.get_policy, agent))
-
-
-@policy_app.command("list")
-def policy_list() -> None:
-    """List every stored policy."""
-    policies = _run(service.list_policies)
-    _emit_list("policies", policies)
 
 
 # ── Review queue ──────────────────────────────────────────────────────────────
@@ -796,6 +811,7 @@ def review_queue(
     created_before: str | None = CREATED_BEFORE_OPTION,
     created_after: str | None = CREATED_AFTER_OPTION,
     limit: int = typer.Option(500, "--limit", help="Maximum proposals."),
+    as_human: str = AS_OPTION,
 ) -> None:
     """List pending proposals (proposed nodes/edges/updates) with reviewer context."""
     proposals = _run(
@@ -805,6 +821,7 @@ def review_queue(
         kind=kind,
         created_before=created_before,
         created_after=created_after,
+        principal=_principal(as_human),
         limit=limit,
     )
     _emit_list("proposals", proposals)
@@ -813,20 +830,20 @@ def review_queue(
 @review_app.command("accept")
 def review_accept(
     ids: list[str] = typer.Argument(..., help="Node, edge, or proposed-version ids to accept."),
-    actor: str = ACTOR_OPTION,
+    as_human: str = AS_OPTION,
 ) -> None:
     """Accept proposals by id (proposed → active); bad ids are reported, not fatal."""
-    _emit(_run(service.accept_proposals, ids, actor=actor))
+    _emit(_run(service.accept_proposals, ids, principal=_principal(as_human)))
 
 
 @review_app.command("reject")
 def review_reject(
     ids: list[str] = typer.Argument(..., help="Node, edge, or proposed-version ids to reject."),
     reason: str = typer.Option(..., "--reason", help="Recorded in every reject event."),
-    actor: str = ACTOR_OPTION,
+    as_human: str = AS_OPTION,
 ) -> None:
     """Reject proposals by id (proposed → archived); bad ids are reported, not fatal."""
-    _emit(_run(service.reject_proposals, ids, reason=reason, actor=actor))
+    _emit(_run(service.reject_proposals, ids, reason=reason, principal=_principal(as_human)))
 
 
 @review_app.command("accept-all")
@@ -836,7 +853,7 @@ def review_accept_all(
     kind: str | None = KIND_OPTION,
     created_before: str | None = CREATED_BEFORE_OPTION,
     created_after: str | None = CREATED_AFTER_OPTION,
-    actor: str = ACTOR_OPTION,
+    as_human: str = AS_OPTION,
 ) -> None:
     """Accept every proposal matching the filters (e.g. one agent's whole run)."""
     _emit(
@@ -847,7 +864,7 @@ def review_accept_all(
             kind=kind,
             created_before=created_before,
             created_after=created_after,
-            actor=actor,
+            principal=_principal(as_human),
         )
     )
 
@@ -860,7 +877,7 @@ def review_reject_all(
     kind: str | None = KIND_OPTION,
     created_before: str | None = CREATED_BEFORE_OPTION,
     created_after: str | None = CREATED_AFTER_OPTION,
-    actor: str = ACTOR_OPTION,
+    as_human: str = AS_OPTION,
 ) -> None:
     """Reject every proposal matching the filters, recording the reason."""
     _emit(
@@ -872,6 +889,187 @@ def review_reject_all(
             kind=kind,
             created_before=created_before,
             created_after=created_after,
-            actor=actor,
+            principal=_principal(as_human),
         )
     )
+
+
+# ── Accounts, grants, and spaces (Q13) ────────────────────────────────────────
+
+
+@human_app.command("create")
+def human_create(
+    name: str = typer.Argument(..., help="Display name for the account."),
+    as_human: str = AS_OPTION,
+) -> None:
+    """Create a human account (passwordless until `human passwd`)."""
+    _emit(_run(service.create_human, name, principal=_principal(as_human)))
+
+
+@human_app.command("list")
+def human_list(as_human: str = AS_OPTION) -> None:
+    """List human accounts."""
+    _emit_list("humans", _run(service.list_humans, principal=_principal(as_human)))
+
+
+@human_app.command("passwd")
+def human_passwd(
+    human_id: str = typer.Argument("owner", help="Account id (default: owner)."),
+    password: str = typer.Option(
+        ...,
+        "--password",
+        help="The new password (argon2id-hashed at rest).",
+        prompt=True,
+        hide_input=True,
+        confirmation_prompt=True,
+    ),
+    as_human: str = AS_OPTION,
+) -> None:
+    """Set or change a human's password (prompted, never echoed)."""
+    _run(service.set_human_password, human_id, password, principal=_principal(as_human))
+    _print_json({"ok": True, "human_id": human_id})
+
+
+@human_app.command("disable")
+def human_disable(
+    human_id: str = typer.Argument(..., help="Account to disable."),
+    as_human: str = AS_OPTION,
+) -> None:
+    """Disable a human (its sessions and its agents' tokens die; proposals stay)."""
+    _run(service.disable_human, human_id, principal=_principal(as_human))
+    _print_json({"ok": True, "human_id": human_id, "disabled": True})
+
+
+@human_app.command("enable")
+def human_enable(
+    human_id: str = typer.Argument(..., help="Account to re-enable."),
+    as_human: str = AS_OPTION,
+) -> None:
+    """Re-enable a disabled human."""
+    _run(service.enable_human, human_id, principal=_principal(as_human))
+    _print_json({"ok": True, "human_id": human_id, "disabled": False})
+
+
+@agent_app.command("create")
+def agent_create(
+    name: str = typer.Argument(..., help="Agent id (becomes agent:<name>)."),
+    kind: str = typer.Option("external", "--kind", help="'external' or 'internal'."),
+    owner: str = typer.Option("owner", "--owner", help="Owning human (external agents)."),
+    as_human: str = AS_OPTION,
+) -> None:
+    """Create an agent account and print its token — shown this once, only the hash is stored."""
+    created = _run(
+        service.create_agent,
+        name,
+        kind=kind,
+        owner_human_id=None if kind == "internal" else owner,
+        principal=_principal(as_human),
+    )
+    _emit(created)
+    if created.token:
+        typer.echo(
+            f"token (shown once — store it now): {created.token}",
+            err=True,
+        )
+
+
+@agent_app.command("list")
+def agent_list(as_human: str = AS_OPTION) -> None:
+    """List agent accounts."""
+    _emit_list("agents", _run(service.list_agents, principal=_principal(as_human)))
+
+
+@agent_app.command("token-rotate")
+def agent_token_rotate(
+    agent_id: str = typer.Argument(..., help="Agent whose token to replace."),
+    as_human: str = AS_OPTION,
+) -> None:
+    """Replace an agent's token (the old one dies now; the new one shows once)."""
+    token = _run(service.rotate_agent_token, agent_id, principal=_principal(as_human))
+    typer.echo(f"token (shown once — store it now): {token}", err=True)
+    _print_json({"ok": True, "agent_id": agent_id})
+
+
+@agent_app.command("disable")
+def agent_disable(
+    agent_id: str = typer.Argument(..., help="Agent to disable."),
+    as_human: str = AS_OPTION,
+) -> None:
+    """Disable an agent (its token dies immediately; its proposals stay, reviewable)."""
+    _run(service.disable_agent, agent_id, principal=_principal(as_human))
+    _print_json({"ok": True, "agent_id": agent_id, "disabled": True})
+
+
+@agent_app.command("enable")
+def agent_enable(
+    agent_id: str = typer.Argument(..., help="Agent to re-enable."),
+    as_human: str = AS_OPTION,
+) -> None:
+    """Re-enable a disabled agent."""
+    _run(service.enable_agent, agent_id, principal=_principal(as_human))
+    _print_json({"ok": True, "agent_id": agent_id, "disabled": False})
+
+
+@app.command()
+def grant(
+    agent_id: str = typer.Argument(..., help="Agent to grant."),
+    space: str = typer.Argument(..., help="Space id or name."),
+    level: str = typer.Argument(..., help="'read', 'suggest', or 'edit'."),
+    as_human: str = AS_OPTION,
+) -> None:
+    """Grant (or re-level) an agent's access to a space; event-logged."""
+    _emit(_run(service.grant, agent_id, space, level, principal=_principal(as_human)))
+
+
+@app.command()
+def revoke(
+    agent_id: str = typer.Argument(..., help="Agent to revoke from."),
+    space: str = typer.Argument(..., help="Space id or name."),
+    as_human: str = AS_OPTION,
+) -> None:
+    """Revoke an agent's grant on a space; event-logged."""
+    _run(service.revoke, agent_id, space, principal=_principal(as_human))
+    _print_json({"ok": True, "agent_id": agent_id, "space": space})
+
+
+@app.command()
+def grants(
+    agent_id: str | None = typer.Option(None, "--agent", help="Limit to one agent."),
+    as_human: str = AS_OPTION,
+) -> None:
+    """List grant rows."""
+    _emit_list("grants", _run(service.list_grants, agent_id, principal=_principal(as_human)))
+
+
+@app.command(name="space-create")
+def space_create(
+    name: str = typer.Argument(..., help="Title (and id suffix) for the new space."),
+    as_human: str = AS_OPTION,
+) -> None:
+    """Create a space (a node of builtin type 'space' in meta; edit there is human-tier)."""
+    node = _run(
+        service.create_node, type="space", title=name, space="meta", principal=_principal(as_human)
+    )
+    _emit(node)
+
+
+@app.command(name="space-list")
+def space_list(as_human: str = AS_OPTION) -> None:
+    """List spaces."""
+    nodes = _run(
+        service.list_nodes,
+        type="space",
+        state="active",
+        include_meta=True,
+        principal=_principal(as_human),
+    )
+    _emit_list("spaces", nodes)
+
+
+@app.command(name="space-archive")
+def space_archive(
+    space_id: str = typer.Argument(..., help="Space node id to archive."),
+    as_human: str = AS_OPTION,
+) -> None:
+    """Archive a space (nodes keep their space_id; grants on it go inert)."""
+    _emit(_run(service.transition, space_id, "archive", principal=_principal(as_human)))

@@ -294,6 +294,255 @@ ALTER TABLE versions ADD COLUMN proposed_fields TEXT;
 """
 
 
+#: Bootstrap space ids created by ``0009_spaces_and_type_nodes`` (Q13). Meta
+#: holds the type vocabulary and, later, the gardener's learned conventions;
+#: everyday content reads exclude it — the type catalog is served by the
+#: type queries, not by content listings. ``main`` is the first default
+#: space and carries no special rules (design-pass note 03 Q9).
+META_SPACE_ID = "meta"
+MAIN_SPACE_ID = "main"
+
+
+SPACES_AND_TYPE_NODES_DDL = """
+-- Spaces and types-are-nodes (Q13, design §5.1/§5.2 as amended 2026-07-25).
+-- `graph_id` becomes `space_id` on nodes only; types and edge types stop
+-- being tables and become ordinary nodes living in the meta space, keeping
+-- their ids so every existing `type_id` value stays valid across the rewire.
+-- The rebuild needs foreign-key enforcement out of the way: the bootstrap is
+-- mutually referential (the metaclass root is its own type, meta's space is
+-- itself), and create-copy-drop-rename transiently drops tables that others
+-- reference. `nodum.db.apply_migration` runs every migration with
+-- `PRAGMA foreign_keys=OFF` and runs `foreign_key_check` over the whole
+-- database before committing — deferring instead is not enough, because
+-- dropping a populated parent leaves a deferred-violation counter that the
+-- rename does not clear. This line keeps the script self-describing if it is
+-- ever replayed by hand with enforcement on.
+PRAGMA defer_foreign_keys = ON;
+
+CREATE TABLE nodes_new (
+    id          TEXT PRIMARY KEY,
+    space_id    TEXT REFERENCES nodes_new(id),
+    type_id     TEXT NOT NULL REFERENCES nodes_new(id),
+    parent_id   TEXT REFERENCES nodes_new(id),
+    position    REAL,
+    title       TEXT,
+    content     TEXT NOT NULL DEFAULT '',
+    props       TEXT NOT NULL DEFAULT '{}',
+    state       TEXT NOT NULL DEFAULT 'active'
+                CHECK (state IN ('active','proposed','archived')),
+    created_by  TEXT NOT NULL,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Existing nodes all land in the main space.
+INSERT INTO nodes_new
+    (id, space_id, type_id, parent_id, position, title, content, props,
+     state, created_by, created_at, updated_at)
+SELECT id, 'main', type_id, parent_id, position, title, content, props,
+       state, created_by, created_at, updated_at
+FROM nodes;
+
+-- Bootstrap, in dependency order (enforcement is deferred, so the mutual
+-- references resolve at COMMIT): the `type` metaclass root (its own type),
+-- the `space` type, and the two space nodes. Meta's space is itself, which
+-- keeps "every node has a space" uniform. `type_kind` in props distinguishes
+-- node types from edge types among the type-nodes.
+INSERT INTO nodes_new
+    (id, space_id, type_id, title, props, state, created_by)
+VALUES
+    ('type',  'meta', 'type',  'type',
+     '{"type_kind":"node","is_builtin":1}', 'active', 'system'),
+    ('space', 'meta', 'type',  'space',
+     '{"type_kind":"node","is_builtin":1}', 'active', 'system'),
+    ('meta',  'meta', 'space', 'meta',  '{}', 'active', 'system'),
+    ('main',  'meta', 'space', 'main',  '{}', 'active', 'system');
+
+-- Type rows become type-nodes in meta, ids preserved. Their catalogs'
+-- columns move into props.
+INSERT INTO nodes_new
+    (id, space_id, type_id, title, props, state, created_by, created_at, updated_at)
+SELECT id, 'meta', 'type', name,
+       json_object('type_kind', 'node',
+                   'schema_json', json(schema_json),
+                   'is_builtin', is_builtin,
+                   'parent_type_id', parent_type_id),
+       'active', 'system', created_at, created_at
+FROM types;
+
+INSERT INTO nodes_new
+    (id, space_id, type_id, title, props, state, created_by, created_at, updated_at)
+SELECT id, 'meta', 'type', name,
+       json_object('type_kind', 'edge',
+                   'schema_json', json(schema_json),
+                   'is_builtin', is_builtin,
+                   'inverse_name', inverse_name),
+       'active', 'system', datetime('now'), datetime('now')
+FROM edge_types;
+
+DROP TABLE nodes;
+ALTER TABLE nodes_new RENAME TO nodes;
+CREATE INDEX idx_nodes_parent ON nodes(parent_id, position);
+CREATE INDEX idx_nodes_type   ON nodes(type_id);
+CREATE INDEX idx_nodes_state  ON nodes(state);
+CREATE INDEX idx_nodes_space  ON nodes(space_id);
+
+-- Edges lose `graph_id` entirely (space derives from the endpoints) and
+-- retarget `type_id` at the type-nodes.
+CREATE TABLE edges_new (
+    id          TEXT PRIMARY KEY,
+    src_id      TEXT NOT NULL REFERENCES nodes(id),
+    dst_id      TEXT NOT NULL REFERENCES nodes(id),
+    type_id     TEXT NOT NULL REFERENCES nodes(id),
+    props       TEXT NOT NULL DEFAULT '{}',
+    confidence  REAL CHECK (confidence BETWEEN 0 AND 1),
+    created_by  TEXT NOT NULL,
+    state       TEXT NOT NULL DEFAULT 'active'
+                CHECK (state IN ('active','proposed','archived')),
+    valid_from  TEXT,
+    valid_to    TEXT,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+INSERT INTO edges_new
+    (id, src_id, dst_id, type_id, props, confidence, created_by, state,
+     valid_from, valid_to, created_at)
+SELECT id, src_id, dst_id, type_id, props, confidence, created_by, state,
+       valid_from, valid_to, created_at
+FROM edges;
+
+DROP TABLE edges;
+ALTER TABLE edges_new RENAME TO edges;
+CREATE INDEX idx_edges_src ON edges(src_id, state);
+CREATE INDEX idx_edges_dst ON edges(dst_id, state);
+
+DROP TABLE types;
+DROP TABLE edge_types;
+
+-- Nothing enforced the (hash, space) rule before this migration — not even
+-- for proposed rows — so a pre-0009 database can hold duplicates that make
+-- the index below fail with a bare IntegrityError, rolling the upgrade back
+-- with no way forward but hand SQL. Dedupe first: keep the earliest live
+-- describing node per (hash, space), archive the rest. Archiving (rather
+-- than deleting) keeps the rows and their history, and the index skips
+-- archived rows, so retiring an asset_ref also frees its hash for a new one.
+UPDATE nodes
+SET state = 'archived', updated_at = datetime('now')
+WHERE type_id = 'asset_ref'
+  AND state != 'archived'
+  AND json_extract(props,'$.asset_hash') IS NOT NULL
+  AND rowid NOT IN (
+      SELECT rowid FROM (
+          SELECT rowid, ROW_NUMBER() OVER (
+              PARTITION BY json_extract(props,'$.asset_hash'), space_id
+              ORDER BY created_at, rowid
+          ) AS rank
+          FROM nodes
+          WHERE type_id = 'asset_ref'
+            AND state != 'archived'
+            AND json_extract(props,'$.asset_hash') IS NOT NULL
+      )
+      WHERE rank = 1
+  );
+
+-- One live describing asset_ref node per (hash, space) — guards the shape
+-- before Phase 4 writes any (design-pass note 04).
+CREATE UNIQUE INDEX idx_asset_ref_per_space ON nodes(
+    json_extract(props,'$.asset_hash'), space_id
+) WHERE type_id = 'asset_ref' AND state != 'archived';
+"""
+
+
+PRINCIPALS_DDL = """
+-- Principals and grants (Q13, design §5.2 as amended 2026-07-25). Human
+-- accounts are identity + credentials + attribution, never a permission
+-- scope — the file is the only isolation boundary, and every human is
+-- full-rights. Agents act within per-(agent, space) grants; the owner
+-- holds no grants at all. The policies table dies here (design §8.3:
+-- learned trust, no policy layer) — auto-accept on the write path dies
+-- with it.
+CREATE TABLE humans (
+    id              TEXT PRIMARY KEY,
+    name            TEXT NOT NULL,
+    credential_hash TEXT,                -- argon2id; NULL until a password is set
+    disabled        INTEGER NOT NULL DEFAULT 0,
+    created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE agents (
+    id              TEXT PRIMARY KEY,
+    kind            TEXT NOT NULL CHECK (kind IN ('internal','external')),
+    name            TEXT NOT NULL,
+    owner_human_id  TEXT REFERENCES humans(id),
+    credential_hash TEXT,                -- sha-256 of the current token; NULL for internal
+    disabled        INTEGER NOT NULL DEFAULT 0,
+    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    -- An external agent answers to a human (that is what cascading
+    -- revocation walks); an internal one is the graph's own, and has none.
+    CHECK (kind = 'internal' OR owner_human_id IS NOT NULL)
+);
+
+CREATE TABLE grants (
+    agent_id   TEXT NOT NULL REFERENCES agents(id),
+    space_id   TEXT NOT NULL REFERENCES nodes(id),   -- a node of builtin type 'space'
+    level      TEXT NOT NULL CHECK (level IN ('read','suggest','edit')),
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (agent_id, space_id)
+);
+
+CREATE TABLE sessions (
+    id         TEXT PRIMARY KEY,         -- random; the cookie value
+    human_id   TEXT NOT NULL REFERENCES humans(id),
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    expires_at TEXT NOT NULL             -- 30 days, sliding
+);
+
+-- The first human account: trusted-local bootstrap, no password yet — it
+-- cannot log in over HTTP until `nodum human passwd` sets one.
+INSERT INTO humans (id, name) VALUES ('owner', 'owner');
+
+-- One agents row per agent identity the log already knows (event actors,
+-- version actors, created_by columns, and the dying policies table), all
+-- external, owned by the first human, with no token — they cannot
+-- authenticate until one is minted. Every source is the *bare* name: an
+-- agent id is what `verify_agent_token` looks up and what `agent:` is
+-- prefixed to, so a row seeded as 'agent:x' would be unusable and would
+-- attribute writes to 'agent:agent:x'. `policies.agent` is the one column
+-- that stored the full actor string, hence its own strip.
+INSERT INTO agents (id, kind, name, owner_human_id)
+SELECT DISTINCT name, 'external', name, 'owner' FROM (
+    SELECT substr(actor, 7) AS name FROM events WHERE actor LIKE 'agent:%'
+    UNION SELECT substr(actor, 7) FROM versions WHERE actor LIKE 'agent:%'
+    UNION SELECT substr(created_by, 7) FROM nodes WHERE created_by LIKE 'agent:%'
+    UNION SELECT substr(created_by, 7) FROM edges WHERE created_by LIKE 'agent:%'
+    UNION SELECT substr(agent, 7) FROM policies WHERE agent LIKE 'agent:%'
+)
+-- A bare 'agent:' actor would otherwise seed an empty-id row.
+WHERE name IS NOT NULL AND length(name) > 0;
+
+-- Parity grants: exactly today's behaviour (read everything, propose
+-- anywhere) so migration changes no agent's effective reach. The owner
+-- tightens from here.
+INSERT INTO grants (agent_id, space_id, level)
+SELECT id, 'meta', 'read' FROM agents;
+INSERT INTO grants (agent_id, space_id, level)
+SELECT id, 'main', 'suggest' FROM agents;
+
+DROP TABLE policies;
+"""
+
+
+ACTOR_STRINGS_DDL = """
+-- Structured actor strings (Q13 R2): the bare 'human' becomes a reference
+-- to the first human account. Agent strings are already 'agent:<name>'
+-- with agent ids equal to the names, so they need no rewrite. Event
+-- payloads (JSON before/after) are immutable history and keep old values.
+UPDATE events   SET actor      = 'human:owner' WHERE actor      = 'human';
+UPDATE versions SET actor      = 'human:owner' WHERE actor      = 'human';
+UPDATE nodes    SET created_by = 'human:owner' WHERE created_by = 'human';
+UPDATE edges    SET created_by = 'human:owner' WHERE created_by = 'human';
+"""
+
+
 #: Ordered (name, SQL) migrations. Append-only — never edit a shipped entry.
 MIGRATIONS: list[tuple[str, str]] = [
     ("0001_core", CORE_DDL),
@@ -304,4 +553,7 @@ MIGRATIONS: list[tuple[str, str]] = [
     ("0006_vectors", VECTORS_DDL),
     ("0007_assets_and_renditions", ASSETS_DDL),
     ("0008_version_proposed_fields", PROPOSED_FIELDS_DDL),
+    ("0009_spaces_and_type_nodes", SPACES_AND_TYPE_NODES_DDL),
+    ("0010_principals", PRINCIPALS_DDL),
+    ("0011_actor_strings", ACTOR_STRINGS_DDL),
 ]

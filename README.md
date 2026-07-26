@@ -9,22 +9,25 @@ reversible.
 
 **Phase 1 (core)** landed: schema + migrations, service layer, event log +
 versions + undo, Markdown-as-truth content, wikilink materialization, and a
-JSON-emitting CLI. **Phase 2 (agent-native)** is underway: event-log
+JSON-emitting CLI. **Phase 2 (agent-native)** landed: event-log
 projectors with checkpoint/rebuild mechanics and two derived indexes — an
 FTS5 full-text index and a sqlite-vec chunk-embedding index (local
 in-process fastembed model, no daemon, no API key) — feeding **hybrid
 search** (BM25 + vector fused by reciprocal rank fusion, then graph-expansion
-re-ranking), DB-stored **agent policies** with auto-accept on the write path,
-the **review/accept API** for the proposal queue (human actor only),
+re-ranking), **principals, spaces and grants** (Q13: human and agent accounts,
+`read`/`suggest`/`edit` grants per (agent, space), enforced by a scope-bound
+store), the **review/accept API** for the proposal queue (a human, or `edit`
+on the item's space; `undo` stays human-only),
 **proposed updates** (agent edits stage as `proposed` versions), an **MCP
 server** (stdio) exposing the read + additive tool tiers *and nothing else*,
 and **content-addressed assets** — binaries and
 their lazily generated `thumb`/`preview` renditions stored in the same file
 as the graph (agents get renditions, never originals). **Phase 3 (human UI)**
-is underway: `nodum serve` runs the **HTTP API** — the human surface, where
-every write is attributed to `human` and no request field can say otherwise —
-and serves the **web UI** from the same process: a Markdown editor, hybrid
-search, the review queue and policy editor, a graph view, an asset browser,
+landed: `nodum serve` runs the **HTTP API** — the human surface, where
+every write is attributed to the session's human and no request field can say
+otherwise — and serves the **web UI** from the same process: a login view,
+an accounts-and-grants admin view, a Markdown editor, hybrid
+search, the review queue, a graph view, an asset browser,
 and per-node version history. Still to come: the ingestion pipeline and the
 consolidation cycle.
 
@@ -58,56 +61,51 @@ make dev-install        # uv sync --all-groups
 # Create the database (path: $NODUM_DB, default ~/.local/share/nodum/nodum.db)
 uv run nodum init
 
-# Build a small graph — every command prints one JSON object
-uv run nodum node create --type concept --title "Graph Theory"
-uv run nodum node create --type note --title "My note" \
+# Build a small graph — every command prints one JSON object, and every
+# command that touches the graph names its human with `--as` (reads included)
+uv run nodum node create --type concept --title "Graph Theory" --as owner
+uv run nodum node create --type note --title "My note" --as owner \
     --content "Notes on [[Graph Theory]] and its applications."
-uv run nodum edge list --type mentions        # the wikilink became an edge
+uv run nodum edge list --type mentions --as owner   # the wikilink became an edge
 
-uv run nodum search "graph theory"            # hybrid search (BM25 + vector, RRF-fused)
+uv run nodum search "graph theory" --as owner       # hybrid search (BM25 + vector, RRF-fused)
 uv run nodum projector status                 # derived-index checkpoints + availability
 uv run nodum projector rebuild fts            # drop + replay from event 0
 uv run nodum projector rebuild vec            # the model-change re-embed path
 
-uv run nodum node list --type note
-uv run nodum history <node-id>                # version snapshots
-uv run nodum undo                             # reverse the latest event
-uv run nodum types                            # the seeded type catalog
+uv run nodum node list --type note --as owner
+uv run nodum history <node-id> --as owner           # version snapshots
+uv run nodum undo --as owner                        # reverse the latest event
+uv run nodum types --as owner                       # the seeded type catalog
 
-# Agent writes land in `proposed` and wait in the review queue…
-uv run nodum node create --type note --title "Bot draft" --actor agent:researcher
-uv run nodum node update <id> --content "bot rewrite" --actor agent:researcher
-uv run nodum review queue --created-by agent:researcher   # nodes, edges, updates
+# The CLI is human-only and every command names its human explicitly:
+uv run nodum node create --type note --title "Draft" --as owner
+uv run nodum node update <id> --content "rewrite" --as owner
 
-# …and only the human touches live state: accept/reject/archive/undo all
-# refuse an agent:* actor. An accepted update applies only the fields the
-# agent named, so edits made while it waited survive.
-uv run nodum review accept-all --created-by agent:researcher
-uv run nodum review reject <id> --reason "not convinced"
-uv run nodum reject <id> --reason "not convinced"   # same audit trail, one id
+# Agent writes (over MCP) land per their grants — `suggest` queues them in
+# the review queue as `proposed`:
+uv run nodum review queue --created-by agent:researcher --as owner   # nodes, edges, updates
 
-# …unless a stored policy auto-accepts them (still the agent's own event).
-# A min_confidence gate grades the agent's *self-reported* confidence, so it
-# only counts when the rule says so out loud:
-uv run nodum policy set agent:researcher --rule \
-    '{"edge_type":"mentions","action":"auto_accept"}'
-uv run nodum policy set agent:researcher --rule \
-    '{"edge_type":"mentions","min_confidence":0.9,"action":"auto_accept","trust_self_reported_confidence":true}'
-uv run nodum policy list
+# Review authority is a human, or `edit` on the item's space; undo stays
+# human-only. An accepted update applies only the fields the agent named, so
+# edits made while it waited survive.
+uv run nodum review accept-all --created-by agent:researcher --as owner
+uv run nodum review reject <id> --reason "not convinced" --as owner
+uv run nodum reject <id> --reason "not convinced" --as owner   # same audit trail
 
 # Curated graph reads (the MCP read tier's service functions)
-uv run nodum traverse <id> --edge-type supports --depth 2
-uv run nodum find-path <a> <b>
-uv run nodum diff <version-a> <version-b>
+uv run nodum traverse <id> --edge-type supports --depth 2 --as owner
+uv run nodum find-path <a> <b> --as owner
+uv run nodum diff <version-a> <version-b> --as owner
 
 # A bounded, filtered neighborhood: every filter applied in SQL, the node cap
 # enforced *while walking* (and the edge list capped with it). `truncated` says
 # whether either cap cut the walk short.
-uv run nodum subgraph <id> --depth 2 --edge-type supports \
+uv run nodum subgraph <id> --depth 2 --edge-type supports --as owner \
     --edge-state active --min-confidence 0.8 --node-type claim --limit 200
 
 # Title-prefix link suggestions for a `[[` autocomplete (no index needed)
-uv run nodum suggest-links "Grap" --limit 20
+uv run nodum suggest-links "Grap" --limit 20 --as owner
 
 # Assets: register a file into the database, derive stored WebP renditions
 uv run nodum asset register ./photo.jpg
@@ -115,19 +113,21 @@ uv run nodum asset rendition <hash> --profile preview --out preview.webp
 uv run nodum asset purge                      # evict the stored renditions
 
 # MCP server (stdio) for external agents — read + additive tiers only, no
-# review tools, no curative tools. Every write is attributed to --actor and
-# lands proposed unless policy auto-accepts. --actor must be agent:<name>.
-uv run nodum mcp serve --actor agent:researcher
+# review tools, no curative tools. The agent authenticates with its token in
+# NODUM_AGENT_TOKEN (minted by `nodum agent create`, shown once).
+NODUM_AGENT_TOKEN=ndm_… uv run nodum mcp serve
 
 # HTTP server for the human: JSON API under /api plus the web UI at /.
-# Loopback by default and no accounts — which means every process on this
-# machine can drive it as the human. A non-loopback bind needs --token.
+# Every /api route needs a session — log in with a human name and password
+# (`nodum human passwd` sets one). Loopback or LAN, the password is the
+# boundary.
 uv run nodum serve                      # http://127.0.0.1:8600
-uv run nodum serve --token s3cret --host 0.0.0.0   # then open the /#token=… URL it prints
-curl -s localhost:8600/api/nodes/<id>   # identical bytes to `nodum node get <id>`
+uv run nodum serve --host 0.0.0.0       # allowed: login, not the bind, is the boundary
+curl -s localhost:8600/api/nodes/<id> -b nodum_session=…   # identical bytes to `nodum node get <id>`
 
-# Reads need nothing. A write from a non-browser client says it is one:
+# A write from a non-browser client says it is one:
 curl -s -X POST localhost:8600/api/nodes \
+  -b nodum_session=… \
   -H 'Content-Type: application/json' -H 'X-Nodum-Client: curl' \
   -d '{"type":"note","title":"From curl"}'
 ```
@@ -162,59 +162,61 @@ degrades to BM25 + graph expansion. `NODUM_EMBED_MODEL` switches the model
 - **Markdown is truth.** Node `content` is canonical Markdown. `[[wikilinks]]`
   are parsed on write and materialized as `mentions` edges; deleting the text
   archives the edge. Unresolvable targets are skipped silently. A materialized
-  edge lands in its writer's state, so an agent's wikilink is a *proposed*
-  edge — writing `[[Your Concept]]` never attaches an agent to a live node.
+  edge lands in the state the writer's grant earns, so a `suggest`-grant
+  agent's wikilink is a *proposed*
+  edge — writing `[[Your Concept]]` never attaches such an agent to a live node.
+  Both directions are grant-bound: retiring a `mentions` edge needs `edit` on
+  **both** endpoint spaces, so a writer cannot prune links into a space it
+  cannot read — where, by definition, it cannot tell a link disappeared.
 - **State machine.** Nodes and edges are `proposed`, `active`, or `archived`.
-  Human (CLI) writes land `active`; any other actor's writes land `proposed`
-  and are accepted/rejected explicitly — individually, in batches, or by
+  Human (CLI) writes land `active`; an agent's writes land per its grant on
+  the space — `proposed` on `suggest`, `active` on `edit` — and the proposed
+  ones are accepted/rejected explicitly — individually, in batches, or by
   filter through the review queue (`nodum review …`). Every reject requires a
   `--reason` and records it in its event, whether it moves one id or a hundred. Agent *updates* stage
   as `proposed` versions: accepting applies **exactly the fields the agent
   named** to the node as it stands now (an ordinary, undoable `node.update`),
   rejecting archives the version. An edit made while the proposal waited is
   therefore never reverted by accepting it. Accepting a proposed node also
-  brings the pending `mentions` edges its wikilinks materialized to `active`.
-- **Live state is the human's, structurally.** `accept`, `reject`, `archive`,
-  and `undo` require the `human` actor; an `agent:*` actor is refused
-  (`ReviewNotPermitted`) on every service entry point, whether a proposal is
-  its own or another agent's. Reviewing turns proposed structure into live
-  structure, archiving retires it, and `undo` writes an event's prior payload
-  back verbatim — `state = 'active'` included — so leaving any of them open
-  would hand an agent the live state it may not write directly. None of them
-  is an MCP tool either: agents may only *grow* the graph.
-- **Agent policies.** Per-agent rulesets stored in the DB (`nodum policy …`)
-  can auto-accept an agent's writes — e.g. "accept `mentions` edges from
-  `agent:researcher`". An auto-accepted write is still the agent's own event,
-  with the matched rule recorded in the payload. A `min_confidence` gate
-  grades the confidence the *agent reports about itself*, which it is free to
-  inflate, so a gated rule only fires when it also carries
-  `"trust_self_reported_confidence": true` — otherwise the write stays
-  `proposed`. No agent-supplied value can buy auto-accept on its own.
-- **MCP server.** `nodum mcp serve --actor agent:<name>` runs a stdio MCP
-  server (the official Python SDK's FastMCP) exposing the design §8.1 read
-  tier (`get_node`, `get_children`, `search`, `traverse`, `list_types`,
-  `get_schema`, `find_path`, `history`, `diff`, `get_asset`) and additive tier
-  (`create_node`, `update_node`, `link`, `propose_edges`). That is the entire
-  registry: the review tools (`accept`/`reject`) and the curative tools
-  (`merge_nodes`, `retype`, …) are **never registered** — structural
-  enforcement of §8.1/§8.2. One configured `--actor` per server attributes
-  every write, and it must be an `agent:<name>` identity (`--actor human`, an
-  empty actor, or an unprefixed name is a startup error).
+  brings the pending `mentions` edges its wikilinks materialized to `active` —
+  those the acceptor could have reviewed directly, that is; a mention into a
+  space they hold nothing on stays queued for someone who can.
+- **Live state is the human's, structurally.** Review (`accept`, `reject`, `archive`)
+  requires a human principal or an agent holding `edit` on the item's space;
+  `undo` is human-only. Either way is refused with `GrantNotPermitted`.
+  Reviewing turns proposed structure into live structure, archiving retires it,
+  and `undo` writes an event's prior payload back verbatim — `state = 'active'`
+  included — so leaving any of them open would hand an agent the live state it
+  may not write directly. None of them is an MCP tool either: agents may only
+  *grow* the graph.
+- **Grants, not policies.** Each agent holds one grant per space at `read`,
+  `suggest`, or `edit` (`nodum grant …` / `nodum revoke` / `nodum grants`,
+  human-only, event-logged). `read` lets it query, `suggest` queues every write
+  as `proposed`, and `edit` writes `active` and carries review authority inside
+  that space. There is deliberately no auto-accept machinery: an agent earns
+  `edit`, or it waits.
+- **MCP server.** `nodum mcp serve` runs a stdio MCP server (the official
+  Python SDK's FastMCP). The agent authenticates with its token in
+  `NODUM_AGENT_TOKEN` (minted by `nodum agent create`, shown once, stored
+  hashed) and is verified at startup; every write is confined to its grants.
+  The registry is the design §8.1 read tier (`get_node`, `get_children`,
+  `search`, `traverse`, `list_types`, `get_schema`, `find_path`, `history`,
+  `diff`, `get_asset`) and additive tier (`create_node`, `update_node`, `link`,
+  `propose_edges`). That is the entire registry: the review tools
+  (`accept`/`reject`) and the curative tools (`merge_nodes`, `retype`, …) are
+  **never registered** — structural enforcement of §8.1/§8.2.
 - **HTTP API + web UI.** `nodum serve` runs one process that answers the JSON
   API under `/api` and serves the built UI at `/`. It is the mirror image of
-  the MCP server: that surface forces an `agent:<name>` identity, this one is
-  the **human** surface and forces `actor = human` on every write — and no
-  request field, header, or query parameter can set an actor, because the
-  adapter never reads one. A body that carries `{"actor": "agent:x"}` is
-  ignored, not honoured and not rejected with a hint. Responses are the same
-  envelope the CLI prints, byte for byte, and failures are
+  the MCP server: that surface authenticates an agent by token, this one is
+  the **human** surface and attributes every write to the session's human
+  principal — and no request field, header, or query parameter can set an
+  identity, because the adapter never reads one. A body that carries
+  `{"actor": "agent:x"}` is ignored, not honoured and not rejected with a hint.
+  Responses are the same envelope the CLI prints, byte for byte, and failures are
   `{"error": {"type", "message"}}` carrying the CLI's own one-line message
   (missing id → 404, bad value → 400, human-only → 403, impossible undo → 409,
-  database busy → a retryable 503). Requests carry only fields the service
-  itself has — disabling an agent policy, for instance, is an explicit
-  `{"rules": []}`, not an `enabled` flag the data model cannot express. With no
-  UI bundle built, the API serves normally and `/` is a page telling you to run
-  `make web-build`.
+  database busy → a retryable 503). With no UI bundle built, the API serves
+  normally and `/` is a page telling you to run `make web-build`.
 - **Origin control, which is not the same thing as auth.** Binding loopback is
   no defence against a *browser*: every page the user visits can reach
   `127.0.0.1`. So a state-changing request must prove it came from this origin
@@ -225,31 +227,38 @@ degrades to BM25 + graph expansion. `NODUM_EMBED_MODEL` switches the model
   the `Host` header is checked against the names the server answers to, which
   is what stops DNS rebinding. Reads need none of it. `--allow-host` names an
   extra host for a reverse proxy.
-- **Auth is `--token`, and only `--token`.** It gates `/api` only — `/healthz`
-  and the UI stay open, and `/healthz` reports liveness and nothing else.
-  **Without it, any process on this machine can drive the API as the human**,
-  including a local agent: origin control stops browsers, not processes. A
-  non-loopback bind without a token is refused outright. `nodum serve --token X`
-  prints a `#token=X` URL; opening it hands the token to the UI (in the
-  fragment, so it never reaches a log) for the rest of that browser tab.
+- **Auth is password login + server-side sessions.** `POST /api/login` with a
+  human name and password (argon2id, constant-time on failure) creates a
+  30-day sliding session row and sets an `HttpOnly; SameSite=Strict` cookie;
+  every `/api` route but login needs it — reads included — while `/healthz`
+  (liveness and nothing else) and the static UI stay open. Origin control
+  stops browsers; the password stops other processes on the machine. A
+  non-loopback bind is allowed — login, not the bind, is the boundary — and
+  marks the cookie `Secure` there. `nodum human passwd` sets the password;
+  logout, expiry, and `human disable` kill the session at the next request.
+  Account and grant administration is on the API too — `GET /api/me`,
+  `/api/humans`, `/api/agents` (the show-once token comes back in the
+  create/token-rotate body) and `/api/grants` mirror the CLI's
+  `human`/`agent`/`grant`/`revoke`/`grants` commands.
 - **Uploads are images only, and bounded.** `POST /api/assets` caps the request
   body before anything buffers it (32 MiB), identifies the type from the bytes
   rather than the filename, and refuses an image whose pixel count would make
   decoding it expensive. There is no delete route, so what lands stays until the
   file is managed out of band.
-- **The six views.** `/editor` is a CodeMirror-6 Markdown editor with slash
-  commands, `[[` autocomplete, live Mermaid preview, drag-drop asset upload,
-  and debounced autosave — a node's `type` is fixed at creation, so the type
+- **The eight views.** `/login` is the session gate: password login with
+  argon2id. `/editor` is a CodeMirror-6 Markdown editor with slash commands,
+  `[[` autocomplete, live Mermaid preview, drag-drop asset upload, and
+  debounced autosave — a node's `type` is fixed at creation, so the type
   commands disappear once it is saved. `/search` is one box over hybrid search
   that renders the server's order and never re-ranks it, with the per-signal
-  breakdown made legible. `/review` is the proposal queue and the policy
-  editor: a reject always asks for a reason, an accept always shows what it
-  will write, and the `min_confidence` trap is called out where it is set.
-  `/graph` renders `subgraph` in Cytoscape, with truncation and the
-  confidence floor's exclusions stated on screen rather than in a footnote.
-  `/assets` is the rendition grid and lightbox; `/history/:nodeId` is the
-  version timeline and side-by-side diff. Every route is a real URL that
-  survives a reload. Source and conventions: [`web/README.md`](web/README.md).
+  breakdown made legible. `/review` is the proposal queue: a reject always asks
+  for a reason, an accept always shows what it will write. `/graph` renders
+  `subgraph` in Cytoscape, with truncation and the confidence floor's exclusions
+  stated on screen rather than in a footnote. `/assets` is the rendition grid
+  and lightbox. `/admin` is accounts and grants: humans, agents with show-once
+  tokens, and the grant grid. `/history/:nodeId` is the version timeline and
+  side-by-side diff. Every route is a real URL that survives a reload. Source
+  and conventions: [`web/README.md`](web/README.md).
 - **Assets and renditions.** `asset register` streams a file into the
   database keyed by its sha256 (dedup is free) and records its metadata row;
   the copy is re-hashed as it is written, so a file that changed since it was

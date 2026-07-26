@@ -4,16 +4,38 @@ from __future__ import annotations
 
 import json
 
+from helpers import agent
 from typer.testing import CliRunner
 
-from nodum import db
+from nodum import db, service
 from nodum.cli import app
 
 runner = CliRunner()
 
 
+#: Commands that never touch a principal: init, schema-dump, --version,
+#: projector/asset plumbing, and the two server launches. Everything else
+#: requires an explicit `--as` — reads included, since reads take a principal.
+NO_AS_GROUPS = {"init", "schema-dump", "projector", "asset", "mcp", "serve"}
+
+#: The asset commands that read through the graph — they carry ``--as`` like
+#: every other read. ``register``/``purge`` touch the blob store alone.
+AS_ASSET_COMMANDS = {"get", "list", "rendition"}
+
+
+def _needs_as(args) -> bool:
+    if not args or "--as" in args:
+        return False
+    if args[0] == "asset":
+        return len(args) > 1 and args[1] in AS_ASSET_COMMANDS
+    return args[0] not in NO_AS_GROUPS
+
+
 def _run_json(*args, input_text=None):
-    result = runner.invoke(app, list(args), input=input_text)
+    args = list(args)
+    if _needs_as(args):
+        args += ["--as", "owner"]
+    result = runner.invoke(app, args, input=input_text)
     assert result.exit_code == 0, result.output
     return json.loads(result.stdout)
 
@@ -80,10 +102,10 @@ def test_edge_create_and_list(fresh_db):
 
 
 def test_state_transitions_and_actor(fresh_db):
-    proposed = _run_json(
-        "node", "create", "--type", "note", "--title", "bot", "--actor", "agent:test"
-    )
-    assert proposed["state"] == "proposed"
+    # A suggest-level agent's write (via the service; the CLI is human-only).
+    proposed = service.create_node(type="note", title="bot", principal=agent("test"))
+    assert proposed.state == "proposed"
+    proposed = proposed.model_dump(mode="json")
     accepted = _run_json("accept", proposed["id"])
     assert accepted["state"] == "active"
     archived = _run_json("archive", accepted["id"])
@@ -92,10 +114,8 @@ def test_state_transitions_and_actor(fresh_db):
 
 def test_reject_records_its_reason_in_the_event(fresh_db):
     """One id or a hundred, a reject leaves the same audit trail."""
-    proposed = _run_json(
-        "node", "create", "--type", "note", "--title", "bot", "--actor", "agent:test"
-    )
-    rejected = _run_json("reject", proposed["id"], "--reason", "off topic")
+    proposed = service.create_node(type="note", title="bot", principal=agent("test"))
+    rejected = _run_json("reject", proposed.id, "--reason", "off topic")
     assert rejected["state"] == "archived"
 
     event = _run_json("events", "--limit", "1")["events"][0]
@@ -104,27 +124,21 @@ def test_reject_records_its_reason_in_the_event(fresh_db):
 
 
 def test_reject_without_a_reason_is_refused(fresh_db):
-    proposed = _run_json(
-        "node", "create", "--type", "note", "--title", "bot", "--actor", "agent:test"
-    )
-    result = runner.invoke(app, ["reject", proposed["id"]])
+    proposed = service.create_node(type="note", title="bot", principal=agent("test"))
+    result = runner.invoke(app, ["reject", proposed.id, "--as", "owner"])
     assert result.exit_code == 2  # typer: missing required --reason
-    assert _run_json("node", "get", proposed["id"])["state"] == "proposed"
+    assert _run_json("node", "get", proposed.id)["state"] == "proposed"
 
 
 def test_every_list_command_reports_a_count(fresh_db):
     """One envelope for lists: `{"<plural>": [...], "count": n}`, no exceptions."""
     node = _run_json("node", "create", "--type", "note", "--title", "T", "--content", "body")
-    _run_json(
-        "policy", "set", "agent:x", "--rule", '{"edge_type":"mentions","action":"auto_accept"}'
-    )
     for args, key in (
         (("node", "list"), "nodes"),
         (("node", "children", node["id"]), "nodes"),
         (("edge", "list"), "edges"),
         (("history", node["id"]), "versions"),
         (("events",), "events"),
-        (("policy", "list"), "policies"),
         (("review", "queue"), "proposals"),
         (("asset", "list"), "assets"),
         (("projector", "run"), "projectors"),
@@ -136,7 +150,7 @@ def test_every_list_command_reports_a_count(fresh_db):
 
 def test_invalid_transition_exits_1(fresh_db):
     node = _run_json("node", "create", "--type", "note", "--title", "active")
-    result = runner.invoke(app, ["accept", node["id"]])
+    result = runner.invoke(app, ["accept", node["id"], "--as", "owner"])
     assert result.exit_code == 1
     assert "cannot accept" in result.stderr
 
@@ -167,13 +181,15 @@ def test_events_and_types(fresh_db):
 
 
 def test_unknown_node_exits_1(fresh_db):
-    result = runner.invoke(app, ["node", "get", "missing"])
+    result = runner.invoke(app, ["node", "get", "missing", "--as", "owner"])
     assert result.exit_code == 1
     assert "not found" in result.stderr
 
 
 def test_bad_set_pair_exits_1(fresh_db):
-    result = runner.invoke(app, ["node", "create", "--type", "note", "--set", "nokey"])
+    result = runner.invoke(
+        app, ["node", "create", "--type", "note", "--set", "nokey", "--as", "owner"]
+    )
     assert result.exit_code == 1
     assert "--set expects key=value" in result.stderr
 
@@ -225,7 +241,7 @@ def test_undo_blocked_by_children_exits_1(fresh_db):
     _run_json("node", "create", "--type", "block", "--content", "b1", "--parent", page["id"])
     create_seq = _run_json("events")["events"][-1]["seq"]
 
-    result = runner.invoke(app, ["undo", str(create_seq)])
+    result = runner.invoke(app, ["undo", str(create_seq), "--as", "owner"])
     assert result.exit_code == 1
     assert "child node" in result.stderr
     assert result.exception is None or isinstance(result.exception, SystemExit)
@@ -252,7 +268,9 @@ def test_locked_database_exits_1(fresh_db, monkeypatch):
     blocker = real_connect(fresh_db)
     blocker.execute("BEGIN EXCLUSIVE")
     try:
-        result = runner.invoke(app, ["node", "create", "--type", "note", "--title", "blocked"])
+        result = runner.invoke(
+            app, ["node", "create", "--type", "note", "--title", "blocked", "--as", "owner"]
+        )
     finally:
         blocker.rollback()
         blocker.close()
@@ -372,12 +390,10 @@ def test_edge_create_batch_from_stdin(fresh_db):
             {"src": a["id"], "dst": "missing", "edge_type": "supports"},
         ]
     )
-    result = runner.invoke(
-        app, ["edge", "create-batch", "-", "--actor", "agent:researcher"], input=suggestions
-    )
+    result = runner.invoke(app, ["edge", "create-batch", "-", "--as", "owner"], input=suggestions)
     assert result.exit_code == 0, result.output
     outcome = json.loads(result.stdout)
-    assert outcome["created"][0]["state"] == "proposed"
+    assert outcome["created"][0]["state"] == "active"
     assert outcome["failed"][0]["index"] == 1
 
 
@@ -417,15 +433,15 @@ def test_search_filters_and_expand(fresh_db):
 
 def test_agent_update_proposes_and_review_accepts(fresh_db):
     note = _run_json("node", "create", "--type", "note", "--title", "N", "--content", "original")
-    version = _run_json(
-        "node", "update", note["id"], "--content", "bot rewrite", "--actor", "agent:researcher"
-    )
-    assert version["state"] == "proposed"
+    # The CLI is human-only (agents use MCP); a suggest-level agent's update is
+    # staged via the service, then reviewed over the CLI.
+    version = service.update_node(note["id"], content="bot rewrite", principal=agent("researcher"))
+    assert version.state == "proposed"
 
     queue = _run_json("review", "queue", "--kind", "update")
-    assert queue["proposals"][0]["id"] == str(version["id"])
+    assert queue["proposals"][0]["id"] == str(version.id)
 
-    accepted = _run_json("accept", str(version["id"]))
+    accepted = _run_json("accept", str(version.id))
     assert accepted["state"] == "applied"
     assert _run_json("node", "get", note["id"])["content"] == "bot rewrite"
 
@@ -433,11 +449,50 @@ def test_agent_update_proposes_and_review_accepts(fresh_db):
 # ── mcp serve: the actor is validated before anything is served ───────────────
 
 
-def test_mcp_serve_rejects_a_non_agent_actor(fresh_db):
-    for actor in ("human", "", "agent:", "agent", "researcher"):
-        result = runner.invoke(app, ["mcp", "serve", "--actor", actor])
-        assert result.exit_code == 1, result.output
-        assert "invalid --actor" in result.output
+def test_human_and_agent_admin_over_the_cli(fresh_db):
+    _run_json("human", "create", "alice", "--as", "owner")
+    humans = _run_json("human", "list", "--as", "owner")
+    assert humans["count"] == 2
+    assert {h["name"] for h in humans["humans"]} == {"owner", "alice"}
+
+    result = runner.invoke(app, ["agent", "create", "researcher", "--as", "owner"])
+    assert result.exit_code == 0, result.output
+    assert "ndm_" in result.stderr  # the token prints once, to stderr
+    agents = _run_json("agent", "list", "--as", "owner")
+    assert agents["agents"][0]["has_token"] is True
+
+    result = runner.invoke(app, ["agent", "token-rotate", "researcher", "--as", "owner"])
+    assert result.exit_code == 0, result.output
+    assert "ndm_" in result.stderr
+
+    _run_json("grant", "researcher", "main", "suggest", "--as", "owner")
+    listed = _run_json("grants", "--agent", "researcher", "--as", "owner")
+    assert listed["grants"][0]["level"] == "suggest"
+    _run_json("revoke", "researcher", "main", "--as", "owner")
+    # What remains is the creation-time template row (read on meta).
+    remaining = _run_json("grants", "--agent", "researcher", "--as", "owner")
+    assert [(g["space_id"], g["level"]) for g in remaining["grants"]] == [("meta", "read")]
+
+    _run_json("agent", "disable", "researcher", "--as", "owner")
+    assert _run_json("agent", "list", "--as", "owner")["agents"][0]["disabled"] is True
+
+
+def test_space_admin_over_the_cli(fresh_db):
+    created = _run_json("space-create", "sandbox", "--as", "owner")
+    assert created["type"] == "space"
+    assert created["space_id"] == "meta"
+    spaces = _run_json("space-list", "--as", "owner")
+    assert {s["title"] for s in spaces["spaces"]} == {"main", "meta", "sandbox"}
+    _run_json("space-archive", created["id"], "--as", "owner")
+    spaces = _run_json("space-list", "--as", "owner")
+    assert {s["title"] for s in spaces["spaces"]} == {"main", "meta"}
+
+
+def test_mcp_serve_requires_an_agent_token(fresh_db, monkeypatch):
+    monkeypatch.delenv("NODUM_AGENT_TOKEN", raising=False)
+    result = runner.invoke(app, ["mcp", "serve"])
+    assert result.exit_code == 1, result.output
+    assert "NODUM_AGENT_TOKEN" in result.output
 
 
 # ── Assets and renditions ─────────────────────────────────────────────────────
@@ -492,7 +547,7 @@ def test_asset_rendition_rejects_non_images(fresh_db, tmp_path):
     text_file.write_text("not an image")
     asset = _run_json("asset", "register", str(text_file))
 
-    result = runner.invoke(app, ["asset", "rendition", asset["hash"]])
+    result = runner.invoke(app, ["asset", "rendition", asset["hash"], "--as", "owner"])
     assert result.exit_code == 1
     assert "only supported for image assets" in result.stderr
 

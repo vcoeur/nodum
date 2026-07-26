@@ -13,20 +13,30 @@ import io
 import json
 
 import pytest
+from helpers import agent, owner
 from mcp.shared.memory import create_connected_server_and_client_session
 from PIL import Image
 
-from nodum import assets, service
-from nodum.mcp_server import ADDITIVE_TOOLS, CURATIVE_TOOLS, READ_TOOLS, REVIEW_TOOLS, create_server
+from nodum import assets, auth, service
+from nodum.mcp_server import (
+    ADDITIVE_TOOLS,
+    CURATIVE_TOOLS,
+    OVERWRITING_TOOLS,
+    READ_TOOLS,
+    REVIEW_TOOLS,
+    create_server,
+)
 
 AGENT = "agent:tester"
+TOKEN = "ndm_test_token_for_the_mcp_suite"
 
 
 def _run(fn):
     """Run an async MCP interaction against a fresh server bound to AGENT."""
 
     async def runner():
-        server = create_server(actor=AGENT)
+        agent(AGENT, token=TOKEN)  # seed the account with a verifiable token
+        server = create_server(token=TOKEN)
         async with create_connected_server_and_client_session(server) as session:
             return await fn(session)
 
@@ -71,42 +81,50 @@ def test_tool_annotations(fresh_db):
     for name in READ_TOOLS:
         assert by_name[name].annotations.readOnlyHint is True
         assert by_name[name].annotations.destructiveHint is False
-    # Everything writable on this surface is additive, so `destructiveHint`
-    # false is honest — the one destructive op (accept) is not registered.
+    # Additive tools only ever add state, whatever grant the agent holds, so
+    # `destructiveHint=False` is honest under `edit` as well as `suggest`.
+    # `update_node` is not: with `edit` it overwrites the node in place, and
+    # hosts auto-approve on that flag (review S15).
     for name in ADDITIVE_TOOLS:
         assert by_name[name].annotations.readOnlyHint is False
-        assert by_name[name].annotations.destructiveHint is False
+        assert by_name[name].annotations.destructiveHint is (name in OVERWRITING_TOOLS)
+    assert set(OVERWRITING_TOOLS) <= set(ADDITIVE_TOOLS)
 
 
-# ── Actor validation: the MCP surface is the external-agent surface ───────────
+def test_write_tool_docstrings_state_what_an_edit_grant_changes(fresh_db):
+    """The tier is additive by *policy*, not by grant: the docs must say so.
+
+    A `suggest` agent's writes queue; an `edit` agent's land live. Tool
+    descriptions are what an agent reads before calling, and they used to
+    promise `proposed` unconditionally (review S15).
+    """
+    tools = _run(lambda session: session.list_tools()).tools
+    for tool in tools:
+        if tool.name in ADDITIVE_TOOLS:
+            assert "edit" in tool.description, tool.name
 
 
-@pytest.mark.parametrize(
-    "actor",
-    [
-        "human",
-        "",
-        "   ",
-        "agent:",
-        "agent",
-        "researcher",
-        "agent:with space",
-        ":agent:x",
-        "Agent:x",
-        # A trailing newline/CR must not slip past the anchor (fullmatch, not
-        # `$`, which would accept a trailing '\n').
-        "agent:x\n",
-        "agent:x\r",
-    ],
-)
-def test_create_server_rejects_a_non_agent_actor(fresh_db, actor):
-    with pytest.raises(ValueError, match="invalid --actor"):
-        create_server(actor=actor)
+# ── Token authentication: the MCP surface verifies before it serves ───────────
 
 
-@pytest.mark.parametrize("actor", ["agent:mcp", "agent:researcher", "agent:gpt-4.1_x"])
-def test_create_server_accepts_well_formed_agent_actors(fresh_db, actor):
-    assert create_server(actor=actor) is not None
+def test_create_server_rejects_an_unknown_token(fresh_db):
+    with pytest.raises(auth.InvalidCredentials):
+        create_server(token="ndm_not_a_real_token")
+
+
+def test_create_server_rejects_a_disabled_agents_token(fresh_db):
+    created = service.create_agent("bot", owner_human_id="owner", principal=owner())
+    service.disable_agent("bot", principal=owner())
+    with pytest.raises(auth.InvalidCredentials):
+        create_server(token=created.token)
+
+
+def test_create_server_rejects_a_token_whose_owner_is_disabled(fresh_db):
+    created = service.create_agent("bot", owner_human_id="owner", principal=owner())
+    service.create_human("second", principal=owner())  # the owner is not the last one
+    service.disable_human("owner", principal=owner())
+    with pytest.raises(auth.InvalidCredentials):
+        create_server(token=created.token)
 
 
 # ── Additive tier: writes are attributed and land proposed ────────────────────
@@ -124,7 +142,12 @@ def test_create_node_lands_proposed_with_the_configured_actor(fresh_db):
 
 
 def test_update_node_stages_a_proposed_version(fresh_db):
-    note = service.create_node(type="note", title="Original", content="original body")
+    note = service.create_node(
+        type="note",
+        title="Original",
+        content="original body",
+        principal=owner(),
+    )
 
     async def scenario(session):
         result = await _call(session, "update_node", {"id": note.id, "content": "bot rewrite"})
@@ -134,29 +157,25 @@ def test_update_node_stages_a_proposed_version(fresh_db):
     version = _run(scenario)
     assert version["state"] == "proposed"
     assert version["content"] == "bot rewrite"
-    assert service.get_node(note.id).content == "original body"
+    assert service.get_node(note.id, principal=owner()).content == "original body"
 
 
-def test_link_and_policy_auto_accept(fresh_db):
-    a = service.create_node(type="concept", title="A")
-    b = service.create_node(type="concept", title="B")
-    c = service.create_node(type="concept", title="C")
-    service.set_policy(AGENT, [{"edge_type": "mentions", "action": "auto_accept"}])
+def test_link_lands_proposed(fresh_db):
+    a = service.create_node(type="concept", title="A", principal=owner())
+    b = service.create_node(type="concept", title="B", principal=owner())
 
     async def scenario(session):
-        auto = await _call(session, "link", {"src": a.id, "dst": b.id, "edge_type": "mentions"})
-        gated = await _call(session, "link", {"src": a.id, "dst": c.id, "edge_type": "supports"})
-        return auto.structuredContent, gated.structuredContent
+        edge = await _call(session, "link", {"src": a.id, "dst": b.id, "edge_type": "mentions"})
+        return edge.structuredContent
 
-    auto_edge, gated_edge = _run(scenario)
-    assert auto_edge["state"] == "active"  # policy auto-accepted
-    assert auto_edge["created_by"] == AGENT
-    assert gated_edge["state"] == "proposed"  # no matching rule
+    edge = _run(scenario)
+    assert edge["state"] == "proposed"
+    assert edge["created_by"] == AGENT
 
 
 def test_propose_edges_batch(fresh_db):
-    a = service.create_node(type="concept", title="A")
-    b = service.create_node(type="concept", title="B")
+    a = service.create_node(type="concept", title="A", principal=owner())
+    b = service.create_node(type="concept", title="B", principal=owner())
 
     async def scenario(session):
         result = await _call(
@@ -181,10 +200,25 @@ def test_propose_edges_batch(fresh_db):
 
 
 def _seed():
-    a = service.create_node(type="concept", title="Alpha concept", content="graph theory")
-    b = service.create_node(type="note", title="Beta note", content="about graph theory")
-    child = service.create_node(type="block", title="Child block", parent_id=b.id)
-    service.create_edge(a.id, b.id, "supports", confidence=0.9)
+    a = service.create_node(
+        type="concept",
+        title="Alpha concept",
+        content="graph theory",
+        principal=owner(),
+    )
+    b = service.create_node(
+        type="note",
+        title="Beta note",
+        content="about graph theory",
+        principal=owner(),
+    )
+    child = service.create_node(
+        type="block",
+        title="Child block",
+        parent_id=b.id,
+        principal=owner(),
+    )
+    service.create_edge(a.id, b.id, "supports", confidence=0.9, principal=owner())
     return a, b, child
 
 
@@ -223,7 +257,7 @@ def test_search_with_filters_and_expand(fresh_db):
 def test_search_date_filters_reach_the_query(fresh_db):
     """`created_after`/`created_before` are honoured, not just accepted."""
     _, b, _ = _seed()
-    stamp = service.get_node(b.id).created_at
+    stamp = service.get_node(b.id, principal=owner()).created_at
 
     def hits(filters):
         arguments = {"query": "graph", "filters": filters}
@@ -279,8 +313,8 @@ def test_list_types_and_get_schema(fresh_db):
 
 
 def test_history_and_diff(fresh_db):
-    note = service.create_node(type="note", title="Draft", content="v1 body")
-    service.update_node(note.id, content="v2 body")
+    note = service.create_node(type="note", title="Draft", content="v1 body", principal=owner())
+    service.update_node(note.id, content="v2 body", principal=owner())
 
     history = _run(lambda session: _call(session, "history", {"node_id": note.id}))
     versions = history.structuredContent["result"]
@@ -297,7 +331,12 @@ def test_history_and_diff(fresh_db):
 
 
 def test_agent_proposes_over_mcp_and_only_the_human_can_review(fresh_db):
-    note = service.create_node(type="note", title="Original", content="original body")
+    note = service.create_node(
+        type="note",
+        title="Original",
+        content="original body",
+        principal=owner(),
+    )
 
     async def scenario(session):
         first = await _call(session, "update_node", {"id": note.id, "content": "accepted body"})
@@ -306,24 +345,26 @@ def test_agent_proposes_over_mcp_and_only_the_human_can_review(fresh_db):
 
     keep, drop = _run(scenario)
     # Neither proposal touched the node — the agent has no way to land them.
-    assert service.get_node(note.id).content == "original body"
+    assert service.get_node(note.id, principal=owner()).content == "original body"
 
-    # The agent's own actor cannot review either proposal, even its own.
-    with pytest.raises(service.ReviewNotPermitted):
-        service.accept_proposals([str(keep["id"])], actor=AGENT)
-    with pytest.raises(service.ReviewNotPermitted):
-        service.reject_proposals([str(drop["id"])], reason="mine", actor=AGENT)
+    # The agent's own principal cannot review either proposal, even its own:
+    # suggest covers proposing, never accepting — refusals land per item.
+    refused = service.accept_proposals([str(keep["id"])], principal=agent(AGENT))
+    assert refused.transitioned == [] and len(refused.failed) == 1
+    refused = service.reject_proposals([str(drop["id"])], reason="mine", principal=agent(AGENT))
+    assert refused.transitioned == [] and len(refused.failed) == 1
 
     # The human works the queue out of band (CLI / review API).
-    service.accept_proposals([str(keep["id"])], actor="human")
-    service.reject_proposals([str(drop["id"])], reason="not good enough", actor="human")
-    assert service.get_node(note.id).content == "accepted body"
-    assert [v.state for v in service.history(note.id)] == ["applied", "applied", "archived"]
+    service.accept_proposals([str(keep["id"])], principal=owner())
+    service.reject_proposals([str(drop["id"])], reason="not good enough", principal=owner())
+    assert service.get_node(note.id, principal=owner()).content == "accepted body"
+    versions = service.history(note.id, principal=owner())
+    assert [v.state for v in versions] == ["applied", "applied", "archived"]
 
 
 def test_agent_wikilinks_over_mcp_stay_proposed(fresh_db):
     """A create_node over MCP must not attach a live edge to a human's node."""
-    target = service.create_node(type="concept", title="Human Concept")
+    target = service.create_node(type="concept", title="Human Concept", principal=owner())
 
     async def scenario(session):
         result = await _call(
@@ -335,13 +376,20 @@ def test_agent_wikilinks_over_mcp_stay_proposed(fresh_db):
 
     node = _run(scenario)
     assert node["state"] == "proposed"
-    assert service.list_edges(node_id=target.id, type="mentions", state="active") == []
-    (pending,) = service.list_edges(node_id=target.id, type="mentions", state="proposed")
+    assert (
+        service.list_edges(node_id=target.id, type="mentions", state="active", principal=owner())
+        == []
+    )
+    (pending,) = service.list_edges(
+        node_id=target.id, type="mentions", state="proposed", principal=owner()
+    )
     assert pending.created_by == AGENT
 
     # The human accepting the node is what brings the edge to life.
-    service.accept_proposals([node["id"]], actor="human")
-    (live,) = service.list_edges(node_id=target.id, type="mentions", state="active")
+    service.accept_proposals([node["id"]], principal=owner())
+    (live,) = service.list_edges(
+        node_id=target.id, type="mentions", state="active", principal=owner()
+    )
     assert live.id == pending.id
 
 

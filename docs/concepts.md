@@ -13,8 +13,8 @@ by a **type catalog** stored in the database, and each type carries a JSON
 schema that the service layer validates against.
 
 ```sh
-nodum types              # the catalog
-nodum schema note        # one type's entry, including its JSON schema
+nodum types --as owner       # the catalog
+nodum schema note --as owner # one type's entry, including its JSON schema
 ```
 
 Because the catalog lives in the database rather than in code, the schema can
@@ -24,7 +24,10 @@ evolve at runtime without a release.
 
 Node content is Markdown, and `[[wikilinks]]` inside it are **materialised as
 real edges** — the prose and the graph cannot disagree, because one derives
-from the other.
+from the other. A link only becomes (or stops being) an edge as far as the
+writer's grants reach: a mention into a space they may only suggest in stays
+`proposed`, and one into a space they cannot read at all is left exactly as it
+is, since an unresolvable link is not a deleted one.
 
 ## The state machine
 
@@ -56,37 +59,34 @@ The log is also the input to the projectors, below.
 ## Actors and privilege
 
 nodum assumes humans and agents both write, and separates them **at the service
-layer** rather than by convention.
+layer** rather than by convention. There are human and agent **accounts** (tables
+`humans` and `agents`), and per-(agent, space) **grants** at three hierarchical
+levels: `read` ⊂ `suggest` ⊂ `edit`.
 
 | | Human | Agent |
 |---|---|---|
-| A write lands as | `active` | `proposed` (unless a policy auto-accepts) |
-| Can accept / reject / archive | yes | no |
+| A write lands as | `active` | `proposed` on a `suggest` grant, `active` on `edit` |
+| Can accept / reject / archive | yes | only with `edit` on the item's space |
 | Can undo | yes | no |
-| Can set a policy | yes | no |
+| Administers accounts and grants | yes | no |
 
 The human-only set is not delegable, whoever filed the proposal. `undo` most of
-all, since restoring an event's payload can write `state = 'active'` back —
-and `policy set`, since a policy grants auto-accept, so an agent setting one
-would self-grant the very privilege the human tier withholds.
+all, since restoring an event's payload can write `state = 'active'` back.
 
 ### Proposed updates
 
-An agent editing a node does not overwrite it. It stages a `proposed` **version**
-that records *which fields it named*. Accepting applies only those fields to
-the node as it stands at that moment, so a human edit made while the proposal
-waited survives.
+An agent with a `suggest` grant editing a node does not overwrite it. It stages
+a `proposed` **version** that records *which fields it named*. Accepting applies
+only those fields to the node as it stands at that moment, so a human edit made
+while the proposal waited survives.
 
-### Policies
+### Grants
 
-A stored, per-agent ruleset can auto-accept writes that match it, moving a
-trusted agent's routine output off the review queue.
-
-!!! warning
-    A rule's `min_confidence` grades the *agent's own reported* confidence. It
-    is therefore inert unless the rule also sets
-    `"trust_self_reported_confidence": true` — an agent grading its own
-    homework only counts if you say it does.
+A grant is one row per (agent, space). It is set with
+`nodum grant <agent> <space> <level>` (human-only, event-logged). A `suggest`
+grant queues everything for review; an `edit` grant writes live and carries
+in-space review authority. There is deliberately no auto-accept machinery: an
+agent earns `edit`, or it waits.
 
 ## Projectors and derived indexes
 
@@ -124,9 +124,11 @@ never originals.**
 The CLI, the HTTP API, and the MCP server are thin adapters over one service
 layer, each with its own identity rule and no logic of its own:
 
-- **CLI** — actor is whatever `--actor` says, defaulting to `human`.
-- **HTTP API** — every write is `human`; no request field can say otherwise.
-- **MCP server** — a fixed `agent:<name>`, exposing the read and additive tool
-  tiers *and nothing else*.
+- **CLI** — human-only; every command that touches the graph names its human
+  with a required `--as human:<id>`, reads included.
+- **HTTP API** — every write is attributed to the session's human (password
+  login, server-side session); no request field can say otherwise.
+- **MCP server** — one agent, authenticated by its token (`NODUM_AGENT_TOKEN`),
+  exposing the read and additive tool tiers *and nothing else*.
 
 Because the logic lives in one place, the surfaces cannot drift apart.

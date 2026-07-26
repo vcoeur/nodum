@@ -300,6 +300,15 @@
   box-shadow: var(--nd-shadow-overlay);
 }
 
+/* The wider layout, for a diff, a manifest, or a form with room to breathe. */
+.nd-modal--wide {
+  width: min(56rem, 100%);
+}
+
+.nd-modal__body > * + * {
+  margin-top: var(--nd-space-8);
+}
+
 .nd-modal__header {
   display: flex;
   align-items: center;

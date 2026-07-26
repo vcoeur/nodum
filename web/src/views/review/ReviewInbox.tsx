@@ -682,8 +682,9 @@ function EmptyQueue({
       body={
         <>
           An empty queue is the normal state. Proposals land here when an agent
-          writes as <code>agent:&lt;name&gt;</code> — over MCP, or through the CLI
-          with <code>--actor</code> — and no policy of theirs auto-accepts it.
+          holding a <code>suggest</code> grant writes — over MCP, authenticated
+          by its token. An <code>edit</code> grant lands those writes directly
+          instead.
           Checked{" "}
           {loadedAt !== null ? new Date(loadedAt).toLocaleTimeString() : "just now"}; this
           view re-checks on a timer and whenever you come back to the window.
@@ -744,14 +745,16 @@ function QueueFailure({ error, onRetry }: { error: unknown; onRetry: () => void 
   if (kind === "forbidden") {
     return (
       <div className="nd-rv-forbidden">
-        <h2>The server refused this as a non-human actor</h2>
+        <h2>The server refused this as a non-human principal</h2>
         <p>
-          Review is the human tier: the service layer refuses <code>accept</code>,{" "}
-          <code>reject</code>, <code>archive</code>, <code>undo</code>, and{" "}
-          <code>policy set</code> for any actor other than <code>human</code>. This
-          web surface <em>is</em> the human surface — it forces{" "}
-          <code>actor="human"</code> server-side and has no way to send another
-          one — so a 403 here means the server is not behaving as the surface
+          Review on this surface is the human tier: <code>accept</code>,{" "}
+          <code>reject</code>, <code>archive</code>, and <code>undo</code> need
+          a human principal (an agent holding <code>edit</code> on the space can
+          review over the service API, but never through this UI, and{" "}
+          <code>undo</code> is human-only everywhere). This
+          web surface <em>is</em> the human surface — it attributes every write
+          to the session's human server-side and has no way to send another
+          identity — so a 403 here means the server is not behaving as the surface
           promises, not that you picked the wrong identity.
         </p>
         <p className="nd-mono">{message}</p>

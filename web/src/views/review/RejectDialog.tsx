@@ -10,7 +10,7 @@
  */
 
 import { useId, useState } from "react";
-import { Modal } from "./Modal";
+import { Modal } from "../../components";
 import { ProposalManifest } from "./ProposalManifest";
 import type { ProposalOut } from "../../api/types";
 import { plural } from "./format";

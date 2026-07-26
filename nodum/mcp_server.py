@@ -13,7 +13,7 @@ block); original binaries are never served over MCP.
 
 **Neither the review tier nor the curative tier is ever registered.** The
 review tools (``accept``, ``reject``) belong to the §8.1 "write
-(human/policy)" tier — accepting is a *destructive* effect (it makes proposed
+(human)" tier — accepting is a *destructive* effect (it makes proposed
 structure live and archives what that structure replaces), so it stays with
 the human, on the CLI and the review API. The curative tools
 (``merge_nodes``, ``retype``, ``supersede_edge``, ``bulk_relink``,
@@ -21,11 +21,11 @@ the human, on the CLI and the review API. The curative tools
 do not exist here, so there is no runtime check to argue around — and
 :mod:`nodum.service` refuses a non-human reviewer regardless of surface.
 
-Identity: one configured actor per server (``nodum mcp serve --actor``), so
-every write is attributed to the connecting agent and lands ``proposed``
-unless the agent's stored policy auto-accepts it. The actor must be an
-``agent:<name>`` string — this surface has no human tier to configure.
-Transport is stdio — what MCP clients actually launch.
+Identity: the agent's bearer token, from the ``NODUM_AGENT_TOKEN``
+environment variable (the shape MCP client configs carry in their ``env``
+blocks — a command-line token would leak into ``ps``). Verification mints
+the agent's principal, and its grant set confines every tool call. Transport
+is stdio — what MCP clients actually launch.
 
 Every tool delegates to :mod:`nodum.service` / :mod:`nodum.search`; there is
 no logic here beyond argument mapping and JSON shaping.
@@ -33,7 +33,7 @@ no logic here beyond argument mapping and JSON shaping.
 
 from __future__ import annotations
 
-import re
+import os
 from pathlib import Path
 from typing import Any
 
@@ -42,29 +42,34 @@ from mcp.server.fastmcp.utilities.types import Image
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel
 
-from nodum import assets, service
+from nodum import assets, auth, service
 from nodum import search as search_module
 
-#: Tool annotations per registered tier (design §8): reads are read-only;
-#: additive writes are non-destructive — they only ever *add* state (even an
-#: auto-accepted write adds an edge), never archive or overwrite existing
-#: state, and everything is reversible via undo. No annotation exists for a
-#: destructive tool because no destructive tool is registered.
+#: Tool annotations per registered tier (design §8). Reads are read-only.
+#: Additive writes only ever *add* state — a node, an edge, a proposed
+#: version — whatever grant the agent holds, so ``destructiveHint=False``
+#: stays true under ``edit`` as well as ``suggest``.
+#:
+#: ``update_node`` is the exception (Q13 review S15): under an ``edit`` grant
+#: it overwrites the node's fields in place and can retire the mentions its
+#: old content carried. MCP hosts auto-approve on ``destructiveHint=False``,
+#: so annotating it that way was a lie told to the approval prompt — it is
+#: marked destructive, and the cost is that an ``edit``-granted agent's
+#: updates get a confirmation an additive tool's do not. Nothing here is
+#: annotated by what the *current* agent may do: annotations are static
+#: registry metadata, so each one states the worst case its grant allows.
 _READ = ToolAnnotations(readOnlyHint=True, destructiveHint=False)
 _ADDITIVE = ToolAnnotations(readOnlyHint=False, destructiveHint=False)
+_OVERWRITING = ToolAnnotations(readOnlyHint=False, destructiveHint=True)
 
 #: Curative tools (design §8.2) — asserted absent from the registry in tests.
 CURATIVE_TOOLS = ("merge_nodes", "retype", "supersede_edge", "bulk_relink", "consolidate")
 
-#: Review tools (design §8.1 "write (human/policy)" tier). Like the curative
+#: Review tools (design §8.1 "write (human)" tier). Like the curative
 #: tools these are **never registered** — asserted absent in tests. Accepting
 #: archives the active structure a proposal replaces, so it is destructive and
 #: human-only; the CLI (``nodum review …``) is where it lives.
 REVIEW_TOOLS = ("accept", "reject")
-
-#: The actor form this surface accepts: an external agent identity, never a
-#: human and never an empty or unprefixed name.
-AGENT_ACTOR_RE = re.compile(r"^agent:[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 #: The tools this server registers, by tier (documentation + test anchor).
 READ_TOOLS = (
@@ -81,26 +86,9 @@ READ_TOOLS = (
 )
 ADDITIVE_TOOLS = ("create_node", "update_node", "link", "propose_edges")
 
-
-def _validate_actor(actor: str) -> str:
-    """Return ``actor`` if it is a well-formed external-agent identity.
-
-    The MCP surface is the external-agent surface: every write it makes must
-    be attributable to an agent and must land ``proposed``. ``--actor human``
-    would silently turn the whole server into a human writing directly into
-    the live graph (and, before the review tools were removed, into a
-    self-approving one), so it is refused here rather than trusted.
-
-    Raises:
-        ValueError: If ``actor`` is not of the form ``agent:<name>``.
-    """
-    if not isinstance(actor, str) or not AGENT_ACTOR_RE.fullmatch(actor):
-        raise ValueError(
-            f"invalid --actor {actor!r}: the MCP server serves external agents only — "
-            "the actor must be 'agent:<name>' (e.g. 'agent:researcher'), never "
-            f"{service.ACTOR_HUMAN!r} or an empty/unprefixed name"
-        )
-    return actor
+#: The write tools whose worst case (under an ``edit`` grant) overwrites live
+#: state rather than adding to it — annotated ``destructiveHint=True``.
+OVERWRITING_TOOLS = ("update_node",)
 
 
 def _dump(result: BaseModel | list[BaseModel]) -> dict[str, Any] | list[dict[str, Any]]:
@@ -110,13 +98,13 @@ def _dump(result: BaseModel | list[BaseModel]) -> dict[str, Any] | list[dict[str
     return result.model_dump(mode="json")
 
 
-def create_server(*, actor: str = "agent:mcp", db_path: str | Path | None = None) -> FastMCP:
-    """Build the nodum MCP server bound to one agent identity and database.
+def create_server(*, token: str, db_path: str | Path | None = None) -> FastMCP:
+    """Build the nodum MCP server bound to one verified agent principal.
 
     Args:
-        actor: The actor string every write is attributed to. Must be an
-            ``agent:<name>`` identity (e.g. ``agent:researcher``) — writes
-            land ``proposed`` unless the agent's stored policy auto-accepts.
+        token: The agent's bearer token (``ndm_…``, minted by
+            ``nodum agent create`` / ``token-rotate``). Verified against its
+            stored hash; the agent's grants then confine every tool call.
         db_path: Explicit database path; defaults to ``NODUM_DB`` resolution.
 
     Returns:
@@ -125,19 +113,19 @@ def create_server(*, actor: str = "agent:mcp", db_path: str | Path | None = None
         registered.
 
     Raises:
-        ValueError: If ``actor`` is not of the form ``agent:<name>``.
+        auth.InvalidCredentials: If the token verifies no enabled agent.
     """
-    _validate_actor(actor)
+    principal = auth.verify_agent_token(token, path=db_path)
     server = FastMCP(
         "nodum",
         instructions=(
             "nodum knowledge graph — read tier (get_node/get_children/search/traverse/"
             "list_types/get_schema/find_path/history/diff/get_asset) and additive tier "
             "(create_node/update_node/link/propose_edges). You can only grow this graph: "
-            "every write lands as a proposal for human review unless the human's stored "
-            "policy auto-accepts it. Reviewing (accept/reject) and curative operations "
-            "are not available over MCP — they belong to the human. Assets are served as "
-            "small derived renditions — never the original binary (design §5.7)."
+            "every write lands as a proposal for human review. Reviewing (accept/reject) "
+            "and curative operations are not available over MCP — they belong to the "
+            "human. Assets are served as small derived renditions — never the original "
+            "binary (design §5.7)."
         ),
     )
 
@@ -146,12 +134,12 @@ def create_server(*, actor: str = "agent:mcp", db_path: str | Path | None = None
     @server.tool(annotations=_READ)
     def get_node(id: str, depth: int = 1) -> dict[str, Any]:
         """Fetch a node plus its active-edge neighborhood out to `depth` hops (0 = node alone)."""
-        return _dump(service.get_neighborhood(id, depth=depth, path=db_path))
+        return _dump(service.get_neighborhood(id, depth=depth, principal=principal, path=db_path))
 
     @server.tool(annotations=_READ)
     def get_children(id: str) -> list[dict[str, Any]]:
         """List a node's children in position order (the document tree)."""
-        return _dump(service.list_children(id, path=db_path))
+        return _dump(service.list_children(id, principal=principal, path=db_path))
 
     @server.tool(annotations=_READ)
     def search(
@@ -185,6 +173,7 @@ def create_server(*, actor: str = "agent:mcp", db_path: str | Path | None = None
             created_after=filters.pop("created_after", None),
             created_before=filters.pop("created_before", None),
             expand=expand,
+            principal=principal,
             path=db_path,
         )
         return _dump(result)
@@ -203,34 +192,39 @@ def create_server(*, actor: str = "agent:mcp", db_path: str | Path | None = None
         """
         return _dump(
             service.traverse(
-                start_id, edge_types=edge_types, depth=depth, direction=direction, path=db_path
+                start_id,
+                edge_types=edge_types,
+                depth=depth,
+                direction=direction,
+                principal=principal,
+                path=db_path,
             )
         )
 
     @server.tool(annotations=_READ)
     def list_types() -> dict[str, Any]:
         """List the full type catalog (node types and edge types)."""
-        return _dump(service.list_types(path=db_path))
+        return _dump(service.list_types(principal=principal, path=db_path))
 
     @server.tool(annotations=_READ)
     def get_schema(type: str) -> dict[str, Any]:
         """Fetch one node or edge type's catalog entry (id or name), incl. its JSON schema."""
-        return _dump(service.get_schema(type, path=db_path))
+        return _dump(service.get_schema(type, principal=principal, path=db_path))
 
     @server.tool(annotations=_READ)
     def find_path(a: str, b: str) -> dict[str, Any]:
         """Find the shortest path between two nodes over active edges (any type)."""
-        return _dump(service.find_path(a, b, path=db_path))
+        return _dump(service.find_path(a, b, principal=principal, path=db_path))
 
     @server.tool(annotations=_READ)
     def history(node_id: str) -> list[dict[str, Any]]:
         """List a node's version history (applied snapshots and proposed/rejected updates)."""
-        return _dump(service.history(node_id, path=db_path))
+        return _dump(service.history(node_id, principal=principal, path=db_path))
 
     @server.tool(annotations=_READ)
     def diff(a: int, b: int) -> dict[str, Any]:
         """Unified diff between two versions of one node (ids from `history`)."""
-        return _dump(service.diff_versions(a, b, path=db_path))
+        return _dump(service.diff_versions(a, b, principal=principal, path=db_path))
 
     @server.tool(annotations=_READ, structured_output=False)
     def get_asset(id_or_hash: str, rendition: str = "preview") -> list[Any]:
@@ -248,11 +242,15 @@ def create_server(*, actor: str = "agent:mcp", db_path: str | Path | None = None
                 f"unsupported rendition {rendition!r}: MCP serves "
                 f"{', '.join(sorted(assets.PROFILES))} only — originals never"
             )
-        asset = assets.get_asset(id_or_hash, path=db_path)
+        asset = assets.get_asset(id_or_hash, principal=principal, path=db_path)
         metadata: dict[str, Any] = {"asset": asset.model_dump(mode="json")}
         try:
             rend = assets.get_rendition(
-                id_or_hash, profile=rendition, include_data=True, path=db_path
+                id_or_hash,
+                profile=rendition,
+                include_data=True,
+                principal=principal,
+                path=db_path,
             )
         except assets.UnsupportedRendition:
             # Not a renderable image: metadata (+ extracted text) only, per §5.7.
@@ -271,10 +269,15 @@ def create_server(*, actor: str = "agent:mcp", db_path: str | Path | None = None
         parent: str | None = None,
         props: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Create a node — always `proposed`, awaiting human review.
+        """Create a node. Where it lands depends on your grant on the space.
 
-        Any `[[wikilinks]]` in `content` materialise as `proposed` `mentions`
-        edges; they go live only when a human accepts this node.
+        With a `suggest` grant the node is `proposed` and waits for review;
+        with `edit` it lands `active` immediately — the grant is the whole
+        difference, and nothing on this surface reports which you hold.
+
+        Any `[[wikilinks]]` in `content` materialise as `mentions` edges in
+        the same way, and a link into a space you may only suggest in stays
+        `proposed` even when the node itself is live.
         """
         return _dump(
             service.create_node(
@@ -283,25 +286,29 @@ def create_server(*, actor: str = "agent:mcp", db_path: str | Path | None = None
                 content=content,
                 parent_id=parent,
                 props=props,
-                actor=actor,
+                principal=principal,
                 path=db_path,
             )
         )
 
-    @server.tool(annotations=_ADDITIVE)
+    @server.tool(annotations=_OVERWRITING)
     def update_node(
         id: str,
         title: str | None = None,
         content: str | None = None,
         props: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Propose an update to a node: stages a new `proposed` version (design §8.1).
+        """Update a node — staged as a proposal, or applied in place under `edit`.
 
-        Only the given fields change — the proposal records which ones, and
-        accepting applies just those to the node as it stands then, so
-        anything edited while your proposal waited is preserved. The node
-        itself is untouched until a human reviewer accepts the proposed
-        version — there is no tool on this surface that can accept it.
+        With a `suggest` grant this stages a new `proposed` version (design
+        §8.1): only the given fields are recorded, and accepting applies just
+        those to the node as it stands then, so anything edited while your
+        proposal waited is preserved. The node itself is untouched until a
+        reviewer accepts — there is no tool on this surface that can accept.
+
+        **With an `edit` grant the node is overwritten immediately**, its old
+        content replaced and the mentions that content carried retired. That
+        is why this tool is annotated destructive while the others are not.
         """
         kwargs: dict[str, Any] = {}
         if title is not None:
@@ -310,7 +317,7 @@ def create_server(*, actor: str = "agent:mcp", db_path: str | Path | None = None
             kwargs["content"] = content
         if props is not None:
             kwargs["props"] = props
-        return _dump(service.update_node(id, actor=actor, path=db_path, **kwargs))
+        return _dump(service.update_node(id, principal=principal, path=db_path, **kwargs))
 
     @server.tool(annotations=_ADDITIVE)
     def link(
@@ -320,27 +327,37 @@ def create_server(*, actor: str = "agent:mcp", db_path: str | Path | None = None
         props: dict[str, Any] | None = None,
         confidence: float | None = None,
     ) -> dict[str, Any]:
-        """Create a typed, directed edge; lands `proposed` unless the human's policy auto-accepts.
+        """Create a typed, directed edge; `proposed` under `suggest`, live under `edit`.
 
-        `confidence` is your own estimate and is recorded as such. It cannot
-        buy auto-accept on its own: a policy confidence gate is only graded
-        when the human's rule opts in to trusting self-reported confidence.
+        The landing state needs the matching grant on **both** endpoint
+        spaces: `edit` on one and `suggest` on the other stages the edge.
+
+        `confidence` is your own estimate and is recorded as such — it is
+        indicative data for the reviewer and triggers nothing on its own.
         """
         return _dump(
             service.create_edge(
-                src, dst, edge_type, props=props, confidence=confidence, actor=actor, path=db_path
+                src,
+                dst,
+                edge_type,
+                props=props,
+                confidence=confidence,
+                principal=principal,
+                path=db_path,
             )
         )
 
     @server.tool(annotations=_ADDITIVE)
     def propose_edges(suggestions: list[dict[str, Any]]) -> dict[str, Any]:
-        """Propose a batch of edges: each suggestion is {src, dst, edge_type, props?, confidence?}.
+        """Write a batch of edges: each suggestion is {src, dst, edge_type, props?, confidence?}.
 
-        Bad suggestions are reported in `failed` by index; the rest still write.
+        Each edge lands exactly as `link` would — `proposed` under `suggest`,
+        live under `edit` on both endpoint spaces. Bad suggestions are
+        reported in `failed` by index; the rest still write.
         """
-        return _dump(service.propose_edges(suggestions, actor=actor, path=db_path))
+        return _dump(service.propose_edges(suggestions, principal=principal, path=db_path))
 
-    # ── Review tier (§8.1 "write (human/policy)") is deliberately absent ──
+    # ── Review tier (§8.1 "write (human)") is deliberately absent ──
     # `accept`/`reject` are not registered here: accepting makes proposed
     # structure live and archives what it replaces, which is destructive and
     # the human's call. The human works the queue through `nodum review …`.
@@ -348,10 +365,21 @@ def create_server(*, actor: str = "agent:mcp", db_path: str | Path | None = None
     return server
 
 
-def serve(*, actor: str = "agent:mcp", db_path: str | Path | None = None) -> None:
+def serve(*, token: str | None = None, db_path: str | Path | None = None) -> None:
     """Run the MCP server on stdio (blocking) — what MCP clients launch.
 
+    The token comes from the environment, never the command line (a flag
+    would leak into ``ps`` and shell history): ``NODUM_AGENT_TOKEN``, which
+    is exactly the shape MCP client configs carry in their ``env`` blocks.
+
     Raises:
-        ValueError: If ``actor`` is not of the form ``agent:<name>``.
+        ValueError: If the environment carries no token.
+        auth.InvalidCredentials: If the token verifies no enabled agent.
     """
-    create_server(actor=actor, db_path=db_path).run()
+    token = token or os.environ.get("NODUM_AGENT_TOKEN")
+    if not token:
+        raise ValueError(
+            "NODUM_AGENT_TOKEN is not set: the MCP server authenticates with an "
+            "agent token (mint one with 'nodum agent create <name>')"
+        )
+    create_server(token=token, db_path=db_path).run()

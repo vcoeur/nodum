@@ -1,0 +1,81 @@
+/* The admin view: agent cards with their grant tables, the humans table. */
+
+.nd-ad__subtitle {
+  max-width: 60ch;
+}
+
+.nd-ad-section {
+  margin-top: var(--nd-space-12);
+}
+
+.nd-ad-section__title {
+  font-size: var(--nd-text-md);
+  margin-bottom: var(--nd-space-4);
+}
+
+.nd-ad-create {
+  margin-bottom: var(--nd-space-6);
+}
+
+.nd-ad-create .nd-input {
+  max-width: 20rem;
+}
+
+.nd-ad-agent {
+  margin-bottom: var(--nd-space-6);
+}
+
+.nd-ad-agent__header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--nd-space-6);
+}
+
+.nd-ad-agent__name {
+  font-size: var(--nd-text-md);
+  display: flex;
+  align-items: baseline;
+  gap: var(--nd-space-4);
+}
+
+.nd-ad-grants {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: var(--nd-space-4);
+  font-size: var(--nd-text-sm);
+}
+
+.nd-ad-grants th {
+  text-align: left;
+  font-size: var(--nd-text-2xs);
+  letter-spacing: var(--nd-tracking-label);
+  text-transform: uppercase;
+  color: var(--nd-text-faint);
+  font-weight: var(--nd-weight-medium);
+  padding: var(--nd-space-2) var(--nd-space-4) var(--nd-space-2) 0;
+  border-bottom: 1px solid var(--nd-border);
+}
+
+.nd-ad-grants td {
+  padding: var(--nd-space-2) var(--nd-space-4) var(--nd-space-2) 0;
+  border-bottom: 1px solid var(--nd-border);
+}
+
+.nd-ad-grants__actions {
+  text-align: right;
+}
+
+.nd-ad-agent__add {
+  margin-top: var(--nd-space-4);
+}
+
+/* The show-once token, in the hand-off dialog. */
+.nd-ad-token {
+  padding: var(--nd-space-4) var(--nd-space-6);
+  background: var(--nd-surface);
+  border: 1px solid var(--nd-border-strong);
+  border-radius: var(--nd-radius-md);
+  word-break: break-all;
+  user-select: all;
+}

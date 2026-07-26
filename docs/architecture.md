@@ -10,7 +10,7 @@ event log or lazily generated.
 flowchart LR
     cli["nodum.cli (Typer)"] --> svc["nodum.service (deterministic, LLM-free)"]
     mcp["nodum.mcp_server (FastMCP, stdio)"] --> svc
-    http["nodum.http_api (Starlette, actor=human)"] --> svc
+    http["nodum.http_api (Starlette, human principal)"] --> svc
     cli --> qry["nodum.search (hybrid: BM25 + vector, RRF)"]
     mcp --> qry
     http --> qry
@@ -18,7 +18,7 @@ flowchart LR
     mcp --> ast
     http --> ast
     http --> web["nodum/_web (built UI bundle)"]
-    svc --> db[("SQLite (WAL): types · nodes · edge_types · edges · versions · events · policies · assets · asset_blobs · renditions · merge_redirects")]
+    svc --> db[("SQLite (WAL): nodes · edges · versions · events · humans · agents · grants · sessions · assets · asset_blobs · renditions · merge_redirects")]
     svc --> mig["nodum.migrations (append-only)"]
     ast --> db
     db -- "events (append-only)" --> prj["nodum.projectors (checkpoints · run · rebuild)"]
@@ -49,19 +49,19 @@ flowchart LR
 
 | Module | Role |
 |---|---|
-| `nodum.db` | Connection management (WAL, foreign keys), `NODUM_DB` resolution, the migration runner over `schema_migrations`. `apply_migration` wraps each script **and** its `schema_migrations` row in one transaction (`BEGIN … COMMIT` inside the `executescript` payload, rollback on failure), so an interrupted upgrade is retried, not stranded half-applied. |
-| `nodum.migrations` | The append-only migration list: `0001_core` (core DDL), `0002_seed_builtin_types` (the built-in type catalog), `0003_projector_checkpoints_and_fts` (`projector_checkpoints` + the derived `node_fts` FTS5 table), `0004_policies` (per-agent policy rulesets), `0005_proposed_versions` (`versions.state` — `applied`/`proposed`/`archived`), `0006_vectors` (the derived `chunks` + `node_vec` sqlite-vec tables), `0007_assets_and_renditions` (`assets` metadata + `asset_blobs` originals + `renditions`, all bytes in-database), `0008_version_proposed_fields` (`versions.proposed_fields` — which fields a proposed update names). Shipped entries are never edited; later phases append their own. |
-| `nodum.service` | The only writer. Validation, the `proposed → active → archived` state machine, the event log, versions (incl. `proposed` updates: agent edits stage a version naming the fields they change; accept applies exactly those as an ordinary `node.update`, reject archives it), undo, wikilink materialization (edges land in the *writer's* state — `proposed` for an agent), agent policies (CRUD + auto-accept evaluation on the edge write path), the review queue (proposal listing with reviewer context over nodes/edges/updates, batch accept/reject by id or filter), and the curated graph reads behind the MCP read tier (`get_neighborhood`, `traverse`, `find_path`, `get_schema`, `diff_versions`) plus `propose_edges` batch writes. Two further reads serve interactive clients rather than agents: `subgraph` (the filtered, node-capped neighborhood — see the decision log) and `suggest_links` (title-prefix lookup for a `[[` autocomplete, read straight off `nodes` so it needs no projector). **`accept`, `reject`, `archive`, and `undo` refuse any actor but `human`, raising `ReviewNotPermitted`.** Each public function opens a short-lived connection, applies pending migrations idempotently, and commits — adapters stay stateless. |
+| `nodum.db` | Connection management (WAL, foreign keys), `NODUM_DB` resolution, the migration runner over `schema_migrations`. `apply_migration` wraps each script **and** its `schema_migrations` row in one transaction (`BEGIN` inside the `executescript` payload, `foreign_key_check` then `COMMIT` around it, rollback on failure), so an interrupted upgrade is retried, not stranded half-applied. Foreign-key *enforcement* is off for the duration and the whole database is checked before the commit: this is SQLite's own recipe for the create-copy-drop-rename rebuild 0009 performs, and deferring instead is not equivalent — dropping a populated parent leaves a deferred-violation counter the rename never clears, which made 0009 fail on any database holding one node and its version row. The schema-consistency check (one per migration whose name implies a schema guarantee) runs **before** the apply loop, so a database that can only be deleted never has 0010's irreversible `DROP TABLE policies` committed onto it first. |
+| `nodum.migrations` | The append-only migration list: `0001_core` (core DDL), `0002_seed_builtin_types` (the built-in type catalog), `0003_projector_checkpoints_and_fts` (`projector_checkpoints` + the derived `node_fts` FTS5 table), `0004_policies` (per-agent policy rulesets — dropped by 0010), `0005_proposed_versions` (`versions.state` — `applied`/`proposed`/`archived`), `0006_vectors` (the derived `chunks` + `node_vec` sqlite-vec tables), `0007_assets_and_renditions` (`assets` metadata + `asset_blobs` originals + `renditions`, all bytes in-database), `0008_version_proposed_fields` (`versions.proposed_fields` — which fields a proposed update names), `0009_spaces_and_type_nodes` (Q13: `graph_id` → `space_id` on nodes only, the type catalogs become type-nodes in the meta space, bootstrap seeds), `0010_principals` (`humans`/`agents`/`grants`/`sessions`, parity grants, the policies table dies), `0011_actor_strings` (the bare `human` becomes `human:owner`). Shipped entries are never edited; later phases append their own. |
+| `nodum.service` | The only writer. Validation, the `proposed → active → archived` state machine, the event log, versions (incl. `proposed` updates: agent edits stage a version naming the fields they change; accept applies exactly those as an ordinary `node.update`, reject archives it), undo, wikilink materialization (edges land per the writer's grants — `proposed` on `suggest`), the review queue (proposal listing with reviewer context over nodes/edges/updates, batch accept/reject by id or filter), and the curated graph reads behind the MCP read tier (`get_neighborhood`, `traverse`, `find_path`, `get_schema`, `diff_versions`) plus `propose_edges` batch writes. Two further reads serve interactive clients rather than agents: `subgraph` (the filtered, node-capped neighborhood — see the decision log) and `suggest_links` (title-prefix lookup for a `[[` autocomplete, read straight off `nodes` so it needs no projector). **Every function takes a `Principal`; the scope-bound store (`nodum.store`) confines reads and writes by grant — `suggest` lands `proposed`, `edit` lands `active` and carries in-space `accept`/`reject`/`archive`; `undo` stays human-only.** Each public function opens a short-lived connection, applies pending migrations idempotently, and commits — adapters stay stateless. |
 | `nodum.projectors` | Derived-index consumers of the event log. The `Projector` base class (`reset`/`apply`/`count`/`availability`), the `REGISTRY`, per-projector checkpoints (`projector_checkpoints.last_event_seq`), incremental `run_projectors`, `rebuild_projector` (reset + replay from event 0), and `projector_status` (with availability + reason). The `fts` projector maintains `node_fts`; the `vec` projector maintains `chunks` + `node_vec` — re-chunking and re-embedding nodes from event payloads, recording `model_id` per chunk. Deterministic and LLM-free; the service layer never calls in — the event log is the only coupling. An unavailable projector (`vec` without a provider) no-ops and keeps its backlog. |
 | `nodum.embeddings` | The embedding provider seam (design D10) + chunking (design D6). Provider interface: `model_id`, `dimensions`, `embed(texts)`. The default `FastembedProvider` runs `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` (384-dim, multilingual) in-process via ONNX — behind the optional `embeddings` extra, resolved from the local HF cache only (downloads need `NODUM_EMBED_DOWNLOAD=1`; model override via `NODUM_EMBED_MODEL`). Chunking is a fixed 512-word window with ~15% overlap (words approximate tokens — dependency-free). `set_provider`/`reset_provider` are the test seam (a deterministic hashing fake lives in `tests/conftest.py`). |
 | `nodum.search` | The query path (design §7). `search()` catches the `fts` and `vec` projectors up with the log, runs BM25 (title boosted 5×) and — when a provider is available — a sqlite-vec KNN over chunk embeddings (closest chunk per node wins), fuses both lists by reciprocal rank fusion (K=60), then optionally expands the fused hits one hop along `active` edges (type weight × confidence). Hits carry the fused `score` plus a per-signal `signals` breakdown (`bm25`/`vector` RRF contributions summing to `score`, `graph` edge weight). Without a provider the vector signal is skipped — graceful degradation to BM25 + graph. |
 | `nodum.assets` | Content-addressed binaries + derived image renditions (design §5.5/§5.7). `register_asset` streams a local file into `asset_blobs` through `Connection.blobopen` (hash pass, then a chunked copy into a `zeroblob` — a large file is never held in memory) and inserts the `assets` metadata row in the same transaction, so a failed copy rolls back whole — idempotent sha256 dedup, deliberately no event-log entry (nothing to undo; ingestion-time asset events are Phase 4). The copy pass re-hashes what it writes and refuses a mismatch (`AssetSourceChanged`): a source that shrank between the passes would otherwise commit with a zero-filled tail under a key its bytes do not match. A file over `SQLITE_LIMIT_LENGTH` (1 GB, read from the connection) is refused up front (`AssetTooLarge`) rather than as a bare `DataError: string or blob too big`. `get_rendition` lazily generates `thumb`/`preview` WebP images with Pillow (downscale-only, EXIF-transposed, 300 KB quality-stepping target on `preview`), stores them in `renditions` keyed by `sha256(asset_hash + ':' + profile)`, and serves cache hits from the stored row thereafter — the rendition's `data` column is read **only** when the caller asks for the bytes, which the MCP `get_asset` path always does (`include_data=True`) and the CLI does only for `asset rendition --out`; `purge_renditions` deletes the rows (all regenerable). Pillow reads originals through `_BlobReader`, a file-like adapter that restores the tolerant out-of-range seeks `sqlite3.Blob` refuses and Pillow's format probing depends on. Non-image assets and unknown profiles are rejected cleanly; `page:<n>` rasters are Phase 4. Two helpers exist for callers that take bytes from a stranger rather than a local file the operator chose: `sniff_image_mime` identifies a format from its magic bytes (registration records what `mimetypes.guess_type` derives from the *name*, which is fine for the CLI and useless over HTTP), and `check_image_pixel_budget` reads dimensions from the image header and refuses anything over `MAX_IMAGE_PIXELS` (40 MP) as `ImageTooLarge` — the same ceiling `_prepare_image` applies before decoding a stored original, since Pillow's own bomb detection *warns* between 1× and 2× its threshold and decodes anyway. |
-| `nodum.mcp_server` | The MCP adapter: a FastMCP (official Python SDK) server over stdio, launched by `nodum mcp serve`. This is the **external-agent** surface, so it registers the additive half of the tool contract and nothing else: the design §8.1 read tier (`get_node`, `get_children`, `search`, `traverse`, `list_types`, `get_schema`, `find_path`, `history`, `diff`, `get_asset`) and additive tier (`create_node`, `update_node`, `link`, `propose_edges`) — every tool a thin delegate to one service/search/assets function, annotated `readOnlyHint` for reads and non-destructive for additive writes (honest, because nothing registered here archives or overwrites state). `get_asset` enforces the §5.7 binary policy structurally: metadata + a `preview`/`thumb` WebP image block, originals never served. The review tools (`accept`/`reject`, §8.1 "write (human/policy)") and the curative tools (§8.2) are **never registered**. One configured `--actor` per server attributes every write, and it must match `agent:<name>` — `--actor human`, an empty actor, or an unprefixed name is refused at startup. |
-| `nodum.models` | The pydantic I/O schema shared by every surface (`NodeOut`, `EdgeOut`, `VersionOut`, `EventOut`, `TypeOut`/`EdgeTypeOut`/`TypesOut`, `UndoResult`, `InitResult`, `ProjectorStatus`/`ProjectorRun`, `SearchHit`/`SearchResult`, `PolicyOut`, `ProposalOut`, `BatchTransitionOut`/`TransitionFailure`, `SubgraphOut`, `PathOut`, `DiffOut`, `ProposeEdgesOut`/`ItemFailure`, `AssetOut`, `RenditionOut`, `PurgeResult`). Every adapter serialises `model_dump(mode="json")`. |
-| `nodum.cli` | Typer adapter. Each command calls one service function and prints exactly one JSON object on stdout — a list-returning command always as `{"<plural>": [...], "count": n}`; errors go to stderr with exit code 1 — including the ones that are not service errors at all: `OSError` (a missing file for `asset register`) and `sqlite3.Error` (chiefly "database is locked", SQLite having one writer) are mapped to a message rather than escaping as a traceback. No `--json` flag — JSON is the only format. Adds `search`, `traverse`, `subgraph`, `suggest-links`, `find-path`, `diff`, `schema`, `edge create-batch`, the `projector run/status/rebuild` group, the `policy set/get/list` group, the `review queue/accept/reject/accept-all/reject-all` group, the `asset register/get/list/rendition/purge` group, `mcp serve`, and `serve` (the HTTP server, port 8600 — which refuses a non-loopback bind without `--token`, prints the database path plus a `#token=…` UI URL on stderr, and converts uvicorn's own startup failure into the contract's exit 1 rather than letting uvicorn's exit 3 escape). |
-| `nodum.http_api` | The HTTP adapter (design §9): a Starlette app (`create_app`) serving the JSON API under `/api` plus the built web UI at `/`, launched by `nodum serve`. This is the **human** surface and the exact inverse of the MCP server: every write is attributed to `HTTP_ACTOR` (`human`) and **no request field, header, or query parameter can set an actor** — the module binds `actor` in exactly one expression, inside `_write`, and route handlers never name the concept, so absence is structural rather than a filter each new endpoint must remember. The service's human tier still applies underneath; nothing is re-implemented here. One `EXCEPTION_STATUS` table (every class `cli._run` catches — `sqlite3.Error` and `OSError` by base class — plus `sqlite3.OperationalError` → 503, `OverflowError` → 400, `PayloadTooLarge` → 413, `ClientDisconnect` → 499) becomes Starlette exception handlers returning `{"error": {"type", "message"}}` with the CLI's own one-line message; anything unmapped is a generic 500 whose traceback goes to the server log, never the body. `RequestGuardMiddleware` is the origin control: `Host` validated against the names the server answers to (DNS rebinding), a same-origin proof required on every state-changing request (`Sec-Fetch-Site`, `Origin`, or the explicit `X-Nodum-Client` header for a non-browser client), `Content-Type: application/json` required on every JSON write so that no CORS-simple request can reach one, and a request-body cap enforced in the wrapped `receive` before anything buffers. Auth is loopback-by-default with an optional static bearer token gating `/api` only (`/healthz` and the UI stay open, and `/healthz` reports liveness alone); no CORS, because the UI is same-origin — and origin control keeps *browsers* out, while only `--token` keeps other local *processes* out. Static hosting serves `nodum/_web/` with unknown non-API paths falling through to its `index.html` (client-side routing) and to the tracked `nodum/_web_placeholder.html` when no bundle is built; `/favicon.ico` is routed ahead of that catch-all and answers with the bundle's icon or a 204, never an HTML document. |
+| `nodum.mcp_server` | The MCP adapter: a FastMCP (official Python SDK) server over stdio, launched by `nodum mcp serve`. This is the **external-agent** surface, so it registers the additive half of the tool contract and nothing else: the design §8.1 read tier (`get_node`, `get_children`, `search`, `traverse`, `list_types`, `get_schema`, `find_path`, `history`, `diff`, `get_asset`) and additive tier (`create_node`, `update_node`, `link`, `propose_edges`) — every tool a thin delegate to one service/search/assets function, annotated `readOnlyHint` for reads, `destructiveHint=False` for the additive writes (they only ever add state, whatever grant the caller holds) and `destructiveHint=True` for `update_node`, which under an `edit` grant overwrites the node in place — hosts auto-approve on that flag, so it states the tool's worst case rather than its usual one. Each write tool's description says what an `edit` grant changes instead of promising `proposed`. `get_asset` enforces the §5.7 binary policy structurally: metadata + a `preview`/`thumb` WebP image block, originals never served. The review tools (`accept`/`reject`, §8.1 "write (human)") and the curative tools (§8.2) are **never registered**. Auth is the agent token in `NODUM_AGENT_TOKEN` (minted by `nodum agent create`/`token-rotate`, shown once, stored hashed; carried in the environment because a flag would leak into `ps`): at startup it is verified against the `agents` table — an unknown or disabled agent is a startup error — and the verified agent's principal is loaded with its grant set, so every read and write is confined to those grants. |
+| `nodum.models` | The pydantic I/O schema shared by every surface (`NodeOut`, `EdgeOut`, `VersionOut`, `EventOut`, `TypeOut`/`EdgeTypeOut`/`TypesOut`, `UndoResult`, `InitResult`, `ProjectorStatus`/`ProjectorRun`, `SearchHit`/`SearchResult`, `ProposalOut`, `BatchTransitionOut`/`TransitionFailure`, `SubgraphOut`, `PathOut`, `DiffOut`, `ProposeEdgesOut`/`ItemFailure`, `AssetOut`, `RenditionOut`, `PurgeResult`, `HumanOut`, `AgentOut`/`AgentCreatedOut`, `GrantOut`). Every adapter serialises `model_dump(mode="json")`. |
+| `nodum.cli` | Typer adapter. Each command calls one service function and prints exactly one JSON object on stdout — a list-returning command always as `{"<plural>": [...], "count": n}`; errors go to stderr with exit code 1 — including the ones that are not service errors at all: `OSError` (a missing file for `asset register`) and `sqlite3.Error` (chiefly "database is locked", SQLite having one writer) are mapped to a message rather than escaping as a traceback. No `--json` flag — JSON is the only format. Adds `search`, `traverse`, `subgraph`, `suggest-links`, `find-path`, `diff`, `schema`, `edge create-batch`, the `projector run/status/rebuild` group, the `review queue/accept/reject/accept-all/reject-all` group, the `asset register/get/list/rendition/purge` group, `mcp serve`, and `serve` (the HTTP server, port 8600 — every command across the CLI that touches the graph takes a required `--as <human>` — reads included, since reads are grant-scoped like writes; `serve` prints the database path on stderr and converts uvicorn's own startup failure into the contract's exit 1 rather than letting uvicorn's exit 3 escape). |
+| `nodum.http_api` | The HTTP adapter (design §9): a Starlette app (`create_app`) serving the JSON API under `/api` plus the built web UI at `/`, launched by `nodum serve`. This is the **human** surface and the exact inverse of the MCP server: every write is attributed to the session's human principal and **no request field, header, or query parameter can set an identity** — every `principal=` binding in the module is `_session_principal(request)`, reading only what the session middleware verified into the scope, and route handlers never name the concept, so absence is structural rather than a filter each new endpoint must remember. The service's grant enforcement still applies underneath; nothing is re-implemented here. One `EXCEPTION_STATUS` table (every class `cli._run` catches — `sqlite3.Error` and `OSError` by base class — plus `sqlite3.OperationalError` → 503, `OverflowError` → 400, `PayloadTooLarge` → 413, `ClientDisconnect` → 499) becomes Starlette exception handlers returning `{"error": {"type", "message"}}` with the CLI's own one-line message; anything unmapped is a generic 500 whose traceback goes to the server log, never the body. `RequestGuardMiddleware` is the origin control: `Host` validated against the names the server answers to (DNS rebinding), a same-origin proof required on every state-changing request (`Sec-Fetch-Site`, `Origin`, or the explicit `X-Nodum-Client` header for a non-browser client), `Content-Type: application/json` required on every JSON write so that no CORS-simple request can reach one, and a request-body cap enforced in the wrapped `receive` before anything buffers. Auth is password login: `POST /api/login` verifies an argon2id hash (constant-time on failure), creates a server-side session row (30-day sliding expiry) and sets an `HttpOnly; SameSite=Strict` cookie; `SessionMiddleware` resolves it to the human's principal on every `/api` request — reads included — with only `/healthz` (liveness alone), `/api/login` and the static UI open. Account and grant administration is part of the API: `GET /api/me` plus `/api/humans`, `/api/agents` and `/api/grants` are thin delegates over the service's human-only admin surface (agent creation is external-kind, owned by the session's human; the show-once token rides the create/token-rotate response body). No CORS, because the UI is same-origin — and origin control keeps *browsers* out, while the password is what keeps other local *processes* out. A non-loopback bind is allowed (login, not the bind, is the boundary) and marks the cookie `Secure` there. Static hosting serves `nodum/_web/` with unknown non-API paths falling through to its `index.html` (client-side routing) and to the tracked `nodum/_web_placeholder.html` when no bundle is built; `/favicon.ico` is routed ahead of that catch-all and answers with the bundle's icon or a 204, never an HTML document. |
 | `nodum.envelope` | The JSON envelope both the CLI and the HTTP API emit: `envelope()` (one `model_dump(mode="json")`), `list_envelope()` (the `{"<plural>": [...], "count": n}` convention), `render_json()` (indented, `ensure_ascii=False`). Extracted so the two surfaces cannot drift — `GET /api/nodes/{id}` and `nodum node get <id>` are byte-identical, and a test asserts exactly that. |
-| `web/` (built into `nodum/_web/`) | The human web UI (design §9): React 19 + TypeScript, Vite, no CSS framework, no runtime network dependency. Seven routes over six views — editor (`/editor`, `/editor/:nodeId`), search (`/search`), review (`/review`), graph (`/graph`, `/graph/:rootId`), assets (`/assets`), history (`/history/:nodeId`) — each lazily loaded, so CodeMirror, Mermaid, and Cytoscape stay out of the initial bundle. `src/api/client.ts` is the only `fetch` in the app and has **no actor parameter anywhere**, mirroring the server's structural rule in the client; it also adopts the optional bearer token from the `#token=…` fragment `nodum serve --token` prints (a fragment, so it never reaches the wire, a log, or a `Referer`) into `sessionStorage`, and sends `Content-Type: application/json` on every non-GET request because the server requires it. `src/lib/` holds the two things every view must get identically right: `time.ts` (SQLite's zone-less UTC timestamps, which a bare `new Date()` reads as local) and `failure.ts` (the API-refused versus nothing-listening split, including the dev proxy's 502). Views never import each other — they link by URL, and `src/router.tsx` is where those paths are defined. Two gates, both in CI: `tsc --noEmit` over the tree, and Vitest (`make web-test`) over the pure modules — a unit harness with no DOM environment, pinned to a non-UTC `TZ` so the timestamp bug stays visible. Conventions: [`web/README.md`](https://github.com/vcoeur/nodum/blob/main/web/README.md). |
+| `web/` (built into `nodum/_web/`) | The human web UI (design §9): React 19 + TypeScript, Vite, no CSS framework, no runtime network dependency. Nine routes over eight views — login (`/login`), editor (`/editor`, `/editor/:nodeId`), search (`/search`), review (`/review`), graph (`/graph`, `/graph/:rootId`), assets (`/assets`), admin (`/admin` — accounts and grants), history (`/history/:nodeId`) — each lazily loaded, so CodeMirror, Mermaid, and Cytoscape stay out of the initial bundle. `src/api/client.ts` is the only `fetch` in the app and has **no actor parameter anywhere**, mirroring the server's structural rule in the client; auth is the `HttpOnly` session cookie the browser attaches to every same-origin request (no token client-side), a 401 from any route but login is broadcast through `src/lib/session.ts` so the app shell can redirect to `/login`, and it sends `Content-Type: application/json` on every non-GET request because the server requires it. `src/lib/` holds the two things every view must get identically right: `time.ts` (SQLite's zone-less UTC timestamps, which a bare `new Date()` reads as local) and `failure.ts` (the API-refused versus nothing-listening split, including the dev proxy's 502). Views never import each other — they link by URL, and `src/router.tsx` is where those paths are defined. Two gates, both in CI: `tsc --noEmit` over the tree, and Vitest (`make web-test`) over the pure modules — a unit harness with no DOM environment, pinned to a non-UTC `TZ` so the timestamp bug stays visible. Conventions: [`web/README.md`](https://github.com/vcoeur/nodum/blob/main/web/README.md). |
 
 ## Design-doc mapping
 
@@ -73,18 +73,18 @@ sections to the code:
 | §2.3 constraints (single write path, Markdown truth, LLM-free core) | `nodum.service` is the only mutation entry point; `content` is canonical Markdown; no LLM calls anywhere in the package — projectors included (Constraint 4). |
 | §4 architecture (service layer, event log, projectors) | `nodum.service` + the `events` table; `nodum.projectors` implements the derived-index consumers with checkpoint/rebuild mechanics. Internal agents are a later phase. |
 | §5.1 everything-is-a-node, structure vs. meaning | One `nodes` table with `parent_id` + fractional `position`; typed `edges` for meaning. |
-| §5.2 schema | `nodum.migrations` `0001_core` — Phase-1 subset (`types`, `nodes`, `edge_types`, `edges`, `versions`, `events`, `merge_redirects`), all with reserved `graph_id DEFAULT 'main'`; `0003_projector_checkpoints_and_fts` adds `projector_checkpoints` and `node_fts` (with the design's `extracted_text` column, empty until asset extraction lands in Phase 4); `0006_vectors` adds `chunks` + `node_vec` (`chunks.id` is an integer rowid for vec0 keying, and deliberately carries no FK to `nodes` — replaying the log must tolerate nodes whose create was undone); `0007_assets_and_renditions` adds `assets` (metadata), `asset_blobs` (original bytes), and `renditions` (derived rows carrying their WebP `data`, plus `width`/`height`/`size_bytes` beyond the design's columns) — binaries live in the one file from the moment assets exist, with no `path` column anywhere; `0008_version_proposed_fields` adds `versions.proposed_fields`. |
+| §5.2 schema (as amended by Q13) | `nodum.migrations` `0001_core` — Phase-1 subset (`types`, `nodes`, `edge_types`, `edges`, `versions`, `events`, `merge_redirects`), all with reserved `graph_id DEFAULT 'main'` — **superseded by `0009`**: `graph_id` became `space_id` on `nodes` only, the `types`/`edge_types` tables were dropped and their rows became type-nodes in the meta space (ids preserved), and `0009`–`0011` added `humans`/`agents`/`grants`/`sessions` and structured actor strings; `0003_projector_checkpoints_and_fts` adds `projector_checkpoints` and `node_fts` (with the design's `extracted_text` column, empty until asset extraction lands in Phase 4); `0006_vectors` adds `chunks` + `node_vec` (`chunks.id` is an integer rowid for vec0 keying, and deliberately carries no FK to `nodes` — replaying the log must tolerate nodes whose create was undone); `0007_assets_and_renditions` adds `assets` (metadata), `asset_blobs` (original bytes), and `renditions` (derived rows carrying their WebP `data`, plus `width`/`height`/`size_bytes` beyond the design's columns) — binaries live in the one file from the moment assets exist, with no `path` column anywhere; `0008_version_proposed_fields` adds `versions.proposed_fields`. |
 | §5.3 built-in types | `nodum.migrations` `0002_seed_builtin_types` (11 node types, 17 edge types with inverses). |
 | §5.4 wikilink sugar | `service._materialize_mentions` — parse on write, resolve by id or exact title, create/archive `mentions` edges, skip unresolvable targets. A materialized edge inherits the *writer's* landing state, so an agent's wikilink is a `proposed` edge, not live structure attached to someone else's node; `service._activate_pending_mentions` brings those edges to `active` when a human accepts the proposing node. |
-| §5.5/§5.7 assets + rendition policy | `nodum.assets` + `get_asset` in `nodum.mcp_server`. `get_asset(id_or_hash, rendition)` accepts an asset hash or an asset-reference node id (resolved via the `asset_hash` prop) and returns metadata + a `preview`/`thumb` WebP image block — MCP never serves originals, and non-image assets get metadata only. `page:<n>` rasters, `get_download_url`/`request_upload_url`, and ingestion are Phase 4. |
-| §6 state machine + provenance | `service.transition` (`accept`/`reject`/`archive` over nodes, edges, and proposed versions — an id that resolves to none of the three raises the shared `RecordNotFound` base, since the id alone never says which kind was meant), actor column on every row, event per transition (a reject's `reason` among the payload). Every transition — plus `undo` — is gated to the `human` actor by `service._require_human_reviewer` (`HUMAN_ONLY_ACTIONS`) at the single choke point each passes through. Versions carry their own `state` (migration `0005`): `applied` snapshots, `proposed` agent updates, `archived` rejects; `proposed_fields` (migration `0008`) records what a proposal asked to change. |
+| §5.5/§5.7 assets + rendition policy | `nodum.assets` + `get_asset` in `nodum.mcp_server`. Asset reads take a principal: rows carry no `space_id` until Phase 4, so the interim rule is any-grant-reaches, no-grant-reaches-nothing, and the node-id handle resolves only inside the caller's read set. `get_asset(id_or_hash, rendition)` accepts an asset hash or an asset-reference node id (resolved via the `asset_hash` prop) and returns metadata + a `preview`/`thumb` WebP image block — MCP never serves originals, and non-image assets get metadata only. `page:<n>` rasters, `get_download_url`/`request_upload_url`, and ingestion are Phase 4. |
+| §6 state machine + provenance | `service.transition` (`accept`/`reject`/`archive` over nodes, edges, and proposed versions — an id that resolves to none of the three raises the shared `RecordNotFound` base, since the id alone never says which kind was meant), actor column on every row, event per transition (a reject's `reason` among the payload). Every transition is gated at the single choke point each passes through (`Store.require_review`): a human, or `edit` on the item's space; `undo` requires a human outright. Versions carry their own `state` (migration `0005`): `applied` snapshots, `proposed` agent updates, `archived` rejects; `proposed_fields` (migration `0008`) records what a proposal asked to change. |
 | §7 retrieval (hybrid fusion) | `nodum.search` — BM25 via FTS5 and vector ANN via sqlite-vec (the `vec` projector, migration `0006`), fused by reciprocal rank fusion (K=60) with per-signal `signals`; one-hop graph expansion over `active` edges (type weight × confidence) applies post-fusion as the `graph` signal. The vector signal degrades gracefully when no embedding provider is available. |
 | §15.1 D6 embedding lifecycle | `nodum.embeddings` chunking (512-word window, ~15% overlap — words approximate tokens) + `chunks.model_id` per embedding (migration `0006`) + `projector rebuild vec` as the full-rebuild-on-model-change path (reset + replay re-embeds everything with the new model). |
 | §15.1 D10 provider abstraction | `nodum.embeddings.EmbeddingProvider` — `model_id` / `dimensions` / `embed(texts)`. The default is local in-process fastembed (no daemon, no API key, no `agedum` dependency); an API-key provider slots in behind the same interface. |
-| §8.1 review/accept API — the "write (human/policy)" tier | `service.list_proposals` (filterable by actor, type, kind, age; reviewer context: edge endpoints, node parent, update target) + `accept_proposals`/`reject_proposals` (by id, reject carries a `reason` into each event payload) + `accept_matching`/`reject_matching` (batch by filter — resolves to concrete ids, then one event per id). All four refuse a non-`human` actor with `ReviewNotPermitted`, as do `archive` and `undo`. `transition` takes the same `reason` and writes it to the same place, so the single-item CLI `reject <id> --reason` is audited exactly like the batch one — the two spellings of a reject differ only in cardinality. CLI: the `review` group (and top-level `accept`/`reject`/`archive`/`undo`). **Not** an MCP tool. |
+| §8.1 review/accept API — the "write (human)" tier | `service.list_proposals` (filterable by actor, type, kind, age; reviewer context: edge endpoints, node parent, update target) + `accept_proposals`/`reject_proposals` (by id, reject carries a `reason` into each event payload) + `accept_matching`/`reject_matching` (batch by filter — resolves to concrete ids, then one event per id). Reviewing needs a human or `edit` on the item's space (`GrantNotPermitted` otherwise); `undo` stays human-only. `transition` takes the same `reason` and writes it to the same place, so the single-item CLI `reject <id> --reason` is audited exactly like the batch one — the two spellings of a reject differ only in cardinality. CLI: the `review` group (and top-level `accept`/`reject`/`archive`/`undo`). **Not** an MCP tool. |
 | §8.1 tool contract (read + additive tiers) | `nodum.mcp_server` over stdio: read tier `get_node`/`get_children`/`search`/`traverse`/`list_types`/`get_schema`/`find_path`/`history`/`diff`/`get_asset`, additive tier `create_node`/`update_node`/`link`/`propose_edges`. That is the whole registry — the review tier is a *different* tier and is not exposed here. All delegate to `nodum.service` / `nodum.search` / `nodum.assets` with tool annotations (`readOnlyHint`, `destructiveHint`). Not yet: `ingest_*`, `get_download_url`, `request_upload_url`, `get_context`, `export`, `schema_propose` (later phases). |
 | §8.2 additive vs. curative | Structural: `nodum.mcp_server` never registers the curative tools (`merge_nodes`, `retype`, `supersede_edge`, `bulk_relink`, `consolidate`) nor the review tools (`accept`, `reject`) — they don't exist on the MCP surface at all; tests assert the registry stays disjoint from both `CURATIVE_TOOLS` and `REVIEW_TOOLS`. |
-| §8.3 agent policies | `policies` table (migration `0004`) + `service.set_policy`/`get_policy`/`list_policies` (CLI `policy` group) + `_auto_accept_rule` on the edge write path. `set_policy` is human-only (`_require_human_reviewer`, like `accept`/`reject`/`archive`/`undo`): a policy grants auto-accept, so an agent setting one would self-grant the direct live write the human tier withholds. `job` rules are stored for the Phase-5 runtime; only `edge_type` + `auto_accept` rules act on direct writes today. A `min_confidence` gate grades the agent's own self-reported confidence, so it fires only when the rule also carries `trust_self_reported_confidence: true`. |
+| §8.3 learned trust (Q13 — policies died) | There is no policy table and no rule engine. Two grant levels with agent self-governance: `suggest` queues everything, `edit` writes `active` and the agent self-governs with its own confidence (indicative data, triggering nothing hardcoded). The graduated middle gear — queue curation — is the Phase-5 gardener's learned behaviour, not this phase's. Structural rails stay hardcoded: merges always human-approved (D9), no curative tools over MCP. |
 
 ## Key decisions (Phase 1)
 
@@ -147,49 +147,35 @@ sections to the code:
 - **Search catches the projector up** before querying, so results always
   reflect the latest committed writes without a manual `projector run`. The
   write path stays free of projector work.
-- **Policies are one row per agent**, keyed by the exact actor string
-  (`agent:researcher`) — no wildcards, no inheritance. The `rules` JSON array
-  keeps the design §8.3 vocabulary (`job`/`edge_type` keys, `auto_accept` /
-  `auto_apply` / `always_propose` actions, optional `min_confidence` gate);
-  edge types are resolved to ids on write and unknown extra keys pass
-  through, so later phases can extend rules without a migration.
-- **Only `edge_type` + `auto_accept` rules act on the direct write path**, and
-  only on edge creation: a matching ungated rule (no `min_confidence`) flips
-  the landing state to `active`. `job` rules govern the internal runtime
-  (Phase 5) and are stored unevaluated; node writes have no policy keys in the
-  design's vocabulary and stay `proposed` for agents.
-- **A `min_confidence` gate grades untrusted input, so it needs an explicit
-  opt-in.** The only confidence on the direct write path is the number the
-  writing agent reports about its own write — an agent that wants `active` can
-  claim `1.0`, which makes a self-graded gate worth nothing. A gated rule
-  therefore fires only when the same rule carries
-  `"trust_self_reported_confidence": true` — a human writing down, in the
-  policy, that they accept this agent's self-grading for this edge type.
-  Without the flag the gate can never be satisfied here and the edge stays
-  `proposed`, so *no* agent-supplied value can by itself buy auto-accept. The
-  flag is validated as a boolean; a later phase supplying an independently
-  measured confidence grades against the same gate without it.
-- **Auto-accept is attribution, not bypass.** The write remains the agent's
-  own event — the op records the landing state (`edge.create`, not
-  `edge.propose`) and the payload records the matched rule under
-  `policy_rule`, so the log alone explains why an agent write landed active.
-- **Policy edits are audited events (`policy.set`) but not undoable.** Undo
-  stays scoped to graph events (`node.*`/`edge.*`): its default target skips
-  non-graph events, and naming one explicitly is refused. Policy history
-  lives in the event payloads (full before/after rulesets).
+- **Grants are one row per (agent, space)** at three hierarchical levels —
+  `read` ⊂ `suggest` ⊂ `edit` (migration `0010`) — per-agent only, no
+  class-defaults layer. Creation-time templates copy a standard row set;
+  administration is owner-only and event-logged.
+- **Policies died with Q13 (§8.3 learned trust).** No policy table, no rule
+  engine, no auto-accept on the write path. Landing state is a function of the
+  grant on the target space alone: `suggest` → `proposed`, `edit` → `active`.
+  Confidence is indicative data for reviewers and the Phase-5 gardener — it
+  triggers nothing hardcoded. The graduated middle gear (queue curation) is
+  the gardener's *learned* behaviour, cycle-checkpointed and journal-reported,
+  not this phase's machinery.
+- **An `edit` grant carries in-space state-machine authority** (Q13 note 03
+  Q1): accept/reject/archive within the granted space, delegated explicitly
+  and revocably. `undo` is not grantable — restoring an event's payload
+  verbatim (`state = 'active'` included) across spaces is exactly the
+  live-state back door the grant model must not open.
 - **Batch review never aborts on a bad id.** `accept_proposals` /
   `reject_proposals` (and the `*_matching` filter variants, which resolve the
   filter to concrete ids first) transition what they can — one event per id,
   actor and reject `reason` on every event — and report the rest in
   `failed`. A batch is a convenience over single transitions, never a silent
   bulk update.
-- **Live state is the human tier, enforced at the choke point.** `accept`,
-  `reject`, `archive`, and `undo` require actor `human`; anything else raises
-  `ReviewNotPermitted`. The check lives in `service._require_human_reviewer`
-  over `HUMAN_ONLY_ACTIONS`, called from `_transition_row` — the single
-  function every transition passes through — plus `_transition_many` and the
-  `*_matching` entry points so a refused reviewer fails before any id is
-  touched (a batch is never half-reviewed), and from `undo` itself. This holds
+- **Live state is gated at the choke point, per item.** `accept`, `reject`,
+  and `archive` require a human or `edit` on the item's space (both endpoint
+  spaces for an edge); `undo` requires a human outright. The check lives in
+  `Store.require_review` / `Store.require_human`, called from
+  `_transition_row` — the single function every transition passes through —
+  and refusals land per item in a batch's `failed` (grants are per-item, so
+  a batch may be partially applied). This holds
   whoever filed the proposal: an agent may neither accept its own work nor
   reject a rival's. `archive` and `undo` are gated for a different reason than
   review: they are how an agent could otherwise *write live state*. Undo in
@@ -201,7 +187,7 @@ sections to the code:
   type excludes edges (and vice versa) rather than leaving the other kind
   unfiltered.
 - **Agent updates stage as `proposed` versions** (design §8.1, migration
-  `0005`). `update_node` with a non-human actor inserts a `versions` row in
+  `0005`). `update_node` from a `suggest`-grant agent inserts a `versions` row in
   state `proposed` (carrying the full would-be title/content/props — unset
   fields copy the current values) and emits `version.propose`; the node
   itself is untouched. Accepting applies the staged fields to the node as an
@@ -251,15 +237,19 @@ sections to the code:
   that can be pointed elsewhere, and only when asked: `edge_states` defaults
   to `("active",)` like every other traversal, and a reviewer who passes
   `--edge-state proposed` is deliberately looking at what is pending.
-- **The MCP server holds one configured actor** (`nodum mcp serve --actor`,
-  default `agent:mcp`). Every tool call passes it to the service layer, so
-  attribution, the proposed-by-default rule, and policy auto-accept behave
-  exactly as CLI `--actor` writes. The actor must match `agent:<name>`:
+- **The MCP server authenticates exactly one agent per process.** The token
+  comes from `NODUM_AGENT_TOKEN` — the environment, never a flag, because a
+  flag leaks into `ps` and shell history — and is verified against the
+  `agents` table at startup; an unknown or disabled agent is a startup
+  error. The verified agent's principal is loaded with its grant set, and
+  every read and write the tools make is confined by the store to those
+  grants. An earlier interim took a configured `--actor` flag instead:
   `--actor human` would have turned the whole server into a direct writer
   into the live graph (and, while the review tools were registered, into a
   self-approving one), and an empty or unprefixed actor was silently accepted
-  — both are now startup errors. There is no per-connection handshake identity
-  yet — multi-tenant auth belongs with the HTTP API phase.
+  — the token closes both, since it can only ever name one enabled agent.
+  There is still no per-connection handshake identity — one stdio process,
+  one agent.
 - **`accept`/`reject` are not MCP tools.** Registering them handed the review
   tier to the agent being reviewed: an agent could accept its own proposals
   and reject another agent's, and the tool was annotated
@@ -388,8 +378,8 @@ sections to the code:
   from the node-type filter, being what was asked for rather than something
   the walk found. `SubgraphOut.truncated` reports whichever cap bit and
   defaults to false, so the uncapped walks sharing the model are unchanged. A
-  `min_confidence` floor drops edges with no stated confidence, the same
-  reading `_auto_accept_rule` takes: unstated is not "meets the bar".
+  `min_confidence` floor drops edges with no stated confidence: unstated is
+  not "meets the bar".
 
   **The result is closed over its own node set.** A breadth-first walk only
   ever selects edges incident to its frontier, so at the outermost ring two
@@ -416,14 +406,15 @@ sections to the code:
   not a link target — while `proposed` ones are kept, matching how every other
   node read treats state.
 - **The HTTP surface is the human's, and says so structurally.** `nodum serve`
-  is the inverse of `mcp serve`: the MCP adapter validates its configured
-  actor into `agent:<name>` and refuses `human`, while `nodum.http_api` never
-  reads an actor at all. The temptation on an HTTP surface is a filter — "strip
+  is the inverse of `mcp serve`: the MCP adapter authenticates exactly one
+  agent by token, while `nodum.http_api` never
+  reads an identity from a request at all. The temptation on an HTTP surface is a filter — "strip
   `actor` from the body before forwarding it" — which is one forgotten endpoint
-  away from failing. Instead the module binds `actor` in exactly one
-  expression (`_write`, to the module constant `HTTP_ACTOR`), handlers name
+  away from failing. Instead the module binds `principal` in exactly one
+  expression (`_write`, to `_session_principal(request)` — what the session
+  middleware verified into the scope), handlers name
   the fields they forward one by one rather than splatting request data, and
-  `_write` refuses a caller-supplied actor outright, so a future `**body`
+  `_write` refuses a caller-supplied principal outright, so a future `**body`
   forward would raise rather than write as an agent.
 - **A structural claim needs a test that can falsify it.** The first cut said
   the boundary held because three AST/source properties enforced it: no route
@@ -454,14 +445,12 @@ sections to the code:
   ban on `getattr` over an adapter module, and an allowlist of the `**` unpack
   sources a call may use.
 - **An adapter may not invent a field the domain cannot express.** The first
-  cut of `PUT /api/policies/{agent}` accepted `{rules, enabled}`, mapping
+  cut of the (since-deleted) policies API accepted `{rules, enabled}`, mapping
   `enabled: false` onto the service's "an empty ruleset disables the policy".
-  It was removed: `PolicyOut` has no `enabled` field to echo back, so the flag
+  It was removed: the model had no `enabled` field to echo back, so the flag
   existed only in the adapter, and its effect was to *delete* the caller's
   rules — a user toggling a policy off and later on would find the ruleset
-  gone, unrecoverably. The body is now `{rules}` alone and disabling is an
-  explicit `{"rules": []}`, which is both what the service stores and what the
-  response shows. The general rule (recorded in `AGENTS.md`): a request key
+  gone, unrecoverably. The general rule (recorded in `AGENTS.md`): a request key
   with no counterpart in `nodum.models`/`nodum.service` does not belong on an
   adapter, least of all when its convenience is spent destroying state.
 - **One envelope, one renderer, two surfaces.** The list convention
@@ -475,7 +464,7 @@ sections to the code:
 - **Errors are the CLI's, translated to status codes.** `EXCEPTION_STATUS`
   maps every exception class `cli._run` catches, so a failure reads the same on
   both surfaces: not-found ids are 404, bad values and impossible transitions
-  400, `ReviewNotPermitted` 403, `UndoNotPossible` 409, and
+  400, `GrantNotPermitted` 403, `UndoNotPossible` 409, and
   `sqlite3.OperationalError` — "database is locked", which a large asset
   registration really can cause, since it holds SQLite's single writer for the
   whole streamed copy — a **retryable 503** rather than a server error.
@@ -495,8 +484,8 @@ sections to the code:
   above were invisible to it. It is replaced by provocations through real
   endpoints plus one test that reads `cli._run`'s own `except` clauses and
   asserts each class is mapped — so the claim is checked rather than restated.
-- **Loopback is not an origin boundary.** `nodum serve` binds `127.0.0.1` with
-  no token, and every page the user visits can reach `127.0.0.1`: a form with
+- **Loopback is not an origin boundary.** `nodum serve` binds `127.0.0.1`,
+  and every page the user visits can reach `127.0.0.1`: a form with
   `enctype="text/plain"` posting to `/api/review/accept` is a CORS-*simple*
   request, so there is no preflight, and the absence of CORS response headers
   stops the attacker *reading the reply* — not the write landing. That is worse
@@ -515,8 +504,9 @@ sections to the code:
   Host names are compared without ports, deliberately: the `make web-dev` proxy
   forwards the browser's own `Host: localhost:5700`, and a port is no part of
   the rebinding defence. What none of it does is authenticate — any local
-  process satisfies every check with three curl headers — so `nodum serve` says
-  that in its banner and refuses a non-loopback bind without `--token`.
+  process satisfies every check with three curl headers — so every `/api` route
+  sits behind the password-login session gate, and `nodum serve` says in its
+  banner that the password is the whole defence there.
 - **A limit that fires after the bytes are on disk is not a limit.**
   `POST /api/assets` was bounded only by `assets.AssetTooLarge` at SQLite's 1 GB
   blob ceiling, checked inside `register_asset` — after Starlette's parser had
@@ -591,7 +581,7 @@ sections to the code:
   caught any bug this phase actually had. The bugs it *does* catch all live in
   plain functions — the zone-less timestamp parser, the refused-versus-
   unreachable classifier, the graph URL codec, the diff zipper, the RRF signal
-  reader, the batch clustering, the policy blast-radius reading.
+  reader, and the batch clustering.
   The timezone pin is the load-bearing part. `web/src/lib/time.ts` exists
   because a zone-less UTC string read as local time is wrong by the reader's
   offset — and **in UTC the bug and the fix produce the same instant**, so on a

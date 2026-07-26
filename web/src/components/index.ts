@@ -8,6 +8,7 @@
 
 export { EmptyState } from "./EmptyState";
 export { ErrorBoundary } from "./ErrorBoundary";
+export { Modal } from "./Modal";
 export { NodeBadge } from "./NodeBadge";
 export { Spinner } from "./Spinner";
 export { ToastProvider, useToast } from "./Toast";

@@ -26,7 +26,9 @@ from pathlib import Path
 import sqlite_vec
 
 from nodum import db, embeddings, projectors
+from nodum.migrations import META_SPACE_ID
 from nodum.models import SearchHit, SearchResult
+from nodum.principal import READ, Principal
 
 #: bm25() column weights for (node_id, title, content, extracted_text): node_id
 #: is unindexed (weight ignored); a title hit outranks a body hit.
@@ -76,10 +78,26 @@ def _node_filters(
     created_by: str | None,
     created_after: str | None,
     created_before: str | None,
+    include_meta: bool,
+    principal: Principal | None,
 ) -> tuple[list[str], list]:
-    """Build the shared ``nodes``-table WHERE clauses (alias ``n``) and params."""
+    """Build the shared ``nodes``-table WHERE clauses (alias ``n``) and params.
+
+    An agent principal is confined to its read set (Q13); a human (or the
+    trusted-local default) just skips the meta space unless ``include_meta``.
+    """
     clauses: list[str] = []
     params: list = []
+    if principal is not None and not principal.is_human:
+        spaces = sorted(principal.read_spaces or ())
+        if not spaces:
+            clauses.append("1 = 0")
+        else:
+            clauses.append(f"n.space_id IN ({','.join('?' * len(spaces))})")
+            params.extend(spaces)
+    elif not include_meta:
+        clauses.append("n.space_id != ?")
+        params.append(META_SPACE_ID)
     if state is not None:
         clauses.append("n.state = ?")
         params.append(state)
@@ -120,9 +138,13 @@ def _search_bm25(
     created_by: str | None,
     created_after: str | None,
     created_before: str | None,
+    include_meta: bool,
+    principal: Principal | None,
 ) -> list[_RankedRow]:
     """Run the BM25-ranked FTS query, best (most-negative bm25) first."""
-    filters, params = _node_filters(state, type_id, created_by, created_after, created_before)
+    filters, params = _node_filters(
+        state, type_id, created_by, created_after, created_before, include_meta, principal
+    )
     clauses = ["node_fts MATCH ?", *filters]
     weights = ", ".join(str(w) for w in _BM25_WEIGHTS)
     rows = conn.execute(
@@ -158,6 +180,8 @@ def _search_vector(
     created_by: str | None,
     created_after: str | None,
     created_before: str | None,
+    include_meta: bool,
+    principal: Principal | None,
 ) -> list[_RankedRow]:
     """Run the sqlite-vec ANN query, aggregating chunks to nodes (best chunk wins).
 
@@ -167,7 +191,9 @@ def _search_vector(
     which is exactly what RRF expects: a weak vector hit still fuses, just
     with a small contribution.
     """
-    filters, params = _node_filters(state, type_id, created_by, created_after, created_before)
+    filters, params = _node_filters(
+        state, type_id, created_by, created_after, created_before, include_meta, principal
+    )
     clauses = filters or ["1=1"]
     rows = conn.execute(
         f"""
@@ -256,6 +282,8 @@ def _expand_hits(
     k: int,
     state: str | None,
     type_id: str | None,
+    include_meta: bool,
+    principal: Principal | None,
 ) -> list[SearchHit]:
     """One-hop graph expansion: active-edge neighbors of the fused hits.
 
@@ -283,6 +311,11 @@ def _expand_hits(
         row = conn.execute("SELECT * FROM nodes WHERE id = ?", (node_id,)).fetchone()
         if row is None:
             continue
+        if principal is not None and not principal.is_human:
+            if row["space_id"] not in (principal.read_spaces or ()):
+                continue
+        elif not include_meta and row["space_id"] == META_SPACE_ID:
+            continue
         if state is not None and row["state"] != state:
             continue
         if type_id is not None and row["type_id"] != type_id:
@@ -309,7 +342,9 @@ def search(
     created_by: str | None = None,
     created_after: str | None = None,
     created_before: str | None = None,
+    include_meta: bool = False,
     expand: bool = False,
+    principal: Principal,
     path: str | Path | None = None,
 ) -> SearchResult:
     """Hybrid-search node title + content: BM25 and vector signals, RRF-fused.
@@ -350,9 +385,13 @@ def search(
         type_id = None
         if type is not None:
             row = conn.execute(
-                "SELECT id FROM types WHERE id = ? OR name = ?", (type, type)
+                "SELECT id, space_id FROM nodes WHERE (id = ? OR title = ?) AND type_id = 'type'"
+                " AND json_extract(props, '$.type_kind') = 'node' AND state = 'active'",
+                (type, type),
             ).fetchone()
-            if row is None:
+            # A type in an unreadable space does not resolve — the catalog is
+            # not an existence oracle for the search filter either (review N1).
+            if row is None or principal.level_on(row["space_id"]) < READ:
                 raise ValueError(f"unknown node type: {type}")
             type_id = row["id"]
         bm25_rows = _search_bm25(
@@ -364,6 +403,8 @@ def search(
             created_by=created_by,
             created_after=created_after,
             created_before=created_before,
+            include_meta=include_meta,
+            principal=principal,
         )
         vector_rows: list[_RankedRow] = []
         provider = embeddings.get_provider()
@@ -378,10 +419,20 @@ def search(
                 created_by=created_by,
                 created_after=created_after,
                 created_before=created_before,
+                include_meta=include_meta,
+                principal=principal,
             )
         hits = _fuse(bm25_rows, vector_rows, k=k)
         if expand and hits:
-            hits += _expand_hits(conn, hits, k=k, state=state, type_id=type_id)
+            hits += _expand_hits(
+                conn,
+                hits,
+                k=k,
+                state=state,
+                type_id=type_id,
+                include_meta=include_meta,
+                principal=principal,
+            )
         return SearchResult(query=query, k=k, hits=hits)
     finally:
         conn.close()

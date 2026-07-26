@@ -5,20 +5,31 @@ from __future__ import annotations
 import sqlite3
 
 import pytest
+from helpers import owner
 
 from nodum import assets, db, service
 from nodum.migrations import MIGRATIONS, SEED_EDGE_TYPES, SEED_NODE_TYPES
 
 CORE_TABLES = {
-    "types",
     "nodes",
-    "edge_types",
     "edges",
     "versions",
     "events",
     "merge_redirects",
     "schema_migrations",
 }
+
+#: The type catalogs became type-nodes in 0009 (Q13) — the tables must be gone.
+DROPPED_TABLES = {"types", "edge_types"}
+
+
+def test_init_drops_the_type_catalog_tables(fresh_db):
+    conn = db.connect()
+    try:
+        rows = conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+        assert DROPPED_TABLES.isdisjoint({row["name"] for row in rows})
+    finally:
+        conn.close()
 
 
 def test_init_applies_all_migrations(fresh_db):
@@ -37,16 +48,17 @@ def test_init_creates_core_tables(fresh_db):
 
 
 def test_init_seeds_builtin_node_types(fresh_db):
-    catalog = service.list_types()
+    catalog = service.list_types(principal=owner())
     names = {node_type.name for node_type in catalog.node_types}
-    assert names == set(SEED_NODE_TYPES)
+    # 0009 adds the metaclass root and the space type to the seed vocabulary.
+    assert names == set(SEED_NODE_TYPES) | {"type", "space"}
     assert all(node_type.is_builtin for node_type in catalog.node_types)
     # Built-in type ids equal their names.
     assert all(node_type.id == node_type.name for node_type in catalog.node_types)
 
 
 def test_init_seeds_builtin_edge_types_with_inverses(fresh_db):
-    catalog = service.list_types()
+    catalog = service.list_types(principal=owner())
     by_name = {edge_type.name: edge_type for edge_type in catalog.edge_types}
     assert set(by_name) == {name for name, _ in SEED_EDGE_TYPES}
     for name, inverse in SEED_EDGE_TYPES:
@@ -56,12 +68,13 @@ def test_init_seeds_builtin_edge_types_with_inverses(fresh_db):
         assert by_name[edge_type.inverse_name].inverse_name == name
 
 
-def test_graph_id_defaults_to_main(fresh_db):
-    node = service.create_node(type="note", title="n1")
-    assert node.graph_id == "main"
-    edge_target = service.create_node(type="note", title="n2")
-    edge = service.create_edge(node.id, edge_target.id, "relates_to")
-    assert edge.graph_id == "main"
+def test_new_nodes_land_in_the_main_space(fresh_db):
+    """graph_id became space_id on nodes only (0009); edges carry no space."""
+    node = service.create_node(type="note", title="n1", principal=owner())
+    assert node.space_id == "main"
+    edge_target = service.create_node(type="note", title="n2", principal=owner())
+    edge = service.create_edge(node.id, edge_target.id, "relates_to", principal=owner())
+    assert not hasattr(edge, "space_id")
 
 
 def test_wal_mode_enabled(fresh_db):
@@ -110,7 +123,11 @@ def test_assets_are_storable_the_moment_the_asset_tables_exist(monkeypatch, tmp_
 def test_no_migration_moves_stored_bytes_between_tables(fresh_db):
     """Asset bytes have exactly one home, so nothing has to be copied later."""
     scripts = "\n".join(sql for _, sql in MIGRATIONS).upper()
-    assert "DROP TABLE" not in scripts
+    # The byte tables specifically are never rebuilt or dropped (the 0009
+    # spaces migration legitimately rebuilds nodes/edges and drops the type
+    # catalogs — assets are untouched by it).
+    for table in ("ASSETS", "ASSET_BLOBS", "RENDITIONS"):
+        assert f"DROP TABLE {table}" not in scripts
 
     conn = db.connect()
     try:
@@ -226,15 +243,20 @@ def test_a_failed_migration_can_be_retried_after_a_fix(fresh_db, monkeypatch):
     monkeypatch.setattr(db, "MIGRATIONS", [*MIGRATIONS, fixed])
     assert service.init().applied == [fixed[0]]
     # And the graph is usable again, not wedged on a half-applied schema.
-    assert service.create_node(type="note", title="after the fix").state == "active"
+    assert service.create_node(
+        type="note",
+        title="after the fix",
+        principal=owner(),
+    )
 
 
 def test_migration_names_are_checked_before_being_inlined(fresh_db):
     conn = db.connect()
     try:
+        before = conn.execute("SELECT count(*) AS n FROM nodes").fetchone()["n"]
         with pytest.raises(ValueError, match="invalid migration name"):
             db.apply_migration(conn, "0099'); DROP TABLE nodes; --", "SELECT 1;")
-        assert conn.execute("SELECT count(*) AS n FROM nodes").fetchone()["n"] == 0
+        assert conn.execute("SELECT count(*) AS n FROM nodes").fetchone()["n"] == before
     finally:
         conn.close()
 

@@ -1,11 +1,20 @@
-import { useEffect, useState } from "react";
-import { NavLink, Outlet } from "react-router-dom";
-import { ErrorBoundary, ToastProvider } from "./components";
-import { getHealth } from "./api/client";
+import { useEffect, useRef, useState } from "react";
+import { NavLink, Outlet, useLocation, useNavigate } from "react-router-dom";
+import { ErrorBoundary, Spinner, ToastProvider } from "./components";
+import { api, getHealth, ApiError } from "./api/client";
+import type { HumanOut } from "./api/types";
+import { onUnauthorized } from "./lib";
 
 /**
  * The app shell: header, view navigation, the routed outlet, and the two global
  * surfaces every view inherits — the toast stack and the crash boundary.
+ *
+ * The shell is also the session gate. Every `/api` route but login requires a
+ * session, so before any view mounts (and fires its own requests) the shell
+ * asks `GET /api/me` who is logged in: a 401 means nobody is, and the user
+ * goes to `/login` — the same place any later 401 sends them, via the
+ * client's unauthorized broadcast. The answer also names the account for the
+ * header. `/login` itself is a sibling route and never passes through here.
  *
  * Owned by the scaffold. View slices must not edit this file; if a view needs
  * something from the shell, add it here in a separate change so the other
@@ -19,10 +28,62 @@ const VIEWS = [
   { to: "/review", label: "Review" },
   { to: "/graph", label: "Graph" },
   { to: "/assets", label: "Assets" },
+  { to: "/admin", label: "Admin" },
 ] as const;
 
 /** The app shell. Rendered as the router's root route element. */
 export default function App() {
+  const navigate = useNavigate();
+  const location = useLocation();
+
+  /** The session's human, once known; null while the gate check runs. */
+  const [me, setMe] = useState<HumanOut | null>(null);
+  /** False until the gate has answered — views mount only past it. */
+  const [gated, setGated] = useState(true);
+
+  // The page a 401 should return to after a fresh login. A ref, because the
+  // broadcast subscription is registered once and must not go stale as the
+  // user navigates.
+  const locationRef = useRef(location);
+  locationRef.current = location;
+
+  useEffect(
+    () =>
+      onUnauthorized(() => {
+        const { pathname, search } = locationRef.current;
+        navigate("/login", { replace: true, state: { from: pathname + search } });
+      }),
+    [navigate],
+  );
+
+  useEffect(() => {
+    const controller = new AbortController();
+    void (async () => {
+      try {
+        const human = await api.getMe(controller.signal);
+        setMe(human);
+      } catch (error) {
+        // A 401 already broadcast the redirect to /login. Anything else — an
+        // unreachable server, above all — must not lock the app behind the
+        // gate: the views render their own failure panels for that.
+        if (error instanceof ApiError && error.status === 401) return;
+      }
+      setGated(false);
+    })();
+    return () => controller.abort();
+  }, []);
+
+  const onLogout = () => {
+    void (async () => {
+      try {
+        await api.logout();
+      } catch {
+        // A dead session lands on /login either way.
+      }
+      navigate("/login", { replace: true });
+    })();
+  };
+
   return (
     <ToastProvider>
       <div className="nd-app">
@@ -49,13 +110,35 @@ export default function App() {
 
           <div className="nd-header__status">
             <ServerStatus />
+            {me ? (
+              <>
+                <span className="nd-header__who" title={`Signed in as ${me.name}`}>
+                  {me.name}
+                </span>
+                <button
+                  type="button"
+                  className="nd-button nd-button--ghost nd-button--small"
+                  onClick={onLogout}
+                >
+                  Log out
+                </button>
+              </>
+            ) : null}
           </div>
         </header>
 
         <main className="nd-main">
-          <ErrorBoundary>
-            <Outlet />
-          </ErrorBoundary>
+          {gated ? (
+            <div className="nd-view">
+              <div className="nd-empty">
+                <Spinner large label="Checking session" />
+              </div>
+            </div>
+          ) : (
+            <ErrorBoundary>
+              <Outlet />
+            </ErrorBoundary>
+          )}
         </main>
       </div>
     </ToastProvider>
