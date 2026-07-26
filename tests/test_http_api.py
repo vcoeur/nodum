@@ -209,6 +209,7 @@ def test_node_get_is_byte_identical_to_the_cli(client, fresh_db):
         ("/api/humans", ["human", "list", "--as", "owner"]),
         ("/api/agents", ["agent", "list", "--as", "owner"]),
         ("/api/grants", ["grants", "--as", "owner"]),
+        ("/api/spaces", ["space-list", "--as", "owner"]),
     ],
 )
 def test_list_envelopes_are_byte_identical_to_the_cli(client, fresh_db, http_path, cli_args):
@@ -248,6 +249,7 @@ def test_every_list_endpoint_uses_the_named_key_plus_count(client, fresh_db):
         ("/api/humans", "humans"),
         ("/api/agents", "agents"),
         ("/api/grants", "grants"),
+        ("/api/spaces", "spaces"),
     ]:
         payload = _ok(client.get(path))
         assert set(payload) == {key, "count"}, path
@@ -1869,6 +1871,19 @@ def test_grants_grant_list_and_revoke(client, fresh_db):
     assert [(row["space_id"], row["level"]) for row in remaining["grants"]] == [("meta", "read")]
     again = client.post("/api/grants/revoke", json={"agent": "researcher", "space": "main"})
     assert again.status_code == 404
+
+
+def test_spaces_lists_active_spaces_only(client, fresh_db):
+    """The grant-admin space picker: active spaces, archived ones drop out."""
+    seeded = _ok(client.get("/api/spaces"))
+    assert [(space["id"], space["type"]) for space in seeded["spaces"]] == [
+        ("meta", "space"),
+        ("main", "space"),
+    ]
+
+    service.transition("main", "archive", principal=owner())
+    remaining = _ok(client.get("/api/spaces"))
+    assert [space["id"] for space in remaining["spaces"]] == ["meta"]
 
 
 def test_the_agent_token_never_reaches_an_event_payload(client, fresh_db):

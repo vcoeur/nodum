@@ -1615,6 +1615,23 @@ def create_app(
         _write(request, service.revoke, agent_id, space, path=db_path)
         return EnvelopeResponse({"ok": True, "agent": agent_id, "space": space})
 
+    async def list_spaces(request: Request) -> Response:
+        """Every active space — the grant-target vocabulary.
+
+        Spaces are nodes of builtin type ``space`` in the meta space, which the
+        everyday node listing excludes (``include_meta``), so ``/api/nodes``
+        cannot serve them. This is the CLI's ``space-list`` read, exposed for
+        the grant-admin UI's space picker.
+        """
+        spaces = service.list_nodes(
+            type="space",
+            state="active",
+            include_meta=True,
+            principal=_session_principal(request),
+            path=db_path,
+        )
+        return EnvelopeResponse(list_envelope("spaces", spaces))
+
     # ── Fallbacks ─────────────────────────────────────────────────────────
 
     async def api_not_found(request: Request) -> Response:
@@ -1717,6 +1734,7 @@ def create_app(
         Route("/api/grants", list_grants),
         Route("/api/grants", set_grant, methods=["POST"]),
         Route("/api/grants/revoke", revoke_grant, methods=["POST"]),
+        Route("/api/spaces", list_spaces),
     ]
 
     routes = [
