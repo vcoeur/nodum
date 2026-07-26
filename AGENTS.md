@@ -402,8 +402,8 @@ Phase-1 decision log.
   inspected, which is how a rogue endpoint once produced
   `created_by: "agent:evil"` on a fully green suite.
 - **A state-changing request must prove it is same-origin**
-  (`RequestGuardMiddleware`), because `nodum serve` binds loopback with no token
-  and loopback is reachable from every page the user visits. The rule:
+  (`RequestGuardMiddleware`), because `nodum serve` binds loopback and loopback
+  is reachable from every page the user visits. The rule:
   `Sec-Fetch-Site` in `{same-origin, none}`, **or** an `Origin` whose host is
   allowed, **or** the `X-Nodum-Client` header — which is how a non-browser
   client declares itself, since a browser always sends one of the first two and
@@ -482,9 +482,11 @@ Phase-1 decision log.
   identity parameter and must never grow one — the server binds the principal
   and the client being unable to express one is the second layer under that.
   It also owns `Content-Type: application/json` on every non-GET request,
-  bodyless ones included, because the server requires it. (INTERIM: the
-  `#token=…` bearer adoption still lives here; the login flow replaces it in
-  the surfaces step.)
+  bodyless ones included, because the server requires it. Auth is the
+  `HttpOnly` session cookie the browser attaches itself — there is no token
+  client-side; a 401 from any route but login is broadcast through
+  `src/lib/session.ts`, and the app shell answers it with a redirect to
+  `/login`.
 - **Never call `new Date()` on a server string.** SQLite writes
   `datetime('now')` — UTC, no zone marker — which every browser reads as *local*
   time. Parse through `parseTimestamp` (`src/lib/time.ts`) and format through
