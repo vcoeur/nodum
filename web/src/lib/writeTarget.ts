@@ -24,7 +24,14 @@
  *
  * Shaped after `session.ts`: a module-level value plus a subscriber set, so the
  * one piece of state has one owner and the shell, the editor and the `/spaces`
- * screen cannot drift apart holding three copies.
+ * screen cannot drift apart holding three copies. **One owner means one owner
+ * per browser, not per tab**, which is why the module also listens for
+ * `storage`: two tabs that disagreed about the target would reproduce D1a's
+ * failure one level out — the human sets `research` in one tab, writes from
+ * another that still says `main`, and the node lands somewhere they did not
+ * choose. `localStorage` is what makes the target survive a session and is also
+ * the only channel a second tab has, so adopting its change is the same
+ * mechanism, read instead of written.
  */
 
 import { useCallback, useSyncExternalStore } from "react";
@@ -82,6 +89,28 @@ export function getWriteTarget(): string {
 }
 
 /**
+ * Adopt a new value and tell every subscriber. Persistence is the caller's.
+ *
+ * Split out from {@link setWriteTarget} because a target arriving from another
+ * tab is already in storage: writing it back would be a redundant write, and in
+ * the `clear()` case it would resurrect the key the other tab just removed.
+ *
+ * @param next The new target, already normalised.
+ */
+function publish(next: string): void {
+  if (next === getWriteTarget()) return;
+  current = next;
+  for (const listener of [...listeners]) {
+    try {
+      listener(next);
+    } catch {
+      // A broken subscriber must not stop the others from re-rendering: a
+      // stale target on screen is exactly what D1a forbids.
+    }
+  }
+}
+
+/**
  * Set the write target and tell every subscriber.
  *
  * A blank or whitespace-only value resets to {@link DEFAULT_WRITE_TARGET}
@@ -94,16 +123,38 @@ export function getWriteTarget(): string {
 export function setWriteTarget(target: string): void {
   const next = target.trim() || DEFAULT_WRITE_TARGET;
   if (next === getWriteTarget()) return;
-  current = next;
+  // Storage first, so a subscriber that re-reads it during the broadcast does
+  // not see the value this call is replacing.
   writeStored(next);
-  for (const listener of [...listeners]) {
-    try {
-      listener(next);
-    } catch {
-      // A broken subscriber must not stop the others from re-rendering: a
-      // stale target on screen is exactly what D1a forbids.
-    }
-  }
+  publish(next);
+}
+
+/**
+ * Adopt a write target another tab set.
+ *
+ * The `storage` event fires only in the *other* documents on this origin, which
+ * is exactly the case D1a's on-screen value cannot cover on its own: a tab that
+ * never re-read storage would keep showing — and writing to — the target it
+ * held when it loaded.
+ *
+ * A `null` key is `localStorage.clear()`, which took our key with everything
+ * else; a `null` or blank value is the key removed or emptied. All three mean
+ * the same thing the module means at startup: the default.
+ *
+ * @param event The `storage` event.
+ */
+function adoptForeignChange(event: StorageEvent): void {
+  if (event.key !== null && event.key !== WRITE_TARGET_STORAGE_KEY) return;
+  publish(event.newValue?.trim() ? event.newValue.trim() : DEFAULT_WRITE_TARGET);
+}
+
+// Registered once, at import, for the same reason the store itself is a module
+// singleton: there is one write target, and a per-component subscription would
+// mean tabs agreeing only while some particular view happened to be mounted.
+// Guarded because this module is also imported by the `node`-environment tests,
+// where there is no window to listen on.
+if (typeof window !== "undefined") {
+  window.addEventListener("storage", adoptForeignChange);
 }
 
 /**

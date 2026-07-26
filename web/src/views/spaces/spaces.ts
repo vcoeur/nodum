@@ -30,7 +30,7 @@
  *   straight to the shared classifier rather than re-derived here.
  */
 
-import { ApiError, isUnknownSpace } from "../../api/client";
+import { isUnknownSpace } from "../../api/client";
 import type { SpaceOut } from "../../api/types";
 import { describeFailure } from "../../lib";
 import type { FailureDescription } from "../../lib";
@@ -275,22 +275,6 @@ export function validateSpaceName(
 }
 
 /**
- * Whether a caught failure is the server declining to resolve a space.
- *
- * {@link isUnknownSpace} is the sanctioned discriminator and is checked first,
- * but `api/client.ts` normalises only the two space-*filtered reads*
- * (`GET /api/nodes`, `GET /api/search`) — the lifecycle routes this screen
- * calls are not wrapped, so their refusal still arrives as a plain
- * {@link ApiError}. The literal message is the same one the client keys on
- * (`service.py`'s `unknown space: <ref>`), which is why matching it here is a
- * stand-in for the normalisation and not a second rule.
- */
-function isSpaceUnresolved(error: unknown): boolean {
-  if (isUnknownSpace(error)) return true;
-  return error instanceof ApiError && /^unknown space:/i.test(error.message);
-}
-
-/**
  * Describe a failure from a space call, in words that never claim the space is gone.
  *
  * The server answers "a space that does not exist" and "a space you cannot
@@ -298,13 +282,16 @@ function isSpaceUnresolved(error: unknown): boolean {
  * inventing a fact — and the shared classifier's own 404 body ("The server has
  * no record of …") is exactly that claim. Everything else is handed to
  * {@link describeFailure} unchanged: this module does not re-derive what kind
- * of failure something was.
+ * of failure something was — including *whether* the failure was an unresolved
+ * space, which {@link isUnknownSpace} is the one owner of. `api/client.ts`
+ * normalises every space-naming call, the three lifecycle routes this screen
+ * uses included, so there is nothing left here to match by hand.
  *
  * @param error The caught value.
  * @param spaceRef The space the call named, for the copy.
  */
 export function describeSpaceFailure(error: unknown, spaceRef: string): FailureDescription {
-  if (isSpaceUnresolved(error)) {
+  if (isUnknownSpace(error)) {
     return {
       kind: "not-found",
       title: "That space did not resolve",

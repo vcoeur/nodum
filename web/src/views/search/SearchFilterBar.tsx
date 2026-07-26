@@ -66,7 +66,8 @@ export function SearchFilterBar({
   return (
     <div className="nd-search-filters" role="group" aria-label="Search filters">
       <SpaceFilter
-        className="nd-search-filters__field nd-search-filters__field--space"
+        className="nd-search-filters__field"
+        controlClassName="nd-search-filters__control"
         value={state.space}
         onChange={(space) => onChange({ space })}
         spaces={spaces}

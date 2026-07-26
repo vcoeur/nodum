@@ -37,7 +37,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { Ref } from "react";
 import { api } from "../../api/client";
 import type { BatchTransitionOut, NodeOut, ProposalOut } from "../../api/types";
-import { EmptyState, Spinner, spaceLabel, useToast } from "../../components";
+import { EmptyState, Spinner, spaceLabel, useSpaces, useToast } from "../../components";
 import { AcceptDialog } from "./AcceptDialog";
 import { RejectDialog } from "./RejectDialog";
 import { ProposalCard } from "./ProposalCard";
@@ -51,7 +51,6 @@ import type { AgentGroup, ProposalBatch, ProposalKind, SpaceSection } from "./gr
 import { formatAbsolute, formatRelative } from "../../lib";
 import { plural } from "./format";
 import { classifyFailure, failureMessage, useReviewQueue } from "./useReviewQueue";
-import { useSpaces } from "./useSpaces";
 
 /** A destructive action waiting on confirmation. */
 interface PendingAction {
@@ -278,7 +277,7 @@ export function ReviewInbox() {
           void queue.refresh();
           // A grant changed on /admin turns a space self-governing; a refresh
           // that only re-read the queue would keep saying otherwise.
-          spaceList.reload();
+          void spaceList.reload();
         }}
         paused={pending !== null || busy}
       />

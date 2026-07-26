@@ -261,14 +261,19 @@ describe("describeSpaceFailure", () => {
   /** Copy that would resolve the server's deliberate ambiguity. */
   const FORBIDDEN = ["no such space", "does not exist", "no record of", "was deleted"];
 
+  /**
+   * The refusal as this screen meets it, from either wire status.
+   *
+   * `api/client.ts` normalises all three lifecycle routes as well as the two
+   * filtered reads, so `UnknownSpaceError` is the only shape that arrives here
+   * — the 400/404 split the class absorbs is what these two stand for.
+   */
   const refusals = {
-    normalised: new UnknownSpaceError("research", 400, "unknown space: research"),
-    raw: new ApiError(404, "TypeNotFound", "unknown space: research"),
+    fromSearchShapedStatus: new UnknownSpaceError("research", 400, "unknown space: research"),
+    fromListingShapedStatus: new UnknownSpaceError("research", 404, "unknown space: research"),
   };
 
-  it("recognises both spellings of the refusal", () => {
-    // The client normalises the two filtered reads; the lifecycle routes this
-    // screen calls arrive raw, and both have to reach the same panel.
+  it("recognises the refusal whichever status the wire carried", () => {
     for (const error of Object.values(refusals)) {
       expect(describeSpaceFailure(error, "research").title).toBe("That space did not resolve");
     }
@@ -283,7 +288,7 @@ describe("describeSpaceFailure", () => {
   });
 
   it("names the reference and points at the one action that helps", () => {
-    const described = describeSpaceFailure(refusals.raw, "research");
+    const described = describeSpaceFailure(refusals.fromListingShapedStatus, "research");
     expect(described.body).toContain('"research"');
     expect(described.body).toContain("reload");
   });

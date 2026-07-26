@@ -28,7 +28,9 @@ every write is attributed to the session's human and no request field can say
 otherwise — and serves the **web UI** from the same process: a login view,
 an accounts-and-grants admin view, a Markdown editor, hybrid
 search, the review queue, a graph view, an asset browser,
-and per-node version history. **Phase 4 (ingestion)** landed: `nodum ingest`
+a spaces view, and per-node version history. Spaces reach that UI as the same
+two independent controls the CLI has — a read filter on every listing and a
+sticky write target shown wherever a node is created. **Phase 4 (ingestion)** landed: `nodum ingest`
 turns a file, a folder, or a URL into a reviewable subgraph — text extraction
 through optional per-format handlers (PDF, OCR, audio; a missing one is
 reported, never fatal), an `asset_ref` node for the bytes, a `source` node
@@ -326,7 +328,7 @@ degrades to BM25 + graph expansion. `NODUM_EMBED_MODEL` switches the model
   properties of a human-only surface behind a password, which is exactly why
   this route sits inside the session gate while the two capability-URL routes
   do not — those carry no ambient credential to ride.
-- **The eight views.** `/login` is the session gate: password login with
+- **The nine views.** `/login` is the session gate: password login with
   argon2id. `/editor` is a CodeMirror-6 Markdown editor with slash commands,
   `[[` autocomplete, live Mermaid preview, drag-drop asset upload, and
   debounced autosave — a node's `type` is fixed at creation, so the type
@@ -336,10 +338,23 @@ degrades to BM25 + graph expansion. `NODUM_EMBED_MODEL` switches the model
   for a reason, an accept always shows what it will write. `/graph` renders
   `subgraph` in Cytoscape, with truncation and the confidence floor's exclusions
   stated on screen rather than in a footnote. `/assets` is the rendition grid
-  and lightbox. `/admin` is accounts and grants: humans, agents with show-once
+  and lightbox. `/spaces` is what territory exists: every active space with its
+  live node count and the agents granted on it, plus create, rename and archive.
+  `/admin` is accounts and grants: humans, agents with show-once
   tokens, and the grant grid. `/history/:nodeId` is the version timeline and
   side-by-side diff. Every route is a real URL that survives a reload. Source
   and conventions: [`web/README.md`](web/README.md).
+- **Spaces in the UI are a filter and a target, never a mode.** Search, the node
+  graph and the review queue take a space *filter* that narrows and defaults to
+  every space in scope; a single app-wide *write target* (sticky across sessions
+  and across tabs) says where a new node lands, and is rendered on every surface
+  that creates one — a persisted target the human cannot see is how work gets
+  filed into a space nobody chose. The review queue groups proposals by space,
+  then by agent, so a space that governs itself (an agent holds `edit`, its
+  writes land `active` and never queue) is visible as *self-governing* rather
+  than as silence. Nothing in the UI ever reports a space as missing: the server
+  refuses an unknown space and an ungranted one with identical words, and the
+  interface keeps that ambiguity intact.
 - **Assets and renditions.** `asset register` streams a file into the
   database keyed by its sha256 (dedup is free) and records its metadata row;
   the copy is re-hashed as it is written, so a file that changed since it was

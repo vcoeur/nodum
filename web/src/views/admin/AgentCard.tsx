@@ -8,10 +8,10 @@
  */
 
 import { useState } from "react";
-import { useToast } from "../../components";
+import { spaceLabel, useToast } from "../../components";
 import { api } from "../../api/client";
 import type { AgentOut, GrantLevel, GrantOut, NodeOut } from "../../api/types";
-import { GRANT_LEVELS, grantableSpaces, grantsForAgent, LEVEL_SUMMARY, spaceLabel } from "./grants";
+import { GRANT_LEVELS, grantableSpaces, grantsForAgent, LEVEL_SUMMARY } from "./grants";
 import { ConfirmDialog } from "./ConfirmDialog";
 
 /** A destructive action waiting on its confirm. */

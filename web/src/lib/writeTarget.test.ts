@@ -11,6 +11,10 @@
  *   showing the target can never fall behind the value nodes are filed under;
  * - it keeps the reference **verbatim**, because a space id and a space name
  *   both resolve server-side and only the server can say which still does;
+ * - **two tabs cannot disagree.** A target set in one tab reaches every other
+ *   open one, because a tab still holding the old value would file a node into
+ *   a space the human had already moved away from — D1a's failure, one level
+ *   out from a single screen;
  * - storage being unavailable **degrades**, it does not throw. The write target
  *   sits on the node-create path, and a browser blocking site data must not
  *   take the editor down with it.
@@ -145,6 +149,97 @@ describe("the change broadcast — what makes the target renderable", () => {
 
     offBad();
     offAfter();
+  });
+});
+
+describe("a second tab", () => {
+  /**
+   * What the browser delivers to *this* document when another one writes.
+   *
+   * The real event is never dispatched by the tab that made the change, so a
+   * test that called `setWriteTarget` would be testing the wrong path.
+   */
+  function fromAnotherTab(key: string | null, newValue: string | null) {
+    window.dispatchEvent(
+      new StorageEvent("storage", { key, newValue, storageArea: window.localStorage }),
+    );
+  }
+
+  it("moves this tab's target when another one changes it", async () => {
+    const store = await freshStore();
+    expect(store.getWriteTarget()).toBe("main");
+
+    fromAnotherTab(KEY, "research");
+
+    expect(store.getWriteTarget()).toBe("research");
+  });
+
+  it("re-renders every subscriber, which is what stops the stale write", async () => {
+    const store = await freshStore();
+    const listener = vi.fn();
+    const off = store.onWriteTargetChange(listener);
+
+    fromAnotherTab(KEY, "research");
+
+    expect(listener).toHaveBeenCalledWith("research");
+    off();
+  });
+
+  it("falls back to main when the other tab cleared the key", async () => {
+    window.localStorage.setItem(KEY, "research");
+    const store = await freshStore();
+    expect(store.getWriteTarget()).toBe("research");
+
+    fromAnotherTab(KEY, null);
+
+    expect(store.getWriteTarget()).toBe("main");
+  });
+
+  it("falls back to main when the other tab cleared all of storage", async () => {
+    // `localStorage.clear()` reports a null key: every key went, ours included.
+    window.localStorage.setItem(KEY, "research");
+    const store = await freshStore();
+
+    fromAnotherTab(null, null);
+
+    expect(store.getWriteTarget()).toBe("main");
+  });
+
+  it("ignores another key entirely", async () => {
+    const store = await freshStore();
+    store.setWriteTarget("research");
+    const listener = vi.fn();
+    const off = store.onWriteTargetChange(listener);
+
+    fromAnotherTab("some.other.key", "reference");
+
+    expect(store.getWriteTarget()).toBe("research");
+    expect(listener).not.toHaveBeenCalled();
+    off();
+  });
+
+  it("says nothing when the other tab set the value this one already holds", async () => {
+    const store = await freshStore();
+    store.setWriteTarget("research");
+    const listener = vi.fn();
+    const off = store.onWriteTargetChange(listener);
+
+    fromAnotherTab(KEY, "research");
+
+    expect(listener).not.toHaveBeenCalled();
+    off();
+  });
+
+  it("does not write the adopted value back into storage", async () => {
+    // The other tab's write is already there. Echoing it would be a redundant
+    // write, and on a clear it would resurrect the key that tab just removed.
+    const store = await freshStore();
+    const written = vi.spyOn(Storage.prototype, "setItem");
+
+    fromAnotherTab(KEY, "research");
+
+    expect(store.getWriteTarget()).toBe("research");
+    expect(written).not.toHaveBeenCalled();
   });
 });
 

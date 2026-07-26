@@ -43,8 +43,9 @@ say otherwise — the shared **envelope**
 module (`nodum.envelope`) both the CLI and the API render through, and the
 **web UI** itself (`web/`, React 19 + TypeScript, built into `nodum/_web/` by
 `make web-build`; gitignored, shipped in the wheel as a hatchling artifact):
-eight views — login, Markdown editor, hybrid search, review queue,
-graph, assets, an accounts-and-grants admin, per-node version history.
+nine views — login, Markdown editor, hybrid search, review queue,
+graph, assets, a spaces screen, an accounts-and-grants admin, per-node version
+history.
 Phase 4 (ingestion) has landed: **text extraction** (`nodum.extract` — a
 registry of optional handlers keyed by MIME family, where an absent dependency
 is a returned result and never an exception), the **ingestion pipeline**
@@ -218,16 +219,20 @@ node for exactly this reason.
   `GET /api/nodes/{id}` is byte-identical to `nodum node get <id>` on stdout.
   New list output goes through `list_envelope`, never a hand-built dict.
 - **`web/`** — the human UI (React 19 + TypeScript + Vite), built into
-  `nodum/_web/` by `make web-build` and served by `nodum serve`. Nine routes
-  over eight views, each lazily loaded so CodeMirror, Mermaid, and Cytoscape stay
+  `nodum/_web/` by `make web-build` and served by `nodum serve`. Ten routes
+  over nine views, each lazily loaded so CodeMirror, Mermaid, and Cytoscape stay
   out of the initial bundle. `src/api/client.ts` is the only `fetch` in the
   app and has **no identity parameter anywhere** — the server's structural
   rule, mirrored in the client. It sends `Content-Type: application/json` on every
   non-GET request, bodyless ones included, because the server requires it.
   `src/lib/` holds the cross-view invariants
-  (timestamps, failure classification); `src/components/` holds shared React
-  components; a view owns its own directory and links to other views by URL,
-  never by import. Full conventions: `web/README.md`.
+  (timestamps, failure classification, the sticky write target);
+  `src/components/` holds shared React
+  components plus the space filter's two halves (`spaceOptions.ts`,
+  `useSpaces.ts`); a view owns its own directory and links to other views by URL,
+  never by import. Spaces reach the UI as the CLI's two independent controls —
+  a per-view read filter and one app-wide write target — never as a mode. Full
+  conventions: `web/README.md`.
 - **`nodum.projectors`** — derived-index consumers of the event log. A
   projector registry (`REGISTRY`), per-projector checkpoints in
   `projector_checkpoints`, incremental `run_projectors`, and
@@ -888,13 +893,58 @@ Phase-1 decision log.
   is the one place that tells *the API refused this* apart from *nothing was
   listening* — and the two are not one test: same-origin it is a `fetch`
   `TypeError`, behind the dev proxy it is a 502. Map its `kind` onto your own
-  panel; do not re-test `status` or `instanceof`.
+  panel; do not re-test `status` or `instanceof`. The same rule covers a refused
+  space: `isUnknownSpace` (`src/api/client.ts`) is the **only** discriminator,
+  and the client normalises every call that names a space — `listNodes`,
+  `search`, `createNode`, `createSpace`, `renameSpace`, `archiveSpace` — into
+  one `UnknownSpaceError`. It is keyed on the message (`unknown space: …`),
+  because no status is specific enough: the node listing answers 404 and search
+  answers 400 for the same event, while a 404 from `POST /api/nodes` is equally
+  an unknown node *type*. Two views once carried their own copy of that match,
+  and a second copy of a discriminator is how the two drift apart — if a bare
+  `ApiError` with that message ever reaches a view, wrap the call in the client.
+- **Nothing user-facing may say a space does not exist.** Not "no such space",
+  not "does not exist", not "unknown/missing/nonexistent space", not "not
+  found" — and not by handing an `UnknownSpaceError` to `describeFailure`,
+  whose 404 body is *"The server has no record of …"*. The server answers a
+  space that was never created and a space the caller holds no grant on with
+  **word-for-word identical text on purpose** (Q13 review S3): a refusal that
+  told them apart would be an existence oracle over every space in the file, and
+  the space filter would leak the shape of what an agent cannot read. Say what
+  changed instead — a space stops resolving once it is archived, and a renamed
+  one no longer answers to its old name. `views/search/spaceFailure.ts`,
+  `views/editor/createOutcome.ts` and `views/spaces/spaces.ts` own that copy and
+  pin it with tests; new copy goes through one of them.
+- **The space surfaces are shared, and there is one of each.** The read filter
+  is `components/SpaceFilter.tsx` (controlled and presentational — the view owns
+  the value, and `controlClassName` is how a filter row sizes it rather than
+  reaching in with a CSS override); its option vocabulary is
+  `components/spaceOptions.ts` (`spaceOptions`, `resolveSpaceValue`,
+  `spaceLabel` — a space reference is an id *or* a name everywhere, so resolve
+  before comparing); the `GET /api/spaces` read behind all of them is
+  `components/useSpaces.ts`. Do not add a seventh copy of that fetch or a second
+  `spaceLabel`.
+- **The write target is app-wide, sticky, and must be visible** (design decision
+  D1a). `src/lib/writeTarget.ts` owns it: one module-level value, persisted in
+  `localStorage`, synchronised across tabs through the `storage` event, and
+  never silently rewritten — a target naming an archived space survives and
+  fails at the write, because filing a node somewhere the human did not choose
+  is worse than a refusal they can read. `useWriteTarget()` is the subscription;
+  a surface that creates a node **shows** the current target, and the post-create
+  confirmation names the space the server actually filed it in. Calling
+  `getWriteTarget()` without rendering the answer is the failure this module
+  exists to prevent.
 - **A view owns its directory and links to other views by URL.** No view imports
   another. Route paths live in `src/router.tsx`; grep for the path string before
   renaming one. A view's entry component keeps a **default export** — the routes
   are lazily loaded and `lazy()` needs it.
 - **Promote to `src/lib/` or `src/components/` on the second user, not the
-  first.** Both are inherited by every view.
+  first.** Both are inherited by every view. `src/lib/` is the plain-function
+  tier; a hook or a shared fetch belongs beside the component it serves, in
+  `src/components/` (`useSpaces.ts` is there because `SpaceFilter` is
+  presentational and cannot own its own data). `writeTarget.ts` is the one hook
+  in `lib/`, and only because the state it owns has no component — every
+  node-create surface has to render it.
 - **Do not render a control for something the service cannot do.** A node's
   `type` is immutable after creation, so the editor drops the type commands on a
   saved node rather than offering one that silently no-ops. Same rule as the
@@ -908,7 +958,8 @@ Phase-1 decision log.
 - **A pure module gets a `*.test.ts` beside it** (`make web-test`, Vitest). The
   harness is unit-only by design — no component rendering — so pull the logic
   worth testing out of the component and test it there, which is what
-  `filters.ts`, `unifiedDiff.ts`, `signals.ts`, and `grouping.ts` already
+  `filters.ts`, `unifiedDiff.ts`, `signals.ts`, `grouping.ts`, `spaceOptions.ts`,
+  `createOutcome.ts` and `views/spaces/spaces.ts` already
   are. Assert the *semantics* the module encodes (a
   `min_confidence` of 0 is a filter, not a no-op; a 502 is unreachable, not a
   refusal), not its line coverage. The global environment is `node`; a suite

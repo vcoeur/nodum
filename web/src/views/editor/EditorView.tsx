@@ -18,8 +18,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import type { KeyboardEvent } from "react";
 import { api } from "../../api/client";
-import type { SpaceOut, TypeOut } from "../../api/types";
-import { EmptyState, Spinner, useToast } from "../../components";
+import type { TypeOut } from "../../api/types";
+import { EmptyState, Spinner, useSpaces, useToast } from "../../components";
 import { MarkdownEditor } from "./MarkdownEditor";
 import type { MarkdownEditorHandle } from "./MarkdownEditor";
 import { MarkdownPreview } from "./MarkdownPreview";
@@ -60,7 +60,7 @@ export default function EditorView() {
   // that makes it *visible* here, which is the whole of D1a. The same value is
   // handed to the document hook, so what the bar shows and what a create writes
   // are one variable rather than two reads of a store.
-  const { spaces, spacesFailed } = useSpaces();
+  const { spaces, failed: spacesFailed } = useSpaces();
   const [writeTarget, setWriteTarget] = useWriteTarget();
 
   const doc = useNodeDocument({
@@ -396,44 +396,6 @@ function useNodeTypes(): { types: TypeOut[]; typesError: string | null } {
   }, []);
 
   return { types, typesError };
-}
-
-/**
- * The active space list, fetched once per mount.
- *
- * Only ever used to *name* a space — the write-target picker's vocabulary and
- * the label beside a saved node. A failure is therefore not fatal: the target
- * still writes, and every label falls back to the reference itself.
- *
- * @returns The spaces (null until known) and whether the request failed.
- */
-function useSpaces(): { spaces: SpaceOut[] | null; spacesFailed: boolean } {
-  const [spaces, setSpaces] = useState<SpaceOut[] | null>(null);
-  const [spacesFailed, setSpacesFailed] = useState(false);
-
-  useEffect(() => {
-    const controller = new AbortController();
-    let cancelled = false;
-
-    void (async () => {
-      try {
-        const listed = await api.listSpaces(controller.signal);
-        if (cancelled) return;
-        setSpaces(listed);
-        setSpacesFailed(false);
-      } catch {
-        if (cancelled || controller.signal.aborted) return;
-        setSpacesFailed(true);
-      }
-    })();
-
-    return () => {
-      cancelled = true;
-      controller.abort();
-    };
-  }, []);
-
-  return { spaces, spacesFailed };
 }
 
 /** The type a new document starts on: the preferred name, else the first offered. */

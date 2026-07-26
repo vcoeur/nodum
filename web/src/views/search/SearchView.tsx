@@ -3,8 +3,8 @@ import type { KeyboardEvent as ReactKeyboardEvent } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { api } from "../../api/client";
 import { describeError, describeFailure } from "../../lib";
-import type { SearchFilters, SearchHit, SearchResult, SpaceOut, TypeOut } from "../../api/types";
-import { ANY_SPACE, EmptyState, Spinner } from "../../components";
+import type { SearchFilters, SearchHit, SearchResult, TypeOut } from "../../api/types";
+import { ANY_SPACE, EmptyState, Spinner, useSpaces } from "../../components";
 import { ResultRow } from "./ResultRow";
 import { SearchFilterBar } from "./SearchFilterBar";
 import { SignalLegend } from "./SignalBreakdown";
@@ -94,8 +94,10 @@ export default function SearchView() {
   const [error, setError] = useState<unknown>(null);
   const [nodeTypes, setNodeTypes] = useState<TypeOut[] | null>(null);
   const [typesFailed, setTypesFailed] = useState(false);
-  const [spaces, setSpaces] = useState<SpaceOut[] | null>(null);
-  const [spacesFailed, setSpacesFailed] = useState(false);
+  // The space filter's vocabulary. A failure is not fatal to searching — the
+  // control says so and the filter stays whatever the URL carried, which is the
+  // only honest thing to do with a space reference nothing can currently name.
+  const { spaces, failed: spacesFailed } = useSpaces();
   const [vector, setVector] = useState<VectorEvidence>({ seen: false, missing: false });
   const [retryToken, setRetryToken] = useState(0);
 
@@ -167,20 +169,6 @@ export default function SearchView() {
           setNodeTypes([]);
           setTypesFailed(true);
         }
-      });
-    return () => controller.abort();
-  }, []);
-
-  // The space filter's vocabulary. A failure is not fatal to searching — the
-  // control says so and the filter stays whatever the URL carried, which is the
-  // only honest thing to do with a space reference nothing can currently name.
-  useEffect(() => {
-    const controller = new AbortController();
-    api
-      .listSpaces(controller.signal)
-      .then((listed) => setSpaces(listed))
-      .catch(() => {
-        if (!controller.signal.aborted) setSpacesFailed(true);
       });
     return () => controller.abort();
   }, []);

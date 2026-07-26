@@ -125,6 +125,20 @@ grants underneath it, and a space it holds no grant on does not resolve at all
 never an existence oracle. Archiving a space retires it from the vocabulary;
 nothing moves, and every node in it keeps its `space_id`.
 
+The web UI (`nodum serve`) says the same thing with controls instead of flags.
+Search, the graph and the review queue carry a **space filter** that defaults to
+every space in scope; a single **write target**, sticky across sessions and
+shared by every open tab, says where a new node lands and is shown on every
+surface that creates one — a target the human cannot see is how work gets filed
+somewhere nobody chose. The `/spaces` screen is the lifecycle: every active
+space with its live node count and the agents granted on it, plus create,
+rename and archive. The review queue groups proposals by space and then by
+agent, which is the only way a space that governs itself — an agent holds
+`edit` there, so its writes land `active` and never queue — can be told apart
+from a space where nothing happened. And because the server refuses an unknown
+space and an ungranted one with identical words, no screen ever reports a space
+as missing; it says what changed instead.
+
 ## Projectors and derived indexes
 
 Search indexes are **projections of the event log**, not a second source of

@@ -24,13 +24,11 @@
  * nothing.
  */
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useRef, useState } from "react";
 import { Link } from "react-router-dom";
-import { EmptyState, Spinner, useToast } from "../../components";
+import { EmptyState, Spinner, useSpaces, useToast } from "../../components";
 import { api } from "../../api/client";
-import type { SpaceOut } from "../../api/types";
 import { clearWriteTarget, describeFailure, useWriteTarget } from "../../lib";
-import type { FailureDescription } from "../../lib";
 import { describeSpaceFailure, renameConsequence, spaceRows, validateSpaceName } from "./spaces";
 import type { SpaceRow } from "./spaces";
 import { SpaceCard } from "./SpaceCard";
@@ -39,8 +37,7 @@ import "./spaces.css";
 /** The spaces route. Default-exported because the route is lazily loaded. */
 export default function SpacesView() {
   const toast = useToast();
-  const [spaces, setSpaces] = useState<SpaceOut[] | null>(null);
-  const [failure, setFailure] = useState<FailureDescription | null>(null);
+  const { spaces, failed, error: loadError, reload } = useSpaces();
   const [newName, setNewName] = useState("");
   const [creating, setCreating] = useState(false);
   const [writeTarget] = useWriteTarget();
@@ -54,27 +51,9 @@ export default function SpacesView() {
    */
   const heading = useRef<HTMLHeadingElement>(null);
 
-  const load = useCallback(async () => {
-    setSpaces(await api.listSpaces());
-  }, []);
-
-  useEffect(() => {
-    let cancelled = false;
-    const controller = new AbortController();
-    void (async () => {
-      try {
-        const loaded = await api.listSpaces(controller.signal);
-        if (!cancelled) setSpaces(loaded);
-      } catch (error) {
-        if (!cancelled) setFailure(describeFailure(error, "the space list"));
-      }
-    })();
-    return () => {
-      cancelled = true;
-      controller.abort();
-    };
-  }, []);
-
+  // The list *is* this screen, so a failed read is the screen's failure rather
+  // than a degraded control the way it is in a filter row.
+  const failure = failed ? describeFailure(loadError, "the space list") : null;
   const rows = spaces === null ? null : spaceRows(spaces, writeTarget);
   // Blank is the resting state of an empty field, not a mistake to report; the
   // create button is disabled for it either way.
@@ -94,7 +73,7 @@ export default function SpacesView() {
       async () => {
         setCreating(false);
         setNewName("");
-        await load();
+        await reload();
         toast.show(
           "success",
           "Space created",
@@ -111,7 +90,7 @@ export default function SpacesView() {
 
   const rename = async (row: SpaceRow, name: string) => {
     await api.renameSpace(row.id, name);
-    await load();
+    await reload();
     toast.show("success", "Space renamed", renameConsequence(row, name));
   };
 
@@ -123,7 +102,7 @@ export default function SpacesView() {
     // human just retired that space themselves, and is told it happened.
     const wasTarget = row.writeTarget;
     if (wasTarget) clearWriteTarget();
-    await load();
+    await reload();
     heading.current?.focus();
     // The count was in the confirm the human just read; repeating it here only
     // invites a grammar branch for the empty case. What the toast has to carry

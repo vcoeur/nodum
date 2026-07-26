@@ -35,7 +35,13 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
-import { EmptyState, Spinner, resolveSpaceValue, spaceLabel } from "../../components";
+import {
+  EmptyState,
+  Spinner,
+  resolveSpaceValue,
+  spaceLabel,
+  useSpaces,
+} from "../../components";
 import type { NodeOut } from "../../api/types";
 import { GraphCanvas } from "./GraphCanvas";
 import type { GraphCanvasHandle } from "./GraphCanvas";
@@ -50,7 +56,6 @@ import type { GraphFilters } from "./filters";
 import { distinctValues, incidentEdges, toElements } from "./graphElements";
 import { shapeForType } from "./graphStyle";
 import { useSubgraph, usePath } from "./useGraphData";
-import { useSpaces } from "./useSpaces";
 import { offeredTypes, useTypeCatalog } from "./useTypeCatalog";
 import "./graph.css";
 

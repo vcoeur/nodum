@@ -122,6 +122,12 @@ export class ApiError extends Error {
  * purpose — a refusal that leaked the difference would be an existence oracle
  * over the whole file. Copy built on this error must not claim the space is
  * missing.
+ *
+ * Every call in this file that names a space raises it — the two filtered
+ * reads, the write target on `POST /api/nodes`, and all three lifecycle
+ * routes. That is deliberate and load-bearing: {@link isUnknownSpace} is the
+ * **only** sanctioned discriminator, so a view must never re-test the message
+ * itself. Two copies of one discriminator is how the two drift apart.
  */
 export class UnknownSpaceError extends ApiError {
   /** The space id or name the caller asked for. */
@@ -146,15 +152,30 @@ export function isUnknownSpace(error: unknown): error is UnknownSpaceError {
   return error instanceof UnknownSpaceError;
 }
 
-/** Both endpoints raise this literal text; the status alone cannot discriminate. */
+/** Every space-resolving route raises this literal text; the status cannot discriminate. */
 const UNKNOWN_SPACE_MESSAGE = /^unknown space:/i;
+
+/**
+ * The space a space itself lives in (`service.META_SPACE_ID`).
+ *
+ * `POST /api/spaces` names no space of its own — it is `create_node(type=
+ * "space", space="meta")` underneath — so `meta` is the reference an unknown-space
+ * refusal from a create would be about, and the one this client reports.
+ */
+const SPACE_HOME = "meta";
 
 /**
  * Recognise an unknown-space refusal and re-shape it; pass anything else through.
  *
- * Keyed on the message rather than the status, because neither status is
- * specific enough on its own: a 404 from `/api/nodes` is equally an unknown
- * `type` filter, and a 400 from `/api/search` is any bad parameter at all.
+ * Keyed on the message rather than the status, because no status is specific
+ * enough on its own: a 404 from `/api/nodes` is equally an unknown `type`
+ * filter, a 400 from `/api/search` is any bad parameter at all, and a 404 from
+ * `POST /api/nodes` is equally an unknown node *type*.
+ *
+ * Applied to **every** call that names a space — the two filtered reads, the
+ * write target, and the three lifecycle routes — so that
+ * {@link isUnknownSpace} is a complete answer and no view has to keep a second
+ * copy of this test.
  *
  * @param error The caught value.
  * @param space The space the call asked for, if it asked for one.
@@ -433,16 +454,22 @@ export function listSpaces(signal?: AbortSignal): Promise<SpaceOut[]> {
  * `POST /api/spaces` — create a space.
  *
  * A space is an ordinary node (builtin type `space`, living in meta), so this
- * is event-logged, versioned and undoable like any other write.
+ * is event-logged, versioned and undoable like any other write — and the space
+ * it resolves is `meta`, which is why a refusal here throws
+ * {@link UnknownSpaceError} naming that rather than the name being created.
  *
  * @param name The space's name, which is the node's title.
  */
-export function createSpace(name: string, signal?: AbortSignal): Promise<NodeOut> {
-  return request<NodeOut>("/spaces", {
-    method: "POST",
-    body: { name },
-    ...(signal ? { signal } : {}),
-  });
+export async function createSpace(name: string, signal?: AbortSignal): Promise<NodeOut> {
+  try {
+    return await request<NodeOut>("/spaces", {
+      method: "POST",
+      body: { name },
+      ...(signal ? { signal } : {}),
+    });
+  } catch (error) {
+    throw asUnknownSpace(error, SPACE_HOME);
+  }
 }
 
 /**
@@ -453,19 +480,26 @@ export function createSpace(name: string, signal?: AbortSignal): Promise<NodeOut
  * is not one. Returns the updated node: the HTTP surface writes as `human`, so
  * the rename always lands rather than staging a proposed version.
  *
+ * A space the server will not resolve throws {@link UnknownSpaceError}, the
+ * same class the filtered reads raise.
+ *
  * @param space The space's id **or** its current name.
  * @param name The new name.
  */
-export function renameSpace(
+export async function renameSpace(
   space: string,
   name: string,
   signal?: AbortSignal,
 ): Promise<NodeOut> {
-  return request<NodeOut>(`/spaces/${encodeURIComponent(space)}/rename`, {
-    method: "POST",
-    body: { name },
-    ...(signal ? { signal } : {}),
-  });
+  try {
+    return await request<NodeOut>(`/spaces/${encodeURIComponent(space)}/rename`, {
+      method: "POST",
+      body: { name },
+      ...(signal ? { signal } : {}),
+    });
+  } catch (error) {
+    throw asUnknownSpace(error, space);
+  }
 }
 
 /**
@@ -475,13 +509,20 @@ export function renameSpace(
  * deleted. There is no way back — the state machine has no `active ←
  * archived` transition — so treat this as final in the interface.
  *
+ * A space the server will not resolve throws {@link UnknownSpaceError}, the
+ * same class the filtered reads raise.
+ *
  * @param space The space's id **or** its name.
  */
-export function archiveSpace(space: string, signal?: AbortSignal): Promise<NodeOut> {
-  return request<NodeOut>(`/spaces/${encodeURIComponent(space)}/archive`, {
-    method: "POST",
-    ...(signal ? { signal } : {}),
-  });
+export async function archiveSpace(space: string, signal?: AbortSignal): Promise<NodeOut> {
+  try {
+    return await request<NodeOut>(`/spaces/${encodeURIComponent(space)}/archive`, {
+      method: "POST",
+      ...(signal ? { signal } : {}),
+    });
+  } catch (error) {
+    throw asUnknownSpace(error, space);
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -542,10 +583,24 @@ export async function listNodes(
  *
  * `body.space` is the write target — where the node lands, by id or name,
  * `main` when absent. It says nothing about *who* wrote it: identity stays
- * server-side, as it does on every call in this file.
+ * server-side, as it does on every call in this file. A target the server will
+ * not resolve throws {@link UnknownSpaceError}: the write path names exactly
+ * one space, so the editor gets the same discriminator the filtered reads do
+ * rather than having to re-test the message itself.
  */
-export function createNode(body: CreateNodeBody, signal?: AbortSignal): Promise<NodeOut> {
-  return request<NodeOut>("/nodes", { method: "POST", body, ...(signal ? { signal } : {}) });
+export async function createNode(
+  body: CreateNodeBody,
+  signal?: AbortSignal,
+): Promise<NodeOut> {
+  try {
+    return await request<NodeOut>("/nodes", {
+      method: "POST",
+      body,
+      ...(signal ? { signal } : {}),
+    });
+  } catch (error) {
+    throw asUnknownSpace(error, body.space);
+  }
 }
 
 /**

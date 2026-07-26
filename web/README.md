@@ -4,10 +4,21 @@ The human web UI for nodum (Phase 3). React 19 + TypeScript, built by Vite into
 `../nodum/_web/`, which the Python process serves at `/` — one process, one
 origin, no CORS.
 
-Eight views ship: **login** (`/login`), **editor** (`/editor`,
+Nine views ship: **login** (`/login`), **editor** (`/editor`,
 `/editor/:nodeId`), **search** (`/search`, also the landing view), **review**
 (`/review`), **graph** (`/graph`, `/graph/:rootId`), **assets** (`/assets`),
-**admin** (`/admin`), and **history** (`/history/:nodeId`).
+**spaces** (`/spaces`), **admin** (`/admin`), and **history**
+(`/history/:nodeId`).
+
+**A space is two independent controls, not a mode** (design decision D1), and
+that shape runs through most of the tree: a *read filter* per view, defaulting
+to every space in scope, and one app-wide sticky *write target*, defaulting to
+`main`. Reading `research` while still filing into `main` is the ordinary case,
+so a single switcher could not have served both. The shared pieces are
+`components/SpaceFilter.tsx` (the read control), `components/useSpaces.ts` (the
+one `GET /api/spaces` read behind every one of them) and `lib/writeTarget.ts`
+(the write half). `/spaces` is where the lifecycle lives — create, rename,
+archive, with each space's live node count and grant holders.
 
 ## Running it
 
@@ -51,13 +62,23 @@ own docblock, because the preview's sanitising policy *is* a parse and asserting
 it against strings would assert against the wrong thing. The opt-out is per
 file; the global config stays `node`.
 
-Covered today: `lib/time.ts`, `lib/failure.ts`, `lib/session.ts`,
-`views/failureRouting.ts`, `views/graph/filters.ts`,
+Covered today: `api/client.ts` (the unknown-space normalisation — the only
+logic in the file that is not a URL and a verb), `lib/time.ts`,
+`lib/failure.ts`, `lib/session.ts`, `lib/writeTarget.ts`,
+`components/spaceOptions.ts`, `views/failureRouting.ts`,
+`views/graph/filters.ts`, `views/graph/graphElements.ts`,
 `views/graph/truncation.ts`, `views/history/unifiedDiff.ts`,
-`views/search/signals.ts`, `views/review/grouping.ts`,
-`views/admin/grants.ts`, `views/login/credentials.ts`,
+`views/search/signals.ts`, `views/search/searchState.ts`,
+`views/search/spaceFailure.ts`, `views/review/grouping.ts`,
+`views/spaces/spaces.ts`, `views/admin/grants.ts`,
+`views/login/credentials.ts`, `views/editor/createOutcome.ts`,
 `views/editor/markdownRender.ts` + `views/editor/mermaidRender.ts` (the
 sanitising policies), and `views/editor/leftoverBuffer.ts`.
+
+`components/useSpaces.ts` is deliberately **not** in that list: it is a hook,
+and the harness renders nothing, so there is no honest way to drive it here.
+Its behaviour is verified by type-checking and in a browser, like every
+component.
 
 **The run pins `TZ` to `Asia/Kathmandu`, and this matters.** SQLite's
 `datetime('now')` is UTC with no zone marker, so the bug `lib/time.ts` fixes —
@@ -82,15 +103,16 @@ type-checking it and driving it in a browser.
 |---|---|
 | `src/main.tsx`, `src/App.tsx`, `src/router.tsx` | entry, app shell (header, nav, toasts, crash boundary, health pill), route table |
 | `src/api/client.ts`, `src/api/types.ts` | the only `fetch` in the app, and the types mirroring `nodum/models.py` |
-| `src/lib/` | cross-view plain functions: timestamp parsing (`time.ts`) and failure classification (`failure.ts`) |
-| `src/components/` | shared React components: `NodeBadge`, `Toast`, `Spinner`, `EmptyState`, `ErrorBoundary` |
+| `src/lib/` | cross-view plain functions: timestamp parsing (`time.ts`), failure classification (`failure.ts`), the 401 broadcast (`session.ts`), and the sticky write target (`writeTarget.ts`, the one module here that also exports a hook) |
+| `src/components/` | shared React components: `NodeBadge`, `Toast`, `Spinner`, `EmptyState`, `ErrorBoundary`, `Modal`, plus the space filter and its two halves — `SpaceFilter.tsx`, `spaceOptions.ts` (the option vocabulary), `useSpaces.ts` (the `GET /api/spaces` read every space surface shares) |
 | `src/styles/` | `tokens.css`, `base.css`, `primitives.css`, `app.css` |
-| `src/views/editor/` | CodeMirror-6 Markdown source editor, slash commands, `[[` autocomplete, live Mermaid preview, autosave |
-| `src/views/search/` | query box, ranked hits, per-signal breakdown, signal grouping |
-| `src/views/review/` | proposal queue, per-kind cards, proposed-version diffs |
-| `src/views/graph/` | Cytoscape subgraph render, filters, path panel |
+| `src/views/editor/` | CodeMirror-6 Markdown source editor, slash commands, `[[` autocomplete, live Mermaid preview, autosave, the write-target picker and the landing/refusal copy (`createOutcome.ts`) |
+| `src/views/search/` | query box, ranked hits, per-signal breakdown, signal grouping, the space filter + show-meta toggle in the URL (`searchState.ts`), refused-filter copy (`spaceFailure.ts`) |
+| `src/views/review/` | proposal queue grouped space → agent, per-kind cards, proposed-version diffs, self-governing space sections |
+| `src/views/graph/` | Cytoscape subgraph render, filters, cross-space edge styling and far-endpoint dimming, path panel |
 | `src/views/assets/` | rendition grid, lightbox, uploader, thin JSON export |
 | `src/views/login/` | password login against `POST /api/login` |
+| `src/views/spaces/` | the space lifecycle: list with node counts and grant holders, create, rename, archive |
 | `src/views/admin/` | accounts and grants administration, show-once token dialog |
 | `src/views/history/` | per-node version timeline and side-by-side diff |
 | `package.json`, `vite.config.ts`, `vitest.config.ts`, `tsconfig.json` | toolchain |
@@ -121,6 +143,37 @@ Conventions that hold across the tree:
   `TypeError`, but behind the dev proxy it is a **502** and therefore an
   `ApiError`. Views map its `kind` onto their own panels; they do not re-derive
   it.
+- **A refused space is `isUnknownSpace`, and only that.** `api/client.ts`
+  normalises the refusal on every call that names a space — the two filtered
+  reads, the write target on `createNode`, and all three lifecycle calls — into
+  one `UnknownSpaceError`. Two views once kept their own `^unknown space:`
+  match because the write path was not wrapped; both are gone, and a third
+  would be the bug, not the belt. If a call ever throws a bare `ApiError`
+  carrying that message, fix the client.
+- **Never say a space does not exist.** Nothing user-facing may render "no such
+  space", "does not exist", "unknown/missing/nonexistent space", or "not found"
+  for a space failure — including by handing an `UnknownSpaceError` to
+  `describeFailure`, whose 404 body is *"The server has no record of …"*. The
+  server answers a space that was never created and a space the caller holds no
+  grant on with **the same words on purpose**; copy that resolved the ambiguity
+  would turn the filter into an existence oracle over spaces the reader cannot
+  read. Say what changed instead — a space stops resolving once it is archived,
+  and a renamed one stops answering to its old name. `views/search/spaceFailure.ts`,
+  `views/editor/createOutcome.ts` and `views/spaces/spaces.ts` own that copy and
+  pin it with tests.
+- **The write target is shown wherever it is used** (design decision D1a). It is
+  app-wide, sticky across sessions, and synchronised across tabs
+  (`lib/writeTarget.ts` listens for `storage`) — all of which make it a way to
+  file work into a space nobody chose if it is ever read without being
+  displayed. `useWriteTarget()` is the subscription; anything calling
+  `getWriteTarget()` without rendering the answer is the failure the module
+  exists to prevent.
+- **One space list.** `components/useSpaces.ts` is the shared
+  `GET /api/spaces` read: the filter's vocabulary, the write-target picker, the
+  grant picker, the review queue's self-governing sections, and `/spaces` all
+  take it from there. It drops its list on failure rather than keeping a stale
+  one, and exposes `error` for the one view that escalates (`/admin` cannot
+  offer a grant without spaces to grant over) rather than degrades.
 - **Logic worth testing lives in a plain module, not in a component.** The
   harness is unit-only, so a rule that matters (a URL codec, a diff parser, a
   grant grid) goes in its own `.ts` with a `.test.ts` beside it, and the
@@ -162,6 +215,15 @@ What it handles for you:
   return a plain array;
 - raises `ApiError` (carrying `status`, `type`, `message`) on any non-2xx, with
   `isNotFound` / `isForbidden` / `isRetryable` helpers;
+- raises `UnknownSpaceError` (test it with `isUnknownSpace`) whenever a call
+  that named a space could not resolve it. The wire is inconsistent here by
+  accretion — the node listing refuses with a **404** (the service's
+  `TypeNotFound`) and search with a **400** (a bare `ValueError`, since
+  `nodum.search` does not import the service's exception vocabulary) — so the
+  class absorbs it: `status` is normalised to 404 so `describeFailure` gives one
+  answer, `wireStatus` keeps what the server said, and `space` names the
+  reference. It is keyed on the message, because neither status is specific
+  enough alone;
 - takes an optional `AbortSignal` on every call — use it in `useEffect` cleanup.
 
 ```ts

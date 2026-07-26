@@ -19,7 +19,7 @@
  *   would turn the editor into an existence oracle over the whole file.
  */
 
-import { ApiError, isUnknownSpace } from "../../api/client";
+import { isUnknownSpace } from "../../api/client";
 import { resolveSpaceValue, spaceLabel } from "../../components/spaceOptions";
 import type { NodeOut } from "../../api/types";
 
@@ -29,29 +29,6 @@ export interface LandingNotice {
   title: string;
   /** Second line: the sticky-target reminder, or the mismatch spelled out. */
   detail: string;
-}
-
-/** The literal text every space-resolving surface refuses with. */
-const UNKNOWN_SPACE_MESSAGE = /^unknown space:/i;
-
-/**
- * Whether a failed write was the write target refusing to resolve.
- *
- * `isUnknownSpace` is the shared answer and is tried first, but it only reaches
- * the two *read* calls the client normalises (`listNodes`, `search`) —
- * `createNode` throws the bare `ApiError` the wire carried. The write target is
- * the one space a create names, so the same message discriminator the client
- * documents is safe to apply here, and it is applied the same way: keyed on the
- * message, because the status alone is not specific enough (a 404 from
- * `POST /api/nodes` is equally an unknown node *type*).
- *
- * @param error The caught value.
- */
-function isRefusedWriteTarget(error: unknown): boolean {
-  if (isUnknownSpace(error)) return true;
-  if (!(error instanceof ApiError)) return false;
-  if (error.status !== 404 && error.status !== 400) return false;
-  return UNKNOWN_SPACE_MESSAGE.test(error.message);
 }
 
 /**
@@ -107,6 +84,11 @@ export function describeLanding(
  * failure D1a exists to prevent. This is the sentence that makes that failure
  * legible.
  *
+ * `isUnknownSpace` is the only test performed: `api/client.ts` normalises the
+ * refusal on **every** call that names a space, `createNode` included, and a
+ * second copy of that message match here would be a discriminator with two
+ * owners.
+ *
  * @param error The caught value.
  * @param requested The write target the create asked for (id or name).
  * @param spaces Every active space, for turning an id into a name.
@@ -118,7 +100,7 @@ export function describeWriteFailure(
   requested: string,
   spaces: readonly NodeOut[],
 ): string | null {
-  if (!isRefusedWriteTarget(error)) return null;
+  if (!isUnknownSpace(error)) return null;
   const name = spaceLabel(spaces, requested);
   return (
     `The write target ${name} would not resolve — a space stops resolving once it is archived, ` +

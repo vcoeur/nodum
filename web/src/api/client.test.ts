@@ -21,7 +21,17 @@
  */
 
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ApiError, isUnknownSpace, listNodes, search, UnknownSpaceError } from "./client";
+import {
+  ApiError,
+  archiveSpace,
+  createNode,
+  createSpace,
+  isUnknownSpace,
+  listNodes,
+  renameSpace,
+  search,
+  UnknownSpaceError,
+} from "./client";
 import { describeFailure } from "../lib/failure";
 
 /** Answer the next request with one status and one error envelope. */
@@ -153,6 +163,76 @@ describe("refusals that are not about a space", () => {
 
     expect(isUnknownSpace(error)).toBe(false);
     expect(describeFailure(error).kind).toBe("unreachable");
+  });
+});
+
+describe("the write path and the lifecycle, not only the two reads", () => {
+  // Every one of these used to throw a bare ApiError, and two views grew their
+  // own copy of the message match to compensate. The discriminator has one
+  // owner; these are the calls that make that true.
+
+  it("normalises the write target a create could not resolve", async () => {
+    stubFetch(404, "TypeNotFound", "unknown space: research");
+    const error = await createNode({ type: "note", title: "x", space: "research" }).catch(
+      (caught: unknown) => caught,
+    );
+
+    expect(isUnknownSpace(error)).toBe(true);
+    expect((error as UnknownSpaceError).space).toBe("research");
+  });
+
+  it("leaves an unknown node type on the create path alone", async () => {
+    // Same route, same status: the write path has its own way of producing a
+    // 404 that has nothing to do with the space it named.
+    stubFetch(404, "TypeNotFound", "unknown type: memo");
+    const error = await createNode({ type: "memo", title: "x", space: "research" }).catch(
+      (caught: unknown) => caught,
+    );
+
+    expect(isUnknownSpace(error)).toBe(false);
+  });
+
+  it("normalises nothing for a create that named no target", async () => {
+    stubFetch(404, "TypeNotFound", "unknown space: ghost");
+    const error = await createNode({ type: "note", title: "x" }).catch(
+      (caught: unknown) => caught,
+    );
+
+    expect(isUnknownSpace(error)).toBe(false);
+  });
+
+  it("normalises a rename and an archive, naming the space each addressed", async () => {
+    stubFetch(404, "TypeNotFound", "unknown space: research");
+    const renamed = await renameSpace("research", "reference").catch(
+      (caught: unknown) => caught,
+    );
+
+    stubFetch(404, "TypeNotFound", "unknown space: research");
+    const archived = await archiveSpace("research").catch((caught: unknown) => caught);
+
+    expect(isUnknownSpace(renamed)).toBe(true);
+    expect(isUnknownSpace(archived)).toBe(true);
+    expect((renamed as UnknownSpaceError).space).toBe("research");
+    expect((archived as UnknownSpaceError).space).toBe("research");
+  });
+
+  it("reports a refused create-space against meta, the space it actually resolves", async () => {
+    // `POST /api/spaces` names no space: it is `create_node(space="meta")`
+    // underneath, so `meta` is what an unknown-space refusal there is about —
+    // never the name being created, which does not exist yet by definition.
+    stubFetch(404, "TypeNotFound", "unknown space: meta");
+    const error = await createSpace("research").catch((caught: unknown) => caught);
+
+    expect(isUnknownSpace(error)).toBe(true);
+    expect((error as UnknownSpaceError).space).toBe("meta");
+  });
+
+  it("leaves a duplicate-name refusal from create-space alone", async () => {
+    stubFetch(400, "ValueError", 'a live space already answers to "research"');
+    const error = await createSpace("research").catch((caught: unknown) => caught);
+
+    expect(isUnknownSpace(error)).toBe(false);
+    expect((error as ApiError).status).toBe(400);
   });
 });
 

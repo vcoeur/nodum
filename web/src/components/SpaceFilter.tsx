@@ -33,6 +33,16 @@ interface SpaceFilterProps {
   label?: string;
   /** Extra class on the wrapping label, for the view's own layout. */
   className?: string;
+  /**
+   * Extra class on the `<select>` itself, for a filter row that sizes its own
+   * controls.
+   *
+   * The alternative — a view-side `.my-row .nd-select {…}` override — reaches
+   * inside a shared component from outside it, which is how one view's layout
+   * silently starts styling another's. A named prop keeps the seam where the
+   * component can see it.
+   */
+  controlClassName?: string;
 }
 
 /**
@@ -44,6 +54,8 @@ interface SpaceFilterProps {
  * @param failed Whether loading the space list failed.
  * @param label Field label.
  * @param className Extra class for the view's layout.
+ * @param controlClassName Extra class for the `<select>`, for a filter row that
+ *   sizes its controls.
  */
 export function SpaceFilter({
   value,
@@ -52,6 +64,7 @@ export function SpaceFilter({
   failed = false,
   label = "Space",
   className,
+  controlClassName,
 }: SpaceFilterProps) {
   const known = spaces ?? [];
   const options = spaceOptions(known, value, failed ? "Spaces unavailable" : "Any space");
@@ -66,7 +79,7 @@ export function SpaceFilter({
     <label className={className ? `nd-field ${className}` : "nd-field"}>
       <span className="nd-label">{label}</span>
       <select
-        className="nd-select"
+        className={controlClassName ? `nd-select ${controlClassName}` : "nd-select"}
         value={selected}
         disabled={spaces === null && !failed}
         title={

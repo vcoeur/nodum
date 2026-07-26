@@ -48,9 +48,15 @@ const SPACES: readonly NodeOut[] = [
   space("01J8ZQ4C7K9V0MZ0R2N6S3XA7B", "research"),
 ];
 
-/** What the server answers a write target it will not resolve. */
-function refusedTarget(status = 404): ApiError {
-  return new ApiError(status, "TypeNotFound", "unknown space: research");
+/**
+ * A refused write target as the editor meets it.
+ *
+ * `api/client.ts` normalises every call that names a space, `createNode`
+ * included, so this is the *only* shape the editor ever catches — the bare
+ * `ApiError` the wire carried never reaches this module.
+ */
+function refusedTarget(wireStatus = 404): UnknownSpaceError {
+  return new UnknownSpaceError("research", wireStatus, "unknown space: research");
 }
 
 describe("the landing notice", () => {
@@ -105,16 +111,14 @@ describe("the landing notice", () => {
 });
 
 describe("a write target the server refused", () => {
-  it("recognises the bare error the create path throws", () => {
-    // `POST /api/nodes` is not one of the two reads the client normalises, so
-    // the failure arrives as a plain ApiError and this is the only thing that
-    // can tell it apart from any other 404.
+  it("recognises the refusal the client normalises the create path into", () => {
     expect(describeWriteFailure(refusedTarget(), "research", SPACES)).not.toBeNull();
   });
 
-  it("recognises the normalised error too, if a create is ever routed through it", () => {
-    const normalised = new UnknownSpaceError("research", 404, "unknown space: research");
-    expect(describeWriteFailure(normalised, "research", SPACES)).not.toBeNull();
+  it("recognises it whichever status the wire carried", () => {
+    // `POST /api/nodes` answers 404 today, but the class exists precisely
+    // because sibling routes answer 400 for the same event.
+    expect(describeWriteFailure(refusedTarget(400), "research", SPACES)).not.toBeNull();
   });
 
   it("declines every other failure, so the generic save-error copy stands", () => {
@@ -122,6 +126,13 @@ describe("a write target the server refused", () => {
     expect(describeWriteFailure(new ApiError(503, "DatabaseBusy", "database is locked"), "main", SPACES)).toBeNull();
     expect(describeWriteFailure(new TypeError("Failed to fetch"), "main", SPACES)).toBeNull();
     expect(describeWriteFailure("a string nobody wrapped", "main", SPACES)).toBeNull();
+  });
+
+  it("re-derives nothing: a bare unknown-space ApiError is the client's bug, not this module's", () => {
+    // If this ever stops being null, the client stopped normalising `createNode`
+    // — and the fix is there, not a second message match here.
+    const bare = new ApiError(404, "TypeNotFound", "unknown space: research");
+    expect(describeWriteFailure(bare, "research", SPACES)).toBeNull();
   });
 
   it("never claims the space does not exist", () => {
