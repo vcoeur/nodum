@@ -441,11 +441,11 @@ def test_agent_update_proposes_and_review_accepts(fresh_db):
 # ── mcp serve: the actor is validated before anything is served ───────────────
 
 
-def test_mcp_serve_rejects_a_non_agent_actor(fresh_db):
-    for actor in ("human", "", "agent:", "agent", "researcher"):
-        result = runner.invoke(app, ["mcp", "serve", "--actor", actor])
-        assert result.exit_code == 1, result.output
-        assert "invalid --actor" in result.output
+def test_mcp_serve_requires_an_agent_token(fresh_db, monkeypatch):
+    monkeypatch.delenv("NODUM_AGENT_TOKEN", raising=False)
+    result = runner.invoke(app, ["mcp", "serve"])
+    assert result.exit_code == 1, result.output
+    assert "NODUM_AGENT_TOKEN" in result.output
 
 
 # ── Assets and renditions ─────────────────────────────────────────────────────

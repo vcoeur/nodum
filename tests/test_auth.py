@@ -42,9 +42,11 @@ def test_create_agent_shows_the_token_once_and_stores_only_its_hash(fresh_db):
     created = service.create_agent("bot", owner_human_id="owner", principal=owner())
     assert created.token.startswith("ndm_")
     assert created.agent.has_token
-    row = service.db.connect().execute(
-        "SELECT credential_hash FROM agents WHERE id = 'bot'"
-    ).fetchone()
+    row = (
+        service.db.connect()
+        .execute("SELECT credential_hash FROM agents WHERE id = 'bot'")
+        .fetchone()
+    )
     assert row["credential_hash"] != created.token  # hash at rest, never the token
 
 
@@ -97,9 +99,9 @@ def test_disabling_the_owner_cascades_to_external_agents_tokens(fresh_db):
 def test_session_resolves_and_slides_expiry(fresh_db):
     session_id = auth.create_session("owner")
     conn = service.db.connect()
-    first = conn.execute(
-        "SELECT expires_at FROM sessions WHERE id = ?", (session_id,)
-    ).fetchone()["expires_at"]
+    first = conn.execute("SELECT expires_at FROM sessions WHERE id = ?", (session_id,)).fetchone()[
+        "expires_at"
+    ]
     # Backdate the row so the slide is observable without sleeping.
     conn.execute(
         "UPDATE sessions SET expires_at = datetime('now', '+1 day') WHERE id = ?",
@@ -107,12 +109,10 @@ def test_session_resolves_and_slides_expiry(fresh_db):
     )
     conn.commit()
     assert auth.principal_for_session(session_id).actor_string == OWNER_ACTOR
-    slid = conn.execute(
-        "SELECT expires_at FROM sessions WHERE id = ?", (session_id,)
-    ).fetchone()["expires_at"]
-    assert slid > first or slid != conn.execute(
-        "SELECT datetime('now', '+1 day')"
-    ).fetchone()[0]
+    slid = conn.execute("SELECT expires_at FROM sessions WHERE id = ?", (session_id,)).fetchone()[
+        "expires_at"
+    ]
+    assert slid > first or slid != conn.execute("SELECT datetime('now', '+1 day')").fetchone()[0]
 
 
 def test_an_expired_session_is_dead_and_deleted(fresh_db):

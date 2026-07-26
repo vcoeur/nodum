@@ -2511,7 +2511,9 @@ def create_human(name: str, *, principal: Principal, path: str | Path | None = N
         human_id = uuid.uuid4().hex[:12]
         conn.execute("INSERT INTO humans (id, name) VALUES (?, ?)", (human_id, name))
         row = conn.execute("SELECT * FROM humans WHERE id = ?", (human_id,)).fetchone()
-        _emit(conn, actor, "human.create", {"before": None, "after": {"id": human_id, "name": name}})
+        _emit(
+            conn, actor, "human.create", {"before": None, "after": {"id": human_id, "name": name}}
+        )
         conn.commit()
         return _human_out(row)
     finally:
@@ -2537,19 +2539,13 @@ def set_human_password(
         conn.close()
 
 
-def _set_disabled(
-    table: str, row_id: str, disabled: bool, *, conn: sqlite3.Connection
-) -> None:
-    cursor = conn.execute(
-        f"UPDATE {table} SET disabled = ? WHERE id = ?", (int(disabled), row_id)
-    )
+def _set_disabled(table: str, row_id: str, disabled: bool, *, conn: sqlite3.Connection) -> None:
+    cursor = conn.execute(f"UPDATE {table} SET disabled = ? WHERE id = ?", (int(disabled), row_id))
     if cursor.rowcount == 0:
         raise RecordNotFound(f"no {table} row with id: {row_id}")
 
 
-def disable_human(
-    human_id: str, *, principal: Principal, path: str | Path | None = None
-) -> None:
+def disable_human(human_id: str, *, principal: Principal, path: str | Path | None = None) -> None:
     """Disable a human: its sessions die, and its external agents' tokens with
     them (verification-time cascade — R3). In-flight proposals are untouched."""
     conn = _connect(path)
@@ -2729,7 +2725,9 @@ def grant(
         conn.close()
 
 
-def revoke(agent_id: str, space: str, *, principal: Principal, path: str | Path | None = None) -> None:
+def revoke(
+    agent_id: str, space: str, *, principal: Principal, path: str | Path | None = None
+) -> None:
     """Revoke an agent's grant on a space; event-logged."""
     conn = _connect(path)
     try:
@@ -2740,9 +2738,7 @@ def revoke(agent_id: str, space: str, *, principal: Principal, path: str | Path 
         ).fetchone()
         if before is None:
             raise RecordNotFound(f"no grant for {agent_id!r} on space {space_id!r}")
-        conn.execute(
-            "DELETE FROM grants WHERE agent_id = ? AND space_id = ?", (agent_id, space_id)
-        )
+        conn.execute("DELETE FROM grants WHERE agent_id = ? AND space_id = ?", (agent_id, space_id))
         _emit(conn, actor, "grant.revoke", {"before": dict(before), "after": None})
         conn.commit()
     finally:

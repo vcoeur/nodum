@@ -46,6 +46,8 @@ edge_app = typer.Typer(no_args_is_help=True, help="Edge operations.")
 projector_app = typer.Typer(
     no_args_is_help=True, help="Derived-index projectors over the event log."
 )
+human_app = typer.Typer(no_args_is_help=True, help="Human account administration.")
+agent_app = typer.Typer(no_args_is_help=True, help="Agent account administration.")
 review_app = typer.Typer(
     no_args_is_help=True, help="The review queue: pending proposals (human actor only)."
 )
@@ -59,6 +61,8 @@ app.add_typer(node_app, name="node")
 app.add_typer(edge_app, name="edge")
 app.add_typer(projector_app, name="projector")
 app.add_typer(review_app, name="review")
+app.add_typer(human_app, name="human")
+app.add_typer(agent_app, name="agent")
 app.add_typer(mcp_app, name="mcp")
 app.add_typer(asset_app, name="asset")
 
@@ -686,22 +690,15 @@ def asset_purge(
 
 
 @mcp_app.command("serve")
-def mcp_serve(
-    actor: str = typer.Option(
-        "agent:mcp",
-        "--actor",
-        help="External-agent identity every write is attributed to: 'agent:<name>'.",
-    ),
-) -> None:
+def mcp_serve() -> None:
     """Launch the MCP server on stdio (read + additive tiers, design §8).
 
-    The actor must be an ``agent:<name>`` identity — the MCP surface serves
-    external agents only, so ``--actor human`` (or a malformed name) exits 1
-    rather than silently writing straight into the live graph.
+    Authentication is the agent token in ``NODUM_AGENT_TOKEN`` — minted by
+    ``nodum agent create`` and carried in the MCP client config's env block.
     """
     from nodum import mcp_server
 
-    _run(mcp_server.serve, actor=actor)
+    _run(mcp_server.serve)
 
 
 # ── HTTP server (the human surface) ──────────────────────────────────────────
@@ -894,3 +891,180 @@ def review_reject_all(
             principal=_principal(as_human),
         )
     )
+
+
+# ── Accounts, grants, and spaces (Q13) ────────────────────────────────────────
+
+
+@human_app.command("create")
+def human_create(
+    name: str = typer.Argument(..., help="Display name for the account."),
+    as_human: str = AS_OPTION,
+) -> None:
+    """Create a human account (passwordless until `human passwd`)."""
+    _emit(_run(service.create_human, name, principal=_principal(as_human)))
+
+
+@human_app.command("list")
+def human_list(as_human: str = AS_OPTION) -> None:
+    """List human accounts."""
+    _emit_list("humans", _run(service.list_humans, principal=_principal(as_human)))
+
+
+@human_app.command("passwd")
+def human_passwd(
+    human_id: str = typer.Argument("owner", help="Account id (default: owner)."),
+    password: str = typer.Option(
+        ...,
+        "--password",
+        help="The new password (argon2id-hashed at rest).",
+        prompt=True,
+        hide_input=True,
+        confirmation_prompt=True,
+    ),
+    as_human: str = AS_OPTION,
+) -> None:
+    """Set or change a human's password (prompted, never echoed)."""
+    _run(service.set_human_password, human_id, password, principal=_principal(as_human))
+    _emit(_run(lambda: {"ok": True, "human_id": human_id}))
+
+
+@human_app.command("disable")
+def human_disable(
+    human_id: str = typer.Argument(..., help="Account to disable."),
+    as_human: str = AS_OPTION,
+) -> None:
+    """Disable a human (its sessions and its agents' tokens die; proposals stay)."""
+    _run(service.disable_human, human_id, principal=_principal(as_human))
+    _emit(_run(lambda: {"ok": True, "human_id": human_id, "disabled": True}))
+
+
+@human_app.command("enable")
+def human_enable(
+    human_id: str = typer.Argument(..., help="Account to re-enable."),
+    as_human: str = AS_OPTION,
+) -> None:
+    """Re-enable a disabled human."""
+    _run(service.enable_human, human_id, principal=_principal(as_human))
+    _emit(_run(lambda: {"ok": True, "human_id": human_id, "disabled": False}))
+
+
+@agent_app.command("create")
+def agent_create(
+    name: str = typer.Argument(..., help="Agent id (becomes agent:<name>)."),
+    kind: str = typer.Option("external", "--kind", help="'external' or 'internal'."),
+    owner: str = typer.Option("owner", "--owner", help="Owning human (external agents)."),
+    as_human: str = AS_OPTION,
+) -> None:
+    """Create an agent account and print its token — shown this once, only the hash is stored."""
+    created = _run(
+        service.create_agent,
+        name,
+        kind=kind,
+        owner_human_id=None if kind == "internal" else owner,
+        principal=_principal(as_human),
+    )
+    _emit(created)
+    if created.token:
+        typer.echo(
+            f"token (shown once — store it now): {created.token}",
+            err=True,
+        )
+
+
+@agent_app.command("list")
+def agent_list(as_human: str = AS_OPTION) -> None:
+    """List agent accounts."""
+    _emit_list("agents", _run(service.list_agents, principal=_principal(as_human)))
+
+
+@agent_app.command("token-rotate")
+def agent_token_rotate(
+    agent_id: str = typer.Argument(..., help="Agent whose token to replace."),
+    as_human: str = AS_OPTION,
+) -> None:
+    """Replace an agent's token (the old one dies now; the new one shows once)."""
+    token = _run(service.rotate_agent_token, agent_id, principal=_principal(as_human))
+    typer.echo(f"token (shown once — store it now): {token}", err=True)
+    _emit(_run(lambda: {"ok": True, "agent_id": agent_id}))
+
+
+@agent_app.command("disable")
+def agent_disable(
+    agent_id: str = typer.Argument(..., help="Agent to disable."),
+    as_human: str = AS_OPTION,
+) -> None:
+    """Disable an agent (its token dies immediately; its proposals stay, reviewable)."""
+    _run(service.disable_agent, agent_id, principal=_principal(as_human))
+    _emit(_run(lambda: {"ok": True, "agent_id": agent_id, "disabled": True}))
+
+
+@agent_app.command("enable")
+def agent_enable(
+    agent_id: str = typer.Argument(..., help="Agent to re-enable."),
+    as_human: str = AS_OPTION,
+) -> None:
+    """Re-enable a disabled agent."""
+    _run(service.enable_agent, agent_id, principal=_principal(as_human))
+    _emit(_run(lambda: {"ok": True, "agent_id": agent_id, "disabled": False}))
+
+
+@app.command()
+def grant(
+    agent_id: str = typer.Argument(..., help="Agent to grant."),
+    space: str = typer.Argument(..., help="Space id or name."),
+    level: str = typer.Argument(..., help="'read', 'suggest', or 'edit'."),
+    as_human: str = AS_OPTION,
+) -> None:
+    """Grant (or re-level) an agent's access to a space; event-logged."""
+    _emit(_run(service.grant, agent_id, space, level, principal=_principal(as_human)))
+
+
+@app.command()
+def revoke(
+    agent_id: str = typer.Argument(..., help="Agent to revoke from."),
+    space: str = typer.Argument(..., help="Space id or name."),
+    as_human: str = AS_OPTION,
+) -> None:
+    """Revoke an agent's grant on a space; event-logged."""
+    _run(service.revoke, agent_id, space, principal=_principal(as_human))
+    _emit(_run(lambda: {"ok": True, "agent_id": agent_id, "space": space}))
+
+
+@app.command()
+def grants(
+    agent_id: str | None = typer.Option(None, "--agent", help="Limit to one agent."),
+    as_human: str = AS_OPTION,
+) -> None:
+    """List grant rows."""
+    _emit_list("grants", _run(service.list_grants, agent_id, principal=_principal(as_human)))
+
+
+@app.command(name="space-create")
+def space_create(
+    name: str = typer.Argument(..., help="Title (and id suffix) for the new space."),
+    as_human: str = AS_OPTION,
+) -> None:
+    """Create a space (a node of builtin type 'space' in meta; edit there is human-tier)."""
+    node = _run(
+        service.create_node, type="space", title=name, space="meta", principal=_principal(as_human)
+    )
+    _emit(node)
+
+
+@app.command(name="space-list")
+def space_list(as_human: str = AS_OPTION) -> None:
+    """List spaces."""
+    nodes = _run(
+        service.list_nodes, type="space", include_meta=True, principal=_principal(as_human)
+    )
+    _emit_list("spaces", nodes)
+
+
+@app.command(name="space-archive")
+def space_archive(
+    space_id: str = typer.Argument(..., help="Space node id to archive."),
+    as_human: str = AS_OPTION,
+) -> None:
+    """Archive a space (nodes keep their space_id; grants on it go inert)."""
+    _emit(_run(service.transition, space_id, "archive", principal=_principal(as_human)))

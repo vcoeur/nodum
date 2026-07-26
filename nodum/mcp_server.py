@@ -21,10 +21,11 @@ the human, on the CLI and the review API. The curative tools
 do not exist here, so there is no runtime check to argue around — and
 :mod:`nodum.service` refuses a non-human reviewer regardless of surface.
 
-Identity: one configured actor per server (``nodum mcp serve --actor``), so
-every write is attributed to the connecting agent and lands ``proposed``.
-The actor must be an ``agent:<name>`` string — this surface has no human
-tier to configure. Transport is stdio — what MCP clients actually launch.
+Identity: the agent's bearer token, from the ``NODUM_AGENT_TOKEN``
+environment variable (the shape MCP client configs carry in their ``env``
+blocks — a command-line token would leak into ``ps``). Verification mints
+the agent's principal, and its grant set confines every tool call. Transport
+is stdio — what MCP clients actually launch.
 
 Every tool delegates to :mod:`nodum.service` / :mod:`nodum.search`; there is
 no logic here beyond argument mapping and JSON shaping.
@@ -32,7 +33,7 @@ no logic here beyond argument mapping and JSON shaping.
 
 from __future__ import annotations
 
-import re
+import os
 from pathlib import Path
 from typing import Any
 
@@ -61,10 +62,6 @@ CURATIVE_TOOLS = ("merge_nodes", "retype", "supersede_edge", "bulk_relink", "con
 #: human-only; the CLI (``nodum review …``) is where it lives.
 REVIEW_TOOLS = ("accept", "reject")
 
-#: The actor form this surface accepts: an external agent identity, never a
-#: human and never an empty or unprefixed name.
-AGENT_ACTOR_RE = re.compile(r"^agent:[A-Za-z0-9][A-Za-z0-9._-]*$")
-
 #: The tools this server registers, by tier (documentation + test anchor).
 READ_TOOLS = (
     "get_node",
@@ -81,27 +78,6 @@ READ_TOOLS = (
 ADDITIVE_TOOLS = ("create_node", "update_node", "link", "propose_edges")
 
 
-def _validate_actor(actor: str) -> str:
-    """Return ``actor`` if it is a well-formed external-agent identity.
-
-    The MCP surface is the external-agent surface: every write it makes must
-    be attributable to an agent and must land ``proposed``. ``--actor human``
-    would silently turn the whole server into a human writing directly into
-    the live graph (and, before the review tools were removed, into a
-    self-approving one), so it is refused here rather than trusted.
-
-    Raises:
-        ValueError: If ``actor`` is not of the form ``agent:<name>``.
-    """
-    if not isinstance(actor, str) or not AGENT_ACTOR_RE.fullmatch(actor):
-        raise ValueError(
-            f"invalid --actor {actor!r}: the MCP server serves external agents only — "
-            "the actor must be 'agent:<name>' (e.g. 'agent:researcher'), never "
-            "'human' or an empty/unprefixed name"
-        )
-    return actor
-
-
 def _dump(result: BaseModel | list[BaseModel]) -> dict[str, Any] | list[dict[str, Any]]:
     """Serialise service results exactly like every other adapter."""
     if isinstance(result, list):
@@ -109,13 +85,13 @@ def _dump(result: BaseModel | list[BaseModel]) -> dict[str, Any] | list[dict[str
     return result.model_dump(mode="json")
 
 
-def create_server(*, actor: str = "agent:mcp", db_path: str | Path | None = None) -> FastMCP:
-    """Build the nodum MCP server bound to one agent identity and database.
+def create_server(*, token: str, db_path: str | Path | None = None) -> FastMCP:
+    """Build the nodum MCP server bound to one verified agent principal.
 
     Args:
-        actor: The actor string every write is attributed to. Must be an
-            ``agent:<name>`` identity (e.g. ``agent:researcher``) — writes
-            land ``proposed``.
+        token: The agent's bearer token (``ndm_…``, minted by
+            ``nodum agent create`` / ``token-rotate``). Verified against its
+            stored hash; the agent's grants then confine every tool call.
         db_path: Explicit database path; defaults to ``NODUM_DB`` resolution.
 
     Returns:
@@ -124,14 +100,9 @@ def create_server(*, actor: str = "agent:mcp", db_path: str | Path | None = None
         registered.
 
     Raises:
-        ValueError: If ``actor`` is not of the form ``agent:<name>``.
+        auth.InvalidCredentials: If the token verifies no enabled agent.
     """
-    _validate_actor(actor)
-    # INTERIM (Q13 surfaces task): the principal is loaded with its grant set
-    # but NO credential is verified — this surface authenticates nothing yet.
-    # Token verification (NODUM_AGENT_TOKEN) lands in the surfaces task; do
-    # not read this as authentication until then.
-    principal = auth.agent_principal(actor.removeprefix("agent:"), path=db_path)
+    principal = auth.verify_agent_token(token, path=db_path)
     server = FastMCP(
         "nodum",
         instructions=(
@@ -363,10 +334,21 @@ def create_server(*, actor: str = "agent:mcp", db_path: str | Path | None = None
     return server
 
 
-def serve(*, actor: str = "agent:mcp", db_path: str | Path | None = None) -> None:
+def serve(*, token: str | None = None, db_path: str | Path | None = None) -> None:
     """Run the MCP server on stdio (blocking) — what MCP clients launch.
 
+    The token comes from the environment, never the command line (a flag
+    would leak into ``ps`` and shell history): ``NODUM_AGENT_TOKEN``, which
+    is exactly the shape MCP client configs carry in their ``env`` blocks.
+
     Raises:
-        ValueError: If ``actor`` is not of the form ``agent:<name>``.
+        ValueError: If the environment carries no token.
+        auth.InvalidCredentials: If the token verifies no enabled agent.
     """
-    create_server(actor=actor, db_path=db_path).run()
+    token = token or os.environ.get("NODUM_AGENT_TOKEN")
+    if not token:
+        raise ValueError(
+            "NODUM_AGENT_TOKEN is not set: the MCP server authenticates with an "
+            "agent token (mint one with 'nodum agent create <name>')"
+        )
+    create_server(token=token, db_path=db_path).run()

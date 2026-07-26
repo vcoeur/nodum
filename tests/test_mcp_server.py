@@ -17,18 +17,19 @@ from helpers import agent, owner
 from mcp.shared.memory import create_connected_server_and_client_session
 from PIL import Image
 
-from nodum import assets, service
+from nodum import assets, auth, service
 from nodum.mcp_server import ADDITIVE_TOOLS, CURATIVE_TOOLS, READ_TOOLS, REVIEW_TOOLS, create_server
 
 AGENT = "agent:tester"
+TOKEN = "ndm_test_token_for_the_mcp_suite"
 
 
 def _run(fn):
     """Run an async MCP interaction against a fresh server bound to AGENT."""
 
     async def runner():
-        agent(AGENT)  # seed the account; the server loads its principal
-        server = create_server(actor=AGENT)
+        agent(AGENT, token=TOKEN)  # seed the account with a verifiable token
+        server = create_server(token=TOKEN)
         async with create_connected_server_and_client_session(server) as session:
             return await fn(session)
 
@@ -80,36 +81,26 @@ def test_tool_annotations(fresh_db):
         assert by_name[name].annotations.destructiveHint is False
 
 
-# ── Actor validation: the MCP surface is the external-agent surface ───────────
+# ── Token authentication: the MCP surface verifies before it serves ───────────
 
 
-@pytest.mark.parametrize(
-    "actor",
-    [
-        "human",
-        "",
-        "   ",
-        "agent:",
-        "agent",
-        "researcher",
-        "agent:with space",
-        ":agent:x",
-        "Agent:x",
-        # A trailing newline/CR must not slip past the anchor (fullmatch, not
-        # `$`, which would accept a trailing '\n').
-        "agent:x\n",
-        "agent:x\r",
-    ],
-)
-def test_create_server_rejects_a_non_agent_actor(fresh_db, actor):
-    with pytest.raises(ValueError, match="invalid --actor"):
-        create_server(actor=actor)
+def test_create_server_rejects_an_unknown_token(fresh_db):
+    with pytest.raises(auth.InvalidCredentials):
+        create_server(token="ndm_not_a_real_token")
 
 
-@pytest.mark.parametrize("actor", ["agent:mcp", "agent:researcher", "agent:gpt-4.1_x"])
-def test_create_server_accepts_well_formed_agent_actors(fresh_db, actor):
-    agent(actor)  # the account must exist for the principal to load
-    assert create_server(actor=actor) is not None
+def test_create_server_rejects_a_disabled_agents_token(fresh_db):
+    created = service.create_agent("bot", owner_human_id="owner", principal=owner())
+    service.disable_agent("bot", principal=owner())
+    with pytest.raises(auth.InvalidCredentials):
+        create_server(token=created.token)
+
+
+def test_create_server_rejects_a_token_whose_owner_is_disabled(fresh_db):
+    created = service.create_agent("bot", owner_human_id="owner", principal=owner())
+    service.disable_human("owner", principal=owner())
+    with pytest.raises(auth.InvalidCredentials):
+        create_server(token=created.token)
 
 
 # ── Additive tier: writes are attributed and land proposed ────────────────────
