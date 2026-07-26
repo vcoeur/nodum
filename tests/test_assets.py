@@ -19,7 +19,6 @@ from PIL import Image
 
 from nodum import assets, db, service
 from nodum.assets import AssetNotFound, UnsupportedRendition
-from nodum.store import GrantNotPermitted
 
 
 def _decode(rendition, path=None):
@@ -345,26 +344,79 @@ def test_options_including_the_db_path_are_keyword_only(fresh_db, tmp_path):
 # ── Access (interim, until Phase 4 gives assets a space) ──────────────────────
 
 
-def test_a_zero_grant_agent_cannot_touch_the_asset_store(fresh_db, tmp_path):
-    """S2: the asset path took no principal, so every agent read every asset."""
+def _describe(asset, space=None, principal=None):
+    """Create the `asset_ref` node that makes an asset reachable in a space."""
+    return service.create_node(
+        type="asset_ref",
+        title=asset.original_name or asset.hash[:8],
+        space=space,
+        props={"asset_hash": asset.hash},
+        principal=principal or owner(),
+    )
+
+
+def test_an_asset_nobody_describes_is_invisible_to_every_agent(fresh_db, tmp_path):
+    """Bytes with no describing node are a human's business until ingestion runs."""
     asset = _register_image(fresh_db, tmp_path)
-    blind = agent("blind", grants={})
+    reader = agent("reader", grants={"main": "read"})
 
-    for call in (
-        lambda: assets.list_assets(principal=blind),
-        lambda: assets.get_asset(asset.hash, principal=blind),
-        lambda: assets.get_rendition(asset.hash, profile="thumb", principal=blind),
-    ):
-        with pytest.raises(GrantNotPermitted):
-            call()
+    assert assets.list_assets(principal=reader) == []
+    with pytest.raises(AssetNotFound):
+        assets.get_asset(asset.hash, principal=reader)
+    with pytest.raises(AssetNotFound):
+        assets.get_rendition(asset.hash, profile="thumb", principal=reader)
+    # The human still sees it — the bytes are registered, just undescribed.
+    assert assets.get_asset(asset.hash, principal=owner()).hash == asset.hash
 
 
-def test_an_agent_holding_any_grant_may_read_assets(fresh_db, tmp_path):
+def test_a_described_asset_is_readable_in_that_nodes_space(fresh_db, tmp_path):
     asset = _register_image(fresh_db, tmp_path)
+    _describe(asset)
     reader = agent("reader", grants={"main": "read"})
 
     assert assets.get_asset(asset.hash, principal=reader).hash == asset.hash
     assert [row.hash for row in assets.list_assets(principal=reader)] == [asset.hash]
+    assert assets.get_rendition(asset.hash, profile="thumb", principal=reader).asset_hash == (
+        asset.hash
+    )
+
+
+def test_a_description_in_another_space_does_not_reach(fresh_db, tmp_path):
+    """The describing node carries the space, so it carries the isolation too."""
+    asset = _register_image(fresh_db, tmp_path)
+    seed_space("b")
+    _describe(asset, space="b")
+    outsider = agent("outsider", grants={"main": "read"})
+    insider = agent("insider", grants={"b": "read"})
+
+    assert assets.list_assets(principal=outsider) == []
+    with pytest.raises(AssetNotFound):
+        assets.get_asset(asset.hash, principal=outsider)
+    assert assets.get_asset(asset.hash, principal=insider).hash == asset.hash
+
+
+def test_archiving_the_last_description_takes_the_asset_out_of_reach(fresh_db, tmp_path):
+    asset = _register_image(fresh_db, tmp_path)
+    node = _describe(asset)
+    reader = agent("reader", grants={"main": "read"})
+    assert assets.get_asset(asset.hash, principal=reader).hash == asset.hash
+
+    service.transition(node.id, "archive", principal=owner())
+
+    with pytest.raises(AssetNotFound):
+        assets.get_asset(asset.hash, principal=reader)
+
+
+def test_a_proposed_description_does_not_grant_reach_yet(fresh_db, tmp_path):
+    """Only an *active* describing node counts — a proposal is not yet structure."""
+    asset = _register_image(fresh_db, tmp_path)
+    proposer = agent("proposer", grants={"meta": "read", "main": "suggest"})
+    node = _describe(asset, principal=proposer)
+    assert node.state == "proposed"
+
+    assert assets.list_assets(principal=proposer) == []
+    service.transition(node.id, "accept", principal=owner())
+    assert [row.hash for row in assets.list_assets(principal=proposer)] == [asset.hash]
 
 
 def test_an_asset_ref_node_in_an_unreadable_space_does_not_resolve(fresh_db, tmp_path):

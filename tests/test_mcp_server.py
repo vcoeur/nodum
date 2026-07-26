@@ -397,9 +397,26 @@ def test_agent_wikilinks_over_mcp_stay_proposed(fresh_db):
 
 
 def _register_png(tmp_path, size=(2000, 1000)):
+    """Register a PNG and describe it in `main`, so an agent can reach it.
+
+    An asset is as reachable as its `asset_ref` nodes (Phase 4 note 01, D1),
+    so registering bytes alone leaves nothing for the MCP surface to fetch.
+    """
     source = tmp_path / "picture.png"
     Image.new("RGB", size, (30, 120, 200)).save(source)
-    return assets.register_asset(source), source
+    asset = assets.register_asset(source)
+    _describe(asset)
+    return asset, source
+
+
+def _describe(asset):
+    """The `asset_ref` node ingestion will write; here the owner stands in for it."""
+    return service.create_node(
+        type="asset_ref",
+        title=asset.original_name or asset.hash[:8],
+        props={"asset_hash": asset.hash},
+        principal=owner(),
+    )
 
 
 def test_get_asset_returns_metadata_and_a_preview_image_block(fresh_db, tmp_path):
@@ -440,6 +457,7 @@ def test_get_asset_non_image_returns_metadata_only(fresh_db, tmp_path):
     text_file = tmp_path / "notes.txt"
     text_file.write_text("plain text")
     asset = assets.register_asset(text_file)
+    _describe(asset)
 
     result = _run(lambda session: _call(session, "get_asset", {"id_or_hash": asset.hash}))
     assert not result.isError

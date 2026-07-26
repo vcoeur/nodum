@@ -180,10 +180,14 @@ node for exactly this reason.
   needs a new migration — the vec0 table is fixed at 384). Tests inject a
   deterministic hashing fake via `embeddings.set_provider`.
 - **`nodum.assets`** — content-addressed binaries and their derived
-  renditions (design §5.5/§5.7). Reads take a principal: asset rows carry no
-  `space_id` until Phase 4, so the interim rule is "readable to any principal
-  holding at least one grant", and a node id offered as a handle resolves only
-  inside the caller's read set. **Bytes live in the database, not on the
+  renditions (design §5.5/§5.7). Reads take a principal, and **an asset is as
+  reachable as its describing nodes**: a principal may read an asset iff it can
+  read an active `asset_ref` node carrying the hash. Asset rows are deduped
+  globally by sha256, so a `space_id` column here could only lie about the
+  second space to register the same bytes; the per-space thing is the node, and
+  0009's unique index is already `(asset_hash, space_id)` over those nodes.
+  Bytes nobody has described are visible to humans only — the right default for
+  freshly registered bytes whose ingestion has not run. **Bytes live in the database, not on the
   filesystem**: `assets` holds metadata, `asset_blobs` holds the bytes under
   the same sha256 key, so the whole system is one file and disaster recovery
   is `DB = everything`. Registration is idempotent sha256 dedup with no
