@@ -607,14 +607,6 @@
 
 /* --- Dialogs -------------------------------------------------------------- */
 
-.nd-rv-modal--wide {
-  width: min(56rem, 100%);
-}
-
-.nd-modal__body > * + * {
-  margin-top: var(--nd-space-8);
-}
-
 .nd-rv-dialog__scope {
   font-family: var(--nd-font-mono);
 }

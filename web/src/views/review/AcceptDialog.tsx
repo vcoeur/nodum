@@ -8,7 +8,7 @@
  * risk is precisely that the set is not what the reviewer pictured.
  */
 
-import { Modal } from "./Modal";
+import { Modal } from "../../components";
 import { ProposalManifest } from "./ProposalManifest";
 import type { ProposalOut } from "../../api/types";
 import { plural } from "./format";

@@ -1,10 +1,9 @@
 /**
- * The dialog shell the review view's confirmations are built on.
+ * The dialog shell every view's confirmations are built on.
  *
- * Duplication note: this is a generic modal wrapper over the shared
- * `.nd-modal` primitives and belongs in `src/components/` the moment a second
- * view needs one — it lives here only because that directory is a coordination
- * surface between slices.
+ * Promoted from the review view when the admin view became the second user —
+ * `src/components/` is the coordination surface between slices, and a generic
+ * modal wrapper over the shared `.nd-modal` primitives belongs here.
  *
  * Two behaviours are deliberate and safety-relevant:
  *
@@ -133,7 +132,7 @@ export function Modal({ title, onClose, children, footer, wide = false }: ModalP
     >
       <div
         ref={dialogRef}
-        className={wide ? "nd-modal nd-rv-modal--wide" : "nd-modal"}
+        className={wide ? "nd-modal nd-modal--wide" : "nd-modal"}
         role="dialog"
         aria-modal="true"
         aria-labelledby={titleId}
