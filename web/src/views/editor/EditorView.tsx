@@ -18,7 +18,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import type { KeyboardEvent } from "react";
 import { api } from "../../api/client";
-import type { TypeOut } from "../../api/types";
+import type { SpaceOut, TypeOut } from "../../api/types";
 import { EmptyState, Spinner, useToast } from "../../components";
 import { MarkdownEditor } from "./MarkdownEditor";
 import type { MarkdownEditorHandle } from "./MarkdownEditor";
@@ -26,7 +26,7 @@ import { MarkdownPreview } from "./MarkdownPreview";
 import { NodeMetaBar } from "./NodeMetaBar";
 import { useNodeDocument } from "./useNodeDocument";
 import type { SlashPaletteState } from "./cm/slashCommands";
-import { describeError } from "../../lib";
+import { describeError, useWriteTarget } from "../../lib";
 import "./editor.css";
 
 /** Quiet time before the preview re-renders. Long enough to stay off the typing path. */
@@ -56,7 +56,19 @@ export default function EditorView() {
   const { types, typesError } = useNodeTypes();
   const [selectedType, setSelectedType] = useState<string | null>(null);
 
-  const doc = useNodeDocument({ nodeId, createType: selectedType });
+  // The write target is app-wide state with one owner; this is the subscription
+  // that makes it *visible* here, which is the whole of D1a. The same value is
+  // handed to the document hook, so what the bar shows and what a create writes
+  // are one variable rather than two reads of a store.
+  const { spaces, spacesFailed } = useSpaces();
+  const [writeTarget, setWriteTarget] = useWriteTarget();
+
+  const doc = useNodeDocument({
+    nodeId,
+    createType: selectedType,
+    writeTarget,
+    spaces: spaces ?? [],
+  });
 
   const editorRef = useRef<MarkdownEditorHandle>(null);
   const [previewVisible, setPreviewVisible] = useState(true);
@@ -268,6 +280,10 @@ export default function EditorView() {
         typesError={typesError}
         selectedType={selectedType}
         onTypeChange={setSelectedType}
+        spaces={spaces}
+        spacesFailed={spacesFailed}
+        writeTarget={writeTarget}
+        onWriteTargetChange={setWriteTarget}
         saveState={doc.saveState}
         saveError={doc.saveError}
         savedAt={doc.savedAt}
@@ -380,6 +396,44 @@ function useNodeTypes(): { types: TypeOut[]; typesError: string | null } {
   }, []);
 
   return { types, typesError };
+}
+
+/**
+ * The active space list, fetched once per mount.
+ *
+ * Only ever used to *name* a space — the write-target picker's vocabulary and
+ * the label beside a saved node. A failure is therefore not fatal: the target
+ * still writes, and every label falls back to the reference itself.
+ *
+ * @returns The spaces (null until known) and whether the request failed.
+ */
+function useSpaces(): { spaces: SpaceOut[] | null; spacesFailed: boolean } {
+  const [spaces, setSpaces] = useState<SpaceOut[] | null>(null);
+  const [spacesFailed, setSpacesFailed] = useState(false);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    let cancelled = false;
+
+    void (async () => {
+      try {
+        const listed = await api.listSpaces(controller.signal);
+        if (cancelled) return;
+        setSpaces(listed);
+        setSpacesFailed(false);
+      } catch {
+        if (cancelled || controller.signal.aborted) return;
+        setSpacesFailed(true);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      controller.abort();
+    };
+  }, []);
+
+  return { spaces, spacesFailed };
 }
 
 /** The type a new document starts on: the preferred name, else the first offered. */

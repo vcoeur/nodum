@@ -38,6 +38,7 @@ function leftover(overrides: Partial<LeftoverBuffer> = {}): LeftoverBuffer {
     content: "the text as typed",
     saved: { title: "Note A", content: "the text as loaded" },
     createType: "type-note",
+    space: "main",
     ...overrides,
   };
 }
@@ -89,8 +90,26 @@ describe("a document that was never saved", () => {
       type: "type-note",
       title: "Fresh",
       content: "typed and left",
+      space: "main",
     });
     expect(written).toBe("node-new");
+  });
+
+  it("files it into the write target the editor was showing, not today's default", async () => {
+    // The buffer carries the space for the same reason it carries the text: by
+    // the time this runs the picker may already be describing another document's
+    // session, and a leftover landing somewhere the human never chose is exactly
+    // the D1a failure the visible target exists to prevent.
+    await flushLeftover(
+      leftover({
+        id: null,
+        title: "Fresh",
+        content: "typed and left",
+        saved: { title: "", content: "" },
+        space: "research",
+      }),
+    );
+    expect(createNode).toHaveBeenCalledWith(expect.objectContaining({ space: "research" }));
   });
 
   it("leaves an untouched blank alone", async () => {
@@ -111,6 +130,7 @@ describe("a document that was never saved", () => {
       type: "type-note",
       title: null,
       content: "body only",
+      space: "main",
     });
   });
 

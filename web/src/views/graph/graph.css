@@ -12,6 +12,25 @@
  * graph and the chrome around it cannot drift apart.
  */
 
+/*
+ * The one hue this view owns.
+ *
+ * `styles/tokens.css` states that both global colour axes are taken — brass
+ * means "you can act on this", the state ramp means the service-layer state
+ * machine — and that anything else needs its own hue, kept view-local until a
+ * second view names it. A cross-space edge (design decision D5) is neither an
+ * affordance nor a state, so this is that hue: magenta, the emptiest slot in
+ * the palette, well clear of the proposed violet it would otherwise be read as.
+ *
+ * It lives on `:root` rather than on `.nd-graph` because `graphStyle.ts` reads
+ * the palette off `document.documentElement` — Cytoscape renders to a canvas
+ * and cannot see custom properties itself. If a second view ever needs it, this
+ * is the declaration to move into `tokens.css`.
+ */
+:root {
+  --nd-graph-crossing: #c07bb5;
+}
+
 /* --- Shell ------------------------------------------------------------- */
 
 .nd-view--wide.nd-graph {
@@ -113,6 +132,12 @@
 
 .nd-graph__actor {
   width: 10rem;
+}
+
+/* The shared SpaceFilter renders an `.nd-field`; this only sizes it to sit in
+   the toolbar row beside the type and confidence controls. */
+.nd-graph__space {
+  width: 11rem;
 }
 
 .nd-graph__states {
@@ -365,6 +390,10 @@
   color: var(--nd-state-archived);
 }
 
+.nd-graph__legend-item--crossing {
+  color: var(--nd-graph-crossing);
+}
+
 .nd-graph__legend-sep {
   width: 1px;
   height: 1em;
@@ -514,7 +543,7 @@
 .nd-graph__edge-row {
   width: 100%;
   display: grid;
-  grid-template-columns: auto auto minmax(0, 1fr) auto auto;
+  grid-template-columns: auto auto minmax(0, 1fr) auto auto auto;
   align-items: center;
   gap: var(--nd-space-4);
   padding: var(--nd-space-2) var(--nd-space-3);
@@ -546,6 +575,14 @@
 
 .nd-graph__edge-confidence {
   color: var(--nd-text-faint);
+}
+
+/* The crossing hue, same one the canvas outlines a crossing edge with. */
+.nd-graph__crossing-mark {
+  color: var(--nd-graph-crossing);
+  font-size: var(--nd-text-2xs);
+  letter-spacing: var(--nd-tracking-label);
+  text-transform: uppercase;
 }
 
 .nd-graph__link-button {

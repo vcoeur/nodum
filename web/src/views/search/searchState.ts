@@ -12,6 +12,9 @@
  * typo must not blank the view.
  */
 
+// Imported from the module rather than the `components` barrel: this file is
+// pure and the barrel re-exports React components.
+import { ANY_SPACE } from "../../components/spaceOptions";
 import type { NodeState } from "../../api/types";
 
 /** Node-state filter. `any` searches every state (the service's `state=None`). */
@@ -36,6 +39,26 @@ export interface SearchState {
   state: StateFilter;
   /** `created_by` filter (e.g. `agent:researcher`), or `""` for every writer. */
   createdBy: string;
+  /**
+   * Space filter: a space id or name, or {@link ANY_SPACE} for every space in
+   * scope (the default).
+   *
+   * The read half of design decision D1. It **narrows and never widens** — the
+   * principal's own scope still applies underneath it — and it is completely
+   * independent of the write target, which is app-wide state rather than URL
+   * state precisely because reading `research` while filing into `main` is the
+   * ordinary case.
+   */
+  space: string;
+  /**
+   * Include the meta space — types, spaces, conventions. Off by default (D3).
+   *
+   * Independent of {@link SearchState.space} on the wire but not in effect:
+   * naming `meta` in the space filter **is itself the opt-in** server-side,
+   * since the default exclusion only applies to an unnarrowed read. So a search
+   * narrowed to meta answers with meta nodes whether or not this is on.
+   */
+  includeMeta: boolean;
   /** Result cap, sent as the server's `k`. */
   limit: number;
   /** Append one-hop active-edge neighbours of the fused hits (the server's `expand`). */
@@ -64,6 +87,8 @@ export const DEFAULT_SEARCH_STATE: SearchState = {
   type: "",
   state: "active",
   createdBy: "",
+  space: ANY_SPACE,
+  includeMeta: false,
   limit: 20,
   expand: false,
   group: "score",
@@ -85,6 +110,11 @@ export function readSearchState(params: URLSearchParams): SearchState {
     type: params.get("type") ?? DEFAULT_SEARCH_STATE.type,
     state: isKnownState ? (rawState as StateFilter) : DEFAULT_SEARCH_STATE.state,
     createdBy: params.get("by") ?? DEFAULT_SEARCH_STATE.createdBy,
+    // Kept verbatim, id or name: a space reference resolves either way and only
+    // the server can say which one still does. Trimmed because a hand-edited or
+    // wrapped URL is the usual source of a stray space.
+    space: (params.get("space") ?? DEFAULT_SEARCH_STATE.space).trim(),
+    includeMeta: params.get("meta") === "1",
     limit:
       Number.isFinite(rawLimit) && rawLimit > 0
         ? Math.min(rawLimit, MAX_LIMIT)
@@ -106,19 +136,38 @@ export function toSearchParams(state: SearchState): URLSearchParams {
   if (state.type) params.set("type", state.type);
   if (state.state !== DEFAULT_SEARCH_STATE.state) params.set("state", state.state);
   if (state.createdBy) params.set("by", state.createdBy);
+  if (state.space) params.set("space", state.space);
+  if (state.includeMeta) params.set("meta", "1");
   if (state.limit !== DEFAULT_SEARCH_STATE.limit) params.set("k", String(state.limit));
   if (state.expand) params.set("expand", "1");
   if (state.group !== DEFAULT_SEARCH_STATE.group) params.set("group", state.group);
   return params;
 }
 
-/** True when nothing but the query differs from the defaults. */
+/** The keys a filter reset restores — every control that narrows the *read*. */
+type FilterKey = "type" | "state" | "createdBy" | "space" | "includeMeta" | "limit" | "expand";
+
+/**
+ * What "clear the filters" restores.
+ *
+ * `query` is not here (clearing it would be clearing the search) and neither is
+ * `group`, which arranges the list the server returned and changes nothing
+ * about what was asked for — offering to clear the filters because of it would
+ * be a lie. {@link hasActiveFilters} reads this same object, so the badge that
+ * offers the reset and the reset itself cannot come to disagree.
+ */
+export const CLEARABLE_FILTERS: Pick<SearchState, FilterKey> = {
+  type: DEFAULT_SEARCH_STATE.type,
+  state: DEFAULT_SEARCH_STATE.state,
+  createdBy: DEFAULT_SEARCH_STATE.createdBy,
+  space: DEFAULT_SEARCH_STATE.space,
+  includeMeta: DEFAULT_SEARCH_STATE.includeMeta,
+  limit: DEFAULT_SEARCH_STATE.limit,
+  expand: DEFAULT_SEARCH_STATE.expand,
+};
+
+/** True when nothing but the query (and the arrangement) is at its default. */
 export function hasActiveFilters(state: SearchState): boolean {
-  return (
-    state.type !== DEFAULT_SEARCH_STATE.type ||
-    state.state !== DEFAULT_SEARCH_STATE.state ||
-    state.createdBy !== DEFAULT_SEARCH_STATE.createdBy ||
-    state.limit !== DEFAULT_SEARCH_STATE.limit ||
-    state.expand !== DEFAULT_SEARCH_STATE.expand
-  );
+  const keys = Object.keys(CLEARABLE_FILTERS) as FilterKey[];
+  return keys.some((key) => state[key] !== CLEARABLE_FILTERS[key]);
 }

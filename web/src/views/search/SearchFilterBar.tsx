@@ -1,4 +1,5 @@
-import type { TypeOut } from "../../api/types";
+import { SpaceFilter } from "../../components";
+import type { SpaceOut, TypeOut } from "../../api/types";
 import { LIMIT_CHOICES, STATE_FILTERS } from "./searchState";
 import type { GroupMode, SearchState, StateFilter } from "./searchState";
 
@@ -12,7 +13,14 @@ import type { GroupMode, SearchState, StateFilter } from "./searchState";
  * The type list comes from `GET /api/types` and is never hardcoded: node types
  * are user-extensible, so a fixed list would be wrong the moment someone adds
  * one. When the catalog cannot be loaded the control degrades to disabled with
- * a reason rather than pretending "any type" was a choice.
+ * a reason rather than pretending "any type" was a choice. The space list is
+ * the same shape of thing over `GET /api/spaces`, which is why both go through
+ * the shared control rather than a local `<select>`.
+ *
+ * The space filter is the **read** half of design decision D1 and nothing else:
+ * it narrows what this search spans and says nothing about where the editor
+ * files new nodes. Reading `research` while still writing into `main` is the
+ * ordinary case, so nothing here may touch the write target.
  */
 
 interface SearchFilterBarProps {
@@ -21,6 +29,10 @@ interface SearchFilterBarProps {
   nodeTypes: TypeOut[] | null;
   /** True once the catalog request failed — the control says so. */
   typesFailed: boolean;
+  /** Active spaces from `GET /api/spaces`; null while loading or after a failure. */
+  spaces: SpaceOut[] | null;
+  /** True once the space list request failed — the control says so. */
+  spacesFailed: boolean;
   /** Apply a partial change to the URL state. */
   onChange: (patch: Partial<SearchState>) => void;
 }
@@ -39,16 +51,28 @@ const STATE_LABEL: Record<StateFilter, string> = {
  * @param state Current URL-backed search state.
  * @param nodeTypes The live node-type catalog.
  * @param typesFailed Whether the catalog request failed.
+ * @param spaces The live space list.
+ * @param spacesFailed Whether the space-list request failed.
  * @param onChange Applies a partial state change.
  */
 export function SearchFilterBar({
   state,
   nodeTypes,
   typesFailed,
+  spaces,
+  spacesFailed,
   onChange,
 }: SearchFilterBarProps) {
   return (
     <div className="nd-search-filters" role="group" aria-label="Search filters">
+      <SpaceFilter
+        className="nd-search-filters__field nd-search-filters__field--space"
+        value={state.space}
+        onChange={(space) => onChange({ space })}
+        spaces={spaces}
+        failed={spacesFailed}
+      />
+
       <label className="nd-search-filters__field">
         <span className="nd-label">Type</span>
         <select
@@ -141,6 +165,22 @@ export function SearchFilterBar({
           onChange={(event) => onChange({ expand: event.target.checked })}
         />
         Include neighbours of matches
+      </label>
+
+      {/* D3: meta holds the type and space vocabulary, not content, so it is
+          off by default and every content listing stays clean. Narrowing the
+          space filter to `meta` is the same opt-in said precisely, which is why
+          this toggle is not disabled when that is the selection. */}
+      <label
+        className="nd-search-filters__toggle"
+        title="Search the meta space too — node types, edge types, spaces, conventions. Off by default so content listings stay clean. Narrowing the space filter to meta does the same thing."
+      >
+        <input
+          type="checkbox"
+          checked={state.includeMeta}
+          onChange={(event) => onChange({ includeMeta: event.target.checked })}
+        />
+        Show meta
       </label>
     </div>
   );

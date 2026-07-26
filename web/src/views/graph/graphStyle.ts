@@ -15,6 +15,13 @@
  *
  * Node *type* is therefore carried by shape rather than by a second colour
  * axis, and the legend under the canvas spells the mapping out.
+ *
+ * **Crossings get the third hue** (design decision D5), which is the one thing
+ * `styles/tokens.css` says needs one: an edge whose endpoints live in different
+ * spaces is neither a state nor an affordance. It is carried on the edge's
+ * *outline* rather than on its line colour, so the state ramp keeps the line
+ * and a proposed crossing still reads as proposed. The hue is view-local
+ * (`--nd-graph-crossing`, defined in `graph.css`) until a second view names it.
  */
 
 import type cytoscape from "cytoscape";
@@ -34,6 +41,8 @@ export interface GraphTokens {
   proposed: string;
   active: string;
   archived: string;
+  /** The third hue: an edge that leaves its space (D5). Not a state, not an affordance. */
+  crossing: string;
   fontUi: string;
   fontMono: string;
 }
@@ -52,6 +61,7 @@ const FALLBACK_TOKENS: GraphTokens = {
   proposed: "#8b7fd4",
   active: "#5aa17f",
   archived: "#767f8f",
+  crossing: "#c07bb5",
   fontUi: "system-ui, sans-serif",
   fontMono: "ui-monospace, monospace",
 };
@@ -70,6 +80,7 @@ const TOKEN_VARIABLES: Record<keyof GraphTokens, string> = {
   proposed: "--nd-state-proposed",
   active: "--nd-state-active",
   archived: "--nd-state-archived",
+  crossing: "--nd-graph-crossing",
   fontUi: "--nd-font-ui",
   fontMono: "--nd-font-mono",
 };
@@ -202,6 +213,14 @@ export function buildStylesheet(tokens: GraphTokens): StylesheetStyle[] {
       style: { "background-opacity": 0.28, "border-width": 2 },
     },
     {
+      // Outside the space filter (D5). Recessive, never removed: the label
+      // stays readable and the node stays selectable, because the edge that
+      // reaches it is a real connection and a graph that dropped the far end
+      // would be claiming the connection stopped at the boundary.
+      selector: "node.space-outside",
+      style: { opacity: 0.4, "text-opacity": 0.6 },
+    },
+    {
       // The root is what was asked for, so it carries the accent.
       selector: "node.is-root",
       style: {
@@ -238,6 +257,12 @@ export function buildStylesheet(tokens: GraphTokens): StylesheetStyle[] {
       },
     },
     {
+      // Attention overrides the space dim. "Clickable" would be an empty
+      // promise if clicking left the node as faint as before.
+      selector: "node.space-outside:selected, node.space-outside.hovered",
+      style: { opacity: 1, "text-opacity": 1 },
+    },
+    {
       selector: "edge",
       style: {
         width: 1.2,
@@ -268,6 +293,29 @@ export function buildStylesheet(tokens: GraphTokens): StylesheetStyle[] {
     {
       selector: "edge.state-archived",
       style: { "line-style": "dotted", opacity: 0.28 },
+    },
+    {
+      // A crossing: the two endpoints live in different spaces (D5). The
+      // marking is an *outline* rather than a line colour, so the state ramp
+      // keeps the line and a proposed crossing still reads violet-and-dashed.
+      // Unconditional on the space filter — a boundary is worth seeing before
+      // anyone narrows the view looking for one.
+      //
+      // Opacity is pointedly left alone: it belongs to the state rules above,
+      // and lifting it here would make an *archived* crossing louder than an
+      // active plain edge, which inverts the ramp the whole canvas reads by.
+      selector: "edge.crossing",
+      style: {
+        "line-outline-width": 1.8,
+        "line-outline-color": tokens.crossing,
+      },
+    },
+    {
+      // Both endpoints outside the filtered space. An edge with *one* end
+      // inside is the crossing the filter exists to make visible, so it is
+      // pointedly not dimmed here.
+      selector: "edge.space-outside",
+      style: { opacity: 0.16 },
     },
     {
       // The edge type only earns screen space when the edge is under attention.

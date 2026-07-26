@@ -75,6 +75,31 @@
   font-size: var(--nd-text-xs);
 }
 
+/* --- Space ---------------------------------------------------------------
+ * Two different jobs, deliberately styled apart. `__space` is where a saved
+ * node *lives* — a fact, so it reads like the rest of the metadata line.
+ * `__space-field` is the sticky **write target**, a control, so it matches the
+ * type picker beside it: D1a's whole point is that the target is as visible at
+ * the moment of writing as the type is.
+ */
+
+.nd-editor__space {
+  white-space: nowrap;
+}
+
+.nd-editor__space-field {
+  display: flex;
+  align-items: center;
+  gap: var(--nd-space-4);
+}
+
+.nd-editor__space-select {
+  width: auto;
+  min-width: 9rem;
+  padding: var(--nd-space-1) var(--nd-space-4);
+  font-size: var(--nd-text-xs);
+}
+
 .nd-editor__history-link {
   font-size: var(--nd-text-xs);
 }

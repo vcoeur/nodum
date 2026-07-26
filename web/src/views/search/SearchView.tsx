@@ -3,18 +3,20 @@ import type { KeyboardEvent as ReactKeyboardEvent } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { api } from "../../api/client";
 import { describeError, describeFailure } from "../../lib";
-import type { SearchFilters, SearchHit, SearchResult, TypeOut } from "../../api/types";
-import { EmptyState, Spinner } from "../../components";
+import type { SearchFilters, SearchHit, SearchResult, SpaceOut, TypeOut } from "../../api/types";
+import { ANY_SPACE, EmptyState, Spinner } from "../../components";
 import { ResultRow } from "./ResultRow";
 import { SearchFilterBar } from "./SearchFilterBar";
 import { SignalLegend } from "./SignalBreakdown";
 import {
-  DEFAULT_SEARCH_STATE,
+  CLEARABLE_FILTERS,
   hasActiveFilters,
   readSearchState,
   toSearchParams,
 } from "./searchState";
 import type { SearchState } from "./searchState";
+import { describeSpaceFilterFailure } from "./spaceFailure";
+import type { SpaceFilterFailure } from "./spaceFailure";
 import { SIGNAL_HELP, SIGNAL_KEYS, describeSignals, readVectorEvidence } from "./signals";
 import type { SignalKey } from "./signals";
 import { queryTerms } from "./snippet";
@@ -92,6 +94,8 @@ export default function SearchView() {
   const [error, setError] = useState<unknown>(null);
   const [nodeTypes, setNodeTypes] = useState<TypeOut[] | null>(null);
   const [typesFailed, setTypesFailed] = useState(false);
+  const [spaces, setSpaces] = useState<SpaceOut[] | null>(null);
+  const [spacesFailed, setSpacesFailed] = useState(false);
   const [vector, setVector] = useState<VectorEvidence>({ seen: false, missing: false });
   const [retryToken, setRetryToken] = useState(0);
 
@@ -101,7 +105,17 @@ export default function SearchView() {
   const committedRef = useRef(uiState.query);
   const requestSeq = useRef(0);
 
-  const { query, type, state: stateFilter, createdBy, limit, expand, group } = uiState;
+  const {
+    query,
+    type,
+    state: stateFilter,
+    createdBy,
+    space,
+    includeMeta,
+    limit,
+    expand,
+    group,
+  } = uiState;
 
   /* --- URL state ---------------------------------------------------- */
 
@@ -157,6 +171,20 @@ export default function SearchView() {
     return () => controller.abort();
   }, []);
 
+  // The space filter's vocabulary. A failure is not fatal to searching — the
+  // control says so and the filter stays whatever the URL carried, which is the
+  // only honest thing to do with a space reference nothing can currently name.
+  useEffect(() => {
+    const controller = new AbortController();
+    api
+      .listSpaces(controller.signal)
+      .then((listed) => setSpaces(listed))
+      .catch(() => {
+        if (!controller.signal.aborted) setSpacesFailed(true);
+      });
+    return () => controller.abort();
+  }, []);
+
   useEffect(() => {
     const trimmed = query.trim();
     if (trimmed.length === 0) {
@@ -174,9 +202,13 @@ export default function SearchView() {
     const filters: SearchFilters = { k: limit, state: stateFilter };
     if (type) filters.type = type;
     if (createdBy.trim()) filters.created_by = createdBy.trim();
+    // The filter narrows and never widens: omitting it reads every space in
+    // scope, which is the default, so an unset filter sends nothing at all.
+    if (space) filters.space = space;
     // Only sent when on: a server that reads presence rather than value must not
     // see `expand=false` and turn expansion on.
     if (expand) filters.expand = true;
+    if (includeMeta) filters.include_meta = true;
 
     api
       .search(trimmed, filters, controller.signal)
@@ -194,7 +226,7 @@ export default function SearchView() {
       });
 
     return () => controller.abort();
-  }, [query, type, stateFilter, createdBy, limit, expand, retryToken]);
+  }, [query, type, stateFilter, createdBy, space, includeMeta, limit, expand, retryToken]);
 
   /* --- Display ------------------------------------------------------ */
 
@@ -328,6 +360,10 @@ export default function SearchView() {
 
   const searching = query.trim().length > 0;
   const showSkeleton = status === "loading" && result === null;
+  // A refused space filter is not "the search was refused": nothing about the
+  // query is wrong, and the one useful action is dropping the filter rather
+  // than retrying the same call.
+  const spaceFailure = status === "error" ? describeSpaceFilterFailure(error, spaces ?? []) : null;
   const showDegradedNote = vector.missing && !vector.seen;
   // Every hit carries the filtered state; under "any" it is genuinely unknown.
   const knownState = stateFilter === "any" ? null : stateFilter;
@@ -366,6 +402,8 @@ export default function SearchView() {
           state={uiState}
           nodeTypes={nodeTypes}
           typesFailed={typesFailed}
+          spaces={spaces}
+          spacesFailed={spacesFailed}
           onChange={applyPatch}
         />
       </div>
@@ -399,7 +437,14 @@ export default function SearchView() {
       {showDegradedNote ? <DegradedVectorNote /> : null}
 
       {status === "error" ? (
-        <ErrorPanel error={error} onRetry={() => setRetryToken((token) => token + 1)} />
+        spaceFailure ? (
+          <SpaceFilterPanel
+            failure={spaceFailure}
+            onClearSpace={() => applyPatch({ space: ANY_SPACE })}
+          />
+        ) : (
+          <ErrorPanel error={error} onRetry={() => setRetryToken((token) => token + 1)} />
+        )
       ) : null}
 
       {!searching && status !== "error" ? <IdleState /> : null}
@@ -427,15 +472,7 @@ export default function SearchView() {
               <button
                 type="button"
                 className="nd-button"
-                onClick={() =>
-                  applyPatch({
-                    type: DEFAULT_SEARCH_STATE.type,
-                    state: DEFAULT_SEARCH_STATE.state,
-                    createdBy: DEFAULT_SEARCH_STATE.createdBy,
-                    limit: DEFAULT_SEARCH_STATE.limit,
-                    expand: DEFAULT_SEARCH_STATE.expand,
-                  })
-                }
+                onClick={() => applyPatch(CLEARABLE_FILTERS)}
               >
                 Clear filters
               </button>
@@ -588,6 +625,35 @@ function ErrorPanel({ error, onRetry }: { error: unknown; onRetry: () => void })
       </div>
       <button type="button" className="nd-button nd-button--small" onClick={onRetry}>
         Retry
+      </button>
+    </div>
+  );
+}
+
+/**
+ * The panel for a space filter the server would not resolve.
+ *
+ * Its own panel rather than a headline on the error one, because the reader's
+ * next move is different: nothing is wrong with the query and retrying it
+ * changes nothing — the filter is what has to go. The copy lives in
+ * `spaceFailure.ts` under a test, since the rule it obeys (never claim the
+ * space does not exist) is a property of the refusal rather than of this view.
+ */
+function SpaceFilterPanel({
+  failure,
+  onClearSpace,
+}: {
+  failure: SpaceFilterFailure;
+  onClearSpace: () => void;
+}) {
+  return (
+    <div className="nd-search__error" role="alert">
+      <div className="nd-search__error-body">
+        <strong>{failure.title}</strong>
+        <span className="nd-meta">{failure.detail}</span>
+      </div>
+      <button type="button" className="nd-button nd-button--small" onClick={onClearSpace}>
+        Search every space
       </button>
     </div>
   );

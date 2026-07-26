@@ -1,0 +1,110 @@
+/* The spaces view: one card per space, its grant table, the archive confirm. */
+
+.nd-sp__subtitle {
+  max-width: 66ch;
+}
+
+.nd-sp-create .nd-input {
+  max-width: 20rem;
+}
+
+.nd-sp-create__error,
+.nd-sp-space__error {
+  margin-top: var(--nd-space-4);
+  font-size: var(--nd-text-xs);
+  color: var(--nd-warn);
+  max-width: 66ch;
+}
+
+.nd-sp-create__hint {
+  margin-top: var(--nd-space-4);
+  max-width: 66ch;
+}
+
+.nd-sp-space__header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--nd-space-6);
+  flex-wrap: wrap;
+}
+
+.nd-sp-space__identity {
+  min-width: 18rem;
+  flex: 1;
+}
+
+.nd-sp-space__name {
+  font-size: var(--nd-text-md);
+  display: flex;
+  align-items: baseline;
+  gap: var(--nd-space-4);
+}
+
+.nd-sp-space__sep {
+  color: var(--nd-text-faint);
+}
+
+.nd-sp-space__actions {
+  align-items: center;
+}
+
+/*
+ * "Self-governing" is neither of the design system's two colour axes: it is not
+ * an affordance (nothing here is clickable) and it is not a service-layer state
+ * — a space whose agents hold `edit` is `active` like every other space in this
+ * list, so borrowing the state ramp's sea-green would say something false. It
+ * gets its own hue, kept view-local until a second view names the concept.
+ */
+.nd-sp-badge--governing {
+  background: var(--nd-info-wash);
+  border-color: rgb(106 147 196 / 35%);
+  color: var(--nd-info);
+}
+
+/* Why a structural space withholds its archive action. */
+.nd-sp-space__note {
+  max-width: 66ch;
+}
+
+.nd-sp-rename {
+  display: flex;
+  align-items: center;
+  gap: var(--nd-space-4);
+}
+
+.nd-sp-rename .nd-input {
+  max-width: 18rem;
+}
+
+.nd-sp-grants {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--nd-text-sm);
+}
+
+.nd-sp-grants th {
+  text-align: left;
+  font-size: var(--nd-text-2xs);
+  letter-spacing: var(--nd-tracking-label);
+  text-transform: uppercase;
+  color: var(--nd-text-faint);
+  font-weight: var(--nd-weight-medium);
+  padding: var(--nd-space-2) var(--nd-space-4) var(--nd-space-2) 0;
+  border-bottom: 1px solid var(--nd-border);
+}
+
+.nd-sp-grants td {
+  padding: var(--nd-space-2) var(--nd-space-4) var(--nd-space-2) 0;
+  border-bottom: 1px solid var(--nd-border);
+}
+
+/* The archive dialog's list of what archiving does and does not do. */
+.nd-sp-consequences {
+  display: flex;
+  flex-direction: column;
+  gap: var(--nd-space-4);
+  padding-left: var(--nd-space-12);
+  list-style: disc;
+  line-height: var(--nd-leading-normal);
+}

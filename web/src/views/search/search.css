@@ -127,6 +127,14 @@
   font-size: var(--nd-text-xs);
 }
 
+/* The space filter is the shared control, so it brings its own `nd-select`
+   rather than this row's `__control` class. Sized to match its neighbours here
+   instead of teaching the shared component about this view's filter row. */
+.nd-search-filters__field--space .nd-select {
+  padding: var(--nd-space-2) var(--nd-space-4);
+  font-size: var(--nd-text-xs);
+}
+
 .nd-search-filters__toggle {
   display: flex;
   align-items: center;

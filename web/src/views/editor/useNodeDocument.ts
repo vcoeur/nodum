@@ -22,6 +22,15 @@
  * single SQLite writer was busy retries by itself, and one that failed for a
  * reason typing will not fix stays visible until the user acts on it.
  *
+ * ## Where a new node lands
+ *
+ * The write target arrives as an option rather than being read from
+ * `lib/writeTarget.ts` here, and it is captured before the request like the
+ * text is. Both follow from D1a: the space the human was *shown* is the space
+ * the node must land in, and a value read at the moment the response comes back
+ * could be a different one. Every create then says where it landed, and one
+ * refused by the target says so in words rather than in the server's.
+ *
  * ## Two documents at once
  *
  * `/editor/:nodeId` → `/editor/:otherId` is a *parameter* change, not a remount:
@@ -42,8 +51,9 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { api } from "../../api/client";
 import type { NodeOut, UpdateNodeBody } from "../../api/types";
-import { useToast } from "../../components";
+import { spaceLabel, useToast } from "../../components";
 import { describeError, isNotFound } from "../../lib";
+import { describeLanding, describeWriteFailure } from "./createOutcome";
 
 /** How the node itself loaded. */
 export type LoadStatus = "loading" | "ready" | "missing" | "unavailable";
@@ -64,6 +74,13 @@ export interface LeftoverBuffer {
   saved: { title: string; content: string };
   /** The type a create would use; null when the type catalog never answered. */
   createType: string | null;
+  /**
+   * The write target a create would use — the space id or name the editor was
+   * *showing* when the buffer was let go of, carried for the same reason the
+   * text is: reading the store here would file the leftover into whatever the
+   * target has become since (design decision D1a).
+   */
+  space: string;
 }
 
 /**
@@ -81,7 +98,7 @@ export interface LeftoverBuffer {
  *   — silently dropping it would be the loss this hook exists to prevent.
  */
 export async function flushLeftover(leftover: LeftoverBuffer): Promise<string | null> {
-  const { id, title, content, saved, createType } = leftover;
+  const { id, title, content, saved, createType, space } = leftover;
 
   if (id === null) {
     // Same rule as the debounced path: opening `/editor` and walking away must
@@ -97,6 +114,7 @@ export async function flushLeftover(leftover: LeftoverBuffer): Promise<string | 
       type: createType,
       title: title.trim() === "" ? null : title,
       content,
+      space,
     });
     return created.id;
   }
@@ -119,6 +137,22 @@ interface UseNodeDocumentOptions {
    * without one, and this hook refuses rather than inventing a type id.
    */
   createType: string | null;
+  /**
+   * The space a create lands in — the sticky write target, by id or name.
+   *
+   * Passed in rather than read from `lib/writeTarget.ts` here on purpose: D1a
+   * requires the create surface to *show* the target, and taking the value the
+   * view is rendering is the only arrangement in which the displayed space and
+   * the written space cannot drift apart.
+   */
+  writeTarget: string;
+  /**
+   * Every active space, for naming one in the post-create confirmation.
+   *
+   * Empty while `GET /api/spaces` has not answered; the confirmation then falls
+   * back to the reference itself rather than going quiet.
+   */
+  spaces: readonly NodeOut[];
 }
 
 /** Everything the editor view needs to render and drive one document. */
@@ -158,7 +192,12 @@ export interface NodeDocument {
  *
  * @param options The route's node id and the type a create would use.
  */
-export function useNodeDocument({ nodeId, createType }: UseNodeDocumentOptions): NodeDocument {
+export function useNodeDocument({
+  nodeId,
+  createType,
+  writeTarget,
+  spaces,
+}: UseNodeDocumentOptions): NodeDocument {
   const navigate = useNavigate();
   const toast = useToast();
 
@@ -202,6 +241,10 @@ export function useNodeDocument({ nodeId, createType }: UseNodeDocumentOptions):
 
   const createTypeRef = useRef(createType);
   createTypeRef.current = createType;
+  const writeTargetRef = useRef(writeTarget);
+  writeTargetRef.current = writeTarget;
+  const spacesRef = useRef(spaces);
+  spacesRef.current = spaces;
   const navigateRef = useRef(navigate);
   navigateRef.current = navigate;
   const toastRef = useRef(toast);
@@ -267,16 +310,31 @@ export function useNodeDocument({ nodeId, createType }: UseNodeDocumentOptions):
         return;
       }
 
+      // Captured before the await, like everything else this save is *for*: the
+      // node must land in the space the editor was showing when it was written,
+      // not in whatever the picker holds by the time the response comes back.
+      const target = writeTargetRef.current;
+
       savingRef.current = true;
       inFlightValuesRef.current = { title: currentTitle, content };
       setSaveState("saving");
       setSaveError(null);
       try {
+        // `space` is sent even when it is `main` — which the server would have
+        // defaulted to anyway. The create body then carries literally what the
+        // picker showed, so there is no unstated default between what the human
+        // read and what was written (design decision D1a).
         const created = await api.createNode({
           type,
           title: currentTitle.trim() === "" ? null : currentTitle,
           content,
+          space: target,
         });
+        // D1a's other half: the landing space is confirmed out loud, from the
+        // server's answer. Said before the currency check, because the node
+        // exists wherever the reader has navigated to since.
+        const landing = describeLanding(created, target, spacesRef.current);
+        toastRef.current.show("success", landing.title, landing.detail);
         // The node exists either way — but if the reader has opened something
         // else since, adopting it here would rebind the editor to it and the
         // navigate below would yank them off the document they just opened.
@@ -294,8 +352,13 @@ export function useNodeDocument({ nodeId, createType }: UseNodeDocumentOptions):
           toastRef.current.showError(error, "The new note could not be saved");
           return;
         }
+        // A write target naming a space that has since been archived or renamed
+        // fails here rather than being rewritten to `main` — deliberately, and
+        // so it has to read as something the human can act on.
         setSaveState("failed");
-        setSaveError(describeError(error));
+        setSaveError(
+          describeWriteFailure(error, target, spacesRef.current) ?? describeError(error),
+        );
       } finally {
         savingRef.current = false;
         inFlightValuesRef.current = null;
@@ -405,11 +468,25 @@ export function useNodeDocument({ nodeId, createType }: UseNodeDocumentOptions):
       content: contentRef.current,
       saved: savedRef.current,
       createType: createTypeRef.current,
+      space: writeTargetRef.current,
     };
     const issue = () => {
-      void flushLeftover(leftover).catch((error: unknown) => {
-        toastRef.current.showError(error, "Unsaved changes to the previous note were lost");
-      });
+      void flushLeftover(leftover).then(
+        (written) => {
+          // A create the reader has already navigated away from is still a node
+          // filed into a space, and D1a allows no silent ones. Only a create
+          // gets this: an update went to the space its node already lived in.
+          if (written === null || leftover.id !== null) return;
+          toastRef.current.show(
+            "success",
+            `Created in ${spaceLabel(spacesRef.current, leftover.space)}`,
+            "Written from the note that was open a moment ago.",
+          );
+        },
+        (error: unknown) => {
+          toastRef.current.showError(error, "Unsaved changes to the previous note were lost");
+        },
+      );
     };
 
     // Two writes to the same node racing each other can land in either order,

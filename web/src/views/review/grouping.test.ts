@@ -1,5 +1,5 @@
 /**
- * Deriving agent runs from a flat review queue.
+ * Deriving agent runs from a flat review queue, and filing them under spaces.
  *
  * Nothing in the schema carries a batch identifier — `events.cycle_id` exists
  * but stays NULL until the Phase-5 consolidation cycle — so a "run" is inferred
@@ -11,16 +11,41 @@
  * proposal (the thing that has waited longest is at the top of the page) while
  * batches within an agent are **newest first** (the run a reviewer just came to
  * look at). Those two directions are deliberate and opposite.
+ *
+ * ## The space level (design decision D4)
+ *
+ * The outer grouping carries a claim the queue by itself cannot make: **an
+ * `edit`-granted space never reaches this queue at all**, because its agents
+ * write `active`. Grouped by agent alone that territory is simply missing, and
+ * "nothing was proposed here" is indistinguishable from "this space governs
+ * itself". So the section for such a space is emitted *because* it is empty,
+ * and the tests below pin all three ways that could quietly stop working:
+ *
+ * - the self-governing section vanishing (D4's original bug, restored);
+ * - it appearing for a space that is merely quiet, which would tell the human
+ *   that a `suggest`-granted space governs itself when it does not;
+ * - it appearing when the space list is unknown, which would state a fact the
+ *   view is in no position to know.
+ *
+ * The other half is honesty about what the wire *does not* say: only a proposed
+ * node carries a space, so an edge or an update that cannot be placed must land
+ * in an explicit unreported bucket rather than being filed under a guess.
  */
 
 import { describe, expect, it } from "vitest";
-import type { ProposalOut } from "../../api/types";
+import type { GrantOut, NodeOut, ProposalOut, SpaceOut, VersionOut } from "../../api/types";
 import {
   BATCH_GAP_MS,
   describeCounts,
+  editGrantedAgents,
   groupProposals,
+  groupProposalsBySpace,
   PROPOSAL_KINDS,
   proposalKind,
+  proposalSpace,
+  referencedNodeIds,
+  spacesFromProposals,
+  UNREPORTED_SPACE,
 } from "./grouping";
 
 /** Base instant for the fixtures; a real SQLite `datetime('now')` value. */
@@ -51,6 +76,78 @@ function proposal(
     version: null,
     context: {},
   };
+}
+
+/** A node row, as a proposed-node entry carries it. */
+function node(id: string, spaceId: string | null): NodeOut {
+  return {
+    id,
+    space_id: spaceId,
+    type: "note",
+    parent_id: null,
+    position: null,
+    title: id,
+    content: "",
+    props: {},
+    state: "proposed",
+    created_by: "agent:a",
+    created_at: at(0),
+    updated_at: at(0),
+  };
+}
+
+/** A proposed node, the one kind that states its own space. */
+function nodeProposal(agent: string, ms: number, nodeId: string, spaceId: string | null) {
+  return { ...proposal(agent, ms, "node"), node: node(nodeId, spaceId) };
+}
+
+/** A proposed edge — the wire carries endpoint ids and no space at all. */
+function edgeProposal(agent: string, ms: number, src: string, dst: string): ProposalOut {
+  const base = proposal(agent, ms, "edge");
+  return {
+    ...base,
+    edge: {
+      id: base.id,
+      src_id: src,
+      dst_id: dst,
+      type: "mentions",
+      props: {},
+      confidence: null,
+      created_by: agent,
+      state: "proposed",
+      valid_from: null,
+      valid_to: null,
+      created_at: base.created_at,
+    },
+  };
+}
+
+/** A proposed version update — likewise no space on the wire. */
+function updateProposal(agent: string, ms: number, targetNodeId: string): ProposalOut {
+  const base = proposal(agent, ms, "update");
+  const version: VersionOut = {
+    id: sequence,
+    node_id: targetNodeId,
+    title: null,
+    content: "",
+    props: {},
+    actor: agent,
+    event_seq: sequence,
+    state: "proposed",
+    proposed_fields: ["content"],
+    created_at: base.created_at,
+  };
+  return { ...base, version };
+}
+
+/** One `(agent, space, level)` grant row. */
+function grant(agentId: string, spaceId: string, level: string): GrantOut {
+  return { agent_id: agentId, space_id: spaceId, level, created_at: at(0) };
+}
+
+/** A space as `GET /api/spaces` renders it. */
+function space(id: string, title: string, grants: GrantOut[] = []): SpaceOut {
+  return { ...node(id, "meta"), title, state: "active", node_count: 1, grants };
 }
 
 describe("proposalKind", () => {
@@ -205,6 +302,311 @@ describe("groupProposals", () => {
     ]);
     expect(groups[0]!.total).toBe(2);
     expect(groups[0]!.batches.flatMap((batch) => batch.proposals)).toHaveLength(2);
+  });
+});
+
+describe("editGrantedAgents", () => {
+  it("names only the agents that write directly", () => {
+    // `edit` lands `active`; `read` and `suggest` do not. Only `edit` explains
+    // an absence from the review queue.
+    const research = space("sp-research", "research", [
+      grant("agent:reader", "sp-research", "read"),
+      grant("agent:scribe", "sp-research", "edit"),
+      grant("agent:scout", "sp-research", "suggest"),
+      grant("agent:archivist", "sp-research", "edit"),
+    ]);
+    expect(editGrantedAgents(research)).toEqual(["agent:archivist", "agent:scribe"]);
+  });
+
+  it("is empty for a space nothing is granted on", () => {
+    expect(editGrantedAgents(space("sp-a", "a"))).toEqual([]);
+  });
+});
+
+describe("referencedNodeIds", () => {
+  it("names the endpoints of an edge and the target of an update", () => {
+    const ids = referencedNodeIds([
+      edgeProposal("agent:a", 0, "n-src", "n-dst"),
+      updateProposal("agent:a", 1_000, "n-target"),
+    ]);
+    expect(ids).toEqual(["n-src", "n-dst", "n-target"]);
+  });
+
+  it("names nothing for a proposed node, which states its own space", () => {
+    expect(referencedNodeIds([nodeProposal("agent:a", 0, "n-1", "sp-a")])).toEqual([]);
+  });
+
+  it("deduplicates, so a hub is not looked up once per edge", () => {
+    const ids = referencedNodeIds([
+      edgeProposal("agent:a", 0, "hub", "n-1"),
+      edgeProposal("agent:a", 1_000, "hub", "n-2"),
+    ]);
+    expect(ids).toEqual(["hub", "n-1", "n-2"]);
+  });
+});
+
+describe("spacesFromProposals", () => {
+  it("indexes the nodes the queue itself states a space for", () => {
+    const index = spacesFromProposals([
+      nodeProposal("agent:a", 0, "n-1", "sp-a"),
+      nodeProposal("agent:a", 1_000, "n-2", "sp-b"),
+      edgeProposal("agent:a", 2_000, "n-1", "n-2"),
+    ]);
+    expect([...index]).toEqual([
+      ["n-1", "sp-a"],
+      ["n-2", "sp-b"],
+    ]);
+  });
+
+  it("skips a node with no space rather than indexing an empty one", () => {
+    expect(spacesFromProposals([nodeProposal("agent:a", 0, "n-1", null)]).size).toBe(0);
+  });
+});
+
+describe("proposalSpace", () => {
+  it("takes a proposed node's own space", () => {
+    expect(proposalSpace(nodeProposal("agent:a", 0, "n-1", "sp-a"))).toBe("sp-a");
+  });
+
+  it("returns null for an edge nothing has placed", () => {
+    // The wire genuinely does not say: `service._edge_context` carries endpoint
+    // id and title only. Guessing here would misfile a real proposal.
+    expect(proposalSpace(edgeProposal("agent:a", 0, "n-1", "n-2"))).toBeNull();
+  });
+
+  it("takes an edge's source space when the index knows it", () => {
+    const index = new Map([
+      ["n-src", "sp-a"],
+      ["n-dst", "sp-b"],
+    ]);
+    expect(proposalSpace(edgeProposal("agent:a", 0, "n-src", "n-dst"), index)).toBe("sp-a");
+  });
+
+  it("falls back to an edge's target when only that end is known", () => {
+    const index = new Map([["n-dst", "sp-b"]]);
+    expect(proposalSpace(edgeProposal("agent:a", 0, "n-src", "n-dst"), index)).toBe("sp-b");
+  });
+
+  it("takes an update's space from the node it targets", () => {
+    const index = new Map([["n-target", "sp-a"]]);
+    expect(proposalSpace(updateProposal("agent:a", 0, "n-target"), index)).toBe("sp-a");
+    expect(proposalSpace(updateProposal("agent:a", 0, "n-target"))).toBeNull();
+  });
+});
+
+describe("groupProposalsBySpace", () => {
+  const research = space("sp-research", "research", [
+    grant("agent:scout", "sp-research", "suggest"),
+  ]);
+  const journal = space("sp-journal", "journal", [grant("agent:scribe", "sp-journal", "edit")]);
+  const quiet = space("sp-quiet", "quiet", [grant("agent:reader", "sp-quiet", "read")]);
+  const spaces = [research, journal, quiet];
+
+  it("returns nothing for an empty queue and no spaces", () => {
+    expect(groupProposalsBySpace([], null)).toEqual([]);
+  });
+
+  it("groups space first, then agent, then run", () => {
+    const sections = groupProposalsBySpace(
+      [
+        nodeProposal("agent:scout", 0, "n-1", "sp-research"),
+        nodeProposal("agent:other", 1_000, "n-2", "sp-research"),
+        nodeProposal("agent:scout", 2_000, "n-3", "sp-main"),
+      ],
+      spaces,
+    );
+    const queues = sections.filter((section) => section.kind === "queue");
+    expect(queues.map((section) => section.spaceId)).toEqual(["sp-research", "sp-main"]);
+    expect(queues[0]!.agents.map((agent) => agent.agent)).toEqual([
+      "agent:scout",
+      "agent:other",
+    ]);
+    expect(queues[0]!.agents[0]!.batches).toHaveLength(1);
+  });
+
+  it("counts per space, which is the number a human governs by", () => {
+    const sections = groupProposalsBySpace(
+      [
+        nodeProposal("agent:a", 0, "n-1", "sp-research"),
+        nodeProposal("agent:a", 1_000, "n-2", "sp-research"),
+        nodeProposal("agent:a", 2_000, "n-3", "sp-main"),
+      ],
+      spaces,
+    );
+    const byId = new Map(sections.map((section) => [section.spaceId, section]));
+    expect(byId.get("sp-research")!.total).toBe(2);
+    expect(byId.get("sp-research")!.counts).toEqual({ node: 2, edge: 0, update: 0 });
+    expect(byId.get("sp-main")!.total).toBe(1);
+  });
+
+  it("orders spaces by their oldest waiting proposal, not by volume", () => {
+    const sections = groupProposalsBySpace(
+      [
+        nodeProposal("agent:a", 60_000, "n-1", "sp-loud"),
+        nodeProposal("agent:a", 61_000, "n-2", "sp-loud"),
+        nodeProposal("agent:a", 62_000, "n-3", "sp-loud"),
+        nodeProposal("agent:a", 0, "n-4", "sp-patient"),
+      ],
+      null,
+    );
+    expect(sections.map((section) => section.spaceId)).toEqual(["sp-patient", "sp-loud"]);
+  });
+
+  it("emits a self-governing section for an edit-granted space with nothing waiting", () => {
+    // The decision D4 exists for. Without this the space is absent, and absent
+    // is indistinguishable from "nobody has proposed anything here".
+    const sections = groupProposalsBySpace([], spaces);
+    expect(sections).toHaveLength(1);
+    expect(sections[0]!.kind).toBe("self-governing");
+    expect(sections[0]!.spaceId).toBe("sp-journal");
+    expect(sections[0]!.total).toBe(0);
+    expect(sections[0]!.editAgents).toEqual(["agent:scribe"]);
+  });
+
+  it("does not call a merely quiet space self-governing", () => {
+    // `read` and `suggest` grants produce proposals (or nothing at all); only
+    // `edit` explains an absence. Claiming otherwise tells the human a space
+    // needs no review when it does.
+    const sections = groupProposalsBySpace([], [research, quiet]);
+    expect(sections).toEqual([]);
+  });
+
+  it("claims nothing about self-governance while the space list is unknown", () => {
+    // Null is "the list failed or has not arrived". Emitting sections from an
+    // empty list would say every space is ordinary, which is a fact this view
+    // does not have.
+    expect(groupProposalsBySpace([], null)).toEqual([]);
+    const sections = groupProposalsBySpace(
+      [nodeProposal("agent:a", 0, "n-1", "sp-research")],
+      null,
+    );
+    expect(sections.every((section) => section.kind !== "self-governing")).toBe(true);
+  });
+
+  it("keeps a space out of the self-governing list once it holds a proposal", () => {
+    // An `edit` agent files none, so a proposal here came from a *different*
+    // agent — the space has a real queue and belongs with the others.
+    const sections = groupProposalsBySpace(
+      [nodeProposal("agent:scout", 0, "n-1", "sp-journal")],
+      spaces,
+    );
+    expect(sections).toHaveLength(1);
+    expect(sections[0]!.kind).toBe("queue");
+    // …and the `edit` grant is still reported, because it explains who did not
+    // file this.
+    expect(sections[0]!.editAgents).toEqual(["agent:scribe"]);
+  });
+
+  it("puts the self-governing sections last, after everything actionable", () => {
+    const sections = groupProposalsBySpace(
+      [nodeProposal("agent:scout", 0, "n-1", "sp-research")],
+      spaces,
+    );
+    expect(sections.map((section) => section.kind)).toEqual(["queue", "self-governing"]);
+  });
+
+  it("files a proposal it cannot place into an explicit bucket, never into a guess", () => {
+    const sections = groupProposalsBySpace([updateProposal("agent:a", 0, "n-unknown")], spaces);
+    const unreported = sections.find((section) => section.kind === "unreported")!;
+    expect(unreported.spaceId).toBe(UNREPORTED_SPACE);
+    expect(unreported.total).toBe(1);
+    // And it is not silently attributed to any real space.
+    expect(sections.filter((section) => section.kind === "queue")).toEqual([]);
+  });
+
+  it("places an edge from the node the same run proposed, for free", () => {
+    // The commonest agent run: propose a node, and the `mentions` edge its
+    // `[[wikilink]]` materialised starts from that very node.
+    const sections = groupProposalsBySpace(
+      [
+        nodeProposal("agent:a", 0, "n-1", "sp-research"),
+        edgeProposal("agent:a", 1_000, "n-1", "n-existing"),
+      ],
+      spaces,
+    );
+    const research_ = sections.find((section) => section.spaceId === "sp-research")!;
+    expect(research_.total).toBe(2);
+    expect(research_.counts).toEqual({ node: 1, edge: 1, update: 0 });
+    expect(sections.some((section) => section.kind === "unreported")).toBe(false);
+  });
+
+  it("uses the caller's index for what the queue cannot place itself", () => {
+    const sections = groupProposalsBySpace(
+      [updateProposal("agent:a", 0, "n-target")],
+      spaces,
+      { nodeSpaces: new Map([["n-target", "sp-research"]]) },
+    );
+    expect(sections[0]!.spaceId).toBe("sp-research");
+    expect(sections[0]!.kind).toBe("queue");
+  });
+
+  it("prefers what the queue states over what the caller supplied", () => {
+    // The proposal's own `space_id` is the server's answer; a cached lookup is
+    // a client-side approximation and must never override it.
+    const sections = groupProposalsBySpace(
+      [nodeProposal("agent:a", 0, "n-1", "sp-research")],
+      spaces,
+      { nodeSpaces: new Map([["n-1", "sp-journal"]]) },
+    );
+    expect(sections[0]!.spaceId).toBe("sp-research");
+  });
+
+  it("sorts the unreported bucket among the queues by age, not to the bottom", () => {
+    // They are real proposals waiting on a human. Burying them under every
+    // named space would hide work behind a presentation choice.
+    const sections = groupProposalsBySpace(
+      [
+        updateProposal("agent:a", 0, "n-unknown"),
+        nodeProposal("agent:a", 60_000, "n-1", "sp-research"),
+      ],
+      spaces,
+    );
+    expect(sections.map((section) => section.kind)).toEqual([
+      "unreported",
+      "queue",
+      "self-governing",
+    ]);
+  });
+
+  it("gives every section a distinct, stable key", () => {
+    const proposals = [
+      nodeProposal("agent:a", 0, "n-1", "sp-research"),
+      nodeProposal("agent:a", 1_000, "n-2", "sp-main"),
+      updateProposal("agent:a", 2_000, "n-unknown"),
+    ];
+    const keys = groupProposalsBySpace(proposals, spaces).map((section) => section.key);
+    expect(new Set(keys).size).toBe(keys.length);
+    expect(groupProposalsBySpace(proposals, spaces).map((section) => section.key)).toEqual(keys);
+  });
+
+  it("passes the batch gap through to the agent level", () => {
+    const proposals = [
+      nodeProposal("agent:a", 0, "n-1", "sp-research"),
+      nodeProposal("agent:a", 600_000, "n-2", "sp-research"),
+    ];
+    expect(groupProposalsBySpace(proposals, null, { gapMs: 60_000 })[0]!.agents[0]!.batches)
+      .toHaveLength(2);
+    expect(groupProposalsBySpace(proposals, null, { gapMs: 900_000 })[0]!.agents[0]!.batches)
+      .toHaveLength(1);
+  });
+
+  it("never loses a proposal to the regrouping", () => {
+    // Whatever the space level does, every waiting item still has to be
+    // reachable — a proposal that fell out of the sections would be one no
+    // human can accept or reject through this view.
+    const proposals = [
+      nodeProposal("agent:a", 0, "n-1", "sp-research"),
+      nodeProposal("agent:b", 1_000, "n-2", null),
+      edgeProposal("agent:a", 2_000, "n-1", "n-2"),
+      updateProposal("agent:c", 3_000, "n-unknown"),
+    ];
+    const sections = groupProposalsBySpace(proposals, spaces);
+    const seen = sections.flatMap((section) =>
+      section.agents.flatMap((agent) => agent.batches.flatMap((batch) => batch.proposals)),
+    );
+    expect(seen).toHaveLength(proposals.length);
+    expect(new Set(seen.map((item) => item.id)).size).toBe(proposals.length);
+    expect(sections.reduce((sum, section) => sum + section.total, 0)).toBe(proposals.length);
   });
 });
 

@@ -6,6 +6,13 @@
  * module still checks it: Cytoscape throws on an edge with a missing endpoint,
  * and a render that dies because the server changed shape is a worse failure
  * than one that quietly drops a dangling edge and says so in the status bar.
+ *
+ * It also marks **crossings** — edges whose two endpoints live in different
+ * spaces (design decision D5). A crossing is a property of the data, not of the
+ * space filter, so it is baked into the element set and is drawn whether or not
+ * anything is narrowed: the boundaries in a file are worth seeing before anyone
+ * goes looking for them. The filter's own effect is a class toggle applied over
+ * the top and never touches these elements.
  */
 
 import type { ElementDefinition } from "cytoscape";
@@ -18,6 +25,8 @@ export interface GraphNodeData extends Record<string, unknown> {
   label: string;
   type: string;
   state: string;
+  /** The node's space id, or `""` when it carries none. */
+  space: string;
 }
 
 /** What the stylesheet and the click handlers read off an edge. */
@@ -28,6 +37,8 @@ export interface GraphEdgeData extends Record<string, unknown> {
   label: string;
   type: string;
   state: string;
+  /** True when the endpoints live in two different, known spaces. */
+  crossing: boolean;
 }
 
 /** The element set plus what had to be dropped to build it. */
@@ -35,6 +46,8 @@ export interface GraphElements {
   elements: ElementDefinition[];
   /** Edges whose endpoints were not both present — expected to always be empty. */
   danglingEdges: number;
+  /** Edges whose endpoints live in different spaces, drawn as crossings. */
+  crossingEdges: number;
   /** Identity of the element set, for deciding whether a re-layout is needed. */
   signature: string;
 }
@@ -57,13 +70,36 @@ function nodeClasses(node: NodeOut, rootId: string): string {
 }
 
 /**
+ * Whether an edge joins two different spaces.
+ *
+ * Both endpoints have to be *known* for the answer to be yes. A node with no
+ * `space_id` is unknown territory, not other territory, so it never produces a
+ * crossing — the alternative marks a boundary the data does not actually claim.
+ *
+ * @param spaceByNode Space id per node id; a missing entry means unknown.
+ * @param edge The edge to classify.
+ */
+function isCrossing(spaceByNode: ReadonlyMap<string, string>, edge: EdgeOut): boolean {
+  const source = spaceByNode.get(edge.src_id);
+  const target = spaceByNode.get(edge.dst_id);
+  if (!source || !target) return false;
+  return source !== target;
+}
+
+/**
  * Build the Cytoscape element set for a subgraph.
  *
  * @param subgraph The server's bounded result.
- * @returns Elements, the count of dropped edges, and a set signature.
+ * @returns Elements, the counts of dropped and crossing edges, and a set
+ *   signature.
  */
 export function toElements(subgraph: SubgraphOut): GraphElements {
   const nodeIds = new Set(subgraph.nodes.map((node) => node.id));
+  const spaceByNode = new Map<string, string>();
+  for (const node of subgraph.nodes) {
+    if (node.space_id) spaceByNode.set(node.id, node.space_id);
+  }
+
   const elements: ElementDefinition[] = subgraph.nodes.map((node) => ({
     group: "nodes",
     data: {
@@ -71,16 +107,20 @@ export function toElements(subgraph: SubgraphOut): GraphElements {
       label: nodeLabel(node),
       type: node.type,
       state: node.state,
+      space: node.space_id ?? "",
     } satisfies GraphNodeData,
     classes: nodeClasses(node, subgraph.root),
   }));
 
   let danglingEdges = 0;
+  let crossingEdges = 0;
   for (const edge of subgraph.edges) {
     if (!nodeIds.has(edge.src_id) || !nodeIds.has(edge.dst_id)) {
       danglingEdges += 1;
       continue;
     }
+    const crossing = isCrossing(spaceByNode, edge);
+    if (crossing) crossingEdges += 1;
     elements.push({
       group: "edges",
       data: {
@@ -90,16 +130,20 @@ export function toElements(subgraph: SubgraphOut): GraphElements {
         label: edge.type,
         type: edge.type,
         state: edge.state,
+        crossing,
       } satisfies GraphEdgeData,
-      classes: `state-${edge.state}`,
+      classes: crossing ? `state-${edge.state} crossing` : `state-${edge.state}`,
     });
   }
 
+  // A node's space is in the signature because it decides the crossing classes:
+  // a node that moved space changes how its edges are drawn, and the canvas
+  // only replaces elements when this string changes.
   const signature = `${subgraph.root}|${subgraph.nodes
-    .map((node) => `${node.id}:${node.state}:${node.type}`)
+    .map((node) => `${node.id}:${node.state}:${node.type}:${node.space_id ?? ""}`)
     .join(",")}|${subgraph.edges.map((edge) => `${edge.id}:${edge.state}`).join(",")}`;
 
-  return { elements, danglingEdges, signature };
+  return { elements, danglingEdges, crossingEdges, signature };
 }
 
 /** One incident edge, resolved against the node at the other end. */
@@ -108,6 +152,13 @@ export interface IncidentEdge {
   /** "out" when the selected node is the source. */
   direction: "out" | "in";
   other: NodeOut | null;
+  /**
+   * True when this edge leaves the selected node's space.
+   *
+   * The panel is where a human lands after clicking a dimmed far endpoint, so
+   * it is where the crossing has to be named rather than only drawn.
+   */
+  crossing: boolean;
 }
 
 /**
@@ -123,12 +174,19 @@ export interface IncidentEdge {
  */
 export function incidentEdges(subgraph: SubgraphOut, nodeId: string): IncidentEdge[] {
   const byId = new Map(subgraph.nodes.map((node) => [node.id, node]));
+  const here = byId.get(nodeId)?.space_id ?? null;
+  /** Unknown on either side is not a crossing — same rule as {@link isCrossing}. */
+  const crosses = (other: NodeOut | null): boolean =>
+    here !== null && other?.space_id != null && other.space_id !== here;
+
   const incident: IncidentEdge[] = [];
   for (const edge of subgraph.edges) {
     if (edge.src_id === nodeId) {
-      incident.push({ edge, direction: "out", other: byId.get(edge.dst_id) ?? null });
+      const other = byId.get(edge.dst_id) ?? null;
+      incident.push({ edge, direction: "out", other, crossing: crosses(other) });
     } else if (edge.dst_id === nodeId) {
-      incident.push({ edge, direction: "in", other: byId.get(edge.src_id) ?? null });
+      const other = byId.get(edge.src_id) ?? null;
+      incident.push({ edge, direction: "in", other, crossing: crosses(other) });
     }
   }
   return incident.sort((a, b) => a.direction.localeCompare(b.direction));

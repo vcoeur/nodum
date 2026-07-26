@@ -22,8 +22,12 @@ export default function ReviewView() {
         <div>
           <h1>Review</h1>
           <p className="nd-meta nd-rv__subtitle">
-            Proposals waiting for a human. Accepting or rejecting one writes live
-            state and is recorded as actor human.
+            Proposals waiting for a human, grouped by space and then by agent.
+            Accepting or rejecting one writes live state and is recorded as
+            actor human. A space whose agents hold <code>edit</code> writes
+            straight to <code>active</code> and never appears here — it is
+            listed at the bottom so its silence is legible rather than
+            invisible.
           </p>
         </div>
       </header>

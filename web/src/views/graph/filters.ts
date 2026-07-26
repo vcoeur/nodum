@@ -7,10 +7,20 @@
  * the browser's query string the API request minus its root — one spelling to
  * learn, and a URL that can be pasted into `curl`.
  *
+ * **`space` is the one exception, and it is a deliberate one.** The subgraph
+ * endpoint takes no space parameter and must not be given one: design decision
+ * D5 keeps the far endpoint of a cross-space edge rendered, dimmed and
+ * clickable, and a server-side filter would delete it instead — leaving the
+ * graph asserting that the connection ends there. So `space` narrows what the
+ * render *emphasises*, never what the walk returns; it is carried in the URL
+ * with the others so a narrowed view is still linkable, and
+ * {@link toSubgraphParams} pointedly never sends it. {@link filterKey}, which
+ * identifies a *request*, pointedly never includes it either.
+ *
  * Only non-default values are written, so the common case stays a clean URL.
  */
 
-import type { NodeState, SubgraphParams } from "../../api/types";
+import type { EdgeOut, NodeOut, NodeState, SubgraphParams } from "../../api/types";
 
 /** Edge lifecycle states the walk can be asked to follow. */
 export const EDGE_STATES: readonly NodeState[] = ["active", "proposed", "archived"];
@@ -42,6 +52,22 @@ export interface GraphFilters {
    * the bar". Off means the parameter is not sent at all.
    */
   minConfidence: number | null;
+  /**
+   * Space to narrow the reading to; `""` is off (design decision D1).
+   *
+   * **This one is not part of the request.** `GET /api/graph/subgraph` has no
+   * `space` parameter, and it must not grow one here: design decision D5 says a
+   * cross-space edge keeps its far endpoint *rendered, dimmed and clickable*,
+   * and a server-side filter would drop that node — making the graph assert
+   * that the connection ends there, which is false. So this is the one control
+   * in the bar that shapes the render rather than the walk, and everything it
+   * touches is still on screen. See {@link spaceDimming}.
+   *
+   * A space reference is an id or a name everywhere in nodum; the picker emits
+   * ids, but a hand-written URL may carry a name, so the view resolves it
+   * against the space list before comparing it to `NodeOut.space_id`.
+   */
+  space: string;
 }
 
 /** The filter set a bare `/graph/:rootId` renders. */
@@ -53,6 +79,7 @@ export const DEFAULT_FILTERS: GraphFilters = {
   nodeTypes: [],
   createdBy: "",
   minConfidence: null,
+  space: "",
 };
 
 /** Depth bounds offered by the control. The server accepts more; this is taste. */
@@ -85,6 +112,7 @@ const FILTER_KEYS = [
   "node_type",
   "created_by",
   "min_confidence",
+  "space",
 ] as const;
 
 /** Parse a bounded integer, falling back when the value is absent or junk. */
@@ -129,6 +157,7 @@ export function parseFilters(params: URLSearchParams): GraphFilters {
     nodeTypes: params.getAll("node_type"),
     createdBy: params.get("created_by") ?? "",
     minConfidence,
+    space: params.get("space") ?? "",
   };
 }
 
@@ -153,6 +182,7 @@ export function applyFilters(current: URLSearchParams, filters: GraphFilters): U
   for (const type of filters.nodeTypes) next.append("node_type", type);
   if (filters.createdBy) next.set("created_by", filters.createdBy);
   if (filters.minConfidence !== null) next.set("min_confidence", String(filters.minConfidence));
+  if (filters.space) next.set("space", filters.space);
 
   return next;
 }
@@ -166,15 +196,21 @@ export function isDefaultFilters(filters: GraphFilters): boolean {
     filters.edgeTypes.length === 0 &&
     filters.nodeTypes.length === 0 &&
     filters.createdBy === "" &&
-    filters.minConfidence === null
+    filters.minConfidence === null &&
+    filters.space === ""
   );
 }
 
 /**
- * A stable string identifying one subgraph request.
+ * A stable string identifying one subgraph *request*.
  *
  * Used as the fetch effect's dependency, so a re-render that changes nothing
  * observable does not re-issue the request.
+ *
+ * `space` is deliberately absent: it never reaches the server (see the module
+ * docstring), so including it would throw away a loaded graph and re-fetch an
+ * identical one every time the human narrowed or widened the space — and the
+ * re-fetch would take the layout with it.
  */
 export function filterKey(rootId: string | undefined, filters: GraphFilters): string {
   return JSON.stringify([
@@ -199,6 +235,10 @@ export function filterKey(rootId: string | undefined, filters: GraphFilters): st
  * The edge states go out as a list rather than a single value, because
  * "active plus proposed" has to be one walk over both — the union of two
  * separate walks is a different graph.
+ *
+ * `filters.space` is **never sent**. The endpoint has no such parameter, and
+ * D5 wants the far side of a crossing kept rather than dropped, so the space
+ * filter is applied to the render by {@link spaceDimming} instead.
  *
  * @param rootId The node at the centre of the walk.
  * @param filters The active filters.
@@ -239,12 +279,27 @@ export interface FilterChip {
  * on screen, and the confidence floor is called out as the one that silently
  * removes human-authored structure.
  *
+ * The space chip is first because it is the widest-reaching, and its label says
+ * *dimmed* rather than *hidden* on purpose: it is the only filter here that
+ * removes nothing, and a chip reading like the others would misdescribe D5's
+ * whole point.
+ *
  * @param filters The active filters.
+ * @param spaceName How to name the filtered space; defaults to the raw
+ *   reference, which is all the caller has before the space list loads.
  * @returns One chip per active constraint, in a stable order.
  */
-export function filterChips(filters: GraphFilters): FilterChip[] {
+export function filterChips(filters: GraphFilters, spaceName?: string): FilterChip[] {
   const chips: FilterChip[] = [];
 
+  if (filters.space) {
+    chips.push({
+      key: "space",
+      label: `space: ${spaceName || filters.space} — outside is dimmed, not hidden`,
+      tone: "neutral",
+      cleared: { ...filters, space: "" },
+    });
+  }
   if (!sameList(filters.edgeStates, DEFAULT_FILTERS.edgeStates)) {
     chips.push({
       key: "edge_state",
@@ -286,4 +341,74 @@ export function filterChips(filters: GraphFilters): FilterChip[] {
     });
   }
   return chips;
+}
+
+/** What a space filter dims, and what it leaves alone (design decision D5). */
+export interface SpaceDimming {
+  /** True when a space filter is on. Everything below is empty when it is not. */
+  active: boolean;
+  /** Nodes outside the space: still drawn, still clickable, just recessive. */
+  nodes: string[];
+  /** Edges with **both** endpoints outside — they recede with them. */
+  edges: string[];
+  /** Rendered nodes inside the space. */
+  inside: number;
+  /** Rendered nodes outside it — the ones the filter dims. */
+  outside: number;
+}
+
+/** Nothing narrowed: the whole render is at full strength. */
+const NO_DIMMING: SpaceDimming = { active: false, nodes: [], edges: [], inside: 0, outside: 0 };
+
+/**
+ * Work out what a space filter recedes.
+ *
+ * This is the whole of D5's "the far endpoint dims, never hides", and the
+ * reason the graph's space control is a render-time filter rather than a
+ * request parameter. A node outside the filtered space is **kept** — drawn,
+ * labelled, and selectable — because the connection into it is a fact about
+ * the file, and deleting the far end would make the picture claim the edge
+ * stopped at the boundary. Narrowing a read is not the same as asserting that
+ * the rest of the graph is absent, which is the split model (D1) said one layer
+ * down.
+ *
+ * A node whose `space_id` is null is treated as *not known to be inside* rather
+ * than as a different space: it dims (conservative, and it stays clickable) but
+ * it never counts as a crossing, since claiming a crossing on unknown data
+ * would be the same false assertion in the other direction.
+ *
+ * An edge dims only when **both** ends are outside. An edge with one end inside
+ * is precisely the crossing the human narrowed the view to notice.
+ *
+ * @param nodes The rendered nodes.
+ * @param edges The rendered edges.
+ * @param spaceId The filtered space, resolved to an id; `""` for no filter.
+ * @returns What to dim, and how much of the render is inside.
+ */
+export function spaceDimming(
+  nodes: readonly NodeOut[],
+  edges: readonly EdgeOut[],
+  spaceId: string,
+): SpaceDimming {
+  if (!spaceId) return NO_DIMMING;
+
+  const outsideIds = new Set<string>();
+  let inside = 0;
+  for (const node of nodes) {
+    if (node.space_id === spaceId) inside += 1;
+    else outsideIds.add(node.id);
+  }
+
+  const dimmedEdges: string[] = [];
+  for (const edge of edges) {
+    if (outsideIds.has(edge.src_id) && outsideIds.has(edge.dst_id)) dimmedEdges.push(edge.id);
+  }
+
+  return {
+    active: true,
+    nodes: nodes.filter((node) => outsideIds.has(node.id)).map((node) => node.id),
+    edges: dimmedEdges,
+    inside,
+    outside: outsideIds.size,
+  };
 }

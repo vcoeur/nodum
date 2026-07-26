@@ -1,15 +1,34 @@
 /**
- * The bar above the editor: title, type, lifecycle metadata, and save state.
+ * The bar above the editor: title, type, space, lifecycle metadata, save state.
  *
  * Everything here has a reserved size. The save indicator is the only element
  * that changes several times a minute, so it is given a fixed width and a
  * right edge to grow towards — a status that re-flows the title field every
  * time it ticks over from "saving" to "saved" is the classic way a two-pane
  * editor ends up feeling unsettled.
+ *
+ * A space appears here in **two different jobs**, which design decision D1
+ * keeps apart everywhere else too and which this bar must not blur:
+ *
+ * - on a saved node, the space it *lives in* — a fact, not a control. A node's
+ *   space is fixed at creation like its type, so offering a picker would be the
+ *   frontend contract's "do not render a control for something the service
+ *   cannot do";
+ * - on a new document, the **write target** — the sticky, app-wide space the
+ *   next create lands in. It is shown at the moment of writing because D1a says
+ *   a persisted target the human cannot see is a way to file work into the
+ *   wrong territory.
  */
 
 import { Link } from "react-router-dom";
-import { NodeBadge, Spinner } from "../../components";
+import {
+  ANY_SPACE,
+  NodeBadge,
+  Spinner,
+  resolveSpaceValue,
+  spaceLabel,
+  spaceOptions,
+} from "../../components";
 import { formatAbsolute } from "../../lib";
 import type { NodeOut, TypeOut } from "../../api/types";
 import type { SaveState } from "./useNodeDocument";
@@ -26,6 +45,13 @@ interface NodeMetaBarProps {
   /** Type the first save will use. Null until the catalog answers. */
   selectedType: string | null;
   onTypeChange(typeId: string): void;
+  /** Active spaces from `GET /api/spaces`; null while loading or after a failure. */
+  spaces: readonly NodeOut[] | null;
+  /** True once the space list request failed — the picker says so. */
+  spacesFailed: boolean;
+  /** The sticky write target: the space the first save will land in. */
+  writeTarget: string;
+  onWriteTargetChange(target: string): void;
   saveState: SaveState;
   saveError: string | null;
   savedAt: number | null;
@@ -34,7 +60,7 @@ interface NodeMetaBarProps {
   onTogglePreview(): void;
 }
 
-/** Title, type, metadata, and save status for the open document. */
+/** Title, type, space, metadata, and save status for the open document. */
 export function NodeMetaBar({
   node,
   title,
@@ -43,6 +69,10 @@ export function NodeMetaBar({
   typesError,
   selectedType,
   onTypeChange,
+  spaces,
+  spacesFailed,
+  writeTarget,
+  onWriteTargetChange,
   saveState,
   saveError,
   savedAt,
@@ -88,6 +118,7 @@ export function NodeMetaBar({
         {node ? (
           <>
             <NodeBadge type={node.type} state={node.state} />
+            <NodeSpace node={node} spaces={spaces} />
             <span className="nd-mono" title="Node id">
               {node.id}
             </span>
@@ -101,12 +132,26 @@ export function NodeMetaBar({
             </Link>
           </>
         ) : (
-          <NewNodeType
-            nodeTypes={nodeTypes}
-            typesError={typesError}
-            selectedType={selectedType}
-            onTypeChange={onTypeChange}
-          />
+          <>
+            <NewNodeType
+              nodeTypes={nodeTypes}
+              typesError={typesError}
+              selectedType={selectedType}
+              onTypeChange={onTypeChange}
+            />
+            <WriteTargetPicker
+              spaces={spaces}
+              spacesFailed={spacesFailed}
+              writeTarget={writeTarget}
+              onWriteTargetChange={onWriteTargetChange}
+            />
+            {typesError === null && nodeTypes.length > 0 ? (
+              <span className="nd-meta">
+                Not saved yet — the first keystroke creates the node in that space. Type and space
+                are fixed after that.
+              </span>
+            ) : null}
+          </>
         )}
       </div>
 
@@ -142,24 +187,104 @@ function NewNodeType({
   }
 
   return (
+    <label className="nd-editor__type-field">
+      <span className="nd-label">Type</span>
+      <select
+        className="nd-select nd-editor__type-select"
+        value={selectedType ?? ""}
+        onChange={(event) => onTypeChange(event.target.value)}
+      >
+        {nodeTypes.map((nodeType) => (
+          <option key={nodeType.id} value={nodeType.id}>
+            {nodeType.name}
+          </option>
+        ))}
+      </select>
+    </label>
+  );
+}
+
+/**
+ * The space a saved node lives in — a fact on the bar, not a control.
+ *
+ * `space_id` reaches the frontend on every node and used to be rendered
+ * nowhere, which left the human unable to answer "where is this?" without the
+ * CLI. It is deliberately read-only: a node's space is fixed at creation, like
+ * its type, so a picker here would offer something `PATCH /api/nodes/{id}`
+ * cannot do.
+ */
+function NodeSpace({ node, spaces }: { node: NodeOut; spaces: readonly NodeOut[] | null }) {
+  if (node.space_id === null) {
+    return (
+      <span className="nd-meta" title="The server reported no space for this node.">
+        space unknown
+      </span>
+    );
+  }
+
+  // Falls back to the raw reference while the space list is still loading, so
+  // the line never renders empty and never renders a bare id twice.
+  const label = spaceLabel(spaces ?? [], node.space_id);
+  return (
+    <span
+      className="nd-meta nd-editor__space"
+      title={`This node lives in the ${label} space. A node's space is fixed at creation, like its type.`}
+    >
+      in <span className="nd-mono">{label}</span>
+    </span>
+  );
+}
+
+/**
+ * The sticky write target, on the surface that is about to use it (D1a).
+ *
+ * Not the shared `SpaceFilter`: that control is the *read* half of D1 and
+ * offers an "any space" sentinel, which a write has no meaning for — a node
+ * lands in exactly one space. The picker is built from the same shared
+ * vocabulary so a target the list does not carry stays representable rather
+ * than rendering blank and being silently rewritten by the next change event.
+ */
+function WriteTargetPicker({
+  spaces,
+  spacesFailed,
+  writeTarget,
+  onWriteTargetChange,
+}: Pick<NodeMetaBarProps, "spaces" | "spacesFailed" | "writeTarget" | "onWriteTargetChange">) {
+  const known = spaces ?? [];
+  const listKnown = spaces !== null && !spacesFailed;
+  const options = spaceOptions(known, writeTarget).filter((option) => option.value !== ANY_SPACE);
+  const selected = resolveSpaceValue(known, writeTarget);
+  const unlisted = options.find((option) => option.value === selected)?.unlisted === true;
+
+  return (
     <>
-      <label className="nd-editor__type-field">
-        <span className="nd-label">Type</span>
+      <label className="nd-editor__space-field">
+        <span className="nd-label">Space</span>
         <select
-          className="nd-select nd-editor__type-select"
-          value={selectedType ?? ""}
-          onChange={(event) => onTypeChange(event.target.value)}
+          className="nd-select nd-editor__space-select"
+          value={selected}
+          disabled={spaces === null && !spacesFailed}
+          title={
+            spacesFailed
+              ? "The space list could not be loaded — a new node will still be written to this target."
+              : "Where the next new node lands. It sticks across sessions and is separate from any space filter you read with."
+          }
+          onChange={(event) => onWriteTargetChange(event.target.value)}
         >
-          {nodeTypes.map((nodeType) => (
-            <option key={nodeType.id} value={nodeType.id}>
-              {nodeType.name}
+          {options.map((option) => (
+            <option key={option.value} value={option.value}>
+              {option.unlisted && listKnown ? `${option.label} (unavailable)` : option.label}
             </option>
           ))}
         </select>
       </label>
-      <span className="nd-meta">
-        Not saved yet — the first keystroke creates the node. Type is fixed after that.
-      </span>
+
+      {unlisted && listKnown ? (
+        <span className="nd-editor__meta-warning" role="alert">
+          {spaceLabel(known, writeTarget)} is not in the space list — it may have been archived or
+          renamed. Saving will be refused until another space is chosen.
+        </span>
+      ) : null}
     </>
   );
 }
