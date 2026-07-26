@@ -228,11 +228,19 @@ describe("the write path and the lifecycle, not only the two reads", () => {
   });
 
   it("leaves a duplicate-name refusal from create-space alone", async () => {
-    stubFetch(400, "ValueError", 'a live space already answers to "research"');
+    // A taken name is a 409 `SpaceNameTaken`, and it may be an *archived*
+    // space that holds it — one no space listing returns. The message is the
+    // only account of that, so it must reach the caller untouched.
+    stubFetch(
+      409,
+      "SpaceNameTaken",
+      "an archived space already answers to 'research' (id sp-1): archiving a space keeps its name reserved",
+    );
     const error = await createSpace("research").catch((caught: unknown) => caught);
 
     expect(isUnknownSpace(error)).toBe(false);
-    expect((error as ApiError).status).toBe(400);
+    expect((error as ApiError).status).toBe(409);
+    expect((error as ApiError).message).toContain("archived space already answers to");
   });
 });
 

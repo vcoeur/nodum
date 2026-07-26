@@ -102,7 +102,11 @@ Two spaces may not share a name, because every space reference resolves as
 `id = ? OR title = ?` and a duplicate would make `--space research` mean
 whichever row the database reached first. The comparison is exact — `Research`
 and `research` are two spaces, and both resolve — and an **archived** space
-frees its name, since it no longer resolves at all.
+keeps its name. A retired name stays reserved for good: archiving is not
+deletion, and the one route back (undoing the `node.archive` event) has to be
+able to put the space back exactly as it was, which it cannot do if something
+else took the name meanwhile. The price is that a retired name is not reusable
+unless you rename that space.
 
 `main` and `meta` cannot be archived. Every write that names no space lands in
 `main`, and that default resolves by id whatever state the row is in, so

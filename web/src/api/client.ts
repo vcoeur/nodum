@@ -442,9 +442,10 @@ export function revokeGrant(
  * `/api/grants` — an agent learning the shape of the delegation around it is
  * precisely what the grant model withholds.
  *
- * Archived spaces are absent, and there is no un-archive: the state machine has
- * no `active ← archived` transition, so a listed archived space could offer
- * nothing.
+ * Archived spaces are absent. They still hold their names, though — a space
+ * title is reserved for good (`0013_unique_space_titles`) — so a create can be
+ * refused for a name that is in nothing this list returns. That refusal says
+ * the holder is archived rather than leaving the human to look for it here.
  */
 export function listSpaces(signal?: AbortSignal): Promise<SpaceOut[]> {
   return requestList<SpaceOut>("spaces", "/spaces", signal ? { signal } : {});
@@ -506,8 +507,10 @@ export async function renameSpace(
  * `POST /api/spaces/{id}/archive` — retire a space.
  *
  * Its nodes keep their `space_id` and grants on it go inert; nothing is
- * deleted. There is no way back — the state machine has no `active ←
- * archived` transition — so treat this as final in the interface.
+ * deleted. Treat it as final in the interface: the state machine has no
+ * `active ← archived` transition, and the one route back — undoing the
+ * `node.archive` event — is not on any screen. The space keeps its name either
+ * way, so the name stays reserved and that undo can never collide.
  *
  * A space the server will not resolve throws {@link UnknownSpaceError}, the
  * same class the filtered reads raise.

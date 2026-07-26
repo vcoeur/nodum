@@ -134,14 +134,18 @@ including every parameter.
     generic `archive <id>`. Archiving `main` would hide it from every listing
     while every write that names no space kept landing there (that default
     resolves by id, whatever state the row is in), and archiving `meta` would
-    retire the space every other space lives in. Nothing un-archives, so a
-    *rename* of either is fine: it moves the title and leaves the id alone.
-  - **Two live spaces cannot share a name.** A space reference resolves as
+    retire the space every other space lives in. Neither failure reports
+    anything as it happens, which is why the refusal is the guard rather than
+    `undo` after the fact. A *rename* of either is fine: it moves the title and
+    leaves the id alone.
+  - **No two spaces can share a name.** A space reference resolves as
     `id = ? OR title = ?`, so a duplicate would make `--space research` mean
     whichever row SQLite reached first. Names are compared exactly, as the
-    lookup does — `Research` and `research` are two spaces. Archiving frees a
-    name: an archived space stops resolving, so holding its title would reserve
-    it for good.
+    lookup does — `Research` and `research` are two spaces. A space **keeps its
+    name when it is archived**: the name stays reserved, so that undoing the
+    archive can never land on a name something else has taken. Reusing a
+    retired name means renaming that space first (`node update <id> --title …`;
+    `space-rename` resolves live spaces only).
 
   A space is used in two independent ways, and they are two controls rather
   than one mode: `--space` on a *read* (`node list`, `search`) narrows the view

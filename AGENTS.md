@@ -123,22 +123,29 @@ node for exactly this reason.
   `resolve_space_id(None)` keeps returning it without reading the row's state,
   so writes go on landing in a space the human can no longer see. A *rename*
   of either stays allowed: it moves the title, and the **id** is what the
-  schema and the default write target depend on. **Two live spaces may not
-  answer to one name** (`_require_space_name_free`): a reference resolves as
+  schema and the default write target depend on. **No two spaces may answer to
+  one name** (`_require_space_name_free`): a reference resolves as
   `id = ? OR title = ?`, so a duplicate makes `--space research` mean whichever
   row SQLite reached first. The check runs in `create_node` and `update_node`
-  (conditioned on the node being a space), because those are the paths that
-  bypass the lifecycle helpers, and migration `0013_unique_space_titles` is the
-  structural half under it — a partial unique index over `nodes(title)` where
-  `type_id = 'space' AND state != 'archived'`, which is exactly the set the
-  resolver searches. Archived titles are free again (an archived space stops
-  resolving, and there is no un-archive, so holding the name would reserve it
-  for good); `proposed` ones are held, because two proposals sharing a title
-  would both accept cleanly and collide where a state-keyed partial index never
-  re-fires. Comparison is BINARY, like the lookup's — `Research` beside
-  `research` is two names that genuinely tell themselves apart. The service
-  check additionally catches the half no index can express: a title equal to
-  another space's *id*.
+  (conditioned on the node being a space), in `_transition_version`'s accept
+  (where a proposed rename actually lands) and in `undo` (which writes a
+  recorded row back past every other guard), because those are the paths that
+  bypass the lifecycle helpers; migration `0013_unique_space_titles` is the
+  structural half under it — a unique index over `nodes(title)` where
+  `type_id = 'space'`, with **no state predicate**. **A space title is reserved
+  forever, archived ones included.** The first cut scoped the index to
+  `state != 'archived'`, arguing that an archived space stops resolving and
+  that nothing un-archives; `undo` does — it restores the `before` row with a
+  raw UPDATE past `TRANSITIONS` — so a freed-then-retaken name made undoing an
+  archive die on `UNIQUE constraint failed` (a 500 on `/api/undo`). Archiving
+  is not deletion, so it must be reversible; the accepted cost is that a
+  retired space's name cannot be reused. A collision is `SpaceNameTaken`
+  (a `ValueError`, **409** over HTTP), and when the holder is archived the
+  message says so — nothing lists archived spaces, so a bare "taken" would name
+  something the human cannot see. Comparison is BINARY, like the lookup's —
+  `Research` beside `research` is two names that genuinely tell themselves
+  apart. The service check additionally catches the half no index can express:
+  a title equal to another space's *id*.
   Each public function opens its own short-lived connection
   (applying pending migrations idempotently) and commits. New behaviour and
   validation go here first; adapters must not add behaviour the service lacks.
@@ -816,11 +823,14 @@ Phase-1 decision log.
   node that is not one. `GET /api/spaces` carries per space the live node count
   and the agents holding grants on it (the `/spaces` screen's read) and is
   byte-identical to `nodum space-list`, as every list endpoint is to its
-  command. The two space rules are the service's, so both archive routes
-  (`/api/spaces/{id}/archive` and `/api/nodes/{id}/archive`) answer 400 for
-  `main` and `meta`, and both writers answer 400 for a name a live space
-  already holds. Do not re-implement either in a handler or in the UI: the
-  screen may say *why* before the click, but the refusal is the server's.
+  command — **active spaces only**, which is why the name refusal below has to
+  explain itself in words. The two space rules are the service's, so both
+  archive routes (`/api/spaces/{id}/archive` and `/api/nodes/{id}/archive`)
+  answer 400 for `main` and `meta`, and both writers answer **409
+  `SpaceNameTaken`** for a name any space already holds — including an archived
+  one, whose message says so, since this listing does not carry it. Do not
+  re-implement either in a handler or in the UI: the screen may say *why*
+  before the click, but the refusal is the server's.
 - **Account and grant administration is on the API too.** `GET /api/me`
   returns the session's human; `/api/humans`, `/api/agents` and `/api/grants`
   mirror the CLI's `human`/`agent`/`grant`/`revoke`/`grants` commands — thin
@@ -914,7 +924,12 @@ Phase-1 decision log.
   changed instead — a space stops resolving once it is archived, and a renamed
   one no longer answers to its old name. `views/search/spaceFailure.ts`,
   `views/editor/createOutcome.ts` and `views/spaces/spaces.ts` own that copy and
-  pin it with tests; new copy goes through one of them.
+  pin it with tests; new copy goes through one of them. The refusal that names
+  an **archived** space holding a name you tried to create is not a breach and
+  not an exception: it is the server's own message, shown verbatim, and the
+  only principals that can reach it are those writing `meta` — which is the
+  grant that already lists every space node, archived included. The service
+  asserts that premise as a test rather than assuming it.
 - **The space surfaces are shared, and there is one of each.** The read filter
   is `components/SpaceFilter.tsx` (controlled and presentational — the view owns
   the value, and `controlClassName` is how a filter row sizes it rather than

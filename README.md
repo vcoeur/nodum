@@ -247,9 +247,10 @@ degrades to BM25 + graph expansion. `NODUM_EMBED_MODEL` switches the model
   not exist. Meta-space nodes (the type vocabulary, the spaces themselves) stay
   out of content reads unless `--include-meta` says otherwise, or the read is
   narrowed to `meta` by name. Two rules keep the vocabulary unambiguous, and
-  both live in the service so every surface has them: **two live spaces may not
-  share a name** (a reference resolves as `id = ? OR title = ?`, compared
-  exactly — and archiving a space frees its name, because it stops resolving),
+  both live in the service so every surface has them: **no two spaces may share
+  a name** (a reference resolves as `id = ? OR title = ?`, compared exactly —
+  and a space keeps its name when it is archived, so a retired name stays
+  reserved and restoring the space can never collide),
   and **`main` and `meta` cannot be archived** (every unnamed write still lands
   in `main` whatever state the row is in; `meta` holds the spaces themselves).
   Renaming either is fine: a rename moves the title, and the id is what

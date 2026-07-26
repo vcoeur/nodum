@@ -160,7 +160,12 @@ Conventions that hold across the tree:
   read. Say what changed instead — a space stops resolving once it is archived,
   and a renamed one stops answering to its old name. `views/search/spaceFailure.ts`,
   `views/editor/createOutcome.ts` and `views/spaces/spaces.ts` own that copy and
-  pin it with tests.
+  pin it with tests. The one refusal that *does* name a space — creating one
+  whose name an **archived** space still holds (a space title is reserved for
+  good) — is not an exception to this: it is the server's message, shown
+  verbatim, and creating a space means writing `meta`, which is exactly the
+  grant that already lists every space node there. The server pins that premise
+  as its own test.
 - **The write target is shown wherever it is used** (design decision D1a). It is
   app-wide, sticky across sessions, and synchronised across tabs
   (`lib/writeTarget.ts` listens for `storage`) — all of which make it a way to

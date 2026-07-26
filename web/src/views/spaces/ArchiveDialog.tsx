@@ -11,8 +11,9 @@
  *
  * The one thing a human reliably assumes about "archive" is that the contents
  * go with it. Here they do not — nodes keep their `space_id` and stay exactly
- * as readable as they were — and there is no un-archive, so both facts belong
- * in front of the button, not in a toast afterwards.
+ * as readable as they were — while the name *does* go with it and stays
+ * reserved, and this screen offers no way back. All three belong in front of
+ * the button, not in a toast afterwards.
  */
 
 import { useState } from "react";

@@ -330,7 +330,7 @@ def test_one_token_hash_cannot_be_shared_by_two_rows(fresh_db):
         conn.close()
 
 
-# ── 0013: one live space per title ───────────────────────────────────────────
+# ── 0013: one space per title, in any state ──────────────────────────────────
 
 
 def test_0013_applies_to_a_populated_database_holding_duplicate_space_titles(tmp_path, monkeypatch):
@@ -342,6 +342,12 @@ def test_0013_applies_to_a_populated_database_holding_duplicate_space_titles(tmp
     SQL. The migration dedupes first, and it **renames** rather than archives:
     archiving retires a space from the vocabulary permanently, which a
     duplicate title does not deserve.
+
+    Archived duplicates are deduped too, because the index covers them: a title
+    is reserved by every space that ever carried it. The tie-break is what that
+    makes load-bearing — a live row must keep the name even when an archived
+    row is older, or the upgrade would silently change what `--space research`
+    resolves to.
     """
     monkeypatch.setenv("NODUM_DB", str(tmp_path / "at0012.db"))
     monkeypatch.setattr(db, "MIGRATIONS", _prefix_through("0012_url_tokens"))
@@ -354,7 +360,10 @@ def test_0013_applies_to_a_populated_database_holding_duplicate_space_titles(tmp
             "  ('sp-first',  'meta', 'space', 'research', 'active',   'human:owner', '2026-01-01'),"
             "  ('sp-second', 'meta', 'space', 'research', 'active',   'human:owner', '2026-01-02'),"
             "  ('sp-third',  'meta', 'space', 'research', 'proposed', 'agent:x',     '2026-01-03'),"
-            "  ('sp-gone',   'meta', 'space', 'research', 'archived', 'human:owner', '2026-01-04');"
+            "  ('sp-gone',   'meta', 'space', 'research', 'archived', 'human:owner', '2026-01-04'),"
+            # The tie-break case: the archived row is the *older* one here.
+            "  ('sp-retired','meta', 'space', 'reading',  'archived', 'human:owner', '2025-12-01'),"
+            "  ('sp-live',   'meta', 'space', 'reading',  'active',   'human:owner', '2026-01-05');"
             "INSERT INTO nodes (id, space_id, type_id, title, created_by)"
             " VALUES ('n-in-second', 'sp-second', 'note', 'lives in the loser', 'human:owner');"
         )
@@ -378,13 +387,18 @@ def test_0013_applies_to_a_populated_database_holding_duplicate_space_titles(tmp
     assert titles["sp-first"] == "research"
     assert titles["sp-second"] == "research (sp-second)"
     assert titles["sp-third"] == "research (sp-third)"
-    # An archived duplicate is left alone: it does not resolve, so it collides
-    # with nothing and its history stays as it was written.
-    assert titles["sp-gone"] == "research"
+    # An archived duplicate is renamed like any other: its title is inside the
+    # index now, so leaving it would be leaving the index uncreatable.
+    assert titles["sp-gone"] == "research (sp-gone)"
+    # And when the archived row is the older one, it still loses: the name goes
+    # on resolving to the space it resolved to before the upgrade.
+    assert titles["sp-live"] == "reading"
+    assert titles["sp-retired"] == "reading (sp-retired)"
 
     # The graph the index was created over still reads and still writes.
     assert service.get_node("n-in-second", principal=owner()).space_id == "sp-second"
     assert service.resolve_space_id("research", principal=owner()) == "sp-first"
+    assert service.resolve_space_id("reading", principal=owner()) == "sp-live"
     assert (
         service.create_node(
             type="note", title="after", space="research (sp-second)", principal=owner()
@@ -405,17 +419,45 @@ def test_0013_guards_the_titles_it_deduped(fresh_db):
                 "INSERT INTO nodes (id, space_id, type_id, title, created_by)"
                 " VALUES ('sp-b', 'meta', 'space', 'research', 'human:owner')"
             )
-        # An archived one is outside the index, so a retired name is free again.
-        conn.execute(
-            "INSERT INTO nodes (id, space_id, type_id, title, state, created_by)"
-            " VALUES ('sp-c', 'meta', 'space', 'research', 'archived', 'human:owner')"
-        )
+        # An archived one is inside the index too: a space title is reserved for
+        # good, so that undoing an archive can never land on a taken name.
+        with pytest.raises(sqlite3.IntegrityError, match="UNIQUE"):
+            conn.execute(
+                "INSERT INTO nodes (id, space_id, type_id, title, state, created_by)"
+                " VALUES ('sp-c', 'meta', 'space', 'research', 'archived', 'human:owner')"
+            )
         # And an untitled space is not one of a kind — NULLs are not in the index.
         for space_id in ("sp-d", "sp-e"):
             conn.execute(
                 "INSERT INTO nodes (id, space_id, type_id, created_by)"
                 f" VALUES ('{space_id}', 'meta', 'space', 'human:owner')"
             )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_0013_lets_a_space_change_state_without_touching_the_index(fresh_db):
+    """No state predicate means no state change can collide.
+
+    Archiving and restoring were the collision the old `state != 'archived'`
+    index created: membership moved with the row's state, so a title could be
+    freed and re-taken under a row that later came back. Now membership is
+    fixed at insert, and the state column is free to move.
+    """
+    conn = db.connect()
+    try:
+        conn.execute(
+            "INSERT INTO nodes (id, space_id, type_id, title, created_by)"
+            " VALUES ('sp-a', 'meta', 'space', 'research', 'human:owner')"
+        )
+        conn.execute("UPDATE nodes SET state = 'archived' WHERE id = 'sp-a'")
+        with pytest.raises(sqlite3.IntegrityError, match="UNIQUE"):
+            conn.execute(
+                "INSERT INTO nodes (id, space_id, type_id, title, created_by)"
+                " VALUES ('sp-b', 'meta', 'space', 'research', 'human:owner')"
+            )
+        conn.execute("UPDATE nodes SET state = 'active' WHERE id = 'sp-a'")
         conn.commit()
     finally:
         conn.close()

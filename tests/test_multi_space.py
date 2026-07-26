@@ -463,23 +463,23 @@ def test_a_principal_that_cannot_read_main_meets_unknown_space_not_the_refusal(f
         service.archive_space("b", principal=outsider)
 
 
-# ── One live space per name, enforced where every surface inherits it ─────────
+# ── One space per name, in any state, enforced where every surface inherits it ─
 
 
 def test_a_second_space_cannot_take_a_live_space_name(fresh_db):
     """`_resolve_space` matches `id = ? OR title = ?`; two matches is ambiguity."""
     _three_spaces()
 
-    with pytest.raises(ValueError, match="a space already answers to 'b'"):
+    with pytest.raises(service.SpaceNameTaken, match="a space already answers to 'b'"):
         service.create_space("b", principal=owner())
-    with pytest.raises(ValueError, match="a space already answers to 'main'"):
+    with pytest.raises(service.SpaceNameTaken, match="a space already answers to 'main'"):
         service.create_space("main", principal=owner())
 
 
 def test_a_rename_cannot_collide_with_another_space_either(fresh_db):
     _three_spaces()
 
-    with pytest.raises(ValueError, match="a space already answers to 'c'"):
+    with pytest.raises(service.SpaceNameTaken, match="a space already answers to 'c'"):
         service.rename_space("b", "c", principal=owner())
     # Renaming a space to a name it already holds is a no-op, not a self-clash.
     assert service.rename_space("b", "b", principal=owner()).title == "b"
@@ -489,10 +489,10 @@ def test_the_generic_node_path_cannot_route_around_the_name_rule(fresh_db):
     """`create_space`/`rename_space` are conveniences; `node create` is the bypass."""
     _three_spaces()
 
-    with pytest.raises(ValueError, match="a space already answers to 'b'"):
+    with pytest.raises(service.SpaceNameTaken, match="a space already answers to 'b'"):
         service.create_node(type="space", title="b", space="meta", principal=owner())
     space_b = service.resolve_space_id("b", principal=owner())
-    with pytest.raises(ValueError, match="a space already answers to 'c'"):
+    with pytest.raises(service.SpaceNameTaken, match="a space already answers to 'c'"):
         service.update_node(space_b, title="c", principal=owner())
 
 
@@ -510,22 +510,106 @@ def test_the_schema_holds_the_rule_under_the_service(fresh_db):
         conn.close()
 
 
-def test_archiving_a_space_frees_its_name(fresh_db):
-    """Decided, not incidental: an archived space stops resolving, so it must.
+def test_archiving_a_space_keeps_its_name_reserved(fresh_db):
+    """The exact reproduction that disproved the old rule, first half.
 
-    `_resolve_space` matches `state = 'active'`, so an archived title can never
-    be reached again — and there is no un-archive. Holding the name would
-    reserve it for good on the strength of a row nothing can reach.
+    Archived titles used to be freed, on the argument that an archived space
+    stops resolving and that the state machine has no un-archive. `undo` is the
+    un-archive: it writes the `before` row back with a raw UPDATE, past
+    `TRANSITIONS`. So the freed name could be re-taken and the restore would
+    then die on the unique index. A space keeps its name instead — the cost,
+    taken knowingly, is exactly this refusal.
     """
     _three_spaces()
     service.archive_space("b", principal=owner())
 
-    fresh = service.create_space("b", principal=owner())
+    with pytest.raises(service.SpaceNameTaken) as refused:
+        service.create_space("b", principal=owner())
 
-    assert fresh.title == "b"
-    assert service.resolve_space_id("b", principal=owner()) == fresh.id
-    # The archived row is still there, still archived, and no longer the answer.
-    assert fresh.id != "b"
+    # The message has to say *archived*: nothing lists archived spaces, so a
+    # bare "that name is taken" would name something the human cannot see.
+    assert "archived space already answers to 'b'" in str(refused.value)
+    assert "id b" in str(refused.value)
+    # The generic path is refused for the same reason, in the same words.
+    with pytest.raises(service.SpaceNameTaken, match="archived space already answers to 'b'"):
+        service.create_node(type="space", title="b", space="meta", principal=owner())
+    # Nothing was created, and the archived row is still archived.
+    assert service.get_node("b", principal=owner()).state == "archived"
+    assert [space.id for space in service.list_spaces(principal=owner())] == ["meta", "main", "c"]
+
+
+def test_undoing_an_archive_restores_the_space_it_retired(fresh_db):
+    """The exact reproduction, second half: the restore that used to fail.
+
+    `undo` of a `node.archive` is the only route back from an archive, and with
+    the name reserved it can no longer land on a title something else took —
+    which is the whole point of reserving it.
+    """
+    _three_spaces()
+    service.archive_space("b", principal=owner())
+    archive_seq = next(
+        event.seq
+        for event in service.list_events(limit=50, principal=owner())
+        if event.op == "node.archive"
+    )
+
+    undone = service.undo(archive_seq, principal=owner())
+
+    assert undone.undone_op == "node.archive"
+    assert service.get_node("b", principal=owner()).state == "active"
+    # And it resolves again, by the name it never lost.
+    assert service.resolve_space_id("b", principal=owner()) == "b"
+    assert service.list_nodes(space="b", principal=owner()) != []
+
+
+def test_undoing_a_rename_onto_a_taken_name_is_refused_not_an_integrity_error(fresh_db):
+    """The collision reserving titles does *not* remove, mapped rather than raw.
+
+    Create `scratch`, rename it to `moved`, create a new space called
+    `scratch`, undo the rename: the recorded row carries the title `scratch`,
+    which is now somebody else's. `undo` writes rows back past every guard, so
+    this is checked there — otherwise it surfaces as `sqlite3.IntegrityError`,
+    which `/api/undo` serves as a 500 for a conflict the caller caused and
+    could fix. (The space is a created one rather than a seeded one because a
+    seeded space's id *is* its name, and an id is taken for good either way.)
+    """
+    original = service.create_space("scratch", principal=owner())
+    service.rename_space(original.id, "moved", principal=owner())
+    replacement = service.create_space("scratch", principal=owner())
+    rename_seq = max(
+        event.seq
+        for event in service.list_events(limit=50, principal=owner())
+        if event.op == "node.update"
+    )
+
+    with pytest.raises(service.UndoNotPossible) as refused:
+        service.undo(rename_seq, principal=owner())
+
+    assert "cannot undo event" in str(refused.value)
+    assert f"a space already answers to 'scratch' (id {replacement.id})" in str(refused.value)
+    # Nothing moved: the undo failed before the UPDATE, not halfway through it.
+    assert service.get_node(original.id, principal=owner()).title == "moved"
+    assert service.resolve_space_id("scratch", principal=owner()) == replacement.id
+
+
+def test_accepting_a_proposed_rename_onto_a_taken_name_is_refused_too(fresh_db):
+    """The other write that lands a title late — checked, for the same reason.
+
+    An agent proposes a rename while the name is free; a human takes the name
+    before the review. The accept is the UPDATE that meets the unique index, so
+    the reviewer gets the write path's sentence rather than an IntegrityError.
+    """
+    _three_spaces()
+    gardener = agent("gardener", grants={"meta": "suggest", "main": "read"})
+    proposal = service.update_node(
+        service.resolve_space_id("b", principal=owner()), title="reading", principal=gardener
+    )
+    service.create_space("reading", principal=owner())
+
+    with pytest.raises(service.SpaceNameTaken, match="a space already answers to 'reading'"):
+        service.transition(str(proposal.id), "accept", principal=owner())
+
+    assert service.get_node("b", principal=owner()).title == "b"
 
 
 def test_two_names_differing_only_in_case_are_two_names(fresh_db):
@@ -551,13 +635,21 @@ def test_the_name_check_tells_a_meta_writer_nothing_it_cannot_already_list(fresh
     cannot in practice: creating a space means writing meta, every space node
     lives in meta, and reading meta lists all of them. The premise is asserted
     here rather than assumed, because a future grant shape could break it.
+
+    It has to hold for **archived** spaces too now that a refusal can name one:
+    `list_nodes` filters by state only when asked to, so the same meta read
+    that shows the live spaces shows the retired ones.
     """
     _three_spaces()
+    service.archive_space("c", principal=owner())
     gardener = agent("gardener", grants={"meta": "edit", "main": "read"})
 
     listed = {node.title for node in service.list_nodes(space="meta", principal=gardener)}
-    assert {"main", "b", "c"} <= listed, "a meta reader already sees every space"
+    assert {"main", "b", "c"} <= listed, "a meta reader already sees every space, archived too"
 
-    # So the refusal below reveals nothing: `c` was in the list it just read.
-    with pytest.raises(ValueError, match="a space already answers to 'c'"):
+    # So neither refusal below reveals anything: both spaces were in the list it
+    # just read, and the archived one is the case that could not be seen before.
+    with pytest.raises(service.SpaceNameTaken, match="a space already answers to 'b'"):
+        service.create_space("b", principal=gardener)
+    with pytest.raises(service.SpaceNameTaken, match="archived space already answers to 'c'"):
         service.create_space("c", principal=gardener)

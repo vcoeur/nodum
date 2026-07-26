@@ -535,6 +535,28 @@ def test_the_cli_inherits_the_space_guards_from_the_service(fresh_db):
     assert (renamed["id"], renamed["title"]) == ("main", "trunk")
 
 
+def test_an_archived_space_keeps_its_name_on_the_cli_too(fresh_db):
+    """`space-list` shows active spaces, so the refusal is all the human gets.
+
+    Which is why it says the holder is archived, and why the CLI is where the
+    name can actually be freed: `space-rename` resolves live spaces only, so
+    renaming a retired space is `node update` on its id.
+    """
+    created = _run_json("space-create", "research", "--as", "owner")
+    _run_json("space-archive", created["id"], "--as", "owner")
+
+    refused = runner.invoke(app, ["space-create", "research", "--as", "owner"])
+    assert refused.exit_code == 1
+    assert "archived space already answers to 'research'" in refused.output
+    assert "Traceback" not in refused.output
+
+    # Freeing it is a node-title update, and then the name is available again.
+    _run_json("node", "update", created["id"], "--title", "research-2025", "--as", "owner")
+    reused = _run_json("space-create", "research", "--as", "owner")
+    assert reused["title"] == "research"
+    assert reused["id"] != created["id"]
+
+
 def test_space_list_reports_live_counts_and_grant_holders(fresh_db):
     _run_json("space-create", "research", "--as", "owner")
     _run_json(

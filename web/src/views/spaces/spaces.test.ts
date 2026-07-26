@@ -184,8 +184,13 @@ describe("archiveConsequences", () => {
     );
   });
 
-  it("says the archive is final", () => {
-    expect(archiveConsequences(rowFor(busy)).join(" ")).toContain("no way back");
+  it("says the archive is final here, and that the name goes with it", () => {
+    const lines = archiveConsequences(rowFor(busy)).join(" ");
+    // A space keeps its title for good (`0013_unique_space_titles`), so "you
+    // cannot call anything this again" is a consequence of archiving, and the
+    // confirm is the only place the human meets it before it bites.
+    expect(lines).toContain("name goes with it and stays reserved");
+    expect(lines).toContain("no way back from this screen");
   });
 
   it("warns about the write target only when this space is it", () => {

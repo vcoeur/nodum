@@ -96,8 +96,12 @@ SUBGRAPH_EDGE_FACTOR = 8
 #: way — `list_spaces` returns active spaces only, so it disappears from every
 #: picker, while `resolve_space_id(None)` keeps returning `main` without ever
 #: reading the row's state, so writes go on landing in a space the human can
-#: no longer see or name. Neither is reversible: the state machine has no
-#: `active ← archived` transition anywhere.
+#: no longer see or name. Undo is not the answer to that, though it *can*
+#: reverse an archive (it restores the `before` row past `TRANSITIONS`): it
+#: reverses one named event, and this is a failure that reports nothing at the
+#: moment it happens — by the time anyone notices where their writes went, the
+#: event is buried under everything that kept arriving. Refusing the archive is
+#: the only guard that fires while somebody is still watching.
 STRUCTURAL_SPACE_IDS: dict[str, str] = {
     MAIN_SPACE_ID: (
         "it is where every write that names no space lands, and that default resolves by id "
@@ -149,6 +153,16 @@ class VersionNotFound(RecordNotFound):
 
 class AccountExists(ValueError):
     """Raised when an account id is already taken (a duplicate ``agent create``)."""
+
+
+class SpaceNameTaken(ValueError):
+    """Raised when another space already answers to a proposed space name.
+
+    A conflict rather than a bad request — the sibling of
+    :class:`AccountExists`, and mapped to the same 409: the name is well-formed
+    and the caller may retry with another one. Derives from ``ValueError`` so
+    the CLI keeps reporting it as the refusal it always was.
+    """
 
 
 class InvalidTransition(ValueError):
@@ -329,13 +343,29 @@ def _resolve_space(conn: sqlite3.Connection, space_ref: str, principal: Principa
 def _require_space_name_free(
     conn: sqlite3.Connection, name: str | None, *, exclude_id: str | None = None
 ) -> None:
-    """Refuse a space name a live space already answers to.
+    """Refuse a space name another space already answers to, whatever its state.
 
     The predicate is :func:`_resolve_space`'s own — ``id = ? OR title = ?`` over
-    live space nodes — because that is what makes a duplicate harmful: two rows
+    space nodes — because that is what makes a duplicate harmful: two rows
     answering to one reference means ``--space research`` resolves to whichever
-    one SQLite reached first. Archived spaces are excluded: they stop resolving,
-    so their titles are free again.
+    one SQLite reached first. It is deliberately **not** narrowed to live rows.
+    That was the first shape of this rule, on the argument that an archived
+    space stops resolving so its name is free again; the argument assumed
+    nothing ever un-archives, and :func:`undo` does — it restores the ``before``
+    row with a raw UPDATE, past ``TRANSITIONS``. A freed name that had been
+    re-taken meanwhile turned that undo into an ``IntegrityError``. **A space
+    title is reserved forever**, so a restore can never fail; the cost, taken
+    knowingly, is that a retired space's name cannot be reused.
+
+    An archived holder gets its own sentence, and both name the space. Nothing
+    lists archived spaces — :func:`list_spaces` and ``GET /api/spaces`` return
+    active ones — so a human would otherwise be refused a name held by
+    something they cannot see anywhere. Saying so is not an existence oracle:
+    creating a space means writing ``meta``, and anything that can read ``meta``
+    can already list every space node in it, archived ones included. Freeing the
+    name means renaming that space, which is an ordinary :func:`update_node` by
+    id — :func:`rename_space` will not reach it, since :func:`_resolve_space`
+    matches ``active`` only.
 
     Migration ``0013_unique_space_titles`` is the structural half of this and
     holds every path, including a raw ``update_node`` on a space node; this
@@ -349,21 +379,29 @@ def _require_space_name_free(
         exclude_id: The space being renamed, so it never clashes with itself.
 
     Raises:
-        ValueError: If another live space already answers to ``name``.
+        SpaceNameTaken: If any other space already answers to ``name``.
     """
     if name is None:
         return
     # `IS NOT` rather than `!=` so a None exclusion compares against NULL.
     row = conn.execute(
-        "SELECT id FROM nodes WHERE type_id = 'space' AND state != 'archived'"
+        "SELECT id, state FROM nodes WHERE type_id = 'space'"
         " AND (id = ? OR title = ?) AND id IS NOT ?",
         (name, name, exclude_id),
     ).fetchone()
-    if row is not None:
-        raise ValueError(
-            f"a space already answers to {name!r}: a space reference resolves by id or by "
-            "title, so the two could not be told apart"
+    if row is None:
+        return
+    if row["state"] == "archived":
+        raise SpaceNameTaken(
+            f"an archived space already answers to {name!r} (id {row['id']}): archiving a space "
+            "keeps its name reserved, so that restoring it can never collide with a newer space "
+            "— the name is not free again. Give the new space another name, or rename the "
+            "archived one to release it."
         )
+    raise SpaceNameTaken(
+        f"a space already answers to {name!r} (id {row['id']}): a space reference resolves by id "
+        "or by title, so the two could not be told apart"
+    )
 
 
 def _create_op(state: str) -> str:
@@ -1377,6 +1415,12 @@ def _transition_version(
     if action == "accept":
         node_before = _row_dict(_get_node_row(conn, before["node_id"]))
         fields = _proposed_fields(before)
+        # A proposed space rename was checked when it was filed, but this is
+        # where it lands and a space may have taken the name in between. The
+        # write path's refusal, so the reviewer reads a sentence rather than the
+        # unique index's IntegrityError.
+        if node_before["type_id"] == "space" and "title" in fields:
+            _require_space_name_free(conn, before["title"], exclude_id=before["node_id"])
         assignments = [f"{name} = ?" for name in fields] + ["updated_at = datetime('now')"]
         conn.execute(
             f"UPDATE nodes SET {', '.join(assignments)} WHERE id = ?",
@@ -2074,6 +2118,21 @@ def undo(
             conn.execute(f"DELETE FROM {table} WHERE id = ?", (after["id"],))
             restored = None
         else:
+            # This UPDATE writes the recorded row back verbatim, past
+            # `TRANSITIONS` and past every guard an ordinary write passes — so a
+            # space's title is the one column here that can land on a name
+            # something else now holds. Restoring an *archived* space cannot:
+            # the name was never freed (`0013`). Undoing a **rename** still can
+            # — create `x`, rename it to `y`, create a new `x`, undo the rename
+            # — so it is checked rather than left to the unique index, which
+            # would surface as a bare IntegrityError and a 500 on `/api/undo`.
+            if kind == "node" and before.get("type_id") == "space":
+                try:
+                    _require_space_name_free(conn, before["title"], exclude_id=before["id"])
+                except SpaceNameTaken as clash:
+                    raise UndoNotPossible(
+                        f"cannot undo event {event['seq']} ({event['op']}): {clash}"
+                    ) from clash
             columns = [key for key in before if key != "id"]
             assignments = ", ".join(f"{key} = ?" for key in columns)
             cursor = conn.execute(
@@ -3226,6 +3285,8 @@ def create_space(name: str, *, principal: Principal, path: str | Path | None = N
 
     Raises:
         GrantNotPermitted: If the principal may not write the meta space.
+        SpaceNameTaken: If any other space — archived ones included, since a
+            space keeps its name for good — already answers to ``name``.
     """
     return create_node(
         type="space", title=name, space=META_SPACE_ID, principal=principal, path=path
@@ -3251,6 +3312,10 @@ def rename_space(
 
     Raises:
         TypeNotFound: If ``space`` resolves to no space the principal can see.
+            An archived space is one of those: :func:`_resolve_space` matches
+            ``active`` only, so freeing an archived space's reserved name is an
+            :func:`update_node` by id rather than a rename here.
+        SpaceNameTaken: If another space already answers to ``name``.
     """
     space_id = resolve_space_id(space, principal=principal, path=path)
     return update_node(space_id, title=name, principal=principal, path=path)
@@ -3263,6 +3328,11 @@ def archive_space(space: str, *, principal: Principal, path: str | Path | None =
     vocabulary (it stops resolving, so nothing new can be written or granted
     there) while every node already in it keeps its ``space_id`` and stays
     exactly as readable as it was.
+
+    Its **name goes with it and stays reserved** (migration ``0013``): no new
+    space may take the name of one that was retired. That is what makes the one
+    route back — :func:`undo` of the ``node.archive`` event, which restores the
+    row past the state machine — something that cannot fail on a collision.
 
     The two structural spaces are refused (:data:`STRUCTURAL_SPACE_IDS`), by
     the transition itself so that no spelling of archive misses it. A *rename*

@@ -18,10 +18,17 @@
  *
  * Everything here is a thin call into `/api/spaces`, which is a thin delegate
  * over `service.create_space` / `rename_space` / `archive_space` / `list_spaces`
- * — this view adds no authority the CLI does not have. Archived spaces are
- * absent and there is no un-archive: the state machine has no
- * `active ← archived` transition, so a listed archived space could offer
- * nothing.
+ * — this view adds no authority the CLI does not have.
+ *
+ * Archived spaces are absent, and stay absent deliberately. They keep their
+ * names (a space title is reserved for good), so a create here can be refused
+ * for a name no row on this screen carries — but a row for one would offer
+ * nothing this view can do: `POST /api/spaces/{id}/rename` resolves live spaces
+ * only (`service._resolve_space` matches `active`), so the one action that
+ * would free the name is not on this surface at all, and a listing whose only
+ * button fails is the opaque failure again, one layer down. The server's
+ * refusal carries the whole answer instead: it says the holder is archived and
+ * names it.
  */
 
 import { useRef, useState } from "react";
@@ -127,7 +134,7 @@ export default function SpacesView() {
             Every active space, how much lives in it, and which agents hold a grant on it. A space
             is where a node goes, never who wrote it — grant an agent one in{" "}
             <Link to="/admin">Admin</Link>. Archiving retires a space from the vocabulary and
-            deletes nothing that is in it.
+            deletes nothing that is in it; the name it was retired under stays reserved.
           </p>
         </div>
       </header>

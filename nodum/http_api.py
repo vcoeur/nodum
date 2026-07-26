@@ -135,6 +135,7 @@ from nodum.service import (
     GrantNotPermitted,
     InvalidTransition,
     RecordNotFound,
+    SpaceNameTaken,
     TypeNotFound,
     UndoNotPossible,
 )
@@ -423,11 +424,14 @@ EXCEPTION_STATUS: dict[type[Exception], int] = {
     # only, and humans are unfiltered, so this is unreachable from this
     # surface by construction; mapped so it could never surface as a 500.
     GrantNotPermitted: 403,
-    # 409 — the graph has grown past the event being undone, or the account
-    # name is taken. AccountExists derives from ValueError; the more specific
-    # entry wins (Starlette walks the exception's MRO).
+    # 409 — the graph has grown past the event being undone, or a name is
+    # taken: an account's, or a space's (including one an archived space still
+    # reserves — `service._require_space_name_free`). All three derive from
+    # ValueError; the more specific entries win (Starlette walks the
+    # exception's MRO).
     UndoNotPossible: 409,
     AccountExists: 409,
+    SpaceNameTaken: 409,
     # 413 — the body passed the ceiling this server is willing to read.
     PayloadTooLarge: 413,
     # 499 — the client hung up mid-body (a cancelled upload). Nothing will read

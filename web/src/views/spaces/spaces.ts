@@ -11,8 +11,8 @@
  *   write that names no space still landing there, because
  *   `resolve_space_id(None)` returns the id without reading the row's state, and
  *   archiving `meta` retires the space that spaces themselves live in. Neither
- *   is reversible: the state machine has no `active ← archived` transition
- *   anywhere.
+ *   failure announces itself, so nobody would know there was anything to undo:
+ *   refusing the archive is the guard that fires while somebody is watching.
  * - **Archiving is not deleting**, and the confirm has to say so in the same
  *   breath as it asks. {@link archiveConsequences} is that copy, counted from
  *   the row rather than written in the abstract.
@@ -21,7 +21,9 @@
  *   `--space research` mean whichever row SQLite reached first. The server
  *   enforces it (`service._require_space_name_free`, and migration
  *   `0013_unique_space_titles` under it); {@link validateSpaceName} is the same
- *   rule said before the request, so the human is told while still typing.
+ *   rule said before the request — over the *active* spaces this screen holds,
+ *   which is all of them it can see. An archived space keeps its name too, and
+ *   nothing lists those, so the server owns that half and says so in words.
  * - **No failure may claim a space does not exist.** The server answers a space
  *   that is not there and a space the caller cannot read with the same words on
  *   purpose (Q13 review S3); copy that resolved the ambiguity would turn the
@@ -193,7 +195,12 @@ export function archiveConsequences(row: SpaceRow): string[] {
   lines.push(
     "The space stops resolving, so nothing new can be written into it or granted on it.",
   );
-  lines.push("There is no way back — nodum has no un-archive.");
+  lines.push(
+    `Its name goes with it and stays reserved: no new space can be called ${row.label} while this one exists, archived or not.`,
+  );
+  lines.push(
+    "There is no way back from this screen — the only route is undoing the archive event itself, on the CLI or the API.",
+  );
 
   if (row.writeTarget) {
     lines.push("It is your current write target, so archiving it resets that to main.");
@@ -239,6 +246,11 @@ export function renameConsequence(row: SpaceRow, name: string): string {
  * standing in front of it. The check is exact rather than case-insensitive
  * because exact is what the server compares: refusing `Research` beside
  * `research` would be refusing a name that genuinely resolves.
+ *
+ * It sees **active** spaces only, because that is what `GET /api/spaces`
+ * returns. An archived space keeps its name reserved too, so a name this
+ * accepts can still come back refused; that refusal is the server's, and it
+ * says the holder is archived — this cannot say it, having never been told.
  *
  * @param name The name as typed.
  * @param spaces Every active space.

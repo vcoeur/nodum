@@ -600,27 +600,38 @@ CREATE INDEX idx_url_tokens_expires ON url_tokens(expires_at);
 
 
 UNIQUE_SPACE_TITLES_DDL = """
--- One live space per title (human-UI phase, gap 2). Every space reference on
--- every surface resolves as `id = ? OR title = ?` (`service._resolve_space`),
--- and nothing stopped two spaces carrying the same title — after which
--- `--space research` meant whichever row SQLite reached first, silently, and
--- differently depending on the query plan. Spaces became creatable from a
--- screen in this phase, so the collision went from theoretical to likely.
+-- One space per title, in any state, for good (human-UI phase, gap 2). Every
+-- space reference on every surface resolves as `id = ? OR title = ?`
+-- (`service._resolve_space`), and nothing stopped two spaces carrying the same
+-- title — after which `--space research` meant whichever row SQLite reached
+-- first, silently, and differently depending on the query plan. Spaces became
+-- creatable from a screen in this phase, so the collision went from theoretical
+-- to likely.
 --
--- The index covers exactly the set the resolver searches, and no more:
+-- What the index covers:
 --
 --   * `type_id = 'space'`, the resolver's own predicate. Deliberately *not*
 --     also scoped to the meta space: the resolver does not care which space a
 --     space node lives in, so a `space`-typed node created anywhere resolves,
 --     and an index scoped to meta would leave that hole open.
---   * `state != 'archived'`. An archived space stops resolving (the resolver
---     matches `active` only), so its title must not reserve a name for good —
---     and it would be for good, because the state machine has no un-archive
---     anywhere. `proposed` is inside the index, though: a proposal is a promise
---     to become active, and two proposed spaces sharing a title would both
---     accept cleanly and collide only afterwards, where a partial index keyed
---     on state never fires because the accept does not change membership. This
---     is 0009's `(hash, space)` shape, for the same reasons.
+--   * **Every state, archived included.** This started out as `state !=
+--     'archived'`, on the argument that an archived space stops resolving so
+--     its name must not stay reserved — "and it would be for good, because the
+--     state machine has no un-archive anywhere". That argument was false.
+--     `service.undo` never consults `TRANSITIONS`: for a non-create event it
+--     writes the `before` row back with a raw UPDATE, so undoing a
+--     `node.archive` restores `state = 'active'`. Archive a space, create a new
+--     one with the freed name, undo the archive — and the undo died on a bare
+--     `UNIQUE constraint failed: nodes.title`, which `/api/undo` served as a
+--     500. Archiving exists precisely *because* it is not deletion, so a rule
+--     whose correctness rests on nothing ever coming back contradicts the thing
+--     it is protecting. Titles are therefore reserved forever: the cost is that
+--     a retired space's name cannot be reused, and the return is that a restore
+--     can never fail and that index membership no longer depends on `state`, so
+--     no state change of any kind can collide. (`proposed` was always inside
+--     the index, for the neighbouring reason: two proposed spaces sharing a
+--     title would both accept cleanly and collide only afterwards. That hazard
+--     is gone with the predicate that caused it.)
 --   * Exact, never case-folded. `title = ?` compares under SQLite's default
 --     BINARY collation, so `Research` and `research` are two names that tell
 --     themselves apart perfectly; a NOCASE index would refuse a pair the
@@ -634,26 +645,29 @@ UNIQUE_SPACE_TITLES_DDL = """
 -- lesson applied. The losers are **renamed, not archived**: archiving retires a
 -- space from the vocabulary permanently, which is far more than a duplicate
 -- title deserves, while `<title> (<id>)` leaves every space usable and is
--- unique because the id is. Titles change here without an event or a version,
--- as every migration's data repair does.
+-- unique because the id is. A live row always wins the tie-break over an
+-- archived one (`state = 'archived'` sorts last), even when the archived one is
+-- older: the name a reference resolves to today must go on resolving to the
+-- same space after the upgrade, so it is the retired duplicate that gets
+-- renamed. Titles change here without an event or a version, as every
+-- migration's data repair does.
 UPDATE nodes
 SET title = title || ' (' || id || ')', updated_at = datetime('now')
 WHERE type_id = 'space'
-  AND state != 'archived'
   AND title IS NOT NULL
   AND rowid NOT IN (
       SELECT rowid FROM (
           SELECT rowid, ROW_NUMBER() OVER (
-              PARTITION BY title ORDER BY created_at, rowid
+              PARTITION BY title ORDER BY state = 'archived', created_at, rowid
           ) AS rank
           FROM nodes
-          WHERE type_id = 'space' AND state != 'archived' AND title IS NOT NULL
+          WHERE type_id = 'space' AND title IS NOT NULL
       )
       WHERE rank = 1
   );
 
 CREATE UNIQUE INDEX idx_space_title ON nodes(title)
-WHERE type_id = 'space' AND state != 'archived' AND title IS NOT NULL;
+WHERE type_id = 'space' AND title IS NOT NULL;
 """
 
 

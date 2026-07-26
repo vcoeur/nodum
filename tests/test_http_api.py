@@ -2455,25 +2455,78 @@ def test_a_structural_space_cannot_be_archived_over_http(client, fresh_db):
 
 
 def test_two_spaces_cannot_share_a_name_over_http(client, fresh_db):
-    """A space resolves by id *or* title, so a duplicate makes `?space=` ambiguous."""
+    """A space resolves by id *or* title, so a duplicate makes `?space=` ambiguous.
+
+    A taken name is a **409**: the request is well-formed and the caller can
+    retry with another name, exactly as a duplicate account id is
+    (`AccountExists`). It was a 400 through the bare `ValueError` before.
+    """
     _ok(client.post("/api/spaces", json={"name": "research"}))
 
     clash = client.post("/api/spaces", json={"name": "research"})
-    assert clash.status_code == 400
+    assert clash.status_code == 409
+    assert clash.json()["error"]["type"] == "SpaceNameTaken"
     assert "a space already answers to 'research'" in clash.json()["error"]["message"]
     # A name equal to another space's *id* is the same ambiguity, and is the half
     # no unique index can express.
-    assert client.post("/api/spaces", json={"name": "main"}).status_code == 400
+    assert client.post("/api/spaces", json={"name": "main"}).status_code == 409
 
     other = _ok(client.post("/api/spaces", json={"name": "draft"}))
     rename = client.post(f"/api/spaces/{other['id']}/rename", json={"name": "research"})
-    assert rename.status_code == 400
+    assert rename.status_code == 409
     assert [row["title"] for row in _ok(client.get("/api/spaces"))["spaces"]] == [
         "meta",
         "main",
         "research",
         "draft",
     ]
+
+
+def test_an_archived_space_keeps_its_name_and_the_refusal_says_so(client, fresh_db):
+    """The name is held by something `GET /api/spaces` does not return.
+
+    Which is exactly why the message has to name the state: the screen's own
+    list cannot explain this refusal, so the words must. And the undo that the
+    reservation protects — the only route back from an archive — now succeeds
+    instead of serving a 500 from a bare `IntegrityError`.
+    """
+    space = _ok(client.post("/api/spaces", json={"name": "research"}))
+    _ok(client.post(f"/api/spaces/{space['id']}/archive"))
+    assert [row["id"] for row in _ok(client.get("/api/spaces"))["spaces"]] == ["meta", "main"]
+
+    refused = client.post("/api/spaces", json={"name": "research"})
+    assert refused.status_code == 409
+    assert refused.json()["error"]["type"] == "SpaceNameTaken"
+    assert "archived space already answers to 'research'" in refused.json()["error"]["message"]
+
+    # And the restore the reservation exists for: undo the archive event.
+    restored = _ok(client.post("/api/undo"))
+    assert restored["undone_op"] == "node.archive"
+    assert [row["id"] for row in _ok(client.get("/api/spaces"))["spaces"]] == [
+        "meta",
+        "main",
+        space["id"],
+    ]
+
+
+def test_undoing_a_rename_onto_a_taken_name_is_a_409_not_a_500(client, fresh_db):
+    """The collision reserving titles does not remove, and it must stay mapped.
+
+    `undo` restores a recorded row with a raw UPDATE, so a rename it reverses
+    can put back a title another space has taken since. Unchecked that is
+    `sqlite3.IntegrityError` — a 500 for a conflict the caller caused and can
+    fix — instead of the 409 every other name clash answers with.
+    """
+    space = _ok(client.post("/api/spaces", json={"name": "scratch"}))
+    _ok(client.post(f"/api/spaces/{space['id']}/rename", json={"name": "moved"}))
+    rename_seq = max(event["seq"] for event in _ok(client.get("/api/events?limit=50"))["events"])
+    replacement = _ok(client.post("/api/spaces", json={"name": "scratch"}))
+
+    refused = client.post("/api/undo", json={"seq": rename_seq})
+    assert refused.status_code == 409
+    assert refused.json()["error"]["type"] == "UndoNotPossible"
+    message = refused.json()["error"]["message"]
+    assert f"a space already answers to 'scratch' (id {replacement['id']})" in message
 
 
 def test_spaces_carry_the_node_count_and_grant_holders(client, fresh_db):
