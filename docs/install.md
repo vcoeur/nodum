@@ -90,9 +90,20 @@ non-loopback bind is allowed — login, not the bind, is the boundary.
 
 ## Using it from an agent
 
+Create an agent account first:
+
 ```sh
-nodum mcp serve --actor agent:researcher
+nodum agent create researcher --as owner    # prints the token once — store it
 ```
 
-This speaks MCP over stdio and exposes the read and additive tool tiers only.
-Writes from that actor land as `proposed` and wait for a human to accept them.
+Then run the MCP server with the token in the environment:
+
+```sh
+NODUM_AGENT_TOKEN=ndm_… nodum mcp serve
+```
+
+It speaks MCP over stdio, exposes the read and additive tool tiers only, and
+confines every call to that agent's grants. A `suggest` grant means its writes
+land `proposed` and wait for a human. Put the token in the MCP client
+configuration's env block — never on the command line, where it would leak into
+`ps` and shell history.

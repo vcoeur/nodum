@@ -26,15 +26,19 @@ Errors are always one line on stderr with exit 1 — never a traceback.
 **Database path** — `--db` flag → `NODUM_DB` environment variable →
 `~/.local/share/nodum/nodum.db`.
 
-**Actors** — writes default to `--actor human`, which lands them `active`. Pass
-`--actor agent:<name>` to land writes as `proposed` instead, unless that
-agent's stored policy auto-accepts them.
+**Attribution** — the CLI is human-only and every command that touches the
+graph requires `--as human:<id>` (or the bare id) — reads included, since
+reads are grant-scoped like writes. A human's write lands `active`. Agents
+write over
+MCP, never the CLI, and land per their grants (`suggest` → `proposed`, `edit` →
+`active`).
 
 **Human-only operations** — `accept`, `reject`, `archive`, `undo`, every
-`review` subcommand, and `policy set` require `--actor human`. An `agent:*`
-actor exits 1. This is not delegable: `policy set` most of all, since a policy
-grants auto-accept and an agent setting one would self-grant the direct live
-write the human tier withholds.
+`review` subcommand, and all account/grant administration (`human`, `agent`,
+`grant`, `revoke`, `space-*` commands) require a human principal. Review
+(`accept`/`reject`/`archive`) can also be exercised by an agent holding `edit`
+on the item's space — over the service API, not the CLI; `undo` stays
+human-only.
 
 **Rejections need a reason** — both `reject <id> --reason` and `review reject
 … --reason` require it and record it in the reject event's payload.
@@ -63,10 +67,10 @@ including every parameter.
 ### Graph
 
 - `init` — Create the database (if needed) and apply pending migrations.
-- `node create` — Create a node (active for actor `human`, proposed otherwise).
+- `node create` — Create a node (`active` for a human; over MCP, per the agent's grant).
 - `node get` — Fetch one node by id (plus its neighborhood when `--depth > 0`).
 - `node list` — List nodes in creation order, optionally filtered.
-- `node update` — Update a node (applies for `human`, stages a proposed version otherwise).
+- `node update` — Update a node (applies for a human or an `edit` grant; stages a proposed version on `suggest`).
 - `node children` — List a node's children in position order.
 - `edge create` — Create a typed, directed edge between two nodes.
 - `edge create-batch` — Propose a batch of edges; bad suggestions are reported, not fatal.
@@ -92,18 +96,22 @@ including every parameter.
 - `reject <id> --reason` — Reject a proposed node, edge, or update (proposed → archived). Human only.
 - `archive <id>` — Archive an active node or edge (active → archived).
 
-### Review queue and policies
+### Review queue
 
 - `review queue` — List pending proposals with reviewer context.
 - `review accept` / `review reject` — Act on proposals by id; bad ids are reported, not fatal.
 - `review accept-all` / `review reject-all` — Act on every proposal matching the filters.
-- `policy set` — Create or replace an agent's policy ruleset (audited as `policy.set`). Human only.
-- `policy get` / `policy list` — Read stored policies.
 
-!!! warning
-    A policy rule's `min_confidence` grades the *agent's own* reported
-    confidence, so it is inert unless the rule also sets
-    `"trust_self_reported_confidence": true`.
+### Accounts, grants, and spaces
+
+- `human create/list/passwd/disable/enable` — Manage human accounts (passwordless
+  until `passwd`; argon2id).
+- `agent create/list/token-rotate/disable/enable` — Manage agent accounts
+  (`create`/`token-rotate` print the show-once token to stderr).
+- `grant <agent> <space> <level>` / `revoke <agent> <space>` / `grants [--agent]` —
+  Event-logged grant administration, levels `read`/`suggest`/`edit`.
+- `space-create` / `space-list` / `space-archive` — Spaces as nodes. These are
+  all human-only.
 
 ### Derived indexes
 
