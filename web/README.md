@@ -4,10 +4,10 @@ The human web UI for nodum (Phase 3). React 19 + TypeScript, built by Vite into
 `../nodum/_web/`, which the Python process serves at `/` — one process, one
 origin, no CORS.
 
-Six views ship: **editor** (`/editor`, `/editor/:nodeId`), **search**
-(`/search`, also the landing view), **review** (`/review`), **graph**
-(`/graph`, `/graph/:rootId`), **assets** (`/assets`), and **history**
-(`/history/:nodeId`).
+Eight views ship: **login** (`/login`), **editor** (`/editor`,
+`/editor/:nodeId`), **search** (`/search`, also the landing view), **review**
+(`/review`), **graph** (`/graph`, `/graph/:rootId`), **assets** (`/assets`),
+**admin** (`/admin`), and **history** (`/history/:nodeId`).
 
 ## Running it
 
@@ -51,11 +51,13 @@ own docblock, because the preview's sanitising policy *is* a parse and asserting
 it against strings would assert against the wrong thing. The opt-out is per
 file; the global config stays `node`.
 
-Covered today: `lib/time.ts`, `lib/failure.ts`, `views/graph/filters.ts`,
-`views/history/unifiedDiff.ts`, `views/search/signals.ts`,
-`views/review/grouping.ts`, `views/review/policyRules.ts`,
+Covered today: `lib/time.ts`, `lib/failure.ts`, `lib/session.ts`,
+`views/failureRouting.ts`, `views/graph/filters.ts`,
+`views/graph/truncation.ts`, `views/history/unifiedDiff.ts`,
+`views/search/signals.ts`, `views/review/grouping.ts`,
+`views/admin/grants.ts`, `views/login/credentials.ts`,
 `views/editor/markdownRender.ts` + `views/editor/mermaidRender.ts` (the
-sanitising policies).
+sanitising policies), and `views/editor/leftoverBuffer.ts`.
 
 **The run pins `TZ` to `Asia/Kathmandu`, and this matters.** SQLite's
 `datetime('now')` is UTC with no zone marker, so the bug `lib/time.ts` fixes —
@@ -85,9 +87,11 @@ type-checking it and driving it in a browser.
 | `src/styles/` | `tokens.css`, `base.css`, `primitives.css`, `app.css` |
 | `src/views/editor/` | CodeMirror-6 Markdown source editor, slash commands, `[[` autocomplete, live Mermaid preview, autosave |
 | `src/views/search/` | query box, ranked hits, per-signal breakdown, signal grouping |
-| `src/views/review/` | proposal queue, per-kind cards, proposed-version diffs, policy editor |
+| `src/views/review/` | proposal queue, per-kind cards, proposed-version diffs |
 | `src/views/graph/` | Cytoscape subgraph render, filters, path panel |
 | `src/views/assets/` | rendition grid, lightbox, uploader, thin JSON export |
+| `src/views/login/` | password login against `POST /api/login` |
+| `src/views/admin/` | accounts and grants administration, show-once token dialog |
 | `src/views/history/` | per-node version timeline and side-by-side diff |
 | `package.json`, `vite.config.ts`, `vitest.config.ts`, `tsconfig.json` | toolchain |
 | `**/*.test.ts` | Vitest unit tests, beside the module each covers |
@@ -119,7 +123,7 @@ Conventions that hold across the tree:
   it.
 - **Logic worth testing lives in a plain module, not in a component.** The
   harness is unit-only, so a rule that matters (a URL codec, a diff parser, a
-  policy reading) goes in its own `.ts` with a `.test.ts` beside it, and the
+  grant grid) goes in its own `.ts` with a `.test.ts` beside it, and the
   component consumes it.
 - **A dialog locks body scroll and hands focus somewhere real.** `review/Modal`
   and `assets/AssetLightbox` both set `body.style.overflow` on open and restore
@@ -172,9 +176,9 @@ try {
 }
 ```
 
-**Never send an actor.** The HTTP surface is the human surface: the server forces
-`actor="human"` on every write and review call, and a client-supplied actor is
-ignored. The client has no parameter for one, deliberately.
+**Never send an identity.** The HTTP surface is the human surface: the server
+attributes every write to the session's human principal, and a client-supplied
+identity is ignored. The client has no parameter for one, deliberately.
 
 `src/api/types.ts` mirrors `nodum/models.py` field for field. If you change a
 pydantic model, change it here in the same commit.
