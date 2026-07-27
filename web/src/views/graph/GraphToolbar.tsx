@@ -57,6 +57,12 @@ interface GraphToolbarProps {
   spacesFailed: boolean;
   /** How the filtered space is named in the chip row. */
   spaceName: string;
+  /**
+   * Whether the space reference actually narrows the render. False for a
+   * reference the space list cannot resolve — an archived space still named in
+   * the URL — where the chip must not promise dimming the banner below denies.
+   */
+  spaceInEffect: boolean;
   unratedEdges: number;
   totalEdges: number;
   loading: boolean;
@@ -83,6 +89,7 @@ export function GraphToolbar({
   archivedSpaces,
   spacesFailed,
   spaceName,
+  spaceInEffect,
   unratedEdges,
   totalEdges,
   loading,
@@ -121,7 +128,7 @@ export function GraphToolbar({
     });
   };
 
-  const chips = filterChips(filters, spaceName);
+  const chips = filterChips(filters, spaceName, spaceInEffect);
 
   return (
     <div className="nd-graph__toolbar">

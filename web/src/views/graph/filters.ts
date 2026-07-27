@@ -284,18 +284,35 @@ export interface FilterChip {
  * removes nothing, and a chip reading like the others would misdescribe D5's
  * whole point.
  *
+ * That clause is conditional, though. A space reference the list cannot resolve
+ * — an archived space still named in the URL — narrows nothing, and the banner
+ * below the toolbar says so in as many words. A chip promising dimming beside a
+ * banner denying it is a contradiction the human reads in one glance, and with
+ * the legend's dimming line correctly suppressed in that state the chip would be
+ * the only sentence on the page still making the claim.
+ *
  * @param filters The active filters.
  * @param spaceName How to name the filtered space; defaults to the raw
  *   reference, which is all the caller has before the space list loads.
+ * @param spaceInEffect Whether the space reference actually narrows the render.
+ *   Defaults to true — the ordinary case, and the one every caller had before
+ *   an unresolvable reference was reachable.
  * @returns One chip per active constraint, in a stable order.
  */
-export function filterChips(filters: GraphFilters, spaceName?: string): FilterChip[] {
+export function filterChips(
+  filters: GraphFilters,
+  spaceName?: string,
+  spaceInEffect: boolean = true,
+): FilterChip[] {
   const chips: FilterChip[] = [];
 
   if (filters.space) {
+    const name = spaceName || filters.space;
     chips.push({
       key: "space",
-      label: `space: ${spaceName || filters.space} — outside is dimmed, not hidden`,
+      label: spaceInEffect
+        ? `space: ${name} — outside is dimmed, not hidden`
+        : `space: ${name} — not in effect`,
       tone: "neutral",
       cleared: { ...filters, space: "" },
     });

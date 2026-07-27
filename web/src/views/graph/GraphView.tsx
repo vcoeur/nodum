@@ -358,6 +358,7 @@ export default function GraphView() {
         archivedSpaces={archivedSpaces.spaces}
         spacesFailed={spaceList.failed}
         spaceName={spaceName.label}
+        spaceInEffect={spaceResolved}
         unratedEdges={unratedEdges}
         totalEdges={data?.edges.length ?? 0}
         loading={subgraph.status === "loading"}

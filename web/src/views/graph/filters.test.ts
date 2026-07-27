@@ -388,6 +388,19 @@ describe("filterChips", () => {
     expect(chip!.tone).toBe("neutral");
   });
 
+  it("drops the dimming claim when the reference narrows nothing", () => {
+    // An archived space still named in the URL resolves to nothing, so the view
+    // renders the whole neighbourhood and the banner under the toolbar says so.
+    // The chip sits roughly one line above that banner: promising "outside is
+    // dimmed" there contradicts it in a single glance, and with the legend's
+    // dimming line correctly suppressed in this state the chip would be the last
+    // thing on the page still making the claim.
+    const [chip] = filterChips({ ...DEFAULT_FILTERS, space: "sp-retired" }, "retired", false);
+    expect(chip!.label).toContain("retired");
+    expect(chip!.label).not.toContain("dimmed");
+    expect(chip!.label).toContain("not in effect");
+  });
+
   it("falls back to the raw reference when the space list has not named it yet", () => {
     const [chip] = filterChips({ ...DEFAULT_FILTERS, space: "sp-research" });
     expect(chip!.label).toContain("sp-research");
