@@ -1,5 +1,5 @@
 import { SpaceFilter } from "../../components";
-import type { SpaceOut, TypeOut } from "../../api/types";
+import type { NodeOut, SpaceOut, TypeOut } from "../../api/types";
 import { LIMIT_CHOICES, STATE_FILTERS } from "./searchState";
 import type { GroupMode, SearchState, StateFilter } from "./searchState";
 
@@ -31,6 +31,11 @@ interface SearchFilterBarProps {
   typesFailed: boolean;
   /** Active spaces from `GET /api/spaces`; null while loading or after a failure. */
   spaces: SpaceOut[] | null;
+  /**
+   * Archived space nodes, so a filter left pointing at one is named rather than
+   * shown as its id. Never a choice — see `SpaceFilter`.
+   */
+  archivedSpaces: readonly NodeOut[];
   /** True once the space list request failed — the control says so. */
   spacesFailed: boolean;
   /** Apply a partial change to the URL state. */
@@ -52,6 +57,7 @@ const STATE_LABEL: Record<StateFilter, string> = {
  * @param nodeTypes The live node-type catalog.
  * @param typesFailed Whether the catalog request failed.
  * @param spaces The live space list.
+ * @param archivedSpaces Archived space nodes, for naming a retired selection.
  * @param spacesFailed Whether the space-list request failed.
  * @param onChange Applies a partial state change.
  */
@@ -60,6 +66,7 @@ export function SearchFilterBar({
   nodeTypes,
   typesFailed,
   spaces,
+  archivedSpaces,
   spacesFailed,
   onChange,
 }: SearchFilterBarProps) {
@@ -71,6 +78,7 @@ export function SearchFilterBar({
         value={state.space}
         onChange={(space) => onChange({ space })}
         spaces={spaces}
+        archivedSpaces={archivedSpaces}
         failed={spacesFailed}
       />
 

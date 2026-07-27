@@ -12,9 +12,17 @@
  * the graph keeps it in toolbar state, a listing may hold it in a hook — the
  * views own that, and a component that owned it instead would make each of them
  * fight it. This renders the value it is given and reports changes.
+ *
+ * **A filter set to a space that has since been archived is named, and stays
+ * unpickable.** The two lists arrive separately for that reason: `spaces` is the
+ * vocabulary — every option a human may choose — and `archivedSpaces` names the
+ * one value already selected, which the vocabulary deliberately does not carry.
+ * Only the current selection is ever resolved against the second list, so
+ * choosing anything else drops the retired space out of the control for good.
  */
 
-import { spaceOptions, resolveSpaceValue } from "./spaceOptions";
+import { spaceOptions, resolveSpaceValue, unlistedMark } from "./spaceOptions";
+import { nameSpace } from "./spaceNaming";
 import type { NodeOut } from "../api/types";
 
 export { ANY_SPACE } from "./spaceOptions";
@@ -26,6 +34,14 @@ interface SpaceFilterProps {
   onChange: (value: string) => void;
   /** Active spaces from `GET /api/spaces`; null while loading or after a failure. */
   spaces: readonly NodeOut[] | null;
+  /**
+   * Archived space nodes, for naming a filter left pointing at one.
+   *
+   * Never a source of options — see the module docblock. Empty (the default) is
+   * the ordinary case: the lazy read behind it fires only when the screen holds
+   * a space `GET /api/spaces` cannot name.
+   */
+  archivedSpaces?: readonly NodeOut[];
   /** True once the space list request failed — the control says so rather than
    *  presenting "Any space" as a choice the human made. */
   failed?: boolean;
@@ -62,6 +78,8 @@ interface SpaceFilterProps {
  * @param value Current selection (id or name); `""` for no filter.
  * @param onChange Applies the new selection.
  * @param spaces The live space list, or null while it is unknown.
+ * @param archivedSpaces Archived space nodes, for naming the current selection
+ *   when it is one of them. Never offered as a choice.
  * @param failed Whether loading the space list failed.
  * @param label Field label.
  * @param className Extra class for the view's layout.
@@ -73,6 +91,7 @@ export function SpaceFilter({
   value,
   onChange,
   spaces,
+  archivedSpaces = [],
   failed = false,
   label = "Space",
   className,
@@ -80,7 +99,16 @@ export function SpaceFilter({
   name = "space",
 }: SpaceFilterProps) {
   const known = spaces ?? [];
-  const options = spaceOptions(known, value, failed ? "Spaces unavailable" : "Any space");
+  // Resolved for the *selection only*, and handed to `spaceOptions` as a name
+  // rather than as a list — that module never sees an archived space, so it
+  // cannot offer one.
+  const selectedName = nameSpace(value, spaces, archivedSpaces);
+  const options = spaceOptions(
+    known,
+    value,
+    selectedName,
+    failed ? "Spaces unavailable" : "Any space",
+  );
   // The list may not be loaded yet while the value already names a space (a
   // shared URL, a restored filter). `spaceOptions` has kept that value
   // representable; this is the matching half — the `<select>` must be given the
@@ -105,7 +133,7 @@ export function SpaceFilter({
       >
         {options.map((option) => (
           <option key={option.value || "any"} value={option.value}>
-            {option.unlisted ? `${option.label} (unavailable)` : option.label}
+            {option.unlisted ? `${option.label} ${unlistedMark(option.archived)}` : option.label}
           </option>
         ))}
       </select>

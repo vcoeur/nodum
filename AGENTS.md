@@ -981,23 +981,38 @@ Phase-1 decision log.
   the value, and `controlClassName` is how a filter row sizes it rather than
   reaching in with a CSS override); its option vocabulary is
   `components/spaceOptions.ts` (`spaceOptions`, `resolveSpaceValue`,
-  `spaceLabel` — a space reference is an id *or* a name everywhere, so resolve
+  `unlistedMark` — a space reference is an id *or* a name everywhere, so resolve
   before comparing); the `GET /api/spaces` read behind all of them is
   `components/useSpaces.ts`. Do not add a seventh copy of that fetch or a second
   `spaceLabel`. `GET /api/spaces` is **active-only and stays that way** — it is
   the vocabulary behind every picker, and a retired space belongs in none of
   them. Naming a space that listing cannot (one archived while its proposals
-  waited, or holding a node you are reading) goes through
-  `components/spaceNaming.ts` and its lazy `components/useArchivedSpaces.ts`,
-  which five surfaces now share — review, search, editor, graph and the grant
-  table. That resolution was once view-local to the review queue; when four more
-  views needed it the answer was to **promote the read, not widen the endpoint**,
-  and that stays the answer. `spaceLabel`'s `?? spaceRef` fallback is correct
-  only for a picker, which must render its own value — every *display* surface
-  goes through `spaceNaming` instead, or it prints 32 hex characters at a human.
-  `nameSpace` has four answers, and `pending` is not `unknown`: a space list
-  still in flight is not an unresolvable space, so `?? []` at a call site is the
-  bug — pass the `null` through.
+  waited, holding a node you are reading, or left behind in a write target or a
+  filter) goes through `components/spaceNaming.ts` and its lazy
+  `components/useArchivedSpaces.ts` — review, search, editor, graph, the grant
+  table, both pickers, and every sentence the editor and search write about a
+  refused space. That resolution was once view-local to the review queue; when
+  the rest of the app needed it the answer was to **promote the read, not widen
+  the endpoint**, and that stays the answer. `nameSpace` has four answers, and
+  `pending` is not `unknown`: a space list still in flight is not an
+  unresolvable space, so `?? []` at a call site is the bug — pass the `null`
+  through.
+- **An archived space is *nameable* everywhere and *selectable* nowhere**, and
+  those are two rules, not one. `spaceLabel`'s `?? spaceRef` fallback is the
+  picker's own — a controlled `<select>` whose `value` matches no option renders
+  blank and is silently rewritten by the next change event — and it is a bare
+  32-hex id anywhere else, which is why it is **no longer exported from
+  `components/`**: its one caller is `spaceOptions`, in the same module, and
+  every surface that reached for it instead of `nameSpace` was an id on a
+  screen. The picker names an archived *selection* by being handed
+  `spaceOptions(spaces, selected, selectedName)` — one already-resolved
+  `SpaceName` for the value it is already carrying. It is never handed the
+  archived **list**, so nothing inside it can put an archived space among the
+  choices; the option it adds is the current value, marked `(archived)` rather
+  than `(unavailable)`, and it is gone the moment the human picks something
+  else. Widening that seam to a list would let someone newly choose a space the
+  server refuses to resolve, which is worse than the id it fixed and is exactly
+  what D1a exists to prevent.
 - **Every surface that displays a node says which space it is in** — the exit
   criterion of the spaces phase, and search is the surface where it matters
   most, because a result list is *scanned*. The rule for how loudly:

@@ -14,19 +14,12 @@
  * resolve, and a server that is not answering.
  */
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import type { KeyboardEvent } from "react";
 import { api } from "../../api/client";
 import type { TypeOut } from "../../api/types";
-import {
-  EmptyState,
-  Spinner,
-  unresolvedSpaceIds,
-  useArchivedSpaces,
-  useSpaces,
-  useToast,
-} from "../../components";
+import { EmptyState, Spinner, useSpaces, useToast } from "../../components";
 import { MarkdownEditor } from "./MarkdownEditor";
 import type { MarkdownEditorHandle } from "./MarkdownEditor";
 import { MarkdownPreview } from "./MarkdownPreview";
@@ -70,22 +63,17 @@ export default function EditorView() {
   const { spaces, failed: spacesFailed } = useSpaces();
   const [writeTarget, setWriteTarget] = useWriteTarget();
 
+  // `spaces` goes in null and all: null means the list has not answered, and
+  // reading it as empty is what makes a screen call a live space unnameable.
+  // The document hook owns the archived listing that names what this one
+  // cannot — both references that need it (the open node's space, the write
+  // target) are its own.
   const doc = useNodeDocument({
     nodeId,
     createType: selectedType,
     writeTarget,
-    spaces: spaces ?? [],
+    spaces,
   });
-
-  // A node whose space has since been archived is a node the meta bar could
-  // otherwise only describe as `in 4affabf6…`. One listing names it, fired only
-  // when the open node actually reports a space `GET /api/spaces` does not
-  // carry — which for an ordinary note is never.
-  const unresolvedNodeSpace = useMemo(
-    () => unresolvedSpaceIds([doc.node?.space_id ?? ""], spaces),
-    [doc.node?.space_id, spaces],
-  );
-  const archivedSpaces = useArchivedSpaces(unresolvedNodeSpace.length > 0);
 
   const editorRef = useRef<MarkdownEditorHandle>(null);
   const [previewVisible, setPreviewVisible] = useState(true);
@@ -298,7 +286,7 @@ export default function EditorView() {
         selectedType={selectedType}
         onTypeChange={setSelectedType}
         spaces={spaces}
-        archivedSpaces={archivedSpaces.spaces}
+        archivedSpaces={doc.archivedSpaces}
         spacesFailed={spacesFailed}
         writeTarget={writeTarget}
         onWriteTargetChange={setWriteTarget}

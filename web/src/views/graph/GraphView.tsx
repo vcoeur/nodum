@@ -38,8 +38,8 @@ import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom"
 import {
   EmptyState,
   Spinner,
+  nameSpace,
   resolveSpaceValue,
-  spaceLabel,
   unresolvedSpaceIds,
   useArchivedSpaces,
   useSpaces,
@@ -183,23 +183,28 @@ export default function GraphView() {
       spaceDimming(data?.nodes ?? [], data?.edges ?? [], spaceResolved ? resolvedSpace : ""),
     [data, resolvedSpace, spaceResolved],
   );
-  const spaceName = spaceLabel(knownSpaces, filters.space);
-
   // The inspector names the space of the node it is showing, and of the far end
   // of every crossing — including a space archived since those nodes were
-  // written, which the shared active-only list cannot name. One lazy listing
-  // covers the whole subgraph. It is deliberately **not** also gated on a node
-  // being selected: `needed` going false on every deselect and true again on
-  // the next select would re-issue the request on each click.
-  const unresolvedNodeSpaces = useMemo(
+  // written, which the shared active-only list cannot name. The **filter's own**
+  // reference is in the same set: an archived one is exactly what puts the
+  // "not in effect" banner on screen, and it read `18ee0caa…` there and in the
+  // picker beside it. One lazy listing covers all of them. It is deliberately
+  // **not** also gated on a node being selected: `needed` going false on every
+  // deselect and true again on the next select would re-issue the request on
+  // each click.
+  const unresolvedSpaces = useMemo(
     () =>
       unresolvedSpaceIds(
-        (data?.nodes ?? []).map((node) => node.space_id ?? ""),
+        [filters.space, ...(data?.nodes ?? []).map((node) => node.space_id ?? "")],
         spaceList.spaces,
       ),
-    [data, spaceList.spaces],
+    [filters.space, data, spaceList.spaces],
   );
-  const archivedSpaces = useArchivedSpaces(unresolvedNodeSpaces.length > 0);
+  const archivedSpaces = useArchivedSpaces(unresolvedSpaces.length > 0);
+  // Through `nameSpace`, not `spaceLabel`: the chip row, the banner and the
+  // legend all render this, and a filter the list cannot name is the case they
+  // exist for.
+  const spaceName = nameSpace(filters.space, spaceList.spaces, archivedSpaces.spaces);
 
   const nodesById = useMemo(() => {
     const index = new Map<string, NodeOut>();
@@ -350,8 +355,9 @@ export default function GraphView() {
         nodeTypeOptions={nodeTypeOptions}
         actorOptions={actorOptions}
         spaces={spaceList.spaces}
+        archivedSpaces={archivedSpaces.spaces}
         spacesFailed={spaceList.failed}
-        spaceName={spaceName}
+        spaceName={spaceName.label}
         unratedEdges={unratedEdges}
         totalEdges={data?.edges.length ?? 0}
         loading={subgraph.status === "loading"}
@@ -403,10 +409,19 @@ export default function GraphView() {
           <div className="nd-graph__banner nd-graph__banner--warn" role="status">
             <div className="nd-graph__banner-text">
               <strong>The space filter is not in effect.</strong> This view is narrowed to{" "}
-              <span className="nd-mono">{filters.space}</span>, but the space list
+              <span className="nd-mono">{spaceName.label}</span>
+              {spaceName.kind === "archived" ? (
+                <span className="nd-badge nd-badge--archived nd-graph__space-mark">
+                  <span className="nd-badge__dot" aria-hidden="true" />
+                  archived
+                </span>
+              ) : null}
+              , but the space list
               {spaceList.failed
                 ? " could not be loaded, so that reference cannot be resolved"
-                : " does not carry that space — it may have been archived or renamed"}
+                : spaceName.kind === "archived"
+                  ? " does not carry it, because archiving takes a space out of every picker"
+                  : " does not carry that space — it may have been archived or renamed"}
               . Nothing is dimmed; you are looking at the whole neighbourhood.
             </div>
             <div className="nd-graph__banner-actions">
@@ -424,7 +439,7 @@ export default function GraphView() {
         {dimming.active && dimming.inside === 0 ? (
           <div className="nd-graph__banner" role="status">
             <div className="nd-graph__banner-text">
-              <strong>Nothing in {spaceName} is in this neighbourhood.</strong> Every node here
+              <strong>Nothing in {spaceName.label} is in this neighbourhood.</strong> Every node here
               belongs to another space, so all of them are dimmed. They are still drawn and still
               clickable — the space filter narrows what you are reading, it does not remove the
               rest of the file.
@@ -516,7 +531,7 @@ export default function GraphView() {
               <>
                 <span className="nd-graph__legend-sep" aria-hidden="true" />
                 <span className="nd-meta">
-                  dimmed = outside {spaceName}, still there and still clickable
+                  dimmed = outside {spaceName.label}, still there and still clickable
                 </span>
               </>
             ) : null}
@@ -543,7 +558,7 @@ export default function GraphView() {
               {data?.truncated ? " · truncated" : ""}
               {/* Said as "of", never as a replacement for the node count: the
                   space filter changed nothing about how much was fetched. */}
-              {dimming.active ? ` · ${dimming.inside} in ${spaceName}` : ""}
+              {dimming.active ? ` · ${dimming.inside} in ${spaceName.label}` : ""}
             </span>
           </div>
         </div>

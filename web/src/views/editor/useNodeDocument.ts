@@ -47,11 +47,11 @@
  *   away from the node the reader just opened.
  */
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { api } from "../../api/client";
 import type { NodeOut, UpdateNodeBody } from "../../api/types";
-import { useToast } from "../../components";
+import { unresolvedSpaceIds, useArchivedSpaces, useToast } from "../../components";
 import { describeError, isNotFound } from "../../lib";
 import {
   describeDetachedWriteFailure,
@@ -166,12 +166,15 @@ interface UseNodeDocumentOptions {
    */
   writeTarget: string;
   /**
-   * Every active space, for naming one in the post-create confirmation.
+   * Every active space, for naming one in the post-create confirmation and in
+   * a refusal.
    *
-   * Empty while `GET /api/spaces` has not answered; the confirmation then falls
-   * back to the reference itself rather than going quiet.
+   * **Null while `GET /api/spaces` has not answered, and passed on as null.**
+   * That read is what decides whether the archived listing below is worth
+   * making at all, so collapsing it to `[]` here would fire it on every mount
+   * and let a refusal call a live space unnameable.
    */
-  spaces: readonly NodeOut[];
+  spaces: readonly NodeOut[] | null;
 }
 
 /** Everything the editor view needs to render and drive one document. */
@@ -181,6 +184,15 @@ export interface NodeDocument {
   loadError: string | null;
   /** The stored node, or null while a new document has never been saved. */
   node: NodeOut | null;
+  /**
+   * Archived space nodes, when this document holds a reference to one.
+   *
+   * Fetched here rather than in the view because the two references that can
+   * need it are both this hook's: the open node's space, and the write target
+   * a refusal has to name. One read serves the meta bar and the refusal copy,
+   * and on a document in a live space it is never issued at all.
+   */
+  archivedSpaces: readonly NodeOut[];
   /**
    * Identity of the buffer currently open.
    *
@@ -258,12 +270,24 @@ export function useNodeDocument({
   /** What that save is writing, so a flush does not re-send bytes already on the wire. */
   const inFlightValuesRef = useRef<{ title: string; content: string } | null>(null);
 
+  // A space this document names that `GET /api/spaces` does not: the open
+  // node's, when it was written somewhere since retired, and the write target,
+  // when the human archived the very space they were filing into. Both degrade
+  // to a bare 32-hex id without this, on the bar and in every refusal.
+  const unresolvedSpaces = useMemo(
+    () => unresolvedSpaceIds([node?.space_id ?? "", writeTarget], spaces),
+    [node?.space_id, writeTarget, spaces],
+  );
+  const archived = useArchivedSpaces(unresolvedSpaces.length > 0);
+
   const createTypeRef = useRef(createType);
   createTypeRef.current = createType;
   const writeTargetRef = useRef(writeTarget);
   writeTargetRef.current = writeTarget;
   const spacesRef = useRef(spaces);
   spacesRef.current = spaces;
+  const archivedRef = useRef(archived.spaces);
+  archivedRef.current = archived.spaces;
   const navigateRef = useRef(navigate);
   navigateRef.current = navigate;
   const toastRef = useRef(toast);
@@ -375,7 +399,12 @@ export function useNodeDocument({
           // through `createOutcome`; this one is the same refusal after the
           // reader moved on, and it also owes them the sentence that says what
           // to do next, because their text is gone.
-          const refused = describeDetachedWriteFailure(error, target, spacesRef.current);
+          const refused = describeDetachedWriteFailure(
+            error,
+            target,
+            spacesRef.current,
+            archivedRef.current,
+          );
           if (refused === null) {
             toastRef.current.showError(error, "The new note could not be saved");
           } else {
@@ -388,7 +417,8 @@ export function useNodeDocument({
         // so it has to read as something the human can act on.
         setSaveState("failed");
         setSaveError(
-          describeWriteFailure(error, target, spacesRef.current) ?? describeError(error),
+          describeWriteFailure(error, target, spacesRef.current, archivedRef.current) ??
+            describeError(error),
         );
       } finally {
         savingRef.current = false;
@@ -527,6 +557,7 @@ export function useNodeDocument({
             error,
             leftover.space,
             spacesRef.current,
+            archivedRef.current,
           );
           if (refused === null) {
             toastRef.current.showError(error, "Unsaved changes to the previous note were lost");
@@ -716,6 +747,7 @@ export function useNodeDocument({
     status,
     loadError,
     node,
+    archivedSpaces: archived.spaces,
     docKey,
     initialContent,
     title,

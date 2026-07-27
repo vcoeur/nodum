@@ -26,11 +26,31 @@
  * of these is how `UnknownSpace: unknown space: research` reached a toast:
  * `describeError` renders an `ApiError` as `type: message`, so any path that
  * hands one an unresolved space prints the forbidden words verbatim.
+ *
+ * Both refusals resolve the target through `nameSpace` over **two** lists. The
+ * space a write target stops resolving for is, overwhelmingly, one the human
+ * just archived — so the active list alone can only render the id, and both
+ * sentences read `The write target 18ee0caa66204b5284774855a9d5cb34 would not
+ * resolve` at the person who retired `reading` a minute ago. Naming it also
+ * lets the copy say the *specific* true thing (archived) instead of the
+ * disjunction (archived or renamed), which stays for the case where nothing
+ * named it.
  */
 
 import { isUnknownSpace } from "../../api/client";
-import { resolveSpaceValue, spaceLabel } from "../../components/spaceOptions";
+import { findSpace, nameSpace } from "../../components/spaceNaming";
+import type { SpaceName } from "../../components/spaceNaming";
 import type { NodeOut } from "../../api/types";
+
+/**
+ * The archived list a landing notice never needs.
+ *
+ * A node cannot land in an archived space — the server refuses the write, which
+ * is the whole of {@link describeWriteFailure}'s existence — so a confirmation
+ * resolves against the active list alone. Named rather than inlined so the
+ * reason is stated once instead of read off an empty array literal.
+ */
+const NO_ARCHIVED_SPACES: readonly NodeOut[] = [];
 
 /** A post-create confirmation: what happened, and where it landed. */
 export interface LandingNotice {
@@ -49,13 +69,15 @@ export interface LandingNotice {
  *
  * @param created The node `POST /api/nodes` returned.
  * @param requested The write target the create asked for (id or name).
- * @param spaces Every active space, for turning an id into a name.
+ * @param spaces Every active space, for turning an id into a name; null while
+ *   `GET /api/spaces` has not answered, which the notice degrades to the
+ *   reference for rather than going quiet.
  * @returns Headline and detail for the post-create toast.
  */
 export function describeLanding(
   created: NodeOut,
   requested: string,
-  spaces: readonly NodeOut[],
+  spaces: readonly NodeOut[] | null,
 ): LandingNotice {
   const landed = created.space_id;
   if (landed === null) {
@@ -67,9 +89,12 @@ export function describeLanding(
     };
   }
 
-  const landedName = spaceLabel(spaces, landed);
-  const asked = resolveSpaceValue(spaces, requested);
-  if (asked === landed || requested === landed) {
+  const landedName = nameSpace(landed, spaces, NO_ARCHIVED_SPACES).label;
+  // A reference is an id *or* a name, so the target has to be matched both ways
+  // before it can be called a mismatch — picking `research` from the list and
+  // the server answering with its id is the ordinary case, not a divergence.
+  const asked = spaces === null ? undefined : findSpace(spaces, requested);
+  if (asked?.id === landed || requested === landed) {
     return {
       title: `Created in ${landedName}`,
       detail: `New nodes keep landing in ${landedName} until you change the space.`,
@@ -79,8 +104,8 @@ export function describeLanding(
   return {
     title: `Created in ${landedName}`,
     detail:
-      `The write target was ${spaceLabel(spaces, requested)}, but the server filed this node ` +
-      `in ${landedName}.`,
+      `The write target was ${nameSpace(requested, spaces, NO_ARCHIVED_SPACES).label}, but the ` +
+      `server filed this node in ${landedName}.`,
   };
 }
 
@@ -92,12 +117,24 @@ export function describeLanding(
  * honest thing available, since the server's refusal is word-for-word identical
  * for a space that was never created and one the caller holds no grant on.
  *
- * @param name The write target, already resolved to something readable.
+ * Two sentences, on one distinction: when the archived listing named the target
+ * there is a specific true thing to say, and the disjunction ("archived, or
+ * renamed") is what is left when nothing named it. Neither may narrow further —
+ * saying *which* of the two is not an inference the interface is entitled to
+ * make about a space it cannot see.
+ *
+ * @param name The write target, resolved through `nameSpace`.
  */
-function targetWouldNotResolve(name: string): string {
+function targetWouldNotResolve(name: SpaceName): string {
+  if (name.kind === "archived") {
+    return (
+      `The write target ${name.label} has been archived — an archived space stops resolving, so ` +
+      "nothing new can be filed there."
+    );
+  }
   return (
-    `The write target ${name} would not resolve — a space stops resolving once it is archived, ` +
-    "and a renamed space no longer answers to its old name."
+    `The write target ${name.label} would not resolve — a space stops resolving once it is ` +
+    "archived, and a renamed space no longer answers to its old name."
   );
 }
 
@@ -118,19 +155,24 @@ function targetWouldNotResolve(name: string): string {
  *
  * @param error The caught value.
  * @param requested The write target the create asked for (id or name).
- * @param spaces Every active space, for turning an id into a name.
+ * @param spaces Every active space, or null while that read has not answered —
+ *   passed through as null, because a list still in flight has ruled nothing
+ *   out and `?? []` here would report a live space as unnameable.
+ * @param archived Archived space nodes from `useArchivedSpaces`, which is what
+ *   turns the usual case of this failure from an id into a name.
  * @returns The sentence for the save-error panel, or null when the failure was
  *   something else and the caller's own error copy should stand.
  */
 export function describeWriteFailure(
   error: unknown,
   requested: string,
-  spaces: readonly NodeOut[],
+  spaces: readonly NodeOut[] | null,
+  archived: readonly NodeOut[],
 ): string | null {
   if (!isUnknownSpace(error)) return null;
   return (
-    `${targetWouldNotResolve(spaceLabel(spaces, requested))} Your text is still here: choose ` +
-    "another space above and save again."
+    `${targetWouldNotResolve(nameSpace(requested, spaces, archived))} Your text is still here: ` +
+    "choose another space above and save again."
   );
 }
 
@@ -152,18 +194,20 @@ export function describeWriteFailure(
  *
  * @param error The caught value.
  * @param requested The write target the create asked for (id or name).
- * @param spaces Every active space, for turning an id into a name.
+ * @param spaces Every active space, or null while that read has not answered.
+ * @param archived Archived space nodes from `useArchivedSpaces`.
  * @returns The toast's detail line, or null when the failure was something else
  *   and the shared classifier should describe it.
  */
 export function describeDetachedWriteFailure(
   error: unknown,
   requested: string,
-  spaces: readonly NodeOut[],
+  spaces: readonly NodeOut[] | null,
+  archived: readonly NodeOut[],
 ): string | null {
   if (!isUnknownSpace(error)) return null;
   return (
-    `${targetWouldNotResolve(spaceLabel(spaces, requested))} That note is no longer open, so ` +
-    "its text could not be kept — pick another space before writing it again."
+    `${targetWouldNotResolve(nameSpace(requested, spaces, archived))} That note is no longer ` +
+    "open, so its text could not be kept — pick another space before writing it again."
   );
 }

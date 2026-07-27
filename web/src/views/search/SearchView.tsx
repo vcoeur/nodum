@@ -238,8 +238,16 @@ export default function SearchView() {
     () => unresolvedSpaceIds(hits.map((each) => each.space_id ?? ""), spaces),
     [hits, spaces],
   );
+  // Under a narrowed filter the rows say nothing about their space, but the
+  // *filter* does — in the picker and, when the server refuses it, in a panel.
+  // A filter left pointing at a space the human archived is the way both of
+  // those are reached, and the reference is all either had to show.
+  const unresolvedFilterSpace = useMemo(
+    () => unresolvedSpaceIds([space], spaces),
+    [space, spaces],
+  );
   const archivedSpaces = useArchivedSpaces(
-    space === ANY_SPACE && unresolvedHitSpaces.length > 0,
+    unresolvedFilterSpace.length > 0 || (space === ANY_SPACE && unresolvedHitSpaces.length > 0),
   );
 
   const groups = useMemo<DisplayGroup[]>(() => {
@@ -372,7 +380,10 @@ export default function SearchView() {
   // A refused space filter is not "the search was refused": nothing about the
   // query is wrong, and the one useful action is dropping the filter rather
   // than retrying the same call.
-  const spaceFailure = status === "error" ? describeSpaceFilterFailure(error, spaces ?? []) : null;
+  const spaceFailure =
+    status === "error"
+      ? describeSpaceFilterFailure(error, spaces, archivedSpaces.spaces)
+      : null;
   const showDegradedNote = vector.missing && !vector.seen;
   // Every hit carries the filtered state; under "any" it is genuinely unknown.
   const knownState = stateFilter === "any" ? null : stateFilter;
@@ -413,6 +424,7 @@ export default function SearchView() {
           nodeTypes={nodeTypes}
           typesFailed={typesFailed}
           spaces={spaces}
+          archivedSpaces={archivedSpaces.spaces}
           spacesFailed={spacesFailed}
           onChange={applyPatch}
         />

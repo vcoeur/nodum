@@ -16,10 +16,17 @@
  * The honest thing to say is what *changed*: a space stops resolving when it is
  * archived, and a renamed space stops answering to its old name — both of which
  * a bookmarked or shared `/search?space=…` link will meet.
+ *
+ * Which of the two it was is usually knowable, and the panel says so when it is.
+ * The filter refuses on exactly the reference `GET /api/spaces` stopped
+ * carrying, so resolving it through `spaceLabel` alone meant the panel was
+ * headed by a 32-hex id in the common case — the human archived `reading` and
+ * followed their own bookmark. It goes through `nameSpace` over both lists now:
+ * named, and told which thing happened when the archived listing knows.
  */
 
 import { isUnknownSpace } from "../../api/client";
-import { spaceLabel } from "../../components/spaceOptions";
+import { nameSpace } from "../../components/spaceNaming";
 import type { NodeOut } from "../../api/types";
 
 /** A refused space filter, in the interface's voice. */
@@ -36,25 +43,34 @@ export interface SpaceFilterFailure {
  * Describe a failed search that was the space filter being refused.
  *
  * @param error The caught value.
- * @param spaces Every active space, for naming the filter's space.
+ * @param spaces Every active space, or null while that read has not answered —
+ *   passed through as null rather than `?? []`, which would have the panel
+ *   report a live space as one nothing names.
+ * @param archived Archived space nodes from `useArchivedSpaces`, which is what
+ *   names the filter in the case this panel most often renders for.
  * @returns The panel's copy, or null when the failure was something else and
  *   the view's ordinary error panel should render instead.
  */
 export function describeSpaceFilterFailure(
   error: unknown,
-  spaces: readonly NodeOut[],
+  spaces: readonly NodeOut[] | null,
+  archived: readonly NodeOut[],
 ): SpaceFilterFailure | null {
   if (!isUnknownSpace(error)) return null;
 
-  // Almost always falls back to the reference: a space that stopped resolving
-  // is a space `GET /api/spaces` no longer lists.
-  const name = spaceLabel(spaces, error.space);
+  // The active list will not hold it — that is why the server refused — so this
+  // is the archived listing's answer or the bare reference.
+  const name = nameSpace(error.space, spaces, archived);
   return {
     title: "That space filter could not be applied",
     detail:
-      `The server would not resolve ${name}. A space stops resolving once it is archived, and a ` +
-      `renamed space no longer answers to its old name — a link from before either change lands ` +
-      `here. Search every space, or narrow to one from the list.`,
+      name.kind === "archived"
+        ? `The server would not resolve ${name.label}, which has been archived. An archived ` +
+          `space stops resolving, and a link from before it was archived lands here — what was ` +
+          `written there is still readable. Search every space, or narrow to one from the list.`
+        : `The server would not resolve ${name.label}. A space stops resolving once it is ` +
+          `archived, and a renamed space no longer answers to its old name — a link from before ` +
+          `either change lands here. Search every space, or narrow to one from the list.`,
     space: error.space,
   };
 }

@@ -27,9 +27,9 @@ import {
   Spinner,
   nameSpace,
   resolveSpaceValue,
-  spaceLabel,
   spaceNameNote,
   spaceOptions,
+  unlistedMark,
 } from "../../components";
 import { formatAbsolute } from "../../lib";
 import type { NodeOut, TypeOut } from "../../api/types";
@@ -50,8 +50,10 @@ interface NodeMetaBarProps {
   /** Active spaces from `GET /api/spaces`; null while loading or after a failure. */
   spaces: readonly NodeOut[] | null;
   /**
-   * Archived space nodes, for naming the space of a node written into one that
-   * has since been retired. Empty until the lazy read is needed.
+   * Archived space nodes, for naming a space the active list will not carry —
+   * the space of a node written into one since retired, and the write target
+   * when the human archived the very space they were filing into. Empty until
+   * the lazy read is needed.
    */
   archivedSpaces: readonly NodeOut[];
   /** True once the space list request failed — the picker says so. */
@@ -149,6 +151,7 @@ export function NodeMetaBar({
             />
             <WriteTargetPicker
               spaces={spaces}
+              archivedSpaces={archivedSpaces}
               spacesFailed={spacesFailed}
               writeTarget={writeTarget}
               onWriteTargetChange={onWriteTargetChange}
@@ -274,16 +277,30 @@ function NodeSpace({
  * lands in exactly one space. The picker is built from the same shared
  * vocabulary so a target the list does not carry stays representable rather
  * than rendering blank and being silently rewritten by the next change event.
+ *
+ * A target the human archived themselves is the ordinary way to arrive here,
+ * and until this was written both the option and the warning under it read
+ * `18ee0caa66204b5284774855a9d5cb34`. Both name it now, through the same
+ * `nameSpace` every display surface uses — and the option is still not a choice
+ * anyone can come back to, because `spaceOptions` is handed the *name* and
+ * never the archived list.
  */
 function WriteTargetPicker({
   spaces,
+  archivedSpaces,
   spacesFailed,
   writeTarget,
   onWriteTargetChange,
-}: Pick<NodeMetaBarProps, "spaces" | "spacesFailed" | "writeTarget" | "onWriteTargetChange">) {
+}: Pick<
+  NodeMetaBarProps,
+  "spaces" | "archivedSpaces" | "spacesFailed" | "writeTarget" | "onWriteTargetChange"
+>) {
   const known = spaces ?? [];
   const listKnown = spaces !== null && !spacesFailed;
-  const options = spaceOptions(known, writeTarget).filter((option) => option.value !== ANY_SPACE);
+  const targetName = nameSpace(writeTarget, spaces, archivedSpaces);
+  const options = spaceOptions(known, writeTarget, targetName).filter(
+    (option) => option.value !== ANY_SPACE,
+  );
   const selected = resolveSpaceValue(known, writeTarget);
   const unlisted = options.find((option) => option.value === selected)?.unlisted === true;
 
@@ -305,7 +322,9 @@ function WriteTargetPicker({
         >
           {options.map((option) => (
             <option key={option.value} value={option.value}>
-              {option.unlisted && listKnown ? `${option.label} (unavailable)` : option.label}
+              {option.unlisted && listKnown
+                ? `${option.label} ${unlistedMark(option.archived)}`
+                : option.label}
             </option>
           ))}
         </select>
@@ -313,8 +332,16 @@ function WriteTargetPicker({
 
       {unlisted && listKnown ? (
         <span className="nd-editor__meta-warning" role="alert">
-          {spaceLabel(known, writeTarget)} is not in the space list — it may have been archived or
-          renamed. Saving will be refused until another space is chosen.
+          {targetName.label}
+          {targetName.kind === "archived" ? (
+            <span className="nd-badge nd-badge--archived nd-editor__space-mark">
+              <span className="nd-badge__dot" aria-hidden="true" />
+              archived
+            </span>
+          ) : null}{" "}
+          {targetName.kind === "archived"
+            ? "has been archived, so it is out of every picker. Saving will be refused until another space is chosen."
+            : "is not in the space list — it may have been archived or renamed. Saving will be refused until another space is chosen."}
         </span>
       ) : null}
     </>

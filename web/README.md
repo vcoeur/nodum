@@ -27,18 +27,33 @@ one (`views/search/resultSpace.ts`), exactly as the state badge does.
 
 Naming one is the harder half, because `GET /api/spaces` is **active-only by
 decision** — it is the vocabulary behind every picker, and a retired space
-belongs in none of them. Five surfaces still have to name a space that listing
-will not carry: the review queue (a space archived while its proposals waited),
-search, the editor's meta bar, the graph inspector, and `/admin`'s grant table
-(archiving makes a grant inert and keeps the row precisely so it can be
-revoked). They all go through `components/spaceNaming.ts` over two lists — the
-shared active one and `components/useArchivedSpaces.ts`, a lazy read of the
-archived space nodes in meta that fires only when something on screen actually
-needs it. `spaceLabel` is **not** that function: its fallback to the raw
-reference is a picker rule (a `<select>` must be able to render its own value)
-and prints a 32-hex id anywhere else. The review queue additionally has to admit
-that a cross-space edge filed under one space needs authority on two —
-`grouping.edgeCrossing`.
+belongs in none of them. Plenty of surfaces still have to name a space that
+listing will not carry: the review queue (a space archived while its proposals
+waited), search, the editor's meta bar, the graph inspector, `/admin`'s grant
+table (archiving makes a grant inert and keeps the row precisely so it can be
+revoked), the write-target and space-filter pickers, and every sentence the
+editor and search write about a write target or filter the server refused. They
+all go through `components/spaceNaming.ts` over two lists — the shared active
+one and `components/useArchivedSpaces.ts`, a lazy read of the archived space
+nodes in meta that fires only when something on screen actually needs it.
+`spaceLabel` is **not** that function: its fallback to the raw reference is a
+picker rule (a `<select>` must be able to render its own value), it prints a
+32-hex id anywhere else, and it is no longer exported from `components/` — its
+one caller is `spaceOptions`, in the same file. The review queue additionally
+has to admit that a cross-space edge filed under one space needs authority on
+two — `grouping.edgeCrossing`.
+
+**Naming an archived selection never makes archived spaces choosable.** That
+is the line the picker walks, and the seam is built so it cannot be crossed by
+accident: `spaceOptions` takes the active list plus, at most, *one
+already-resolved `SpaceName` for the value it is already carrying*. It never
+receives the archived list, so there is nothing inside it to offer. The one
+option it adds beyond `spaces` is the current selection — because a controlled
+`<select>` has to render its own value — marked `(archived)` when the archived
+listing named it and `(unavailable)` when nothing did, and gone the instant the
+human selects something else. Handing that module a list instead of a name
+would let someone newly pick a space the server refuses to resolve, which is a
+worse bug than the bare id it fixed.
 
 ## Running it
 
@@ -129,7 +144,7 @@ type-checking it and driving it in a browser.
 | `src/main.tsx`, `src/App.tsx`, `src/router.tsx` | entry, app shell (header, nav, toasts, crash boundary, health pill), route table |
 | `src/api/client.ts`, `src/api/types.ts` | the only `fetch` in the app, and the types mirroring `nodum/models.py` |
 | `src/lib/` | cross-view plain functions: timestamp parsing (`time.ts`), failure classification (`failure.ts`), the 401 broadcast (`session.ts`), and the sticky write target (`writeTarget.ts`, the one module here that also exports a hook) |
-| `src/components/` | shared React components: `NodeBadge`, `Toast`, `Spinner`, `EmptyState`, `ErrorBoundary`, `Modal`, plus the whole space vocabulary — `SpaceFilter.tsx` with `spaceOptions.ts` (what a picker offers) and `useSpaces.ts` (the `GET /api/spaces` read every space surface shares), and `spaceNaming.ts` with `useArchivedSpaces.ts` (what a surface that *displays* a space calls it, including one the active listing does not carry) |
+| `src/components/` | shared React components: `NodeBadge`, `Toast`, `Spinner`, `EmptyState`, `ErrorBoundary`, `Modal`, plus the whole space vocabulary — `SpaceFilter.tsx` with `spaceOptions.ts` (what a picker offers, which is the active list and never more) and `useSpaces.ts` (the `GET /api/spaces` read every space surface shares), and `spaceNaming.ts` with `useArchivedSpaces.ts` (what a surface that *displays* a space calls it, including one the active listing does not carry — and what names an archived value a picker is already holding) |
 | `src/styles/` | `tokens.css`, `base.css`, `primitives.css`, `app.css` |
 | `src/views/editor/` | CodeMirror-6 Markdown source editor, slash commands, `[[` autocomplete, live Mermaid preview, autosave, the write-target picker and the landing/refusal copy (`createOutcome.ts`) |
 | `src/views/search/` | query box, ranked hits, per-signal breakdown, signal grouping, the space filter + show-meta toggle in the URL (`searchState.ts`), refused-filter copy (`spaceFailure.ts`), when a row names its space (`resultSpace.ts`) |
@@ -215,10 +230,14 @@ Conventions that hold across the tree:
   **It stays active-only.** A surface needing to name a retired space takes the
   lazy `components/useArchivedSpaces.ts` instead; widening this endpoint would
   put archived spaces into six pickers to fix a label on one screen. Pass
-  `spaces` to `nameSpace` / `unresolvedSpaceIds` **null and all** rather than
-  `?? []` — null means *not answered yet*, and reading it as "empty" is what
-  makes a screen claim nothing names a live space and fires the archived read
-  on a healthy file.
+  `spaces` to `nameSpace` / `unresolvedSpaceIds` / `describeWriteFailure` /
+  `describeSpaceFilterFailure` **null and all** rather than `?? []` — null means
+  *not answered yet*, and reading it as "empty" is what makes a screen claim
+  nothing names a live space and fires the archived read on a healthy file.
+  A surface derives `needed` for the archived read from **everything it names**,
+  the write target and the space filter included: gating only on rendered rows
+  left the two controls that most often point at a retired space unable to name
+  one.
 - **Logic worth testing lives in a plain module, not in a component.** The
   harness is unit-only, so a rule that matters (a URL codec, a diff parser, a
   grant grid) goes in its own `.ts` with a `.test.ts` beside it, and the

@@ -47,6 +47,12 @@ interface GraphToolbarProps {
   actorOptions: readonly string[];
   /** Active spaces for the space picker; null while loading or after a failure. */
   spaces: readonly SpaceOut[] | null;
+  /**
+   * Archived space nodes, so a filter left pointing at one is named in the
+   * picker rather than shown as its id. Never offered as a choice — the
+   * vocabulary is `spaces` alone.
+   */
+  archivedSpaces: readonly NodeOut[];
   /** True once the space list request failed. */
   spacesFailed: boolean;
   /** How the filtered space is named in the chip row. */
@@ -74,6 +80,7 @@ export function GraphToolbar({
   nodeTypeOptions,
   actorOptions,
   spaces,
+  archivedSpaces,
   spacesFailed,
   spaceName,
   unratedEdges,
@@ -227,6 +234,7 @@ export function GraphToolbar({
           value={filters.space}
           onChange={(space) => onFiltersChange({ ...filters, space })}
           spaces={spaces}
+          archivedSpaces={archivedSpaces}
           failed={spacesFailed}
         />
 

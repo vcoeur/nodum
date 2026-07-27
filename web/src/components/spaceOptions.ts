@@ -25,10 +25,21 @@
  * surface that *displays* a space rather than offering it wants `nameSpace`
  * (`spaceNaming.ts`) instead — the fallback is right for a picker and is a bare
  * 32-hex id everywhere else.
+ *
+ * **An archived space may be named here, and may never be offered here.** Those
+ * are two different things and this module is built so they cannot be confused:
+ * it takes the *active* list and, at most, **one already-resolved name for the
+ * value it is already carrying** ({@link spaceOptions}'s `selectedName`). It
+ * never receives the archived list, so no edit inside it can put an archived
+ * space among the choices — there is nothing here to put. A human who moves off
+ * a retired space cannot come back to it, which is what archiving means, and
+ * D1a is why: a write target the human could re-choose but the server will not
+ * resolve files work nowhere.
  */
 
 import type { NodeOut } from "../api/types";
 import { findSpace } from "./spaceNaming";
+import type { SpaceName } from "./spaceNaming";
 
 /** The "no space filter" value: read every space in scope. The default. */
 export const ANY_SPACE = "";
@@ -45,6 +56,16 @@ export interface SpaceOption {
    * come back to. The picker marks it rather than passing it off as ordinary.
    */
   unlisted?: boolean;
+  /**
+   * True when that unlisted selection was resolved to an **archived** space.
+   *
+   * Only ever set on an `unlisted` option, and it says what the mark should
+   * read: *archived* is a fact about a space that is still there, *unavailable*
+   * is all a picker can say when nothing named it. Neither makes the option
+   * selectable — it is the current value, and it disappears the moment the
+   * human picks something else.
+   */
+  archived?: boolean;
 }
 
 /**
@@ -59,13 +80,30 @@ export interface SpaceOption {
  * **That fallback is a picker rule, not a naming rule.** Outside a `<select>`
  * it prints a 32-hex id at a reader — use `nameSpace` (`spaceNaming.ts`), which
  * keeps *archived* apart from *nothing names this* instead of collapsing both
- * into the id.
+ * into the id. It is kept out of the `components/` barrel for that reason: its
+ * one caller is {@link spaceOptions}, below, and every surface that reached for
+ * it instead of `nameSpace` was a bare id on a screen.
  *
  * @param spaces Every active space.
  * @param spaceRef A space id or name.
  */
 export function spaceLabel(spaces: readonly NodeOut[], spaceRef: string): string {
   return findSpace(spaces, spaceRef)?.title ?? spaceRef;
+}
+
+/**
+ * What a picker appends to an option that only exists because it is selected.
+ *
+ * One owner for two words that have to stay different: *archived* is a fact —
+ * the space is there, retired, and its content still readable — while
+ * *unavailable* is the honest shrug for a reference nothing named. Both pickers
+ * render this, and neither may drop the mark: an unlisted option shown plainly
+ * reads as a choice the human could make again, and it is not.
+ *
+ * @param archived Whether the selection resolved to an archived space.
+ */
+export function unlistedMark(archived = false): string {
+  return archived ? "(archived)" : "(unavailable)";
 }
 
 /**
@@ -88,14 +126,26 @@ export function resolveSpaceValue(spaces: readonly NodeOut[], spaceRef: string):
  * Spaces are sorted by label rather than left in server order, because the list
  * is a vocabulary the human scans and `GET /api/spaces` orders by id.
  *
+ * **The choices are exactly `spaces`.** The only option this adds beyond them is
+ * the current selection, when the list does not hold it, and only because a
+ * controlled `<select>` has to be able to render its own value. `selectedName`
+ * changes what that one option *says* and never whether it exists — which is
+ * how an archived write target can be named without becoming a space anyone can
+ * newly choose. Pass a name resolved from some *other* reference and the option
+ * would carry the wrong label; it is the resolution of `selected`, or null.
+ *
  * @param spaces Every active space; an empty list yields the sentinel alone.
  * @param selected The current selection, by id or name, so it can be
  *   guaranteed representable.
+ * @param selectedName `selected` resolved through `nameSpace` — supplies the
+ *   name (and the archived mark) for a selection the active list cannot name.
+ *   Null when the caller has nothing better than the reference.
  * @param anyLabel Label for the no-filter sentinel.
  */
 export function spaceOptions(
   spaces: readonly NodeOut[],
   selected: string = ANY_SPACE,
+  selectedName: SpaceName | null = null,
   anyLabel = "Any space",
 ): SpaceOption[] {
   const listed: SpaceOption[] = spaces
@@ -106,7 +156,12 @@ export function spaceOptions(
 
   const resolved = resolveSpaceValue(spaces, selected);
   if (resolved !== ANY_SPACE && !options.some((option) => option.value === resolved)) {
-    options.push({ value: resolved, label: spaceLabel(spaces, resolved), unlisted: true });
+    options.push({
+      value: resolved,
+      label: selectedName?.label ?? spaceLabel(spaces, resolved),
+      unlisted: true,
+      archived: selectedName?.kind === "archived",
+    });
   }
 
   return options;
