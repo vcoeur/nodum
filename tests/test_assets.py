@@ -968,7 +968,10 @@ def test_unreadable_image_bytes_are_rejected(fresh_db, tmp_path):
         source.write_bytes(payload)
         asset = assets.register_asset(source)
         assert asset.mime.startswith("image/"), (name, asset.mime)
-        with pytest.raises(UnsupportedRendition):
+        # The message matters as much as the class: all four land on the one
+        # `OSError` branch, so a narrower catch reintroducing F1 would change
+        # what comes back rather than only how it is raised.
+        with pytest.raises(UnsupportedRendition, match="not a raster image"):
             assets.get_rendition(asset.hash, principal=owner())
 
 

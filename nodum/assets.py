@@ -228,9 +228,9 @@ RECOGNISED_IMAGE_MIMES: frozenset[str] = frozenset(
     mime for mime in RECOGNISED_MIMES if mime.startswith("image/")
 )
 
-#: Bytes read from the head of a file to identify it — one read serving both
-#: halves of the sniff. Every signature above fits in the first 12; the text
-#: heuristic wants a window, and 4 KiB is it (git reads 8000).
+#: Bytes read from each end of a file to identify it. Every signature above fits
+#: in the first 12; the text heuristic wants a window at *both* ends, and 4 KiB
+#: is it (git reads 8000). The head window also bounds the displaced-PDF scan.
 _SNIFF_BYTES = 4096
 
 #: C0 control characters that appear in ordinary text: tab, newline, vertical
@@ -491,13 +491,12 @@ def _sniff_displaced_pdf(head: bytes) -> str | None:
     """Find a PDF header that is not at offset 0, the way the readers do.
 
     A ``%PDF-`` marker need not lead the file: `pypdf` and PDFium both scan for
-    it, so a PDF with a stray byte or a garbage prefix ahead of its header is a
-    document this system can fully act on — it extracts, it paginates, and its
-    ``page:<n>`` rasters render. Refusing it at the door contradicted the one
-    rule the recognised set is derived from, and it was the *live* end-to-end
-    pass that caught it: the review's own fix for the mis-typing (F3) was
-    verified through :func:`nodum.ingest.ingest_file`, which has no admission
-    policy, so nothing exercised the route a browser actually posts to.
+    it, so a PDF behind a stray byte is a document this system can act on.
+    Refusing it at the door contradicted the one rule the recognised set is
+    derived from, and it was the *live* end-to-end pass that caught it: the
+    review's own fix for the mis-typing (F3) was verified with a hand-assembled
+    uncompressed fixture, which is NUL-free and so takes the text branch, while
+    every real PDF carries compressed streams and takes this one.
 
     **Only reached when the file is not text**, which is what makes the scan
     safe: a real PDF's body carries NUL bytes in its streams, while prose that
@@ -506,6 +505,20 @@ def _sniff_displaced_pdf(head: bytes) -> str | None:
     text test first therefore costs nothing and removes the whole class of false
     positive, where a bounded scan would only have made it rarer. The version
     digits are required for the same reason, one layer down.
+
+    **How far the tolerance actually goes**, measured on this install rather than
+    assumed: `pypdf` reads a header at any offset, PDFium stops looking at 1 KiB,
+    and this scan stops at the head window. So a prefix under 1 KiB is whole —
+    text, pages and ``page:<n>`` rasters; between 1 KiB and the window the
+    document extracts and paginates but its page rasters answer a clean 400; past
+    the window it is refused at the door. Degradation is a refusal or a mapped
+    error at every step, never a wrong answer.
+
+    Admission therefore widens to *non-text bytes carrying a versioned PDF header
+    in the head window*, which is broader than "is a PDF" — a zip whose first
+    entry is a PDF qualifies. That costs nothing that was not already available:
+    the same bytes at offset 0 are a leading signature and were admitted before
+    this function existed, and everything downstream degrades cleanly.
 
     :param head: The leading window, already read.
     :returns: ``application/pdf`` for a displaced header, else ``None``.

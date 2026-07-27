@@ -334,9 +334,12 @@ degrades to BM25 + graph expansion. `NODUM_EMBED_MODEL` switches the model
   rendition ceiling. Neither route reads the type
   off the filename or the client's `Content-Type`. Something neither takes — a
   `.docx`, a renamed binary, anything with no signature and NULs in it — goes
-  in through `nodum ingest file`, where the operator owns the file; the text test
-  behind that is a heuristic over a window at each end of the file rather than a
-  guarantee, and the sniffer's own docstring says exactly what it checks. There is
+  in through `nodum ingest file`, where the operator owns the file. Both halves
+  of that are heuristics rather than guarantees, and the sniffer's own docstring
+  says exactly what each one checks: the text test is a window at each end of the
+  file, and the displaced-PDF scan admits any non-text bytes carrying a versioned
+  `%PDF-` header in the head window — so a zip whose first entry is a PDF gets
+  in, and gets an honest "no text came out" for its trouble. There is
   no delete route, so what lands stays until it is managed out of band — which is
   why an upload that will be refused for a reason needing no bytes (an
   unresolvable target space) is refused before anything is stored.

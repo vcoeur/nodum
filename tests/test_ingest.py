@@ -320,6 +320,37 @@ def test_the_already_ingested_branch_still_reports_a_truncated_document(
     assert len(again.pages) == 3
 
 
+def test_archiving_a_page_of_a_truncated_document_does_not_un_truncate_it(
+    fresh_db, tmp_path, monkeypatch
+):
+    """The two halves of F2's fix cancelled each other, and a merge-gate review caught it.
+
+    Restricting `pages` to non-archived blocks was right; inferring the cap's
+    effect from that same filtered list was not. One archived page — ordinary
+    curation — then turned the `true` the first drop reported into a `false`,
+    which is the silent truncation the flag exists to prevent, arriving through
+    the fix for its sibling.
+    """
+    monkeypatch.setattr(ingest, "MAX_PAGE_BLOCKS", 3)
+    monkeypatch.setattr(
+        extract,
+        "extract",
+        lambda source, *, mime: extract.Extraction(
+            handler="pdf", text="x", pages=[f"page {n}" for n in range(1, 11)]
+        ),
+    )
+    source_file = tmp_path / "long.pdf"
+    source_file.write_bytes(b"%PDF-1.4\n%%EOF\n")
+    first = ingest.ingest_file(source_file, principal=owner())
+    service.transition(first.pages[1].id, "archive", principal=owner())
+
+    again = ingest.ingest_file(source_file, principal=owner())
+
+    assert again.pages_truncated is True
+    # The retired page leaves the list and stays in the count.
+    assert len(again.pages) == 2
+
+
 def test_a_doomed_ingestion_stores_no_bytes(fresh_db, tmp_path):
     """Review F13: nothing irreversible happens before a refusal that needs no bytes.
 

@@ -404,7 +404,7 @@ def _already_ingested(
     truthful instead of claiming a fresh extraction.
     """
     extracted = asset.extracted_text or ""
-    pages = _existing_page_blocks(source, principal=principal, path=path)
+    pages, blocks_ever_written = _existing_page_blocks(source, principal=principal, path=path)
     return IngestOut(
         asset=asset,
         asset_ref=asset_ref,
@@ -416,7 +416,9 @@ def _already_ingested(
         # truncated when it was not — and that is the right side to err on, since
         # the other one has a 900-page scan answering `false` on the second drop,
         # which is the silent truncation this pipeline promises never to make.
-        pages_truncated=len(pages) >= MAX_PAGE_BLOCKS,
+        # Counted over every page block ever written, archived included: retiring
+        # one page of a truncated scan does not un-truncate it.
+        pages_truncated=blocks_ever_written >= MAX_PAGE_BLOCKS,
         edges=service.list_edges(
             node_id=source.id, type=PROVENANCE_EDGE, principal=principal, path=path
         ),
@@ -433,8 +435,8 @@ def _already_ingested(
 
 def _existing_page_blocks(
     source: NodeOut, *, principal: Principal, path: str | Path | None
-) -> list[NodeOut]:
-    """The page blocks a ``source`` node already carries — what the created branch means.
+) -> tuple[list[NodeOut], int]:
+    """The page blocks a ``source`` node carries, and how many were ever written.
 
     ``service.list_children`` filters on neither type nor state, and a ``source``
     is an ordinary node: anything can be written as its child (the CLI's
@@ -444,12 +446,22 @@ def _existing_page_blocks(
     CLI, over MCP and in the browser at once, since all three read this one
     field (review F2). Restricting it here rather than at a caller is what keeps
     the two branches of one function answering the same question.
+
+    **Two counts, because they answer different questions.** The list is what the
+    document *has*, which is the created branch's meaning. The count is what the
+    cap *did*, and it must include archived blocks: inferring the truncation flag
+    from the filtered list let a single archived page turn a `true` into a
+    `false` — reintroducing, through the very filter that fixed its sibling, the
+    silent truncation the flag exists to prevent.
+
+    :returns: The live page blocks, and the number of page blocks in any state.
     """
-    return [
+    page_blocks = [
         child
         for child in service.list_children(source.id, principal=principal, path=path)
-        if child.type == PAGE_TYPE and child.state != ARCHIVED_STATE
+        if child.type == PAGE_TYPE
     ]
+    return [child for child in page_blocks if child.state != ARCHIVED_STATE], len(page_blocks)
 
 
 def _source_content(text: str) -> str:

@@ -1020,10 +1020,17 @@ Phase-1 decision log.
   else with NULs and no signature are refused by both, and that refusal names
   `nodum ingest file` as the way in, because the pipeline's tolerance for a file
   no handler claims is unchanged and the CLI is where an operator registers a
-  file they already own. **The refusal of a renamed binary is a heuristic, not a
-  guarantee** — see the sniffer's windowed text rule under `nodum.assets`; a
-  NUL-free, control-free binary format is admitted as text, which is bounded by
-  what the download route will serve it back as. Availability is *not* part of it
+  file they already own. **That refusal is a heuristic, not a guarantee**, and it
+  has exactly two documented ways through, both of which degrade cleanly rather
+  than reaching anything they should not. A **NUL-free, control-free** binary
+  format is admitted as text — see the sniffer's windowed rule under
+  `nodum.assets` — bounded by what the download route serves it back as. And
+  **non-text bytes carrying a versioned `%PDF-` header in the head window** are
+  admitted as PDF, so a zip whose first entry is a PDF passes: that is the
+  displaced-header scan being broader than "is a PDF", it grants nothing the same
+  bytes at offset 0 did not already grant as a leading signature, and the
+  downstream answer is an extraction `detail` or a mapped 400, never a 500 or a
+  bad rendition. Availability is *not* part of it
   — an install without the `pdf` extra still admits a PDF and reports in `detail`
   that no text came out, since refusing at the door is a worse answer than the
   honest empty one.
