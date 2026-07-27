@@ -72,6 +72,10 @@ SOURCE_TYPE = "source"
 #: Node type of the per-page children of a paginated source.
 PAGE_TYPE = "block"
 
+#: State a retired node carries, and so the one a page block is no longer
+#: counted in (:func:`_existing_page_blocks`).
+ARCHIVED_STATE = "archived"
+
 #: Edge tying a source to the bytes it was extracted from. Directed
 #: source → asset_ref: the document is *derived from* the binary, and the
 #: seed set carries ``derived`` as the inverse.
@@ -276,8 +280,14 @@ def _ingest(
     path: str | Path | None,
 ) -> IngestOut:
     """Run the pipeline over a file already on disk (the shared half of both entry points)."""
-    asset = assets.register_asset(source_file, name=name, path=path)
+    # Resolve the target space **before** any bytes are stored. Registration is
+    # the irreversible half of this function — there is no delete route — so a
+    # refusal that needs nothing but the space reference must happen first: an
+    # upload grant minted against a space archived inside its five-minute TTL
+    # used to store up to 32 MiB with no describing node, no FTS row, and no way
+    # to reclaim them, while the caller was told the upload failed (review F13).
     target_space = service.resolve_space_id(space, principal=principal, path=path)
+    asset = assets.register_asset(source_file, name=name, path=path)
 
     existing_ref = service.find_by_asset_hash(
         asset.hash, type=ASSET_REF_TYPE, space_id=target_space, principal=principal, path=path
@@ -394,11 +404,19 @@ def _already_ingested(
     truthful instead of claiming a fresh extraction.
     """
     extracted = asset.extracted_text or ""
+    pages = _existing_page_blocks(source, principal=principal, path=path)
     return IngestOut(
         asset=asset,
         asset_ref=asset_ref,
         source=source,
-        pages=service.list_children(source.id, principal=principal, path=path),
+        pages=pages,
+        # Inferred rather than recorded: this branch re-extracts nothing, so the
+        # block count is the only evidence left that the cap bit. A document
+        # whose text ran to exactly `MAX_PAGE_BLOCKS` pages is then reported as
+        # truncated when it was not — and that is the right side to err on, since
+        # the other one has a 900-page scan answering `false` on the second drop,
+        # which is the silent truncation this pipeline promises never to make.
+        pages_truncated=len(pages) >= MAX_PAGE_BLOCKS,
         edges=service.list_edges(
             node_id=source.id, type=PROVENANCE_EDGE, principal=principal, path=path
         ),
@@ -411,6 +429,27 @@ def _already_ingested(
         created=False,
         event_seq=0,
     )
+
+
+def _existing_page_blocks(
+    source: NodeOut, *, principal: Principal, path: str | Path | None
+) -> list[NodeOut]:
+    """The page blocks a ``source`` node already carries — what the created branch means.
+
+    ``service.list_children`` filters on neither type nor state, and a ``source``
+    is an ordinary node: anything can be written as its child (the CLI's
+    ``--parent-id``, MCP, any ``parent_id`` write), and an archived page block
+    keeps its parent. Reporting every child made ``pages`` claim a hand-written
+    note was a page of the document and kept counting a retired block — on the
+    CLI, over MCP and in the browser at once, since all three read this one
+    field (review F2). Restricting it here rather than at a caller is what keeps
+    the two branches of one function answering the same question.
+    """
+    return [
+        child
+        for child in service.list_children(source.id, principal=principal, path=path)
+        if child.type == PAGE_TYPE and child.state != ARCHIVED_STATE
+    ]
 
 
 def _source_content(text: str) -> str:

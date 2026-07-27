@@ -14,7 +14,8 @@ the service layer rather than writing anything itself.
 Originals are streamed in and out through :meth:`sqlite3.Connection.blobopen`,
 so neither registration nor rendering ever holds a whole file in memory. The
 copy is re-hashed as it streams: content addressing is only worth something if
-the stored bytes really do hash to their key, and the file is read twice.
+the stored bytes really do hash to their key, and the file is read twice —
+twice in full, plus the two bounded window reads :func:`sniff_mime` takes.
 A single asset cannot exceed ``SQLITE_LIMIT_LENGTH`` (1 GB) — checked up
 front. Note that the streamed copy holds SQLite's single write lock for its
 whole duration, so a very large registration blocks other writers.
@@ -45,13 +46,42 @@ Rendering is bounded by pixel count, not just by file size: a decompression
 bomb is a small file whose *decode* is enormous, so :data:`MAX_IMAGE_PIXELS`
 is checked from the image header — before any decoding — both when a caller
 offers bytes (:func:`check_image_pixel_budget`) and when a stored original is
-about to be rendered (:func:`_prepare_image`). A page raster has no header to
-read, so its budget is arithmetic instead: the bitmap PDFium allocates is the
-page geometry times the DPI scale, and PDF permits a 200×200 inch page, which
-is 829 megapixels at 144 DPI. :func:`sniff_image_mime` is the matching "what
-is this really" helper: registration records the MIME ``mimetypes`` derives
-from the *name*, which is fine for a local file the operator chose and useless
-against a network upload.
+about to be rendered (:func:`_prepare_image`). The offering side takes its
+ceiling as an argument, because *admission* and *rendition* are two questions:
+a 40 MP ceiling is the right answer for bytes whose whole purpose is a
+rendition and the wrong one for a 600 dpi A3 scan being turned into knowledge
+(~70 MP), so a caller may pass ``limit=None`` and keep only the guard that is
+about danger rather than capability — Pillow's own bomb refusal, plus bytes it
+cannot read at all. A page raster has no header to read, so its budget is
+arithmetic instead: the bitmap PDFium allocates is the page geometry times the
+DPI scale, and PDF permits a 200×200 inch page, which is 829 megapixels at
+144 DPI. :func:`sniff_mime` is the matching "what is this really" helper: it
+names a type from the *bytes*, over a vocabulary of what this system can act on
+(:data:`RECOGNISED_MIMES` — the rasters a rendition is derived from, PDF, the
+audio containers, and text).
+
+**Evidence has two strengths, and the stored MIME depends on which it got.** A
+leading signature is a format identifying itself: definite, and it may overrule
+the filename's ``mimetypes.guess_type`` when the two name different families,
+because the name is chosen by whoever supplied the bytes while the stored MIME
+is what ``page:<n>`` rasters and extraction dispatch on — a PDF delivered as
+``scan.txt`` has to land as ``application/pdf`` or it reaches neither. The text
+heuristic is not that: it is a *window* test that can only say "nothing in
+these 4 KiB looks binary", so it may only **fill in** where the name guessed
+nothing (:func:`_stored_mime`, note 01 D3 as revised by review F3). So an SVG
+keeps ``image/svg+xml``, and ``application/json`` and ``application/xhtml+xml``
+keep themselves without a special-case list, because weak evidence can no longer
+overrule a specific guess.
+
+**A displaced PDF header is definite evidence too** — the readers this project
+uses scan for ``%PDF-`` rather than requiring it at offset 0, so a PDF behind a
+stray byte is a document that extracts, paginates and rasterises. It is checked
+**after** the text test, and only when that says the bytes are not text, which is
+what makes searching for the marker safe rather than merely unlikely to misfire:
+a PDF's streams carry NUL bytes and prose quoting ``%PDF-1.4`` does not
+(:func:`_sniff_displaced_pdf`). Refusing such a file at the door was a live
+end-to-end finding, not a test one — the fix it belongs to was verified through
+the pipeline, which has no admission policy.
 
 **Access: an asset is as reachable as its describing nodes.** Asset rows are
 keyed by sha256 and deduped globally, so a ``space_id`` column here could only
@@ -72,6 +102,7 @@ whose ingestion has not run yet.
 from __future__ import annotations
 
 import base64
+import codecs
 import hashlib
 import io
 import json
@@ -81,7 +112,7 @@ import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
-from PIL import Image, ImageOps, UnidentifiedImageError
+from PIL import Image, ImageOps
 
 from nodum import db
 from nodum.models import AssetOut, PurgeResult, RenditionOut
@@ -104,10 +135,24 @@ _CHUNK_BYTES = 1 << 20
 #: decodes anyway, which is exactly the 121 MP case that cost 185 MB of RSS.
 MAX_IMAGE_PIXELS = 40_000_000
 
-#: Image formats this system can render, and the magic bytes that identify
-#: each. Sniffed rather than trusted: ``mimetypes.guess_type`` reads the
-#: filename, which whoever supplied the bytes also chose.
-_IMAGE_SIGNATURES: tuple[tuple[bytes, str], ...] = (
+#: Formats identified by a leading signature, and the MIME each sniffs to.
+#: Sniffed rather than trusted: ``mimetypes.guess_type`` reads the filename,
+#: which whoever supplied the bytes also chose.
+#:
+#: The vocabulary is *what this system can act on*, taken from the two places
+#: that already decide that — the rendition path (rasters, plus PDF for
+#: ``page:<n>``) and :mod:`nodum.extract`'s registry (PDF, images, audio, text).
+#: A tagless MP3 — a bare ``\xff\xfb`` frame sync — is deliberately absent: two
+#: bytes that common are not evidence, and anything that writes an ``.mp3``
+#: writes an ID3 header in front of it.
+#:
+#: The four rasters after the classic six are here because this Pillow build
+#: reads and renders them (review F8): a JPEG 2000, an ICO and a BigTIFF all
+#: carry NULs in their header, so the text heuristic could never name them and
+#: they were refused at the door while ``get_rendition`` on the very same bytes
+#: produced a thumbnail. The set the network admits has to be the set this
+#: install can act on, or the policy is refusing its own capability.
+_SIGNATURES: tuple[tuple[bytes, str], ...] = (
     (b"\x89PNG\r\n\x1a\n", "image/png"),
     (b"\xff\xd8\xff", "image/jpeg"),
     (b"GIF87a", "image/gif"),
@@ -115,11 +160,107 @@ _IMAGE_SIGNATURES: tuple[tuple[bytes, str], ...] = (
     (b"BM", "image/bmp"),
     (b"II*\x00", "image/tiff"),
     (b"MM\x00*", "image/tiff"),
+    # BigTIFF (version 43 where TIFF writes 42) — a distinct header, the same
+    # MIME and the same Pillow plugin.
+    (b"II+\x00", "image/tiff"),
+    (b"MM\x00+", "image/tiff"),
+    # JPEG 2000 in both spellings Pillow accepts: the JP2 signature box, and the
+    # bare codestream a `.j2k` is. Two signatures, one MIME, like GIF's two.
+    (b"\x00\x00\x00\x0cjP  \r\n\x87\n", "image/jp2"),
+    (b"\xff\x4f\xff\x51", "image/jp2"),
+    # ICO: two reserved NUL bytes then the type word (1 = icon).
+    (b"\x00\x00\x01\x00", "image/x-icon"),
+    (b"%PDF-", "application/pdf"),
+    (b"ID3", "audio/mpeg"),
+    (b"OggS", "audio/ogg"),
+    (b"fLaC", "audio/flac"),
 )
 
-#: Bytes read to identify a format. WebP needs 12 (``RIFF….WEBP``); the rest
-#: are shorter.
-_SNIFF_BYTES = 16
+#: RIFF is one container that names its payload at offset 8, so the ``RIFF``
+#: prefix alone says nothing: WebP and WAV differ only in that form name.
+_RIFF_FORMS: dict[bytes, str] = {b"WEBP": "image/webp", b"WAVE": "audio/wav"}
+
+#: A PDF header carrying its version, searched for rather than matched at offset
+#: 0 (:func:`_sniff_displaced_pdf`). The digits are required so the pattern
+#: names a header rather than any mention of the marker.
+_PDF_HEADER = re.compile(rb"%PDF-\d\.\d")
+
+#: What an ISO-base-media file (``....ftyp``) sniffs to, by the brand at offset
+#: 8 — the only part of the header that says what is *in* the container.
+#:
+#: Only the audio-only brands and AVIF are claimed. ``M4A ``/``M4B `` are
+#: audio-only by definition, and AVIF is a raster this Pillow build renders.
+#: Everything else in the family is video (``isom``, ``mp41``, ``mp42``,
+#: ``avc1``, ``qt  ``), which :mod:`nodum.extract` deliberately claims no
+#: handler for. This used to be a ``brand.startswith(b"mp4")`` prefix match on
+#: the theory that a muxer writes an ``mp4x`` brand for audio-only MP4: it does
+#: not — ffmpeg writes ``isom`` by default and ``mp42`` on request for ordinary
+#: *video*, so two videos differing only in brand got opposite answers and one
+#: of them was stored as ``audio/mp4`` (review F7).
+_ISO_BMFF_BRANDS: dict[bytes, str] = {
+    b"M4A ": "audio/mp4",
+    b"M4B ": "audio/mp4",
+    b"avif": "image/avif",
+}
+
+#: What a NUL-free, control-character-free window sniffs to. Text is the one
+#: recognised type with no signature to match — see :func:`_sniff_text`.
+TEXT_MIME = "text/plain"
+
+#: The MIME recorded when neither the bytes nor the name say anything.
+FALLBACK_MIME = "application/octet-stream"
+
+#: Every MIME :func:`sniff_mime` can return — the vocabulary of "bytes this
+#: system can act on", and therefore the widest set any network surface may
+#: admit. Derived from the signature table rather than restated, so a format
+#: added above reaches the policy without a second edit.
+RECOGNISED_MIMES: frozenset[str] = frozenset(
+    {mime for _signature, mime in _SIGNATURES}
+    | set(_RIFF_FORMS.values())
+    | set(_ISO_BMFF_BRANDS.values())
+    | {TEXT_MIME}
+)
+
+#: The raster subset of :data:`RECOGNISED_MIMES`: the types a ``thumb`` or
+#: ``preview`` can be derived from, and so the only ones a note can inline and
+#: have rendered.
+RECOGNISED_IMAGE_MIMES: frozenset[str] = frozenset(
+    mime for mime in RECOGNISED_MIMES if mime.startswith("image/")
+)
+
+#: Bytes read from the head of a file to identify it — one read serving both
+#: halves of the sniff. Every signature above fits in the first 12; the text
+#: heuristic wants a window, and 4 KiB is it (git reads 8000).
+_SNIFF_BYTES = 4096
+
+#: C0 control characters that appear in ordinary text: tab, newline, vertical
+#: tab, form feed, carriage return, and escape (an ANSI-coloured log).
+_TEXT_CONTROL_BYTES = frozenset(b"\t\n\x0b\x0c\r\x1b")
+
+#: The same set as characters, for a window read through a UTF-16/32 BOM, where
+#: the rule has to apply to decoded code points rather than to raw bytes.
+_TEXT_CONTROL_CHARS = frozenset("\t\n\x0b\x0c\r\x1b")
+
+#: Byte-order marks that make a window text despite the NUL rule, each with the
+#: encoding the rest of the window is then read in and its code-unit width.
+#:
+#: Only UTF-16 and UTF-32 are here. They spell ASCII with NUL padding, so the
+#: NUL rule alone would call every one of them binary, and the mark is the file
+#: saying otherwise — but the exemption is from the *NUL* rule only: the window
+#: is decoded in that encoding and still has to be free of control characters.
+#: **The UTF-8 BOM is deliberately absent** (review F4): UTF-8 text passes the
+#: ordinary byte test unaided, so honouring the mark bought nothing but a
+#: bypass — three bytes in front of an ``.exe`` made it ``text/plain`` and the
+#: capability route admitted it.
+#:
+#: UTF-32-LE precedes UTF-16-LE because ``\xff\xfe\x00\x00`` starts with
+#: ``\xff\xfe``; the wider mark has to be tested first or it never matches.
+_TEXT_BOMS: tuple[tuple[bytes, str, int], ...] = (
+    (codecs.BOM_UTF32_LE, "utf-32-le", 4),
+    (codecs.BOM_UTF32_BE, "utf-32-be", 4),
+    (codecs.BOM_UTF16_LE, "utf-16-le", 2),
+    (codecs.BOM_UTF16_BE, "utf-16-be", 2),
+)
 
 
 class AssetNotFound(LookupError):
@@ -272,29 +413,224 @@ def rendition_id(asset_hash: str, profile: str) -> str:
     return hashlib.sha256(f"{asset_hash}:{profile}".encode()).hexdigest()
 
 
-def sniff_image_mime(source: str | Path) -> str | None:
-    """Identify a file's image type from its leading bytes.
+@dataclass(frozen=True)
+class _Sniff:
+    """What the bytes said, and how strongly they said it.
+
+    ``definite`` is true only for a leading-signature match — a format
+    identifying itself, which may overrule a filename from another family. The
+    text heuristic sets it false, because a window test can never be more than
+    weak evidence (see :func:`_sniff_text`).
+    """
+
+    mime: str | None
+    definite: bool
+
+
+def sniff_mime(source: str | Path) -> str | None:
+    """Identify a file's type from its bytes.
 
     Args:
         source: Path to the file to inspect.
 
     Returns:
-        The MIME type, or ``None`` for anything that is not a recognised raster
-        image. A caller deciding whether to *accept* bytes must use this rather
-        than the filename: the two disagree exactly when it matters.
+        One of :data:`RECOGNISED_MIMES`, or ``None`` for bytes this system can
+        do nothing with. A caller deciding whether to *accept* bytes must use
+        this rather than the filename: the two disagree exactly when it matters.
+        A caller deciding what to *record* needs the strength of the evidence as
+        well and goes through :func:`_sniff`.
+    """
+    return _sniff(source).mime
+
+
+def _sniff(source: str | Path) -> _Sniff:
+    """Name a file's type from its bytes, with how strongly the bytes said it.
+
+    Reads a :data:`_SNIFF_BYTES` window from the head, and — only if no
+    signature matched, so the common case pays nothing — a second one from the
+    tail, which is what the text decision needs (:func:`_sniff_text`). The two
+    windows never overlap: for a file smaller than two windows the second one
+    is simply the remainder.
+
+    Three questions in a fixed order, and the order carries an argument: a
+    leading signature, then text, then a displaced PDF header. The last is
+    reached only for bytes that are *not* text, which is what makes searching
+    the window for ``%PDF-`` safe (:func:`_sniff_displaced_pdf`).
     """
     with Path(source).expanduser().open("rb") as handle:
         head = handle.read(_SNIFF_BYTES)
-    if head.startswith(b"RIFF") and head[8:12] == b"WEBP":
-        return "image/webp"
-    for signature, mime in _IMAGE_SIGNATURES:
+        signature = _sniff_signature(head)
+        if signature is not None:
+            return _Sniff(signature, definite=True)
+        size = handle.seek(0, io.SEEK_END)
+        tail_offset = max(len(head), size - _SNIFF_BYTES)
+        handle.seek(tail_offset)
+        tail = handle.read(_SNIFF_BYTES)
+    text = _sniff_text(head, tail, tail_offset)
+    if text is not None:
+        return _Sniff(text, definite=False)
+    displaced = _sniff_displaced_pdf(head)
+    return _Sniff(displaced, definite=displaced is not None)
+
+
+def _sniff_signature(head: bytes) -> str | None:
+    """Match a window's leading bytes against :data:`_SIGNATURES` and the containers."""
+    if head.startswith(b"RIFF"):
+        return _RIFF_FORMS.get(head[8:12])
+    if head[4:8] == b"ftyp":
+        # ISO base media: the box name says only "some MP4-family file", and the
+        # brand at offset 8 says which (:data:`_ISO_BMFF_BRANDS`).
+        return _ISO_BMFF_BRANDS.get(head[8:12])
+    for signature, mime in _SIGNATURES:
         if head.startswith(signature):
             return mime
     return None
 
 
+def _sniff_displaced_pdf(head: bytes) -> str | None:
+    """Find a PDF header that is not at offset 0, the way the readers do.
+
+    A ``%PDF-`` marker need not lead the file: `pypdf` and PDFium both scan for
+    it, so a PDF with a stray byte or a garbage prefix ahead of its header is a
+    document this system can fully act on — it extracts, it paginates, and its
+    ``page:<n>`` rasters render. Refusing it at the door contradicted the one
+    rule the recognised set is derived from, and it was the *live* end-to-end
+    pass that caught it: the review's own fix for the mis-typing (F3) was
+    verified through :func:`nodum.ingest.ingest_file`, which has no admission
+    policy, so nothing exercised the route a browser actually posts to.
+
+    **Only reached when the file is not text**, which is what makes the scan
+    safe: a real PDF's body carries NUL bytes in its streams, while prose that
+    merely quotes ``%PDF-1.4`` does not — this repository's own
+    ``docs/architecture.md`` quotes it, and so does ``AGENTS.md``. Ordering the
+    text test first therefore costs nothing and removes the whole class of false
+    positive, where a bounded scan would only have made it rarer. The version
+    digits are required for the same reason, one layer down.
+
+    :param head: The leading window, already read.
+    :returns: ``application/pdf`` for a displaced header, else ``None``.
+    """
+    return "application/pdf" if _PDF_HEADER.search(head) is not None else None
+
+
+def _sniff_text(head: bytes, tail: bytes, tail_offset: int) -> str | None:
+    """Decide whether a file is text, from a window at each end of it.
+
+    What is actually checked, and nothing more than this:
+
+    * an empty file is **not** text — it is no evidence of anything, and every
+      test below passes vacuously over zero bytes;
+    * a UTF-16/UTF-32 BOM exempts the file from the NUL rule (those encodings
+      spell ASCII with NUL padding), and the window is then decoded in that
+      encoding and required to be free of control characters;
+    * otherwise git's rule (``buffer_is_binary``) — a NUL byte means binary —
+      extended to the remaining C0 controls, since a window carrying a stray
+      ``\\x07`` is not prose;
+    * and **both** windows have to pass. A binary file with a long ASCII prefix
+      is admitted by a head-only test: 4096 spaces in front of a zip file is
+      still a valid zip, and its central directory is at the *end*.
+
+    **This is a heuristic and not a guarantee.** It says that neither end of
+    the file looks binary in :data:`_SNIFF_BYTES` bytes; it cannot say the file
+    is text, and a NUL-free, control-free binary format is admitted as text.
+    What that costs is bounded on purpose: extraction yields junk text instead
+    of a refusal, renditions still refuse it on the stored MIME, and
+    ``GET /api/download/{token}`` serves every original as
+    ``application/octet-stream`` with ``nosniff`` and ``attachment``, so nothing
+    stored here is ever served back as an executable type.
+
+    Args:
+        head: The first :data:`_SNIFF_BYTES` bytes of the file.
+        tail: The last window, or empty when the head already reached the end.
+        tail_offset: Where ``tail`` starts, which is what lets a UTF-16/32
+            window be decoded on the file's own code-unit boundaries.
+
+    Returns:
+        :data:`TEXT_MIME`, or ``None``.
+    """
+    if not head:
+        return None
+    for mark, encoding, unit in _TEXT_BOMS:
+        if not head.startswith(mark):
+            continue
+        if not _decodes_as_text(head[len(mark) :], encoding, unit, skew=0):
+            return None
+        skew = (len(mark) - tail_offset) % unit
+        return TEXT_MIME if _decodes_as_text(tail, encoding, unit, skew=skew) else None
+    for window in (head, tail):
+        if b"\x00" in window:
+            return None
+        if any(byte < 0x20 and byte not in _TEXT_CONTROL_BYTES for byte in window):
+            return None
+    return TEXT_MIME
+
+
+def _decodes_as_text(window: bytes, encoding: str, unit: int, *, skew: int) -> bool:
+    """Is a UTF-16/32 window, decoded, free of control characters?
+
+    ``skew`` is how far into a code unit the window begins, so the tail window
+    is decoded on the same boundaries the file's own units sit on; the trailing
+    partial unit is dropped for the same reason. Bytes that decode to no
+    scalar value at all (a surrogate, a code point past U+10FFFF) are not text.
+    """
+    aligned = window[skew:]
+    aligned = aligned[: len(aligned) - len(aligned) % unit]
+    if not aligned:
+        return True
+    try:
+        text = aligned.decode(encoding)
+    except UnicodeDecodeError:
+        return False
+    return all(char >= " " or char in _TEXT_CONTROL_CHARS for char in text)
+
+
+def _mime_family(mime: str) -> str:
+    """Group a MIME into the family :func:`_stored_mime` compares on."""
+    return mime.split("/", 1)[0]
+
+
+def _stored_mime(original_name: str, sniffed: _Sniff) -> str:
+    """Decide the MIME to record for a fresh registration (note 01 D3, review F3).
+
+    Two rules, one per strength of evidence:
+
+    * a **signature** may overrule the name when the two name different
+      families, and the name keeps its specificity *within* one family. So PDF
+      bytes called ``scan.txt`` are stored as ``application/pdf`` — which is
+      what ``page:<n>`` rasters and extraction dispatch on — while a PNG called
+      ``photo.jpeg`` keeps the name's answer, which no path here depends on.
+    * the **text heuristic** may only fill in where the name guessed nothing.
+      It is a window test, not an identification: a PDF whose ``%PDF-`` sits one
+      byte in sniffs as text, and letting that overrule ``.pdf`` cost the
+      document its handler, its page rasters, and put raw PDF bytes into the FTS
+      index. The same rule is what keeps ``image/svg+xml``,
+      ``application/json`` and ``application/xhtml+xml`` — all of which sniff as
+      text — without a list of exceptions to maintain.
+
+    Args:
+        original_name: The recorded name, whose extension is the guess.
+        sniffed: What :func:`_sniff` made of the same bytes.
+
+    Returns:
+        The MIME to store. Bytes the sniffer cannot name fall back to the guess
+        and then to :data:`FALLBACK_MIME`, exactly as registration always did.
+    """
+    guessed = mimetypes.guess_type(original_name)[0]
+    if guessed == FALLBACK_MIME:
+        # `.bin` guesses octet-stream, which is the *absence* of an answer
+        # spelled as a type; it must not outrank a real sniff.
+        guessed = None
+    if sniffed.mime is None:
+        return guessed or FALLBACK_MIME
+    if guessed is None:
+        return sniffed.mime
+    if not sniffed.definite:
+        return guessed
+    return guessed if _mime_family(guessed) == _mime_family(sniffed.mime) else sniffed.mime
+
+
 def check_image_pixel_budget(
-    source: str | Path, *, limit: int = MAX_IMAGE_PIXELS
+    source: str | Path, *, limit: int | None = MAX_IMAGE_PIXELS, name: str | None = None
 ) -> tuple[int, int]:
     """Read an image's dimensions from its header and refuse a decompression bomb.
 
@@ -303,7 +639,16 @@ def check_image_pixel_budget(
 
     Args:
         source: Path to the image file.
-        limit: Maximum pixel count to allow.
+        limit: Maximum pixel count to allow, or ``None`` for no ceiling of our
+            own. ``None`` keeps the guards that are about *danger* — Pillow's
+            own bomb refusal, and bytes Pillow cannot read at all — and drops
+            the one that is about *capability*, which is what a route admitting
+            bytes for ingestion rather than for rendering wants: a 600 dpi A3
+            scan is ~70 MP and nothing decodes it at admission time (review F9).
+        name: Name to use in a refusal instead of the path. The path is the
+            operator's on a terminal and a stranger's over a socket — the rule
+            ``http_api._failure_message`` already applies to ``OSError`` — so a
+            network caller is told the filename *it* supplied (review F6).
 
     Returns:
         The image's ``(width, height)``.
@@ -313,14 +658,22 @@ def check_image_pixel_budget(
             refuses the header outright as a bomb.
         UnsupportedRendition: If the file is not an image Pillow can read.
     """
+    described = name or source
     try:
         with Image.open(Path(source).expanduser()) as image:
             width, height = image.size
     except Image.DecompressionBombError as exc:
         raise ImageTooLarge(f"image refused as a decompression bomb: {exc}") from exc
-    except UnidentifiedImageError as exc:
-        raise UnsupportedRendition(f"not a raster image Pillow can read: {source}") from exc
-    if width * height > limit:
+    except OSError as exc:
+        # `OSError`, not `UnidentifiedImageError`: once a plugin's `accept()`
+        # matches and the parse then fails, Pillow raises a **bare** OSError
+        # ("Truncated File Read" for a short BMP, "could not create decoder
+        # object" for a truncated WebP), and `UnidentifiedImageError` is itself
+        # an OSError subclass — so catching only the subclass let the sibling
+        # case out of an anonymous route as `EXCEPTION_STATUS[OSError]`, a 500
+        # that also spent the caller's upload token (review F1).
+        raise UnsupportedRendition(f"not a raster image Pillow can read: {described}") from exc
+    if limit is not None and width * height > limit:
         raise ImageTooLarge(
             f"image is {width}×{height} ({width * height} pixels); the limit is {limit}"
         )
@@ -381,11 +734,18 @@ def register_asset(
     partial download — and a mismatch is refused rather than stored, because
     the alternative is a row whose bytes do not hash to their own key.
 
+    The recorded MIME prefers the bytes over the name (:func:`_stored_mime`).
+    On a dedup hit the stored type is kept — except where a definite signature
+    contradicts its family, which is repaired in place (:func:`_repaired_mime`),
+    so bytes registered under an older rule cannot poison every later reader of
+    the row. Nothing here *refuses* anything on type: the CLI registers a local
+    file the operator already owns, and that tolerance is deliberate — a type
+    policy belongs to the surfaces that take bytes from a stranger.
+
     Args:
         source: Path to the local file to register.
         name: Original name to record (defaults to the source file's name);
-            also the hint for MIME guessing (``application/octet-stream``
-            when nothing matches).
+            also the guess :func:`_stored_mime` weighs against the sniff.
         path: Explicit database path; defaults to ``NODUM_DB`` resolution.
 
     Returns:
@@ -410,9 +770,12 @@ def register_asset(
             )
         existing = conn.execute("SELECT * FROM assets WHERE hash = ?", (asset_hash,)).fetchone()
         if existing is not None:
-            return _asset_out(existing)
+            return _asset_out(_repaired_mime(conn, existing, source_file))
 
-        mime = mimetypes.guess_type(original_name)[0] or "application/octet-stream"
+        # `_sniff` reads a window from each end of the file, so neither this nor
+        # the dedup branch above is a third *pass* over it — the hash and copy
+        # passes are the only full reads.
+        mime = _stored_mime(original_name, _sniff(source_file))
         # Metadata row, then a zero-filled blob of the right size, then the
         # bytes streamed into it — all in one transaction, so a crash mid-copy
         # rolls back rather than leaving a half-written asset.
@@ -434,6 +797,41 @@ def register_asset(
         return _asset_out(row)
     finally:
         conn.close()
+
+
+def _repaired_mime(conn: sqlite3.Connection, row: sqlite3.Row, source_file: Path) -> sqlite3.Row:
+    """Fix a deduped row whose stored MIME a definite signature contradicts.
+
+    Registration returns on the sha256 hit, so bytes first registered under an
+    older rule — or under a name from another family — kept a wrong type
+    forever, and the new flow inherited it: a PDF stored as ``text/plain``
+    reaches no extraction handler, writes no page blocks and answers ``page:1``
+    with a refusal, while the ingestion that found the row reports success. The
+    hash proves the bytes are the same bytes; the type recorded for them is
+    simply wrong, so it is repaired rather than carried.
+
+    Only a **signature** repairs it, and only across families: the text
+    heuristic is a window guess and must never rewrite stored state (review F3),
+    and ``notes.md``'s ``text/markdown`` is a *better* answer than the sniff's
+    ``text/plain``, not a contradiction of it.
+
+    An ``UPDATE`` is how this table is already maintained: ``assets`` is
+    content-addressed base state rather than graph state, so it carries no
+    principal and no event (:func:`set_extracted_text` is the precedent, and
+    migration 0007's comment the reason) — the same bytes always resolve to the
+    same row, so there is nothing to undo.
+
+    Returns:
+        The row as it now stands: unchanged, or re-read after the repair.
+    """
+    sniffed = _sniff(source_file)
+    if sniffed.mime is None or not sniffed.definite:
+        return row
+    if _mime_family(sniffed.mime) == _mime_family(row["mime"]):
+        return row
+    conn.execute("UPDATE assets SET mime = ? WHERE hash = ?", (sniffed.mime, row["hash"]))
+    conn.commit()
+    return conn.execute("SELECT * FROM assets WHERE hash = ?", (row["hash"],)).fetchone()
 
 
 def _stream_into_blob(
@@ -849,7 +1247,13 @@ def get_rendition(
                     image = _prepare_image(original, spec)
                 else:
                     image = _render_pdf_page(original, page_number, spec)
-        except UnidentifiedImageError as exc:
+        except OSError as exc:
+            # `OSError` for the same reason :func:`check_image_pixel_budget`
+            # catches it (review F1): `UnidentifiedImageError` is one of its
+            # subclasses, and a plugin whose `accept()` matched before failing to
+            # parse raises the bare class ("Truncated File Read"). Catching only
+            # the subclass made a stored, signature-carrying, unparseable raster a
+            # 500 on the rendition route instead of this 400.
             raise UnsupportedRendition(
                 f"cannot render {asset['mime']} ({asset['original_name']}): not a raster image"
             ) from exc

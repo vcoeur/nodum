@@ -31,12 +31,14 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import codecs
 import hashlib
 import inspect
 import io
 import json
 import sqlite3
 import threading
+import zipfile
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from importlib.util import find_spec
 from pathlib import Path
@@ -48,7 +50,7 @@ from PIL import Image
 from starlette.requests import ClientDisconnect
 from typer.testing import CliRunner
 
-from nodum import assets, auth, cli, db, http_api, service, urls
+from nodum import assets, auth, cli, db, http_api, ingest, service, urls
 from nodum.principal import Principal
 
 AGENT = "agent:researcher"
@@ -1360,7 +1362,7 @@ def test_an_operator_can_name_the_host_this_server_answers_to(fresh_db):
     assert anywhere.get("/api/types", headers={"Host": "elsewhere.example"}).status_code == 200
 
 
-# ── 4c. Upload limits ─────────────────────────────────────────────────────────
+# ── 4c. Upload limits and the two routes' type policy ─────────────────────────
 
 
 def test_an_oversized_upload_is_refused_before_it_is_buffered(fresh_db, tmp_path):
@@ -1410,6 +1412,17 @@ def test_the_body_cap_covers_json_routes_too(fresh_db):
     assert response.status_code == 413
 
 
+def _put_through_a_grant(client, name: str, payload: bytes) -> httpx.Response:
+    """Mint an upload grant and PUT ``payload`` at it, as an anonymous holder would.
+
+    The grant declares ``application/octet-stream`` (``_mint_upload``'s default)
+    for every call, which is the point: the declared MIME is a promise made
+    before the bytes moved, and the policy reads the bytes instead.
+    """
+    grant = _mint_upload(client, name, len(payload))["grant"]
+    return Client(client.app).put(grant["url"], guard=False, content=payload)
+
+
 @pytest.mark.parametrize(
     ("name", "payload"),
     [
@@ -1423,12 +1436,328 @@ def test_the_body_cap_covers_json_routes_too(fresh_db):
     ],
 )
 def test_only_real_images_can_be_uploaded(client, fresh_db, name, payload):
-    """The type is decided by the bytes, never by the name the client chose."""
+    """The type is decided by the bytes, never by the name the client chose.
+
+    This route registers bytes and writes no describing node, so what describes
+    them is the note that inlines a rendition of them — which is why its admitted
+    set is the rasters and nothing else. The HTML row is refused *here* and
+    admitted on the capability route, which ingests it: the policy is one rule
+    parameterised by what the route can act on, not one rule per route.
+    """
     response = client.post("/api/assets", files={"file": (name, payload)})
 
     assert response.status_code == 400, response.text
     assert response.json()["error"]["type"] == "UnsupportedRendition"
+    # The refusal names what *is* accepted, not only what was refused.
+    assert "image/png" in response.json()["error"]["message"]
     assert assets.list_assets(principal=owner()) == []
+
+
+def test_a_document_is_refused_by_the_asset_route_and_ingested_by_the_capability_one(
+    client, fresh_db
+):
+    """The split this project opened on, closed in both directions.
+
+    A PDF is not something a note can inline and render, so ``/api/assets``
+    refuses it and says what it is. It *is* something ingestion turns into a
+    subgraph, so the capability route takes it — and the stored MIME follows the
+    bytes, not the grant's declaration.
+    """
+    payload = b"%PDF-1.7\n1 0 obj\n<< /Type /Catalog >>\n"
+
+    refused = client.post("/api/assets", files={"file": ("paper.pdf", payload)})
+    assert refused.status_code == 400, refused.text
+    assert refused.json()["error"]["type"] == "UnsupportedRendition"
+    assert "application/pdf" in refused.json()["error"]["message"]
+    assert assets.list_assets(principal=owner()) == []
+
+    result = _ok(_put_through_a_grant(client, "paper.pdf", payload))
+
+    assert result["asset"]["mime"] == "application/pdf"
+    assert result["asset_ref"]["props"]["asset_hash"] == result["asset"]["hash"]
+
+
+def _padded_zip() -> bytes:
+    """A real zip behind 4 KiB of ASCII — still a zip, and text to a head-only sniff."""
+    body = io.BytesIO()
+    with zipfile.ZipFile(body, "w") as archive:
+        archive.writestr("word/document.xml", "<w:document/>")
+    return b"A" * 4096 + body.getvalue()
+
+
+@pytest.mark.parametrize(
+    ("label", "payload"),
+    [
+        # The original case: `MZ` plus NULs matches no signature and fails the
+        # NUL test, so it is not text either. `/api/assets` already refused it;
+        # `PUT /api/uploads/{token}` used to register *and describe* it.
+        ("a bare executable", b"MZ\x90\x00\x03\x00\x00\x00\x04\x00\x00\x00this is a program"),
+        # Review F4's first bypass: any BOM used to mean text *before* the NUL
+        # test ran, so three bytes in front of the same program was admitted,
+        # stored as `text/plain`, and given a whole subgraph.
+        ("a BOM in front of it", codecs.BOM_UTF8 + b"MZ\x90\x00\x03\x00\x00\x00\x00\x00"),
+        ("a BOM in front of NULs", codecs.BOM_UTF8 + b"\x00" * 4096),
+        # F4's second bypass: a head-only window sees only the padding, and a
+        # zip's central directory is at the end — where the tail window looks.
+        ("an ASCII-padded zip", _padded_zip()),
+        # Review F5: `any()` over an empty window is False, so every test in the
+        # heuristic passed vacuously and a zero-byte `.exe` was admitted.
+        ("nothing at all", b""),
+    ],
+)
+def test_a_binary_the_window_test_catches_is_refused_by_both_upload_routes(
+    client, fresh_db, label, payload
+):
+    """What the type policy delivers on a renamed binary, stated exactly.
+
+    The text decision is a **windowed heuristic**: it says neither end of the
+    file looks binary in 4 KiB. It is not a guarantee that a renamed binary is
+    refused — a NUL-free, control-character-free format still gets in as text —
+    and each row here is a way past it that *was* open and is now closed.
+    """
+    inline = client.post("/api/assets", files={"file": ("innocent.png", payload)})
+    assert inline.status_code == 400, (label, inline.text)
+    assert inline.json()["error"]["type"] == "UnsupportedRendition"
+
+    capability = _put_through_a_grant(client, "innocent.pdf", payload)
+    assert capability.status_code == 400, (label, capability.text)
+    assert capability.json()["error"]["type"] == "UnsupportedRendition"
+    message = capability.json()["error"]["message"]
+    # The widest network route names what it does accept, and — having no wider
+    # route to redirect to — points at the CLI for the rest.
+    assert "application/pdf" in message
+    assert "nodum ingest file" in message
+
+    assert assets.list_assets(principal=owner()) == []
+    assert service.list_nodes(type="asset_ref", principal=owner()) == []
+
+
+def test_a_pdf_whose_header_is_one_byte_in_still_ingests_as_a_pdf(client, fresh_db):
+    """Review F3: a signature is definite evidence and a window test is not.
+
+    `\\n` before `%PDF-` is read fine by both `pypdf` and `pypdfium2`, matches no
+    signature, and sniffs as text — which used to overrule the filename's
+    `application/pdf` and cost the document its handler, its `page:<n>` rasters,
+    and put raw PDF bytes into `assets.extracted_text` and the FTS index.
+
+    Note the fixture's reach: `sample.pdf` is uncompressed, so its bytes are
+    NUL-free and it sniffs as *text*, which the name then outranks. A PDF with a
+    compressed stream sniffs as nothing — covered by
+    `test_a_pdf_with_binary_streams_and_a_displaced_header_is_admitted`, the case
+    that was refused at the door while this test was green.
+    """
+    payload = b"\n" + PDF_FIXTURE.read_bytes()
+
+    result = _ok(_put_through_a_grant(client, "shifted.pdf", payload))
+
+    assert result["asset"]["mime"] == "application/pdf"
+    if find_spec("pypdf") is not None:
+        assert result["extraction"]["handler"] == "pdf"
+        assert len(result["pages"]) == 2
+        assert "%PDF" not in (result["asset"]["extracted_text"] or "")
+    if find_spec("pypdfium2") is not None:
+        raster = client.get(f"/api/assets/{result['asset']['hash']}/rendition/page:1")
+        assert raster.status_code == 200, raster.text
+
+
+def test_a_pdf_with_binary_streams_and_a_displaced_header_is_admitted(client, fresh_db, tmp_path):
+    """The live end-to-end pass found this; the suite could not.
+
+    Every PDF a human drops carries compressed streams, so it does not sniff as
+    text — and with the header displaced it matched no leading signature either,
+    so the route answered 400 *"not a type this API recognises"* for a document
+    `pypdf` and PDFium both read. The sibling test above stayed green throughout,
+    because its hand-assembled fixture is NUL-free and took the text branch.
+
+    Drives the route rather than `ingest_file`, since admission is the thing
+    under test and the pipeline has no admission policy.
+    """
+    real = tmp_path / "real.pdf"
+    Image.new("RGB", (24, 18), "teal").save(real, "PDF")
+    assert b"\x00" in real.read_bytes(), "fixture must carry binary stream bytes"
+    payload = b"\n" + real.read_bytes()
+
+    result = _ok(_put_through_a_grant(client, "scan.pdf", payload))
+
+    assert result["asset"]["mime"] == "application/pdf"
+    assert result["created"] is True
+    if find_spec("pypdf") is not None:
+        assert result["extraction"]["handler"] == "pdf"
+    if find_spec("pypdfium2") is not None:
+        raster = client.get(f"/api/assets/{result['asset']['hash']}/rendition/page:1")
+        assert raster.status_code == 200, raster.text
+
+
+def test_a_binary_that_is_not_a_pdf_is_still_refused_by_the_displaced_scan(client, fresh_db):
+    """The scan widens what is admitted by exactly one format, not by "binary"."""
+    payload = b"MZ\x90\x00\x03\x00" + b"\x00" * 300 + b"this is a program"
+
+    refused = _put_through_a_grant(client, "innocent.pdf", payload)
+
+    assert refused.status_code == 400, refused.text
+    assert "not a type this API recognises" in refused.json()["error"]["message"]
+
+
+@pytest.mark.parametrize(
+    ("name", "options", "sniffed"),
+    [
+        ("photo.jp2", {}, "image/jp2"),
+        ("photo.avif", {}, "image/avif"),
+        ("photo.ico", {}, "image/x-icon"),
+        ("scan.tif", {"big_tiff": True}, "image/tiff"),
+    ],
+)
+def test_a_raster_this_build_renders_is_admitted_by_both_routes(
+    client, fresh_db, tmp_path, name, options, sniffed
+):
+    """Review F8: the admitted set has to be what this install can act on.
+
+    All four carry NULs in their header, so the text heuristic could never name
+    them and both routes 400'd — while `register_asset` + a `thumb` of the very
+    same bytes succeeded. Base took them on the capability route.
+    """
+    source = tmp_path / name
+    Image.new("RGB", (64, 48), "red").save(source, **options)
+    payload = source.read_bytes()
+    assert assets.sniff_mime(source) == sniffed, "admission is decided on this"
+
+    registered = _ok(client.post("/api/assets", files={"file": (name, payload)}))
+    # The name keeps its specificity inside the family, so `.ico` stores the
+    # `mimetypes` spelling rather than the sniffer's; both are rasters.
+    assert registered["mime"].startswith("image/")
+    thumb = client.get(f"/api/assets/{registered['hash']}/rendition/thumb")
+    assert thumb.status_code == 200, thumb.text
+
+    ingested = _ok(_put_through_a_grant(client, name, payload))
+    assert ingested["asset"]["hash"] == registered["hash"]
+    assert ingested["asset_ref"]["props"]["asset_hash"] == registered["hash"]
+
+
+def test_a_document_no_handler_claims_is_refused_over_http_but_not_by_the_pipeline(
+    client, fresh_db, tmp_path
+):
+    """The deliberate cost of the policy, and its boundary.
+
+    A ``.docx`` is a zip: no signature this system reads, NULs in the first
+    window, no handler in :mod:`nodum.extract`. Over the network we take from a
+    stranger, so both routes refuse it. The pipeline's own tolerance — a file no
+    handler claims is still registered and described — is unchanged, and that is
+    what ``nodum ingest file`` gives an operator registering a file they own.
+    """
+    payload = b"PK\x03\x04\x14\x00\x06\x00\x08\x00\x00\x00word/document.xml"
+
+    assert client.post("/api/assets", files={"file": ("notes.docx", payload)}).status_code == 400
+    assert _put_through_a_grant(client, "notes.docx", payload).status_code == 400
+    assert assets.list_assets(principal=owner()) == []
+
+    source = tmp_path / "notes.docx"
+    source.write_bytes(payload)
+    ingested = ingest.ingest_file(source, principal=owner())
+
+    assert ingested.created is True
+    assert ingested.extraction.handler == "none"
+    assert ingested.asset_ref.props["asset_hash"] == ingested.asset.hash
+
+
+def test_a_decompression_bomb_is_refused_on_the_capability_route_too(
+    client, fresh_db, tmp_path, monkeypatch
+):
+    """Same bomb, same header read; the budget was simply never run on this route.
+
+    It applies wherever the bytes turn out to be an image — a type with no pixels
+    to count (a PDF, an audio file, text) skips it rather than being refused.
+    What this route uses is the **bomb** half of the budget: Pillow's own
+    threshold, lowered here rather than met, since meeting it means allocating
+    179 megapixels.
+    """
+    bomb = tmp_path / "bomb.png"
+    Image.new("L", (8000, 8000)).save(bomb, "PNG")
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 1000)
+
+    response = _put_through_a_grant(client, "bomb.png", bomb.read_bytes())
+
+    assert response.status_code == 400, response.text
+    assert response.json()["error"]["type"] == "ImageTooLarge"
+    assert assets.list_assets(principal=owner()) == []
+    assert service.list_nodes(type="asset_ref", principal=owner()) == []
+
+
+def test_a_big_scan_is_ingested_and_refused_by_the_rendition_route(client, fresh_db, tmp_path):
+    """Capability must not gate admission (review F9).
+
+    A 49 MP PNG is over the 40 MP *rendition* ceiling and is an ordinary
+    document — a 600 dpi A3 scan is ~70 MP. Making that ceiling an admission
+    rule on the ingestion route contradicted this change's own principle, the
+    one that keeps a PDF admissible on an install with no `pdf` extra. So the
+    ceiling stays where a rendition is the point: `POST /api/assets`.
+    """
+    scan = tmp_path / "scan.png"
+    Image.new("L", (7000, 7000)).save(scan, "PNG")
+    payload = scan.read_bytes()
+
+    ingested = _ok(_put_through_a_grant(client, "scan.png", payload))
+    assert ingested["created"] is True
+    assert ingested["asset"]["mime"] == "image/png"
+    stored = [row.hash for row in assets.list_assets(principal=owner())]
+    assert stored == [ingested["asset"]["hash"]]
+
+    # The ceiling still holds where it means something: a rendition of those
+    # bytes, and the route whose entire purpose is producing one.
+    rendition = client.get(f"/api/assets/{ingested['asset']['hash']}/rendition/thumb")
+    assert rendition.status_code == 400
+    assert rendition.json()["error"]["type"] == "ImageTooLarge"
+    refused = client.post("/api/assets", files={"file": ("scan.png", payload)})
+    assert refused.status_code == 400
+    assert refused.json()["error"]["type"] == "ImageTooLarge"
+
+
+def test_an_unreadable_image_is_a_400_on_the_anonymous_route_and_names_no_path(client, fresh_db):
+    """Review F1 and F6 in one request, on the route with no session behind it.
+
+    Both payloads match an image signature, so Pillow's plugin `accept()`s them
+    and the parse then fails with a **bare** `OSError` —
+    `EXCEPTION_STATUS[OSError]` is 500, and the token was already spent by it.
+    And the message may not carry the spool path: this caller is a stranger.
+    """
+    for name, payload in (
+        ("x.bmp", b"BM" + b"not really a bitmap, no NULs here"),
+        ("x.webp", b"RIFF\x1a\x00\x00\x00WEBPVP8L" + b"\x00" * 8),
+    ):
+        response = _put_through_a_grant(client, name, payload)
+
+        assert response.status_code == 400, response.text
+        assert response.json()["error"]["type"] == "UnsupportedRendition"
+        message = response.json()["error"]["message"]
+        assert name in message
+        assert "/tmp" not in message and "nodum-upload-" not in message
+    assert assets.list_assets(principal=owner()) == []
+
+
+@pytest.mark.skipif(
+    find_spec("pypdfium2") is None or find_spec("pypdf") is None,
+    reason="the pdf extra is not installed",
+)
+def test_an_admitted_pdf_through_the_capability_route_becomes_the_whole_subgraph(client, fresh_db):
+    """The route's exit criterion: an admitted document lands as knowledge.
+
+    Not only the bytes — the describing node, the source carrying the extracted
+    text, the provenance edge, one block per page, and a ``page:<n>`` raster that
+    resolves, which is exactly what the stored MIME being ``application/pdf``
+    buys (the grant said ``application/octet-stream``).
+    """
+    result = _ok(_put_through_a_grant(client, "ostrogoths.pdf", PDF_FIXTURE.read_bytes()))
+
+    assert result["created"] is True
+    assert result["asset"]["mime"] == "application/pdf"
+    assert result["extraction"]["handler"] == "pdf"
+    assert result["asset_ref"]["props"]["asset_hash"] == result["asset"]["hash"]
+    assert result["edges"][0]["type"] == "derived_from"
+    assert [page["props"]["page"] for page in result["pages"]] == [1, 2]
+    assert result["asset_ref"]["created_by"] == OWNER_ACTOR
+
+    raster = client.get(f"/api/assets/{result['asset']['hash']}/rendition/page:1")
+    assert raster.status_code == 200, raster.text
+    assert Image.open(io.BytesIO(raster.content)).format == "WEBP"
 
 
 def test_a_decompression_bomb_is_refused_at_upload_and_at_rendering(client, fresh_db, tmp_path):
@@ -1783,7 +2112,14 @@ def test_an_upload_url_ingests_the_bytes_the_grant_was_minted_for(client, fresh_
 
 def test_an_upload_grant_dies_with_the_account_that_minted_it(client, fresh_db):
     """The principal is re-minted from the token row, so revocation reaches a
-    capability already handed out — it must not outlive the account behind it."""
+    capability already handed out — it must not outlive the account behind it.
+
+    The status is asserted exactly (review F12): `auth.PrincipalDisabled` derives
+    from `OSError` through `PermissionError`, so it landed on the `OSError → 500`
+    row and was rewritten as `storage error: PrincipalDisabled` — a sentence the
+    browser now shows a human for what is plainly a refusal. `>= 400` could not
+    see that.
+    """
     payload = b"late delivery"
     agent_principal = agent("courier", grants={"meta": "read", "main": "suggest"})
     grant = urls.mint_upload(
@@ -1793,8 +2129,34 @@ def test_an_upload_grant_dies_with_the_account_that_minted_it(client, fresh_db):
 
     response = Client(client.app).put(grant.url, guard=False, content=payload)
 
-    assert response.status_code >= 400
+    assert response.status_code == 403, response.text
+    assert response.json()["error"]["type"] == "PrincipalDisabled"
+    assert "storage error" not in response.text
     assert service.list_nodes(type="source", principal=owner()) == []
+
+
+def test_a_grant_for_a_space_archived_since_the_mint_stores_no_bytes(client, fresh_db):
+    """Review F13: a doomed upload used to store up to 32 MiB anyway.
+
+    Registration ran *before* the space was resolved, so a grant minted against
+    a space archived inside its five-minute TTL left bytes with no describing
+    node, no FTS row and no delete route — while the client was told the upload
+    failed. "Nothing was uploaded" has to be true, not merely reworded.
+    """
+    space = _ok(client.post("/api/spaces", json={"name": "shortlived"}))["id"]
+    payload = b"filed into a space that is about to retire"
+    grant = _mint_upload(client, "note.txt", len(payload), space=space)["grant"]
+    _ok(client.post(f"/api/spaces/{space}/archive"))
+
+    response = Client(client.app).put(grant["url"], guard=False, content=payload)
+
+    assert response.status_code == 404, response.text
+    assert assets.list_assets(principal=owner()) == []
+    conn = db.connect(fresh_db)
+    try:
+        assert conn.execute("SELECT count(*) AS n FROM asset_blobs").fetchone()["n"] == 0
+    finally:
+        conn.close()
 
 
 def test_an_upload_over_the_grants_ceiling_is_refused_while_it_streams(client, fresh_db):
@@ -1857,12 +2219,27 @@ def test_an_upload_request_that_declares_nonsense_is_a_400_not_a_500(client, fre
         {"name": 7, "mime": "application/octet-stream", "size": 4},
         {"name": "x.bin", "mime": "application/octet-stream", "size": 4, "sha256": 12},
         {"name": "x.bin", "mime": "application/octet-stream", "size": 4, "space": ["main"]},
-        # Above nodum.urls.MAX_UPLOAD_BYTES: the service's own bound.
-        {"name": "x.bin", "mime": "application/octet-stream", "size": urls.MAX_UPLOAD_BYTES + 1},
+        {"name": "x.bin", "mime": "application/octet-stream", "size": -1},
     ):
         response = client.post("/api/uploads", json=body)
         assert response.status_code == 400, (body, response.text)
         assert "Traceback" not in response.text
+
+
+def test_an_upload_declared_over_the_ceiling_is_a_413_not_a_bare_value_error(client, fresh_db):
+    """Review F11: a declared size above `urls.MAX_UPLOAD_BYTES` is the 413 case.
+
+    It answered 400 with `ValueError` as its type, so the browser rendered
+    `ValueError: size must be between 0 and 33554432 bytes, got …` at a human —
+    while `PayloadTooLarge` sat right there, mapped, describing exactly this.
+    """
+    body = {"name": "x.bin", "mime": "application/octet-stream", "size": urls.MAX_UPLOAD_BYTES + 1}
+
+    response = client.post("/api/uploads", json=body)
+
+    assert response.status_code == 413, response.text
+    assert response.json()["error"]["type"] == "PayloadTooLarge"
+    assert "ValueError" not in response.text
 
 
 def test_a_declared_hash_this_file_already_holds_moves_no_bytes(client, fresh_db, tmp_path):

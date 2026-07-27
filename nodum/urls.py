@@ -117,6 +117,24 @@ REDEEM_OPS = {"download": "asset.download", "upload": "asset.upload"}
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
+class PayloadTooLarge(ValueError):
+    """Raised when a body — promised or delivered — is more than will be read.
+
+    Both ends of that ceiling live in this module: :data:`MAX_UPLOAD_BYTES` is
+    the most a grant may promise, and the HTTP adapter's own
+    ``MAX_REQUEST_BYTES`` is deliberately equal to it. The class therefore lives
+    here rather than in the adapter, which imports it and maps it to **413** —
+    the same direction :class:`TokenInvalid` already runs in, and the only one
+    available, since a domain module must not import an adapter.
+
+    A ``ValueError``, so the CLI's ``_run`` reports it as one readable line like
+    every other caller mistake; the adapter's explicit 413 row wins over the
+    400 it would inherit through ``ValueError``, because status lookup walks the
+    MRO. The adapter raises it *mid-read* as well, from the wrapped ``receive``,
+    which is what keeps the bytes past the limit from ever being buffered.
+    """
+
+
 class TokenInvalid(ValueError):
     """Raised when a capability token cannot be redeemed.
 
@@ -297,15 +315,24 @@ def mint_upload(
         hit) — never both, never neither.
 
     Raises:
-        ValueError: If ``size`` is negative or above :data:`MAX_UPLOAD_BYTES`,
-            if ``sha256`` is not lowercase hex sha-256, or if ``ttl_seconds``
-            is outside its bounds.
+        PayloadTooLarge: If ``size`` is above :data:`MAX_UPLOAD_BYTES` — the
+            grant would promise more than the server will read.
+        ValueError: If ``size`` is negative, if ``sha256`` is not lowercase hex
+            sha-256, or if ``ttl_seconds`` is outside its bounds.
         TypeNotFound: If ``space`` does not resolve for this principal.
         GrantNotPermitted: If the principal cannot write the target space.
     """
     ttl = _checked_ttl(ttl_seconds)
-    if not 0 <= size <= MAX_UPLOAD_BYTES:
-        raise ValueError(f"size must be between 0 and {MAX_UPLOAD_BYTES} bytes, got {size}")
+    if size > MAX_UPLOAD_BYTES:
+        # The declared size is over the ceiling: that is a payload too large,
+        # which already has a class and a 413, and a browser rendering a bare
+        # `ValueError: size must be between …` for it was the whole bug.
+        raise PayloadTooLarge(
+            f"this server will not read more than {MAX_UPLOAD_BYTES} bytes in one "
+            f"upload; the declared size is {size}"
+        )
+    if size < 0:
+        raise ValueError(f"size must be a non-negative byte count, got {size}")
     if sha256 is not None and not SHA256_RE.match(sha256):
         raise ValueError("sha256 must be a lowercase hex sha-256 digest")
 

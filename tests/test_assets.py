@@ -10,18 +10,21 @@ wrote rather than one PDFium wrote for itself.
 
 from __future__ import annotations
 
+import codecs
 import hashlib
 import io
 import random
 import sqlite3
 import sys
+import zipfile
+from importlib.util import find_spec
 from pathlib import Path
 
 import pytest
 from helpers import agent, owner, seed_space
 from PIL import Image
 
-from nodum import assets, db, service
+from nodum import assets, db, extract, service
 from nodum.assets import AssetNotFound, ImageTooLarge, UnsupportedRendition
 
 
@@ -164,10 +167,60 @@ def test_zero_byte_asset_registers(fresh_db, tmp_path):
 
 def test_register_dedups_identical_content(fresh_db, tmp_path):
     first = _register_image(fresh_db, tmp_path)
-    second = assets.register_asset(tmp_path / "photo.png", name="renamed.png")
+    second = assets.register_asset(tmp_path / "photo.png", name="renamed.jpg")
     assert second.hash == first.hash
     assert second.original_name == "photo.png"  # the existing row wins
+    # And so does its MIME. The second name guesses `image/jpeg`, so this is the
+    # dedup hit refusing to re-derive a type from a *name* — while still holding
+    # the repair below, which only a signature from another family triggers.
+    assert (first.mime, second.mime) == ("image/png", "image/png")
     assert len(assets.list_assets(principal=owner())) == 1
+
+
+def test_a_dedup_hit_repairs_a_stored_mime_a_signature_contradicts(fresh_db, tmp_path):
+    """A pre-upgrade row must not poison every later reader of it (review F10).
+
+    Registration returns on the sha256 hit, so a wrong type recorded under an
+    older rule was permanent: these PDF bytes, first registered as ``scan.txt``
+    when the name decided the MIME, stayed ``text/plain`` when the same bytes
+    were ingested as ``scan.pdf`` — admitted by the policy, and then handed to no
+    handler, with no page blocks and a refused ``page:1``, while the row reported
+    a successful ingest.
+    """
+    pdf = _make_pdf(tmp_path / "scan.pdf")
+    stale = tmp_path / "scan.txt"
+    stale.write_bytes(pdf.read_bytes())
+    conn = db.connect(fresh_db)
+    try:
+        # The pre-upgrade state, written the way the old rule would have.
+        assets.register_asset(stale)
+        conn.execute("UPDATE assets SET mime = 'text/plain'")
+        conn.commit()
+    finally:
+        conn.close()
+
+    repaired = assets.register_asset(pdf)
+
+    assert repaired.mime == "application/pdf"
+    assert assets.get_asset(repaired.hash, principal=owner()).mime == "application/pdf"
+    # And the repair is what makes the rest of the pipeline reachable again.
+    assert extract.handler_for(repaired.mime) is not None
+    if find_spec("pypdfium2") is not None:
+        page = assets.get_rendition(repaired.hash, profile="page:1", principal=owner())
+        assert page.width > 0
+
+
+def test_a_dedup_hit_keeps_a_more_specific_stored_mime(fresh_db, tmp_path):
+    """The repair is across families only: `text/markdown` is not contradicted by
+    the text heuristic, it is a better answer than it."""
+    notes = tmp_path / "notes.md"
+    notes.write_bytes(b"# heading\n")
+    first = assets.register_asset(notes)
+    same_bytes = tmp_path / "notes.txt"
+    same_bytes.write_bytes(b"# heading\n")
+
+    assert first.mime == "text/markdown"
+    assert assets.register_asset(same_bytes).mime == "text/markdown"
 
 
 def test_register_distinct_content_gets_distinct_hashes(fresh_db, tmp_path):
@@ -175,6 +228,370 @@ def test_register_distinct_content_gets_distinct_hashes(fresh_db, tmp_path):
     other = _register_image(fresh_db, tmp_path, name="b.png", size=(10, 10))
     assert one.hash != other.hash
     assert len(assets.list_assets(principal=owner())) == 2
+
+
+# ── Sniffing the bytes, and the MIME that gets stored (note 01 D2/D3) ────────
+
+
+#: One hand-written sample per type identified by a *signature*. Signature bytes
+#: are enough — the sniffer reads a window and never decodes — and the coverage
+#: assertion below keeps this table plus :data:`PILLOW_RASTERS` level with
+#: ``assets.RECOGNISED_MIMES``. The names are the names such a file would arrive
+#: under and are deliberately wrong for the bytes; nothing reads them here.
+SNIFF_SAMPLES: tuple[tuple[str, bytes, str], ...] = (
+    ("notes.txt", b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR", "image/png"),
+    ("notes.txt", b"\xff\xd8\xff\xe0\x00\x10JFIF", "image/jpeg"),
+    ("notes.txt", b"GIF87a\x01\x00\x01\x00", "image/gif"),
+    ("notes.txt", b"GIF89a\x01\x00\x01\x00", "image/gif"),
+    ("notes.txt", b"RIFF\x1a\x00\x00\x00WEBPVP8L", "image/webp"),
+    ("notes.txt", b"BM\x8a\x00\x00\x00\x00\x00", "image/bmp"),
+    ("notes.txt", b"II*\x00\x08\x00\x00\x00", "image/tiff"),
+    ("notes.txt", b"MM\x00*\x00\x00\x00\x08", "image/tiff"),
+    ("cover.png", b"%PDF-1.7\n1 0 obj\n", "application/pdf"),
+    ("cover.png", b"ID3\x04\x00\x00\x00\x00\x00#TSSE", "audio/mpeg"),
+    ("cover.png", b"RIFF$\x00\x00\x00WAVEfmt ", "audio/wav"),
+    ("cover.png", b"OggS\x00\x02\x00\x00\x00\x00", "audio/ogg"),
+    ("cover.png", b'fLaC\x00\x00\x00"', "audio/flac"),
+    # The two audio-only ISO-BMFF brands, and nothing wider (see the video row
+    # in the refusal table below — an `mp4` *prefix* match claimed video).
+    ("cover.png", b"\x00\x00\x00 ftypM4A \x00\x00\x02\x00", "audio/mp4"),
+    ("cover.png", b"\x00\x00\x00 ftypM4B \x00\x00\x02\x00", "audio/mp4"),
+    ("archive.zip", "les cimes enneigées\n".encode(), "text/plain"),
+)
+
+#: Every raster this Pillow build reads, as **Pillow writes it** — the claim
+#: being tested is "the admitted set is what this install can act on", so
+#: hand-writing the headers would test the table against itself. The four after
+#: the classic six are review F8's: each carries NULs in its header, so the text
+#: heuristic could never name it, and each renders a thumbnail happily.
+PILLOW_RASTERS: tuple[tuple[str, dict, str], ...] = (
+    ("photo.png", {}, "image/png"),
+    ("photo.jpeg", {}, "image/jpeg"),
+    ("photo.gif", {}, "image/gif"),
+    ("photo.webp", {}, "image/webp"),
+    ("photo.bmp", {}, "image/bmp"),
+    ("photo.tif", {}, "image/tiff"),
+    ("photo.jp2", {}, "image/jp2"),
+    ("codestream.j2k", {}, "image/jp2"),
+    ("photo.avif", {}, "image/avif"),
+    ("photo.ico", {}, "image/x-icon"),
+    ("scan.tif", {"big_tiff": True}, "image/tiff"),
+)
+
+#: What ``mimetypes`` guesses for a ``.docx`` — long enough to be worth a name.
+DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+
+
+@pytest.mark.parametrize(("name", "payload", "expected"), SNIFF_SAMPLES)
+def test_every_signature_type_is_named_from_its_bytes(tmp_path, name, payload, expected):
+    """The bytes name the type, and the filename is not consulted at all.
+
+    `sniff_mime` takes a path and never looks at its name — the rows above are
+    named the way such a file would arrive, but what they assert is only that a
+    leading signature is enough. Whether a *name* can outrank the bytes is the
+    stored-MIME table's question, further down.
+    """
+    source = tmp_path / name
+    source.write_bytes(payload)
+    assert assets.sniff_mime(source) == expected
+
+
+@pytest.mark.parametrize(("name", "options", "expected"), PILLOW_RASTERS)
+def test_every_raster_this_pillow_reads_is_named_and_renders(
+    fresh_db, tmp_path, name, options, expected
+):
+    """The recognised set is what this install can act on — proved on both halves.
+
+    JPEG 2000, AVIF, ICO and BigTIFF were refused at the door while
+    `register_asset` + `get_rendition` on the very same bytes produced a
+    thumbnail, so the policy was refusing its own capability (review F8).
+    """
+    source = tmp_path / name
+    Image.new("RGB", (64, 48), "red").save(source, **options)
+
+    assert assets.sniff_mime(source) == expected
+    assert expected in assets.RECOGNISED_IMAGE_MIMES
+    asset = assets.register_asset(source)
+    thumb = assets.get_rendition(asset.hash, profile="thumb", principal=owner())
+    assert (thumb.mime, thumb.width > 0, thumb.height > 0) == (assets.RENDITION_MIME, True, True)
+
+
+def test_the_sniff_samples_cover_the_whole_recognised_vocabulary():
+    """`http_api` derives its widest admitted set from this vocabulary, so a type
+    added to the sniffer with no sample here would go untested by construction."""
+    named = {expected for _name, _payload, expected in SNIFF_SAMPLES}
+    named |= {expected for _name, _options, expected in PILLOW_RASTERS}
+    assert named == assets.RECOGNISED_MIMES
+    assert {
+        "image/png",
+        "image/jpeg",
+        "image/gif",
+        "image/webp",
+        "image/bmp",
+        "image/tiff",
+        "image/jp2",
+        "image/avif",
+        "image/x-icon",
+    } == assets.RECOGNISED_IMAGE_MIMES
+
+
+def test_every_recognised_type_has_an_extraction_handler():
+    """The stated justification for the vocabulary, asserted rather than asserted-in-prose.
+
+    `RECOGNISED_MIMES` is "what this system can act on", derived from the
+    rendition path and `nodum.extract`'s registry. If a member reached neither,
+    the network would admit bytes nothing downstream claims.
+    """
+    unclaimed = sorted(
+        mime for mime in assets.RECOGNISED_MIMES if extract.handler_for(mime) is None
+    )
+    assert unclaimed == []
+
+
+@pytest.mark.parametrize(
+    ("name", "payload"),
+    [
+        # A renamed executable: the hole the one-sniffer policy closes.
+        ("innocent.pdf", b"MZ\x90\x00\x03\x00\x00\x00\x04\x00\x00\x00"),
+        # A `.docx` is a zip, which no handler claims — the deliberate cost.
+        ("report.docx", b"PK\x03\x04\x14\x00\x06\x00\x08\x00\x00\x00"),
+        # ISO base media with a *video* brand: `nodum.extract` claims no
+        # `video/*` family, so naming it would admit bytes nothing can read.
+        ("clip.m4a", b"\x00\x00\x00 ftypisom\x00\x00\x02\x00"),
+        # And the brand that made the prefix match wrong: ffmpeg writes `mp42`
+        # for ordinary *video*, so `brand.startswith(b"mp4")` claimed video as
+        # `audio/mp4` and gave two videos opposite answers (review F7).
+        ("clip.mp4", b"\x00\x00\x00 ftypmp42\x00\x00\x02\x00mdat"),
+        # RIFF is a container; neither of the two forms this system reads.
+        ("track.wav", b"RIFF$\x00\x00\x00AVI LIST"),
+        # NUL-free, but a bell is not prose.
+        ("log.txt", b"progress: \x07\x07 done"),
+    ],
+)
+def test_bytes_this_system_cannot_act_on_sniff_to_nothing(tmp_path, name, payload):
+    """`None` is the answer a network surface refuses on, whatever the name claims."""
+    source = tmp_path / name
+    source.write_bytes(payload)
+    assert assets.sniff_mime(source) is None
+
+
+def test_text_is_decided_by_gits_rule_over_a_window_at_each_end(tmp_path):
+    """git's `buffer_is_binary`: a NUL in a window means binary.
+
+    The windows are bounded, so a NUL between them is never consulted — the cost
+    the design states rather than hides. An empty file is **not** text: it is no
+    evidence at all, and every test in the heuristic passes vacuously over zero
+    bytes, which is how a zero-byte `.exe` was admitted and given a whole
+    subgraph (review F5).
+    """
+    prose = tmp_path / "prose"
+    prose.write_bytes(b"tabs\tlines\nreturns\r\nform\x0cfeed\x0bvertical\x1b[0mescape")
+    assert assets.sniff_mime(prose) == assets.TEXT_MIME
+
+    inside = tmp_path / "inside"
+    inside.write_bytes(b"a" * 100 + b"\x00" + b"a" * 100)
+    assert assets.sniff_mime(inside) is None
+
+    between = tmp_path / "between"
+    between.write_bytes(b"a" * assets._SNIFF_BYTES + b"\x00" + b"a" * assets._SNIFF_BYTES)
+    assert assets.sniff_mime(between) == assets.TEXT_MIME
+
+    empty = tmp_path / "empty"
+    empty.write_bytes(b"")
+    assert assets.sniff_mime(empty) is None
+
+
+def test_the_text_window_is_read_from_both_ends(tmp_path):
+    """A binary file with a long ASCII prefix is admitted by a head-only test.
+
+    4096 spaces in front of a zip is still a valid zip — its central directory
+    is at the *end*, which is exactly where the second window looks (review F4).
+    """
+    body = io.BytesIO()
+    with zipfile.ZipFile(body, "w") as archive:
+        archive.writestr("word/document.xml", "<w:document/>")
+    padded = b"A" * assets._SNIFF_BYTES + body.getvalue()
+    source = tmp_path / "report.docx"
+    source.write_bytes(padded)
+
+    assert zipfile.is_zipfile(io.BytesIO(padded)), "the padded file is still a real zip"
+    assert assets.sniff_mime(source) is None
+
+
+@pytest.mark.parametrize(
+    ("bom", "encoding"),
+    [
+        (codecs.BOM_UTF16_LE, "utf-16-le"),
+        (codecs.BOM_UTF16_BE, "utf-16-be"),
+        (codecs.BOM_UTF32_LE, "utf-32-le"),
+        (codecs.BOM_UTF32_BE, "utf-32-be"),
+    ],
+)
+def test_a_utf16_or_utf32_bom_exempts_a_file_from_the_nul_rule_and_nothing_else(
+    tmp_path, bom, encoding
+):
+    """Those encodings spell ASCII with NUL padding, so the NUL rule alone would
+    call every one of them binary — but the exemption is from that rule only.
+
+    The window is decoded in the marked encoding and still has to be free of
+    control characters, at both ends. A BOM used to short-circuit the whole
+    heuristic, so `BOM + <a program>` was admitted as text (review F4).
+    """
+    source = tmp_path / "cimes.txt"
+    source.write_bytes(bom + "les cimes enneigées".encode(encoding))
+    assert assets.sniff_mime(source) == assets.TEXT_MIME
+
+    program = tmp_path / "innocent.pdf"
+    program.write_bytes(bom + b"MZ\x90\x00\x03\x00\x00\x00" + b"\x00" * 200)
+    assert assets.sniff_mime(program) is None
+
+    body = io.BytesIO()
+    with zipfile.ZipFile(body, "w") as archive:
+        archive.writestr("word/document.xml", "<w:document/>")
+    padded = tmp_path / "padded.docx"
+    padded.write_bytes(bom + ("a" * 3000).encode(encoding) + body.getvalue())
+    assert assets.sniff_mime(padded) is None
+
+
+def test_a_utf8_bom_proves_nothing_and_no_longer_admits_a_binary(tmp_path):
+    """UTF-8 text passes the ordinary byte test unaided, so honouring its mark
+    bought only a bypass: three bytes in front of an `.exe` made it text, and the
+    capability route admitted it, stored it, and wrote a whole subgraph (F4)."""
+    prose = tmp_path / "cimes.txt"
+    prose.write_bytes(codecs.BOM_UTF8 + "les cimes enneigées\n".encode())
+    assert assets.sniff_mime(prose) == assets.TEXT_MIME
+
+    for payload in (
+        codecs.BOM_UTF8 + b"MZ\x90\x00\x03\x00\x00\x00\x04\x00\x00\x00program",
+        codecs.BOM_UTF8 + b"\x00" * assets._SNIFF_BYTES,
+    ):
+        program = tmp_path / "innocent.pdf"
+        program.write_bytes(payload)
+        assert assets.sniff_mime(program) is None
+
+
+@pytest.mark.parametrize(
+    ("name", "payload", "expected"),
+    [
+        # A *signature* wins when the name names another family: the stored MIME
+        # is what `page:<n>` and extraction dispatch on, so a PDF delivered under
+        # any of these names has to land as one.
+        ("scan.txt", b"%PDF-1.7\n1 0 obj\n", "application/pdf"),
+        ("scan", b"%PDF-1.7\n1 0 obj\n", "application/pdf"),
+        ("scan.bin", b"%PDF-1.7\n1 0 obj\n", "application/pdf"),
+        ("cover.png", b"ID3\x04\x00\x00\x00\x00\x00#TSSE", "audio/mpeg"),
+        # The name keeps its specificity inside one family: flattening these to
+        # the sniff's text/plain would send each to the wrong handler.
+        ("notes.md", b"# heading\n", "text/markdown"),
+        ("page.html", b"<p>markup</p>", "text/html"),
+        ("basin.csv", b"a,b\n1,2\n", "text/csv"),
+        # The text heuristic is weak evidence and may only *fill in*, so these
+        # keep their own names although all three sniff as text (review F3).
+        # `application/json` and `application/xhtml+xml` need no special-case
+        # list any more; SVG is a raster's name over bytes Pillow cannot render.
+        ("data.json", b'{"basin": 1}', "application/json"),
+        ("page.xhtml", b"<html/>", "application/xhtml+xml"),
+        ("logo.svg", b'<svg xmlns="http://www.w3.org/2000/svg"/>', "image/svg+xml"),
+        # Unrecognised bytes keep exactly today's behaviour: the name's guess,
+        # then the octet-stream fallback.
+        ("report.docx", b"PK\x03\x04\x14\x00\x06\x00\x08\x00\x00\x00", DOCX_MIME),
+        ("mystery.bin", b"\x00\x01\x02\x03", assets.FALLBACK_MIME),
+        ("mystery", b"\x00\x01\x02\x03", assets.FALLBACK_MIME),
+    ],
+)
+def test_the_stored_mime_prefers_a_signature_over_a_name_from_another_family(
+    fresh_db, tmp_path, name, payload, expected
+):
+    """Note 01 D3 as revised by review F3, on new registrations only."""
+    source = tmp_path / name
+    source.write_bytes(payload)
+    assert assets.register_asset(source).mime == expected
+
+
+def test_a_shifted_pdf_header_keeps_the_name_the_bytes_cannot_provide(fresh_db, tmp_path):
+    """The text heuristic is a window guess, and it used to outrank a real name.
+
+    A PDF whose `%PDF-` sits one byte in is read by both `pypdf` and `pypdfium2`
+    and matches no signature, so it sniffs as text. Letting that overrule `.pdf`
+    cost the document its handler and its page rasters and put raw PDF bytes
+    into `assets.extracted_text` — and therefore into the FTS index (review F3).
+
+    Note which path this exercises: `_make_pdf` hand-assembles an uncompressed
+    PDF, so its bytes are NUL-free from end to end and the *text* branch answers.
+    A PDF carrying a compressed stream does not sniff as text at all — see
+    `test_a_displaced_pdf_header_is_definite_when_the_bytes_are_not_text`, which
+    is the case this fixture cannot reach.
+    """
+    shifted = tmp_path / "sample.pdf"
+    shifted.write_bytes(b"\n" + _make_pdf(tmp_path / "real.pdf").read_bytes())
+
+    assert assets.sniff_mime(shifted) == assets.TEXT_MIME
+    asset = assets.register_asset(shifted)
+    assert asset.mime == "application/pdf"
+    assert extract.handler_for(asset.mime).name == "pdf"
+
+
+def _binary_stream_pdf(path):
+    """Write a PDF whose image stream carries NUL bytes, like any real one.
+
+    Every PDF a human actually drops — a scan, an export, anything with a font
+    subset or a compressed image — has binary streams in it, and so does not
+    sniff as text. The hand-assembled fixture above cannot represent that, which
+    is exactly how the displaced-header refusal survived a green suite.
+    """
+    Image.new("RGB", (24, 18), "teal").save(path, "PDF")
+    assert b"\x00" in path.read_bytes(), "fixture must carry binary stream bytes"
+    return path
+
+
+def test_a_displaced_pdf_header_is_definite_when_the_bytes_are_not_text(fresh_db, tmp_path):
+    """A `%PDF-` marker need not lead the file, and the readers already know that.
+
+    Found by the live end-to-end pass rather than by a test: `pypdf` and PDFium
+    both scan for the header, so a real PDF behind a stray byte extracts,
+    paginates and rasterises — while the sniffer called it nothing at all and the
+    route refused it outright. The text test runs first, which is what keeps the
+    scan safe: prose quoting the marker is text and never reaches it.
+    """
+    displaced = tmp_path / "scan.pdf"
+    displaced.write_bytes(b"\n" + _binary_stream_pdf(tmp_path / "real.pdf").read_bytes())
+
+    assert assets.sniff_mime(displaced) == "application/pdf"
+    assert assets.register_asset(displaced).mime == "application/pdf"
+
+
+def test_a_displaced_header_outranks_a_name_from_another_family(fresh_db, tmp_path):
+    """Definite evidence, so it behaves like a leading signature and overrules."""
+    misnamed = tmp_path / "scan.txt"
+    misnamed.write_bytes(b"\n" + _binary_stream_pdf(tmp_path / "real.pdf").read_bytes())
+
+    assert assets.register_asset(misnamed).mime == "application/pdf"
+
+
+def test_prose_quoting_a_pdf_header_stays_text(fresh_db, tmp_path):
+    """The ordering, stated as a test, because this repository's own docs do it.
+
+    `docs/architecture.md` and `AGENTS.md` both quote `%PDF-`. A bounded scan
+    would have made this rare; running the text test first makes it impossible.
+    """
+    prose = tmp_path / "architecture.md"
+    prose.write_bytes(b"The sniffer matches %PDF-1.4 at the head of the window.\n" * 4)
+
+    assert assets.sniff_mime(prose) == assets.TEXT_MIME
+    assert assets.register_asset(prose).mime == "text/markdown"
+
+
+def test_registration_still_refuses_nothing_on_type(fresh_db, tmp_path):
+    """The sniff decides what is *recorded*, never what is *accepted*.
+
+    `register_asset` takes no principal and the CLI's tolerance for arbitrary
+    operator-owned files is deliberate: a type policy belongs to the surfaces
+    that take bytes from a stranger (note 01 D2).
+    """
+    for index, payload in enumerate((b"MZ\x90\x00program", b"PK\x03\x04\x14\x00", b"\x00" * 32)):
+        source = tmp_path / f"whatever-{index}"
+        source.write_bytes(payload)
+        assert assets.register_asset(source).mime == assets.FALLBACK_MIME
 
 
 # ── Metadata resolution: by hash or by asset-reference node ──────────────────
@@ -531,11 +948,82 @@ def test_non_image_assets_are_rejected(fresh_db, tmp_path):
 
 
 def test_unreadable_image_bytes_are_rejected(fresh_db, tmp_path):
-    fake = tmp_path / "broken.png"
-    fake.write_bytes(b"definitely not a png")
-    asset = assets.register_asset(fake)
-    with pytest.raises(UnsupportedRendition, match="not a raster image"):
-        assets.get_rendition(asset.hash, principal=owner())
+    """Two refusals, and which one a file gets follows the strength of the evidence.
+
+    Prose called `broken.png` keeps `image/png`: the text heuristic is a window
+    guess and may not overrule a name (review F3, revising D3's first cut, which
+    stored `text/plain` here and refused it on the stored type instead). So it
+    reaches Pillow, like a truncated PNG that really does carry the signature,
+    and both come back as `UnsupportedRendition` — a 400 rather than a 500.
+    """
+    for name, payload in (
+        ("broken.png", b"definitely not a png"),
+        ("truncated.png", b"\x89PNG\r\n\x1a\n" + b"cut off here"),
+        # The pair review F1 found: once a plugin's `accept()` matches, a failed
+        # parse is a **bare** OSError, not `UnidentifiedImageError`.
+        ("short.bmp", b"BM" + b"not really a bitmap, no NULs here"),
+        ("cut.webp", b"RIFF\x1a\x00\x00\x00WEBPVP8L" + b"\x00" * 8),
+    ):
+        source = tmp_path / name
+        source.write_bytes(payload)
+        asset = assets.register_asset(source)
+        assert asset.mime.startswith("image/"), (name, asset.mime)
+        with pytest.raises(UnsupportedRendition):
+            assets.get_rendition(asset.hash, principal=owner())
+
+
+@pytest.mark.parametrize(
+    ("name", "payload"),
+    [
+        # `UnidentifiedImageError` is an OSError *subclass*, so catching only it
+        # let its siblings out as `EXCEPTION_STATUS[OSError]` — a 500 on a route
+        # with no session, which also spent the caller's upload token (F1).
+        ("short.bmp", b"BM" + b"not really a bitmap, no NULs here"),
+        ("cut.webp", b"RIFF\x1a\x00\x00\x00WEBPVP8L" + b"\x00" * 8),
+        ("nothing.png", b"\x89PNG\r\n\x1a\n" + b"cut off here"),
+    ],
+)
+def test_the_pixel_budget_refuses_bytes_pillow_cannot_read_without_leaking_the_path(
+    tmp_path, name, payload
+):
+    """One refusal class for every unreadable image, and no spool path in it.
+
+    The path is the operator's on a terminal and a stranger's over a socket
+    (review F6): the network-facing message names the filename the client
+    supplied, exactly as the sibling rendition refusal does.
+    """
+    spooled = tmp_path / name
+    spooled.write_bytes(payload)
+
+    with pytest.raises(UnsupportedRendition) as refused:
+        assets.check_image_pixel_budget(spooled, name=name)
+
+    assert str(refused.value) == f"not a raster image Pillow can read: {name}"
+    assert str(tmp_path) not in str(refused.value)
+    # On the CLI the path is the useful answer, so it is still the default.
+    with pytest.raises(UnsupportedRendition, match=str(spooled)):
+        assets.check_image_pixel_budget(spooled)
+
+
+def test_the_pixel_ceiling_is_optional_and_the_bomb_guard_is_not(tmp_path, monkeypatch):
+    """Two questions of one header read (review F9).
+
+    `limit=None` is for a route admitting bytes to *ingest*, where 40 MP is a
+    statement about renditions and a 600 dpi A3 scan is an ordinary document.
+    What stays is the guard about danger: Pillow's own bomb refusal, which
+    `limit=None` does not switch off. Pillow's threshold is lowered here rather
+    than met, since meeting it means allocating 179 megapixels.
+    """
+    scan = tmp_path / "scan.png"
+    Image.new("L", (7000, 7000)).save(scan, "PNG")  # 49 MP, over the 40 MP ceiling
+
+    assert assets.check_image_pixel_budget(scan, limit=None) == (7000, 7000)
+    with pytest.raises(ImageTooLarge, match="the limit is"):
+        assets.check_image_pixel_budget(scan)
+
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 1000)
+    with pytest.raises(ImageTooLarge, match="decompression bomb"):
+        assets.check_image_pixel_budget(scan, limit=None)
 
 
 @pytest.mark.parametrize("profile", ["banner", "page", "page:0", "page:01", "page:-1", "PAGE:1"])
