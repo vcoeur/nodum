@@ -14,7 +14,9 @@
  *   binds the session's principal server-side; a client-supplied identity
  *   would be ignored, so this client never sends one;
  * - every write carries `Content-Type: application/json` (or multipart, for an
- *   upload), because the server refuses anything else — see {@link rawRequest};
+ *   asset registration), because the server refuses anything else. The one
+ *   exception is the capability upload, whose raw body sits outside that gate
+ *   by design — all three branches are in {@link rawRequest};
  * - auth is the session cookie, which the browser attaches to every same-origin
  *   request on its own — there is no token in this file. A 401 from any route
  *   but login means the session is gone and is reported through
@@ -42,6 +44,7 @@ import type {
   GrantOut,
   HealthOut,
   HumanOut,
+  IngestOut,
   JsonObject,
   LoginOut,
   NodeFilters,
@@ -50,6 +53,7 @@ import type {
   ProposalOut,
   RejectProposalsBody,
   RenditionProfile,
+  RequestUploadBody,
   ReviewQueueFilters,
   RevokeGrantBody,
   RotatedTokenOut,
@@ -63,6 +67,7 @@ import type {
   TypesOut,
   UndoResult,
   UpdateNodeBody,
+  UploadGrantOut,
   VersionOut,
 } from "./types";
 import { reportUnauthorized } from "../lib/session";
@@ -124,10 +129,14 @@ export class ApiError extends Error {
  * missing.
  *
  * Every call in this file that names a space raises it — the two filtered
- * reads, the write target on `POST /api/nodes`, and all three lifecycle
- * routes. That is deliberate and load-bearing: {@link isUnknownSpace} is the
- * **only** sanctioned discriminator, so a view must never re-test the message
- * itself. Two copies of one discriminator is how the two drift apart.
+ * reads, the write target on `POST /api/nodes`, all three lifecycle routes, and
+ * **both** halves of the capability upload. That is deliberate and
+ * load-bearing: {@link isUnknownSpace} is the **only** sanctioned
+ * discriminator, so a view must never re-test the message itself. Two copies of
+ * one discriminator is how the two drift apart. The upload pair raises the
+ * {@link UnknownUploadSpaceError} subclass, which `isUnknownSpace` answers for
+ * as well: it adds *which request* refused, not a second way to ask whether one
+ * did.
  */
 export class UnknownSpaceError extends ApiError {
   /** The space id or name the caller asked for. */
@@ -152,8 +161,12 @@ export function isUnknownSpace(error: unknown): error is UnknownSpaceError {
   return error instanceof UnknownSpaceError;
 }
 
-/** Every space-resolving route raises this literal text; the status cannot discriminate. */
-const UNKNOWN_SPACE_MESSAGE = /^unknown space:/i;
+/**
+ * Every space-resolving route raises this literal text; the status cannot
+ * discriminate. The capture is the reference the server itself named, which is
+ * the only thing a call handed a bare token — the redemption — has to go on.
+ */
+const UNKNOWN_SPACE_MESSAGE = /^unknown space:\s*(\S.*?)\s*$/i;
 
 /**
  * The space a space itself lives in (`service.META_SPACE_ID`).
@@ -182,10 +195,27 @@ const SPACE_HOME = "meta";
  */
 function asUnknownSpace(error: unknown, space: string | undefined): unknown {
   if (!space) return error;
-  if (!(error instanceof ApiError)) return error;
-  if (error.status !== 404 && error.status !== 400) return error;
-  if (!UNKNOWN_SPACE_MESSAGE.test(error.message)) return error;
-  return new UnknownSpaceError(space, error.status, error.message);
+  const named = unknownSpaceReference(error);
+  if (named === null) return error;
+  return new UnknownSpaceError(space, (error as ApiError).status, (error as ApiError).message);
+}
+
+/**
+ * The space reference an unknown-space refusal named, or null for anything else.
+ *
+ * Split out of {@link asUnknownSpace} for the one call that cannot supply the
+ * reference itself: {@link redeemUploadGrant} is handed a token, and the space
+ * it was minted against lives in the token row rather than in the call. The
+ * server's message carries the *resolved* id there, so a caller that knows the
+ * reference the human typed re-labels it afterwards.
+ *
+ * @param error The caught value.
+ * @returns The reference the refusal named, or null when this is not one.
+ */
+function unknownSpaceReference(error: unknown): string | null {
+  if (!(error instanceof ApiError)) return null;
+  if (error.status !== 404 && error.status !== 400) return null;
+  return UNKNOWN_SPACE_MESSAGE.exec(error.message)?.[1] ?? null;
 }
 
 /**
@@ -237,10 +267,15 @@ async function toApiError(response: Response): Promise<ApiError> {
 /** Options for {@link rawRequest}. */
 interface RequestOptions {
   method?: "GET" | "POST" | "PATCH" | "PUT" | "DELETE";
-  /** JSON-serialised into the body. Mutually exclusive with `form`. */
+  /** JSON-serialised into the body. Mutually exclusive with `form` and `raw`. */
   body?: unknown;
   /** Sent as-is; the browser sets the multipart boundary. */
   form?: FormData;
+  /**
+   * Sent as the whole body, with no `Content-Type` of ours — the capability
+   * upload. Mutually exclusive with `body` and `form`.
+   */
+  raw?: Blob;
   signal?: AbortSignal;
 }
 
@@ -259,6 +294,14 @@ async function rawRequest<T>(path: string, options: RequestOptions = {}): Promis
     // The browser sets `multipart/form-data` with its own boundary; setting it
     // here would send a boundary-less header the server cannot parse.
     body = options.form;
+  } else if (options.raw) {
+    // A raw body, and no content type of ours. The two capability routes sit
+    // outside the content-type gate (`http_api._is_capability_path`) precisely
+    // so a raw upload need not claim to be JSON, and claiming it would be a
+    // lie about the bytes. What the browser derives from the Blob is harmless:
+    // `PUT /api/uploads/{token}` reads the name and the MIME off the token row
+    // it minted, never off the request.
+    body = options.raw;
   } else if (method !== "GET") {
     // Every state-changing JSON route requires `Content-Type: application/json`
     // — including the ones that take no body (`POST /nodes/{id}/archive`). That
@@ -824,6 +867,13 @@ export function diffVersions(a: number, b: number, signal?: AbortSignal): Promis
  *
  * Registration is idempotent sha256 dedup, so re-uploading the same bytes
  * returns the existing asset.
+ *
+ * **This route only registers bytes**: no `asset_ref`, no `source`, no event.
+ * It is the editor's drop — an image whose describing node is the note that
+ * carries it inline — and it admits rasters alone for that reason. A document
+ * the graph is meant to *know about* goes through {@link ingestUpload}, which
+ * is the whole difference between bytes in the store and a subgraph
+ * (design decision D1).
  */
 export function uploadAsset(file: File, signal?: AbortSignal): Promise<AssetOut> {
   const form = new FormData();
@@ -852,6 +902,230 @@ export function getAsset(id: string, signal?: AbortSignal): Promise<AssetOut> {
  */
 export function renditionUrl(id: string, profile: RenditionProfile = "preview"): string {
   return `${API_BASE}/assets/${encodeURIComponent(id)}/rendition/${encodeURIComponent(profile)}`;
+}
+
+/* ------------------------------------------------------------------ */
+/* Uploads — the capability flow (design §5.7 rule 4)                   */
+/* ------------------------------------------------------------------ */
+
+/** Which of the upload flow's two requests something happened on. */
+export type UploadPhase =
+  /** `POST /api/uploads` — nothing has been sent yet. */
+  | "mint"
+  /** `PUT /api/uploads/{token}` — the grant is spent and the body has gone. */
+  | "redemption";
+
+/**
+ * A refused write target on the upload flow, tagged with which request refused.
+ *
+ * A subclass rather than a second discriminator, and that is the point:
+ * {@link isUnknownSpace} stays the **only** test for space-ness and answers
+ * true for this too. What it adds is a different fact — *when* in the flow the
+ * refusal happened — because the two are not the same event for a human. A
+ * refused mint sent nothing at all; a refused redemption spent the grant and
+ * streamed the body before the pipeline resolved the space and stopped. Copy
+ * that cannot tell them apart ends up claiming "nothing was uploaded" about a
+ * request that uploaded the whole file.
+ */
+export class UnknownUploadSpaceError extends UnknownSpaceError {
+  /** The request that refused the space. */
+  readonly phase: UploadPhase;
+
+  constructor(space: string, wireStatus: number, message: string, phase: UploadPhase) {
+    super(space, wireStatus, message);
+    this.name = "UnknownUploadSpaceError";
+    this.phase = phase;
+  }
+}
+
+/**
+ * Which upload request refused a space, when that is what happened.
+ *
+ * @param error The caught value.
+ * @returns The phase, or null for anything that is not an upload's own
+ *   space refusal — including a bare {@link UnknownSpaceError}, which carries
+ *   no phase to report.
+ */
+export function uploadRefusalPhase(error: unknown): UploadPhase | null {
+  return error instanceof UnknownUploadSpaceError ? error.phase : null;
+}
+
+/**
+ * Tag an unknown-space refusal with the request it came from.
+ *
+ * @param error The caught value.
+ * @param space The space the call asked for, if it asked for one.
+ * @param phase Which request this is.
+ */
+function asUploadSpaceRefusal(
+  error: unknown,
+  space: string | undefined,
+  phase: UploadPhase,
+): unknown {
+  const normalised = asUnknownSpace(error, space);
+  if (!isUnknownSpace(normalised)) return normalised;
+  return new UnknownUploadSpaceError(
+    normalised.space,
+    normalised.wireStatus,
+    normalised.message,
+    phase,
+  );
+}
+
+/**
+ * `POST /api/uploads` — mint a single-use grant to PUT one file to.
+ *
+ * The mint is where everything is checked *before* any bytes move: the
+ * declared `size` against the server's own ceiling, and the target `space`
+ * against what this session may write. A space it will not resolve throws
+ * {@link UnknownSpaceError}, like every other call in this file that names one
+ * — so a caller branches on {@link isUnknownSpace} and never on the message.
+ *
+ * Callers want {@link ingestUpload}; this half is exported because the two
+ * requests fail for genuinely different reasons and a caller may want to know
+ * which one it was.
+ */
+export async function requestUploadUrl(
+  body: RequestUploadBody,
+  signal?: AbortSignal,
+): Promise<UploadGrantOut> {
+  try {
+    return await request<UploadGrantOut>("/uploads", {
+      method: "POST",
+      body,
+      ...(signal ? { signal } : {}),
+    });
+  } catch (error) {
+    throw asUploadSpaceRefusal(error, body.space, "mint");
+  }
+}
+
+/**
+ * `PUT /api/uploads/{token}` — spend a grant and run the ingestion pipeline.
+ *
+ * **Redeemed against our own origin, never against `grant.url`** (design
+ * decision D5): that field is absolute and built from `NODUM_PUBLIC_URL`,
+ * which exists so a foreign host can be told where this server lives and may
+ * name an address that is not the one this page was served from. The client
+ * owns its origin; the grant only carries the capability.
+ *
+ * The body is the file itself, with no content type of ours — see
+ * {@link rawRequest}'s `raw` branch.
+ *
+ * The token is spent by `urls.consume` **before** the body is read, so a
+ * refusal of the bytes still spends the grant. There is nothing to resume and
+ * no revoke endpoint: a retry is a fresh mint.
+ *
+ * **This half normalises a refused space itself**, because it is exported and
+ * can therefore leak on its own. The pipeline resolves the token row's space
+ * again on the far side of the PUT, so this request refuses an unresolvable
+ * target exactly as the mint does — and a bare `ApiError(404, "TypeNotFound",
+ * "unknown space: sp-old")` reaching `describeFailure` renders as *"The server
+ * has no record of this upload. unknown space: sp-old"*, which is two forbidden
+ * phrasings in one sentence. The space is read out of the server's own message,
+ * since this call is handed a token and the target lives in the token row;
+ * {@link ingestUpload} re-labels it with the reference the human actually typed,
+ * because the message names the **resolved** 32-hex id.
+ *
+ * @param token The `token` from the grant, not its `url`.
+ * @param file The bytes to send.
+ * @throws UnknownUploadSpaceError When the pipeline could not resolve the space
+ *   the grant was minted against, phase `redemption`.
+ */
+export async function redeemUploadGrant(
+  token: string,
+  file: Blob,
+  signal?: AbortSignal,
+): Promise<IngestOut> {
+  try {
+    return await request<IngestOut>(`/uploads/${encodeURIComponent(token)}`, {
+      method: "PUT",
+      raw: file,
+      ...(signal ? { signal } : {}),
+    });
+  } catch (error) {
+    throw asUploadSpaceRefusal(error, unknownSpaceReference(error) ?? undefined, "redemption");
+  }
+}
+
+/**
+ * Ingest one file this browser is holding: mint a grant, then spend it.
+ *
+ * The capability flow was built for "an agent host with no shared filesystem",
+ * and a browser is exactly that — it holds bytes, not a path the server can
+ * read, which is why `POST /api/ingest` (one of `path` or `url`, both
+ * server-side) cannot serve it. What comes back is therefore the subgraph
+ * ingestion wrote — `asset_ref`, `source`, the `derived_from` edge and one
+ * `block` per page — rather than a registration receipt.
+ *
+ * No `sha256` is declared, deliberately: see {@link RequestUploadBody}.
+ *
+ * @param file The file to ingest; its name and size are declared on the mint.
+ * @param options `space` is the write target for the describing nodes.
+ * @throws ApiError From either request — a mint the size or the space refused,
+ *   or a redemption the server's type policy refused. Both are ordinary
+ *   failures for the caller to describe; neither leaves a resumable state. A
+ *   refused space arrives as {@link UnknownUploadSpaceError}, whose `phase`
+ *   says which request it was — the two are not the same event on screen, since
+ *   a refused mint sent nothing and a refused redemption sent the whole file.
+ */
+export async function ingestUpload(
+  file: File,
+  options: { space?: string } = {},
+  signal?: AbortSignal,
+): Promise<IngestOut> {
+  const minted = await requestUploadUrl(
+    {
+      name: file.name,
+      // A browser reports "" for a type it cannot guess from the extension.
+      // Saying so plainly beats inventing one, and the server prefers what it
+      // sniffs out of the bytes over anything declared here anyway.
+      mime: file.type || "application/octet-stream",
+      size: file.size,
+      ...(options.space === undefined ? {} : { space: options.space }),
+    },
+    signal,
+  );
+
+  if (minted.grant === null) {
+    // Only a *declared* sha256 the store already holds produces a grantless
+    // answer, and this client declares none — so reaching here means the
+    // response did not match its own contract. Reported as a refusal rather
+    // than dereferenced into a `TypeError`, and worded for what the caller has
+    // to know: no ingestion happened, so nothing describes these bytes.
+    throw new ApiError(
+      500,
+      "MissingUploadGrant",
+      "the server answered with no upload grant, so these bytes were not ingested",
+    );
+  }
+
+  try {
+    return await redeemUploadGrant(minted.grant.token, file, signal);
+  } catch (error) {
+    // `redeemUploadGrant` already normalised the refusal — it has to, being
+    // exported — but it could only name the space the *server* named, which is
+    // the resolved 32-hex id. This is the only place that knows the reference
+    // the human typed, so it re-labels rather than leaving an id on screen.
+    throw relabelUploadSpace(error, options.space);
+  }
+}
+
+/**
+ * Re-label an upload's space refusal with the reference the caller asked for.
+ *
+ * The mint refuses the reference it was given, so it needs none of this; the
+ * redemption refuses the id the token row resolved to, which is a 32-hex string
+ * nobody typed. The phase is preserved — that is the fact the copy branches on.
+ *
+ * @param error The caught value.
+ * @param space The reference the caller asked for, if it asked for one.
+ */
+function relabelUploadSpace(error: unknown, space: string | undefined): unknown {
+  if (space === undefined) return error;
+  if (!(error instanceof UnknownUploadSpaceError)) return error;
+  if (error.space === space) return error;
+  return new UnknownUploadSpaceError(space, error.wireStatus, error.message, error.phase);
 }
 
 /* ------------------------------------------------------------------ */
@@ -936,6 +1210,9 @@ export const api = {
   listAssets,
   getAsset,
   renditionUrl,
+  requestUploadUrl,
+  redeemUploadGrant,
+  ingestUpload,
   listEvents,
   undo,
   exportNode,

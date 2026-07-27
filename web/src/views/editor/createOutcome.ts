@@ -27,6 +27,12 @@
  * `describeError` renders an `ApiError` as `type: message`, so any path that
  * hands one an unresolved space prints the forbidden words verbatim.
  *
+ * The sentence that says *what changed about the target* is not written here
+ * any more: the assets drop-zone became its second user and the two copies had
+ * already drifted, so it lives in `components/spaceNaming.ts` as
+ * `writeTargetWouldNotResolve`, beside `spaceNameNote`. What stays local is the
+ * last sentence of each shape, which is the part that genuinely differs.
+ *
  * Both refusals resolve the target through `nameSpace` over **two** lists. The
  * space a write target stops resolving for is, overwhelmingly, one the human
  * just archived — so the active list alone can only render the id, and both
@@ -38,8 +44,7 @@
  */
 
 import { isUnknownSpace } from "../../api/client";
-import { findSpace, nameSpace } from "../../components/spaceNaming";
-import type { SpaceName } from "../../components/spaceNaming";
+import { findSpace, nameSpace, writeTargetWouldNotResolve } from "../../components/spaceNaming";
 import type { NodeOut } from "../../api/types";
 
 /**
@@ -110,35 +115,6 @@ export function describeLanding(
 }
 
 /**
- * Why a write target stopped resolving, said without claiming it is not there.
- *
- * The one sentence both refusal shapes are built on, so the copy rule is obeyed
- * in one place rather than in each caller. It states what *changed* — the only
- * honest thing available, since the server's refusal is word-for-word identical
- * for a space that was never created and one the caller holds no grant on.
- *
- * Two sentences, on one distinction: when the archived listing named the target
- * there is a specific true thing to say, and the disjunction ("archived, or
- * renamed") is what is left when nothing named it. Neither may narrow further —
- * saying *which* of the two is not an inference the interface is entitled to
- * make about a space it cannot see.
- *
- * @param name The write target, resolved through `nameSpace`.
- */
-function targetWouldNotResolve(name: SpaceName): string {
-  if (name.kind === "archived") {
-    return (
-      `The write target ${name.label} has been archived — an archived space stops resolving, so ` +
-      "nothing new can be filed there."
-    );
-  }
-  return (
-    `The write target ${name.label} would not resolve — a space stops resolving once it is ` +
-    "archived, and a renamed space no longer answers to its old name."
-  );
-}
-
-/**
  * Explain a create that the write target refused, or decline to.
  *
  * A target naming a space that has since been archived or renamed survives in
@@ -171,7 +147,7 @@ export function describeWriteFailure(
 ): string | null {
   if (!isUnknownSpace(error)) return null;
   return (
-    `${targetWouldNotResolve(nameSpace(requested, spaces, archived))} Your text is still here: ` +
+    `${writeTargetWouldNotResolve(nameSpace(requested, spaces, archived))} Your text is still here: ` +
     "choose another space above and save again."
   );
 }
@@ -207,7 +183,7 @@ export function describeDetachedWriteFailure(
 ): string | null {
   if (!isUnknownSpace(error)) return null;
   return (
-    `${targetWouldNotResolve(nameSpace(requested, spaces, archived))} That note is no longer ` +
+    `${writeTargetWouldNotResolve(nameSpace(requested, spaces, archived))} That note is no longer ` +
     "open, so its text could not be kept — pick another space before writing it again."
   );
 }

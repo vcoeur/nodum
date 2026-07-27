@@ -30,7 +30,13 @@ export { ErrorBoundary } from "./ErrorBoundary";
 export { Modal } from "./Modal";
 export { NodeBadge } from "./NodeBadge";
 export { SpaceFilter } from "./SpaceFilter";
-export { findSpace, nameSpace, spaceNameNote, unresolvedSpaceIds } from "./spaceNaming";
+export {
+  findSpace,
+  nameSpace,
+  spaceNameNote,
+  unresolvedSpaceIds,
+  writeTargetWouldNotResolve,
+} from "./spaceNaming";
 export type { SpaceName, SpaceNameKind } from "./spaceNaming";
 export { ANY_SPACE, resolveSpaceValue, spaceOptions, unlistedMark } from "./spaceOptions";
 export type { SpaceOption } from "./spaceOptions";

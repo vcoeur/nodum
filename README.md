@@ -319,15 +319,30 @@ degrades to BM25 + graph expansion. `NODUM_EMBED_MODEL` switches the model
   `POST /api/spaces/{id}/rename`, `POST /api/spaces/{id}/archive`, and
   `GET /api/spaces` listing every active space with its live node count and
   grant holders.
-- **Uploads are images only, and bounded.** `POST /api/assets` — the editor's
-  drag-drop route — caps the request
-  body before anything buffers it (32 MiB), identifies the type from the bytes
-  rather than the filename, and refuses an image whose pixel count would make
-  decoding it expensive. There is no delete route, so what lands stays until the
-  file is managed out of band. `PUT /api/uploads/{token}` is the other way in
-  and takes any format, because it is not anonymous: it spends a capability
-  minted by an authenticated human, is capped by that grant's own declared size
-  as it streams, and ingests under the principal who authorised it.
+- **Uploads are typed by their bytes, on both routes.** One policy, with the
+  route's capability as its only parameter. `POST /api/assets` — the editor's
+  drag-drop route — caps the request body before anything buffers it (32 MiB)
+  and admits the raster images this install can render: it registers bytes and
+  writes no describing
+  node, so what describes them is the note that inlines a rendition of them, and
+  it is the one route where the 40 MP rendition ceiling decides *admission*.
+  `PUT /api/uploads/{token}` admits everything the sniffer can name — rasters,
+  PDF, the common audio containers, and text — because it *ingests*: bytes in,
+  reviewable subgraph out, under the principal who minted the grant and capped
+  by that grant's own declared size as it streams. A 70 MP scan is an ordinary
+  document there, so that route keeps the decompression-bomb guard and drops the
+  rendition ceiling. Neither route reads the type
+  off the filename or the client's `Content-Type`. Something neither takes — a
+  `.docx`, a renamed binary, anything with no signature and NULs in it — goes
+  in through `nodum ingest file`, where the operator owns the file. Both halves
+  of that are heuristics rather than guarantees, and the sniffer's own docstring
+  says exactly what each one checks: the text test is a window at each end of the
+  file, and the displaced-PDF scan admits any non-text bytes carrying a versioned
+  `%PDF-` header in the head window — so a zip whose first entry is a PDF gets
+  in, and gets an honest "no text came out" for its trouble. There is
+  no delete route, so what lands stays until it is managed out of band — which is
+  why an upload that will be refused for a reason needing no bytes (an
+  unresolvable target space) is refused before anything is stored.
 - **Ingesting over HTTP.** `POST /api/ingest` takes exactly one of `path` and
   `url` (both or neither is a 400 rather than a precedence rule nobody
   remembers). Note what it hands the session's human: `path` is read *by the

@@ -325,6 +325,94 @@ export interface PurgeResult {
   bytes_freed: number;
 }
 
+/**
+ * What extraction got out of one asset, as reported to clients.
+ *
+ * The text itself is not echoed here — it lands on the asset's
+ * `extracted_text` and, capped, as the `source` node's content, and an
+ * envelope carrying a whole PDF's text would be unusable. `chars` and `pages`
+ * are how a caller tells "nothing came out" from "a lot came out", and
+ * `detail` says why when the answer is nothing: it is where *"install the
+ * `pdf` extra"* and *"a scanned PDF needs OCR"* are already phrased, so a
+ * readout that drops it drops the only actionable sentence in the response.
+ */
+export interface ExtractionOut {
+  /** The handler that ran, or `"none"` when nothing claimed the MIME. */
+  handler: string;
+  chars: number;
+  /** Pages the handler produced; 0 for a format that is not paginated. */
+  pages: number;
+  detail: string | null;
+}
+
+/**
+ * The outcome of ingesting one file or URL (design §5.5–§5.7).
+ *
+ * Bytes in, reviewable subgraph out: the `asset` itself, an `asset_ref` node
+ * describing it *in one space* (which is what makes the bytes reachable by
+ * anyone but a human, and findable at all), a `source` node carrying the
+ * extracted text, a `derived_from` edge between them, and one `block` child
+ * per page that had text.
+ *
+ * `created` is false when the target space already had that describing node:
+ * ingestion is idempotent per `(hash, space)`, so a re-run returns the
+ * existing subgraph rather than duplicating it. **That flag is the server's
+ * own account of *ingested* versus *already ingested*, and the only one a
+ * client may use** — there is no client-side hash bookkeeping to be done here.
+ *
+ * `pages` are the per-page `block` children under `source`, and
+ * `pages_truncated` says the document had more pages than the cap allowed —
+ * never a silent truncation.
+ */
+export interface IngestOut {
+  asset: AssetOut;
+  asset_ref: NodeOut;
+  source: NodeOut;
+  pages: NodeOut[];
+  pages_truncated: boolean;
+  edges: EdgeOut[];
+  extraction: ExtractionOut;
+  created: boolean;
+  event_seq: number;
+}
+
+/**
+ * A short-lived, single-use capability URL (design §5.7 rule 4).
+ *
+ * `token` is shown once and never stored in the clear — the database keeps
+ * only its sha256, exactly as it keeps an agent token.
+ *
+ * **`url` is not for this client.** It is absolute and built from
+ * `NODUM_PUBLIC_URL`, which exists for a host that is *not* this browser and
+ * may name another address entirely; the browser owns its own origin and
+ * carries only the capability, so it redeems `token` against `/api/uploads/…`
+ * here and never follows this field (design decision D5).
+ */
+export interface UrlGrantOut {
+  /** `"download"` or `"upload"`. */
+  kind: string;
+  token: string;
+  url: string;
+  asset_hash: string | null;
+  expires_at: string;
+  /** The body ceiling the redemption enforces; null on a download grant. */
+  max_bytes: number | null;
+}
+
+/**
+ * The answer to `POST /api/uploads`: a grant, or an instant dedup hit.
+ *
+ * Exactly one side is populated, never both and never neither. `asset` with a
+ * null `grant` is the dedup shortcut, and it is reachable **only** by
+ * declaring a `sha256` the store already holds — which this client never does
+ * (see {@link RequestUploadBody} and design decision D4). So the grantless
+ * shape is one to handle honestly rather than a path anything here takes.
+ */
+export interface UploadGrantOut {
+  grant: UrlGrantOut | null;
+  asset: AssetOut | null;
+}
+
 /** A grant level, weakest to strongest (the server's `GRANT_LEVEL_NAMES`). */
 export type GrantLevel = "read" | "suggest" | "edit";
 
@@ -591,4 +679,33 @@ export interface SetGrantBody {
 export interface RevokeGrantBody {
   agent: string;
   space: string;
+}
+
+/**
+ * Body for `POST /api/uploads` (mirrors `urls.mint_upload`).
+ *
+ * `size` is the ceiling the redemption then enforces on the body *as it
+ * streams*, so it is the file's real length rather than an estimate. The
+ * service refuses one above `urls.MAX_UPLOAD_BYTES` at mint time — before any
+ * bytes cross the network — as it refuses a `space` the session cannot write.
+ *
+ * **There is deliberately no `sha256` field.** A declared hash the store
+ * already holds is answered with the existing asset and *no grant*, and that
+ * shortcut proves the **bytes** exist rather than that anything *describes*
+ * them (design decision D4). A file registered earlier through the editor's
+ * drop is exactly the undescribed case, so declaring the hash would silently
+ * skip the ingestion the human asked for. The client has no way to express
+ * one — the same shape as its having no way to express an identity.
+ */
+export interface RequestUploadBody {
+  /** The name the bytes will be stored and titled under. */
+  name: string;
+  /** The declared content type. Advisory: the server stores what it sniffs. */
+  mime: string;
+  size: number;
+  /**
+   * The **write target**: which space the describing nodes land in, by id or
+   * name. Omitted lands them in `main`.
+   */
+  space?: string;
 }

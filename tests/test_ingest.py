@@ -251,6 +251,127 @@ def test_page_blocks_stop_at_the_cap_and_say_so(fresh_db, tmp_path, monkeypatch)
     assert result.pages_truncated is True
 
 
+def test_the_already_ingested_branch_reports_page_blocks_and_nothing_else(
+    fresh_db, tmp_path, monkeypatch
+):
+    """Review F2: `pages` was every child of the source, of any type and any state.
+
+    A `source` is an ordinary node, so anything can be written under it — a note
+    a human filed there, a page block since retired — and `list_children`
+    filters on neither type nor state. Every consumer reads this one field, so
+    the answer was wrong on the CLI, over MCP and in the browser at once.
+    """
+    monkeypatch.setattr(
+        extract,
+        "extract",
+        lambda source, *, mime: extract.Extraction(
+            handler="pdf", text="one two", pages=["one", "two"]
+        ),
+    )
+    source_file = tmp_path / "scan.pdf"
+    source_file.write_bytes(b"%PDF-1.4\n%%EOF\n")
+    first = ingest.ingest_file(source_file, principal=owner())
+    assert [page.props["page"] for page in first.pages] == [1, 2]
+
+    # An annotation filed under the document, and one page retired.
+    service.create_node(
+        type="note",
+        title="Marginalia",
+        content="my own reading",
+        parent_id=first.source.id,
+        principal=owner(),
+    )
+    service.transition(first.pages[1].id, "archive", principal=owner())
+
+    # The second drop takes the already-ingested branch, which re-extracts
+    # nothing — so what it reports about pages is a read of the graph alone.
+    again = ingest.ingest_file(source_file, principal=owner())
+
+    assert again.created is False
+    assert [page.id for page in again.pages] == [first.pages[0].id]
+    assert {page.type for page in again.pages} == {ingest.PAGE_TYPE}
+    assert again.pages_truncated is False
+
+
+def test_the_already_ingested_branch_still_reports_a_truncated_document(
+    fresh_db, tmp_path, monkeypatch
+):
+    """The cap's effect has to survive the second drop (review F2).
+
+    `pages_truncated` was hard-coded false on this branch, so a 900-page scan
+    reported the cap on the first ingestion and denied it on the next — a silent
+    truncation, which is exactly what `MAX_PAGE_BLOCKS` promises never to be.
+    """
+    monkeypatch.setattr(ingest, "MAX_PAGE_BLOCKS", 3)
+    monkeypatch.setattr(
+        extract,
+        "extract",
+        lambda source, *, mime: extract.Extraction(
+            handler="pdf", text="x", pages=[f"page {n}" for n in range(1, 11)]
+        ),
+    )
+    source_file = tmp_path / "long.pdf"
+    source_file.write_bytes(b"%PDF-1.4\n%%EOF\n")
+
+    first = ingest.ingest_file(source_file, principal=owner())
+    again = ingest.ingest_file(source_file, principal=owner())
+
+    assert (first.pages_truncated, again.pages_truncated) == (True, True)
+    assert len(again.pages) == 3
+
+
+def test_archiving_a_page_of_a_truncated_document_does_not_un_truncate_it(
+    fresh_db, tmp_path, monkeypatch
+):
+    """The two halves of F2's fix cancelled each other, and a merge-gate review caught it.
+
+    Restricting `pages` to non-archived blocks was right; inferring the cap's
+    effect from that same filtered list was not. One archived page — ordinary
+    curation — then turned the `true` the first drop reported into a `false`,
+    which is the silent truncation the flag exists to prevent, arriving through
+    the fix for its sibling.
+    """
+    monkeypatch.setattr(ingest, "MAX_PAGE_BLOCKS", 3)
+    monkeypatch.setattr(
+        extract,
+        "extract",
+        lambda source, *, mime: extract.Extraction(
+            handler="pdf", text="x", pages=[f"page {n}" for n in range(1, 11)]
+        ),
+    )
+    source_file = tmp_path / "long.pdf"
+    source_file.write_bytes(b"%PDF-1.4\n%%EOF\n")
+    first = ingest.ingest_file(source_file, principal=owner())
+    service.transition(first.pages[1].id, "archive", principal=owner())
+
+    again = ingest.ingest_file(source_file, principal=owner())
+
+    assert again.pages_truncated is True
+    # The retired page leaves the list and stays in the count.
+    assert len(again.pages) == 2
+
+
+def test_a_doomed_ingestion_stores_no_bytes(fresh_db, tmp_path):
+    """Review F13: nothing irreversible happens before a refusal that needs no bytes.
+
+    Registration is the irreversible half — there is no delete route — and it ran
+    before the space was resolved, so a target that stopped resolving left bytes
+    with no describing node and no way to reclaim them.
+    """
+    source = tmp_path / "note.txt"
+    source.write_text("filed nowhere", encoding="utf-8")
+
+    with pytest.raises(service.TypeNotFound):
+        ingest.ingest_file(source, space="never-created", principal=owner())
+
+    assert assets.list_assets(principal=owner()) == []
+    conn = db.connect(fresh_db)
+    try:
+        assert conn.execute("SELECT count(*) AS n FROM asset_blobs").fetchone()["n"] == 0
+    finally:
+        conn.close()
+
+
 def test_a_long_body_is_capped_with_a_visible_marker(fresh_db, tmp_path, monkeypatch):
     """The node content is the embedding input; the full text is never lost —
     it stays on the asset for BM25."""

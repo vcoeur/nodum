@@ -241,8 +241,15 @@ node for exactly this reason.
   class `cli._run` catches — the `sqlite3.Error` and `OSError` rows are the
   **base** classes, so `DatabaseError`/`IntegrityError`/`ProgrammingError`/
   `DataError` land on a status rather than a generic 500 — plus
-  `sqlite3.OperationalError` → 503, `OverflowError` → 400, `PayloadTooLarge` →
-  413 and `ClientDisconnect` → 499, which only a network surface meets.
+  `sqlite3.OperationalError` → 503, `OverflowError` → 400,
+  `urls.PayloadTooLarge` → 413 and `ClientDisconnect` → 499, which only a network
+  surface meets. Both `auth` failures are listed too, because both derive from
+  `OSError` through `PermissionError` and would otherwise inherit its 500:
+  `InvalidCredentials` → 401 and `PrincipalDisabled` → **403**, which the
+  capability upload route reaches for real when a grant outlives the account that
+  minted it — it used to be rewritten as `storage error: PrincipalDisabled`, and
+  `_failure_message` now exempts it from the storage rewrite as well as mapping
+  it, since neither is a storage failure.
   `test_every_exception_cli_run_catches_is_mapped` reads `cli._run`'s own
   except clauses and asserts the claim instead of restating it. Unmapped
   exceptions are a generic 500 with no traceback in the body.
@@ -260,7 +267,15 @@ node for exactly this reason.
   out of the initial bundle. `src/api/client.ts` is the only `fetch` in the
   app and has **no identity parameter anywhere** — the server's structural
   rule, mirrored in the client. It sends `Content-Type: application/json` on every
-  non-GET request, bodyless ones included, because the server requires it.
+  non-GET request that goes to a JSON route, bodyless ones included, because the
+  server requires it there — and on exactly one kind of request it deliberately
+  sends **no content type at all**: the raw-bytes `PUT /api/uploads/{token}`,
+  which is its own `rawRequest` branch. That is coherent rather than an
+  exception to be tidied away: the capability routes sit outside the
+  content-type gate on purpose (`_is_capability_path`), because that gate exists
+  to stop a cross-origin browser write riding an ambient cookie and a capability
+  URL carries no ambient credential — so demanding `application/json` on a body
+  that is not JSON would only make the client lie about its bytes.
   `src/lib/` holds the cross-view invariants
   (timestamps, failure classification, the sticky write target);
   `src/components/` holds shared React
@@ -327,7 +342,56 @@ node for exactly this reason.
   between is refused (`AssetSourceChanged`) instead of stored under a key it
   does not match, and a file above `SQLITE_LIMIT_LENGTH` (1 GB) is refused up
   front (`AssetTooLarge`). Note the streamed copy holds SQLite's single write
-  lock for its whole duration. Renditions (`thumb` ≤256px WebP
+  lock for its whole duration. **There is one sniffer, `sniff_mime`, and how
+  strongly it knows decides whether it can overrule the filename.** It names a
+  type from the *bytes* over `RECOGNISED_MIMES` — the rasters this Pillow build
+  reads (PNG, JPEG, GIF, WebP, BMP, TIFF including BigTIFF, JPEG 2000, AVIF,
+  ICO), `application/pdf`, the audio containers, and `text/plain` — a vocabulary
+  derived from the two places that already decide what this system can act on:
+  the rendition path and `nodum.extract`'s registry, and `RECOGNISED_MIMES` is
+  asserted to be covered by `extract.handler_for` rather than merely claimed to
+  be. **A signature is definite evidence and the text heuristic is weak
+  evidence**, which is the whole of the stored-MIME rule (`_stored_mime`): a
+  signature may overrule a name from another family — PDF bytes called
+  `scan.txt` land as `application/pdf`, which is what `page:<n>` rasters and
+  extraction dispatch on — while the name keeps its specificity *within* a
+  family, and the text heuristic may only **fill in** where the name guessed
+  nothing. That last clause is load-bearing: an uncompressed PDF whose `%PDF-`
+  sits one byte in sniffs as text, and letting that win cost the document its
+  handler, its page rasters, and put raw PDF bytes into the FTS index. It is also
+  why `image/svg+xml`, `application/json` and `application/xhtml+xml` keep their
+  own names with no list of exceptions to maintain. **A displaced `%PDF-` header
+  is definite evidence too** (`_sniff_displaced_pdf`): `pypdf` and PDFium both
+  *scan* for the marker rather than requiring it at offset 0, so a real PDF
+  behind a stray byte extracts, paginates and rasterises — and since every PDF a
+  human actually drops carries compressed streams, it does not sniff as text
+  either, so before this it matched nothing and the upload route **refused it
+  outright**. Order matters and is the safety argument: the scan runs only for
+  bytes the text test rejected, so prose quoting `%PDF-1.4` — which this repo's
+  own `docs/architecture.md` and this file both do — can never reach it, where a
+  bounded scan would only have made the misfire rarer. That refusal was found by
+  a live end-to-end pass and not by the suite: the test for the mis-typing above
+  drives this very route, but with a hand-assembled uncompressed fixture that
+  takes the text branch, so it stayed green while a real PDF was turned away.
+  **A fixture that cannot reach the branch is not coverage of it.** **Text is a windowed heuristic
+  and is documented as one, not as a guarantee**: a NUL or any other C0 control
+  byte means binary, checked over a 4 KiB window at *each* end of the file (the
+  tail is what catches a zip behind 4 KiB of ASCII, since its central directory
+  is at the end); a UTF-16/UTF-32 BOM exempts a file from the NUL rule *only*,
+  and the window is then decoded in that encoding and still has to be
+  control-free; a UTF-8 BOM proves nothing and is not honoured, because UTF-8
+  text passes the byte test unaided and the exemption only ever bought a bypass;
+  and an empty file is not text. A NUL-free, control-free binary format is still
+  admitted as text — stated, bounded, and never called a guarantee. New
+  registrations decide their own MIME; a **dedup hit** keeps the stored one
+  except where a definite signature contradicts its family, which is repaired
+  with an `UPDATE` (`_repaired_mime`) — `assets` is content-addressed base state
+  maintained exactly that way already (`set_extracted_text`), and a row
+  registered under an older rule otherwise poisons every later reader of it.
+  Registration itself **refuses nothing on type** — it takes no principal,
+  and the CLI's tolerance for arbitrary operator-owned files is deliberate; a
+  type policy belongs to the HTTP surfaces that take bytes from a stranger.
+  Renditions (`thumb` ≤256px WebP
   q75, `preview` ≤1024px WebP q80 with a 300 KB quality-stepping target) are
   keyed by `sha256(asset_hash + ':' + profile)`, generated lazily with Pillow
   on first request, stored as blobs, and evicted by `purge_renditions` (CLI
@@ -345,7 +409,17 @@ node for exactly this reason.
   naming the extra rather than an `ImportError` at startup. A raster has no
   image header to read, so its pixel budget is arithmetic (page geometry × the
   DPI scale) — PDF permits a 200×200 inch page, which is 829 MP at 144 DPI.
-  Pillow reads originals through
+  `check_image_pixel_budget` takes its ceiling as an argument and `limit=None` is
+  a real posture, not a bypass: **the bomb guard and the 40 MP ceiling answer two
+  different questions.** What Pillow itself calls a decompression bomb — and
+  bytes Pillow cannot read at all — is about danger and applies wherever an
+  image arrives; 40 MP is about what this server can *render*, so it gates
+  admission only on the route whose purpose is a rendition. Both refusals also
+  take a `name`, because the spool path is the operator's on a terminal and a
+  stranger's over a socket. Note that "cannot read" is `OSError`, not
+  `UnidentifiedImageError`: that class is one of its subclasses, and a plugin
+  whose `accept()` matched before the parse failed raises the bare class, which
+  used to escape as an unmapped 500. Pillow reads originals through
   `_BlobReader`, which restores the file-style tolerant seeks that
   `sqlite3.Blob` refuses and Pillow's format probing depends on.
 - **`nodum.extract`** — MIME → text, through handlers that degrade instead of
@@ -396,12 +470,25 @@ node for exactly this reason.
   **Idempotent per `(hash, space)`** — registration is content-addressed and
   0009's unique index allows one live `asset_ref` per pair, so a re-run finds
   the describing node instead of tripping the index, and a run interrupted
-  between the two node writes is repaired by running it again. Blank pages are
+  between the two node writes is repaired by running it again. That second branch
+  answers the *same* question as the first: `pages` is the source's **`block`
+  children in a non-archived state** and not every child it happens to have (a
+  `source` is an ordinary node, so a note filed under it by any `parent_id` write
+  used to be reported as a page of the document), and `pages_truncated` is
+  inferred from whether the count reached `MAX_PAGE_BLOCKS` rather than
+  hard-coded false — a re-drop of a 900-page scan must not deny the cap the first
+  drop reported. Blank pages are
   skipped (a scanned PDF with no OCR handler would otherwise propose a hundred
   empty nodes) while the page number stays in props, so numbering is honestly
   sparse rather than quietly renumbered, and `MAX_PAGE_BLOCKS` (100) stops a
   900-page scan from becoming a 900-item review queue — the overflow is
-  reported through `pages_truncated`, never dropped silently. `ingest_url` is
+  reported through `pages_truncated`, never dropped silently.
+  **Nothing irreversible happens before a refusal that needs no bytes**: the
+  target space is resolved *before* `register_asset`, because registration is the
+  irreversible half (there is no delete route) and a grant minted against a space
+  archived inside its five-minute TTL otherwise stored up to 32 MiB with no
+  describing node, no FTS row, and no way to reclaim them — while the client was
+  told the upload failed. `ingest_url` is
   `http`/`https` only, one bounded read with a timeout, redirects confined to
   the same two schemes (urllib would otherwise follow one to `ftp:`); it does
   **not** block loopback or private ranges, because the server is itself a
@@ -441,7 +528,14 @@ node for exactly this reason.
   `MAX_UPLOAD_BYTES` is deliberately equal to `http_api.MAX_REQUEST_BYTES` and
   must never exceed it (a grant promising more than the server will read fails
   halfway through the transfer); the value is duplicated rather than imported,
-  because a domain module has no business importing an adapter. `TokenInvalid`
+  because a domain module has no business importing an adapter. A declared size
+  above it raises **`PayloadTooLarge`**, which lives here for the same reason —
+  both ends of that ceiling are here, and the adapter imports the class and maps
+  it to 413, the direction `TokenInvalid` already runs in. It derives from
+  `ValueError` so the CLI reports it as one line; the explicit 413 row wins over
+  the inherited 400 because status lookup walks the MRO. A *negative* size stays
+  an ordinary `ValueError` — that is a malformed request, not an oversized one.
+  `TokenInvalid`
   is one class with one message for unknown, expired, spent, and wrong-kind —
   telling them apart is free intelligence for whoever is guessing. Both mints
   resolve their asset through `assets.get_asset`, so an asset the principal
@@ -826,16 +920,20 @@ Phase-1 decision log.
   `CONTENT_SECURITY_POLICY` does not reach this route (it is set by the static
   handler). The bytes stream out of the blob in 1 MiB chunks; never read an
   original into memory to send it.
-- **`PUT /api/uploads/{token}` registers bytes and stops there.** Registration
-  is content-addressed base state and needs no identity, which is why it can
-  happen without a session at all. The `asset_ref`/`source`/`derived_from`
-  subgraph is a *graph* write, needs a live principal with a grant on the
-  space, and this request has none — so freshly uploaded bytes have no
-  describing node until someone ingests them behind a session, which Phase 4's
-  plan calls the correct default for an ingestion that has not finished.
-  Closing that gap belongs in the domain layer, where the token row's
-  principal can legitimately be loaded; it must not be closed by an adapter
-  inventing a principal.
+- **`PUT /api/uploads/{token}` ingests: bytes in, reviewable subgraph out.**
+  This bullet used to say the route "registers bytes and stops there" and
+  prescribed closing that gap in the domain layer, where the token row's
+  principal can legitimately be loaded. Phase 4 did exactly that, in
+  `ingest.ingest_upload`, and nobody updated the bullet. The route now answers
+  with the whole ingestion — asset, `asset_ref`, `source`, `derived_from`, one
+  `block` per page — and the adapter still invents no identity: it hands the
+  spooled file and the token row to the domain, which re-mints the principal
+  from the row's own `created_by`, so a grant whose account has since been
+  disabled fails there and not here. What the route itself owes is what a
+  network surface always owes — the grant's `max_bytes` enforced *while* the
+  body streams, and the type policy below — and nothing more. A refusal
+  **spends the token**, since `urls.consume` runs before the bytes are read, so
+  a client retries by re-minting; nothing may offer to resume a spent grant.
 - **`POST /api/ingest` takes exactly one of `path` and `url`** (plus optional
   `name`/`space`/`title`); both or neither is a 400 rather than a precedence
   rule nobody remembers. Note what it hands the session's human, deliberately:
@@ -889,13 +987,63 @@ Phase-1 decision log.
   says is said to everyone; it used to say the absolute database path.
 - **`POST /api/assets` is bounded before it buffers**: `MAX_REQUEST_BYTES` is
   checked against `Content-Length` and then enforced mid-stream (the header is
-  client-supplied and cannot be the only guard), the type is sniffed from the
-  bytes against `UPLOAD_MIME_ALLOWLIST` rather than read off the filename, and
-  `assets.MAX_IMAGE_PIXELS` refuses a decompression bomb from the image header.
-  The allowlist is deliberately narrower than what `assets.register_asset` will
-  store: the CLI registers a local file the operator owns, this one takes a
-  file from a stranger. **There is no delete route**, so anything that does land
-  is only reclaimable out of band — a known gap, not an oversight.
+  client-supplied and cannot be the only guard). It registers bytes and writes
+  no describing node, so what describes them is the note that inlines
+  `![alt](/api/assets/<hash>/rendition/preview)` — which is why it admits
+  `INLINE_IMAGE_MIMES`, the rasters this Pillow build can actually render, and
+  nothing else, and why the 40 MP rendition ceiling is an admission rule *here*.
+  A document belongs on
+  the capability route, which ingests it. **There is no delete route**, so
+  anything that does land is only reclaimable out of band — a known gap, not an
+  oversight, and the reason both routes refuse before they store rather than
+  after.
+- **One type policy over both upload routes, with the route's capability as its
+  only parameter.** `_refuse_unsupported_upload(spooled, name, admits=…,
+  pixel_limit=…, cli_hint=…)` sniffs
+  the *bytes* (`assets.sniff_mime`) and never the filename or the client's
+  `Content-Type` — the sender chose both — then refuses anything outside
+  `admits`: `INLINE_IMAGE_MIMES` on `POST /api/assets`, `INGESTIBLE_MIMES` on
+  `PUT /api/uploads/{token}`. The second **is** `assets.RECOGNISED_MIMES` rather
+  than a copy of it, so the policy cannot drift from what the sniffer knows;
+  widening either route means adding the type to the sniffer, where the whole
+  system sees it. Every other difference between the two routes is a **named
+  argument, never a set comparison**: the decompression-bomb guard runs on both
+  (it was unguarded on the capability route), while `pixel_limit` carries
+  `assets.MAX_IMAGE_PIXELS` on `/api/assets` alone — 40 MP is what this server
+  can *render*, and a 600 dpi A3 scan is ~70 MP of ordinary document, so making
+  it an admission rule on the ingestion route would be capability gating
+  admission — and `cli_hint` says whether the refusal points at
+  `nodum ingest file`, which is a fact about being the widest *network* route and
+  not something to infer from `admits == INGESTIBLE_MIMES`.
+  What the policy gives up, deliberately: a PDF is refused by `/api/assets` and
+  ingested by the capability route; a renamed binary, a `.docx`, and anything
+  else with NULs and no signature are refused by both, and that refusal names
+  `nodum ingest file` as the way in, because the pipeline's tolerance for a file
+  no handler claims is unchanged and the CLI is where an operator registers a
+  file they already own. **That refusal is a heuristic, not a guarantee**, and it
+  has exactly two documented ways through, both of which degrade cleanly rather
+  than reaching anything they should not. A **NUL-free, control-free** binary
+  format is admitted as text — see the sniffer's windowed rule under
+  `nodum.assets` — bounded by what the download route serves it back as. And
+  **non-text bytes carrying a versioned `%PDF-` header in the head window** are
+  admitted as PDF, so a zip whose first entry is a PDF passes: that is the
+  displaced-header scan being broader than "is a PDF", it grants nothing the same
+  bytes at offset 0 did not already grant as a leading signature, and the
+  downstream answer is an extraction `detail` or a mapped 400, never a 500 or a
+  bad rendition. Availability is *not* part of it
+  — an install without the `pdf` extra still admits a PDF and reports in `detail`
+  that no text came out, since refusing at the door is a worse answer than the
+  honest empty one.
+  A new upload route names its admitted set and calls this helper; it does not
+  grow a check of its own.
+- **A refusal on the capability route is indistinguishable from a re-drop in the
+  audit log.** The escape hatches log both ends (`asset.upload_url` on the mint,
+  `asset.upload` on the redemption) and ingestion logs `asset.ingest`, but a spent
+  `asset.upload` with no `asset.ingest` after it now means *type-refused* **or**
+  *over the grant's size* **or** *already ingested into that space* — three
+  outcomes, one silence. Nothing reads it wrongly today; it is a readability cost
+  on the one surface whose rule is that an escape hatch logs both ends, and it is
+  written down here rather than left to be rediscovered.
 - **Do not invent request fields the domain has no representation for.** If a
   body key has no counterpart in `nodum.models`/`nodum.service`, it does not
   belong here. (The lesson was learned on the since-deleted policies API: an
@@ -929,8 +1077,17 @@ Phase-1 decision log.
 - **One `fetch`.** Everything goes through `src/api/client.ts`. It has no
   identity parameter and must never grow one — the server binds the principal
   and the client being unable to express one is the second layer under that.
-  It also owns `Content-Type: application/json` on every non-GET request,
-  bodyless ones included, because the server requires it. Auth is the
+  It also owns `Content-Type: application/json` on every non-GET request to a
+  JSON route, bodyless ones included, because the server requires it there. It
+  has **three** request shapes, not two, and the third one sends no content type
+  at all: `rawRequest`'s raw-body branch, for `PUT /api/uploads/{token}`. Do not
+  "fix" it by adding a header — the capability routes are deliberately outside
+  the content-type gate (`_is_capability_path`): that gate stops a cross-origin
+  browser write riding the session cookie, and a capability URL carries no
+  ambient credential to ride, so requiring `application/json` on a body of raw
+  bytes would only be the client lying about what it sends. A `form` body
+  (`POST /api/assets`, multipart) is the second shape and sets no content type
+  either, because the browser writes its own boundary. Auth is the
   `HttpOnly` session cookie the browser attaches itself — there is no token
   client-side; a 401 from any route but login is broadcast through
   `src/lib/session.ts`, and the app shell answers it with a redirect to
@@ -947,8 +1104,16 @@ Phase-1 decision log.
   panel; do not re-test `status` or `instanceof`. The same rule covers a refused
   space: `isUnknownSpace` (`src/api/client.ts`) is the **only** discriminator,
   and the client normalises every call that names a space — `listNodes`,
-  `search`, `createNode`, `createSpace`, `renameSpace`, `archiveSpace` — into
-  one `UnknownSpaceError`. It is keyed on the message (`unknown space: …`),
+  `search`, `createNode`, `createSpace`, `renameSpace`, `archiveSpace`, and the
+  upload flow's two halves, `requestUploadUrl` (`POST /api/uploads`) and
+  `redeemUploadGrant` (`PUT /api/uploads/{token}`) — into
+  one `UnknownSpaceError`. The upload pair raises the `UnknownUploadSpaceError`
+  **subclass**, which is a second *fact* rather than a second discriminator:
+  `isUnknownSpace` answers true for it exactly as before, and what it adds is
+  which request refused, because a refused mint sent nothing while a refused
+  redemption already spent the grant and streamed the body. Copy that cannot tell
+  those apart claims "nothing was uploaded" about a request that uploaded the
+  whole file. It is keyed on the message (`unknown space: …`),
   because no status is specific enough: the node listing answers 404 and search
   answers 400 for the same event, while a 404 from `POST /api/nodes` is equally
   an unknown node *type*. Two views once carried their own copy of that match,
@@ -970,7 +1135,14 @@ Phase-1 decision log.
   changed instead — a space stops resolving once it is archived, and a renamed
   one no longer answers to its old name. `views/search/spaceFailure.ts`,
   `views/editor/createOutcome.ts` and `views/spaces/spaces.ts` own that copy and
-  pin it with tests; new copy goes through one of them. The refusal that names
+  pin it with tests; new copy goes through one of them. The one sentence about a
+  refused **write target** — the space a create or an upload was filing into —
+  belongs to `components/spaceNaming.ts` instead (`writeTargetWouldNotResolve`):
+  the uploader is that sentence's
+  second user, and the rule here is to promote on the second user rather than let
+  a second view keep its own copy. `components/` is also where it can be reached
+  by every node-creating surface, which is what makes it the shared tier.
+  The refusal that names
   an **archived** space holding a name you tried to create is not a breach and
   not an exception: it is the server's own message, shown verbatim, and the
   only principals that can reach it are those writing `meta` — which is the

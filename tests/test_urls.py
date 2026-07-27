@@ -351,10 +351,28 @@ def test_an_upload_token_is_also_single_use(fresh_db):
 # ── Bounds ────────────────────────────────────────────────────────────────────
 
 
-@pytest.mark.parametrize("size", [urls.MAX_UPLOAD_BYTES + 1, -1])
-def test_a_size_outside_the_cap_is_refused(fresh_db, size):
-    with pytest.raises(ValueError, match="size must be between"):
-        urls.mint_upload("huge.bin", "application/octet-stream", size, principal=owner())
+def test_a_size_over_the_cap_is_a_payload_too_large(fresh_db):
+    """A declared size above the ceiling *is* a payload too large (review F11).
+
+    It used to be a bare `ValueError`, which the HTTP surface renders through
+    `type(exc).__name__` — so a browser showed a human
+    `ValueError: size must be between 0 and 33554432 bytes, got …` for what the
+    413 class beside it already describes.
+    """
+    with pytest.raises(urls.PayloadTooLarge, match="will not read more than"):
+        urls.mint_upload(
+            "huge.bin", "application/octet-stream", urls.MAX_UPLOAD_BYTES + 1, principal=owner()
+        )
+    assert _rows() == []
+    # Still a ValueError underneath, so `cli._run` keeps reporting it as one line.
+    assert issubclass(urls.PayloadTooLarge, ValueError)
+
+
+def test_a_negative_size_is_still_an_ordinary_value_error(fresh_db):
+    """The too-small case is a malformed request, not an oversized one."""
+    with pytest.raises(ValueError, match="non-negative") as refused:
+        urls.mint_upload("odd.bin", "application/octet-stream", -1, principal=owner())
+    assert not isinstance(refused.value, urls.PayloadTooLarge)
     assert _rows() == []
 
 

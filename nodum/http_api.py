@@ -139,6 +139,7 @@ from nodum.service import (
     TypeNotFound,
     UndoNotPossible,
 )
+from nodum.urls import PayloadTooLarge
 
 #: The session cookie's name: an opaque id for a server-side ``sessions`` row
 #: (30-day sliding expiry), set by ``POST /api/login`` as ``HttpOnly;
@@ -281,19 +282,31 @@ DOWNLOAD_CONTENT_TYPE = "application/octet-stream"
 #: ``AssetTooLarge`` remains the storage-layer backstop under it.
 MAX_REQUEST_BYTES = 32 * 1024 * 1024
 
-#: MIME types ``POST /api/assets`` accepts, sniffed from the bytes rather than
-#: taken from the filename or the client's ``Content-Type``.
+#: What ``POST /api/assets`` admits: the rasters a note can inline and this
+#: server can render.
 #:
-#: Deliberately narrower than what ``assets.register_asset`` will store: the
-#: CLI registers a local file the operator already owns and Phase-4 ingestion
-#: will want documents, but the *network* surface should only accept what this
-#: system can actually do something with, which today is raster images
-#: (renditions, design §5.7). ``.exe``, ``.html`` and ``.iso`` were all stored
-#: happily before this list existed. SVG is excluded on purpose — it is a
-#: script-bearing document that Pillow cannot render anyway.
-UPLOAD_MIME_ALLOWLIST = frozenset(
-    {"image/png", "image/jpeg", "image/gif", "image/webp", "image/bmp", "image/tiff"}
-)
+#: That route registers bytes and writes no describing node, so the thing that
+#: describes them is the note carrying
+#: ``![alt](/api/assets/<hash>/rendition/preview)`` — which only means anything
+#: for an image. "Raster" is therefore a contract here rather than an accident
+#: of history, and it is narrower than what ``assets.register_asset`` will
+#: store, because the CLI registers a local file the operator already owns while
+#: this one takes a file from a stranger. SVG is excluded with the rest — it is
+#: a script-bearing document Pillow cannot render anyway.
+INLINE_IMAGE_MIMES = assets.RECOGNISED_IMAGE_MIMES
+
+#: What ``PUT /api/uploads/{token}`` admits: everything the sniffer can name.
+#:
+#: Those bytes become a subgraph — ``asset_ref`` + ``source`` +
+#: ``derived_from`` + one ``block`` per page — so the right question is not "can
+#: this be rendered" but "can this system act on it at all", which is exactly
+#: what :data:`assets.RECOGNISED_MIMES` answers. Derived from the sniffer rather
+#: than listed here, so the policy cannot drift from what the sniffer knows.
+#:
+#: Availability is deliberately *not* part of it: an install without the ``pdf``
+#: extra still admits a PDF and reports in ``detail`` that no text came out,
+#: because refusing at the door is a worse answer than the honest empty one.
+INGESTIBLE_MIMES = assets.RECOGNISED_MIMES
 
 #: Methods that do not change state, and so carry no CSRF risk worth gating.
 SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
@@ -370,15 +383,6 @@ _FALSE_VALUES = frozenset({"0", "false", "no", "off", ""})
 _SAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]")
 
 
-class PayloadTooLarge(Exception):
-    """Raised from the wrapped ``receive`` when a body passes :data:`MAX_REQUEST_BYTES`.
-
-    Raised *mid-read*, so the bytes past the limit are never buffered — the
-    point of the class. ``Content-Length`` is checked first where a client
-    supplies one, but it is client-supplied and cannot be the only guard.
-    """
-
-
 #: Exception → HTTP status. It covers every class ``cli._run`` catches — the
 #: ``sqlite3`` and ``OSError`` rows are the **base** classes, so every
 #: ``DatabaseError``/``IntegrityError``/``ProgrammingError``/``DataError`` lands
@@ -424,6 +428,13 @@ EXCEPTION_STATUS: dict[type[Exception], int] = {
     # only, and humans are unfiltered, so this is unreachable from this
     # surface by construction; mapped so it could never surface as a 500.
     GrantNotPermitted: 403,
+    # 403 too, and reachable: `PUT /api/uploads/{token}` re-mints the grant's
+    # principal inside `ingest.ingest_upload`, so a capability outliving the
+    # account that authorised it fails there. `PrincipalDisabled` derives from
+    # OSError (via PermissionError) and inherited the 500 below, which rewrote it
+    # as `storage error: PrincipalDisabled` — a sentence a browser now shows a
+    # human, and not a storage failure at all.
+    auth.PrincipalDisabled: 403,
     # 409 — the graph has grown past the event being undone, or a name is
     # taken: an account's, or a space's (including one an archived space still
     # reserves — `service._require_space_name_free`). All three derive from
@@ -432,7 +443,10 @@ EXCEPTION_STATUS: dict[type[Exception], int] = {
     UndoNotPossible: 409,
     AccountExists: 409,
     SpaceNameTaken: 409,
-    # 413 — the body passed the ceiling this server is willing to read.
+    # 413 — the body passed the ceiling this server is willing to read, whether
+    # it was declared at mint time (`urls.mint_upload`) or delivered here. Both
+    # raise `urls.PayloadTooLarge`, which derives from ValueError; this row is
+    # more specific, and Starlette walks the MRO, so it wins over the 400.
     PayloadTooLarge: 413,
     # 499 — the client hung up mid-body (a cancelled upload). Nothing will read
     # this status; it exists so the case is a mapped outcome rather than an
@@ -528,11 +542,13 @@ def _failure_message(exc: Exception) -> str:
     ``database error: …`` is what the CLI prints for a SQLite failure. An
     ``OSError`` is the one deliberate divergence: ``cli._run`` appends the
     filename, and this surface must not — the path is the operator's on a
-    terminal and a stranger's over a socket. ``auth.InvalidCredentials``
-    derives from ``OSError`` (via ``PermissionError``) and is checked first:
-    it is a credential failure, never a storage one.
+    terminal and a stranger's over a socket. Both ``auth`` failures derive from
+    ``OSError`` (via ``PermissionError``) and are checked first: a wrong password
+    and a disabled account are decisions about a principal, never storage
+    failures, and ``storage error: PrincipalDisabled`` is what the fall-through
+    made of the second one.
     """
-    if isinstance(exc, auth.InvalidCredentials):
+    if isinstance(exc, (auth.InvalidCredentials, auth.PrincipalDisabled)):
         return str(exc)
     if isinstance(exc, sqlite3.Error):
         return f"database error: {exc}"
@@ -1193,31 +1209,72 @@ def _id_list(value: Any) -> list[str]:
 # ── Upload policy ─────────────────────────────────────────────────────────────
 
 
-def _refuse_unsupported_upload(spooled: Path, original_name: str) -> None:
-    """Refuse an upload this system cannot store or render, before it is stored.
+#: What a refusal on the widest network route points at instead of itself.
+#:
+#: ``PUT /api/uploads/{token}`` admits everything the sniffer can name, so there
+#: is no wider *network* route to redirect to: the remaining way in for a
+#: ``.docx``, a ``.zip``, or anything else carrying NULs and no signature is the
+#: CLI, where an operator registers a file they already own. That tolerance is
+#: the pipeline's, unchanged — a file no handler claims is still registered and
+#: described. ``POST /api/assets`` gets no such line, because the type it just
+#: refused is very likely ingestible one route over.
+INGEST_CLI_HINT = (
+    " — 'nodum ingest file <path>' is the way in for a type this surface will not take"
+)
 
-    The type is decided by the *bytes*, never by ``original_name`` or the
-    client's declared ``Content-Type``: both are attacker-chosen, and
-    ``register_asset`` records the MIME that ``mimetypes.guess_type`` derives
-    from the name — so a renamed executable used to be stored as ``image/png``.
+
+def _refuse_unsupported_upload(
+    spooled: Path,
+    original_name: str,
+    *,
+    admits: frozenset[str],
+    pixel_limit: int | None,
+    cli_hint: bool,
+) -> None:
+    """Refuse an upload the requested route cannot act on, before it is stored.
+
+    One policy with the route's capability as its only parameter (Phase 4 note
+    01 D2). The type is decided by the *bytes*, never by ``original_name`` or the
+    client's declared ``Content-Type``: both are chosen by whoever sent the file,
+    so a renamed executable used to be stored as ``image/png`` on one route and
+    ingested unexamined on the other.
+
+    Where the bytes turn out to be an image, the header is read in the same pass.
+    What that read *refuses* is the caller's to say, because two different
+    questions are asked of it: a decompression bomb is dangerous on any route,
+    while the 40 MP rendition ceiling is a statement about what this server can
+    render and belongs only to the route whose whole purpose is a rendition
+    (review F9 — capability must not gate admission, exactly as an install
+    without the ``pdf`` extra still admits a PDF).
 
     Args:
         spooled: The temp file holding the uploaded bytes.
-        original_name: The client's filename, used only in the error message.
+        original_name: The client's filename, used only in the error message —
+            including the image refusal's, which must not name the spool path.
+        admits: The MIME types this route can act on —
+            :data:`INLINE_IMAGE_MIMES` or :data:`INGESTIBLE_MIMES`.
+        pixel_limit: Pixel ceiling for an image, or ``None`` to keep only the
+            bomb guard (see :func:`assets.check_image_pixel_budget`).
+        cli_hint: Whether the refusal should name ``nodum ingest file``. True on
+            the widest *network* route, which has nowhere wider to point at —
+            passed rather than inferred from ``admits``, because a set-value
+            comparison standing in for "is this the widest route" reads as an
+            accident and breaks the moment two routes admit the same set.
 
     Raises:
-        UnsupportedRendition: If the bytes are not one of
-            :data:`UPLOAD_MIME_ALLOWLIST`.
-        ImageTooLarge: If the image's pixel count is above what a rendition may
-            decode.
+        UnsupportedRendition: If the bytes are not one of ``admits``, or are an
+            image whose header Pillow cannot read.
+        ImageTooLarge: If the image is a bomb, or is above ``pixel_limit``.
     """
-    sniffed = assets.sniff_image_mime(spooled)
-    if sniffed not in UPLOAD_MIME_ALLOWLIST:
+    sniffed = assets.sniff_mime(spooled)
+    if sniffed not in admits:
         raise UnsupportedRendition(
-            f"{original_name!r} is {sniffed or 'not a recognised image'}; this API stores "
-            f"images only ({', '.join(sorted(UPLOAD_MIME_ALLOWLIST))})"
+            f"{original_name!r} is {sniffed or 'not a type this API recognises'}; "
+            f"this route accepts {', '.join(sorted(admits))}"
+            f"{INGEST_CLI_HINT if cli_hint else ''}"
         )
-    assets.check_image_pixel_budget(spooled)
+    if sniffed.startswith("image/"):
+        assets.check_image_pixel_budget(spooled, limit=pixel_limit, name=original_name)
 
 
 # ── Serving original bytes ────────────────────────────────────────────────────
@@ -1710,12 +1767,18 @@ def create_app(
           the parser and copied a second time by this handler — a 400 MB upload
           measured 839 MB of ``/tmp``, and tripping the real 1 GB limit needed
           more than 2 GB of it.
-        * **Type** is sniffed from the bytes (:func:`assets.sniff_image_mime`),
-          not read off the filename, so a renamed ``.exe`` is refused rather
-          than stored under ``image/png``.
+        * **Type** is sniffed from the bytes (:func:`assets.sniff_mime`), not
+          read off the filename, so a renamed ``.exe`` is refused rather than
+          stored under ``image/png``. This route admits
+          :data:`INLINE_IMAGE_MIMES` — the rasters a note can inline — and a
+          document belongs on the capability route, which ingests it.
         * **Pixel count** is read from the image header, so a 612 KB PNG that
           decodes to 14000×14000 is refused here rather than raising
           ``DecompressionBombError`` out of the rendition endpoint as a 500.
+          This is the one route where ``assets.MAX_IMAGE_PIXELS`` gates
+          *admission*: everything it takes is here to be rendered, so bytes
+          above the rendition ceiling have no purpose it can serve. The
+          capability route beside it keeps the bomb guard and drops the ceiling.
         """
         async with request.form(max_files=1, max_fields=1) as form:
             upload = form.get("file")
@@ -1727,7 +1790,15 @@ def create_app(
                 with spooled.open("wb") as handle:
                     while chunk := await upload.read(UPLOAD_CHUNK_BYTES):
                         handle.write(chunk)
-                _refuse_unsupported_upload(spooled, original_name)
+                _refuse_unsupported_upload(
+                    spooled,
+                    original_name,
+                    admits=INLINE_IMAGE_MIMES,
+                    # This route exists to produce renditions, so the rendition
+                    # ceiling is an admission rule here and nowhere else.
+                    pixel_limit=assets.MAX_IMAGE_PIXELS,
+                    cli_hint=False,
+                )
                 asset = assets.register_asset(spooled, name=original_name, path=db_path)
         return EnvelopeResponse(envelope(asset))
 
@@ -1905,6 +1976,23 @@ def create_app(
         *authorised* the grant from the row's own ``created_by``. The identity
         never passes through this module, and a grant whose account has since
         been disabled fails there rather than here.
+
+        **The type policy applies here too**, and it is the same one
+        ``POST /api/assets`` runs — :func:`_refuse_unsupported_upload` with this
+        route's own admitted set, :data:`INGESTIBLE_MIMES`. It cannot run before
+        the body has arrived, because it reads the bytes; it runs before
+        anything is stored or described. The grant's declared ``mime`` is not
+        consulted: it was a promise made at mint time about a file that had not
+        moved yet, and the bytes are the only evidence. A refusal still spends
+        the token — ``urls.consume`` ran first, by design — so the client
+        re-mints to retry.
+
+        What it does **not** apply is the 40 MP rendition ceiling. These bytes
+        become knowledge rather than a thumbnail, and a 600 dpi A3 scan is ~70 MP
+        — refusing it here would make capability gate admission, which this
+        policy refuses to do everywhere else (an install without the ``pdf``
+        extra still admits a PDF). The decompression-bomb guard is about danger
+        rather than capability, so it applies here as on every route.
         """
         row = urls.consume(request.path_params["token"], kind="upload", path=db_path)
         max_bytes = row["max_bytes"]
@@ -1920,6 +2008,16 @@ def create_app(
                             f"this upload grant is for {max_bytes} bytes and the body is larger"
                         )
                     handle.write(chunk)
+            _refuse_unsupported_upload(
+                spooled,
+                original_name,
+                admits=INGESTIBLE_MIMES,
+                # No rendition ceiling: these bytes are being turned into
+                # knowledge, and a 600 dpi A3 scan (~70 MP) is an ordinary
+                # document. The bomb guard still runs.
+                pixel_limit=None,
+                cli_hint=True,
+            )
             result = ingest.ingest_upload(row, spooled, path=db_path)
         return EnvelopeResponse(envelope(result))
 

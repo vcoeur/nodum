@@ -1,12 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { DragEvent as ReactDragEvent } from "react";
 import { listAssets, listNodes } from "../../api/client";
-import { EmptyState, Spinner } from "../../components";
+import { EmptyState, Spinner, unresolvedSpaceIds, useArchivedSpaces, useSpaces } from "../../components";
 import type { AssetOut, NodeOut } from "../../api/types";
 import { AssetGrid } from "./AssetGrid";
 import { AssetLightbox } from "./AssetLightbox";
 import { AssetUploader, useAssetUploads } from "./AssetUploader";
-import { describeFailure, type FailureDescription } from "../../lib";
+import { describeFailure, useWriteTarget, type FailureDescription } from "../../lib";
 import "./assets.css";
 
 /**
@@ -22,6 +22,13 @@ import "./assets.css";
  * Renditions are generated lazily and are fully regenerable, so a first view
  * is allowed to be slow — every image here has an explicit loading state and a
  * reserved frame rather than an assumption that it will appear instantly.
+ *
+ * The drop-zone is the other half of the page, and it **creates nodes** — a
+ * drop here runs the ingestion pipeline rather than registering bytes. That is
+ * why this view reads the space vocabulary at all: decision D1a requires the
+ * write target to be on screen wherever it is used, and a target or a landing
+ * space the active listing cannot name has to be named rather than printed as a
+ * 32-hex id.
  */
 
 /** How many nodes to scan when resolving which notes reference an asset. */
@@ -73,15 +80,28 @@ export default function AssetsView() {
     return () => controller.abort();
   }, [load]);
 
-  // Captured in a ref so the upload queue's dedup check always sees the
-  // hashes as they were *before* the batch, without re-creating the callback.
-  const knownHashes = useRef<Set<string>>(new Set());
-  knownHashes.current = useMemo(() => new Set(assets.map((asset) => asset.hash)), [assets]);
+  const { spaces } = useSpaces();
+  const [writeTarget] = useWriteTarget();
 
   const uploads = useAssetUploads({
-    isKnownHash: useCallback((hash: string) => knownHashes.current.has(hash), []),
-    onRegistered: useCallback(() => void load(), [load]),
+    writeTarget,
+    onIngested: useCallback(() => void load(), [load]),
   });
+
+  // Everything this screen names, not only what a row happens to show: the
+  // write target is the reference that most often points at a space the active
+  // listing does not carry, and gating on the queue alone would leave the one
+  // control that has to be legible unable to name it. A refused row names the
+  // target *it* was minted against, which is not necessarily the current one.
+  const namedSpaces = useMemo(
+    () =>
+      [
+        writeTarget,
+        ...uploads.items.flatMap((item) => [item.requestedSpace, item.outcome?.spaceId ?? ""]),
+      ].filter((reference) => reference !== ""),
+    [writeTarget, uploads.items],
+  );
+  const archivedSpaces = useArchivedSpaces(unresolvedSpaceIds(namedSpaces, spaces).length > 0);
 
   const { references, referencesLoading } = useAssetReferences(openIndex !== null);
 
@@ -102,6 +122,11 @@ export default function AssetsView() {
     if (dragDepth.current === 0) setDragging(false);
   };
 
+  // No `busy` check here: the queue refuses a second concurrent batch itself,
+  // which is the only place that can answer synchronously and the only place
+  // both entry points (this drop and the panel's file input) go through. A copy
+  // of the guard here would be a second owner of the rule, and this one reads a
+  // `busy` that React may not have re-rendered yet.
   const onDrop = (event: ReactDragEvent) => {
     if (!carriesFiles(event)) return;
     event.preventDefault();
@@ -162,7 +187,12 @@ export default function AssetsView() {
         </div>
       </header>
 
-      <AssetUploader queue={uploads} />
+      <AssetUploader
+        queue={uploads}
+        writeTarget={writeTarget}
+        spaces={spaces}
+        archivedSpaces={archivedSpaces.spaces}
+      />
 
       {list.status === "loading" ? (
         <div className="nd-empty">
@@ -185,7 +215,7 @@ export default function AssetsView() {
       {list.status === "ready" && assets.length === 0 ? (
         <EmptyState
           title="No assets registered"
-          body="Drop an image on this page, or use Choose files. Files are stored under their sha256, so the same file registered twice is stored once."
+          body="Drop a document on this page, or use Choose files. Each one is ingested into the space shown above: the bytes are stored under their sha256 and the graph gets nodes describing them and whatever text came out."
         />
       ) : null}
 
@@ -195,7 +225,7 @@ export default function AssetsView() {
 
       {dragging ? (
         <div className="nd-assets__drop-overlay" aria-hidden="true">
-          <p className="nd-assets__drop-label">Drop to register</p>
+          <p className="nd-assets__drop-label">Drop to ingest</p>
         </div>
       ) : null}
 

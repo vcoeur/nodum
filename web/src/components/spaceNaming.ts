@@ -30,6 +30,11 @@
  *   "nothing names this space" while the request that would name it is in
  *   flight, and {@link unresolvedSpaceIds} must not report every space on the
  *   screen as unresolved and fire the archived read on a perfectly healthy one.
+ *
+ * The two sentences built on those answers live here too —
+ * {@link spaceNameNote} and {@link writeTargetWouldNotResolve} — because each
+ * has more than one caller and both sit inside the same copy rule: nothing
+ * user-facing may say a space does not exist.
  */
 
 import type { NodeOut } from "../api/types";
@@ -125,6 +130,48 @@ export function spaceNameNote(name: SpaceName): string | null {
     return "The space list has not answered yet, so this is the id rather than the name.";
   }
   return null;
+}
+
+/**
+ * Why a write target stopped resolving, said without claiming it is not there.
+ *
+ * The sibling of {@link spaceNameNote}, and here for the same reason: it is one
+ * sentence that more than one view has to write, and it sits inside the copy
+ * rule that no surface may claim a space does not exist. The editor's create
+ * path wrote it first; the assets drop-zone became the second user and the two
+ * copies had already drifted, so it lives here now and both call it.
+ *
+ * Three answers, on what is actually known about the target:
+ *
+ * - `archived` — the archived listing named it, so there is a specific true
+ *   thing to say and the disjunction would be vaguer than the facts;
+ * - `pending` — the active list has not answered, so the label is the raw
+ *   reference and the sentence says why rather than leaving a 32-hex id
+ *   unexplained;
+ * - anything else — the disjunction, which is all that is left. It may **not**
+ *   narrow: which of *archived* and *ungranted* it was is not an inference this
+ *   interface is entitled to make about a space it cannot see.
+ *
+ * @param name The write target, resolved through {@link nameSpace}.
+ * @returns One or two sentences naming the target and what changed about it.
+ */
+export function writeTargetWouldNotResolve(name: SpaceName): string {
+  if (name.kind === "archived") {
+    return (
+      `The write target ${name.label} has been archived — an archived space stops resolving, so ` +
+      "nothing new can be filed there."
+    );
+  }
+  const disjunction =
+    "a space stops resolving once it is archived, and a renamed space no longer answers to its " +
+    "old name";
+  if (name.kind === "pending") {
+    return (
+      `The write target ${name.label} would not resolve — the space list has not answered yet, ` +
+      `so this is its id rather than its name. And ${disjunction}.`
+    );
+  }
+  return `The write target ${name.label} would not resolve — ${disjunction}.`;
 }
 
 /**

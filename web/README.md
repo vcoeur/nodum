@@ -35,7 +35,13 @@ revoked), the write-target and space-filter pickers, and every sentence the
 editor and search write about a write target or filter the server refused. They
 all go through `components/spaceNaming.ts` over two lists — the shared active
 one and `components/useArchivedSpaces.ts`, a lazy read of the archived space
-nodes in meta that fires only when something on screen actually needs it.
+nodes in meta that fires only when something on screen actually needs it. Two
+sentences built on those answers live in the same module, because each has more
+than one caller and both sit inside the never-say-it-does-not-exist rule:
+`spaceNameNote`, and `writeTargetWouldNotResolve` — the *"the write target
+`reading` has been archived …"* sentence that the editor's create path and the
+assets drop-zone both write, and had already drifted into two wordings before it
+was promoted.
 `spaceLabel` is **not** that function: its fallback to the raw reference is a
 picker rule (a `<select>` must be able to render its own value), it prints a
 32-hex id anywhere else, and it is no longer exported from `components/` — its
@@ -54,6 +60,87 @@ listing named it and `(unavailable)` when nothing did, and gone the instant the
 human selects something else. Handing that module a list instead of a name
 would let someone newly pick a space the server refuses to resolve, which is a
 worse bug than the bare id it fixed.
+
+## Two drops, two routes
+
+Dropping a file has two meanings in this app, and the file's *type* is not what
+tells them apart — what the human is doing is (design decision D1):
+
+| Act | Route | Who describes the bytes |
+|---|---|---|
+| Put a picture in the prose I am writing | `POST /api/assets` | the note that carries it inline |
+| Turn this document into knowledge | `POST /api/uploads` → `PUT /api/uploads/{token}` | ingestion, as `asset_ref` + `source` + `derived_from` + one `block` per page |
+
+The **editor's** drop is the first: it inserts a rendition URL into the Markdown
+and nothing else, and its own copy already routes everything else away. It keeps
+`POST /api/assets`, which registers bytes and stops — and admits rasters alone,
+because those bytes get inlined and rendered as an image.
+
+The **assets page's** drop-zone is the second, and it is the whole of
+`client.ts`'s `ingestUpload`: mint a single-use grant, then spend it. Bytes with
+no describing node are readable by humans and by nobody else and carry no
+`node_fts` row, so a document registered through the other route is invisible to
+agents and to search — which is why widening that route was the wrong fix and
+the capability flow is the right one. Images go through it too, deliberately: an
+image with no OCR handler yields a description and no text, exactly as
+`nodum ingest file <image>` does, and branching on the type inside one drop-zone
+would rebuild the split one level up where the human cannot see which of the two
+things happened.
+
+Three rules that are easy to get wrong there, all pinned by tests:
+
+- **redeem on our own origin.** The grant's `url` is absolute and built from
+  `NODUM_PUBLIC_URL`, which exists for a foreign host and may name another
+  machine; the browser uses `grant.token` against `/api/uploads/{token}` here.
+  The client owns its origin, the grant carries only the capability;
+- **declare no `sha256`.** A declared hash the store already holds is answered
+  with the existing asset and no grant at all, and that shortcut proves the
+  *bytes* exist rather than that anything *describes* them — a file registered
+  earlier through the editor is exactly the undescribed case, so declaring it
+  would silently skip the ingestion the human asked for;
+- **statuses come from the server.** `created: true` is *ingested*,
+  `created: false` is *already ingested*; there is no client-side hash
+  bookkeeping, and `views/assets/uploadOutcome.ts` is where that reading and the
+  detail-line wording live. Two slots on that line belong to one thing each: the
+  landing phrase reports a *filing*, so the already-ingested branch says
+  "Already described in `research`" rather than claiming a write nothing made,
+  and the "why no text" slot belongs to the **extraction** — on the
+  already-ingested branch the server puts its own idempotency note in
+  `extraction.detail`, and letting it through had the second drop of an OCR-less
+  PNG read *"no text extracted — already ingested into this space"*: a causal
+  claim that is false, in the slot where *"install the `ocr` extra"* had been.
+
+Three more, about the queue rather than the wire:
+
+- **one batch at a time.** Ingestion holds the single SQLite writer for a
+  registration, an extraction and one `create_node` per page, and a second
+  concurrent batch would contend for it while the first to finish cleared `busy`
+  and refreshed the grid under the other. A drop arriving mid-batch is refused
+  and **said so** — files disappearing on a drop is worse than the loops it
+  prevents;
+- **an abort stops the readout, and only sometimes the write.** Between the two
+  requests it leaves a minted, unspent grant and nothing else. After the last
+  chunk has left it stops nothing server-side: `urls.consume` has spent the
+  token, and the refusal check and `ingest_upload` then run synchronously with no
+  disconnect check, so the bytes and the whole subgraph land while the queue has
+  stopped listening — the human is left with no row, no verdict and no link to
+  something that exists. Closing that would mean owning the queue above the view
+  so a batch survives navigation, which has not been done;
+- **the bookkeeping is a plain module.** `views/assets/uploadQueue.ts` holds what
+  a drop becomes (`nextBatch`, which freezes the write target per batch), what
+  each status is called (`statusLabel`, total over the status union by
+  construction), what a refused drop says, and the one per-batch announcement a
+  live region over the rows was drowning.
+
+Because the drop-zone creates nodes, it is also a D1a surface: it **shows** the
+write target, files into it, and names the space the server actually filed into.
+A refused target goes through `describeUploadFailure`, never through
+`describeFailure` — which would print *"The server has no record of …"* about a
+space. And when the target it is showing is one the server will already refuse,
+it **warns before the drop** in the same register as the editor's meta bar —
+*"Every drop will be refused until another space is chosen"* — with a `<Link>` to
+`/editor`, where the picker lives. A badge and nothing else let a human drop a
+whole batch into a target this panel already knew would fail every row.
 
 ## Running it
 
@@ -97,8 +184,9 @@ own docblock, because the preview's sanitising policy *is* a parse and asserting
 it against strings would assert against the wrong thing. The opt-out is per
 file; the global config stays `node`.
 
-Covered today: `api/client.ts` (the unknown-space normalisation — the only
-logic in the file that is not a URL and a verb), `lib/time.ts`,
+Covered today: `api/client.ts` (the unknown-space normalisation and the
+two-request capability upload — the only logic in the file that is not a URL and
+a verb), `lib/time.ts`,
 `lib/failure.ts`, `lib/session.ts`, `lib/writeTarget.ts`,
 `components/spaceOptions.ts`, `components/spaceNaming.ts`,
 `views/failureRouting.ts`,
@@ -109,6 +197,7 @@ logic in the file that is not a URL and a verb), `lib/time.ts`,
 `views/spaces/spaces.ts`, `views/admin/grants.ts`,
 `views/search/resultSpace.ts`, `views/login/credentials.ts`,
 `views/editor/createOutcome.ts`,
+`views/assets/uploadOutcome.ts`, `views/assets/uploadQueue.ts`,
 `views/editor/markdownRender.ts` + `views/editor/mermaidRender.ts` (the
 sanitising policies), and `views/editor/leftoverBuffer.ts`.
 
@@ -150,7 +239,7 @@ type-checking it and driving it in a browser.
 | `src/views/search/` | query box, ranked hits, per-signal breakdown, signal grouping, the space filter + show-meta toggle in the URL (`searchState.ts`), refused-filter copy (`spaceFailure.ts`), when a row names its space (`resultSpace.ts`) |
 | `src/views/review/` | proposal queue grouped space → agent, per-kind cards, proposed-version diffs, self-governing space sections, cross-space edge marking (`grouping.edgeCrossing`) |
 | `src/views/graph/` | Cytoscape subgraph render, filters, cross-space edge styling and far-endpoint dimming, path panel |
-| `src/views/assets/` | rendition grid, lightbox, uploader, thin JSON export |
+| `src/views/assets/` | rendition grid, lightbox, the ingesting drop-zone with its queue readout (`uploadOutcome.ts`) and its bookkeeping (`uploadQueue.ts` — batches, status labels, the refused second drop, the per-batch announcement), thin JSON export |
 | `src/views/login/` | password login against `POST /api/login` |
 | `src/views/spaces/` | the space lifecycle: list with node counts and grant holders, create, rename, archive — and `spaces.ts`'s `archiveConsequences`, the one place the archive dialog's promises are written, every line of which has to be something the server actually delivers |
 | `src/views/admin/` | accounts and grants administration, show-once token dialog |
@@ -185,11 +274,14 @@ Conventions that hold across the tree:
   it.
 - **A refused space is `isUnknownSpace`, and only that.** `api/client.ts`
   normalises the refusal on every call that names a space — the two filtered
-  reads, the write target on `createNode`, and all three lifecycle calls — into
-  one `UnknownSpaceError`. Two views once kept their own `^unknown space:`
-  match because the write path was not wrapped; both are gone, and a third
-  would be the bug, not the belt. If a call ever throws a bare `ApiError`
-  carrying that message, fix the client.
+  reads, the write target on `createNode`, all three lifecycle calls, and both
+  halves of the upload — into one `UnknownSpaceError`. Two views once kept their
+  own `^unknown space:` match because the write path was not wrapped; both are
+  gone, and a third would be the bug, not the belt. If a call ever throws a bare
+  `ApiError` carrying that message, fix the client. Facts a view needs *beyond*
+  space-ness ride on a subclass rather than on a second test:
+  `UnknownUploadSpaceError.phase` says which of the upload's two requests refused,
+  and `isUnknownSpace` answers true for it too.
 - **Never say a space does not exist.** Nothing user-facing may render "no such
   space", "does not exist", "unknown/missing/nonexistent space", or "not found"
   for a space failure — including by handing an `UnknownSpaceError` to
@@ -288,6 +380,26 @@ What it handles for you:
   answer, `wireStatus` keeps what the server said, and `space` names the
   reference. It is keyed on the message, because neither status is specific
   enough alone;
+- composes the capability upload: `ingestUpload(file, { space })` mints the grant
+  and spends it, and **both** halves normalise a refused space onto
+  `UnknownSpaceError` — the pipeline resolves the target again on the far side of
+  the PUT, so the second request can refuse it too. Each half does its **own**
+  normalising, because each is exported: unnormalised, a direct caller of
+  `redeemUploadGrant` has no sanctioned way to recognise the refusal and the only
+  thing left is `describeFailure`, which renders a 404 as *"The server has no
+  record of …"* alongside the server's own *"unknown space: sp-old"* — two
+  forbidden phrasings in one sentence. The redemption reads the reference out of
+  the server's message, since it is handed a token and the target lives in the
+  token row; `ingestUpload` then re-labels it, because that message names the
+  *resolved* 32-hex id rather than the reference the human typed. What the two
+  refusals do **not** collapse is *which request said no*:
+  `UnknownUploadSpaceError` carries a `phase`, read with `uploadRefusalPhase`,
+  and it is a subclass so that `isUnknownSpace` stays the only test for
+  space-ness. The phase is load-bearing copy: a refused mint sent nothing, while
+  a refused redemption spent the grant and streamed the whole file. Its raw body
+  is the client's one non-JSON write: the two capability routes sit outside the
+  server's content-type gate precisely so an upload need not claim to be JSON,
+  and that is the third branch in `rawRequest`;
 - takes an optional `AbortSignal` on every call — use it in `useEffect` cleanup.
 
 ```ts
