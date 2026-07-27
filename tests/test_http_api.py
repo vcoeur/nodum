@@ -501,6 +501,12 @@ WRITE_FUNCTIONS = {
     "enable_agent",
     "grant",
     "revoke",
+    # Space lifecycle (the /api/spaces writers). Thin delegates in the service,
+    # but writes all the same: each one ends in a node create, update, or
+    # transition attributed to whoever called it.
+    "create_space",
+    "rename_space",
+    "archive_space",
 }
 
 
@@ -2193,6 +2199,28 @@ def test_review_queue_filters_and_batch_forms(client, fresh_db):
     assert reject_event.payload["reason"] == "no"
 
 
+def test_the_review_queue_reports_a_space_for_every_kind_over_the_wire(client, fresh_db):
+    """What the queue's space grouping (D4) actually consumes.
+
+    The screen used to backfill this with a capped, chunked pass of `getNode`
+    calls because only a proposed *node* stated a space. Every kind states one
+    now, so a section header has its proposals under it without the client
+    asking the server anything twice.
+    """
+    research = _ok(client.post("/api/spaces", json={"name": "research"}))["id"]
+    near = service.create_node(type="concept", title="Near", principal=owner())
+    far = service.create_node(type="concept", title="Far", space="research", principal=owner())
+    proposer = agent(AGENT, grants={"meta": "read", "main": "suggest", research: "suggest"})
+    service.create_edge(near.id, far.id, "supports", principal=proposer)
+    service.update_node(near.id, content="revised", principal=proposer)
+
+    queue = {row["kind"]: row for row in _ok(client.get("/api/review/queue"))["proposals"]}
+
+    assert queue["edge"]["context"]["src"]["space_id"] == "main"
+    assert queue["edge"]["context"]["dst"]["space_id"] == research
+    assert queue["update"]["context"]["node"]["space_id"] == "main"
+
+
 def test_asset_upload_list_get_and_rendition(client, fresh_db):
     payload = _png_bytes()
     uploaded = _ok(client.post("/api/assets", files={"file": ("photo.png", payload, "image/png")}))
@@ -2392,9 +2420,318 @@ def test_spaces_lists_active_spaces_only(client, fresh_db):
         ("main", "space"),
     ]
 
-    service.transition("main", "archive", principal=owner())
+    space = _ok(client.post("/api/spaces", json={"name": "scratch"}))
+    assert [row["id"] for row in _ok(client.get("/api/spaces"))["spaces"]] == [
+        "meta",
+        "main",
+        space["id"],
+    ]
+
+    service.transition(space["id"], "archive", principal=owner())
     remaining = _ok(client.get("/api/spaces"))
-    assert [space["id"] for space in remaining["spaces"]] == ["meta"]
+    assert [row["id"] for row in remaining["spaces"]] == ["meta", "main"]
+
+
+def test_a_structural_space_cannot_be_archived_over_http(client, fresh_db):
+    """The refusal lives in the service, so both spellings of archive inherit it.
+
+    The `/spaces` screen disables the button; that is copy, not a guard. This
+    is the guard — and the generic node route is checked too, because a route
+    that reaches the same row is the same hole.
+    """
+    for path in ("/api/spaces/main/archive", "/api/nodes/main/archive"):
+        refused = client.post(path)
+        assert refused.status_code == 400, path
+        assert "cannot archive the 'main' space" in refused.json()["error"]["message"]
+
+    assert client.post("/api/spaces/meta/archive").status_code == 400
+    assert [row["id"] for row in _ok(client.get("/api/spaces"))["spaces"]] == ["meta", "main"]
+
+    # Rename stays allowed: it moves the title, not the id everything depends on.
+    renamed = _ok(client.post("/api/spaces/main/rename", json={"name": "trunk"}))
+    assert (renamed["id"], renamed["title"]) == ("main", "trunk")
+    landed = _ok(client.post("/api/nodes", json={"type": "note", "title": "still lands"}))
+    assert landed["space_id"] == "main"
+
+
+def test_two_spaces_cannot_share_a_name_over_http(client, fresh_db):
+    """A space resolves by id *or* title, so a duplicate makes `?space=` ambiguous.
+
+    A taken name is a **409**: the request is well-formed and the caller can
+    retry with another name, exactly as a duplicate account id is
+    (`AccountExists`). It was a 400 through the bare `ValueError` before.
+    """
+    _ok(client.post("/api/spaces", json={"name": "research"}))
+
+    clash = client.post("/api/spaces", json={"name": "research"})
+    assert clash.status_code == 409
+    assert clash.json()["error"]["type"] == "SpaceNameTaken"
+    assert "a space already answers to 'research'" in clash.json()["error"]["message"]
+    # A name equal to another space's *id* is the same ambiguity, and is the half
+    # no unique index can express.
+    assert client.post("/api/spaces", json={"name": "main"}).status_code == 409
+
+    other = _ok(client.post("/api/spaces", json={"name": "draft"}))
+    rename = client.post(f"/api/spaces/{other['id']}/rename", json={"name": "research"})
+    assert rename.status_code == 409
+    assert [row["title"] for row in _ok(client.get("/api/spaces"))["spaces"]] == [
+        "meta",
+        "main",
+        "research",
+        "draft",
+    ]
+
+
+def test_an_archived_space_keeps_its_name_and_the_refusal_says_so(client, fresh_db):
+    """The name is held by something `GET /api/spaces` does not return.
+
+    Which is exactly why the message has to name the state: the screen's own
+    list cannot explain this refusal, so the words must. And the undo that the
+    reservation protects — the only route back from an archive — now succeeds
+    instead of serving a 500 from a bare `IntegrityError`.
+    """
+    space = _ok(client.post("/api/spaces", json={"name": "research"}))
+    _ok(client.post(f"/api/spaces/{space['id']}/archive"))
+    assert [row["id"] for row in _ok(client.get("/api/spaces"))["spaces"]] == ["meta", "main"]
+
+    refused = client.post("/api/spaces", json={"name": "research"})
+    assert refused.status_code == 409
+    assert refused.json()["error"]["type"] == "SpaceNameTaken"
+    assert "archived space already answers to 'research'" in refused.json()["error"]["message"]
+
+    # And the restore the reservation exists for: undo the archive event.
+    restored = _ok(client.post("/api/undo"))
+    assert restored["undone_op"] == "node.archive"
+    assert [row["id"] for row in _ok(client.get("/api/spaces"))["spaces"]] == [
+        "meta",
+        "main",
+        space["id"],
+    ]
+
+
+def test_undoing_a_rename_onto_a_taken_name_is_a_409_not_a_500(client, fresh_db):
+    """The collision reserving titles does not remove, and it must stay mapped.
+
+    `undo` restores a recorded row with a raw UPDATE, so a rename it reverses
+    can put back a title another space has taken since. Unchecked that is
+    `sqlite3.IntegrityError` — a 500 for a conflict the caller caused and can
+    fix — instead of the 409 every other name clash answers with.
+    """
+    space = _ok(client.post("/api/spaces", json={"name": "scratch"}))
+    _ok(client.post(f"/api/spaces/{space['id']}/rename", json={"name": "moved"}))
+    rename_seq = max(event["seq"] for event in _ok(client.get("/api/events?limit=50"))["events"])
+    replacement = _ok(client.post("/api/spaces", json={"name": "scratch"}))
+
+    refused = client.post("/api/undo", json={"seq": rename_seq})
+    assert refused.status_code == 409
+    assert refused.json()["error"]["type"] == "UndoNotPossible"
+    message = refused.json()["error"]["message"]
+    assert f"a space already answers to 'scratch' (id {replacement['id']})" in message
+
+
+def test_posting_a_space_typed_node_outside_meta_is_a_400(client, fresh_db):
+    """This answered 200, and `space` is in the editor's type picker.
+
+    So a human could nest a space inside ordinary territory with one click —
+    `GET /api/spaces` then listed it and every space reference resolved it,
+    while the grants governing it were the host space's. That is also what let
+    the name refusal become an existence oracle on the rename path.
+    """
+    refused = client.post("/api/nodes", json={"type": "space", "title": "scratch", "space": "main"})
+
+    assert refused.status_code == 400
+    assert "a space must live in the 'meta' space" in refused.json()["error"]["message"]
+    assert [row["id"] for row in _ok(client.get("/api/spaces"))["spaces"]] == ["meta", "main"]
+
+    # Aimed at meta it is an ordinary space create, exactly as `POST /api/spaces` is.
+    landed = _ok(client.post("/api/nodes", json={"type": "space", "title": "s", "space": "meta"}))
+    assert landed["space_id"] == "meta"
+    assert landed["id"] in [row["id"] for row in _ok(client.get("/api/spaces"))["spaces"]]
+
+
+def test_undoing_a_space_create_that_now_holds_nodes_is_a_409_not_a_500(client, fresh_db):
+    """`/spaces` put this one click away, and it answered with a server error.
+
+    The create-reversal guarded `parent_id` children but not `nodes.space_id`,
+    so the FK surfaced as `sqlite3.Error` → 500 for the ordinary "the graph has
+    grown past this" case — the class of failure `/api/undo` was cleaned of.
+    """
+    space = _ok(client.post("/api/spaces", json={"name": "temp"}))
+    create_seq = max(event["seq"] for event in _ok(client.get("/api/events?limit=50"))["events"])
+    _ok(client.post("/api/nodes", json={"type": "note", "title": "n", "space": "temp"}))
+
+    refused = client.post("/api/undo", json={"seq": create_seq})
+
+    assert refused.status_code == 409
+    assert refused.json()["error"]["type"] == "UndoNotPossible"
+    assert "still holds 1 node" in refused.json()["error"]["message"]
+    assert space["id"] in [row["id"] for row in _ok(client.get("/api/spaces"))["spaces"]]
+
+
+def test_archiving_a_space_over_http_leaves_its_grant_inert_but_revocable(client, fresh_db):
+    """The archive dialog's promise, end to end on the surface that makes it.
+
+    `GET /api/spaces` stops carrying the space and its grant holders, so
+    `/admin` is the only screen left that can show the delegation — and it must
+    still be able to take it away.
+    """
+    space = _ok(client.post("/api/spaces", json={"name": "research"}))
+    _ok(client.post("/api/agents", json={"name": "researcher"}))
+    _ok(
+        client.post(
+            "/api/grants", json={"agent": "researcher", "space": "research", "level": "edit"}
+        )
+    )
+
+    _ok(client.post(f"/api/spaces/{space['id']}/archive"))
+
+    assert [row["id"] for row in _ok(client.get("/api/spaces"))["spaces"]] == ["meta", "main"]
+    held = _ok(client.get("/api/grants?agent=researcher"))["grants"]
+    assert (space["id"], "edit") in {(row["space_id"], row["level"]) for row in held}
+    # Granting more on it is refused rather than silently conferring nothing.
+    refused = client.post(
+        "/api/grants", json={"agent": "researcher", "space": space["id"], "level": "read"}
+    )
+    assert refused.status_code == 400
+    assert "cannot grant on the archived space" in refused.json()["error"]["message"]
+    # And the grant can be taken away for good, which it could not before.
+    _ok(client.post("/api/grants/revoke", json={"agent": "researcher", "space": space["id"]}))
+    left = _ok(client.get("/api/grants?agent=researcher"))["grants"]
+    assert space["id"] not in {row["space_id"] for row in left}
+
+
+def test_spaces_carry_the_node_count_and_grant_holders(client, fresh_db):
+    """What the ``/spaces`` screen reads: territory, not just a name."""
+    space = _ok(client.post("/api/spaces", json={"name": "research"}))
+    assert (space["type"], space["space_id"]) == ("space", "meta")
+
+    _ok(client.post("/api/nodes", json={"type": "note", "title": "n", "space": "research"}))
+    _ok(client.post("/api/agents", json={"name": "researcher"}))
+    _ok(
+        client.post(
+            "/api/grants", json={"agent": "researcher", "space": "research", "level": "suggest"}
+        )
+    )
+
+    listed = {row["title"]: row for row in _ok(client.get("/api/spaces"))["spaces"]}
+    assert listed["research"]["node_count"] == 1
+    assert [(g["agent_id"], g["level"]) for g in listed["research"]["grants"]] == [
+        ("researcher", "suggest")
+    ]
+    assert listed["main"]["node_count"] == 0
+    assert listed["main"]["grants"] == []
+
+
+def test_the_space_lifecycle_round_trips_over_http(client, fresh_db):
+    space = _ok(client.post("/api/spaces", json={"name": "draft"}))
+
+    renamed = _ok(client.post(f"/api/spaces/{space['id']}/rename", json={"name": "reference"}))
+    assert (renamed["id"], renamed["title"]) == (space["id"], "reference")
+    # Resolvable by name as well as by id — the same rule `--space` follows.
+    assert (
+        _ok(client.post("/api/spaces/reference/rename", json={"name": "library"}))["id"]
+        == (space["id"])
+    )
+
+    archived = _ok(client.post(f"/api/spaces/{space['id']}/archive"))
+    assert archived["state"] == "archived"
+    assert [row["title"] for row in _ok(client.get("/api/spaces"))["spaces"]] == ["meta", "main"]
+    assert client.post("/api/spaces", json={}).status_code == 400
+
+
+def test_the_space_routes_refuse_a_node_that_is_not_a_space(client, fresh_db):
+    """The URL says space, so it must not be a second way to edit any node."""
+    note = service.create_node(type="note", title="not a space", principal=owner())
+
+    assert client.post(f"/api/spaces/{note.id}/rename", json={"name": "x"}).status_code == 404
+    assert client.post(f"/api/spaces/{note.id}/archive").status_code == 404
+    assert service.get_node(note.id, principal=owner()).title == "not a space"
+
+
+def test_a_node_create_lands_in_the_space_the_body_names(client, fresh_db):
+    """B2: the write target. Absent, it is ``main`` — the service's own default."""
+    _ok(client.post("/api/spaces", json={"name": "research"}))
+
+    default = _ok(client.post("/api/nodes", json={"type": "note", "title": "default"}))
+    targeted = _ok(
+        client.post("/api/nodes", json={"type": "note", "title": "filed", "space": "research"})
+    )
+
+    assert default["space_id"] == "main"
+    assert targeted["space_id"] != "main"
+    assert targeted["created_by"] == OWNER_ACTOR  # a space is a place, never an identity
+    assert (
+        client.post("/api/nodes", json={"type": "note", "title": "x", "space": "nope"}).status_code
+        == 404
+    )
+    assert (
+        client.post("/api/nodes", json={"type": "note", "title": "x", "space": 7}).status_code
+        == 400
+    )
+
+
+def test_the_listing_and_search_space_filters_narrow_the_read(client, fresh_db):
+    _ok(client.post("/api/spaces", json={"name": "research"}))
+    main = _ok(
+        client.post(
+            "/api/nodes", json={"type": "note", "title": "main memo", "content": "territory"}
+        )
+    )
+    filed = _ok(
+        client.post(
+            "/api/nodes",
+            json={
+                "type": "note",
+                "title": "research memo",
+                "content": "territory",
+                "space": "research",
+            },
+        )
+    )
+
+    everything = _ok(client.get("/api/nodes"))
+    assert {row["id"] for row in everything["nodes"]} == {main["id"], filed["id"]}
+    narrowed = _ok(client.get("/api/nodes?space=research"))
+    assert [row["id"] for row in narrowed["nodes"]] == [filed["id"]]
+
+    assert {hit["node_id"] for hit in _ok(client.get("/api/search?q=territory"))["hits"]} == {
+        main["id"],
+        filed["id"],
+    }
+    searched = _ok(client.get("/api/search?q=territory&space=research"))
+    assert [hit["node_id"] for hit in searched["hits"]] == [filed["id"]]
+
+    # An unknown space is a 404 from the listing and a 400 from search, never a
+    # 500. The split is pre-existing and the `type` filter behaves identically:
+    # the listing raises the service's `TypeNotFound`, while `nodum.search`
+    # raises a plain `ValueError` rather than importing the service's exception
+    # vocabulary. A client handles both.
+    assert client.get("/api/nodes?space=nope").status_code == 404
+    assert client.get("/api/search?q=territory&space=nope").status_code == 400
+
+
+def test_include_meta_is_off_by_default_on_both_reads(client, fresh_db):
+    """B3/D3: the type vocabulary stays out of content listings until asked for."""
+    service.create_node(
+        type="type",
+        title="territory-kind",
+        content="territory vocabulary",
+        space="meta",
+        props={"type_kind": "node"},
+        principal=owner(),
+    )
+    _ok(client.post("/api/nodes", json={"type": "note", "title": "memo", "content": "territory"}))
+
+    listed = _ok(client.get("/api/nodes"))
+    assert [row for row in listed["nodes"] if row["space_id"] == "meta"] == []
+    with_meta = _ok(client.get("/api/nodes?include_meta=true"))
+    assert [row for row in with_meta["nodes"] if row["space_id"] == "meta"] != []
+
+    assert [hit["title"] for hit in _ok(client.get("/api/search?q=territory"))["hits"]] == ["memo"]
+    assert "territory-kind" in {
+        hit["title"] for hit in _ok(client.get("/api/search?q=territory&include_meta=1"))["hits"]
+    }
+    assert client.get("/api/nodes?include_meta=maybe").status_code == 400
 
 
 def test_the_agent_token_never_reaches_an_event_payload(client, fresh_db):

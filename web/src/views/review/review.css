@@ -76,6 +76,81 @@
   gap: var(--nd-space-8);
 }
 
+/* --- Space grouping (design decision D4) ---------------------------------- */
+
+/*
+ * The outer grouping level. Deliberately quieter than the batch cards it
+ * contains — a space is a heading over work, not itself a thing to act on, and
+ * the accent is reserved for what you can act on.
+ */
+.nd-rv-space {
+  display: flex;
+  flex-direction: column;
+  gap: var(--nd-space-8);
+  padding: var(--nd-space-8);
+  border: 1px solid var(--nd-border);
+  border-radius: var(--nd-radius-md);
+  background: var(--nd-surface);
+}
+
+.nd-rv-space__head {
+  display: flex;
+  flex-direction: column;
+  gap: var(--nd-space-2);
+}
+
+.nd-rv-space__name {
+  display: flex;
+  align-items: baseline;
+  gap: var(--nd-space-4);
+  font-size: var(--nd-text-lg);
+  color: var(--nd-text);
+}
+
+/* The archived mark beside a section's name: the state ramp's own lowest
+   contrast, since that is exactly what it is saying. */
+.nd-rv-space__mark {
+  font-size: var(--nd-text-2xs);
+}
+
+/*
+ * The self-governing panel: an empty section that is *supposed* to be empty.
+ * It is styled as a statement rather than as a queue — no left-edge proposed
+ * violet, which would imply something is waiting — and recessive, because
+ * nothing here needs doing.
+ */
+.nd-rv-space--governed {
+  background: none;
+  border-style: dashed;
+}
+
+.nd-rv-space--governed .nd-rv-space__name {
+  font-size: var(--nd-text-md);
+  color: var(--nd-text-muted);
+}
+
+.nd-rv-space__governed-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--nd-space-4);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.nd-rv-space__governed-list li {
+  display: flex;
+  align-items: baseline;
+  gap: var(--nd-space-8);
+  flex-wrap: wrap;
+}
+
+.nd-rv-space__governed-name {
+  font-size: var(--nd-text-sm);
+  font-weight: var(--nd-weight-medium);
+  color: var(--nd-text);
+}
+
 /* --- Agent and batch grouping -------------------------------------------- */
 
 .nd-rv-agent {
@@ -84,6 +159,13 @@
   gap: var(--nd-space-8);
   padding-top: var(--nd-space-8);
   border-top: 1px solid var(--nd-border);
+}
+
+/* The space header already separates it; a second rule above the first agent
+   inside a space reads as an empty row. */
+.nd-rv-space > .nd-rv-agent:first-of-type {
+  padding-top: 0;
+  border-top: 0;
 }
 
 .nd-rv-agent__head {
@@ -234,6 +316,14 @@
   color: var(--nd-accent);
 }
 
+/* A crossing is neither a state nor an affordance, so it takes the third hue —
+   the same one the graph outlines a cross-space edge with. */
+.nd-rv-kind--crossing {
+  border-color: var(--nd-crossing);
+  background: var(--nd-crossing-wash);
+  color: var(--nd-crossing);
+}
+
 /* --- Proposal detail ----------------------------------------------------- */
 
 .nd-rv-detail {
@@ -299,6 +389,12 @@
   font-size: var(--nd-text-sm);
   font-weight: var(--nd-weight-medium);
   overflow-wrap: anywhere;
+}
+
+/* Which space this end lives in — the dimension that decides who may accept
+   the edge, so it sits with the endpoint rather than in the facts list. */
+.nd-rv-edge__space {
+  font-size: var(--nd-text-2xs);
 }
 
 .nd-rv-edge__arrow {
@@ -542,6 +638,13 @@
 .nd-rv-flag--danger {
   border-left-color: var(--nd-danger);
   background: var(--nd-danger-wash);
+}
+
+/* Not a warning: a cross-space edge is ordinary and reviewable. The flag says
+   which two spaces it joins, in the hue the graph uses for the same fact. */
+.nd-rv-flag--crossing {
+  border-left-color: var(--nd-crossing);
+  background: var(--nd-crossing-wash);
 }
 
 /* --- Selection bar, outcome, failure states ------------------------------- */

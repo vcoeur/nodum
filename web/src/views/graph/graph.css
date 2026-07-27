@@ -12,6 +12,16 @@
  * graph and the chrome around it cannot drift apart.
  */
 
+/*
+ * The crossing hue used to be declared here, view-local, per the rule in
+ * `styles/tokens.css`: a hue outside the two global axes stays in the view
+ * that needs it until a second one names it. The review queue now marks the
+ * same fact on a cross-space edge proposal, so `--nd-crossing` has moved to
+ * `tokens.css` and this view reads it from there — including `graphStyle.ts`,
+ * which pulls the palette off `document.documentElement` because Cytoscape
+ * renders to a canvas and cannot see custom properties itself.
+ */
+
 /* --- Shell ------------------------------------------------------------- */
 
 .nd-view--wide.nd-graph {
@@ -113,6 +123,12 @@
 
 .nd-graph__actor {
   width: 10rem;
+}
+
+/* The shared SpaceFilter renders an `.nd-field`; this only sizes it to sit in
+   the toolbar row beside the type and confidence controls. */
+.nd-graph__space {
+  width: 11rem;
 }
 
 .nd-graph__states {
@@ -365,6 +381,10 @@
   color: var(--nd-state-archived);
 }
 
+.nd-graph__legend-item--crossing {
+  color: var(--nd-crossing);
+}
+
 .nd-graph__legend-sep {
   width: 1px;
   height: 1em;
@@ -484,6 +504,13 @@
   overflow-wrap: anywhere;
 }
 
+/* The space row's archived mark, inside the value cell so the two-column
+   grid keeps its shape. */
+.nd-graph__space-mark {
+  margin-left: var(--nd-space-2);
+  vertical-align: baseline;
+}
+
 .nd-graph__excerpt {
   font-size: var(--nd-text-xs);
   line-height: var(--nd-leading-prose);
@@ -514,7 +541,7 @@
 .nd-graph__edge-row {
   width: 100%;
   display: grid;
-  grid-template-columns: auto auto minmax(0, 1fr) auto auto;
+  grid-template-columns: auto auto minmax(0, 1fr) auto auto auto;
   align-items: center;
   gap: var(--nd-space-4);
   padding: var(--nd-space-2) var(--nd-space-3);
@@ -546,6 +573,14 @@
 
 .nd-graph__edge-confidence {
   color: var(--nd-text-faint);
+}
+
+/* The crossing hue, same one the canvas outlines a crossing edge with. */
+.nd-graph__crossing-mark {
+  color: var(--nd-crossing);
+  font-size: var(--nd-text-2xs);
+  letter-spacing: var(--nd-tracking-label);
+  text-transform: uppercase;
 }
 
 .nd-graph__link-button {

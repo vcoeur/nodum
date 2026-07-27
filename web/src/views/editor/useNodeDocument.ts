@@ -22,6 +22,15 @@
  * single SQLite writer was busy retries by itself, and one that failed for a
  * reason typing will not fix stays visible until the user acts on it.
  *
+ * ## Where a new node lands
+ *
+ * The write target arrives as an option rather than being read from
+ * `lib/writeTarget.ts` here, and it is captured before the request like the
+ * text is. Both follow from D1a: the space the human was *shown* is the space
+ * the node must land in, and a value read at the moment the response comes back
+ * could be a different one. Every create then says where it landed, and one
+ * refused by the target says so in words rather than in the server's.
+ *
  * ## Two documents at once
  *
  * `/editor/:nodeId` → `/editor/:otherId` is a *parameter* change, not a remount:
@@ -38,12 +47,17 @@
  *   away from the node the reader just opened.
  */
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { api } from "../../api/client";
 import type { NodeOut, UpdateNodeBody } from "../../api/types";
-import { useToast } from "../../components";
+import { unresolvedSpaceIds, useArchivedSpaces, useToast } from "../../components";
 import { describeError, isNotFound } from "../../lib";
+import {
+  describeDetachedWriteFailure,
+  describeLanding,
+  describeWriteFailure,
+} from "./createOutcome";
 
 /** How the node itself loaded. */
 export type LoadStatus = "loading" | "ready" | "missing" | "unavailable";
@@ -64,6 +78,28 @@ export interface LeftoverBuffer {
   saved: { title: string; content: string };
   /** The type a create would use; null when the type catalog never answered. */
   createType: string | null;
+  /**
+   * The write target a create would use — the space id or name the editor was
+   * *showing* when the buffer was let go of, carried for the same reason the
+   * text is: reading the store here would file the leftover into whatever the
+   * target has become since (design decision D1a).
+   */
+  space: string;
+}
+
+/** What a detached flush wrote. */
+export interface FlushOutcome {
+  /** The node id that was written. */
+  id: string;
+  /**
+   * The node `POST /api/nodes` returned, when this flush *created* one.
+   *
+   * Carried rather than reduced to an id because the confirmation has to name
+   * the space **the server filed it in**, which only the response knows: the
+   * requested target is what was asked for, and `describeLanding` exists to
+   * keep those two apart.
+   */
+  created: NodeOut | null;
 }
 
 /**
@@ -76,12 +112,12 @@ export interface LeftoverBuffer {
  * describing something the reader is not looking at.
  *
  * @param leftover The buffer, captured before it was replaced.
- * @returns The id written, or null when there was nothing to write.
+ * @returns What was written, or null when there was nothing to write.
  * @throws Error If a never-saved buffer has text but no type to create it under
  *   — silently dropping it would be the loss this hook exists to prevent.
  */
-export async function flushLeftover(leftover: LeftoverBuffer): Promise<string | null> {
-  const { id, title, content, saved, createType } = leftover;
+export async function flushLeftover(leftover: LeftoverBuffer): Promise<FlushOutcome | null> {
+  const { id, title, content, saved, createType, space } = leftover;
 
   if (id === null) {
     // Same rule as the debounced path: opening `/editor` and walking away must
@@ -97,8 +133,9 @@ export async function flushLeftover(leftover: LeftoverBuffer): Promise<string | 
       type: createType,
       title: title.trim() === "" ? null : title,
       content,
+      space,
     });
-    return created.id;
+    return { id: created.id, created };
   }
 
   const body: UpdateNodeBody = {};
@@ -106,7 +143,7 @@ export async function flushLeftover(leftover: LeftoverBuffer): Promise<string | 
   if (content !== saved.content) body.content = content;
   if (Object.keys(body).length === 0) return null;
   await api.updateNode(id, body);
-  return id;
+  return { id, created: null };
 }
 
 interface UseNodeDocumentOptions {
@@ -119,6 +156,25 @@ interface UseNodeDocumentOptions {
    * without one, and this hook refuses rather than inventing a type id.
    */
   createType: string | null;
+  /**
+   * The space a create lands in — the sticky write target, by id or name.
+   *
+   * Passed in rather than read from `lib/writeTarget.ts` here on purpose: D1a
+   * requires the create surface to *show* the target, and taking the value the
+   * view is rendering is the only arrangement in which the displayed space and
+   * the written space cannot drift apart.
+   */
+  writeTarget: string;
+  /**
+   * Every active space, for naming one in the post-create confirmation and in
+   * a refusal.
+   *
+   * **Null while `GET /api/spaces` has not answered, and passed on as null.**
+   * That read is what decides whether the archived listing below is worth
+   * making at all, so collapsing it to `[]` here would fire it on every mount
+   * and let a refusal call a live space unnameable.
+   */
+  spaces: readonly NodeOut[] | null;
 }
 
 /** Everything the editor view needs to render and drive one document. */
@@ -128,6 +184,15 @@ export interface NodeDocument {
   loadError: string | null;
   /** The stored node, or null while a new document has never been saved. */
   node: NodeOut | null;
+  /**
+   * Archived space nodes, when this document holds a reference to one.
+   *
+   * Fetched here rather than in the view because the two references that can
+   * need it are both this hook's: the open node's space, and the write target
+   * a refusal has to name. One read serves the meta bar and the refusal copy,
+   * and on a document in a live space it is never issued at all.
+   */
+  archivedSpaces: readonly NodeOut[];
   /**
    * Identity of the buffer currently open.
    *
@@ -158,7 +223,12 @@ export interface NodeDocument {
  *
  * @param options The route's node id and the type a create would use.
  */
-export function useNodeDocument({ nodeId, createType }: UseNodeDocumentOptions): NodeDocument {
+export function useNodeDocument({
+  nodeId,
+  createType,
+  writeTarget,
+  spaces,
+}: UseNodeDocumentOptions): NodeDocument {
   const navigate = useNavigate();
   const toast = useToast();
 
@@ -200,8 +270,24 @@ export function useNodeDocument({ nodeId, createType }: UseNodeDocumentOptions):
   /** What that save is writing, so a flush does not re-send bytes already on the wire. */
   const inFlightValuesRef = useRef<{ title: string; content: string } | null>(null);
 
+  // A space this document names that `GET /api/spaces` does not: the open
+  // node's, when it was written somewhere since retired, and the write target,
+  // when the human archived the very space they were filing into. Both degrade
+  // to a bare 32-hex id without this, on the bar and in every refusal.
+  const unresolvedSpaces = useMemo(
+    () => unresolvedSpaceIds([node?.space_id ?? "", writeTarget], spaces),
+    [node?.space_id, writeTarget, spaces],
+  );
+  const archived = useArchivedSpaces(unresolvedSpaces.length > 0);
+
   const createTypeRef = useRef(createType);
   createTypeRef.current = createType;
+  const writeTargetRef = useRef(writeTarget);
+  writeTargetRef.current = writeTarget;
+  const spacesRef = useRef(spaces);
+  spacesRef.current = spaces;
+  const archivedRef = useRef(archived.spaces);
+  archivedRef.current = archived.spaces;
   const navigateRef = useRef(navigate);
   navigateRef.current = navigate;
   const toastRef = useRef(toast);
@@ -267,16 +353,31 @@ export function useNodeDocument({ nodeId, createType }: UseNodeDocumentOptions):
         return;
       }
 
+      // Captured before the await, like everything else this save is *for*: the
+      // node must land in the space the editor was showing when it was written,
+      // not in whatever the picker holds by the time the response comes back.
+      const target = writeTargetRef.current;
+
       savingRef.current = true;
       inFlightValuesRef.current = { title: currentTitle, content };
       setSaveState("saving");
       setSaveError(null);
       try {
+        // `space` is sent even when it is `main` — which the server would have
+        // defaulted to anyway. The create body then carries literally what the
+        // picker showed, so there is no unstated default between what the human
+        // read and what was written (design decision D1a).
         const created = await api.createNode({
           type,
           title: currentTitle.trim() === "" ? null : currentTitle,
           content,
+          space: target,
         });
+        // D1a's other half: the landing space is confirmed out loud, from the
+        // server's answer. Said before the currency check, because the node
+        // exists wherever the reader has navigated to since.
+        const landing = describeLanding(created, target, spacesRef.current);
+        toastRef.current.show("success", landing.title, landing.detail);
         // The node exists either way — but if the reader has opened something
         // else since, adopting it here would rebind the editor to it and the
         // navigate below would yank them off the document they just opened.
@@ -291,11 +392,34 @@ export function useNodeDocument({ nodeId, createType }: UseNodeDocumentOptions):
         navigateRef.current(`/editor/${created.id}`, { replace: true });
       } catch (error) {
         if (!stillCurrent()) {
-          toastRef.current.showError(error, "The new note could not be saved");
+          // Not `showError`: the shared classifier renders an `ApiError` as
+          // `type: message`, which for a refused space is the literal
+          // "UnknownSpace: unknown space: research" — the one wording nothing
+          // user-facing may use. The in-place branch below has always routed
+          // through `createOutcome`; this one is the same refusal after the
+          // reader moved on, and it also owes them the sentence that says what
+          // to do next, because their text is gone.
+          const refused = describeDetachedWriteFailure(
+            error,
+            target,
+            spacesRef.current,
+            archivedRef.current,
+          );
+          if (refused === null) {
+            toastRef.current.showError(error, "The new note could not be saved");
+          } else {
+            toastRef.current.show("error", "The new note could not be saved", refused);
+          }
           return;
         }
+        // A write target naming a space that has since been archived or renamed
+        // fails here rather than being rewritten to `main` — deliberately, and
+        // so it has to read as something the human can act on.
         setSaveState("failed");
-        setSaveError(describeError(error));
+        setSaveError(
+          describeWriteFailure(error, target, spacesRef.current, archivedRef.current) ??
+            describeError(error),
+        );
       } finally {
         savingRef.current = false;
         inFlightValuesRef.current = null;
@@ -405,11 +529,47 @@ export function useNodeDocument({ nodeId, createType }: UseNodeDocumentOptions):
       content: contentRef.current,
       saved: savedRef.current,
       createType: createTypeRef.current,
+      space: writeTargetRef.current,
     };
     const issue = () => {
-      void flushLeftover(leftover).catch((error: unknown) => {
-        toastRef.current.showError(error, "Unsaved changes to the previous note were lost");
-      });
+      void flushLeftover(leftover).then(
+        (written) => {
+          // A create the reader has already navigated away from is still a node
+          // filed into a space, and D1a allows no silent ones. Only a create
+          // gets this: an update went to the space its node already lived in.
+          if (written === null || written.created === null) return;
+          // Through `describeLanding`, like the in-place create: the
+          // confirmation names the space **the server** filed the node in, off
+          // the response, rather than echoing back the target that was asked
+          // for. Naming the request would confirm nothing, and would go on
+          // reading plausibly the day the two stop agreeing.
+          const landing = describeLanding(written.created, leftover.space, spacesRef.current);
+          toastRef.current.show(
+            "success",
+            landing.title,
+            `Written from the note that was open a moment ago. ${landing.detail}`,
+          );
+        },
+        (error: unknown) => {
+          // Same reason as the detached create above: an unresolved space
+          // handed to the shared classifier prints the forbidden wording.
+          const refused = describeDetachedWriteFailure(
+            error,
+            leftover.space,
+            spacesRef.current,
+            archivedRef.current,
+          );
+          if (refused === null) {
+            toastRef.current.showError(error, "Unsaved changes to the previous note were lost");
+          } else {
+            toastRef.current.show(
+              "error",
+              "Unsaved changes to the previous note were lost",
+              refused,
+            );
+          }
+        },
+      );
     };
 
     // Two writes to the same node racing each other can land in either order,
@@ -490,7 +650,12 @@ export function useNodeDocument({ nodeId, createType }: UseNodeDocumentOptions):
     setSaveState("clean");
     setSaveError(null);
     setSavedAt(null);
-  }, [cancelTimer]);
+    // `flushBuffer`, not `cancelTimer`: this callback calls the first and never
+    // the second. Both happen to be permanently stable today, so the wrong
+    // dependency is inert — and there is no ESLint here to notice if one of
+    // them ever stops being, at which point `openBlank` would go on flushing
+    // through a closure over a buffer that has already moved on.
+  }, [flushBuffer]);
 
   useEffect(() => {
     if (nodeId === undefined) {
@@ -582,6 +747,7 @@ export function useNodeDocument({ nodeId, createType }: UseNodeDocumentOptions):
     status,
     loadError,
     node,
+    archivedSpaces: archived.spaces,
     docKey,
     initialContent,
     title,

@@ -9,9 +9,12 @@
  * - **Elements** are replaced only when the element *signature* changes, and
  *   the positions of nodes that survive the change are carried over, so
  *   nudging the depth by one does not scramble the map you were reading.
- * - **Selection, hover, and path highlighting are class toggles.** They never
- *   touch the layout, which is what makes clicking around feel immediate on a
- *   graph at the 200-node cap.
+ * - **Selection, hover, path highlighting and the space dim are class
+ *   toggles.** They never touch the layout, which is what makes clicking around
+ *   feel immediate on a graph at the 200-node cap. The space filter belongs in
+ *   that list rather than in the element set precisely because it removes
+ *   nothing (design decision D5): narrowing to a space must not scatter the map
+ *   the reader had, so it may not re-run the layout.
  * - **No animation on a re-render.** The layout runs with `animate: false`;
  *   the only motion in the view is the user's own pan and zoom.
  */
@@ -76,6 +79,10 @@ interface GraphCanvasProps {
   pathEndIds: readonly string[];
   /** True while a path is highlighted, which fades everything off it. */
   pathActive: boolean;
+  /** Nodes outside the space filter: dimmed, still drawn, still clickable (D5). */
+  dimmedNodeIds: readonly string[];
+  /** Edges with both endpoints outside the space filter. */
+  dimmedEdgeIds: readonly string[];
   /** Called with a node id, or null when the background is clicked. */
   onSelect: (nodeId: string | null) => void;
 }
@@ -95,6 +102,8 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
     pathEdgeIds,
     pathEndIds,
     pathActive,
+    dimmedNodeIds,
+    dimmedEdgeIds,
     onSelect,
   },
   ref,
@@ -260,6 +269,31 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
       }
     });
   }, [selectedId]);
+
+  // --- Space dim: another class toggle, and never a layout ------------------
+  //
+  // Keyed on the joined id lists rather than the arrays themselves: the parent
+  // rebuilds them every render, and an identity dependency would re-run this on
+  // every keystroke in the toolbar.
+  const dimmedNodeKey = dimmedNodeIds.join(",");
+  const dimmedEdgeKey = dimmedEdgeIds.join(",");
+  useEffect(() => {
+    const cy = cyRef.current;
+    if (!cy) return;
+    cy.batch(() => {
+      cy.elements().removeClass("space-outside");
+      const outside = new Set([
+        ...(dimmedNodeKey ? dimmedNodeKey.split(",") : []),
+        ...(dimmedEdgeKey ? dimmedEdgeKey.split(",") : []),
+      ]);
+      if (outside.size === 0) return;
+      // Filtered rather than merged, for the reason spelled out in the path
+      // effect: `merge` returns a new collection instead of mutating.
+      cy.elements()
+        .filter((element) => outside.has(element.id()))
+        .addClass("space-outside");
+    });
+  }, [dimmedNodeKey, dimmedEdgeKey, signature]);
 
   // --- Path highlight -------------------------------------------------------
   const pathNodeKey = pathNodeIds.join(",");

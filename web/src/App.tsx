@@ -3,7 +3,7 @@ import { NavLink, Outlet, useLocation, useNavigate } from "react-router-dom";
 import { ErrorBoundary, Spinner, ToastProvider } from "./components";
 import { api, getHealth, ApiError } from "./api/client";
 import type { HumanOut } from "./api/types";
-import { onUnauthorized } from "./lib";
+import { clearWriteTarget, onUnauthorized } from "./lib";
 
 /**
  * The app shell: header, view navigation, the routed outlet, and the two global
@@ -28,6 +28,7 @@ const VIEWS = [
   { to: "/review", label: "Review" },
   { to: "/graph", label: "Graph" },
   { to: "/assets", label: "Assets" },
+  { to: "/spaces", label: "Spaces" },
   { to: "/admin", label: "Admin" },
 ] as const;
 
@@ -80,6 +81,14 @@ export default function App() {
       } catch {
         // A dead session lands on /login either way.
       }
+      // The write target is persisted per *browser*, not per session, so
+      // without this the next human to sign in on this machine inherits the
+      // previous one's target and files their first note into a space they
+      // never chose — D1a's failure across an account change rather than
+      // across a tab. Clearing it is not a silent rewrite: nobody is looking
+      // at a create surface at this point, and the reset is announced by the
+      // editor showing `main` the moment one is opened.
+      clearWriteTarget();
       navigate("/login", { replace: true });
     })();
   };

@@ -6,13 +6,16 @@
  * shape is fixed and small, and the view reads it rather than re-deriving
  * anything by chasing ids:
  *
- * - node   → `{"parent": {"id", "title"}}`, or `{}` for a root node
- * - edge   → `{"src": {"id", "title"}, "dst": {"id", "title"}}`
- * - update → `{"node": {"id", "title"}}`
+ * - node   → `{"parent": <ref>}`, or `{}` for a root node
+ * - edge   → `{"src": <ref>, "dst": <ref>}`
+ * - update → `{"node": <ref>}`
  *
- * A referenced row that no longer exists comes back as `{"id"}` alone, with no
- * `title` key — so every reader here tolerates a missing title rather than
- * assuming one.
+ * where a ref is `{"id", "title", "space_id"}` (`service._node_ref`). The space
+ * is what the review queue groups by, so {@link ContextRef} carries it too.
+ *
+ * A referenced row that no longer exists comes back as `{"id"}` alone, with
+ * neither a `title` nor a `space_id` — so every reader here tolerates both
+ * being absent rather than assuming them.
  */
 
 import type { ProposalOut, VersionOut } from "../../api/types";
@@ -23,13 +26,15 @@ export const VERSION_FIELDS = ["title", "content", "props"] as const;
 /** One of the three snapshot fields. */
 export type VersionField = (typeof VERSION_FIELDS)[number];
 
-/** An id/title pair out of a proposal's `context`. */
+/** One referenced node out of a proposal's `context`. */
 export interface ContextRef {
   id: string;
   title: string | null;
+  /** The space it lives in; null only when the node no longer resolves. */
+  spaceId: string | null;
 }
 
-/** Read one `{id, title}` entry out of a context object, tolerating absence. */
+/** Read one node ref out of a context object, tolerating every absent field. */
 export function contextRef(context: unknown, key: string): ContextRef | null {
   if (context === null || typeof context !== "object") return null;
   const entry = (context as Record<string, unknown>)[key];
@@ -37,7 +42,12 @@ export function contextRef(context: unknown, key: string): ContextRef | null {
   const id = (entry as Record<string, unknown>).id;
   if (typeof id !== "string") return null;
   const title = (entry as Record<string, unknown>).title;
-  return { id, title: typeof title === "string" ? title : null };
+  const spaceId = (entry as Record<string, unknown>).space_id;
+  return {
+    id,
+    title: typeof title === "string" ? title : null,
+    spaceId: typeof spaceId === "string" ? spaceId : null,
+  };
 }
 
 /** A context ref rendered for display: its title, or its id when untitled. */

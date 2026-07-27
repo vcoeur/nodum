@@ -1,10 +1,33 @@
 /**
- * The review inbox: every `proposed` item, grouped by agent and by batch.
+ * The review inbox: every `proposed` item, grouped by **space**, then by agent,
+ * then by batch (design decision D4).
  *
  * The grouping is the point. A proposal is rarely interesting alone — what a
  * human decides on is "this run of this agent", so the batch is the default
  * unit of accept and reject, and the per-item controls are the exception for
  * when a run is mostly right.
+ *
+ * Space is the outer level because of what it makes visible rather than what it
+ * tidies. An `edit`-granted space **never reaches this queue**: its agents land
+ * writes `active` and file no proposals. Grouped by agent alone, that territory
+ * is simply absent, and the human cannot tell "nothing has been proposed here"
+ * from "this space governs itself" — so this view renders a section for it
+ * saying exactly that, and the section is empty on purpose. Absence is the bug
+ * D4 exists to fix, so absence is the one thing that must not be the rendering.
+ *
+ * There is deliberately **no space filter** here. The sections *are* the
+ * navigation, and narrowing to one space would hide the self-governing sections
+ * — the one thing the human cannot learn anywhere else in this view.
+ *
+ * A section header therefore has to be able to name **any** space the queue
+ * reports, including one that has since been archived and so left
+ * `GET /api/spaces`. That name comes from the shared `components/spaceNaming.ts`
+ * over two lists: the active one and a lazy read of archived space nodes
+ * (`components/useArchivedSpaces.ts`), which runs only when a section actually
+ * needs it. This queue was the first surface to need that and is no longer the
+ * only one — search, the editor and the graph inspector name spaces the same
+ * way. The shared endpoint stays active-only: it is the vocabulary behind every
+ * picker in the app, and a retired space belongs in none of them.
  *
  * Two deliberateness rules, chosen so that neither becomes a dialog people
  * learn to click through:
@@ -24,12 +47,26 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { Ref } from "react";
 import { api } from "../../api/client";
 import type { BatchTransitionOut, ProposalOut } from "../../api/types";
-import { EmptyState, Spinner, useToast } from "../../components";
+import {
+  EmptyState,
+  Spinner,
+  nameSpace,
+  unresolvedSpaceIds,
+  useArchivedSpaces,
+  useSpaces,
+  useToast,
+} from "../../components";
+import type { SpaceName } from "../../components";
 import { AcceptDialog } from "./AcceptDialog";
 import { RejectDialog } from "./RejectDialog";
 import { ProposalCard } from "./ProposalCard";
-import { describeCounts, groupProposals, PROPOSAL_KINDS, proposalKind } from "./grouping";
-import type { AgentGroup, ProposalBatch, ProposalKind } from "./grouping";
+import {
+  describeCounts,
+  groupProposalsBySpace,
+  PROPOSAL_KINDS,
+  proposalKind,
+} from "./grouping";
+import type { AgentGroup, ProposalBatch, ProposalKind, SpaceSection } from "./grouping";
 import { formatAbsolute, formatRelative } from "../../lib";
 import { plural } from "./format";
 import { classifyFailure, failureMessage, useReviewQueue } from "./useReviewQueue";
@@ -82,6 +119,7 @@ export function ReviewInbox() {
   // Polling pauses while a dialog is open or a request is in flight, so the
   // list never re-orders under a pointer that is about to click it.
   const queue = useReviewQueue(pending !== null || busy);
+  const spaceList = useSpaces();
 
   const agents = useMemo(
     () => [...new Set(queue.proposals.map((proposal) => proposal.created_by))].sort(),
@@ -98,7 +136,38 @@ export function ReviewInbox() {
     [queue.proposals, agentFilter, kindFilter],
   );
 
-  const groups = useMemo(() => groupProposals(visible), [visible]);
+  const sections = useMemo(
+    () => groupProposalsBySpace(visible, spaceList.spaces),
+    [visible, spaceList.spaces],
+  );
+  // Sections that hold something. A self-governing section is not "content" —
+  // it is a statement about an absence, so it must not make an empty queue look
+  // occupied, and it must survive the toolbar filters that would otherwise
+  // strip the queue to nothing.
+  const withProposals = sections.filter((section) => section.total > 0);
+  const selfGoverning = sections.filter((section) => section.kind === "self-governing");
+
+  // A section whose space no picker lists is a space that was archived while
+  // its proposals waited. The read that names it is lazy — see
+  // `useArchivedSpaces` for why the shared endpoint stays active-only.
+  //
+  // `spaceList.spaces` is passed through **null and all**: while the space list
+  // is in flight it is null, and reading that as an empty list would report
+  // every section here as unresolved and fire the archived read on a queue that
+  // needs nothing of the sort. `unresolvedSpaceIds` owns that rule.
+  const unresolved = useMemo(
+    () =>
+      unresolvedSpaceIds(
+        sections.map((section) => section.spaceId),
+        spaceList.spaces,
+      ),
+    [sections, spaceList.spaces],
+  );
+  const archivedSpaces = useArchivedSpaces(unresolved.length > 0);
+  const spaceName = useCallback(
+    (spaceId: string): SpaceName => nameSpace(spaceId, spaceList.spaces, archivedSpaces.spaces),
+    [spaceList.spaces, archivedSpaces.spaces],
+  );
 
   const selectedProposals = useMemo(
     () => visible.filter((proposal) => selected.has(proposal.id)),
@@ -236,6 +305,7 @@ export function ReviewInbox() {
       <QueueToolbar
         total={queue.proposals.length}
         shown={visible.length}
+        spaceCount={withProposals.length}
         agents={agents}
         agentFilter={agentFilter}
         onAgentFilter={setAgentFilter}
@@ -243,7 +313,15 @@ export function ReviewInbox() {
         onKindFilter={setKindFilter}
         loadedAt={queue.loadedAt}
         refreshing={queue.refreshing}
-        onRefresh={() => void queue.refresh()}
+        onRefresh={() => {
+          void queue.refresh();
+          // A grant changed on /admin turns a space self-governing; a refresh
+          // that only re-read the queue would keep saying otherwise. The
+          // archived list rides along for the same reason — a space archived
+          // on /spaces moves a section from one list to the other.
+          void spaceList.reload();
+          void archivedSpaces.reload();
+        }}
         paused={pending !== null || busy}
       />
 
@@ -268,6 +346,15 @@ export function ReviewInbox() {
         />
       ) : null}
 
+      {spaceList.failed ? (
+        <p className="nd-rv-flag nd-rv-flag--warn">
+          The space list could not be loaded, so these proposals are not grouped by space and
+          nothing below can say which spaces govern themselves. An <code>edit</code>-granted space
+          files no proposals at all — its silence here is not evidence of anything until this
+          list is readable again.
+        </p>
+      ) : null}
+
       {visible.length === 0 ? (
         <EmptyQueue
           filtered={queue.proposals.length > 0}
@@ -278,23 +365,42 @@ export function ReviewInbox() {
           }}
         />
       ) : (
-        groups.map((group) => (
-          <AgentSection
-            key={group.agent}
-            group={group}
-            selected={selected}
-            expanded={expanded}
-            busy={busy}
-            onToggleSelect={toggleSelect}
-            onToggleExpand={toggleExpand}
-            onSetBatchSelection={setBatchSelection}
-            onAcceptOne={acceptOne}
-            onRejectOne={(proposal) => askReject([proposal], "One proposal")}
-            onAcceptBatch={(batch) => askAccept([...batch.proposals], batchScope(batch))}
-            onRejectBatch={(batch) => askReject([...batch.proposals], batchScope(batch))}
-          />
-        ))
+        withProposals.map((section) => {
+          const named = sectionSpaceName(section, spaceName);
+          const label = named.label;
+          return (
+            <SpacePanel
+              key={section.key}
+              section={section}
+              name={named}
+              spaceName={spaceName}
+              selected={selected}
+              expanded={expanded}
+              busy={busy}
+              onToggleSelect={toggleSelect}
+              onToggleExpand={toggleExpand}
+              onSetBatchSelection={setBatchSelection}
+              onAcceptOne={acceptOne}
+              // The space is in every confirmation scope, not only in the
+              // heading: a batch accept is a live write, and "which territory"
+              // is part of what is being confirmed.
+              onRejectOne={(proposal) => askReject([proposal], `One proposal in ${label}`)}
+              onAcceptBatch={(batch) =>
+                askAccept([...batch.proposals], `${label} · ${batchScope(batch)}`)
+              }
+              onRejectBatch={(batch) =>
+                askReject([...batch.proposals], `${label} · ${batchScope(batch)}`)
+              }
+            />
+          );
+        })
       )}
+
+      {/* Outside the empty-queue branch on purpose: an empty queue is exactly
+          when "this space governs itself" is the thing worth knowing. */}
+      {selfGoverning.length > 0 ? (
+        <SelfGoverningSpaces sections={selfGoverning} spaceName={spaceName} />
+      ) : null}
 
       {pending?.mode === "accept" ? (
         <AcceptDialog
@@ -324,10 +430,214 @@ function batchScope(batch: ProposalBatch): string {
   return `${batch.agent} · run of ${formatAbsolute(batch.startedAt)}`;
 }
 
+/** How a space section is named, in its heading and in every dialog under it. */
+function sectionSpaceName(
+  section: SpaceSection,
+  spaceName: (spaceId: string) => SpaceName,
+): SpaceName {
+  return section.kind === "unreported"
+    ? { label: "space not reported", kind: "unknown" }
+    : spaceName(section.spaceId);
+}
+
+/**
+ * One space's share of the queue: the header, then its agents.
+ *
+ * The header carries the per-space count because that is the number a human
+ * governs by — "how much is waiting in research" is a different question from
+ * "how much is waiting", and only one of them tells you where to spend an
+ * afternoon. It also names the agents holding `edit` here even when there are
+ * proposals: an `edit` agent files none, so seeing one listed beside a queue
+ * means some *other* agent holds only `suggest`, which is worth reading off the
+ * screen rather than inferring.
+ *
+ * Two facts about the *filing* live here too, because the header is where a
+ * human decides they have understood the section:
+ *
+ * - **an archived space is marked as one.** Its proposals are still waiting and
+ *   still reviewable — archiving retires the name, it deletes nothing — but a
+ *   section headed by a space that no picker offers has to say why;
+ * - **the crossings are counted.** An edge whose endpoints are in different
+ *   spaces is filed under its source alone, while accepting it needs authority
+ *   on *both*. That simplification is deliberate; leaving it unsaid is not.
+ */
+function SpacePanel({
+  section,
+  name,
+  spaceName,
+  selected,
+  expanded,
+  busy,
+  onToggleSelect,
+  onToggleExpand,
+  onSetBatchSelection,
+  onAcceptOne,
+  onRejectOne,
+  onAcceptBatch,
+  onRejectBatch,
+}: {
+  section: SpaceSection;
+  /** What this space is called, and how that name was resolved. */
+  name: SpaceName;
+  /** Names any other space — the far end of a crossing, on the cards below. */
+  spaceName: (spaceId: string) => SpaceName;
+  selected: ReadonlySet<string>;
+  expanded: ReadonlySet<string>;
+  busy: boolean;
+  onToggleSelect: (id: string) => void;
+  onToggleExpand: (id: string) => void;
+  onSetBatchSelection: (batch: ProposalBatch, include: boolean) => void;
+  onAcceptOne: (proposal: ProposalOut) => void;
+  onRejectOne: (proposal: ProposalOut) => void;
+  onAcceptBatch: (batch: ProposalBatch) => void;
+  onRejectBatch: (batch: ProposalBatch) => void;
+}) {
+  const unreported = section.kind === "unreported";
+
+  return (
+    <section className="nd-rv-space">
+      <header className="nd-rv-space__head">
+        <h2 className="nd-rv-space__name">
+          {unreported ? (
+            "Space not reported"
+          ) : name.kind === "unknown" || name.kind === "pending" ? (
+            // The id is all this heading has, either because nothing names the
+            // space or because the list that would is still in flight. Mono
+            // either way; only the first of those gets a paragraph saying so.
+            <span className="nd-mono" title={name.label}>
+              {name.label}
+            </span>
+          ) : (
+            name.label
+          )}
+          {name.kind === "archived" ? (
+            <span className="nd-badge nd-badge--archived nd-rv-space__mark">
+              <span className="nd-badge__dot" aria-hidden="true" />
+              archived
+            </span>
+          ) : null}
+        </h2>
+        <p className="nd-meta">
+          {plural(section.total, "proposal")}
+          {describeCounts(section.counts) ? ` · ${describeCounts(section.counts)}` : ""} · oldest{" "}
+          {formatRelative(section.oldestAt)} · {plural(section.agents.length, "agent")}
+        </p>
+        {unreported ? (
+          <p className="nd-meta">
+            The queue reports a space for every proposal whose subject still exists, so these
+            reference a node that does not — undone, most likely, after the proposal was filed.
+            They are ordinary proposals and can be reviewed normally; they are grouped apart
+            rather than filed under a space nothing says they belong to.
+          </p>
+        ) : null}
+        {name.kind === "archived" ? (
+          <p className="nd-meta">
+            This space has been archived, so no picker offers it any more and nothing new can be
+            filed here. Archiving is not deletion: these proposals are still waiting and still
+            reviewable, and accepting one lands the node in the space it names, exactly as it
+            would have before.
+          </p>
+        ) : null}
+        {!unreported && name.kind === "unknown" ? (
+          <p className="nd-meta">
+            The active space list does not name this space and neither does the archived one, so
+            all this section has to go on is the id the proposals report. They are ordinary
+            proposals and review normally.
+          </p>
+        ) : null}
+        {section.crossings > 0 ? (
+          <p className="nd-meta">
+            {plural(section.crossings, "proposal")} here{" "}
+            {section.crossings === 1 ? "is an edge" : "are edges"} into another space, filed under{" "}
+            {unreported ? "this bucket" : "this one"} because that is where the edge{" "}
+            <em>starts</em>. Reviewing such an edge in fact needs <code>edit</code> on both
+            endpoint spaces — each card names the far side.
+          </p>
+        ) : null}
+        {!unreported && section.editAgents.length > 0 ? (
+          <p className="nd-meta">
+            {section.editAgents.join(", ")} hold <code>edit</code> here and write directly —
+            nothing below was filed by {section.editAgents.length === 1 ? "it" : "them"}.
+          </p>
+        ) : null}
+      </header>
+
+      {section.agents.map((group) => (
+        <AgentSection
+          key={group.agent}
+          group={group}
+          spaceName={spaceName}
+          selected={selected}
+          expanded={expanded}
+          busy={busy}
+          onToggleSelect={onToggleSelect}
+          onToggleExpand={onToggleExpand}
+          onSetBatchSelection={onSetBatchSelection}
+          onAcceptOne={onAcceptOne}
+          onRejectOne={onRejectOne}
+          onAcceptBatch={onAcceptBatch}
+          onRejectBatch={onRejectBatch}
+        />
+      ))}
+    </section>
+  );
+}
+
+/**
+ * The spaces that hold nothing here, and never will.
+ *
+ * This panel is design decision D4's reason for existing. An `edit`-granted
+ * space's agents land their writes `active`, so they file no proposals and the
+ * space is simply missing from a queue grouped by agent — indistinguishable
+ * from a space nobody has touched. Saying so is the only place in the UI where
+ * "this territory governs itself" is visible, and it has to be said *here*,
+ * where a human is deciding whether they have seen everything.
+ *
+ * It renders zero counts rather than nothing at all, and it renders when the
+ * whole queue is empty, because an empty screen is exactly the case it exists
+ * to explain.
+ */
+function SelfGoverningSpaces({
+  sections,
+  spaceName,
+}: {
+  sections: SpaceSection[];
+  /** Names each space; these are all active, since they come off the list. */
+  spaceName: (spaceId: string) => SpaceName;
+}) {
+  return (
+    <section className="nd-rv-space nd-rv-space--governed" aria-label="Self-governing spaces">
+      <header className="nd-rv-space__head">
+        <h2 className="nd-rv-space__name">Self-governing — no review</h2>
+        <p className="nd-meta">
+          {plural(sections.length, "space")} where an agent holds <code>edit</code>. Those writes
+          land <code>active</code> immediately, so nothing from them ever reaches this queue. The
+          zero below is the design, not an empty inbox — and it is not a claim that nothing has
+          been written there.
+        </p>
+      </header>
+      <ul className="nd-rv-space__governed-list">
+        {sections.map((section) => (
+          <li key={section.key}>
+            <span className="nd-rv-space__governed-name">
+              {spaceName(section.spaceId).label}
+            </span>
+            <span className="nd-meta">
+              0 proposals · written directly by{" "}
+              <span className="nd-mono">{section.editAgents.join(", ")}</span>
+            </span>
+          </li>
+        ))}
+      </ul>
+    </section>
+  );
+}
+
 /** Filters, freshness, and the manual refresh. */
 function QueueToolbar({
   total,
   shown,
+  spaceCount,
   agents,
   agentFilter,
   onAgentFilter,
@@ -340,6 +650,8 @@ function QueueToolbar({
 }: {
   total: number;
   shown: number;
+  /** Spaces currently holding something, for the "across N spaces" line. */
+  spaceCount: number;
   agents: string[];
   agentFilter: string;
   onAgentFilter: (value: string) => void;
@@ -356,6 +668,7 @@ function QueueToolbar({
         <label className="nd-rv-toolbar__field">
           <span className="nd-label">Agent</span>
           <select
+            name="review-agent"
             className="nd-select"
             value={agentFilter}
             onChange={(event) => onAgentFilter(event.target.value)}
@@ -372,6 +685,7 @@ function QueueToolbar({
         <label className="nd-rv-toolbar__field">
           <span className="nd-label">Kind</span>
           <select
+            name="review-kind"
             className="nd-select"
             value={kindFilter}
             onChange={(event) => onKindFilter(event.target.value as ProposalKind | "")}
@@ -389,6 +703,7 @@ function QueueToolbar({
       <div className="nd-row nd-rv-toolbar__status">
         <span className="nd-meta">
           {shown === total ? plural(total, "proposal") : `${shown} of ${total} proposals`} waiting
+          {spaceCount > 0 ? ` across ${plural(spaceCount, "space")}` : ""}
           {loadedAt !== null ? ` · checked ${new Date(loadedAt).toLocaleTimeString()}` : ""}
           {paused ? " · polling paused" : ""}
         </span>
@@ -403,6 +718,7 @@ function QueueToolbar({
 /** One agent's share of the queue. */
 function AgentSection({
   group,
+  spaceName,
   selected,
   expanded,
   busy,
@@ -415,6 +731,8 @@ function AgentSection({
   onRejectBatch,
 }: {
   group: AgentGroup;
+  /** Names a space, for the cards that have a crossing to report. */
+  spaceName: (spaceId: string) => SpaceName;
   selected: ReadonlySet<string>;
   expanded: ReadonlySet<string>;
   busy: boolean;
@@ -442,6 +760,7 @@ function AgentSection({
         <BatchSection
           key={batch.key}
           batch={batch}
+          spaceName={spaceName}
           selected={selected}
           expanded={expanded}
           busy={busy}
@@ -461,6 +780,7 @@ function AgentSection({
 /** One derived batch — an agent's run — with its own accept/reject. */
 function BatchSection({
   batch,
+  spaceName,
   selected,
   expanded,
   busy,
@@ -473,6 +793,8 @@ function BatchSection({
   onRejectBatch,
 }: {
   batch: ProposalBatch;
+  /** Names a space, for the cards that have a crossing to report. */
+  spaceName: (spaceId: string) => SpaceName;
   selected: ReadonlySet<string>;
   expanded: ReadonlySet<string>;
   busy: boolean;
@@ -492,6 +814,7 @@ function BatchSection({
       <header className="nd-rv-batch__head">
         <label className="nd-rv-batch__select">
           <input
+            name={`select-run-${batch.key}`}
             type="checkbox"
             checked={allSelected}
             onChange={(event) => onSetBatchSelection(batch, event.target.checked)}
@@ -539,6 +862,7 @@ function BatchSection({
           <ProposalCard
             key={`${proposal.kind}:${proposal.id}`}
             proposal={proposal}
+            spaceName={spaceName}
             selected={selected.has(proposal.id)}
             onToggleSelect={() => onToggleSelect(proposal.id)}
             expanded={expanded.has(proposal.id)}

@@ -39,6 +39,7 @@ from nodum.models import (
     PathOut,
     ProposalOut,
     ProposeEdgesOut,
+    SpaceOut,
     SubgraphOut,
     TransitionFailure,
     TypeOut,
@@ -88,6 +89,31 @@ MAX_SUBGRAPH_LIMIT = 2000
 #: argument still describes the size of the whole result.
 SUBGRAPH_EDGE_FACTOR = 8
 
+#: The spaces the schema creates and the system depends on, mapped to why
+#: archiving one is refused. Both are refused *here*, in the service, so every
+#: surface inherits it: a disabled button on one screen leaves the CLI and the
+#: API wide open, and archiving `main` is destructive in the quietest possible
+#: way — `list_spaces` returns active spaces only, so it disappears from every
+#: picker, while `resolve_space_id(None)` keeps returning `main` without ever
+#: reading the row's state, so writes go on landing in a space the human can
+#: no longer see or name. Undo is not the answer to that, though it *can*
+#: reverse an archive (it restores the `before` row past `TRANSITIONS`): it
+#: reverses one named event, and this is a failure that reports nothing at the
+#: moment it happens — by the time anyone notices where their writes went, the
+#: event is buried under everything that kept arriving. Refusing the archive is
+#: the only guard that fires while somebody is still watching.
+STRUCTURAL_SPACE_IDS: dict[str, str] = {
+    MAIN_SPACE_ID: (
+        "it is where every write that names no space lands, and that default resolves by id "
+        "whatever state the row is in — archiving it would hide the space while nodes kept "
+        "arriving in it"
+    ),
+    META_SPACE_ID: (
+        "it is the space that spaces themselves live in, along with the whole type vocabulary — "
+        "archiving it would retire the space holding every other space"
+    ),
+}
+
 #: Sentinel distinguishing "argument not given" from an explicit ``None``.
 _UNSET: Any = object()
 
@@ -127,6 +153,16 @@ class VersionNotFound(RecordNotFound):
 
 class AccountExists(ValueError):
     """Raised when an account id is already taken (a duplicate ``agent create``)."""
+
+
+class SpaceNameTaken(ValueError):
+    """Raised when another space already answers to a proposed space name.
+
+    A conflict rather than a bad request — the sibling of
+    :class:`AccountExists`, and mapped to the same 409: the name is well-formed
+    and the caller may retry with another one. Derives from ``ValueError`` so
+    the CLI keeps reporting it as the refusal it always was.
+    """
 
 
 class InvalidTransition(ValueError):
@@ -302,6 +338,176 @@ def _resolve_space(conn: sqlite3.Connection, space_ref: str, principal: Principa
     if row is None or principal.level_on(row["id"]) < READ:
         raise TypeNotFound(f"unknown space: {space_ref}")
     return row["id"]
+
+
+def _resolve_space_for_admin(conn: sqlite3.Connection, space_ref: str) -> tuple[str, str]:
+    """Resolve a space id or name to ``(id, state)`` **whatever its state**.
+
+    :func:`_resolve_space` matches ``state = 'active'``, which is right for
+    every read and write that names a space: an archived space is out of the
+    vocabulary. It is wrong for grant administration, and that left a real hole
+    — archiving a space made its grants unrevokable, because :func:`revoke`
+    could no longer resolve the space they were on. An authority with no
+    supported route to remove it is a bug whichever way the inertness question
+    goes, and raw SQL was the only way out.
+
+    Deliberately separate from :func:`_resolve_space` rather than a flag on it:
+    the active-only rule is what keeps a space reference from telling an
+    ungranted space apart from a nonexistent one, and a flag is how that gets
+    switched off by accident. **Human-only callers only** — both callers gate on
+    :func:`_admin_actor` first, so naming an archived space back is not a leak;
+    humans are unfiltered and can already list every space node.
+
+    Args:
+        conn: Open connection.
+        space_ref: Space id or title.
+
+    Returns:
+        ``(space_id, state)``.
+
+    Raises:
+        TypeNotFound: If the reference resolves to no space at all.
+    """
+    row = conn.execute(
+        "SELECT id, state FROM nodes WHERE (id = ? OR title = ?) AND type_id = 'space'",
+        (space_ref, space_ref),
+    ).fetchone()
+    if row is None:
+        raise TypeNotFound(f"unknown space: {space_ref}")
+    return row["id"], row["state"]
+
+
+def _require_space_lives_in_meta(space_id: str) -> None:
+    """Refuse a ``space``-typed node anywhere but the meta space.
+
+    "A space is a node of builtin type ``space`` living in meta" is the model
+    every adapter is written against — :func:`create_space` hardcodes it, and
+    :func:`list_spaces` and ``GET /api/spaces`` list whatever carries the type
+    regardless of where it sits. The generic ``create_node`` was the one path
+    that could put a space somewhere else, and a space living inside an
+    ordinary space is incoherent twice over: it is listed and resolved as real
+    territory while the grants that govern it are the *host* space's.
+
+    It is also what made :func:`_require_space_name_free` an existence oracle.
+    That check is deliberately unscoped, on the premise that only a meta writer
+    can reach it and a meta reader can already list every space; the premise
+    held for creates (:func:`_resolve_node_type` needs READ on meta to resolve
+    the ``space`` type) but not for renames, which are gated on SUGGEST on the
+    space the node itself lives in. A ``space``-typed node in ``main`` therefore
+    let a principal holding nothing but ``main`` rename it onto a name and learn
+    from the refusal that some space it cannot list holds it — plus that space's
+    id. Keeping spaces in meta restores the premise instead of weakening the
+    refusal, which has to keep naming an archived holder to be usable at all.
+
+    Migration ``0013``'s index stays deliberately unscoped to meta, and this
+    does not contradict it: the index is the backstop for writers that never
+    pass through here (raw SQL, a future adapter), so it covers every space
+    node wherever it sits.
+
+    Args:
+        space_id: The target space the ``space``-typed node would land in.
+
+    Raises:
+        ValueError: If ``space_id`` is not the meta space.
+    """
+    if space_id != META_SPACE_ID:
+        raise ValueError(
+            f"a space must live in the {META_SPACE_ID!r} space, not {space_id!r}: spaces are the "
+            "vocabulary every other space is named from, and one nested inside ordinary territory "
+            "would be listed and resolved as real while being governed by its host's grants"
+        )
+
+
+def _require_space_name_free(
+    conn: sqlite3.Connection,
+    name: str | None,
+    principal: Principal,
+    *,
+    exclude_id: str | None = None,
+) -> None:
+    """Refuse a space name another space already answers to, whatever its state.
+
+    The predicate is :func:`_resolve_space`'s own — ``id = ? OR title = ?`` over
+    space nodes — because that is what makes a duplicate harmful: two rows
+    answering to one reference means ``--space research`` resolves to whichever
+    one SQLite reached first. It is deliberately **not** narrowed to live rows.
+    That was the first shape of this rule, on the argument that an archived
+    space stops resolving so its name is free again; the argument assumed
+    nothing ever un-archives, and :func:`undo` does — it restores the ``before``
+    row with a raw UPDATE, past ``TRANSITIONS``. A freed name that had been
+    re-taken meanwhile turned that undo into an ``IntegrityError``. **A space
+    title is reserved forever**, so a restore can never fail; the cost, taken
+    knowingly, is that a retired space's name cannot be reused.
+
+    An archived holder gets its own sentence, and both name the space. Nothing
+    lists archived spaces — :func:`list_spaces` and ``GET /api/spaces`` return
+    active ones — so a human would otherwise be refused a name held by
+    something they cannot see anywhere. Saying so is not an existence oracle,
+    but only because **the caller can read meta**, and a meta reader can already
+    list every space node in it, archived ones included.
+
+    That premise is checked here rather than trusted, and here rather than at
+    each call site, because this is the function that discloses: the search
+    spans every space in the file regardless of scope, so the principal it
+    answers has to be one that could run the search itself. `create_node` is
+    safe by construction (resolving the ``space`` type needs READ on meta), but
+    a rename is gated on SUGGEST on the space the node *already lives in* — and
+    a ``space``-typed node sitting in ``main`` therefore let a principal holding
+    nothing but ``main`` read a confirm/deny, plus the holder's id, for a space
+    it cannot list. :func:`_require_space_lives_in_meta` stops new ones being
+    made; this check covers the rows a database already holds, and covers the
+    accept path (:func:`_transition_version`) where the reviewer need not be the
+    proposer. The refusal is on the **grant**, so it reads identically whether
+    or not the name is taken — weakening the message was not the alternative,
+    since it has to keep naming an archived holder, the one space no listing
+    shows. Freeing that name means renaming it, an ordinary :func:`update_node`
+    by id — :func:`rename_space` will not reach it, since :func:`_resolve_space`
+    matches ``active`` only.
+
+    Migration ``0013_unique_space_titles`` is the structural half of this and
+    holds every path, including a raw ``update_node`` on a space node; this
+    check is what turns the collision into one sentence instead of an
+    ``IntegrityError``, and it additionally catches the half an index cannot
+    express — a title equal to some *other* space's id.
+
+    Args:
+        conn: Open connection.
+        name: The proposed name; ``None`` (an untitled space) is always free.
+        principal: Who is asking — must be able to read the meta space, since
+            the answer describes every space in the file.
+        exclude_id: The space being renamed, so it never clashes with itself.
+
+    Raises:
+        GrantNotPermitted: If ``principal`` cannot read the meta space.
+        SpaceNameTaken: If any other space already answers to ``name``.
+    """
+    if principal.level_on(META_SPACE_ID) < READ:
+        raise GrantNotPermitted(
+            f"{principal.actor_string} has no read grant on space {META_SPACE_ID!r}: naming a "
+            "space is naming part of the vocabulary every space is named from, so it takes a "
+            "grant on the space that holds it"
+        )
+    if name is None:
+        return
+    # `IS NOT` rather than `!=` so a None exclusion compares against NULL.
+    row = conn.execute(
+        "SELECT id, state FROM nodes WHERE type_id = 'space'"
+        " AND (id = ? OR title = ?) AND id IS NOT ?",
+        (name, name, exclude_id),
+    ).fetchone()
+    if row is None:
+        return
+    if row["state"] == "archived":
+        raise SpaceNameTaken(
+            f"an archived space already answers to {name!r} (id {row['id']}): archiving a space "
+            "keeps its name reserved, so that restoring it can never collide with a newer space "
+            "— the name is not free again. Give the new space another name, or rename the "
+            "archived one to release it."
+        )
+    raise SpaceNameTaken(
+        f"a space already answers to {name!r} (id {row['id']}): a space reference resolves by id "
+        "or by title, so the two could not be told apart"
+    )
 
 
 def _create_op(state: str) -> str:
@@ -744,6 +950,14 @@ def create_node(
                 )
         node_id = uuid.uuid4().hex
         state = store.landing_state(target_space)
+        # A space is an ordinary node, so this is the path a raw
+        # `node create --type space` takes past `create_space` — both space
+        # rules have to sit here or that path is the way around them. After the
+        # grant check, so a caller with no authority here is refused for that
+        # first.
+        if type_id == "space":
+            _require_space_lives_in_meta(target_space)
+            _require_space_name_free(conn, title, principal)
         if parent_id is None:
             row = conn.execute(
                 "SELECT COALESCE(MAX(position), 0) + 1.0 AS pos FROM nodes WHERE parent_id IS NULL"
@@ -841,6 +1055,17 @@ def update_node(
         before = _row_dict(before_row)
         if not principal.is_human and principal.level_on(before["space_id"]) < SUGGEST:
             raise GrantNotPermitted(f"{actor} has no write grant on space {before['space_id']!r}")
+        # Renaming a space is renaming a node, so the name rule belongs here too:
+        # `rename_space` delegates to this function, and `node update` reaches it
+        # directly. Refused at propose time as well as at apply time, so an agent
+        # learns now rather than the reviewer learning at accept.
+        # The grant checked above is on the space the node *lives in*, which for
+        # a space node is meta — but only because `_require_space_lives_in_meta`
+        # keeps it there, and a database written before that guard can still
+        # hold one elsewhere. `_require_space_name_free` owns that gate, since
+        # it is the call that discloses.
+        if before["type_id"] == "space" and title is not _UNSET and title != before["title"]:
+            _require_space_name_free(conn, title, principal, exclude_id=node_id)
         new_title = before["title"] if title is _UNSET else title
         new_content = before["content"] if content is _UNSET else content
         new_props = before["props"] if props is _UNSET else json.dumps(props, ensure_ascii=False)
@@ -902,47 +1127,126 @@ def update_node(
         conn.close()
 
 
+def _node_list_filters(
+    store: Store,
+    *,
+    state: str | None,
+    type_id: str | None,
+    parent_id: str | None,
+    space_id: str | None,
+    include_meta: bool,
+) -> tuple[list[str], list[Any]]:
+    """Build :func:`list_nodes`' ``WHERE`` clauses and params (unaliased ``nodes``).
+
+    Extracted so the invariant below is assertable directly, the way
+    :func:`nodum.search._node_filters` already is: a runtime call cannot reach
+    the state that breaks it, which is exactly why the builder is worth pinning
+    rather than only its behaviour.
+
+    **The space filter is ANDed onto the principal's scope; it never replaces
+    it.** The scope clause is the boundary (an agent's read set); ``space_id``
+    is a convenience that narrows it further. Resolution already refuses to
+    hand an agent the id of a space outside its read set, so making the filter
+    an *alternative* to the scope would not show up in any behavioural test —
+    the suite stayed wholly green under exactly that mutation. Hence the pin.
+
+    Naming the meta space is itself the ``include_meta`` opt-in, so the default
+    meta exclusion applies only to an unnarrowed listing by an unfiltered
+    principal.
+
+    Args:
+        store: The scope-bound store, for the principal's node scope.
+        state: One of :data:`STATES`, already validated.
+        type_id: Resolved node-type id.
+        parent_id: Only this node's children.
+        space_id: Resolved space id, or ``None`` for every space in scope.
+        include_meta: Include meta-space nodes in an unnarrowed listing.
+
+    Returns:
+        ``(clauses, params)``, to be joined with ``AND``.
+    """
+    clauses: list[str] = []
+    params: list[Any] = []
+    scope, scope_params = store.node_scope()
+    if scope:
+        clauses.append(scope.removeprefix(" AND "))
+        params.extend(scope_params)
+    elif not include_meta and space_id is None:
+        clauses.append("space_id != ?")
+        params.append(META_SPACE_ID)
+    if space_id is not None:
+        clauses.append("space_id = ?")
+        params.append(space_id)
+    if type_id is not None:
+        clauses.append("type_id = ?")
+        params.append(type_id)
+    if state is not None:
+        clauses.append("state = ?")
+        params.append(state)
+    if parent_id is not None:
+        clauses.append("parent_id = ?")
+        params.append(parent_id)
+    return clauses, params
+
+
 def list_nodes(
     *,
     type: str | None = None,
     state: str | None = None,
     parent_id: str | None = None,
+    space: str | None = None,
     include_meta: bool = False,
     principal: Principal,
     limit: int = 500,
     path: str | Path | None = None,
 ) -> list[NodeOut]:
-    """List nodes, optionally filtered by type name/id, state, or parent.
+    """List nodes, optionally filtered by type name/id, state, parent, or space.
 
     Ordered by ``created_at``; ``limit`` caps the result (default 500).
     Meta-space nodes (the type vocabulary, spaces) are excluded unless
     ``include_meta`` — content listings are not the type catalog. An agent
     principal is additionally confined to its read set (which may include
     meta, e.g. for the type vocabulary).
+
+    ``space`` **narrows** that read set and can never widen it: it resolves
+    through :func:`_resolve_space`, so a space the principal holds no grant on
+    does not resolve at all, and the scope clause is still ANDed underneath it.
+    It is a convenience for the human (who is unfiltered and sees the whole
+    file), not a boundary — the boundary is the grant set.
+
+    Args:
+        type: Node-type id or name.
+        state: One of :data:`STATES`.
+        parent_id: Only this node's children.
+        space: Space id or name; ``None`` spans every space in scope. Naming
+            the meta space explicitly is itself the ``include_meta`` opt-in —
+            the default exclusion only applies to an unnarrowed listing.
+        include_meta: Include meta-space nodes in an unnarrowed listing.
+        principal: Who is asking.
+        limit: Maximum rows.
+        path: Explicit database path.
+
+    Raises:
+        TypeNotFound: If ``type`` or ``space`` resolves to nothing the
+            principal can read — an ungranted space and a nonexistent one
+            answer identically (Q13 review S3).
+        ValueError: If ``state`` is not a known state.
     """
     conn = _connect(path)
     try:
         store = Store(conn, principal)
-        clauses: list[str] = []
-        params: list[Any] = []
-        scope, scope_params = store.node_scope()
-        if scope:
-            clauses.append(scope.removeprefix(" AND "))
-            params.extend(scope_params)
-        elif not include_meta:
-            clauses.append("space_id != ?")
-            params.append(META_SPACE_ID)
-        if type is not None:
-            clauses.append("type_id = ?")
-            params.append(_resolve_node_type(conn, type, principal))
-        if state is not None:
-            if state not in STATES:
-                raise ValueError(f"state must be one of {STATES}, got {state!r}")
-            clauses.append("state = ?")
-            params.append(state)
-        if parent_id is not None:
-            clauses.append("parent_id = ?")
-            params.append(parent_id)
+        space_id = _resolve_space(conn, space, principal) if space is not None else None
+        type_id = _resolve_node_type(conn, type, principal) if type is not None else None
+        if state is not None and state not in STATES:
+            raise ValueError(f"state must be one of {STATES}, got {state!r}")
+        clauses, params = _node_list_filters(
+            store,
+            state=state,
+            type_id=type_id,
+            parent_id=parent_id,
+            space_id=space_id,
+            include_meta=include_meta,
+        )
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         rows = conn.execute(
             f"SELECT * FROM nodes {where} ORDER BY created_at, rowid LIMIT ?",
@@ -1274,6 +1578,14 @@ def _transition_version(
     if action == "accept":
         node_before = _row_dict(_get_node_row(conn, before["node_id"]))
         fields = _proposed_fields(before)
+        # A proposed space rename was checked when it was filed, but this is
+        # where it lands and a space may have taken the name in between. The
+        # write path's refusal, so the reviewer reads a sentence rather than the
+        # unique index's IntegrityError.
+        if node_before["type_id"] == "space" and "title" in fields:
+            _require_space_name_free(
+                conn, before["title"], store.principal, exclude_id=before["node_id"]
+            )
         assignments = [f"{name} = ?" for name in fields] + ["updated_at = datetime('now')"]
         conn.execute(
             f"UPDATE nodes SET {', '.join(assignments)} WHERE id = ?",
@@ -1360,6 +1672,13 @@ def _transition_row(
     ):
         raise RecordNotFound(f"no node, edge, or version with id: {record_id}")
     store.require_review(spaces, action)
+    # The structural spaces are not archivable by any spelling. This sits here
+    # rather than in `archive_space` because `archive <id>` and
+    # `POST /api/nodes/{id}/archive` reach the same row without going near it.
+    if action == "archive" and kind == "node" and record_id in STRUCTURAL_SPACE_IDS:
+        raise InvalidTransition(
+            f"cannot archive the {record_id!r} space: {STRUCTURAL_SPACE_IDS[record_id]}"
+        )
     if before["state"] != from_state:
         raise InvalidTransition(
             f"cannot {action} a {kind} in state {before['state']!r} (requires state {from_state!r})"
@@ -1585,29 +1904,47 @@ def _proposal_rows(
     return results
 
 
+def _node_ref(conn: sqlite3.Connection, node_id: str) -> dict[str, Any]:
+    """One node as reviewer context: its id, title and space.
+
+    The **space** is what makes the review queue groupable: the human UI's D4
+    puts space at the outer level, and a proposed node states its own while an
+    edge and an update state nothing but the row itself. Without this field
+    every edge proposal — which is every ``mentions`` edge a ``[[wikilink]]``
+    materialised, the commonest thing an agent files — reaches the queue with
+    nothing to group on.
+
+    A node that no longer resolves (an ``undo`` took it back) comes out as its
+    id alone, with neither a title nor a space, which is the one case a queue
+    genuinely cannot report a space for.
+    """
+    row = conn.execute("SELECT id, title, space_id FROM nodes WHERE id = ?", (node_id,)).fetchone()
+    if row is None:
+        return {"id": node_id}
+    return {"id": row["id"], "title": row["title"], "space_id": row["space_id"]}
+
+
 def _node_context(conn: sqlite3.Connection, node: dict[str, Any]) -> dict[str, Any]:
-    """Reviewer context for a proposed node: its parent's id/title, if any."""
+    """Reviewer context for a proposed node: its parent, if any."""
     if node["parent_id"] is None:
         return {}
-    row = conn.execute("SELECT id, title FROM nodes WHERE id = ?", (node["parent_id"],)).fetchone()
-    parent = {"id": row["id"], "title": row["title"]} if row else {"id": node["parent_id"]}
-    return {"parent": parent}
+    return {"parent": _node_ref(conn, node["parent_id"])}
 
 
 def _edge_context(conn: sqlite3.Connection, edge: dict[str, Any]) -> dict[str, Any]:
-    """Reviewer context for a proposed edge: endpoint ids and titles."""
-    context: dict[str, Any] = {}
-    for key, column in (("src", "src_id"), ("dst", "dst_id")):
-        row = conn.execute("SELECT id, title FROM nodes WHERE id = ?", (edge[column],)).fetchone()
-        context[key] = {"id": row["id"], "title": row["title"]} if row else {"id": edge[column]}
-    return context
+    """Reviewer context for a proposed edge: both endpoints.
+
+    An edge is only listed when **both** endpoints are readable
+    (:meth:`Store.edge_scope`), so this reports nothing the reviewer could not
+    already read directly.
+    """
+    endpoints = (("src", "src_id"), ("dst", "dst_id"))
+    return {key: _node_ref(conn, edge[column]) for key, column in endpoints}
 
 
 def _update_context(conn: sqlite3.Connection, version: dict[str, Any]) -> dict[str, Any]:
-    """Reviewer context for a proposed update: the current node's id/title."""
-    row = conn.execute("SELECT id, title FROM nodes WHERE id = ?", (version["node_id"],)).fetchone()
-    node = {"id": row["id"], "title": row["title"]} if row else {"id": version["node_id"]}
-    return {"node": node}
+    """Reviewer context for a proposed update: the node it targets."""
+    return {"node": _node_ref(conn, version["node_id"])}
 
 
 def list_proposals(
@@ -1931,6 +2268,22 @@ def undo(
                         f"cannot undo event {event['seq']} ({event['op']}): node {after['id']} "
                         f"still has {len(children)} child node(s) — undo or reparent them first"
                     )
+                # `nodes.space_id` is the second foreign key into this row, and
+                # it is the one a space create grows: undoing the create of a
+                # space that has since been written into hit the FK and served a
+                # bare IntegrityError — a 500 on `/api/undo`, and `database
+                # error: FOREIGN KEY constraint failed` on the CLI, for the
+                # ordinary "the graph has grown past this" case the contract
+                # promises to name. `/spaces` put it one click away.
+                occupants = conn.execute(
+                    "SELECT id FROM nodes WHERE space_id = ? AND id != ?",
+                    (after["id"], after["id"]),
+                ).fetchall()
+                if occupants:
+                    raise UndoNotPossible(
+                        f"cannot undo event {event['seq']} ({event['op']}): space {after['id']} "
+                        f"still holds {len(occupants)} node(s) — undo their creation first"
+                    )
                 for edge in conn.execute(
                     "SELECT * FROM edges WHERE src_id = ? OR dst_id = ?",
                     (after["id"], after["id"]),
@@ -1946,6 +2299,23 @@ def undo(
             conn.execute(f"DELETE FROM {table} WHERE id = ?", (after["id"],))
             restored = None
         else:
+            # This UPDATE writes the recorded row back verbatim, past
+            # `TRANSITIONS` and past every guard an ordinary write passes — so a
+            # space's title is the one column here that can land on a name
+            # something else now holds. Restoring an *archived* space cannot:
+            # the name was never freed (`0013`). Undoing a **rename** still can
+            # — create `x`, rename it to `y`, create a new `x`, undo the rename
+            # — so it is checked rather than left to the unique index, which
+            # would surface as a bare IntegrityError and a 500 on `/api/undo`.
+            if kind == "node" and before.get("type_id") == "space":
+                try:
+                    _require_space_name_free(
+                        conn, before["title"], principal, exclude_id=before["id"]
+                    )
+                except SpaceNameTaken as clash:
+                    raise UndoNotPossible(
+                        f"cannot undo event {event['seq']} ({event['op']}): {clash}"
+                    ) from clash
             columns = [key for key in before if key != "id"]
             assignments = ", ".join(f"{key} = ?" for key in columns)
             cursor = conn.execute(
@@ -2983,8 +3353,14 @@ def grant(
 ) -> GrantOut:
     """Grant (or re-level) an agent's access to a space; event-logged.
 
+    An archived space is refused, and says so: a grant on it would confer
+    nothing (:func:`nodum.auth._grant_set` drops grants on archived spaces) and
+    would come to life only if the archive were undone, which is delegation by
+    accident. Restore the space first if that is what you meant.
+
     Raises:
-        ValueError: If ``level`` is not one of :data:`GRANT_LEVEL_NAMES`.
+        ValueError: If ``level`` is not one of :data:`GRANT_LEVEL_NAMES`, or if
+            the space is archived.
         RecordNotFound: If the agent does not exist.
         TypeNotFound: If the space does not resolve.
     """
@@ -2995,7 +3371,15 @@ def grant(
         actor = _admin_actor(conn, principal)
         if not conn.execute("SELECT 1 FROM agents WHERE id = ?", (agent_id,)).fetchone():
             raise RecordNotFound(f"no agents row with id: {agent_id}")
-        space_id = _resolve_space(conn, space, principal)
+        # Human-only (`_admin_actor` above), so resolving an archived space by
+        # name is not a leak — and refusing it by name beats the bare "unknown
+        # space" the active-only resolver used to answer with.
+        space_id, space_state = _resolve_space_for_admin(conn, space)
+        if space_state == "archived":
+            raise ValueError(
+                f"cannot grant on the archived space {space_id!r}: archiving a space makes every "
+                "grant on it inert, so this one would confer nothing until the archive was undone"
+            )
         before = conn.execute(
             "SELECT * FROM grants WHERE agent_id = ? AND space_id = ?", (agent_id, space_id)
         ).fetchone()
@@ -3029,11 +3413,21 @@ def grant(
 def revoke(
     agent_id: str, space: str, *, principal: Principal, path: str | Path | None = None
 ) -> None:
-    """Revoke an agent's grant on a space; event-logged."""
+    """Revoke an agent's grant on a space; event-logged.
+
+    Reaches an **archived** space too, by id or by its name. Archiving already
+    makes the grant inert, but the row survives so the human can see it and
+    take it away for good — and resolving active spaces only left no supported
+    way to do that at all, short of undoing the archive or raw SQL.
+
+    Raises:
+        RecordNotFound: If the agent holds no grant on the space.
+        TypeNotFound: If the space does not resolve.
+    """
     conn = _connect(path)
     try:
         actor = _admin_actor(conn, principal)
-        space_id = _resolve_space(conn, space, principal)
+        space_id, _ = _resolve_space_for_admin(conn, space)
         before = conn.execute(
             "SELECT * FROM grants WHERE agent_id = ? AND space_id = ?", (agent_id, space_id)
         ).fetchone()
@@ -3065,6 +3459,177 @@ def list_grants(
                 space_id=row["space_id"],
                 level=row["level"],
                 created_at=row["created_at"],
+            )
+            for row in rows
+        ]
+    finally:
+        conn.close()
+
+
+# ── Space lifecycle (a space is a node of builtin type 'space' in meta) ───────
+#
+# These three are deliberately thin: each delegates to the ordinary node
+# operation so a space create, rename and archive are event-logged, versioned
+# and undoable exactly like any other node write. What they add is the one
+# piece of knowledge that would otherwise be copied into every adapter — that a
+# space *is* a node, of type `space`, living in meta — plus the resolution rule
+# that makes a name usable everywhere an id is, and that refuses to touch a
+# node that is not a space at all.
+
+
+def create_space(name: str, *, principal: Principal, path: str | Path | None = None) -> NodeOut:
+    """Create a space: a node of builtin type ``space``, living in the meta space.
+
+    Args:
+        name: The space's title — what ``--space``, a grant, and the space
+            filter may name it by, alongside its generated id.
+        principal: Who is writing. Writing meta is the human tier in practice,
+            so this is a human operation unless an agent was granted meta.
+        path: Explicit database path.
+
+    Returns:
+        The created space node.
+
+    Raises:
+        GrantNotPermitted: If the principal may not write the meta space.
+        SpaceNameTaken: If any other space — archived ones included, since a
+            space keeps its name for good — already answers to ``name``.
+    """
+    return create_node(
+        type="space", title=name, space=META_SPACE_ID, principal=principal, path=path
+    )
+
+
+def rename_space(
+    space: str, name: str, *, principal: Principal, path: str | Path | None = None
+) -> NodeOut | VersionOut:
+    """Rename a space — a space is a node, so its name is a node title.
+
+    Args:
+        space: Space id or name; one the principal cannot read does not
+            resolve, and neither does a node that is not a space.
+        name: The new title.
+        principal: Who is writing.
+        path: Explicit database path.
+
+    Returns:
+        The renamed space node — or, on the ``suggest`` path, the proposed
+        version staging the new title, exactly as :func:`update_node` does for
+        any other node.
+
+    Raises:
+        TypeNotFound: If ``space`` resolves to no space the principal can see.
+            An archived space is one of those: :func:`_resolve_space` matches
+            ``active`` only, so freeing an archived space's reserved name is an
+            :func:`update_node` by id rather than a rename here.
+        SpaceNameTaken: If another space already answers to ``name``.
+    """
+    space_id = resolve_space_id(space, principal=principal, path=path)
+    return update_node(space_id, title=name, principal=principal, path=path)
+
+
+def archive_space(space: str, *, principal: Principal, path: str | Path | None = None) -> NodeOut:
+    """Archive a space; its nodes keep their ``space_id`` and grants on it go inert.
+
+    Nothing is moved or deleted: archiving retires the space from the
+    vocabulary (it stops resolving, so nothing new can be written or granted
+    there) while every node already in it keeps its ``space_id`` and stays
+    exactly as readable **to a human** as it was.
+
+    **Every agent is cut off, which is the point.** "Grants go inert" is what
+    archiving promises a human who reaches for it to stop an agent, and it is
+    enforced where grants become a principal (:func:`nodum.auth._grant_set`), so
+    it holds for reads, writes, proposals and review alike rather than only for
+    the calls that spell the space's name. It was previously true only of those:
+    an agent kept full live authority over every node already in the space,
+    reachable by node id, while :func:`list_spaces` stopped showing the space
+    or its grants — hidden authority, and unrevokable to boot.
+
+    The grant **rows** survive on purpose. A human can still see them
+    (:func:`list_grants`) and :func:`revoke` them, and undoing the archive
+    restores exactly the delegation that was in place. Inert, not destroyed.
+
+    Its **name goes with it and stays reserved** (migration ``0013``): no new
+    space may take the name of one that was retired. That is what makes the one
+    route back — :func:`undo` of the ``node.archive`` event, which restores the
+    row past the state machine — something that cannot fail on a collision.
+
+    The two structural spaces are refused (:data:`STRUCTURAL_SPACE_IDS`), by
+    the transition itself so that no spelling of archive misses it. A *rename*
+    of either stays allowed, and the asymmetry is the point: a rename touches
+    the title, and it is the **id** the schema and the default write target
+    depend on.
+
+    Args:
+        space: Space id or name.
+        principal: Who is writing.
+        path: Explicit database path.
+
+    Returns:
+        The archived space node.
+
+    Raises:
+        TypeNotFound: If ``space`` resolves to no space the principal can see.
+        InvalidTransition: If ``space`` is ``main`` or ``meta``.
+    """
+    space_id = resolve_space_id(space, principal=principal, path=path)
+    # A resolved space id is always a node id, so this transition is a node's —
+    # including the structural refusal, which `_transition_row` owns so that
+    # `archive <id>` cannot route around it.
+    archived = transition(space_id, "archive", principal=principal, path=path)
+    return archived
+
+
+def list_spaces(*, principal: Principal, path: str | Path | None = None) -> list[SpaceOut]:
+    """Every active space, with its live node count and the agents granted on it.
+
+    The ``/spaces`` screen's read, and the CLI's ``space-list``: the space
+    nodes plus the two facts that make a space territory rather than a name —
+    how much lives there, and who else may touch it.
+
+    Human-only for the same reason :func:`list_grants` is: which agent holds
+    what is governance information, and an agent learning the shape of the
+    delegation around it is precisely what the grant model withholds.
+
+    Args:
+        principal: Who is asking; must be a human.
+        path: Explicit database path.
+
+    Returns:
+        One :class:`SpaceOut` per active space, in creation order.
+
+    Raises:
+        GrantNotPermitted: If the principal is not a human.
+    """
+    conn = _connect(path)
+    try:
+        Store(conn, principal).require_human("list spaces")
+        rows = conn.execute(
+            "SELECT * FROM nodes WHERE type_id = 'space' AND state = 'active'"
+            " ORDER BY created_at, rowid"
+        ).fetchall()
+        counts = {
+            row["space_id"]: row["live_nodes"]
+            for row in conn.execute(
+                "SELECT space_id, COUNT(*) AS live_nodes FROM nodes"
+                " WHERE state != 'archived' GROUP BY space_id"
+            )
+        }
+        grants: dict[str, list[GrantOut]] = {}
+        for row in conn.execute("SELECT * FROM grants ORDER BY agent_id"):
+            grants.setdefault(row["space_id"], []).append(
+                GrantOut(
+                    agent_id=row["agent_id"],
+                    space_id=row["space_id"],
+                    level=row["level"],
+                    created_at=row["created_at"],
+                )
+            )
+        return [
+            SpaceOut(
+                **_node_out(row).model_dump(),
+                node_count=counts.get(row["id"], 0),
+                grants=grants.get(row["id"], []),
             )
             for row in rows
         ]

@@ -10,10 +10,17 @@
  * view adds no authority the CLI does not have.
  */
 
-import { useCallback, useEffect, useState } from "react";
-import { EmptyState, Spinner, useToast } from "../../components";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import {
+  EmptyState,
+  Spinner,
+  unresolvedSpaceIds,
+  useArchivedSpaces,
+  useSpaces,
+  useToast,
+} from "../../components";
 import { api } from "../../api/client";
-import type { AgentOut, GrantOut, HumanOut, NodeOut } from "../../api/types";
+import type { AgentOut, GrantOut, HumanOut } from "../../api/types";
 import { describeFailure } from "../../lib";
 import type { FailureDescription } from "../../lib";
 import { formatTimestamp } from "../../lib";
@@ -21,11 +28,16 @@ import { AgentCard } from "./AgentCard";
 import { TokenDialog } from "./TokenDialog";
 import "./admin.css";
 
-/** Everything the view loads once and reloads after each mutation. */
+/**
+ * Everything the view loads once and reloads after each mutation.
+ *
+ * The space list is not in here: it comes from the shared {@link useSpaces},
+ * which every space surface reads. What this view does with a failed one is
+ * still its own decision — see the failure derivation below.
+ */
 interface AdminData {
   agents: AgentOut[];
   grants: GrantOut[];
-  spaces: NodeOut[];
   humans: HumanOut[];
 }
 
@@ -39,40 +51,61 @@ interface FreshToken {
 export default function AdminView() {
   const toast = useToast();
   const [data, setData] = useState<AdminData | null>(null);
-  const [failure, setFailure] = useState<FailureDescription | null>(null);
+  const [accountsFailure, setAccountsFailure] = useState<FailureDescription | null>(null);
   const [freshToken, setFreshToken] = useState<FreshToken | null>(null);
   const [newAgentName, setNewAgentName] = useState("");
   const [creating, setCreating] = useState(false);
+  const spaceList = useSpaces();
 
   const load = useCallback(async () => {
-    const [agents, grants, spaces, humans] = await Promise.all([
+    const [agents, grants, humans] = await Promise.all([
       api.listAgents(),
       api.listGrants(),
-      api.listSpaces(),
       api.listHumans(),
     ]);
-    setData({ agents, grants, spaces, humans });
+    setData({ agents, grants, humans });
   }, []);
 
   useEffect(() => {
     let cancelled = false;
     void (async () => {
       try {
-        const [agents, grants, spaces, humans] = await Promise.all([
+        const [agents, grants, humans] = await Promise.all([
           api.listAgents(),
           api.listGrants(),
-          api.listSpaces(),
           api.listHumans(),
         ]);
-        if (!cancelled) setData({ agents, grants, spaces, humans });
+        if (!cancelled) setData({ agents, grants, humans });
       } catch (error) {
-        if (!cancelled) setFailure(describeFailure(error, "the accounts"));
+        if (!cancelled) setAccountsFailure(describeFailure(error, "the accounts"));
       }
     })();
     return () => {
       cancelled = true;
     };
   }, []);
+
+  // This view *escalates* a missing space list rather than degrading with it,
+  // which is why the shared hook carries the error. Without the vocabulary the
+  // add-grant picker would render empty — indistinguishable from "every space is
+  // already granted" — on the one screen whose job is handing an agent a space.
+  const failure =
+    accountsFailure ?? (spaceList.failed ? describeFailure(spaceList.error, "the spaces") : null);
+  // Bound to a local so the null check below narrows inside the render callbacks
+  // too; a property access does not.
+  const spaces = spaceList.spaces;
+
+  // A grant on an archived space is the one grant this screen is now *for*:
+  // archiving makes it inert but keeps the row precisely so a human can come
+  // here and revoke it for good, and the archive dialog says so. A row headed
+  // by a 32-hex id is that promise with the space's name filed off, so the
+  // lazy archived read names them — fired only when a grant actually points at
+  // a space `GET /api/spaces` no longer carries.
+  const unresolvedGrantSpaces = useMemo(
+    () => unresolvedSpaceIds((data?.grants ?? []).map((grant) => grant.space_id), spaces),
+    [data, spaces],
+  );
+  const archivedSpaces = useArchivedSpaces(unresolvedGrantSpaces.length > 0);
 
   const createAgent = () => {
     const name = newAgentName.trim();
@@ -106,7 +139,7 @@ export default function AdminView() {
 
       {failure ? (
         <EmptyState title={failure.title} body={failure.body} />
-      ) : data === null ? (
+      ) : data === null || spaces === null ? (
         <div className="nd-empty">
           <Spinner large label="Loading accounts" />
         </div>
@@ -117,6 +150,7 @@ export default function AdminView() {
 
             <div className="nd-row nd-ad-create">
               <input
+                name="new-agent-name"
                 className="nd-input"
                 type="text"
                 placeholder="New agent name"
@@ -147,7 +181,8 @@ export default function AdminView() {
                   key={agent.id}
                   agent={agent}
                   grants={data.grants}
-                  spaces={data.spaces}
+                  spaces={spaces}
+                  archivedSpaces={archivedSpaces.spaces}
                   onChanged={load}
                   onToken={(agentName, token) => setFreshToken({ agentName, token })}
                 />

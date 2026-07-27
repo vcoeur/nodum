@@ -62,6 +62,7 @@ export function VersionTimeline({ versions, selected, onToggle }: VersionTimelin
           >
             <label className="nd-timeline__pick">
               <input
+                name={`compare-v${version.id}`}
                 type="checkbox"
                 checked={isSelected}
                 onChange={() => onToggle(version.id)}

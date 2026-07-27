@@ -2,14 +2,17 @@
  * The admin view's grant logic (`grants.ts`).
  *
  * The semantics that matter: a re-grant is an upsert (so the picker withholds
- * spaces the agent already holds), level order is load-bearing (the picker
- * presents weakest to strongest, matching the server's `GRANT_LEVEL_NAMES`),
- * and a grant row must render even when its space can no longer be listed.
+ * spaces the agent already holds) and level order is load-bearing (the picker
+ * presents weakest to strongest, matching the server's `GRANT_LEVEL_NAMES`).
+ *
+ * Naming a space — including the archived-space fallback a grant row depends on
+ * — is covered once, in `components/spaceOptions.test.ts`, since that is where
+ * the one `spaceLabel` lives.
  */
 
 import { describe, expect, it } from "vitest";
 import type { GrantOut, NodeOut } from "../../api/types";
-import { GRANT_LEVELS, grantableSpaces, grantsForAgent, spaceLabel } from "./grants";
+import { GRANT_LEVELS, grantableSpaces, grantsForAgent } from "./grants";
 
 /** A grant row with only the fields these functions read. */
 function grant(agentId: string, spaceId: string, level = "read"): GrantOut {
@@ -76,20 +79,5 @@ describe("grantableSpaces", () => {
   it("is not fooled by another agent's grants", () => {
     const grants = [grant("b", "main"), grant("b", "meta"), grant("b", "research")];
     expect(grantableSpaces(spaces, grants, "a")).toHaveLength(3);
-  });
-});
-
-describe("spaceLabel", () => {
-  it("prefers the space's title", () => {
-    expect(spaceLabel([space("main", "Main")], "main")).toBe("Main");
-  });
-
-  it("falls back to the id for an untitled space", () => {
-    expect(spaceLabel([space("main", null)], "main")).toBe("main");
-  });
-
-  it("falls back to the id for a space the list no longer carries", () => {
-    // An archived space drops out of /api/spaces; its grant rows must still render.
-    expect(spaceLabel([], "main")).toBe("main");
   });
 });

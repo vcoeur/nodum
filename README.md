@@ -28,7 +28,9 @@ every write is attributed to the session's human and no request field can say
 otherwise — and serves the **web UI** from the same process: a login view,
 an accounts-and-grants admin view, a Markdown editor, hybrid
 search, the review queue, a graph view, an asset browser,
-and per-node version history. **Phase 4 (ingestion)** landed: `nodum ingest`
+a spaces view, and per-node version history. Spaces reach that UI as the same
+two independent controls the CLI has — a read filter on every listing and a
+sticky write target shown wherever a node is created. **Phase 4 (ingestion)** landed: `nodum ingest`
 turns a file, a folder, or a URL into a reviewable subgraph — text extraction
 through optional per-format handlers (PDF, OCR, audio; a missing one is
 reported, never fatal), an `asset_ref` node for the bytes, a `source` node
@@ -84,6 +86,19 @@ uv run nodum projector rebuild vec            # the model-change re-embed path
 
 uv run nodum node list --type note --as owner
 uv run nodum history <node-id> --as owner           # version snapshots
+
+# Spaces: a second axis beside the type graph. Reading and writing are two
+# independent controls — `--space` filters a read, and `--space` targets a
+# write — so you can read one space while still filing into another.
+uv run nodum space-create research --as owner
+uv run nodum space-list --as owner                  # + live node counts and grant holders
+uv run nodum space-rename research reference --as owner
+uv run nodum node create --type note --title "Filed" --space reference --as owner
+uv run nodum node list --space reference --as owner
+uv run nodum search "graph theory" --space reference --as owner
+uv run nodum node list --include-meta --as owner    # the type vocabulary, off by default
+uv run nodum space-archive reference --as owner     # nodes keep their space_id; grants go inert
+
 uv run nodum undo --as owner                        # reverse the latest event
 uv run nodum types --as owner                       # the seeded type catalog
 
@@ -219,6 +234,34 @@ degrades to BM25 + graph expansion. `NODUM_EMBED_MODEL` switches the model
   as `proposed`, and `edit` writes `active` and carries review authority inside
   that space. There is deliberately no auto-accept machinery: an agent earns
   `edit`, or it waits.
+- **Spaces: a filter for reading, a target for writing.** A space is a node of
+  builtin type `space`, so its whole lifecycle is an ordinary node's
+  (`space-create` / `space-rename` / `space-archive`, each event-logged,
+  versioned and undoable), and `space-list` reports each one's live node count
+  and the agents granted on it. The two uses are deliberately separate
+  controls: `--space` on a read **narrows** the view (default: every space in
+  scope), `--space` on a write **targets** where the node lands (default:
+  `main`). The read filter is a convenience, never a boundary — the boundary is
+  the grant set, which is still applied underneath it, and a space a principal
+  holds no grant on does not resolve at all, reading exactly like one that does
+  not exist. Meta-space nodes (the type vocabulary, the spaces themselves) stay
+  out of content reads unless `--include-meta` says otherwise, or the read is
+  narrowed to `meta` by name. Four rules keep the vocabulary unambiguous, and
+  all live in the service so every surface has them: **no two spaces may share
+  a name** (a reference resolves as `id = ? OR title = ?`, compared exactly —
+  and a space keeps its name when it is archived, so a retired name stays
+  reserved and restoring the space can never collide);
+  **`main` and `meta` cannot be archived** (every unnamed write still lands
+  in `main` whatever state the row is in; `meta` holds the spaces themselves) —
+  renaming either is fine, since a rename moves the title and the id is what
+  everything structural depends on;
+  **a space lives in `meta`** (one nested in ordinary territory would be listed
+  and resolved as real while governed by its host's grants);
+  and **archiving a space makes every grant on it inert** — cutting an agent
+  off is what archiving is usually for, so while the space is archived a grant
+  on it confers nothing at all, including on nodes reached by id. The grant rows
+  are kept rather than deleted, so `grants` still lists them, `revoke` still
+  removes them, and undoing the archive restores the delegation unchanged.
 - **MCP server.** `nodum mcp serve` runs a stdio MCP server (the official
   Python SDK's FastMCP). The agent authenticates with its token in
   `NODUM_AGENT_TOKEN` (minted by `nodum agent create`, shown once, stored
@@ -268,6 +311,14 @@ degrades to BM25 + graph expansion. `NODUM_EMBED_MODEL` switches the model
   `/api/humans`, `/api/agents` (the show-once token comes back in the
   create/token-rotate body) and `/api/grants` mirror the CLI's
   `human`/`agent`/`grant`/`revoke`/`grants` commands.
+- **Spaces are on the API as both controls.** `GET /api/nodes` and
+  `GET /api/search` take `?space=` and `?include_meta=` (the read filter and
+  the meta toggle, both off by default); `POST /api/nodes` takes `space` in the
+  body (the write target, `main` when absent — a place, never an identity).
+  The lifecycle mirrors the CLI: `POST /api/spaces`,
+  `POST /api/spaces/{id}/rename`, `POST /api/spaces/{id}/archive`, and
+  `GET /api/spaces` listing every active space with its live node count and
+  grant holders.
 - **Uploads are images only, and bounded.** `POST /api/assets` — the editor's
   drag-drop route — caps the request
   body before anything buffers it (32 MiB), identifies the type from the bytes
@@ -285,7 +336,7 @@ degrades to BM25 + graph expansion. `NODUM_EMBED_MODEL` switches the model
   properties of a human-only surface behind a password, which is exactly why
   this route sits inside the session gate while the two capability-URL routes
   do not — those carry no ambient credential to ride.
-- **The eight views.** `/login` is the session gate: password login with
+- **The nine views.** `/login` is the session gate: password login with
   argon2id. `/editor` is a CodeMirror-6 Markdown editor with slash commands,
   `[[` autocomplete, live Mermaid preview, drag-drop asset upload, and
   debounced autosave — a node's `type` is fixed at creation, so the type
@@ -295,10 +346,27 @@ degrades to BM25 + graph expansion. `NODUM_EMBED_MODEL` switches the model
   for a reason, an accept always shows what it will write. `/graph` renders
   `subgraph` in Cytoscape, with truncation and the confidence floor's exclusions
   stated on screen rather than in a footnote. `/assets` is the rendition grid
-  and lightbox. `/admin` is accounts and grants: humans, agents with show-once
+  and lightbox. `/spaces` is what territory exists: every active space with its
+  live node count and the agents granted on it, plus create, rename and archive.
+  `/admin` is accounts and grants: humans, agents with show-once
   tokens, and the grant grid. `/history/:nodeId` is the version timeline and
   side-by-side diff. Every route is a real URL that survives a reload. Source
   and conventions: [`web/README.md`](web/README.md).
+- **Spaces in the UI are a filter and a target, never a mode.** Search, the node
+  graph and the review queue take a space *filter* that narrows and defaults to
+  every space in scope; a single app-wide *write target* (sticky across sessions
+  and across tabs) says where a new node lands, and is rendered on every surface
+  that creates one — a persisted target the human cannot see is how work gets
+  filed into a space nobody chose. Every search result names its space unless
+  the filter already determined it, so the list a human scans is readable across
+  spaces. The review queue groups proposals by space,
+  then by agent, so a space that governs itself (an agent holds `edit`, its
+  writes land `active` and never queue) is visible as *self-governing* rather
+  than as silence; a cross-space edge proposal is filed under its source's space
+  and **marked as a crossing**, because accepting one needs authority on both
+  endpoints. Nothing in the UI ever reports a space as missing: the server
+  refuses an unknown space and an ungranted one with identical words, and the
+  interface keeps that ambiguity intact.
 - **Assets and renditions.** `asset register` streams a file into the
   database keyed by its sha256 (dedup is free) and records its metadata row;
   the copy is re-hashed as it is written, so a file that changed since it was
@@ -382,7 +450,9 @@ degrades to BM25 + graph expansion. `NODUM_EMBED_MODEL` switches the model
   fixed-window text chunks (512 words, ~15% overlap, `model_id` recorded per
   chunk). `nodum search` fuses both — BM25 and vector lists merged by
   reciprocal rank fusion, then one-hop graph expansion along `active` edges —
-  and every hit carries a per-signal `signals` breakdown. With no embedding
+  and every hit carries a per-signal `signals` breakdown plus the `space_id` it
+  lives in, since a result list spans every space in scope unless `--space`
+  narrowed it. With no embedding
   provider, the vector signal drops out and search stays BM25 + graph.
 
 See [docs/architecture.md](docs/architecture.md) for the module map and

@@ -27,6 +27,9 @@ def test_vector_only_hit_surfaces_with_vector_signal(fresh_db, fake_embedder):
     # (poor) vector rank.
     assert set(by_id[vector_only.id].signals) == {"vector"}
     assert by_id[target.id].score > by_id[vector_only.id].score
+    # The vector list builds its own row shape, so it has to carry the space
+    # too — a hit reached through it is scanned in the same result list.
+    assert by_id[vector_only.id].space_id == vector_only.space_id == "main"
 
 
 def test_fused_beats_single_signal_where_lists_agree(fresh_db, fake_embedder):

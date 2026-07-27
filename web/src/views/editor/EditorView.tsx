@@ -19,14 +19,14 @@ import { Link, useParams } from "react-router-dom";
 import type { KeyboardEvent } from "react";
 import { api } from "../../api/client";
 import type { TypeOut } from "../../api/types";
-import { EmptyState, Spinner, useToast } from "../../components";
+import { EmptyState, Spinner, useSpaces, useToast } from "../../components";
 import { MarkdownEditor } from "./MarkdownEditor";
 import type { MarkdownEditorHandle } from "./MarkdownEditor";
 import { MarkdownPreview } from "./MarkdownPreview";
 import { NodeMetaBar } from "./NodeMetaBar";
 import { useNodeDocument } from "./useNodeDocument";
 import type { SlashPaletteState } from "./cm/slashCommands";
-import { describeError } from "../../lib";
+import { describeError, useWriteTarget } from "../../lib";
 import "./editor.css";
 
 /** Quiet time before the preview re-renders. Long enough to stay off the typing path. */
@@ -56,7 +56,24 @@ export default function EditorView() {
   const { types, typesError } = useNodeTypes();
   const [selectedType, setSelectedType] = useState<string | null>(null);
 
-  const doc = useNodeDocument({ nodeId, createType: selectedType });
+  // The write target is app-wide state with one owner; this is the subscription
+  // that makes it *visible* here, which is the whole of D1a. The same value is
+  // handed to the document hook, so what the bar shows and what a create writes
+  // are one variable rather than two reads of a store.
+  const { spaces, failed: spacesFailed } = useSpaces();
+  const [writeTarget, setWriteTarget] = useWriteTarget();
+
+  // `spaces` goes in null and all: null means the list has not answered, and
+  // reading it as empty is what makes a screen call a live space unnameable.
+  // The document hook owns the archived listing that names what this one
+  // cannot — both references that need it (the open node's space, the write
+  // target) are its own.
+  const doc = useNodeDocument({
+    nodeId,
+    createType: selectedType,
+    writeTarget,
+    spaces,
+  });
 
   const editorRef = useRef<MarkdownEditorHandle>(null);
   const [previewVisible, setPreviewVisible] = useState(true);
@@ -268,6 +285,11 @@ export default function EditorView() {
         typesError={typesError}
         selectedType={selectedType}
         onTypeChange={setSelectedType}
+        spaces={spaces}
+        archivedSpaces={doc.archivedSpaces}
+        spacesFailed={spacesFailed}
+        writeTarget={writeTarget}
+        onWriteTargetChange={setWriteTarget}
         saveState={doc.saveState}
         saveError={doc.saveError}
         savedAt={doc.savedAt}

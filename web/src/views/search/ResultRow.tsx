@@ -1,7 +1,9 @@
 import type { KeyboardEvent } from "react";
 import { Link } from "react-router-dom";
 import { NodeBadge } from "../../components";
+import type { SpaceName } from "../../components";
 import type { SearchHit } from "../../api/types";
+import { hitSpaceTitle } from "./resultSpace";
 import { SignalBreakdown } from "./SignalBreakdown";
 import { describeSignals } from "./signals";
 import { renderSnippet } from "./snippet";
@@ -14,6 +16,11 @@ import { renderSnippet } from "./snippet";
  * links and Enter is the browser's own activation, not a re-implementation of
  * it. The row highlights on `:focus-within`, so focus anywhere inside it —
  * title, subgraph link — reads as "this row".
+ *
+ * The head's right-hand marks are the row's dimensions, in filter order: the
+ * space (only when the filter left it open — see `resultSpace.ts`), then type
+ * and state. They sit at one x position down the list precisely because the
+ * list is scanned rather than read.
  */
 
 interface ResultRowProps {
@@ -29,6 +36,17 @@ interface ResultRowProps {
    * rather than guessing.
    */
   knownState: string | null;
+  /**
+   * This hit's space, resolved, or null when the row states none.
+   *
+   * Computed by `hitSpaceName` (`resultSpace.ts`), which follows the same rule
+   * as `knownState` one dimension over: an active space filter determines every
+   * hit's space, so the row names it only when the search spanned more than
+   * one. It carries *how* the name resolved as well as the name, because a hit
+   * in a space archived since it was written is a fact the row has to show —
+   * the alternative is the 32-hex id this once rendered.
+   */
+  spaceName: SpaceName | null;
   /** Query terms to mark in the snippet. */
   terms: string[];
   /** Registers the title link so the view can move focus to this row. */
@@ -43,6 +61,7 @@ interface ResultRowProps {
  * @param hit The hit, verbatim from the server.
  * @param index Position in the flattened display order.
  * @param knownState The state implied by the active filter, or null.
+ * @param spaceName The space to name on this row, or null.
  * @param terms Query terms to mark in the snippet.
  * @param linkRef Ref callback for the title link.
  * @param onKeyDown Row-level keyboard handler.
@@ -51,6 +70,7 @@ export function ResultRow({
   hit,
   index,
   knownState,
+  spaceName,
   terms,
   linkRef,
   onKeyDown,
@@ -78,7 +98,22 @@ export function ResultRow({
         >
           {title}
         </Link>
-        <NodeBadge type={hit.type} state={knownState} />
+        <span className="nd-row nd-search-hit__marks">
+          {spaceName === null ? null : (
+            <span className="nd-meta nd-search-hit__space" title={hitSpaceTitle(spaceName)}>
+              in <span className="nd-mono">{spaceName.label}</span>
+              {/* Marked, not merely named: a hit in a retired space is worth a
+                  second's pause, and the filter cannot narrow to it. */}
+              {spaceName.kind === "archived" ? (
+                <span className="nd-badge nd-badge--archived nd-search-hit__space-mark">
+                  <span className="nd-badge__dot" aria-hidden="true" />
+                  archived
+                </span>
+              ) : null}
+            </span>
+          )}
+          <NodeBadge type={hit.type} state={knownState} />
+        </span>
       </div>
 
       {showPlaceholder ? (

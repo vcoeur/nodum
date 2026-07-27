@@ -66,6 +66,13 @@
   text-align: right;
 }
 
+/* The archived mark beside a grant's space name — an inert grant kept only so
+   it can be revoked, which is worth saying in the row rather than in a title. */
+.nd-ad-grants__mark {
+  margin-left: var(--nd-space-2);
+  vertical-align: baseline;
+}
+
 .nd-ad-agent__add {
   margin-top: var(--nd-space-4);
 }

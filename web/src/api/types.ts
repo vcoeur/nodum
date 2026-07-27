@@ -159,9 +159,15 @@ export interface ProjectorRun {
  * `signals` carries each retrieval signal's contribution: RRF contributions
  * for `bm25` and `vector` (they sum to `score`), and the edge weight for
  * `graph` expansion hits.
+ *
+ * `space_id` is where the node lives. A result list spans every space in scope
+ * unless the filter narrowed it, so without this the busiest surface in the UI
+ * cannot answer "which space is this in?" — see `views/search/resultSpace.ts`
+ * for when a row renders it.
  */
 export interface SearchHit {
   node_id: string;
+  space_id: string | null;
   type: string;
   title: string | null;
   snippet: string;
@@ -356,6 +362,26 @@ export interface GrantOut {
   created_at: string;
 }
 
+/**
+ * A space, as `GET /api/spaces` and `nodum space-list` render it.
+ *
+ * A space **is** a node — builtin type `space`, living in the meta space — so
+ * every {@link NodeOut} field is here unchanged and anything that only wants
+ * the node keeps reading it as one. The two additions are what make it
+ * *territory* rather than a name:
+ *
+ * - `node_count` counts the space's **live** nodes, `active` plus `proposed`.
+ *   A space holding nothing but an agent's proposals is not empty, so this is
+ *   deliberately not a count of `active` alone.
+ * - `grants` lists the agents holding a grant on the space. It is how a human
+ *   sees delegated territory at a glance — and an `edit`-granted space governs
+ *   itself, so it never reaches the review queue at all.
+ */
+export interface SpaceOut extends NodeOut {
+  node_count: number;
+  grants: GrantOut[];
+}
+
 /* ------------------------------------------------------------------ */
 /* Shapes the HTTP surface adds on top of models.py                     */
 /* ------------------------------------------------------------------ */
@@ -410,8 +436,35 @@ export interface ApiErrorBody {
 /* Request bodies / filter bags                                         */
 /* ------------------------------------------------------------------ */
 
+/**
+ * The two read-side space controls, shared by `GET /api/nodes` and
+ * `GET /api/search` (the CLI's `--space` / `--include-meta`).
+ *
+ * They are a **filter**, not a mode: omitting `space` reads every space the
+ * principal can, and the filter only ever narrows. The write target is a
+ * separate, independent control (`CreateNodeBody.space`) — reading `research`
+ * while still filing into `main` is the ordinary case.
+ */
+export interface SpaceReadControls {
+  /**
+   * Narrow to one space, by id **or** name. Omitted reads every space in scope.
+   *
+   * A space that does not exist and a space the principal holds no grant on
+   * are refused identically and deliberately — see `UnknownSpaceError` in
+   * `api/client.ts`, which is what a caller branches on.
+   */
+  space?: string;
+  /**
+   * Include the meta space (types, spaces, conventions). Off server-side by
+   * default. Naming `space: "meta"` **is itself the opt-in** — the default
+   * exclusion applies only to an unnarrowed read, so a `meta` filter returning
+   * nothing would be a trap rather than a rule.
+   */
+  include_meta?: boolean;
+}
+
 /** Filters for `GET /api/nodes` (mirrors `service.list_nodes`). */
-export interface NodeFilters {
+export interface NodeFilters extends SpaceReadControls {
   type?: string;
   state?: NodeState;
   parent_id?: string;
@@ -425,6 +478,14 @@ export interface CreateNodeBody {
   content?: string;
   parent_id?: string | null;
   props?: JsonObject;
+  /**
+   * The **write target**: which space the node lands in, by id or name.
+   * Omitted lands it in `main`.
+   *
+   * A space says *where a node goes*, never *who wrote it* — the session's
+   * human is still the only writer this surface has.
+   */
+  space?: string;
 }
 
 /**
@@ -457,7 +518,7 @@ export interface CreateEdgeBody {
 }
 
 /** Filters for `GET /api/search` (mirrors `search.search`). */
-export interface SearchFilters {
+export interface SearchFilters extends SpaceReadControls {
   k?: number;
   /** Node-state filter; `"any"` searches every state. Defaults to `active`. */
   state?: NodeState | "any";

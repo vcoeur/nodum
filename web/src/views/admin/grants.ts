@@ -2,9 +2,15 @@
  * Grant-display logic for the admin view, kept pure so the harness can cover it.
  *
  * The server orders grant rows by (agent, space); everything this view derives
- * — one agent's slice, the spaces still grantable to it, the label a space id
- * gets — comes from the two lists the view already loaded (grants, spaces), so
- * the picker never needs a per-agent round trip.
+ * — one agent's slice, the spaces still grantable to it — comes from the two
+ * lists the view already loaded (grants, spaces), so the picker never needs a
+ * per-agent round trip.
+ *
+ * Naming a space is *not* here: `components/spaceOptions.ts` owns `spaceLabel`
+ * for every view. This module had its own id-only copy, which is a strict
+ * subset — a space reference resolves by id **or** title everywhere in nodum,
+ * and the server refuses a title that equals another space's id, so the shared
+ * one is safe on a grant row's `space_id` and right everywhere else.
  */
 
 import type { GrantLevel, GrantOut, NodeOut } from "../../api/types";
@@ -50,17 +56,4 @@ export function grantableSpaces(
     grants.filter((grant) => grant.agent_id === agentId).map((grant) => grant.space_id),
   );
   return spaces.filter((space) => !held.has(space.id));
-}
-
-/**
- * How to name a space: its title, or the bare id when it has none — or when the
- * space is gone from the picker list entirely (archived; a grant on it goes
- * inert but stays on record, and the row must still render).
- *
- * @param spaces Every active space.
- * @param spaceId The id a grant row names.
- */
-export function spaceLabel(spaces: readonly NodeOut[], spaceId: string): string {
-  const space = spaces.find((candidate) => candidate.id === spaceId);
-  return space?.title ?? spaceId;
 }

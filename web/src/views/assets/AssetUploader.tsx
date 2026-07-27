@@ -181,6 +181,7 @@ export function AssetUploader({ queue }: { queue: UploadQueue }) {
 
       <input
         ref={inputRef}
+        name="asset-files"
         type="file"
         multiple
         className="nd-sr-only"

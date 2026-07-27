@@ -31,7 +31,15 @@ const rrf = (rank: number) => 1 / (RRF_K + rank);
 /** A hit carrying exactly the signals given. */
 function hit(signals: Record<string, number>, node_id = "n1"): SearchHit {
   const score = (signals.bm25 ?? 0) + (signals.vector ?? 0);
-  return { node_id, type: "note", title: "A note", snippet: "…", score, signals };
+  return {
+    node_id,
+    space_id: "main",
+    type: "note",
+    title: "A note",
+    snippet: "…",
+    score,
+    signals,
+  };
 }
 
 describe("describeSignals", () => {

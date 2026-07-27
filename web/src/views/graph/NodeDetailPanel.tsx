@@ -6,10 +6,16 @@
  * distinction matters here more than anywhere else in the view: this panel is
  * where a filtered graph would most easily be mistaken for a complete one, so
  * the heading says "in this view" and means it.
+ *
+ * It is also where a dimmed node lands. D5 keeps the far endpoint of a crossing
+ * clickable, and a click that opened a panel saying nothing about *why* the
+ * node was faint would have been a half-kept promise — so the panel names the
+ * node's space, says when that is outside the current filter, and marks each
+ * incident edge that leaves the space.
  */
 
 import { Link } from "react-router-dom";
-import { NodeBadge } from "../../components";
+import { NodeBadge, nameSpace, spaceNameNote } from "../../components";
 import type { NodeOut } from "../../api/types";
 import { formatAbsolute, formatTimestampLong } from "../../lib";
 import type { IncidentEdge } from "./graphElements";
@@ -20,6 +26,16 @@ interface NodeDetailPanelProps {
   isRoot: boolean;
   /** True when a node-type filter is on and this root would not have passed it. */
   rootExemptFromTypeFilter: boolean;
+  /** Active spaces, for naming this node's; null before the list answers. */
+  spaces: readonly NodeOut[] | null;
+  /**
+   * Archived space nodes, from the lazy read: a subgraph reaches nodes written
+   * into a space that has since been retired, and the panel names those rather
+   * than printing the 32-hex id it used to.
+   */
+  archivedSpaces: readonly NodeOut[];
+  /** The space the view is narrowed to, resolved to an id; `""` for no filter. */
+  filteredSpace: string;
   incident: IncidentEdge[];
   /** Link target for "re-root here", carrying the current filters. */
   rerootTo: string;
@@ -53,6 +69,9 @@ export function NodeDetailPanel({
   node,
   isRoot,
   rootExemptFromTypeFilter,
+  spaces,
+  archivedSpaces,
+  filteredSpace,
   incident,
   rerootTo,
   onSelect,
@@ -61,6 +80,13 @@ export function NodeDetailPanel({
   onClose,
 }: NodeDetailPanelProps) {
   const preview = excerpt(node.content);
+  const outsideFilter = filteredSpace !== "" && node.space_id !== filteredSpace;
+  const crossings = incident.filter(({ crossing }) => crossing).length;
+  // Through `nameSpace`, not `spaceLabel`: a subgraph reaches nodes in a space
+  // archived since they were written, and the picker fallback rendered those as
+  // `space  ab30b069e18a42288bb0749c2169251d`.
+  const spaceName = node.space_id === null ? null : nameSpace(node.space_id, spaces, archivedSpaces);
+  const spaceNote = spaceName === null ? null : spaceNameNote(spaceName);
 
   return (
     <section className="nd-graph__panel-section" aria-label="Selected node">
@@ -88,9 +114,27 @@ export function NodeDetailPanel({
         </p>
       ) : null}
 
+      {outsideFilter ? (
+        <p className="nd-graph__hint">
+          This node is outside the space you have narrowed to, which is why it is drawn faintly.
+          It is not hidden and it is not out of reach — the filter narrows what you are reading,
+          not what exists.
+        </p>
+      ) : null}
+
       <dl className="nd-graph__facts">
         <dt>id</dt>
         <dd className="nd-mono">{node.id}</dd>
+        <dt>space</dt>
+        <dd className="nd-mono" title={spaceNote ?? undefined}>
+          {spaceName === null ? "—" : spaceName.label}
+          {spaceName?.kind === "archived" ? (
+            <span className="nd-badge nd-badge--archived nd-graph__space-mark">
+              <span className="nd-badge__dot" aria-hidden="true" />
+              archived
+            </span>
+          ) : null}
+        </dd>
         <dt>created by</dt>
         <dd className="nd-mono">{node.created_by}</dd>
         {/* Through `lib/time.ts`, like every other timestamp: the server sends
@@ -160,7 +204,7 @@ export function NodeDetailPanel({
           </p>
         ) : (
           <ul className="nd-graph__edge-list">
-            {incident.map(({ edge, direction, other }) => (
+            {incident.map(({ edge, direction, other, crossing }) => (
               <li key={edge.id}>
                 <button
                   type="button"
@@ -175,6 +219,22 @@ export function NodeDetailPanel({
                   <span className="nd-truncate nd-graph__edge-other">
                     {other?.title ?? other?.id ?? "(missing)"}
                   </span>
+                  {/* Always a cell, empty when there is no crossing: the row is
+                      a fixed grid, and a conditional column would shift every
+                      other row's alignment. */}
+                  <span className="nd-graph__crossing-mark">
+                    {crossing ? (
+                      <span
+                        title={`Crosses into ${
+                          other?.space_id
+                            ? nameSpace(other.space_id, spaces, archivedSpaces).label
+                            : "another space"
+                        }`}
+                      >
+                        crossing
+                      </span>
+                    ) : null}
+                  </span>
                   <NodeBadge state={edge.state} stateOnly />
                   <span className="nd-mono nd-graph__edge-confidence">
                     {edge.confidence === null ? "—" : edge.confidence.toFixed(2)}
@@ -184,6 +244,12 @@ export function NodeDetailPanel({
             ))}
           </ul>
         )}
+        {crossings > 0 ? (
+          <p className="nd-graph__hint">
+            {crossings === 1 ? "One edge leaves" : `${crossings} edges leave`} this node's space.
+            The node at the far end is drawn, not hidden, whatever the space filter says.
+          </p>
+        ) : null}
         {incident.some(({ edge }) => edge.confidence === null) ? (
           <p className="nd-graph__hint">
             “—” means no stated confidence. A confidence floor would drop those edges.

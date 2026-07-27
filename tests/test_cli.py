@@ -498,9 +498,171 @@ def test_space_admin_over_the_cli(fresh_db):
     assert created["space_id"] == "meta"
     spaces = _run_json("space-list", "--as", "owner")
     assert {s["title"] for s in spaces["spaces"]} == {"main", "meta", "sandbox"}
+
+    renamed = _run_json("space-rename", "sandbox", "scratch", "--as", "owner")
+    assert (renamed["id"], renamed["title"]) == (created["id"], "scratch")
+
     _run_json("space-archive", created["id"], "--as", "owner")
     spaces = _run_json("space-list", "--as", "owner")
     assert {s["title"] for s in spaces["spaces"]} == {"main", "meta"}
+
+
+def test_the_cli_inherits_the_space_guards_from_the_service(fresh_db):
+    """Neither guard is a screen's job: the CLI has no screen and needs both."""
+    _run_json("space-create", "research", "--as", "owner")
+
+    for command in (
+        ["space-archive", "main", "--as", "owner"],
+        ["space-archive", "meta", "--as", "owner"],
+        # The generic node archive reaches the same row, so it is the same hole.
+        ["archive", "main", "--as", "owner"],
+        # And one name per space, whichever command spells the write.
+        ["space-create", "research", "--as", "owner"],
+        ["space-rename", "research", "main", "--as", "owner"],
+        ["node", "create", "--type", "space", "--title", "research", "--as", "owner"],
+        # A space belongs in meta; the generic create is the path that could
+        # put one anywhere else, and `--space` defaults to `main`.
+        ["node", "create", "--type", "space", "--title", "elsewhere", "--as", "owner"],
+        # fmt: off
+        [
+            "node",
+            "create",
+            "--type",
+            "space",
+            "--title",
+            "elsewhere",
+            "--space",
+            "main",
+            "--as",
+            "owner",
+        ],
+        # fmt: on
+    ):
+        result = runner.invoke(app, command)
+        assert result.exit_code == 1, command
+        assert "Traceback" not in result.output
+
+    assert {s["title"] for s in _run_json("space-list", "--as", "owner")["spaces"]} == {
+        "main",
+        "meta",
+        "research",
+    }
+    # Renaming a structural space is still fine — the id is what things depend on.
+    renamed = _run_json("space-rename", "main", "trunk", "--as", "owner")
+    assert (renamed["id"], renamed["title"]) == ("main", "trunk")
+
+
+def test_an_archived_space_keeps_its_name_on_the_cli_too(fresh_db):
+    """`space-list` shows active spaces, so the refusal is all the human gets.
+
+    Which is why it says the holder is archived, and why the CLI is where the
+    name can actually be freed: `space-rename` resolves live spaces only, so
+    renaming a retired space is `node update` on its id.
+    """
+    created = _run_json("space-create", "research", "--as", "owner")
+    _run_json("space-archive", created["id"], "--as", "owner")
+
+    refused = runner.invoke(app, ["space-create", "research", "--as", "owner"])
+    assert refused.exit_code == 1
+    assert "archived space already answers to 'research'" in refused.output
+    assert "Traceback" not in refused.output
+
+    # Freeing it is a node-title update, and then the name is available again.
+    _run_json("node", "update", created["id"], "--title", "research-2025", "--as", "owner")
+    reused = _run_json("space-create", "research", "--as", "owner")
+    assert reused["title"] == "research"
+    assert reused["id"] != created["id"]
+
+
+def test_a_grant_on_an_archived_space_is_inert_and_still_revocable_on_the_cli(fresh_db):
+    """`space-archive` promises the grants go inert; `grant-revoke` must reach them.
+
+    Both halves were wrong: the agent kept live authority over everything in the
+    space it could reach by node id, and `revoke` resolved active spaces only,
+    so there was no supported way to take the grant away at all.
+    """
+    created = _run_json("space-create", "research", "--as", "owner")
+    _run_json("agent", "create", "researcher", "--as", "owner")
+    _run_json("grant", "researcher", "research", "edit", "--as", "owner")
+    _run_json("space-archive", created["id"], "--as", "owner")
+
+    # The row survives so the human can see what is still delegated.
+    held = _run_json("grants", "--agent", "researcher", "--as", "owner")["grants"]
+    assert (created["id"], "edit") in {(row["space_id"], row["level"]) for row in held}
+
+    # Granting more is refused, in one line, naming the reason.
+    refused = runner.invoke(app, ["grant", "researcher", "research", "read", "--as", "owner"])
+    assert refused.exit_code == 1
+    assert "cannot grant on the archived space" in refused.output
+    assert "Traceback" not in refused.output
+
+    # And it can be revoked, by the space's name as well as by its id.
+    _run_json("revoke", "researcher", "research", "--as", "owner")
+    left = _run_json("grants", "--agent", "researcher", "--as", "owner")["grants"]
+    assert created["id"] not in {row["space_id"] for row in left}
+
+
+def test_space_list_reports_live_counts_and_grant_holders(fresh_db):
+    _run_json("space-create", "research", "--as", "owner")
+    _run_json(
+        "node", "create", "--type", "note", "--title", "n", "--space", "research", "--as", "owner"
+    )
+    runner.invoke(app, ["agent", "create", "researcher", "--as", "owner"])
+    _run_json("grant", "researcher", "research", "suggest", "--as", "owner")
+
+    listed = {s["title"]: s for s in _run_json("space-list", "--as", "owner")["spaces"]}
+
+    assert listed["research"]["node_count"] == 1
+    assert [(g["agent_id"], g["level"]) for g in listed["research"]["grants"]] == [
+        ("researcher", "suggest")
+    ]
+
+
+def test_the_space_filter_and_meta_toggle_over_the_cli(fresh_db):
+    """The two read-side controls, independent of the write target."""
+    _run_json("space-create", "research", "--as", "owner")
+    _run_json(
+        "node",
+        "create",
+        "--type",
+        "note",
+        "--title",
+        "main memo",
+        "-c",
+        "territory",
+        "--as",
+        "owner",
+    )
+    _run_json(
+        "node",
+        "create",
+        "--type",
+        "note",
+        "--title",
+        "filed",
+        "-c",
+        "territory",
+        "--space",
+        "research",
+        "--as",
+        "owner",
+    )
+
+    everything = _run_json("node", "list", "--as", "owner")
+    assert {row["title"] for row in everything["nodes"]} == {"main memo", "filed"}
+    narrowed = _run_json("node", "list", "--space", "research", "--as", "owner")
+    assert [row["title"] for row in narrowed["nodes"]] == ["filed"]
+
+    # Meta is out of a content listing until it is asked for by name or by flag.
+    assert {row["space_id"] for row in everything["nodes"]} == {
+        "main",
+        narrowed["nodes"][0]["space_id"],
+    }
+    with_meta = _run_json("node", "list", "--include-meta", "--as", "owner")
+    assert "meta" in {row["space_id"] for row in with_meta["nodes"]}
+
+    hits = _run_json("search", "territory", "--space", "research", "--as", "owner")
+    assert [hit["title"] for hit in hits["hits"]] == ["filed"]
 
 
 def test_mcp_serve_requires_an_agent_token(fresh_db, monkeypatch):

@@ -1,5 +1,6 @@
 /**
- * Grouping the review queue by agent and by batch.
+ * Grouping the review queue: **space, then agent, then batch** (design decision
+ * D4).
  *
  * `list_proposals` returns a flat list ordered oldest-first, and nothing in the
  * schema carries a batch identifier — `cycle_id` exists on `events` but is
@@ -12,10 +13,36 @@
  * If a later phase gives proposals a real batch id (`cycle_id` on the event, a
  * run id on the row), replace {@link groupProposals} with a lookup on it and
  * delete the clustering — the rest of the view only consumes the shape below.
+ *
+ * ## Why space is the outer level
+ *
+ * Not for tidiness. **An `edit`-granted space never reaches this queue at
+ * all** — its agents write `active` directly, so they file no proposals. Group
+ * by agent alone and that territory becomes invisible: the human sees nothing
+ * and cannot tell "nothing has been proposed here" from "this space governs
+ * itself". A section that says *self-governing — no review* is the only place
+ * that fact can surface, so {@link groupProposalsBySpace} emits one for every
+ * edit-granted space with an empty queue, and the emptiness is the point rather
+ * than a reason to leave it out.
+ *
+ * ## Where a proposal's space comes from
+ *
+ * The server states it, for every kind. A **node** proposal carries its own
+ * (`node.space_id`); an **edge** and an **update** carry theirs in the reviewer
+ * context, where `service._node_ref` puts a `space_id` on every referenced node
+ * beside its id and title. Nothing is looked up from here.
+ *
+ * The *space not reported* section survives that, and is not vestigial: a
+ * referenced node that no longer resolves — `undo` took its creation back after
+ * an edge to it was proposed — comes back as an id with no title and no space,
+ * and there is genuinely nothing to file it under. It is a section that should
+ * now be empty on a healthy graph, which is exactly why it must stay honest
+ * rather than be deleted.
  */
 
-import type { ProposalOut } from "../../api/types";
+import type { ProposalOut, SpaceOut } from "../../api/types";
 import { timestampMs } from "../../lib";
+import { contextRef } from "./proposalText";
 
 /** The three things an agent can propose. `ProposalOut.kind` is a bare string. */
 export type ProposalKind = "node" | "edge" | "update";
@@ -152,6 +179,229 @@ export function groupProposals(
 
   groups.sort((a, b) => (timestampMs(a.oldestAt) ?? 0) - (timestampMs(b.oldestAt) ?? 0));
   return groups;
+}
+
+/* ------------------------------------------------------------------ */
+/* Spaces: the outer grouping level (D4)                                */
+/* ------------------------------------------------------------------ */
+
+/**
+ * The bucket for proposals whose space the queue does not report.
+ *
+ * Reachable only through a referenced node that no longer resolves, so on a
+ * healthy graph it stays empty — see the module docblock.
+ */
+export const UNREPORTED_SPACE = "";
+
+/** Why a space section is on screen. */
+export type SpaceSectionKind =
+  /** It holds proposals. */
+  | "queue"
+  /** It holds proposals whose referenced node no longer resolves. */
+  | "unreported"
+  /** It holds none, and never will: every agent on it writes `active` directly. */
+  | "self-governing";
+
+/** One space's whole share of the queue, or its documented absence from it. */
+export interface SpaceSection {
+  /** Stable React key. */
+  key: string;
+  /** The space id, or {@link UNREPORTED_SPACE} for the unplaceable bucket. */
+  spaceId: string;
+  kind: SpaceSectionKind;
+  /** Agents with proposals here, longest-waiting first. Empty when self-governing. */
+  agents: AgentGroup[];
+  /** Proposals waiting in this space. */
+  total: number;
+  counts: KindCounts;
+  /** This space's oldest waiting proposal; `""` when there are none. */
+  oldestAt: string;
+  /**
+   * How many of these proposals are edges that leave this space.
+   *
+   * Filed here under their source (see {@link edgeCrossing}), so the count is
+   * what lets the header state the simplification instead of embodying it.
+   */
+  crossings: number;
+  /**
+   * Agents holding `edit` here — they land writes `active`, so nothing they do
+   * reaches this queue. Populated on a queue section too: a space with both an
+   * `edit` agent and waiting proposals means some *other* agent holds only
+   * `suggest`, which is worth seeing rather than inferring.
+   */
+  editAgents: string[];
+}
+
+/**
+ * The agents that write directly into a space.
+ *
+ * `edit` is the level that lands `active` rather than `proposed`, so these are
+ * exactly the agents whose work never appears in the review queue.
+ *
+ * @param space One row of `GET /api/spaces`.
+ * @returns Agent ids holding `edit`, sorted.
+ */
+export function editGrantedAgents(space: SpaceOut): string[] {
+  return space.grants
+    .filter((grant) => grant.level === "edit")
+    .map((grant) => grant.agent_id)
+    .sort();
+}
+
+/**
+ * Which space a proposal belongs to, or null when the server did not say.
+ *
+ * - A **node** states its own on the row, always.
+ * - An **update** takes the space of the node it targets, off `context.node`.
+ * - An **edge** takes its **source**'s space, off `context.src`, and its
+ *   target's only when the source no longer resolves. An edge is stored as
+ *   `src → dst` and the assertion originates at the subject; note that
+ *   reviewing a cross-space edge in fact needs authority on *both* endpoint
+ *   spaces (`Store.edge_landing_state`), so filing it under one is a
+ *   simplification the section header must not pretend otherwise about —
+ *   {@link edgeCrossing} and {@link SpaceSection.crossings} are what stop it
+ *   pretending.
+ *
+ * Null means the referenced node did not come back — undone, or otherwise gone
+ * — which is the whole of what {@link UNREPORTED_SPACE} now covers.
+ *
+ * @param proposal One queue entry.
+ * @returns The space id, or null when the queue reports none.
+ */
+export function proposalSpace(proposal: ProposalOut): string | null {
+  if (proposal.node) return proposal.node.space_id;
+  if (proposal.edge) {
+    return (
+      contextRef(proposal.context, "src")?.spaceId ??
+      contextRef(proposal.context, "dst")?.spaceId ??
+      null
+    );
+  }
+  if (proposal.version) return contextRef(proposal.context, "node")?.spaceId ?? null;
+  return null;
+}
+
+/** An edge proposal whose two endpoints live in different spaces. */
+export interface EdgeCrossing {
+  /** The **source**'s space — the section this proposal is filed under. */
+  from: string;
+  /** The **target**'s space, which the filing says nothing about. */
+  to: string;
+}
+
+/**
+ * The crossing an edge proposal makes, or null when it makes none.
+ *
+ * A cross-space edge is filed under its source's space alone (see
+ * {@link proposalSpace}), while accepting it in fact needs `edit` on **both**
+ * endpoint spaces — `Store.edge_landing_state` is what decides where such an
+ * edge lands. That gap is a deliberate simplification of the grouping, and
+ * this is what keeps it from being a silent one: a queue that files a crossing
+ * under one space and then says nothing about the second is asserting, by
+ * omission, that reviewing it is a single-space act.
+ *
+ * Null for anything that is not a crossing we can see: a node or update
+ * proposal, an edge inside one space, and — deliberately — an edge with an
+ * endpoint the server could not resolve. An unresolved endpoint reports no
+ * space at all, and "no space reported" is not evidence of a different one.
+ *
+ * @param proposal One queue entry.
+ * @returns Both endpoint spaces when they differ, else null.
+ */
+export function edgeCrossing(proposal: ProposalOut): EdgeCrossing | null {
+  if (!proposal.edge) return null;
+  const from = contextRef(proposal.context, "src")?.spaceId ?? null;
+  const to = contextRef(proposal.context, "dst")?.spaceId ?? null;
+  if (from === null || to === null || from === to) return null;
+  return { from, to };
+}
+
+/** Options for {@link groupProposalsBySpace}. */
+export interface SpaceGroupingOptions {
+  /** Gap that ends a batch; defaults to {@link BATCH_GAP_MS}. */
+  gapMs?: number;
+}
+
+/**
+ * Group the queue into space sections, each split into agents and their runs.
+ *
+ * Sections holding proposals come first, ordered by their oldest waiting
+ * proposal — the queue is a waiting list and the thing that has waited longest
+ * belongs at the top, which is the same rule agents are ordered by one level
+ * down. The *space not reported* bucket sorts among them for the same reason:
+ * it holds real proposals, and burying it under every named space would hide
+ * work rather than explain it.
+ *
+ * **Self-governing sections come last and hold nothing.** They exist to say
+ * that an `edit`-granted space is absent from this queue *by design* rather
+ * than by chance, which is the whole of D4. They are emitted only when the
+ * space list is known: with `spaces` null (still loading, or the request
+ * failed) the view has no way to tell a self-governing space from any other,
+ * and inventing the distinction would be worse than admitting it is unknown.
+ *
+ * A space that is merely empty — no proposals, no `edit` grant — gets no
+ * section. Nothing has been proposed there and nothing governs it, so there is
+ * no fact to state; emitting one per space would bury the queue under the file.
+ *
+ * @param proposals The queue as the server returned it (oldest first).
+ * @param spaces Every active space, or null when the list is unknown.
+ * @param options See {@link SpaceGroupingOptions}.
+ */
+export function groupProposalsBySpace(
+  proposals: readonly ProposalOut[],
+  spaces: readonly SpaceOut[] | null,
+  options: SpaceGroupingOptions = {},
+): SpaceSection[] {
+  const buckets = new Map<string, ProposalOut[]>();
+  for (const proposal of proposals) {
+    const spaceId = proposalSpace(proposal) ?? UNREPORTED_SPACE;
+    const bucket = buckets.get(spaceId);
+    if (bucket) bucket.push(proposal);
+    else buckets.set(spaceId, [proposal]);
+  }
+
+  const grantsBySpace = new Map<string, string[]>();
+  for (const space of spaces ?? []) grantsBySpace.set(space.id, editGrantedAgents(space));
+
+  const sections: SpaceSection[] = [];
+  for (const [spaceId, bucket] of buckets) {
+    const agents = groupProposals(bucket, options.gapMs);
+    const counts = emptyCounts();
+    for (const proposal of bucket) count(counts, proposal);
+    sections.push({
+      key: spaceId || "(unreported)",
+      spaceId,
+      kind: spaceId === UNREPORTED_SPACE ? "unreported" : "queue",
+      agents,
+      total: bucket.length,
+      counts,
+      oldestAt: agents[0]?.oldestAt ?? "",
+      crossings: bucket.filter((proposal) => edgeCrossing(proposal) !== null).length,
+      editAgents: grantsBySpace.get(spaceId) ?? [],
+    });
+  }
+  sections.sort((a, b) => (timestampMs(a.oldestAt) ?? 0) - (timestampMs(b.oldestAt) ?? 0));
+
+  const selfGoverning: SpaceSection[] = [];
+  for (const space of spaces ?? []) {
+    if (buckets.has(space.id)) continue;
+    const editAgents = grantsBySpace.get(space.id) ?? [];
+    if (editAgents.length === 0) continue;
+    selfGoverning.push({
+      key: space.id,
+      spaceId: space.id,
+      kind: "self-governing",
+      agents: [],
+      total: 0,
+      counts: emptyCounts(),
+      oldestAt: "",
+      crossings: 0,
+      editAgents,
+    });
+  }
+  selfGoverning.sort((a, b) => a.spaceId.localeCompare(b.spaceId));
+
+  return [...sections, ...selfGoverning];
 }
 
 /** Render a counter as "3 nodes · 12 edges", skipping the zeroes. */

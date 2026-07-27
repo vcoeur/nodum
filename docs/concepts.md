@@ -88,6 +88,71 @@ grant queues everything for review; an `edit` grant writes live and carries
 in-space review authority. There is deliberately no auto-accept machinery: an
 agent earns `edit`, or it waits.
 
+### Spaces
+
+A space is the second axis beside the type graph: `main` and `meta` are seeded,
+and `nodum space-create` adds more. A space is itself a **node** — builtin type
+`space`, living in the meta space — so creating, renaming
+(`nodum space-rename`) and archiving (`nodum space-archive`) one are ordinary
+node writes, each event-logged, versioned and undoable. `nodum space-list`
+reports every active space with its live node count and the agents granted on
+it.
+
+Two spaces may not share a name, because every space reference resolves as
+`id = ? OR title = ?` and a duplicate would make `--space research` mean
+whichever row the database reached first. The comparison is exact — `Research`
+and `research` are two spaces, and both resolve — and an **archived** space
+keeps its name. A retired name stays reserved for good: archiving is not
+deletion, and the one route back (undoing the `node.archive` event) has to be
+able to put the space back exactly as it was, which it cannot do if something
+else took the name meanwhile. The price is that a retired name is not reusable
+unless you rename that space.
+
+`main` and `meta` cannot be archived. Every write that names no space lands in
+`main`, and that default resolves by id whatever state the row is in, so
+archiving it would hide the space while nodes kept arriving there; `meta` is the
+space that spaces themselves live in. Renaming either is fine — a rename moves
+the title, and it is the id everything structural depends on.
+
+**Archiving a space cuts every agent off it.** That is usually the reason to
+reach for it, so it is what it does: while a space is archived, a grant on it
+confers nothing — no reads, no writes, no proposals, no review — whether the
+call names the space or reaches a node inside it by id. The grant *rows* are
+kept rather than deleted, so `nodum grants` still lists them and
+`nodum revoke <agent> <space>` still takes one away (by the space's id or its
+name, archived or not), and undoing the archive puts the delegation back exactly
+as it was. Granting on an archived space is refused: it would confer nothing
+until someone undid the archive, which is delegation by accident.
+
+A space is used two ways, and they are deliberately two separate controls:
+
+- **Reading** — an optional filter (`--space` on `node list` and `search`,
+  `?space=` on the HTTP reads) that defaults to *every space in scope*.
+- **Writing** — a target (`--space` on `node create` and `ingest`, `space` in
+  the `POST /api/nodes` body) that defaults to `main`.
+
+Reading one space while still filing into another is the ordinary case, which
+is why a single "current space" switch would not do. The read filter is a
+convenience and **not** a permission boundary: an agent stays confined to its
+grants underneath it, and a space it holds no grant on does not resolve at all
+— answering exactly as a space that does not exist would, so the filter is
+never an existence oracle. Archiving a space retires it from the vocabulary;
+nothing moves, and every node in it keeps its `space_id`.
+
+The web UI (`nodum serve`) says the same thing with controls instead of flags.
+Search, the graph and the review queue carry a **space filter** that defaults to
+every space in scope; a single **write target**, sticky across sessions and
+shared by every open tab, says where a new node lands and is shown on every
+surface that creates one — a target the human cannot see is how work gets filed
+somewhere nobody chose. The `/spaces` screen is the lifecycle: every active
+space with its live node count and the agents granted on it, plus create,
+rename and archive. The review queue groups proposals by space and then by
+agent, which is the only way a space that governs itself — an agent holds
+`edit` there, so its writes land `active` and never queue — can be told apart
+from a space where nothing happened. And because the server refuses an unknown
+space and an ungranted one with identical words, no screen ever reports a space
+as missing; it says what changed instead.
+
 ## Projectors and derived indexes
 
 Search indexes are **projections of the event log**, not a second source of

@@ -53,6 +53,18 @@
   --nd-info: #6a93c4;
   --nd-info-wash: rgb(106 147 196 / 14%);
 
+  /* --- Crossing: an edge whose endpoints live in two spaces --------
+   * The third hue, and the only one outside the two axes above. A crossing
+   * is neither an affordance nor a state — it is a fact about territory —
+   * so it gets magenta, the emptiest slot in the palette and well clear of
+   * the proposed violet it would otherwise be read as. It began view-local
+   * in the graph (design decision D5) and moved here the moment the review
+   * queue had to mark the same fact, which is the rule this file states:
+   * a hue is view-local until a second view names it.
+   */
+  --nd-crossing: #c07bb5;
+  --nd-crossing-wash: rgb(192 123 181 / 14%);
+
   /* --- Typography -------------------------------------------------
    * No webfont: the app is served by a local Python process with no network
    * at runtime, and bundling a face into the wheel to look less default is a

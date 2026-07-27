@@ -599,6 +599,128 @@ CREATE INDEX idx_url_tokens_expires ON url_tokens(expires_at);
 """
 
 
+UNIQUE_SPACE_TITLES_DDL = """
+-- One space per title, in any state, for good (human-UI phase, gap 2). Every
+-- space reference on every surface resolves as `id = ? OR title = ?`
+-- (`service._resolve_space`), and nothing stopped two spaces carrying the same
+-- title — after which `--space research` meant whichever row SQLite reached
+-- first, silently, and differently depending on the query plan. Spaces became
+-- creatable from a screen in this phase, so the collision went from theoretical
+-- to likely.
+--
+-- What the index covers:
+--
+--   * `type_id = 'space'`, the resolver's own predicate. Deliberately *not*
+--     also scoped to the meta space: the resolver does not care which space a
+--     space node lives in, so a `space`-typed node created anywhere resolves,
+--     and an index scoped to meta would leave that hole open.
+--   * **Every state, archived included.** This started out as `state !=
+--     'archived'`, on the argument that an archived space stops resolving so
+--     its name must not stay reserved — "and it would be for good, because the
+--     state machine has no un-archive anywhere". That argument was false.
+--     `service.undo` never consults `TRANSITIONS`: for a non-create event it
+--     writes the `before` row back with a raw UPDATE, so undoing a
+--     `node.archive` restores `state = 'active'`. Archive a space, create a new
+--     one with the freed name, undo the archive — and the undo died on a bare
+--     `UNIQUE constraint failed: nodes.title`, which `/api/undo` served as a
+--     500. Archiving exists precisely *because* it is not deletion, so a rule
+--     whose correctness rests on nothing ever coming back contradicts the thing
+--     it is protecting. Titles are therefore reserved forever: the cost is that
+--     a retired space's name cannot be reused, and the return is that a restore
+--     can never fail and that index membership no longer depends on `state`, so
+--     no state change of any kind can collide. (`proposed` was always inside
+--     the index, for the neighbouring reason: two proposed spaces sharing a
+--     title would both accept cleanly and collide only afterwards. That hazard
+--     is gone with the predicate that caused it.)
+--   * Exact, never case-folded. `title = ?` compares under SQLite's default
+--     BINARY collation, so `Research` and `research` are two names that tell
+--     themselves apart perfectly; a NOCASE index would refuse a pair the
+--     resolver handles. The constraint is exactly as tight as the lookup.
+--
+-- A NULL title is left out of the index entirely: a space with no title cannot
+-- be named by one, so no two of them are ambiguous.
+--
+-- Dedupe first, or this fails with a bare IntegrityError on any database that
+-- already holds a collision — 0009 was bitten by exactly that, and this is its
+-- lesson applied. The losers are **renamed, not archived**: archiving retires a
+-- space from the vocabulary permanently, which is far more than a duplicate
+-- title deserves, while `<title> (<id>)` leaves every space usable and is
+-- unique because the id is. Titles change here without an event or a version,
+-- as every migration's data repair does.
+--
+-- Three properties the dedupe has to have, each one a defect it was found
+-- without:
+--
+--   1. **An `active` row keeps the name**, whatever else shares it. The
+--      tie-break demotes every non-active state at once (`state != 'active'`),
+--      not just `archived`: a `proposed` duplicate used to sort level with a
+--      live one and win on `created_at`, so an older proposal took the name off
+--      a live space — `--space research` stopped resolving at all, and started
+--      resolving to a *different* space the moment the proposal was accepted.
+--      An agent with `suggest` on meta can file proposed spaces, and nothing
+--      enforced uniqueness before this migration, so that state is reachable.
+--      What a reference resolves to today must go on resolving to the same
+--      space after the upgrade.
+--   2. **The rename cannot itself collide.** `<title> (<id>)` is unique among
+--      losers because ids are, but a database can already hold a space
+--      literally titled `research (sp-b)` — and then deduping two spaces called
+--      `research` produced that very string, the index refused it, and the
+--      whole upgrade rolled back with the bare IntegrityError this migration
+--      exists to prevent. So the name is searched rather than assumed: the base
+--      `<title> (<id>)`, then `<base> 1`, `<base> 2`, … until one is free. The
+--      search only has to dodge names that survive the statement (titles no
+--      loser is vacating, and every space id — see 3), because two losers can
+--      never land on one string: distinct ids make the bases distinct, a base
+--      always ends in `)` while a suffixed name always ends in a digit, and two
+--      suffixed names split unambiguously at that trailing digit.
+--   3. **The id/title ambiguity is deduped too.** `_resolve_space` matches
+--      `id = ? OR title = ?`, so a space *titled* `sp-x` while another space is
+--      *identified* `sp-x` is the same ambiguity as two equal titles — and one
+--      no index can express, which is why `service._require_space_name_free`
+--      refuses to create it. The migration left it standing, so a database
+--      could carry it past the upgrade and resolve `sp-x` plan-dependently
+--      forever, invisibly. The row holding the *title* loses: an id is
+--      immutable and is the reference of last resort.
+WITH RECURSIVE
+ranked AS (
+    SELECT rowid AS rid, id, title, ROW_NUMBER() OVER (
+        PARTITION BY title ORDER BY state != 'active', created_at, rowid
+    ) AS rank
+    FROM nodes
+    WHERE type_id = 'space' AND title IS NOT NULL
+),
+space_ids AS (SELECT id FROM nodes WHERE type_id = 'space'),
+losers AS (
+    SELECT r.rid, r.title || ' (' || r.id || ')' AS base
+    FROM ranked r
+    WHERE r.rank > 1
+       OR EXISTS (SELECT 1 FROM space_ids s WHERE s.id = r.title AND s.id <> r.id)
+),
+keepers AS (
+    SELECT title FROM ranked WHERE rid NOT IN (SELECT rid FROM losers)
+),
+candidates(rid, base, suffix, name) AS (
+    SELECT rid, base, 0, base FROM losers
+    UNION ALL
+    SELECT rid, base, suffix + 1, base || ' ' || (suffix + 1)
+    FROM candidates
+    WHERE name IN (SELECT title FROM keepers) OR name IN (SELECT id FROM space_ids)
+),
+resolved AS (
+    SELECT rid, name FROM candidates
+    WHERE name NOT IN (SELECT title FROM keepers)
+      AND name NOT IN (SELECT id FROM space_ids)
+)
+UPDATE nodes
+SET title = (SELECT name FROM resolved WHERE resolved.rid = nodes.rowid),
+    updated_at = datetime('now')
+WHERE rowid IN (SELECT rid FROM resolved);
+
+CREATE UNIQUE INDEX idx_space_title ON nodes(title)
+WHERE type_id = 'space' AND title IS NOT NULL;
+"""
+
+
 #: Ordered (name, SQL) migrations. Append-only — never edit a shipped entry.
 MIGRATIONS: list[tuple[str, str]] = [
     ("0001_core", CORE_DDL),
@@ -613,4 +735,5 @@ MIGRATIONS: list[tuple[str, str]] = [
     ("0010_principals", PRINCIPALS_DDL),
     ("0011_actor_strings", ACTOR_STRINGS_DDL),
     ("0012_url_tokens", URL_TOKENS_DDL),
+    ("0013_unique_space_titles", UNIQUE_SPACE_TITLES_DDL),
 ]

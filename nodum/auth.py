@@ -69,6 +69,47 @@ def _connect(path: str | Path | None) -> sqlite3.Connection:
     return conn
 
 
+def _grant_set(conn: sqlite3.Connection, agent_id: str) -> dict[str, str]:
+    """One agent's live grants as ``{space_id: level}`` — archived spaces excluded.
+
+    **A grant confers authority only while its space resolves.** Archiving a
+    space is how a human cuts every agent off it — that is what the CLI, the
+    service and the archive dialog all promise — and the grant rows are
+    deliberately *kept* rather than deleted so the human can still see and
+    revoke them, and so undoing the archive restores exactly the delegation
+    that was there before. Inert, not destroyed.
+
+    Filtering here rather than at each check is what makes it total: every
+    downstream rule reads the principal's grant set, so ``level_on``,
+    ``read_spaces``, both scope clauses, the landing states and the review gate
+    all inherit it with no call-site sweep to get wrong. Before this, archiving
+    left an agent full live authority over every node already in the space
+    (reachable by id, since only the *reference* stopped resolving) while
+    ``list_spaces`` stopped showing the space or its grants — authority that was
+    hidden and, because ``revoke`` resolved active spaces only, unrevokable.
+
+    Only a demonstrably archived space is dropped: a grant naming a space with
+    no node row at all behaves exactly as it did, since nothing here claims to
+    know what that means.
+
+    Args:
+        conn: Open connection.
+        agent_id: The agent whose grants to load.
+
+    Returns:
+        Space id → level name, for every grant whose space is not archived.
+    """
+    return {
+        row["space_id"]: row["level"]
+        for row in conn.execute(
+            "SELECT g.space_id, g.level FROM grants g WHERE g.agent_id = ?"
+            " AND NOT EXISTS (SELECT 1 FROM nodes n WHERE n.id = g.space_id"
+            " AND n.type_id = 'space' AND n.state = 'archived')",
+            (agent_id,),
+        ).fetchall()
+    }
+
+
 def principal_from_actor(actor: str, *, path: str | Path | None = None) -> Principal:
     """Re-mint the principal an actor string names — **from stored state only**.
 
@@ -153,13 +194,7 @@ def agent_principal(agent_id: str, *, path: str | Path | None = None) -> Princip
             raise UnknownPrincipal(f"unknown agent account: {agent_id}")
         if row["disabled"]:
             raise PrincipalDisabled(f"agent account is disabled: {agent_id}")
-        grants = {
-            grant["space_id"]: grant["level"]
-            for grant in conn.execute(
-                "SELECT space_id, level FROM grants WHERE agent_id = ?", (agent_id,)
-            ).fetchall()
-        }
-        return Principal(kind=row["kind"], id=agent_id, grants=grants)
+        return Principal(kind=row["kind"], id=agent_id, grants=_grant_set(conn, agent_id))
     finally:
         conn.close()
 
@@ -299,13 +334,7 @@ def verify_agent_token(token: str, *, path: str | Path | None = None) -> Princip
         ).fetchone()
         if row is None or row["agent_disabled"] or row["owner_disabled"]:
             raise InvalidCredentials("invalid credentials")
-        grants = {
-            grant["space_id"]: grant["level"]
-            for grant in conn.execute(
-                "SELECT space_id, level FROM grants WHERE agent_id = ?", (row["id"],)
-            ).fetchall()
-        }
-        return Principal(kind=row["kind"], id=row["id"], grants=grants)
+        return Principal(kind=row["kind"], id=row["id"], grants=_grant_set(conn, row["id"]))
     finally:
         conn.close()
 

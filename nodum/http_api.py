@@ -135,6 +135,7 @@ from nodum.service import (
     GrantNotPermitted,
     InvalidTransition,
     RecordNotFound,
+    SpaceNameTaken,
     TypeNotFound,
     UndoNotPossible,
 )
@@ -423,11 +424,14 @@ EXCEPTION_STATUS: dict[type[Exception], int] = {
     # only, and humans are unfiltered, so this is unreachable from this
     # surface by construction; mapped so it could never surface as a 500.
     GrantNotPermitted: 403,
-    # 409 — the graph has grown past the event being undone, or the account
-    # name is taken. AccountExists derives from ValueError; the more specific
-    # entry wins (Starlette walks the exception's MRO).
+    # 409 — the graph has grown past the event being undone, or a name is
+    # taken: an account's, or a space's (including one an archived space still
+    # reserves — `service._require_space_name_free`). All three derive from
+    # ValueError; the more specific entries win (Starlette walks the
+    # exception's MRO).
     UndoNotPossible: 409,
     AccountExists: 409,
+    SpaceNameTaken: 409,
     # 413 — the body passed the ceiling this server is willing to read.
     PayloadTooLarge: 413,
     # 499 — the client hung up mid-body (a cancelled upload). Nothing will read
@@ -1450,12 +1454,19 @@ def create_app(
     # ── Nodes ─────────────────────────────────────────────────────────────
 
     async def list_nodes(request: Request) -> Response:
-        """List nodes in creation order, optionally filtered."""
+        """List nodes in creation order, optionally filtered.
+
+        ``space`` narrows the listing to one space and ``include_meta`` opts
+        into the meta space; both default to the whole file minus meta, which
+        is what every view showed before spaces reached the UI.
+        """
         params = request.query_params
         nodes = service.list_nodes(
             type=params.get("type"),
             state=params.get("state"),
             parent_id=_param(params, "parent_id", "parent"),
+            space=params.get("space"),
+            include_meta=_bool_param(params, "include_meta"),
             principal=_session_principal(request),
             limit=_int_param(params, "limit", default=500),
             path=db_path,
@@ -1463,7 +1474,13 @@ def create_app(
         return EnvelopeResponse(list_envelope("nodes", nodes))
 
     async def create_node(request: Request) -> Response:
-        """Create a node. It lands ``active``: this is the human surface."""
+        """Create a node. It lands ``active``: this is the human surface.
+
+        ``space`` is the write target — optional, and ``main`` when absent,
+        exactly as the service defaults it. It names *where the node goes*,
+        never *who wrote it*: the writer is the session's human and no body
+        field can say otherwise.
+        """
         body = await _json_body(request)
         node = _write(
             request,
@@ -1473,6 +1490,7 @@ def create_app(
             content=body.get("content") or "",
             parent_id=body.get("parent_id"),
             props=body.get("props"),
+            space=_optional_str(body, "space"),
             path=db_path,
         )
         return EnvelopeResponse(envelope(node))
@@ -1568,6 +1586,8 @@ def create_app(
             created_by=params.get("created_by"),
             created_after=params.get("created_after"),
             created_before=params.get("created_before"),
+            include_meta=_bool_param(params, "include_meta"),
+            space=params.get("space"),
             expand=_bool_param(params, "expand"),
             principal=_session_principal(request),
             path=db_path,
@@ -2053,21 +2073,44 @@ def create_app(
         return EnvelopeResponse({"ok": True, "agent": agent_id, "space": space})
 
     async def list_spaces(request: Request) -> Response:
-        """Every active space — the grant-target vocabulary.
+        """Every active space, with its live node count and grant holders.
 
         Spaces are nodes of builtin type ``space`` in the meta space, which the
         everyday node listing excludes (``include_meta``), so ``/api/nodes``
-        cannot serve them. This is the CLI's ``space-list`` read, exposed for
-        the grant-admin UI's space picker.
+        cannot serve them. This is the CLI's ``space-list`` read verbatim — the
+        grant-admin picker's vocabulary, and the ``/spaces`` screen's answer to
+        "what territory exists, how much is in it, and who else may touch it".
         """
-        spaces = service.list_nodes(
-            type="space",
-            state="active",
-            include_meta=True,
-            principal=_session_principal(request),
+        spaces = service.list_spaces(principal=_session_principal(request), path=db_path)
+        return EnvelopeResponse(list_envelope("spaces", spaces))
+
+    async def create_space(request: Request) -> Response:
+        """Create a space (a node of builtin type ``space``, living in meta)."""
+        body = await _json_body(request)
+        space = _write(request, service.create_space, _required_str(body, "name"), path=db_path)
+        return EnvelopeResponse(envelope(space))
+
+    async def rename_space(request: Request) -> Response:
+        """Rename a space — a space is a node, so this is a node-title update.
+
+        The path segment is a space id or name, resolved as a *space*: a node
+        of any other type does not resolve here, so this route cannot be used
+        to rename something that is not a space.
+        """
+        body = await _json_body(request)
+        space = _write(
+            request,
+            service.rename_space,
+            request.path_params["id"],
+            _required_str(body, "name"),
             path=db_path,
         )
-        return EnvelopeResponse(list_envelope("spaces", spaces))
+        return EnvelopeResponse(envelope(space))
+
+    async def archive_space(request: Request) -> Response:
+        """Archive a space; its nodes keep their ``space_id`` and grants go inert."""
+        space = _write(request, service.archive_space, request.path_params["id"], path=db_path)
+        return EnvelopeResponse(envelope(space))
 
     # ── Fallbacks ─────────────────────────────────────────────────────────
 
@@ -2184,6 +2227,9 @@ def create_app(
         Route("/api/grants", set_grant, methods=["POST"]),
         Route("/api/grants/revoke", revoke_grant, methods=["POST"]),
         Route("/api/spaces", list_spaces),
+        Route("/api/spaces", create_space, methods=["POST"]),
+        Route("/api/spaces/{id}/rename", rename_space, methods=["POST"]),
+        Route("/api/spaces/{id}/archive", archive_space, methods=["POST"]),
     ]
 
     routes = [

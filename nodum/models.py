@@ -173,9 +173,16 @@ class SearchHit(BaseModel):
     carries each retrieval signal's contribution: RRF contributions for
     ``bm25`` and ``vector`` (they sum to ``score``), and the edge weight for
     ``graph`` expansion hits.
+
+    ``space_id`` is the space the node lives in. A result list spans every
+    space in scope unless ``--space`` narrowed it, so without this a reader
+    scanning results cannot tell a ``main`` hit from a ``research`` one
+    (human-UI D1: the filter is a filter, not a mode). It is nullable for the
+    same reason :class:`NodeOut` is — the column is.
     """
 
     node_id: str
+    space_id: str | None
     type: str
     title: str | None
     snippet: str
@@ -196,9 +203,13 @@ class ProposalOut(BaseModel):
 
     ``kind`` is ``node`` (a proposed node), ``edge`` (a proposed edge), or
     ``update`` (a proposed new version of an existing node). ``context``
-    carries what a reviewer needs beyond the row itself — for an edge, the
-    source/target node ids and titles; for a node, its parent's id/title when
-    it has one; for an update, the current node's id/title/content.
+    carries what a reviewer needs beyond the row itself, as one entry per
+    referenced node — ``src``/``dst`` for an edge, ``parent`` for a node that
+    has one, ``node`` for an update. Every entry is ``{id, title, space_id}``,
+    and the space is what lets the review queue group by space (human-UI D4):
+    a proposed node states its own, and an edge or an update would otherwise
+    state none. A referenced node that no longer resolves comes back as ``{id}``
+    alone, so read the other two as optional.
     """
 
     kind: str
@@ -470,3 +481,22 @@ class GrantOut(BaseModel):
     space_id: str
     level: str
     created_at: str
+
+
+class SpaceOut(NodeOut):
+    """A space node plus what makes it *territory* rather than a name.
+
+    A space is a node of builtin type ``space``, so every :class:`NodeOut`
+    field is here unchanged and a client that only wants the node keeps
+    reading it as one.
+
+    ``node_count`` counts the space's **live** nodes — ``active`` plus
+    ``proposed``, since a space holding nothing but proposals is not empty —
+    and excludes ``archived`` ones, which are retired rather than territory.
+    ``grants`` lists the agents holding a grant on the space, which is how a
+    human sees delegated territory at a glance (an ``edit``-granted space
+    governs itself and never reaches the review queue).
+    """
+
+    node_count: int
+    grants: list[GrantOut]

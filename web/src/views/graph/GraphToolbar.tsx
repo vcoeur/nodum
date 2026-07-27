@@ -3,15 +3,21 @@
  *
  * Every control here writes to the URL, and the URL is the request: the
  * parameter names match `GET /api/graph/subgraph` one for one, so what you see
- * in the address bar is what the server was asked. Nothing in this bar filters
- * client-side — a filter that only hid things in the browser would still be
- * paying the cost of fetching them, and would disagree with the node cap about
- * what "200 nodes" means.
+ * in the address bar is what the server was asked. No control here *hides*
+ * things client-side — a filter that only hid things in the browser would still
+ * be paying the cost of fetching them, and would disagree with the node cap
+ * about what "200 nodes" means.
+ *
+ * **The space filter is the deliberate exception, and it hides nothing.** It is
+ * a render-time control (design decision D5): the far endpoint of a cross-space
+ * edge stays drawn, dimmed and clickable, so there is nothing for the server to
+ * leave out and no disagreement with the cap — the node count on screen is
+ * unchanged by it. The reasoning lives in `filters.ts`.
  */
 
 import { useEffect, useRef, useState } from "react";
-import { NodeBadge, Spinner } from "../../components";
-import type { NodeOut } from "../../api/types";
+import { NodeBadge, SpaceFilter, Spinner } from "../../components";
+import type { NodeOut, SpaceOut } from "../../api/types";
 import { ConfidenceFilter } from "./ConfidenceFilter";
 import { TypeFilter } from "./TypeFilter";
 import { RootPicker } from "./RootPicker";
@@ -39,6 +45,24 @@ interface GraphToolbarProps {
   nodeTypeOptions: readonly string[];
   /** Actors seen in the current render, offered as `created_by` completions. */
   actorOptions: readonly string[];
+  /** Active spaces for the space picker; null while loading or after a failure. */
+  spaces: readonly SpaceOut[] | null;
+  /**
+   * Archived space nodes, so a filter left pointing at one is named in the
+   * picker rather than shown as its id. Never offered as a choice — the
+   * vocabulary is `spaces` alone.
+   */
+  archivedSpaces: readonly NodeOut[];
+  /** True once the space list request failed. */
+  spacesFailed: boolean;
+  /** How the filtered space is named in the chip row. */
+  spaceName: string;
+  /**
+   * Whether the space reference actually narrows the render. False for a
+   * reference the space list cannot resolve — an archived space still named in
+   * the URL — where the chip must not promise dimming the banner below denies.
+   */
+  spaceInEffect: boolean;
   unratedEdges: number;
   totalEdges: number;
   loading: boolean;
@@ -61,6 +85,11 @@ export function GraphToolbar({
   edgeTypeOptions,
   nodeTypeOptions,
   actorOptions,
+  spaces,
+  archivedSpaces,
+  spacesFailed,
+  spaceName,
+  spaceInEffect,
   unratedEdges,
   totalEdges,
   loading,
@@ -99,7 +128,7 @@ export function GraphToolbar({
     });
   };
 
-  const chips = filterChips(filters);
+  const chips = filterChips(filters, spaceName, spaceInEffect);
 
   return (
     <div className="nd-graph__toolbar">
@@ -134,6 +163,7 @@ export function GraphToolbar({
           <span className="nd-label">Depth</span>
           <span className="nd-graph__slider">
             <input
+              name="graph-depth"
               type="range"
               min={MIN_DEPTH}
               max={MAX_DEPTH}
@@ -150,6 +180,7 @@ export function GraphToolbar({
         <label className="nd-graph__control">
           <span className="nd-label">Node limit</span>
           <input
+            name="graph-limit"
             className="nd-input nd-input--mono nd-graph__number"
             type="number"
             min={MIN_LIMIT}
@@ -173,6 +204,7 @@ export function GraphToolbar({
             {EDGE_STATES.map((state) => (
               <label key={state} className="nd-graph__check">
                 <input
+                  name={`graph-edge-state-${state}`}
                   type="checkbox"
                   checked={filters.edgeStates.includes(state)}
                   onChange={() => toggleEdgeState(state)}
@@ -200,9 +232,23 @@ export function GraphToolbar({
           note="The root is exempt: it is what you asked for, so it is shown whatever its type."
         />
 
+        {/* Same row as the type and confidence filters, and deliberately not
+            marked out as special — it *reads* like the others. What it does
+            differs (it dims rather than drops), which the chip row states in
+            words rather than leaving to a colour nobody has been taught. */}
+        <SpaceFilter
+          className="nd-graph__space"
+          value={filters.space}
+          onChange={(space) => onFiltersChange({ ...filters, space })}
+          spaces={spaces}
+          archivedSpaces={archivedSpaces}
+          failed={spacesFailed}
+        />
+
         <label className="nd-graph__control">
           <span className="nd-label">Edges by</span>
           <input
+            name="graph-created-by"
             className="nd-input nd-input--mono nd-graph__actor"
             type="text"
             list="nd-graph-actors"

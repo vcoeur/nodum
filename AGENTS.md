@@ -23,7 +23,9 @@ breakdown, **principals, spaces and grants** (Q13: `humans`/`agents`/
 `grants` tables, a scope-bound store, `read`/`suggest`/`edit` per
 (agent, space) — no policies, no auto-accept anywhere), the
 **review/accept API** (proposal listing with reviewer
-context, batch accept/reject by id or filter — a human, or `edit` on the
+context, where every referenced node is reported as `{id, title, space_id}` so
+the human UI's queue can group by space without chasing ids, plus batch
+accept/reject by id or filter — a human, or `edit` on the
 item's space; `undo` stays human-only), **proposed updates** (agent `update_node` stages a
 `proposed` version recording which fields it named; accept applies exactly
 those, reject archives it — migrations 0005/0008), the **MCP server**
@@ -41,8 +43,9 @@ say otherwise — the shared **envelope**
 module (`nodum.envelope`) both the CLI and the API render through, and the
 **web UI** itself (`web/`, React 19 + TypeScript, built into `nodum/_web/` by
 `make web-build`; gitignored, shipped in the wheel as a hatchling artifact):
-eight views — login, Markdown editor, hybrid search, review queue,
-graph, assets, an accounts-and-grants admin, per-node version history.
+nine views — login, Markdown editor, hybrid search, review queue,
+graph, assets, a spaces screen, an accounts-and-grants admin, per-node version
+history.
 Phase 4 (ingestion) has landed: **text extraction** (`nodum.extract` — a
 registry of optional handlers keyed by MIME family, where an absent dependency
 is a returned result and never an exception), the **ingestion pipeline**
@@ -104,7 +107,75 @@ node for exactly this reason.
   drawn with gaps, and a `truncated` flag saying whether **either** cap bit —
   and **`suggest_links`**, a title-prefix lookup for a `[[` autocomplete that
   reads `nodes` directly, so it answers on a database whose projectors have
-  never run. Each public function opens its own short-lived connection
+  never run. **Spaces** live here too: the read-side `space` filter on
+  `list_nodes` (and its twin in `nodum.search`), and the lifecycle trio
+  `create_space` / `rename_space` / `archive_space` plus the `list_spaces`
+  aggregation — thin delegates to `create_node` / `update_node` / `transition`
+  that own the "a space is a node of type `space` in meta" rule so that neither
+  adapter has to restate it, and no new SQL path exists for a space write.
+  Four space rules are enforced **here** rather than on a screen, because a
+  disabled button leaves the CLI and the API wide open. **`main` and `meta`
+  cannot be archived** (`STRUCTURAL_SPACE_IDS`): the check sits in
+  `_transition_row`, not in `archive_space`, since `archive <id>` and
+  `POST /api/nodes/{id}/archive` reach the same row without going near the
+  lifecycle helper. Archiving `main` is destructive in the quietest way there
+  is — it vanishes from `list_spaces` and every picker, while
+  `resolve_space_id(None)` keeps returning it without reading the row's state,
+  so writes go on landing in a space the human can no longer see. A *rename*
+  of either stays allowed: it moves the title, and the **id** is what the
+  schema and the default write target depend on. **No two spaces may answer to
+  one name** (`_require_space_name_free`): a reference resolves as
+  `id = ? OR title = ?`, so a duplicate makes `--space research` mean whichever
+  row SQLite reached first. The check runs in `create_node` and `update_node`
+  (conditioned on the node being a space), in `_transition_version`'s accept
+  (where a proposed rename actually lands) and in `undo` (which writes a
+  recorded row back past every other guard), because those are the paths that
+  bypass the lifecycle helpers; migration `0013_unique_space_titles` is the
+  structural half under it — a unique index over `nodes(title)` where
+  `type_id = 'space'`, with **no state predicate**. **A space title is reserved
+  forever, archived ones included.** The first cut scoped the index to
+  `state != 'archived'`, arguing that an archived space stops resolving and
+  that nothing un-archives; `undo` does — it restores the `before` row with a
+  raw UPDATE past `TRANSITIONS` — so a freed-then-retaken name made undoing an
+  archive die on `UNIQUE constraint failed` (a 500 on `/api/undo`). Archiving
+  is not deletion, so it must be reversible; the accepted cost is that a
+  retired space's name cannot be reused. A collision is `SpaceNameTaken`
+  (a `ValueError`, **409** over HTTP), and when the holder is archived the
+  message says so — nothing lists archived spaces, so a bare "taken" would name
+  something the human cannot see. Comparison is BINARY, like the lookup's —
+  `Research` beside `research` is two names that genuinely tell themselves
+  apart. The service check additionally catches the half no index can express:
+  a title equal to another space's *id*.
+  **A space lives in `meta`, and `create_node` enforces it**
+  (`_require_space_lives_in_meta`). It is the model every adapter is already
+  written against — `create_space` hardcodes it — but the generic path could
+  put a `space`-typed node in ordinary territory, where `GET /api/spaces`
+  listed it and `_resolve_space` resolved it as real while the grants governing
+  it were the *host* space's. That is also what made the name check an
+  existence oracle: the check is deliberately unscoped, on the premise that
+  only a principal who can read `meta` reaches it (and such a principal can
+  already list every space). The premise held for creates — resolving the
+  `space` type needs READ on `meta` — but a rename is gated on `suggest` on the
+  space the node **lives in**, so a space node in `main` let an agent holding
+  nothing but `main` rename it onto a name and read a confirm/deny, plus the
+  holder's id, for a space it cannot list. `update_node` therefore requires
+  READ on `meta` before the name check as well, so a legacy or raw-SQL row
+  cannot reopen it; the refusal is on the *grant*, identical for a taken and a
+  free name. Migration `0013`'s index stays unscoped to meta on purpose — it is
+  the backstop for writers that never pass through the service.
+  **Archiving a space makes every grant on it inert** — enforced where grants
+  become a principal (`auth._grant_set`), so reads, writes, proposals and
+  review all inherit it rather than only the calls that spell the space's name.
+  Cutting an agent off is *why* a human archives a space, and it used to be
+  true only of those name-spelling calls: everything reachable by node id kept
+  full live authority while `list_spaces` stopped showing the space or its
+  grants — hidden authority, and unrevokable, since `grant`/`revoke` resolved
+  active spaces only. The grant **rows** survive on purpose, so `list_grants`
+  still shows them and `revoke` still reaches them (`_resolve_space_for_admin`,
+  human-only, resolves a space in any state), and undoing the archive restores
+  exactly the delegation that was there. Inert, not destroyed. `grant` on an
+  archived space is refused and says why.
+  Each public function opens its own short-lived connection
   (applying pending migrations idempotently) and commits. New behaviour and
   validation go here first; adapters must not add behaviour the service lacks.
 - **`nodum.mcp_server`** — the MCP adapter (stdio, official Python SDK
@@ -184,16 +255,20 @@ node for exactly this reason.
   `GET /api/nodes/{id}` is byte-identical to `nodum node get <id>` on stdout.
   New list output goes through `list_envelope`, never a hand-built dict.
 - **`web/`** — the human UI (React 19 + TypeScript + Vite), built into
-  `nodum/_web/` by `make web-build` and served by `nodum serve`. Nine routes
-  over eight views, each lazily loaded so CodeMirror, Mermaid, and Cytoscape stay
+  `nodum/_web/` by `make web-build` and served by `nodum serve`. Ten routes
+  over nine views, each lazily loaded so CodeMirror, Mermaid, and Cytoscape stay
   out of the initial bundle. `src/api/client.ts` is the only `fetch` in the
   app and has **no identity parameter anywhere** — the server's structural
   rule, mirrored in the client. It sends `Content-Type: application/json` on every
   non-GET request, bodyless ones included, because the server requires it.
   `src/lib/` holds the cross-view invariants
-  (timestamps, failure classification); `src/components/` holds shared React
-  components; a view owns its own directory and links to other views by URL,
-  never by import. Full conventions: `web/README.md`.
+  (timestamps, failure classification, the sticky write target);
+  `src/components/` holds shared React
+  components plus the space filter's two halves (`spaceOptions.ts`,
+  `useSpaces.ts`); a view owns its own directory and links to other views by URL,
+  never by import. Spaces reach the UI as the CLI's two independent controls —
+  a per-view read filter and one app-wide write target — never as a mode. Full
+  conventions: `web/README.md`.
 - **`nodum.projectors`** — derived-index consumers of the event log. A
   projector registry (`REGISTRY`), per-projector checkpoints in
   `projector_checkpoints`, incremental `run_projectors`, and
@@ -379,7 +454,12 @@ node for exactly this reason.
   `type`/`state`/`created_by`/date filters; optional one-hop graph expansion
   over `active` edges (`--expand`) applies after fusion. Hits carry the
   fused `score` plus a per-signal `signals` breakdown (`bm25` / `vector` /
-  `graph`). With no embedding provider the vector signal is skipped —
+  `graph`) **and their `space_id`** — a result list spans every space in scope
+  unless `space` narrowed it, so a hit that did not name its own would be
+  unplaceable on the one surface a human scans rather than reads. All three
+  hit shapes carry it (both ranked lists build `_RankedRow`, graph expansion
+  builds its own `SearchHit`); adding a fourth means carrying it there too.
+  With no embedding provider the vector signal is skipped —
   search silently degrades to BM25 + graph.
 - **`nodum.db`** — connection management (WAL, foreign keys), `NODUM_DB`
   resolution, the migration runner. Each migration's script and its
@@ -394,7 +474,7 @@ node for exactly this reason.
   a database whose only cure is deletion never gets a new (possibly
   irreversible) migration committed onto it first.
 - **`nodum.migrations`** — the append-only migration list (`0001_core` …
-  `0012_url_tokens`). Never edit a shipped migration; append a
+  `0013_unique_space_titles`). Never edit a shipped migration; append a
   new one. A migration must never leave data readable only through a store a
   later migration replaces: introduce a table where its bytes already belong
   (this is why asset bytes are part of `0007` and there is no `path` column
@@ -527,6 +607,19 @@ Phase-1 decision log.
   `scripts/smoke-install.sh` asserts against a freshly built wheel. Note
   `schema-dump` (the CLI adapter's own surface) is a different thing from
   `schema <type>` (one node/edge type's catalog entry from the database).
+- **A space is two independent controls, not a mode** (the human-UI phase's
+  D1): reads take an optional `--space` **filter** that defaults to *every
+  space in scope*, and writes take a `--space` **target** that defaults to
+  `main`. Reading `research` while still filing into `main` is the ordinary
+  case, so one switch could not serve both. The filter **narrows** and never
+  widens: it resolves through the same rule every other space reference does
+  (a space the principal holds no grant on does not resolve, and reads
+  identically to a nonexistent one), and the principal's scope clause is still
+  ANDed underneath it — an agent is confined by its grants whatever it asks
+  for. `--include-meta` is the other read-side control, off by default;
+  naming the meta space with `--space meta` is the same opt-in said precisely,
+  since `meta` is itself in the space list and a filter that silently returned
+  nothing there would be a trap.
 - Surface: `init`, `node create/get/update/list/children`, `edge
   create/list/create-batch`, `accept <id>` / `reject <id> --reason` /
   `archive <id>` (each takes a node, edge, or proposed-version id), `undo [seq]`,
@@ -547,9 +640,20 @@ Phase-1 decision log.
   `agent create/list/token-rotate/disable/enable` (create and rotate print
   the show-once `ndm_…` token to stderr; only the hash is stored),
   `grant <agent> <space> <level>` / `revoke <agent> <space>` / `grants [--agent]`
-  (`read`/`suggest`/`edit`, event-logged),
-  `space-create`/`space-list`/`space-archive` (a space is a node of builtin
-  type `space` in the meta space),
+  (`read`/`suggest`/`edit`, event-logged; `revoke` reaches an **archived**
+  space by id or name, since archiving makes a grant inert but leaves the row
+  for the human to take away, while `grant` refuses one and says why),
+  `space-create`/`space-list`/`space-rename`/`space-archive` (a space is a node
+  of builtin type `space` in the meta space, so its whole lifecycle is an
+  ordinary node's — create, a title update, a state transition — and every one
+  is event-logged, versioned and undoable like any other write; the three
+  mutating commands go through `service.create_space`/`rename_space`/
+  `archive_space`, which own the "a space is a node in meta" rule so no adapter
+  has to, and refuse a node that is not a space rather than editing it under a
+  space-shaped name. `space-list` (`service.list_spaces`) carries each space's
+  **live node count** — `active` + `proposed`, since a space holding only
+  proposals is not empty — and the **agents granted on it**, which is human-only
+  for the same reason `grants` is),
   `mcp serve` (the agent token comes from `NODUM_AGENT_TOKEN`, never a flag),
   `serve [--host 127.0.0.1] [--port 8600] [--allow-host NAME]
   [--db PATH]`. `serve` prints the database path on stderr and translates
@@ -740,6 +844,34 @@ Phase-1 decision log.
   blocks neither loopback nor private ranges. Both are properties of a
   human-only surface behind a password — which is exactly why this route is
   inside the session gate and the two token routes are not.
+- **Spaces reach the human over HTTP as a filter, a target, and a lifecycle.**
+  `GET /api/nodes` and `GET /api/search` take `?space=` (narrow to one space)
+  and `?include_meta=` (off by default) — the CLI's two read-side controls,
+  same names, same rules. `POST /api/nodes` takes `space` in the body: the
+  **write target**, optional, `main` when absent. A space names *where a node
+  goes*, never *who wrote it* — the session's human is still the only writer,
+  and `space` is an ordinary service parameter rather than a new concept, which
+  is exactly the test "do not invent request fields the domain has no
+  representation for" asks for. The lifecycle is `POST /api/spaces` (create),
+  `POST /api/spaces/{id}/rename` and `POST /api/spaces/{id}/archive`, in the
+  `/api/nodes/{id}/archive` verb-POST style; `{id}` is a space id *or name* and
+  resolves as a **space**, so neither route can be used to rename or retire a
+  node that is not one. `GET /api/spaces` carries per space the live node count
+  and the agents holding grants on it (the `/spaces` screen's read) and is
+  byte-identical to `nodum space-list`, as every list endpoint is to its
+  command — **active spaces only**, which is why the name refusal below has to
+  explain itself in words. The space rules are the service's, so both
+  archive routes (`/api/spaces/{id}/archive` and `/api/nodes/{id}/archive`)
+  answer 400 for `main` and `meta`; both writers answer **409
+  `SpaceNameTaken`** for a name any space already holds — including an archived
+  one, whose message says so, since this listing does not carry it; and
+  `POST /api/nodes` answers 400 for `{"type": "space"}` aimed anywhere but
+  `meta` (it used to answer 200, and `space` is in the editor's type picker, so
+  a human could nest a space inside ordinary territory with one click).
+  Archiving a space through either route makes every grant on it inert, which is
+  what the archive confirm has to say, and `/api/grants` can still revoke one
+  afterwards. Do not re-implement any of it in a handler or in the UI: the
+  screen may say *why* before the click, but the refusal is the server's.
 - **Account and grant administration is on the API too.** `GET /api/me`
   returns the session's human; `/api/humans`, `/api/agents` and `/api/grants`
   mirror the CLI's `human`/`agent`/`grant`/`revoke`/`grants` commands — thin
@@ -812,13 +944,136 @@ Phase-1 decision log.
   is the one place that tells *the API refused this* apart from *nothing was
   listening* — and the two are not one test: same-origin it is a `fetch`
   `TypeError`, behind the dev proxy it is a 502. Map its `kind` onto your own
-  panel; do not re-test `status` or `instanceof`.
+  panel; do not re-test `status` or `instanceof`. The same rule covers a refused
+  space: `isUnknownSpace` (`src/api/client.ts`) is the **only** discriminator,
+  and the client normalises every call that names a space — `listNodes`,
+  `search`, `createNode`, `createSpace`, `renameSpace`, `archiveSpace` — into
+  one `UnknownSpaceError`. It is keyed on the message (`unknown space: …`),
+  because no status is specific enough: the node listing answers 404 and search
+  answers 400 for the same event, while a 404 from `POST /api/nodes` is equally
+  an unknown node *type*. Two views once carried their own copy of that match,
+  and a second copy of a discriminator is how the two drift apart — if a bare
+  `ApiError` with that message ever reaches a view, wrap the call in the client.
+- **Nothing user-facing may say a space does not exist.** Not "no such space",
+  not "does not exist", not "unknown/missing/nonexistent space", not "not
+  found" — and not by handing an `UnknownSpaceError` to `describeFailure`,
+  whose 404 body is *"The server has no record of …"*, nor to `toast.showError`,
+  which renders `` `${type}: ${message}` `` and so emits *"UnknownSpace: unknown
+  space: research"* verbatim. That second trap is the one that actually bit, on
+  the detached editor saves, because reaching for the error toast reads as a
+  reporting choice rather than a copy decision. It is a copy decision. The
+  server answers a
+  space that was never created and a space the caller holds no grant on with
+  **word-for-word identical text on purpose** (Q13 review S3): a refusal that
+  told them apart would be an existence oracle over every space in the file, and
+  the space filter would leak the shape of what an agent cannot read. Say what
+  changed instead — a space stops resolving once it is archived, and a renamed
+  one no longer answers to its old name. `views/search/spaceFailure.ts`,
+  `views/editor/createOutcome.ts` and `views/spaces/spaces.ts` own that copy and
+  pin it with tests; new copy goes through one of them. The refusal that names
+  an **archived** space holding a name you tried to create is not a breach and
+  not an exception: it is the server's own message, shown verbatim, and the
+  only principals that can reach it are those writing `meta` — which is the
+  grant that already lists every space node, archived included. The service
+  asserts that premise as a test rather than assuming it.
+- **The space surfaces are shared, and there is one of each.** The read filter
+  is `components/SpaceFilter.tsx` (controlled and presentational — the view owns
+  the value, and `controlClassName` is how a filter row sizes it rather than
+  reaching in with a CSS override); its option vocabulary is
+  `components/spaceOptions.ts` (`spaceOptions`, `resolveSpaceValue`,
+  `unlistedMark` — a space reference is an id *or* a name everywhere, so resolve
+  before comparing); the `GET /api/spaces` read behind all of them is
+  `components/useSpaces.ts`. Do not add a seventh copy of that fetch or a second
+  `spaceLabel`. `GET /api/spaces` is **active-only and stays that way** — it is
+  the vocabulary behind every picker, and a retired space belongs in none of
+  them. Naming a space that listing cannot (one archived while its proposals
+  waited, holding a node you are reading, or left behind in a write target or a
+  filter) goes through `components/spaceNaming.ts` and its lazy
+  `components/useArchivedSpaces.ts` — review, search, editor, graph, the grant
+  table, both pickers, and every sentence the editor and search write about a
+  refused space. That resolution was once view-local to the review queue; when
+  the rest of the app needed it the answer was to **promote the read, not widen
+  the endpoint**, and that stays the answer. `nameSpace` has four answers, and
+  `pending` is not `unknown`: a space list still in flight is not an
+  unresolvable space, so `?? []` at a call site is the bug — pass the `null`
+  through.
+- **An archived space is *nameable* everywhere and *selectable* nowhere**, and
+  those are two rules, not one. `spaceLabel`'s `?? spaceRef` fallback is the
+  picker's own — a controlled `<select>` whose `value` matches no option renders
+  blank and is silently rewritten by the next change event — and it is a bare
+  32-hex id anywhere else, which is why it is **no longer exported from
+  `components/`**: its one caller is `spaceOptions`, in the same module, and
+  every surface that reached for it instead of `nameSpace` was an id on a
+  screen. The picker names an archived *selection* by being handed
+  `spaceOptions(spaces, selected, selectedName)` — one already-resolved
+  `SpaceName` for the value it is already carrying. It is never handed the
+  archived **list**, so nothing inside it can put an archived space among the
+  choices; the option it adds is the current value, marked `(archived)` rather
+  than `(unavailable)`, and it is gone the moment the human picks something
+  else. Widening that seam to a list would let someone newly choose a space the
+  server refuses to resolve, which is worse than the id it fixed and is exactly
+  what D1a exists to prevent.
+- **Every surface that displays a node says which space it is in** — the exit
+  criterion of the spaces phase, and search is the surface where it matters
+  most, because a result list is *scanned*. The rule for how loudly:
+  **a row states a dimension the filter has not already determined.** A concrete
+  space filter is ANDed onto both ranked lists and onto graph expansion, so
+  under one every hit provably lives there and repeating it per row is the
+  filter read back; under *any space* it is the fact the scan needs.
+  `views/search/resultSpace.ts` owns that rule, beside the identical one
+  `ResultRow.knownState` follows for the state filter.
+- **Where the review queue simplifies, it says so.** A cross-space edge proposal
+  is filed under **one** space (its source's) while accepting it needs `edit` on
+  **both** endpoints (`Store.edge_landing_state`). The filing rule stays — a
+  proposal rendered under two sections, or a "crossings" section, is a grouping
+  change nothing asked for — so the honesty is carried instead by
+  `grouping.edgeCrossing`: the card is marked `cross-space`, the Inspect panel
+  names the space of each endpoint and states the both-ends rule, and the
+  section header counts how many of its proposals leave it
+  (`SpaceSection.crossings`). A header that files a crossing under one space and
+  then says nothing is asserting, by omission, that reviewing it is a
+  single-space act. The same applies to a section for an archived space: it is
+  named and marked, never left as a bare id.
+- **The archive confirmation states consequences the server actually delivers.**
+  `views/spaces/spaces.ts`'s `archiveConsequences` is the one place that copy
+  lives, and every line in it has to be a fact: the space leaves every picker
+  and stops resolving; its nodes keep their `space_id` and stay readable to the
+  human; its **name stays reserved**, so no new space may take it; and **every
+  grant on it goes inert** — an agent granted there can read, write, propose and
+  review nothing until the archive is undone, though the grant row survives on
+  `/admin` so it can be revoked for good. That last line was copy before it was
+  behaviour: the service kept the agent's authority over everything reachable by
+  node id, so the dialog promised the opposite of what happened. Do not soften
+  it back — a human archiving a space to cut an agent off now gets exactly that.
+- **The write target is app-wide, sticky, and must be visible** (design decision
+  D1a). `src/lib/writeTarget.ts` owns it: one module-level value, persisted in
+  `localStorage`, synchronised across tabs through the `storage` event, and
+  **never changed without the human being told** — a target naming a space
+  archived from somewhere else (the CLI, another session) survives and fails at
+  the write, because filing a node somewhere the human did not choose is worse
+  than a refusal they can read. The one reset is `clearWriteTarget()`, and it has
+  two callers. `/spaces` calls it when the human archives the very space they are
+  filing into: that is the second half of an act they just performed, not a
+  correction behind their back, and it is announced in both the archive
+  confirmation (before) and the toast (after). Logout calls it too — the value is
+  persisted per browser, not per session, so a second human signing in on the
+  same machine would otherwise inherit the first one's target. The rule is about
+  *silence*, not about immutability. `useWriteTarget()` is the subscription;
+  a surface that creates a node **shows** the current target, and the post-create
+  confirmation names the space the server actually filed it in. Calling
+  `getWriteTarget()` without rendering the answer is the failure this module
+  exists to prevent.
 - **A view owns its directory and links to other views by URL.** No view imports
   another. Route paths live in `src/router.tsx`; grep for the path string before
   renaming one. A view's entry component keeps a **default export** — the routes
   are lazily loaded and `lazy()` needs it.
 - **Promote to `src/lib/` or `src/components/` on the second user, not the
-  first.** Both are inherited by every view.
+  first.** Both are inherited by every view. `src/lib/` is the plain-function
+  tier; a hook or a shared fetch belongs beside the component it serves, in
+  `src/components/` (`useSpaces.ts` is there because `SpaceFilter` is
+  presentational and cannot own its own data). `writeTarget.ts` is the one hook
+  in `lib/`, and only because the state it owns has no component — every
+  node-create surface has to render it.
 - **Do not render a control for something the service cannot do.** A node's
   `type` is immutable after creation, so the editor drops the type commands on a
   saved node rather than offering one that silently no-ops. Same rule as the
@@ -827,12 +1082,24 @@ Phase-1 decision log.
   means "you can act on this", the state ramp means the service-layer state
   machine (`proposed` violet, `active` sea-green, `archived` lowest-contrast).
   Anything else needs its own hue, kept view-local until a second view names it.
+  Exactly one has: `--nd-crossing` (magenta) means *this edge's endpoints are in
+  two different spaces*, which is neither an affordance nor a state. It began
+  view-local in the graph (D5) and moved into `styles/tokens.css` when the review
+  queue had to mark the same fact, which is the promotion rule working rather
+  than an exception to it.
   Class names are `nd-`-prefixed because Mermaid and Cytoscape inject global
   stylesheets on `.node`, `.label`, and `.edge`.
+- **A form control carries an `id` or a `name`** — a field with neither is one a
+  browser cannot address, which is what DevTools flags and what autofill and
+  assistive tooling fall back to guessing about. There is no `<form>` submit
+  anywhere here, so the value never travels; the attribute exists to make the
+  control a named thing. `SpaceFilter` takes `name` as a prop (default `space`)
+  for the same reason it takes `controlClassName`.
 - **A pure module gets a `*.test.ts` beside it** (`make web-test`, Vitest). The
   harness is unit-only by design — no component rendering — so pull the logic
   worth testing out of the component and test it there, which is what
-  `filters.ts`, `unifiedDiff.ts`, `signals.ts`, and `grouping.ts` already
+  `filters.ts`, `unifiedDiff.ts`, `signals.ts`, `grouping.ts`, `spaceOptions.ts`,
+  `createOutcome.ts` and `views/spaces/spaces.ts` already
   are. Assert the *semantics* the module encodes (a
   `min_confidence` of 0 is a filter, not a no-op; a 502 is unreachable, not a
   refusal), not its line coverage. The global environment is `node`; a suite
