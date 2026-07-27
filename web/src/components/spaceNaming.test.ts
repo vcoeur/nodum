@@ -18,7 +18,13 @@
 
 import { describe, expect, it } from "vitest";
 import type { NodeOut } from "../api/types";
-import { findSpace, nameSpace, spaceNameNote, unresolvedSpaceIds } from "./spaceNaming";
+import {
+  findSpace,
+  nameSpace,
+  spaceNameNote,
+  unresolvedSpaceIds,
+  writeTargetWouldNotResolve,
+} from "./spaceNaming";
 
 /** A space node, trimmed to what the resolver reads. */
 function space(id: string, title: string | null, state = "active"): NodeOut {
@@ -107,6 +113,60 @@ describe("spaceNameNote", () => {
     const forbidden = /no such space|does not exist|nonexistent|missing space|not found|no record/i;
     for (const kind of ["active", "archived", "unknown", "pending"] as const) {
       expect(spaceNameNote({ label: "sp-x", kind }) ?? "").not.toMatch(forbidden);
+    }
+  });
+});
+
+describe("writeTargetWouldNotResolve", () => {
+  /** Every wording nothing user-facing may use about a space. */
+  const FORBIDDEN =
+    /no such space|does not exist|nonexistent|missing space|not found|no record|unknown space/i;
+
+  it("says the specific true thing about an archived target, and names it", () => {
+    const sentence = writeTargetWouldNotResolve(nameSpace("sp-old", ACTIVE, ARCHIVED));
+
+    expect(sentence).toBe(
+      "The write target reading has been archived — an archived space stops resolving, so " +
+        "nothing new can be filed there.",
+    );
+    // Not the disjunction: the archived listing answered, so guessing between
+    // archived and renamed would be vaguer than what is known.
+    expect(sentence).not.toMatch(/renamed/i);
+  });
+
+  it("keeps the disjunction when neither list names the target", () => {
+    const sentence = writeTargetWouldNotResolve(nameSpace("ghost", ACTIVE, ARCHIVED));
+
+    expect(sentence).toBe(
+      "The write target ghost would not resolve — a space stops resolving once it is archived, " +
+        "and a renamed space no longer answers to its old name.",
+    );
+  });
+
+  it("keeps the disjunction for a target the active list still lists", () => {
+    // Archived from another session between the list read and the write: the
+    // list says `active` and the server said no, so the disjunction is right.
+    expect(writeTargetWouldNotResolve(nameSpace("sp-main", ACTIVE, ARCHIVED))).toContain(
+      "The write target main would not resolve",
+    );
+  });
+
+  it("explains the bare reference while the space list is still in flight", () => {
+    // `pending` is not `unknown`, and this is where the two stop being
+    // interchangeable on screen: a list that has not answered cannot name the
+    // target, so the sentence says why rather than leaving a 32-hex id alone.
+    const pending = writeTargetWouldNotResolve(nameSpace("sp-old", null, ARCHIVED));
+    const unknown = writeTargetWouldNotResolve(nameSpace("sp-old", ACTIVE, []));
+
+    expect(pending).toContain("the space list has not answered yet");
+    expect(pending).toContain("its id rather than its name");
+    expect(unknown).not.toContain("has not answered");
+    expect(pending).not.toBe(unknown);
+  });
+
+  it("never claims a space does not exist, for any answer", () => {
+    for (const kind of ["active", "archived", "unknown", "pending"] as const) {
+      expect(writeTargetWouldNotResolve({ label: "sp-x", kind })).not.toMatch(FORBIDDEN);
     }
   });
 });

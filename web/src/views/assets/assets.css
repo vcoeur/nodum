@@ -48,15 +48,35 @@
   list-style: none;
 }
 
+/* The flex gap is the whole of the spacing before the archived badge; the mark
+   used to add a margin of its own on top of it. */
+.nd-uploader__target {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--nd-space-2);
+}
+
+/* The write target will refuse every drop, and a drop arrived while a batch was
+   running. Same register as `.nd-editor__meta-warning`, which faces the first of
+   those states in the editor: `--nd-warn`, because nothing has broken — a write
+   is being declined in advance, and the remedy is on screen. */
+.nd-uploader__warning,
+.nd-uploader__refused {
+  font-size: var(--nd-text-xs);
+  line-height: var(--nd-leading-normal);
+  color: var(--nd-warn);
+}
+
 .nd-uploader__item {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 5rem 9rem minmax(0, 1fr);
-  align-items: center;
+  grid-template-columns: minmax(0, 1fr) 5rem 9rem minmax(0, 2fr) auto;
+  align-items: start;
   gap: var(--nd-space-6);
   padding: var(--nd-space-3) var(--nd-space-6);
   border-radius: var(--nd-radius-sm);
   background: var(--nd-bg);
   font-size: var(--nd-text-xs);
+  line-height: var(--nd-leading-normal);
 }
 
 .nd-uploader__status {
@@ -66,23 +86,35 @@
   color: var(--nd-text-muted);
 }
 
-.nd-uploader__item--registered .nd-uploader__status {
+/* A subgraph landed: the state ramp's `active`, which is what the nodes it
+   wrote are. */
+.nd-uploader__item--ingested .nd-uploader__status {
   color: var(--nd-state-active);
 }
 
-/* A dedup hit is a non-event: the archived ramp says "nothing happened here"
-   without borrowing the danger colour, which would read as a failure. */
-.nd-uploader__item--duplicate .nd-uploader__status {
-  color: var(--nd-state-archived);
+/* Already described in this space, so nothing was written — a non-event, which
+   is what the ordinary muted text says. Deliberately **not** the archived ramp:
+   that ramp encodes the service-layer state machine, and the `source` node this
+   row links to is `active`. Borrowing it painted "archived" on a live node. */
+.nd-uploader__item--already-ingested .nd-uploader__status {
+  color: var(--nd-text-muted);
 }
 
 .nd-uploader__item--failed .nd-uploader__status {
   color: var(--nd-danger);
 }
 
+/* Wraps, and has to. The previous occupant of this cell was a twelve-character
+   hash; it now carries the whole readout, and the refusal sentence runs to about
+   a hundred and seventy characters at `--nd-text-xs`. An ellipsis here cut the
+   copy the readout exists for, and put the rest only in a `title` that keyboard
+   and touch users never reach. */
 .nd-uploader__detail {
-  overflow: hidden;
-  text-overflow: ellipsis;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.nd-uploader__open {
   white-space: nowrap;
 }
 

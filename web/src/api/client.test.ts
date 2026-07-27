@@ -1,8 +1,9 @@
 /**
- * The API client's one piece of real logic: normalising a refused space filter.
+ * The two pieces of real logic in the API client: normalising a refused space
+ * filter, and the two-request capability upload.
  *
  * Everything else in `client.ts` is a URL and a verb, which type-checking
- * already covers. This does not: the two space-filtered reads answer an
+ * already covers. Neither of these is: the two space-filtered reads answer an
  * unresolvable space with **different statuses** — 404 from `GET /api/nodes`
  * (the service's `TypeNotFound`), 400 from `GET /api/search` (a bare
  * `ValueError`, since `nodum.search` does not import the service's exception
@@ -15,9 +16,14 @@
  * keyed on the status alone would have swallowed (a 404 from the listing is
  * equally an unknown `type` filter).
  *
+ * The upload is here for the same reason: which address it redeems on, what it
+ * declines to declare, and that its body is not sent as JSON are three
+ * decisions no type expresses, and each of them is the difference between a
+ * working ingestion and a silent wrong one.
+ *
  * `fetch` is stubbed rather than run: the point is the client's own reaction to
  * a wire shape, and the wire shape is pinned on the Python side by
- * `test_spaces_reach_the_human_over_http`.
+ * `test_spaces_reach_the_human_over_http` and the capability-URL tests.
  */
 
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -26,13 +32,17 @@ import {
   archiveSpace,
   createNode,
   createSpace,
+  ingestUpload,
   isUnknownSpace,
   listNodes,
+  redeemUploadGrant,
   renameSpace,
   search,
   UnknownSpaceError,
+  uploadRefusalPhase,
 } from "./client";
 import { describeFailure } from "../lib/failure";
+import type { IngestOut, UploadGrantOut } from "./types";
 
 /** Answer the next request with one status and one error envelope. */
 function stubFetch(status: number, type: string, message: string) {
@@ -241,6 +251,242 @@ describe("the write path and the lifecycle, not only the two reads", () => {
     expect(isUnknownSpace(error)).toBe(false);
     expect((error as ApiError).status).toBe(409);
     expect((error as ApiError).message).toContain("archived space already answers to");
+  });
+});
+
+/**
+ * The capability upload is the second piece of real logic in this file: two
+ * requests, and three of the decisions behind them are invisible in the types.
+ */
+describe("the capability upload flow", () => {
+  /** One recorded request. */
+  interface Call {
+    url: string;
+    init: RequestInit;
+  }
+
+  /** Answer the requests in order, recording what was sent. */
+  function stubSequence(...responses: { status?: number; body: unknown }[]): Call[] {
+    const calls: Call[] = [];
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL, init: RequestInit = {}) => {
+      calls.push({ url: String(input), init });
+      const answer = responses[calls.length - 1] ?? { body: {} };
+      return new Response(JSON.stringify(answer.body), {
+        status: answer.status ?? 200,
+        headers: { "content-type": "application/json" },
+      });
+    });
+    return calls;
+  }
+
+  /** A grant whose `url` deliberately names somewhere this page is not. */
+  function grant(token: string): UploadGrantOut {
+    return {
+      grant: {
+        kind: "upload",
+        token,
+        url: `https://nodum.example.org/api/uploads/${token}`,
+        asset_hash: null,
+        expires_at: "2026-07-27 10:05:00",
+        max_bytes: 12,
+      },
+      asset: null,
+    };
+  }
+
+  /** Enough of an `IngestOut` to be parsed; the readout is tested elsewhere. */
+  function ingested(): Partial<IngestOut> {
+    return { created: true, event_seq: 3 };
+  }
+
+  const file = () => new File(["a document\n"], "paper.pdf", { type: "application/pdf" });
+
+  it("declares name, mime, size and the write target — and no sha256", () => {
+    // D4: a declared hash the graph already holds is answered with the asset and
+    // no grant, and that shortcut proves the bytes exist rather than that
+    // anything describes them. Declaring one would skip the ingestion asked for.
+    const calls = stubSequence({ body: grant("tok-1") }, { body: ingested() });
+
+    return ingestUpload(file(), { space: "research" }).then(() => {
+      expect(calls[0]?.url).toBe("/api/uploads");
+      const body = JSON.parse(String(calls[0]?.init.body)) as Record<string, unknown>;
+      expect(body).toEqual({
+        name: "paper.pdf",
+        mime: "application/pdf",
+        size: 11,
+        space: "research",
+      });
+      expect(body).not.toHaveProperty("sha256");
+    });
+  });
+
+  it("redeems on our own origin, never the address the grant carries", async () => {
+    // D5: `grant.url` is built from `NODUM_PUBLIC_URL`, which exists for a
+    // foreign host and may name another machine entirely. The client owns its
+    // origin; the grant carries only the capability.
+    const calls = stubSequence({ body: grant("tok-1") }, { body: ingested() });
+    await ingestUpload(file(), { space: "research" });
+
+    expect(calls[1]?.url).toBe("/api/uploads/tok-1");
+    expect(calls[1]?.init.method).toBe("PUT");
+  });
+
+  it("sends the bytes raw, without claiming they are JSON", async () => {
+    // Every other non-GET here carries `Content-Type: application/json` because
+    // the server demands it. The two capability routes sit outside that gate
+    // precisely so a raw upload need not lie about its body.
+    const sent = file();
+    const calls = stubSequence({ body: grant("tok-1") }, { body: ingested() });
+    await ingestUpload(sent);
+
+    expect(calls[1]?.init.body).toBe(sent);
+    expect(calls[1]?.init.headers).not.toHaveProperty("Content-Type");
+  });
+
+  it("says so when a file's type is unknown rather than inventing one", async () => {
+    const calls = stubSequence({ body: grant("tok-1") }, { body: ingested() });
+    await ingestUpload(new File(["x"], "notes", { type: "" }));
+
+    const body = JSON.parse(String(calls[0]?.init.body)) as Record<string, unknown>;
+    expect(body["mime"]).toBe("application/octet-stream");
+  });
+
+  it("normalises a write target the mint refused", async () => {
+    stubSequence({
+      status: 404,
+      body: { error: { type: "TypeNotFound", message: "unknown space: research" } },
+    });
+    const error = await ingestUpload(file(), { space: "research" }).catch(
+      (caught: unknown) => caught,
+    );
+
+    expect(isUnknownSpace(error)).toBe(true);
+    expect((error as UnknownSpaceError).space).toBe("research");
+  });
+
+  it("normalises the same refusal from the redemption, which resolves the space again", async () => {
+    // A space archived between the mint and the PUT: the pipeline resolves the
+    // token row's space on the far side, so the refusal arrives from the second
+    // request with the same message and belongs to the same discriminator.
+    stubSequence(
+      { body: grant("tok-1") },
+      {
+        status: 404,
+        body: { error: { type: "TypeNotFound", message: "unknown space: sp-old" } },
+      },
+    );
+    const error = await ingestUpload(file(), { space: "sp-old" }).catch(
+      (caught: unknown) => caught,
+    );
+
+    expect(isUnknownSpace(error)).toBe(true);
+    expect((error as UnknownSpaceError).space).toBe("sp-old");
+  });
+
+  it("normalises a refused space on the exported redemption, with no mint in sight", async () => {
+    // `redeemUploadGrant` is exported on the `api` barrel and its docstring
+    // invites direct use, so it has to be safe on its own. Unnormalised, a
+    // direct caller has no sanctioned way to recognise the refusal —
+    // `isUnknownSpace` answers false — and the only thing left is
+    // `describeFailure`, which renders any 404 as *"The server has no record of
+    // …"* plus the server's own *"unknown space: sp-old"*: two forbidden
+    // phrasings in one sentence. Normalising is what gives the caller the
+    // discriminator that keeps it away from that path.
+    stubSequence({
+      status: 404,
+      body: { error: { type: "TypeNotFound", message: "unknown space: sp-old" } },
+    });
+    const error = await redeemUploadGrant("tok-1", file()).catch((caught: unknown) => caught);
+
+    expect(isUnknownSpace(error)).toBe(true);
+    expect((error as UnknownSpaceError).type).toBe("UnknownSpace");
+    // The token row's space is what the pipeline resolved, so the message names
+    // the id; that is all this half can know, and it is not left bare.
+    expect((error as UnknownSpaceError).space).toBe("sp-old");
+    expect((error as UnknownSpaceError).wireStatus).toBe(404);
+  });
+
+  it("leaves a redemption refusal that is not about a space alone", async () => {
+    stubSequence({
+      status: 400,
+      body: {
+        error: { type: "UnsupportedUpload", message: "these bytes are not a type this route can act on" },
+      },
+    });
+    const error = await redeemUploadGrant("tok-1", file()).catch((caught: unknown) => caught);
+
+    expect(isUnknownSpace(error)).toBe(false);
+    expect((error as ApiError).type).toBe("UnsupportedUpload");
+  });
+
+  it("says which request refused, because the two are not the same event", async () => {
+    // A refused mint sent nothing; a refused redemption spent the grant and
+    // streamed the whole file. Copy that cannot tell them apart claims "nothing
+    // was uploaded" about a request that uploaded all of it.
+    stubSequence({
+      status: 404,
+      body: { error: { type: "TypeNotFound", message: "unknown space: research" } },
+    });
+    const fromMint = await ingestUpload(file(), { space: "research" }).catch(
+      (caught: unknown) => caught,
+    );
+
+    stubSequence(
+      { body: grant("tok-1") },
+      {
+        status: 404,
+        body: { error: { type: "TypeNotFound", message: "unknown space: sp-old" } },
+      },
+    );
+    const fromRedemption = await ingestUpload(file(), { space: "reading" }).catch(
+      (caught: unknown) => caught,
+    );
+
+    expect(uploadRefusalPhase(fromMint)).toBe("mint");
+    expect(uploadRefusalPhase(fromRedemption)).toBe("redemption");
+    // Still one discriminator for space-ness: the phase is extra information,
+    // not a second way to ask whether a space was refused.
+    expect(isUnknownSpace(fromMint)).toBe(true);
+    expect(isUnknownSpace(fromRedemption)).toBe(true);
+  });
+
+  it("re-labels a redemption refusal with the reference the human typed", async () => {
+    // The pipeline reports the *resolved* id, which is a 32-hex string nobody
+    // typed; the caller asked for `reading`, and that is what the copy has to
+    // resolve and name.
+    stubSequence(
+      { body: grant("tok-1") },
+      {
+        status: 404,
+        body: {
+          error: { type: "TypeNotFound", message: "unknown space: 18ee0caa66204b5284774855a9d5cb34" },
+        },
+      },
+    );
+    const error = await ingestUpload(file(), { space: "reading" }).catch(
+      (caught: unknown) => caught,
+    );
+
+    expect((error as UnknownSpaceError).space).toBe("reading");
+    expect(uploadRefusalPhase(error)).toBe("redemption");
+  });
+
+  it("has no phase on a bare unknown-space error, which no upload raises", () => {
+    expect(uploadRefusalPhase(new UnknownSpaceError("sp-old", 404, "unknown space: sp-old"))).toBeNull();
+    expect(uploadRefusalPhase(new ApiError(400, "TokenInvalid", "invalid or expired token"))).toBeNull();
+  });
+
+  it("does not crash on a grantless answer, and says nothing was ingested", async () => {
+    // Unreachable while no sha256 is declared, so this is the shape being
+    // handled honestly rather than dereferenced into a TypeError.
+    const calls = stubSequence({
+      body: { grant: null, asset: { hash: "a".repeat(64) } },
+    });
+    const error = await ingestUpload(file()).catch((caught: unknown) => caught);
+
+    expect(calls).toHaveLength(1);
+    expect((error as ApiError).type).toBe("MissingUploadGrant");
+    expect((error as ApiError).message).toContain("not ingested");
   });
 });
 
