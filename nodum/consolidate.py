@@ -94,6 +94,11 @@ JOB_NEGLECT = "neglect_report"
 #: nothing to the review surface.
 DUPLICATE_EDGE_TYPE = "duplicate_of"
 
+#: The state every edge a job suggests is filed in, whatever the gardener's
+#: grant would otherwise allow (see :func:`_write_edges`). A suggestion nobody
+#: reviews is not a suggestion.
+SUGGESTION_LANDING = "proposed"
+
 #: The honest type for an inferred link. Embedding proximity and co-citation are
 #: evidence that two nodes are *about* related things — they are not evidence
 #: that one supports, cites, or is part of the other, and ``relates_to`` is the
@@ -821,7 +826,7 @@ JOBS = {
 }
 
 
-# ── Writing (one door, so the landing state is reported in one place) ────────
+# ── Writing (one door, so the landing state is chosen in one place) ──────────
 
 
 def _write_edges(context: _Context, outcome: JobOutcome, suggestions: list[dict[str, Any]]) -> None:
@@ -831,29 +836,30 @@ def _write_edges(context: _Context, outcome: JobOutcome, suggestions: list[dict[
     suggestion rather than aborting the batch, so a cross-space pair the
     gardener may not write costs one ``skipped`` line and not the job.
 
-    The landing state is **reported, not chosen**: an edge lands ``proposed``
-    under a ``suggest`` grant and ``active`` under an ``edit`` one, and
-    migration ``0014`` grants the gardener ``edit`` on ``meta`` and ``main``. So
-    on a default install these suggestions land ``active`` and do *not* reach
-    the review queue. That is a service-layer gap rather than a decision here —
-    there is no way to ask for a proposal when you hold ``edit`` (design §8.3's
-    ``always_propose`` policy rule is the seam for it and is not implemented) —
-    and the report says which state each batch landed in so the journal cannot
-    hide it. The D9 guarantee is untouched either way: the cycle proposes a
-    ``duplicate_of`` edge and never performs a merge.
+    **The landing state is chosen, not inherited.** Migration ``0014`` grants
+    the gardener ``edit`` on ``meta`` and ``main``, and a write lands at the
+    writer's grant level by default — so without this these suggestions would
+    land ``active`` and become asserted fact instead of reaching the review
+    queue, which is exactly what job 1's D9 argument rests on. Design §8.3 has
+    the seam: *"``edit`` = the agent writes ``active`` directly and self-governs
+    with its own confidence — confident writes go active, uncertain ones are
+    filed ``proposed``."* Every edge this door writes is inferred from
+    arithmetic over titles, vectors and shared neighbours, which is the
+    uncertain half by construction, so the whole door files
+    :data:`SUGGESTION_LANDING`. The grant is untouched — it is what lets the
+    *pruning* half of job 2 archive an edge outright — and the report still
+    says which state each batch landed in.
     """
     if not suggestions:
         return
-    result = service.propose_edges(suggestions, principal=context.principal, path=context.path)
+    result = service.propose_edges(
+        suggestions,
+        landing=SUGGESTION_LANDING,
+        principal=context.principal,
+        path=context.path,
+    )
     outcome.proposed = [edge.id for edge in result.created]
-    landed = sorted({edge.state for edge in result.created})
-    outcome.detail["landed"] = landed
-    if "active" in landed:
-        outcome.notes.append(
-            "these landed 'active' rather than 'proposed': the gardener holds `edit` where they "
-            "were written, and the service layer offers no way to ask for a proposal when you "
-            "hold `edit`. A human still performs every merge (D9) — the cycle never does"
-        )
+    outcome.detail["landed"] = sorted({edge.state for edge in result.created})
     for failure in result.failed:
         suggestion = suggestions[failure.index]
         outcome.skipped.append(

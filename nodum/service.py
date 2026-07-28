@@ -60,7 +60,7 @@ from nodum.models import (
     VersionOut,
 )
 from nodum.principal import EDIT, READ, SUGGEST, Principal
-from nodum.store import GrantNotPermitted, Store
+from nodum.store import GrantNotPermitted, Store, require_landing_state
 
 #: Allowed state values shared by nodes and edges.
 STATES = ("proposed", "active", "archived")
@@ -1473,6 +1473,7 @@ def _create_edge_in_conn(
     *,
     props: dict[str, Any] | None,
     confidence: float | None,
+    landing: str | None,
     actor: str,
     store: Store,
 ) -> dict[str, Any]:
@@ -1482,7 +1483,8 @@ def _create_edge_in_conn(
     principal cannot read is *not found* (an unreadable space does not
     exist); the landing state needs the matching grant on **both** endpoint
     spaces, and a cross-space edge's type node must live in meta
-    (:func:`Store.edge_landing_state` — Q13 note 03).
+    (:func:`Store.edge_landing_state` — Q13 note 03). ``landing`` is the
+    writer's own ceiling on that state (:func:`Store.cap_landing`).
     """
     src = _get_node_row(conn, src_id)
     dst = _get_node_row(conn, dst_id)
@@ -1493,7 +1495,7 @@ def _create_edge_in_conn(
     type_id, type_space = _resolve_edge_type(conn, type, store.principal)
     if confidence is not None and not 0 <= confidence <= 1:
         raise ValueError(f"confidence must be between 0 and 1, got {confidence}")
-    state = store.edge_landing_state(src["space_id"], dst["space_id"], type_space)
+    state = store.edge_landing_state(src["space_id"], dst["space_id"], type_space, landing)
     return _insert_edge(
         conn,
         src_id=src_id,
@@ -1513,6 +1515,7 @@ def create_edge(
     *,
     props: dict[str, Any] | None = None,
     confidence: float | None = None,
+    landing: str | None = None,
     principal: Principal,
     path: str | Path | None = None,
 ) -> EdgeOut:
@@ -1523,13 +1526,29 @@ def create_edge(
     ``suggest`` → ``proposed``); a cross-space edge's type node must live in
     meta.
 
+    Args:
+        src_id: Source node id.
+        dst_id: Destination node id.
+        type: Edge-type id or name.
+        props: Free-form JSON-object metadata.
+        confidence: Optional confidence in ``[0, 1]``.
+        landing: The writer's own ceiling on the landing state (design §8.3 —
+            a grant is a ceiling, not a mandate): ``"proposed"`` files the
+            edge for review even when the grant would have written it live.
+            It can only lower; asking for more than the grant allows is
+            refused (:func:`Store.cap_landing`).
+        principal: Who is writing.
+        path: Explicit database path.
+
     Raises:
         NodeNotFound: If either endpoint does not resolve — or is not
             readable by the principal.
         TypeNotFound: If the edge type does not resolve.
         GrantNotPermitted: If the grants on the endpoint spaces do not cover
-            the write, or a cross-space edge uses a non-meta type.
-        ValueError: If ``confidence`` is outside ``[0, 1]``.
+            the write, a cross-space edge uses a non-meta type, or ``landing``
+            asks for more than the grant allows.
+        ValueError: If ``confidence`` is outside ``[0, 1]``, or ``landing`` is
+            not a state a write can land in.
     """
     conn = _connect(path)
     try:
@@ -1541,6 +1560,7 @@ def create_edge(
             type,
             props=props,
             confidence=confidence,
+            landing=landing,
             actor=principal.actor_string,
             store=store,
         )
@@ -1553,6 +1573,7 @@ def create_edge(
 def propose_edges(
     suggestions: list[dict[str, Any]],
     *,
+    landing: str | None = None,
     principal: Principal,
     path: str | Path | None = None,
 ) -> ProposeEdgesOut:
@@ -1564,9 +1585,20 @@ def propose_edges(
     unknown endpoint/type, bad confidence) lands in ``failed`` with its
     input index; the rest still write. One commit for the whole batch.
 
+    Args:
+        suggestions: The edges to write, one object each.
+        landing: The writer's own ceiling on the landing state, applied to
+            every suggestion in the batch (see :func:`create_edge`). It is a
+            batch-level argument, so an unusable value is raised once rather
+            than reported once per suggestion.
+        principal: Who is writing.
+        path: Explicit database path.
+
     Raises:
-        ValueError: If ``suggestions`` is not a list of objects.
+        ValueError: If ``suggestions`` is not a list of objects, or ``landing``
+            is not a state a write can land in.
     """
+    require_landing_state(landing)
     conn = _connect(path)
     try:
         store = Store(conn, principal)
@@ -1584,6 +1616,7 @@ def propose_edges(
                     str(suggestion["edge_type"]),
                     props=suggestion.get("props"),
                     confidence=suggestion.get("confidence"),
+                    landing=landing,
                     actor=principal.actor_string,
                     store=store,
                 )
@@ -4714,6 +4747,7 @@ def supersede_edge(
                     replacement.get("type", before["type_id"]),
                     props=props,
                     confidence=replacement.get("confidence", before["confidence"]),
+                    landing=None,
                     actor=actor,
                     store=store,
                 )

@@ -139,6 +139,116 @@ def test_create_edge_validates(fresh_db):
         service.create_edge(a.id, b.id, "supports", confidence=1.5, principal=owner())
 
 
+# ── The landing seam: a grant is a ceiling, not a mandate (design §8.3) ───────
+
+
+def _pair():
+    """Two claim nodes in `main`, written by the owner, to hang an edge between."""
+    return (
+        service.create_node(type="claim", title="A", principal=owner()),
+        service.create_node(type="claim", title="B", principal=owner()),
+    )
+
+
+def test_an_edit_grant_may_file_a_write_proposed_instead(fresh_db):
+    """§8.3's self-governing writer: confident writes go active, uncertain ones wait."""
+    a, b = _pair()
+    curator = agent("curator", grants={"meta": "read", "main": "edit"})
+
+    edge = service.create_edge(a.id, b.id, "supports", landing="proposed", principal=curator)
+
+    assert edge.state == "proposed"
+    # And it is in the queue, which is the whole point of asking for it.
+    assert [item.id for item in service.list_proposals(principal=owner())] == [edge.id]
+
+
+def test_a_human_may_file_a_write_proposed_too(fresh_db):
+    """No human special case: a human is `edit` everywhere, so the same ceiling applies."""
+    a, b = _pair()
+
+    edge = service.create_edge(a.id, b.id, "supports", landing="proposed", principal=owner())
+
+    assert edge.state == "proposed"
+
+
+def test_asking_to_land_active_on_a_suggest_grant_is_refused(fresh_db):
+    """The seam only ever lowers — it is never a way around the grant."""
+    a, b = _pair()
+    proposer = agent("proposer", grants={"meta": "read", "main": "suggest"})
+
+    with pytest.raises(GrantNotPermitted, match="ceiling on the grant"):
+        service.create_edge(a.id, b.id, "supports", landing="active", principal=proposer)
+
+    assert service.list_edges(principal=owner()) == []
+
+
+def test_a_suggest_grant_lands_proposed_whatever_it_asks_for(fresh_db):
+    """The ceiling property: no argument value can raise where a write lands."""
+    a, b = _pair()
+    proposer = agent("proposer", grants={"meta": "read", "main": "suggest"})
+
+    for landing in (None, "proposed"):
+        edge = service.create_edge(a.id, b.id, "supports", landing=landing, principal=proposer)
+        assert edge.state == "proposed"
+
+
+def test_landing_active_under_an_edit_grant_is_the_default_said_out_loud(fresh_db):
+    a, b = _pair()
+    curator = agent("curator", grants={"meta": "read", "main": "edit"})
+
+    edge = service.create_edge(a.id, b.id, "supports", landing="active", principal=curator)
+
+    assert edge.state == "active"
+
+
+def test_propose_edges_applies_the_landing_to_the_whole_batch(fresh_db):
+    a, b = _pair()
+    c = service.create_node(type="claim", title="C", principal=owner())
+    curator = agent("curator", grants={"meta": "read", "main": "edit"})
+
+    result = service.propose_edges(
+        [
+            {"src": a.id, "dst": b.id, "edge_type": "supports"},
+            {"src": b.id, "dst": c.id, "edge_type": "supports"},
+        ],
+        landing="proposed",
+        principal=curator,
+    )
+
+    assert result.failed == []
+    assert [edge.state for edge in result.created] == ["proposed", "proposed"]
+
+
+def test_propose_edges_reports_an_escalation_as_a_failed_suggestion(fresh_db):
+    """A refusal that depends on the endpoints is per suggestion, like every other."""
+    a, b = _pair()
+    proposer = agent("proposer", grants={"meta": "read", "main": "suggest"})
+
+    result = service.propose_edges(
+        [{"src": a.id, "dst": b.id, "edge_type": "supports"}],
+        landing="active",
+        principal=proposer,
+    )
+
+    assert result.created == []
+    assert "ceiling on the grant" in result.failed[0].error
+    assert service.list_edges(principal=owner()) == []
+
+
+def test_a_landing_state_a_write_cannot_land_in_is_refused_once(fresh_db):
+    """`archived` is not a landing state, and a batch-level argument fails once."""
+    a, b = _pair()
+
+    with pytest.raises(ValueError, match="landing must be one of"):
+        service.create_edge(a.id, b.id, "supports", landing="archived", principal=owner())
+    with pytest.raises(ValueError, match="landing must be one of"):
+        service.propose_edges(
+            [{"src": a.id, "dst": b.id, "edge_type": "supports"}] * 3,
+            landing="archived",
+            principal=owner(),
+        )
+
+
 def test_accept_reject_archive_transitions(fresh_db):
     node = service.create_node(type="note", title="p", principal=agent("x"))
     assert node.state == "proposed"

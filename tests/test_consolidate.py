@@ -403,15 +403,64 @@ def test_with_a_provider_the_job_never_claims_it_degraded(fresh_db):
     assert not [note for note in outcome.notes if "no embedding provider" in note]
 
 
-def test_the_report_says_which_state_the_suggestions_landed_in(fresh_db):
-    """The gardener holds `edit` on main, so they land active — and it is said."""
+def test_a_duplicate_candidate_lands_proposed_and_reaches_the_review_queue(fresh_db):
+    """The point of the job: the gardener holds `edit` and files a proposal anyway.
+
+    A grant is a ceiling, not a mandate (design §8.3), so the candidate arrives
+    where a human reviews it rather than as asserted fact.
+    """
     _node("Alpha")
     _node("Alpha")
 
     outcome = _outcome(_run().report, consolidate.JOB_DUPLICATES)
 
-    assert outcome.detail["landed"] == ["active"]
-    assert any("landed 'active'" in note for note in outcome.notes)
+    (edge,) = _duplicates()
+    assert edge.state == "proposed"
+    assert outcome.detail["landed"] == ["proposed"]
+    queued = [item for item in service.list_proposals(principal=owner()) if item.kind == "edge"]
+    assert [item.id for item in queued] == [edge.id]
+    assert queued[0].created_by == "agent:builtin-gardener"
+
+
+def test_an_inferred_link_lands_proposed_too(fresh_db):
+    """One door, one landing state: the link job suggests as much as job 1 does."""
+    first, second = _node("First"), _node("Second")
+    for hub in (_node("HubOne"), _node("HubTwo")):
+        _edge(first.id, hub.id)
+        _edge(second.id, hub.id)
+
+    outcome = _outcome(_run().report, consolidate.JOB_LINKS)
+
+    assert {edge.state for edge in _related()} == {"proposed"}
+    assert outcome.detail["landed"] == ["proposed"]
+
+
+def test_the_gardener_still_prunes_with_the_grant_it_files_proposals_under(fresh_db):
+    """Filing below the grant is per write — it does not disarm the `edit` grant."""
+    first, second = _node("First"), _node("Second")
+    kept = _edge(first.id, second.id)
+    duplicate = _edge(first.id, second.id)
+
+    outcome = _outcome(_run().report, consolidate.JOB_LINKS)
+
+    assert outcome.applied == [duplicate.id]
+    assert _edge_state(duplicate.id) == "archived"
+    assert _edge_state(kept.id) == "active"
+
+
+def test_a_reviewed_candidate_does_not_come_back_next_cycle(fresh_db):
+    """Accepting is what makes the candidate live, and the cycle leaves it alone."""
+    _node("Alpha")
+    _node("Alpha")
+    _run()
+    (candidate,) = _duplicates()
+    service.transition(candidate.id, "accept", principal=owner())
+
+    second = _run()
+
+    assert _outcome(second.report, consolidate.JOB_DUPLICATES).proposed == []
+    assert [edge.id for edge in _duplicates()] == [candidate.id]
+    assert _edge_state(candidate.id) == "active"
 
 
 def test_consolidation_never_proposes_a_merge(fresh_db):
@@ -781,7 +830,7 @@ def test_the_events_a_failed_cycle_wrote_stay_and_stay_stamped(fresh_db, monkeyp
     result = _run()
 
     stamped = service.list_events(owner(), cycle_id=result.cycle.id)
-    assert [event.op for event in stamped] == ["edge.create"]
+    assert [event.op for event in stamped] == ["edge.propose"]
     assert result.cycle.status == "failed"
 
 
