@@ -33,12 +33,16 @@ write over
 MCP, never the CLI, and land per their grants (`suggest` → `proposed`, `edit` →
 `active`).
 
-**Human-only operations** — `accept`, `reject`, `archive`, `undo`, every
+**Human-only operations** — `accept`, `reject`, `archive`, `undo`, `rollback`,
+every
 `review` subcommand, and all account/grant administration (`human`, `agent`,
 `grant`, `revoke`, `space-*` commands) require a human principal. Review
-(`accept`/`reject`/`archive`) can also be exercised by an agent holding `edit`
-on the item's space — over the service API, not the CLI; `undo` stays
-human-only.
+(`accept`/`reject`/`archive`) and the curative tier (`merge-nodes`, `retype`,
+`supersede-edge`, `bulk-relink`, `consolidate`) can also be exercised by an
+agent holding `edit` on the spaces involved — over the service API, not the
+CLI. `undo` and `rollback` stay human-only: both write a recorded payload back
+verbatim, `state = 'active'` included, and `rollback` does it for a whole cycle
+at once.
 
 **Rejections need a reason** — both `reject <id> --reason` and `review reject
 … --reason` require it and record it in the reject event's payload.
@@ -94,10 +98,15 @@ including every parameter.
 
 ### History and state
 
-- `events` — Show the most recent event-log entries (newest first).
+- `events` — Show the most recent event-log entries (newest first). `--cycle
+  <id>` narrows to one consolidation cycle: that is a journal entry's diff, read
+  off the append-only log rather than stored a second time.
 - `history <node-id>` — Show a node's version history (chronological).
 - `diff <a> <b>` — Unified diff between two versions of one node.
 - `undo [seq]` — Reverse an event, restoring the prior state from its payload.
+  An event carrying a `cycle_id` is **not** undoable here — `rollback` takes
+  the whole cycle instead — and the no-argument search skips those rather than
+  stopping on one.
 - `accept <id>` — Accept a proposed node, edge, or update (proposed → active). Human only.
 - `reject <id> --reason` — Reject a proposed node, edge, or update (proposed → archived). Human only.
 - `archive <id>` — Archive an active node or edge (active → archived).
@@ -171,6 +180,65 @@ including every parameter.
   filter is a convenience, not a boundary: an agent stays confined to its
   grants underneath it, and a space it holds no grant on does not resolve at
   all, answering exactly as a nonexistent one does.
+
+### Consolidation and the curative tier
+
+- `consolidate` — Run a consolidation cycle: the gardener's four deterministic
+  jobs, and its report. `--scope` confines it to one space, `--job` selects jobs
+  (repeatable; default is all of them, in order), `--dry-run` computes
+  everything and emits **no** event at all.
+- `cycle-list` — List cycles, newest first: the dream journal. Human-only.
+- `cycle-get <id>` — One journal entry: what ran, what it measured, how it
+  ended. Human-only.
+- `rollback <cycle-id>` — Take a whole cycle back, all of it or none of it.
+  `--dry-run` reports what would be reversed and what stands in the way.
+  Human-only.
+- `merge-nodes <ids…> --into <id>` — Merge nodes into a survivor. Soft and
+  reversible: nothing is destroyed.
+- `retype <ids…> --type <t>` — Change nodes' type. The one sanctioned exception
+  to a node's type being fixed at creation.
+- `supersede-edge <edge-id>` — Retire an edge that stopped being true,
+  optionally naming its successor with `--src`, `--dst`, `--type`,
+  `--confidence` and `--set`.
+- `bulk-relink` — Repoint or retype many edges at once. `--src`/`--dst`/
+  `--type`/`--state` select, `--to-type`/`--to-dst` say what changes, and
+  `--dry-run` prints the diff and writes nothing.
+
+The writes a cycle makes are the **gardener's** (`agent:builtin-gardener`), an
+internal agent seeded with `edit` on `meta` and `main` as ordinary grant rows —
+they show up in `space-list` and `nodum revoke builtin-gardener main` takes them
+away. `--as` on `consolidate` names who *asked*, which the journal records as
+`triggered_by`, and that is deliberately not the same thing as who acted: an
+entry carrying only one of the two could answer "I did not ask for this" or
+"who ran this at 04:00", never both.
+
+**The gardener proposes; it does not dispose.** Duplicate candidates become
+`proposed` `duplicate_of` edges in the review queue — a merge is always
+human-approved — and every edge it infers is filed `proposed` even though its
+grant would let it write live, because a suggestion nobody reviews is not a
+suggestion. What it does apply are the two prunings a machine can be right
+about: an exact duplicate edge, and an edge incident to an archived node.
+
+**What a cycle changed is not in its report.** The report says what each job
+examined, proposed, applied and skipped, plus the coherence metrics before and
+after; the diff is `nodum events --cycle <id>`, read off the same append-only
+log as everything else, so the journal can never become a second record that
+disagrees with what happened.
+
+**Every curative command runs inside a cycle**, including when you type it
+yourself — each writes several rows from one decision, and `undo` reverses one
+row from one payload, so undoing half a merge would leave the other half
+standing. `rollback <cycle-id>` is therefore the way back from all of them, and
+`undo` refuses a cycle-stamped event by name rather than doing the wrong thing
+quietly. A rollback is itself a cycle, so rolling *that* back re-applies the
+original.
+
+**A rollback refuses rather than clobbers.** If anything outside the cycle has
+touched a row the cycle touched, nothing is written and the refusal is this
+CLI's one structured error — `{"error": {"type", "message", "conflicts"}}` on
+stdout, each conflict naming both the cycle event that wrote the row and the
+later event that moved it, with the message on stderr and exit 1 as usual.
+`--dry-run` asks the same question without the refusal.
 
 ### Derived indexes
 
@@ -280,11 +348,30 @@ Spaces mirror their commands the same way: `GET /api/nodes` and
 `POST /api/spaces/{id}/rename` and `POST /api/spaces/{id}/archive`, with
 `GET /api/spaces` returning exactly what `nodum space-list` prints.
 `POST /api/ingest` mirrors `nodum ingest`, taking exactly one of `path` and
-`url`. The two capability-URL redemption routes — `GET /api/download/{token}`
+`url`. The consolidation journal is there too: `GET /api/cycles` (newest first),
+`POST /api/cycles` (run one now, with optional `scope` and `dry_run`),
+`GET /api/cycles/{id}` (the entry plus the events it wrote, bounded by `?limit=`
+with `events_truncated` when it bit) and `POST /api/cycles/{id}/rollback`, where
+a graph that has moved on is a **409** carrying the conflicting rows rather than
+a bare refusal. The curative tier has no HTTP routes at all — it is the CLI's.
+The two capability-URL redemption routes — `GET /api/download/{token}`
 and `PUT /api/uploads/{token}` — are the only `/api` routes outside the session
 gate: the single-use token in the path *is* the authorisation, so there is no
 ambient cookie for a cross-origin page to ride.
 
 ```sh
 nodum serve [--host 127.0.0.1] [--port 8600] [--allow-host NAME] [--db PATH]
+```
+
+**The nightly consolidation cycle is configured by environment, not by flag.**
+Set `NODUM_CONSOLIDATE_AT` to a 24-hour local wall-clock time and `nodum serve`
+runs one cycle a night in the process it is already running — no cron, no second
+process. Unset means **off**, which is the default: a background process that
+writes to the graph without being asked is not something to enable by surprise,
+and a flag would put that one keystroke away from an ordinary `serve`. A value
+that is set but unreadable is announced on stderr and ignored, rather than
+stopping the server from booting.
+
+```sh
+NODUM_CONSOLIDATE_AT=03:30 nodum serve
 ```
