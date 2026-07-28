@@ -32,35 +32,61 @@
  * cancelling, nothing confirming on a keypress (the `Modal` contract).
  */
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { api, isRollbackConflict } from "../../api/client";
 import { Modal, Spinner, useToast } from "../../components";
-import type { CycleOut, RollbackOut } from "../../api/types";
+import type {
+  CycleOut,
+  RollbackBlockerOut,
+  RollbackConflictOut,
+  RollbackOut,
+} from "../../api/types";
 import { describeError, describeFailure } from "../../lib";
 import type { FailureDescription } from "../../lib";
-import { rollbackPlan, rollbackRefusal, shortId } from "./journal";
-import type { RollbackPlan, RowNamer } from "./journal";
+import { rollbackPlan, rollbackRefusal, rowHeadlines, shortId, verdictNodeIds } from "./journal";
+import type { EventChange } from "./journal";
+import { useNodeTitles } from "./useNodeTitles";
 
-/** Where the dialog is: rehearsing, showing a verdict, or refusing to plan. */
+/**
+ * Where the dialog is: rehearsing, showing the dry run's verdict, showing the
+ * 409 race's, or refusing to plan at all.
+ *
+ * It holds the server's **raw** answer rather than a rendered plan, because
+ * naming the rows takes a lookup that lands after the verdict does — see the
+ * titles below. The plan is derived each render from whatever has resolved so
+ * far, so a title arriving simply renames a row already on screen.
+ */
 type PreflightState =
   | { status: "checking" }
-  | { status: "ready"; plan: RollbackPlan }
+  | { status: "ready"; result: RollbackOut }
+  | { status: "refused"; conflicts: RollbackConflictOut[] }
   | { status: "failed"; failure: FailureDescription };
+
+/** Stable empties, so the verdict memo below does not change identity per render. */
+const NO_CONFLICTS: RollbackConflictOut[] = [];
+const NO_BLOCKERS: RollbackBlockerOut[] = [];
 
 interface RollbackDialogProps {
   /** The cycle being taken back. */
   cycle: CycleOut;
   /**
-   * Names a row this cycle touched, from the page's own event list.
+   * The cycle's own events, reduced — the page's record of what it wrote.
    *
    * The server reports a conflict by row id, because it is reporting on the
    * `nodes`/`edges` tables. The page behind this dialog is not: every
-   * conflicting row is a row the cycle wrote, so its event is in the list and
+   * conflicting row is a row the cycle wrote, so its event is in this list and
    * that payload already carries the title. Showing `e1a2b3c4…` while the list
    * two inches away says *"Meeting 2026-07-01"* makes the reader do a lookup the
    * page had already done.
+   *
+   * Passed as the events rather than as a namer, because for an **edge** the
+   * event carries two endpoint *ids* and the titles have to be fetched — the
+   * same lookup the diff behind this dialog is already doing for its own page.
+   * Handed a pre-built namer, this dialog printed `relates_to: 19c082d3… →
+   * db24d36d…` for an edge the list rendered as *"event sourcing → Event
+   * Sourcing"*.
    */
-  nameRow: RowNamer;
+  changes: readonly EventChange[];
   /** Called with the result once a rollback has actually happened. */
   onRolledBack: (result: RollbackOut) => Promise<void> | void;
   /** Cancel handler for every dismissal route. */
@@ -71,11 +97,11 @@ interface RollbackDialogProps {
  * Confirm a rollback, having first asked the server whether it would work.
  *
  * @param cycle The cycle being taken back.
- * @param nameRow Names a row this cycle touched; see the prop's own note.
+ * @param changes The cycle's reduced events; see the prop's own note.
  * @param onRolledBack Called with the outcome; the dialog closes after it.
  * @param onClose Cancel handler.
  */
-export function RollbackDialog({ cycle, nameRow, onRolledBack, onClose }: RollbackDialogProps) {
+export function RollbackDialog({ cycle, changes, onRolledBack, onClose }: RollbackDialogProps) {
   const toast = useToast();
   const [preflight, setPreflight] = useState<PreflightState>({ status: "checking" });
   const [committing, setCommitting] = useState(false);
@@ -84,7 +110,7 @@ export function RollbackDialog({ cycle, nameRow, onRolledBack, onClose }: Rollba
     const controller = new AbortController();
     api
       .rollbackCycle(cycle.id, { dryRun: true }, controller.signal)
-      .then((result) => setPreflight({ status: "ready", plan: rollbackPlan(result, nameRow) }))
+      .then((result) => setPreflight({ status: "ready", result }))
       .catch((error: unknown) => {
         if (controller.signal.aborted) return;
         // Every refusal other than a conflict is raised on the dry run too — a
@@ -94,9 +120,34 @@ export function RollbackDialog({ cycle, nameRow, onRolledBack, onClose }: Rollba
         setPreflight({ status: "failed", failure: describeFailure(error, "this cycle") });
       });
     return () => controller.abort();
-    // `nameRow` is memoised by the view; it changes only when the event list it
-    // reads does, which is exactly when the preflight is worth re-running.
-  }, [cycle.id, nameRow]);
+  }, [cycle.id]);
+
+  // The rows the verdict names, whichever of the two verdicts is on screen.
+  const verdict = useMemo(() => {
+    if (preflight.status === "ready") {
+      return { conflicts: preflight.result.conflicts, blockers: preflight.result.blockers };
+    }
+    if (preflight.status === "refused") {
+      return { conflicts: preflight.conflicts, blockers: NO_BLOCKERS };
+    }
+    return { conflicts: NO_CONFLICTS, blockers: NO_BLOCKERS };
+  }, [preflight]);
+
+  // One lookup, bounded by the verdict rather than by the cycle: a clean
+  // rollback names no rows and fetches nothing at all.
+  const wanted = useMemo(
+    () => verdictNodeIds(verdict.conflicts, verdict.blockers, changes),
+    [verdict, changes],
+  );
+  const titles = useNodeTitles(wanted);
+  const rowNames = useMemo(() => rowHeadlines(changes, titles), [changes, titles]);
+  const nameRow = useCallback(
+    // Two sources, in order: a row this cycle wrote is called what its own event
+    // calls it; a dependant is a row outside the cycle, so only the direct
+    // title lookup can name one.
+    (rowId: string) => rowNames.get(rowId) ?? titles.get(rowId) ?? null,
+    [rowNames, titles],
+  );
 
   const commit = () => {
     setCommitting(true);
@@ -112,7 +163,7 @@ export function RollbackDialog({ cycle, nameRow, onRolledBack, onClose }: Rollba
           // The race: the preflight passed and the graph moved before the
           // commit. Nothing was written, so the dialog stays up with the new
           // verdict rather than reporting a failure and closing.
-          setPreflight({ status: "ready", plan: rollbackRefusal(error.conflicts, nameRow) });
+          setPreflight({ status: "refused", conflicts: error.conflicts });
           return;
         }
         toast.show("error", "The rollback did not happen", describeError(error));
@@ -120,7 +171,12 @@ export function RollbackDialog({ cycle, nameRow, onRolledBack, onClose }: Rollba
     );
   };
 
-  const plan = preflight.status === "ready" ? preflight.plan : null;
+  const plan =
+    preflight.status === "ready"
+      ? rollbackPlan(preflight.result, nameRow)
+      : preflight.status === "refused"
+        ? rollbackRefusal(preflight.conflicts, nameRow)
+        : null;
   const canConfirm = plan !== null && !plan.blocked && !committing;
 
   return (

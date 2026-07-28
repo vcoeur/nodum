@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import ast
+import inspect
+
 import pytest
 from helpers import OWNER_ACTOR, agent, owner
 
-from nodum import auth, service
+from nodum import auth, search, service
 from nodum.migrations import GARDENER_AGENT_ID
 from nodum.service import (
     EdgeNotFound,
@@ -430,6 +433,52 @@ def test_the_reserved_prefix_is_still_answered_first(fresh_db):
 # ── Capped reads: a limit below 1 is a refusal, never "unbounded" ─────────────
 
 
+def _capped_reads():
+    """Every public read across `service` and `search` that takes a row cap.
+
+    **Discovered, never listed.** `require_positive_limit`'s docstring claims
+    every capped read goes through it, and the test that named that universal
+    called two functions by hand — so `list_edges`, `list_proposals`,
+    `suggest_links` and `search` sat outside the claim while it stayed green.
+    A read that grows a `limit` (or search's `k`) joins this set the moment it
+    is written, and the call table below has to grow with it or the test fails
+    on the set comparison before it ever reaches an assertion about behaviour.
+
+    Returns:
+        ``{"<module>.<function>": cap-parameter-name}``.
+    """
+    found = {}
+    for module in (service, search):
+        for name, function in vars(module).items():
+            if name.startswith("_") or not inspect.isfunction(function):
+                continue
+            # The helper takes a `limit` because it *is* the check, and it is
+            # defined once — `search` re-exports nothing, it imports it, which
+            # the module test below already skips.
+            if function is service.require_positive_limit:
+                continue
+            if inspect.getmodule(function) is not module:
+                continue
+            parameters = inspect.signature(function).parameters
+            cap = next((name for name in ("limit", "k") if name in parameters), None)
+            if cap is not None:
+                found[f"{module.__name__.rpartition('.')[2]}.{name}"] = cap
+    return found
+
+
+def _calls_the_limit_helper(qualified_name):
+    """True when ``<module>.<function>``'s body calls ``require_positive_limit``."""
+    module_name, _, function_name = qualified_name.partition(".")
+    module = {"service": service, "search": search}[module_name]
+    tree = ast.parse(inspect.getsource(getattr(module, function_name)))
+    return any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "require_positive_limit"
+        for node in ast.walk(tree)
+    )
+
+
 def test_a_limit_below_one_is_refused_by_every_capped_read(fresh_db):
     """SQLite reads a negative ``LIMIT`` as *unbounded* — the opposite answer.
 
@@ -438,19 +487,84 @@ def test_a_limit_below_one_is_refused_by_every_capped_read(fresh_db):
     the entire log and the entire node list, so a caller asking for **less**
     silently got **everything**. A `limit` of 0 was the mirror image, returning
     nothing under a spelling that reads like "as few as possible".
+
+    Four more were still outside the rule when this test claimed all of them.
+    `list_edges` took the number to SQL like the two above; `list_proposals`
+    sliced a Python list, so a negative limit silently dropped rows off the
+    **end of the review queue** — `--limit -2` on 1043 proposals answered with
+    1041 and exit 0, on the one screen whose whole job is not to lose one; and
+    `search`'s `k` reached three ranked queries the same way. `suggest_links`
+    restated the check inline instead of routing through the helper, which is
+    the same failure one edit away.
+
+    So the set is **enumerated** rather than typed out: `_capped_reads` reads it
+    off the two modules, and a new capped read fails here until it is added.
     """
     for index in range(3):
-        service.create_node(type="note", title=f"n{index}", principal=owner())
+        node = service.create_node(type="note", title=f"n{index}", principal=owner())
+    service.create_edge(node.id, node.id, "relates_to", principal=owner())
 
-    for limit in (0, -3):
-        with pytest.raises(ValueError, match="limit must be >= 1"):
-            service.list_nodes(principal=owner(), limit=limit)
-        with pytest.raises(ValueError, match="limit must be >= 1"):
-            service.list_events(owner(), limit=limit)
+    # One call per capped read, with the cap left for the loop to supply.
+    calls = {
+        "service.list_nodes": lambda cap: service.list_nodes(principal=owner(), **cap),
+        "service.list_edges": lambda cap: service.list_edges(principal=owner(), **cap),
+        "service.list_proposals": lambda cap: service.list_proposals(principal=owner(), **cap),
+        "service.list_events": lambda cap: service.list_events(owner(), **cap),
+        "service.list_cycles": lambda cap: service.list_cycles(principal=owner(), **cap),
+        "service.subgraph": lambda cap: service.subgraph(node.id, principal=owner(), **cap),
+        "service.suggest_links": lambda cap: service.suggest_links("n", principal=owner(), **cap),
+        "search.search": lambda cap: search.search("n0", principal=owner(), **cap),
+    }
+    discovered = _capped_reads()
+    assert set(calls) == set(discovered), (
+        "a capped read appeared or moved; add it to the call table above so the "
+        "universal this test names keeps covering every one of them"
+    )
+
+    for name, cap in sorted(discovered.items()):
+        for value in (0, -3):
+            with pytest.raises(ValueError, match=f"{cap} must be >= 1"):
+                calls[name]({cap: value})
+
+    # And each one reaches that refusal through the **helper**, not through a
+    # copy of it. `suggest_links` restated the check inline and was correct, so
+    # nothing behavioural could tell the two apart — which is exactly how the
+    # next capped read gets a fifth spelling of one rule, and how one of them
+    # ends up saying something the others do not.
+    for name in sorted(discovered):
+        assert _calls_the_limit_helper(name), (
+            f"{name} caps its result without calling require_positive_limit; "
+            "the helper's docstring claims every capped read goes through it"
+        )
 
     # The guard refuses the bad value and nothing else: 1 still means one.
+    for name, cap in sorted(discovered.items()):
+        assert calls[name]({cap: 1}) is not None, name
     assert len(service.list_nodes(principal=owner(), limit=1)) == 1
     assert len(service.list_events(owner(), limit=1)) == 1
+    assert len(service.list_edges(principal=owner(), limit=1)) == 1
+
+
+def test_a_negative_limit_never_silently_truncates_the_review_queue(fresh_db):
+    """The queue is the one listing that must not lose an item, and it did.
+
+    `list_proposals` caps with a Python slice rather than SQL, so a negative
+    `limit` is not "unbounded" here — it is `rows[:-3]`, which drops the **last**
+    three proposals and returns the rest under a 200. Live, `GET
+    /api/review/queue?limit=-2` answered with 1041 of 1043 items and said
+    nothing; `--limit 0` emptied the queue and exited 0. Both are worse than the
+    unbounded read the SQL callers had, because a caller cannot tell a short
+    answer from a short queue.
+    """
+    for index in range(5):
+        service.create_node(type="note", title=f"p{index}", principal=agent("researcher"))
+    assert len(service.list_proposals(principal=owner())) == 5
+
+    with pytest.raises(ValueError, match="limit must be >= 1"):
+        service.list_proposals(principal=owner(), limit=-3)
+    with pytest.raises(ValueError, match="limit must be >= 1"):
+        service.list_proposals(principal=owner(), limit=0)
+    assert len(service.list_proposals(principal=owner(), limit=2)) == 2
 
 
 def test_a_missing_human_is_named_without_naming_the_table_it_lives_in(fresh_db):

@@ -54,6 +54,17 @@ at once.
 raw-string fallback, so `--set year=1815` yields an integer and `--set
 venue=Nature` a string.
 
+**A row cap below 1 is an error** — on every command that takes one: `node
+list`, `edge list`, `events`, `review queue`, `suggest-links`, `subgraph`,
+`cycle-list`, and `search`'s `-k`. Asking for fewer rows than exist used to
+give you *more*: SQLite reads a negative `LIMIT` as "unbounded", so `nodum
+events --limit -3` printed the whole log. Where the cap is applied in Python
+instead the same typo did something different and quieter — it dropped that many
+rows off the **end** of the list and answered normally, so a `review queue
+--limit -1` was a proposal you never saw. One refusal now covers all of them,
+and it names the option you actually typed (`k` for `search`, `limit`
+elsewhere).
+
 ## Self-description
 
 Two commands work without a database, which makes them safe to run against a
@@ -194,7 +205,6 @@ including every parameter.
   (repeatable; default is all of them, in order), `--dry-run` computes
   everything and emits **no** event at all.
 - `cycle-list` — List cycles, newest first: the dream journal. Human-only.
-  `--limit` below 1 is an error, not SQL's "unbounded".
 - `cycle-get <id>` — One journal entry: what ran, what it measured, how it
   ended. Human-only. It returns the **row alone**; what the cycle *changed* is
   `events --cycle <id>`, because the row stores no diff of its own.
@@ -202,7 +212,11 @@ including every parameter.
   Human-only, and the door out of an interrupted run: `rollback` refuses a cycle
   that has not closed and `undo` refuses every cycle-stamped event, so until it
   is closed the run's writes are irreversible on every surface. A cycle that
-  already said how it ended is refused rather than re-closed.
+  already said how it ended is refused rather than re-closed. You should not
+  have to remember the command: every refusal a stranded cycle causes names it
+  with the id already filled in — the `rollback` refusal, and the "a
+  consolidation cycle is already running" that now blocks *every* later run
+  rather than only the ones in the same process.
 - `rollback <cycle-id>` — Take a whole cycle back, all of it or none of it.
   `--dry-run` reports what would be reversed and what stands in the way.
   Human-only.
@@ -218,7 +232,13 @@ including every parameter.
   `--confidence` and `--set`.
 - `bulk-relink` — Repoint or retype many edges at once. `--src`/`--dst`/
   `--type`/`--state` select, `--to-type`/`--to-dst` say what changes, and
-  `--dry-run` prints the diff and writes nothing.
+  `--dry-run` prints the diff and writes nothing. Its answer separates two
+  things that used to share a list: `unchanged` is bare edge ids the change
+  would not alter (a fact about the diff — you asked for something already
+  true), while `skipped` is the refusals with their reasons — a self-loop, a
+  duplicate the graph already carries, or a space you may not edit. Unlike
+  `retype`, this command exits **0** either way, so check `skipped` rather than
+  the exit code.
 
 The writes a cycle makes are the **gardener's** (`agent:builtin-gardener`), an
 internal agent seeded with `read` on `meta` and `edit` on `main` as ordinary
@@ -227,12 +247,22 @@ they show up in `space-list` and `nodum revoke builtin-gardener main` takes them
 away. Every other space needs an explicit
 `nodum grant builtin-gardener <space> edit`; `consolidate --scope` on a space
 the gardener holds nothing on refuses with that command in the message rather
-than running. Two cycles never run at once in one process: a second caller is
-refused with *a consolidation cycle is already running* instead of queueing
-behind the first and proposing every candidate a second time. Ctrl-C closes the
-cycle `failed` on the way out, so an interrupted run is still one a
-`cycle-rollback` can take back. `--as` on `consolidate` names who *asked*, which the journal records as
-`triggered_by`, and that is deliberately not the same thing as who acted: an
+than running — and that refusal reaches every surface intact, the journal's
+scope picker in the browser included. Two consolidation cycles never run at
+once **against one database file**, and that is stronger than it sounds: the
+guard is a uniqueness rule on the journal, not a lock inside one interpreter, so
+a `nodum consolidate` you type here while `nodum serve` runs one is refused too.
+It used not to be — both ran, and every duplicate pair was proposed twice into
+the review queue. The refusal is *a consolidation cycle is already running*,
+naming the cycle in the way and the `nodum cycle-abandon <id>` that clears it,
+because a run that was killed never closes itself and would otherwise block
+every later run. Curative operations and `rollback` are deliberately outside the
+rule: each is one short operation you asked for, and blocking those for the
+length of a nightly sweep would take the curative tier offline every night.
+Ctrl-C
+closes the cycle `failed` on the way out, so an interrupted run is still one a
+`nodum rollback <cycle-id>` can take back. `--as` on `consolidate` names who
+*asked*, which the journal records as `triggered_by`, and that is deliberately not the same thing as who acted: an
 entry carrying only one of the two could answer "I did not ask for this" or
 "who ran this at 04:00", never both.
 
@@ -256,6 +286,14 @@ standing. `rollback <cycle-id>` is therefore the way back from all of them, and
 `undo` refuses a cycle-stamped event by name rather than doing the wrong thing
 quietly. A rollback is itself a cycle, so rolling *that* back re-applies the
 original.
+
+That last fact is why the refusal names **two** ways forward and not one. If it
+only said "roll the cycle back", a bare `nodum undo` typed afterwards would land
+on the identical sentence — the rollback is a cycle too, and its events are
+stamped — and following the advice twice re-applies exactly what you just took
+back. There is no state in which a bare `nodum undo` gets you out, so the
+message says so and names the last write that carries no cycle at all, with the
+`nodum undo <seq>` that reverses it.
 
 **A rollback refuses rather than clobbers.** If anything outside the cycle has
 touched a row the cycle touched, nothing is written and the refusal is this
@@ -385,7 +423,11 @@ place the two surfaces deliberately differ: it composes the row, its metrics and
 into one round trip, because a browser paints one screen from one request, while
 `nodum cycle-get` returns the row and leaves the diff to `nodum events --cycle`.
 `POST /api/cycles` runs the cycle **off the event loop**, so the rest of the
-server keeps answering for the minutes a real cycle takes.
+server keeps answering for the minutes a real cycle takes. That frees the loop
+and not the database: SQLite has one writer, so a read issued while a cycle runs
+queues behind whichever burst holds the write lock — measured at **1168 ms**
+against **5 ms** on an idle server. The server stays responsive; individual
+requests do not stay fast.
 The curative tier has no HTTP routes at all — it is the CLI's.
 The two capability-URL redemption routes — `GET /api/download/{token}`
 and `PUT /api/uploads/{token}` — are the only `/api` routes outside the session
@@ -408,6 +450,21 @@ in the startup banner beside the database path, since a background writer on the
 graph is the last thing that should start silently. "One a night" holds across
 daylight-saving changes: the wait is computed in aware local time, so the
 25-hour night does not run two cycles and the 23-hour one does not run late.
+
+**A night the schedule skipped says so in the log, not in the journal.** Cycles
+are serialised, so a cycle you started yourself — from `nodum consolidate` or
+the journal's run button — that is still going at the configured time makes the
+timer bounce off it. That is a *skip*: it is logged as one, at warning level
+with the reason and no traceback, and it writes nothing to the journal, because
+the journal records runs that happened and the cycle that ran that night is
+already in it, listed under whoever asked for it.
+
+The line matters most in the case that is not benign. A cycle a `SIGKILL` or a
+power cut left `running` never closes itself and now blocks **every** later
+night, so the warning repeats — and it carries the whole refusal, which names
+that cycle and the `nodum cycle-abandon <id>` that clears it. The journal shows
+the cause too: the blocking cycle is sitting in `nodum cycle-list` as
+`running`, which is where "why has nothing run since Tuesday" is answered.
 
 ```sh
 NODUM_CONSOLIDATE_AT=03:30 nodum serve

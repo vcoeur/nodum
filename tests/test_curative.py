@@ -925,15 +925,32 @@ def test_a_relink_onto_an_edge_the_graph_already_carries_is_skipped(fresh_db):
     assert "already carries an identical edge" in result.skipped[0].error
 
 
-def test_an_edge_nothing_would_change_on_is_skipped_not_rewritten(fresh_db):
-    first, second = _node("A"), _node("B")
-    edge = service.create_edge(first.id, second.id, "supports", principal=owner())
+def test_an_edge_nothing_would_change_on_is_reported_apart_from_a_refusal(fresh_db):
+    """A no-op annotation and a refusal are two facts, and they had one key.
 
-    result = service.bulk_relink({"src_id": first.id}, {"dst_id": second.id}, principal=owner())
+    "nothing would change on this edge" sat in `skipped[]` under a field called
+    `error`, beside a permission refusal and a duplicate — so a script could
+    only tell them apart by matching the sentence, and that is why `bulk-relink`
+    correctly exits 0 where every other batch verb exits 1 on a non-empty
+    failure list. `unchanged` is the diff annotation; `skipped` is the refusals.
+    """
+    first, second, third = _node("A"), _node("B"), _node("C")
+    already_there = service.create_edge(first.id, second.id, "supports", principal=owner())
+    self_loop = service.create_edge(third.id, first.id, "supports", principal=owner())
 
+    result = service.bulk_relink({"dst_id": first.id}, {"dst_id": third.id}, principal=owner())
+
+    # The self-loop edge is refused; the one already pointing at `third` is not.
     assert result.matched == 1 and result.changes == []
-    assert result.skipped[0].id == edge.id
-    assert "nothing would change" in result.skipped[0].error
+    assert result.unchanged == []
+    assert [failure.id for failure in result.skipped] == [self_loop.id]
+    assert "self-loop" in result.skipped[0].error
+
+    no_op = service.bulk_relink({"src_id": first.id}, {"dst_id": second.id}, principal=owner())
+
+    assert no_op.matched == 1 and no_op.changes == []
+    assert no_op.unchanged == [already_there.id]
+    assert no_op.skipped == [], "a no-op is not a refusal and must not sit among them"
     assert [event for event in _events() if event.op == "edge.relink"] == []
 
 

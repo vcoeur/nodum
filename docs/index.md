@@ -105,8 +105,10 @@ infers in the review queue rather than asserting it. A **curative tier**
 (`merge-nodes`, `retype`, `supersede-edge`, `bulk-relink`) changes structure
 rather than adding to it, each operation inside a cycle. A **dream journal**
 (`nodum cycle-list` / `cycle-get`, and a view in the web UI) says what ran, who
-asked, what it measured and what it changed. Cycles run on demand, and nightly
-when `NODUM_CONSOLIDATE_AT` says so — unset means off.
+asked, what it measured and what it changed — and `nodum cycle-abandon <id>` is
+the way out of a run a crash left open, since a cycle that never closed cannot
+be rolled back and its events cannot be undone either. Cycles run on demand, and
+nightly when `NODUM_CONSOLIDATE_AT` says so — unset means off.
 
 Still to come: claim proposals and the gardener's LLM half — everything that
 needs a judgement rather than arithmetic.

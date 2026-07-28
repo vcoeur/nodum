@@ -52,6 +52,25 @@ def _graph():
     return {table: _rows(table, order) for table, order in GRAPH_TABLES.items()}
 
 
+def _journal():
+    """What the journal says about each cycle's own writes, keyed by cycle id.
+
+    `cycles` cannot be in `GRAPH_TABLES`: a rollback writes a journal entry of
+    its own, so the table grows by construction and no two moments compare whole.
+    `(status, rolled_back_by)` is the part that must come back identical — it is
+    the journal's answer to *are this cycle's writes standing?*, and the graph
+    rows are the truth it has to agree with. A reversal that restores the rows
+    and leaves the journal saying the opposite is a divergence `_graph()` alone
+    cannot see.
+    """
+    return {row["id"]: (row["status"], row["rolled_back_by"]) for row in _rows("cycles")}
+
+
+def _journal_of(recorded):
+    """`_journal()` narrowed to the cycles `recorded` already knew about."""
+    return {cycle_id: verdict for cycle_id, verdict in _journal().items() if cycle_id in recorded}
+
+
 def _edge(edge_id):
     """One edge row, read past every filter (an archived edge is still a row)."""
     conn = db.connect()
@@ -480,22 +499,68 @@ def test_the_involution_holds_past_the_second_rollback(fresh_db):
     Two rollbacks were never enough to catch it: the involution has to be
     exercised past the point where a rollback is reversing another rollback's
     reversal.
+
+    The **journal** is compared beside the rows for the same reason the third
+    table is compared beside the first two. Clearing the `rolled_back` mark ran
+    exactly one hop up the chain, which is right at depth 2 and wrong from depth
+    3: reversing a rollback puts the rollback *it* reversed back into force, so
+    the cycle that one took back is taken back again. Leaving that mark off says
+    a cycle's writes are standing while they are not — the mirror of the
+    invariant `_apply_rollback` documents, and invisible in `nodes`, `edges` and
+    `merge_redirects` alike.
     """
     survivor, duplicate, other = _node("Alpha"), _node("Alpha (dup)"), _node("Gamma")
     service.create_edge(other.id, duplicate.id, "supports", principal=owner())
     merge = service.merge_nodes([duplicate.id], into=survivor.id, principal=owner())
-    merged = _graph()
+    merged, merged_journal = _graph(), _journal()
 
     first = service.rollback_cycle(merge.cycle_id, principal=owner())
-    unmerged = _graph()
+    unmerged, unmerged_journal = _graph(), _journal()
     assert unmerged != merged
+    assert unmerged_journal != merged_journal
 
     next_cycle = first.rollback_cycle_id
     for depth in range(2, 6):
         result = service.rollback_cycle(next_cycle, principal=owner())
         next_cycle = result.rollback_cycle_id
-        expected = merged if depth % 2 == 0 else unmerged
+        taken_back = depth % 2 == 1
+        expected = unmerged if taken_back else merged
+        expected_journal = unmerged_journal if taken_back else merged_journal
         assert _graph() == expected, f"rollback #{depth} diverged from the state it must reproduce"
+        assert _journal_of(expected_journal) == expected_journal, (
+            f"rollback #{depth} left the journal disagreeing with the rows it restored"
+        )
+
+
+def test_a_cycle_taken_back_from_depth_three_still_refuses_a_second_rollback(fresh_db):
+    """What the missing mark costs a human, rather than what it looks like in SQL.
+
+    `rollback_cycle` refuses a cycle that is already `rolled_back` — that guard
+    is the only thing standing between one cycle's writes and being reversed
+    twice. It reads `cycles.status`, so a mark cleared one hop too far does not
+    merely mislead the dream journal: it hands the guard a `completed` row and
+    the refusal never happens.
+
+    At depth 3 the retype has been taken back (the node is a `claim` again) by
+    the *first* rollback, which reversing the second put back into force. So the
+    journal has to name that rollback, and asking to roll the retype back again
+    has to be refused by name.
+    """
+    node = _node("Alpha")
+    retype = service.retype([node.id], "concept", principal=owner())
+    first = service.rollback_cycle(retype.cycle_id, principal=owner())
+
+    cycle = first.rollback_cycle_id
+    for _ in range(2):
+        cycle = service.rollback_cycle(cycle, principal=owner()).rollback_cycle_id
+
+    # Depth 3: the retype is reversed again, so the journal must say so.
+    assert service.get_node(node.id, principal=owner()).type == "claim"
+    taken_back = service.get_cycle(retype.cycle_id, principal=owner())
+    assert taken_back.status == "rolled_back"
+    assert taken_back.rolled_back_by == first.rollback_cycle_id
+    with pytest.raises(InvalidTransition, match="already been rolled back"):
+        service.rollback_cycle(retype.cycle_id, principal=owner())
 
 
 def test_a_thrice_rolled_back_merge_leaves_the_node_mergeable_again(fresh_db):

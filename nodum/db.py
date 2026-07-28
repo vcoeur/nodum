@@ -176,6 +176,7 @@ def _verify_schema_consistency(conn: sqlite3.Connection) -> None:
         ("0009_spaces_and_type_nodes", _spaces_problems),
         ("0010_principals", _principals_problems),
         ("0011_actor_strings", _actor_string_problems),
+        ("0014_cycles_and_gardener", _cycles_problems),
     ):
         if name not in recorded:
             continue
@@ -246,6 +247,24 @@ def _actor_string_problems(conn: sqlite3.Connection) -> list[str]:
         if row is not None:
             problems.append(f"table {table!r} still carries unstructured 'human' actors")
     return problems
+
+
+def _cycles_problems(conn: sqlite3.Connection) -> list[str]:
+    """0014 guarantees the one-running-consolidation index that serialises runs.
+
+    The index is the cross-process lock: without it two ``nodum consolidate``
+    runs both open a cycle and every duplicate pair is proposed twice. ``0014``
+    was amended in place while it was still unreleased, so a database built from
+    its first cut carries the recorded name and not the index — and
+    :func:`init_db` skips a migration whose name it already has, so nothing else
+    would ever notice.
+    """
+    indexes = {
+        row["name"] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'index'")
+    }
+    if "idx_cycles_one_running_consolidation" not in indexes:
+        return ["index 'idx_cycles_one_running_consolidation' is missing (two runs could overlap)"]
+    return []
 
 
 def init_db(conn: sqlite3.Connection) -> list[str]:

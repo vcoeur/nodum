@@ -639,12 +639,23 @@ class RelinkDiff(BaseModel):
 class BulkRelinkOut(BaseModel):
     """The outcome — or, on a dry run, the proposal — of a bulk relink.
 
-    ``matched`` counts the edges the selector reached, ``changes`` the ones that
-    would change (or did), and ``skipped`` the matched edges left alone, each
-    with the reason: nothing to change, a self-loop, a duplicate of an edge the
-    graph already carries, or a space the caller may not edit. ``truncated`` is
-    true when the server-side ceiling stopped the selection short of the whole
-    match — never a silent truncation.
+    ``matched`` counts the edges the selector reached and ``changes`` the ones
+    that would change (or did). The rest are reported in **two** lists, because
+    they are two different facts. ``unchanged`` is a bare list of edge ids the
+    change would not alter — a diff annotation, and the reason a caller asked
+    for something that was already true. ``skipped`` is the refusals, each with
+    a reason: a self-loop, a duplicate of an edge the graph already carries, or
+    a space the caller may not edit.
+
+    They used to share one list under a field named ``error``, so "nothing would
+    change on this edge" and "you may not edit that space" were distinguishable
+    only by matching the sentence — which is exactly why ``bulk-relink`` is the
+    one batch verb whose exit code is *not* derived from its failure list. A
+    script can now derive it: ``skipped`` is the failures, and ``unchanged`` is
+    not one.
+
+    ``truncated`` is true when the server-side ceiling stopped the selection
+    short of the whole match — never a silent truncation.
 
     ``dry_run`` writes nothing at all: no cycle is opened and no event is
     emitted, so ``cycle_id`` is ``None``. That is the reviewable diff §8.5 asks
@@ -655,6 +666,7 @@ class BulkRelinkOut(BaseModel):
     dry_run: bool
     matched: int
     changes: list[RelinkDiff]
+    unchanged: list[str]
     skipped: list[TransitionFailure]
     truncated: bool
     cycle_id: str | None = None

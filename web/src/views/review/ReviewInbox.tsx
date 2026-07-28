@@ -74,13 +74,25 @@ import {
   editGrantNote,
   groupProposalsBySpace,
   PROPOSAL_KINDS,
+  PROPOSAL_PAGE_SIZE,
   proposalKind,
+  proposalPageKey,
+  queueCount,
+  queueTruncationNote,
+  restrictToPage,
+  sectionOrder,
   selfGoverningNote,
 } from "./grouping";
 import type { AgentGroup, ProposalBatch, ProposalKind, SpaceSection } from "./grouping";
-import { formatAbsolute, formatRelative } from "../../lib";
+import { formatAbsolute, formatRelative, pageWindow } from "../../lib";
+import type { PageWindow } from "../../lib";
 import { plural } from "./format";
-import { classifyFailure, failureMessage, useReviewQueue } from "./useReviewQueue";
+import {
+  classifyFailure,
+  failureMessage,
+  REVIEW_QUEUE_LIMIT,
+  useReviewQueue,
+} from "./useReviewQueue";
 
 /** A destructive action waiting on confirmation. */
 interface PendingAction {
@@ -109,6 +121,7 @@ export function ReviewInbox() {
   const [result, setResult] = useState<ActionResult | null>(null);
   const [agentFilter, setAgentFilter] = useState<string>("");
   const [kindFilter, setKindFilter] = useState<ProposalKind | "">("");
+  const [page, setPage] = useState(0);
   const outcomeRef = useRef<HTMLDivElement | null>(null);
 
   /**
@@ -155,8 +168,28 @@ export function ReviewInbox() {
   // it is a statement about an absence, so it must not make an empty queue look
   // occupied, and it must survive the toolbar filters that would otherwise
   // strip the queue to nothing.
-  const withProposals = sections.filter((section) => section.total > 0);
+  const withProposals = useMemo(() => sections.filter((section) => section.total > 0), [sections]);
   const selfGoverning = sections.filter((section) => section.kind === "self-governing");
+
+  // The queue pages, for the reason the journal's event list does: a cycle files
+  // hundreds of proposals in one run, and rendering a card for each came to
+  // 10 673 DOM nodes. The pager slices the *render* order rather than the wire
+  // order, and `restrictToPage` narrows nothing but what is drawn — every count
+  // on every header stays the whole run's.
+  const order = useMemo(() => sectionOrder(withProposals), [withProposals]);
+  const view = pageWindow(order.length, page, PROPOSAL_PAGE_SIZE, "proposal");
+  const onPage = useMemo(
+    () => new Set(order.slice(view.from, view.to).map(proposalPageKey)),
+    [order, view.from, view.to],
+  );
+  const pagedSections = useMemo(
+    () => restrictToPage(withProposals, onPage),
+    [withProposals, onPage],
+  );
+  // The queue shrinks under the reader on every accept and on every poll;
+  // `pageWindow` clamps an out-of-range index, and this puts a reader whose
+  // filters changed back at the top rather than deep inside a different list.
+  useEffect(() => setPage(0), [agentFilter, kindFilter]);
 
   // A section whose space no picker lists is a space that was archived while
   // its proposals waited. The read that names it is lazy — see
@@ -316,6 +349,7 @@ export function ReviewInbox() {
       <QueueToolbar
         total={queue.proposals.length}
         shown={visible.length}
+        truncated={queue.truncated}
         spaceCount={withProposals.length}
         agents={agents}
         agentFilter={agentFilter}
@@ -341,6 +375,14 @@ export function ReviewInbox() {
           The last refresh failed ({failureMessage(queue.error)}). Showing the
           queue as of {queue.loadedAt ? new Date(queue.loadedAt).toLocaleTimeString() : "the last successful load"}.
         </p>
+      ) : null}
+
+      {/* The queue's own truncation notice. `GET /api/review/queue` sends no
+          total and no flag, so a filled window is the only signal there is —
+          and saying nothing about it is how "500 proposals waiting" came to be
+          printed over a queue of 1043. */}
+      {queue.truncated ? (
+        <p className="nd-rv-flag nd-rv-flag--warn">{queueTruncationNote(REVIEW_QUEUE_LIMIT)}</p>
       ) : null}
 
       {result ? (
@@ -376,35 +418,41 @@ export function ReviewInbox() {
           }}
         />
       ) : (
-        withProposals.map((section) => {
-          const named = sectionSpaceName(section, spaceName);
-          const label = named.label;
-          return (
-            <SpacePanel
-              key={section.key}
-              section={section}
-              name={named}
-              spaceName={spaceName}
-              selected={selected}
-              expanded={expanded}
-              busy={busy}
-              onToggleSelect={toggleSelect}
-              onToggleExpand={toggleExpand}
-              onSetBatchSelection={setBatchSelection}
-              onAcceptOne={acceptOne}
-              // The space is in every confirmation scope, not only in the
-              // heading: a batch accept is a live write, and "which territory"
-              // is part of what is being confirmed.
-              onRejectOne={(proposal) => askReject([proposal], `One proposal in ${label}`)}
-              onAcceptBatch={(batch) =>
-                askAccept([...batch.proposals], `${label} · ${batchScope(batch)}`)
-              }
-              onRejectBatch={(batch) =>
-                askReject([...batch.proposals], `${label} · ${batchScope(batch)}`)
-              }
-            />
-          );
-        })
+        <>
+          {view.pages > 1 ? <QueuePager view={view} onPage={setPage} /> : null}
+
+          {pagedSections.map((section) => {
+            const named = sectionSpaceName(section, spaceName);
+            const label = named.label;
+            return (
+              <SpacePanel
+                key={section.key}
+                section={section}
+                name={named}
+                spaceName={spaceName}
+                selected={selected}
+                expanded={expanded}
+                busy={busy}
+                onToggleSelect={toggleSelect}
+                onToggleExpand={toggleExpand}
+                onSetBatchSelection={setBatchSelection}
+                onAcceptOne={acceptOne}
+                // The space is in every confirmation scope, not only in the
+                // heading: a batch accept is a live write, and "which territory"
+                // is part of what is being confirmed.
+                onRejectOne={(proposal) => askReject([proposal], `One proposal in ${label}`)}
+                onAcceptBatch={(batch) =>
+                  askAccept([...batch.proposals], `${label} · ${batchScope(batch)}`)
+                }
+                onRejectBatch={(batch) =>
+                  askReject([...batch.proposals], `${label} · ${batchScope(batch)}`)
+                }
+              />
+            );
+          })}
+
+          {view.pages > 1 ? <QueuePager view={view} onPage={setPage} /> : null}
+        </>
       )}
 
       {/* Outside the empty-queue branch on purpose: an empty queue is exactly
@@ -637,10 +685,45 @@ function SelfGoverningSpaces({
   );
 }
 
+/** Previous / next over the queue's pages, with the range it is showing. */
+function QueuePager({
+  view,
+  onPage,
+}: {
+  /** The slice currently rendered, from `lib/paging.pageWindow`. */
+  view: PageWindow;
+  onPage: (page: number) => void;
+}) {
+  return (
+    <div className="nd-row nd-rv-pager">
+      <button
+        type="button"
+        className="nd-button nd-button--small"
+        onClick={() => onPage(view.page - 1)}
+        disabled={view.page === 0}
+      >
+        ← Previous
+      </button>
+      <span className="nd-meta nd-rv-pager__range">
+        {view.label} · page {view.page + 1} of {view.pages}
+      </span>
+      <button
+        type="button"
+        className="nd-button nd-button--small"
+        onClick={() => onPage(view.page + 1)}
+        disabled={view.page >= view.pages - 1}
+      >
+        Next →
+      </button>
+    </div>
+  );
+}
+
 /** Filters, freshness, and the manual refresh. */
 function QueueToolbar({
   total,
   shown,
+  truncated,
   spaceCount,
   agents,
   agentFilter,
@@ -654,6 +737,8 @@ function QueueToolbar({
 }: {
   total: number;
   shown: number;
+  /** Whether the read filled its window, so `total` is a floor and not a total. */
+  truncated: boolean;
   /** Spaces currently holding something, for the "across N spaces" line. */
   spaceCount: number;
   agents: string[];
@@ -706,7 +791,7 @@ function QueueToolbar({
 
       <div className="nd-row nd-rv-toolbar__status">
         <span className="nd-meta">
-          {shown === total ? plural(total, "proposal") : `${shown} of ${total} proposals`} waiting
+          {queueCount(shown, total, truncated)} waiting
           {spaceCount > 0 ? ` across ${plural(spaceCount, "space")}` : ""}
           {loadedAt !== null ? ` · checked ${new Date(loadedAt).toLocaleTimeString()}` : ""}
           {paused ? " · polling paused" : ""}
@@ -859,10 +944,20 @@ function BatchSection({
         A run is derived here from arrival times — proposals from one agent filed
         within two minutes of each other. Nothing in the schema records a batch id
         yet.
+        {batch.shown.length < batch.proposals.length ? (
+          // Said where the mismatch is visible: the two buttons above act on the
+          // whole run, and this is the line that explains why they count higher
+          // than the cards below.
+          <>
+            {" "}
+            Showing {batch.shown.length} of this run&rsquo;s {batch.proposals.length} on this page;
+            the two buttons above still act on all {batch.proposals.length}.
+          </>
+        ) : null}
       </p>
 
       <div className="nd-stack nd-rv-batch__items">
-        {batch.proposals.map((proposal) => (
+        {batch.shown.map((proposal) => (
           <ProposalCard
             key={`${proposal.kind}:${proposal.id}`}
             proposal={proposal}

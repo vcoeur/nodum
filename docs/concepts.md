@@ -239,13 +239,25 @@ The **curative tier** is the human-facing half of the same machinery:
 rather than adding to it. Each runs inside a cycle even when you type it
 yourself, which is why `undo` refuses a cycle-stamped event and points at
 `rollback` instead: a merge is several rows from one decision, and reversing one
-of them would leave the other half standing.
+of them would leave the other half standing. The refusal also names the last
+write that belongs to no cycle, because "roll the cycle back" on its own is a
+loop — a rollback is a cycle too, so a bare `nodum undo` after one lands on the
+same sentence again, and doing what it says twice re-applies what you just
+reversed.
 
 Cycles run on demand (`nodum consolidate`, or a button in the web UI) and
 nightly when `NODUM_CONSOLIDATE_AT` is set. Unset means off, which is the
 default; when it is set, `nodum serve` says so in its startup banner. Only one
-cycle runs at a time in a process — a second caller is refused rather than
-queued, since queueing would run it over a graph the first had just changed.
+consolidation cycle runs at a time **against a database file**, not merely
+within one process: the guard is a uniqueness rule on the journal itself, so a
+`nodum consolidate` you type at a terminal while `nodum serve` is running one is
+refused just as an in-process caller is. A second caller is refused rather than
+queued, since queueing would run it over a graph the first had just changed —
+and the refusal names the cycle in the way, plus the `nodum cycle-abandon <id>`
+that clears it, because a run that was killed never closes itself and would
+otherwise block every later run behind advice nobody could act on. Curative
+operations and rollbacks are outside that rule: each is one short operation you
+asked for, and neither is what proposes a duplicate twice.
 
 ## Projectors and derived indexes
 

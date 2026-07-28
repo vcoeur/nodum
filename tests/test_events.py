@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 import pytest
 from helpers import OWNER_ACTOR, agent, owner
 
@@ -231,6 +233,77 @@ def test_undo_with_no_seq_names_the_cycle_instead_of_reaching_past_it(fresh_db):
     # And the refusal is followable: it names the command that does work.
     with pytest.raises(UndoNotPossible, match=f"nodum rollback {cycle.id}"):
         service.undo(principal=owner())
+
+
+def test_the_refusal_names_the_undo_that_works_instead_of_looping(fresh_db):
+    """ "Run: nodum rollback <id>" is a loop, because a rollback is a cycle too.
+
+    Bare `undo` after any cycle refuses and points at `rollback`. Following that
+    once is right; the rollback's own events are cycle-stamped, so following it
+    again re-applies exactly what was just taken back, and there is no state in
+    which a bare `undo` recovers. The refusal has to name the verb that does
+    work — and the query behind it already knows the answer: the most recent
+    undoable event carrying no cycle at all.
+    """
+    ordinary = service.create_node(type="note", title="mine", principal=owner())
+    outside_seq = _events()[-1].seq
+    cycle = service.open_cycle(trigger="scheduled", principal=owner())
+    with service.in_cycle(cycle.id):
+        service.create_node(type="note", title="gardened", principal=owner())
+
+    with pytest.raises(UndoNotPossible) as refused:
+        service.undo(principal=owner())
+
+    message = str(refused.value)
+    assert f"nodum undo {outside_seq}" in message
+    # And it is followable: that verb reverses the write it names, and nothing else.
+    service.undo(outside_seq, principal=owner())
+    with pytest.raises(NodeNotFound):
+        service.get_node(ordinary.id, principal=owner())
+
+
+def test_the_refusal_says_so_when_there_is_no_write_outside_a_cycle_left(fresh_db):
+    """Naming an event that does not exist would be worse than the loop it replaces."""
+    cycle = service.open_cycle(trigger="scheduled", principal=owner())
+    with service.in_cycle(cycle.id):
+        service.create_node(type="note", title="gardened", principal=owner())
+
+    with pytest.raises(UndoNotPossible) as refused:
+        service.undo(principal=owner())
+
+    message = str(refused.value)
+    assert re.search(r"nodum undo \d", message) is None, "it named an event that does not exist"
+    assert "no write outside a cycle" in message
+
+
+def test_a_single_row_cycle_is_not_explained_as_half_a_merge(fresh_db):
+    """The merge sentence is true of a multi-row op and false of a lone edge.
+
+    "one event of a merge reversed on its own would leave the other half
+    standing" is the reason `undo` refuses a *multi-row* decision. A cycle that
+    wrote one `edge.propose` has no other half, so the sentence explains the
+    refusal with something that did not happen — while the real reason (a cycle
+    is taken back whole, by rollback) is the same either way.
+    """
+    src = service.create_node(type="note", title="a", principal=owner())
+    dst = service.create_node(type="note", title="b", principal=owner())
+    lone = service.open_cycle(trigger="scheduled", principal=owner())
+    with service.in_cycle(lone.id):
+        service.create_edge(src.id, dst.id, "relates_to", principal=owner())
+    service.close_cycle(lone.id, status="completed", report={}, principal=owner())
+
+    with pytest.raises(UndoNotPossible) as one_row:
+        service.undo(_events()[-1].seq, principal=owner())
+    assert "merge" not in str(one_row.value)
+
+    several = service.open_cycle(trigger="scheduled", principal=owner())
+    with service.in_cycle(several.id):
+        service.create_node(type="note", title="c", principal=owner())
+        service.create_node(type="note", title="d", principal=owner())
+
+    with pytest.raises(UndoNotPossible) as many_rows:
+        service.undo(_events()[-1].seq, principal=owner())
+    assert "would leave the other half standing" in str(many_rows.value)
 
 
 def test_a_bare_undo_still_skips_what_a_previous_undo_reversed(fresh_db):

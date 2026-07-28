@@ -33,9 +33,11 @@ import ast
 import asyncio
 import codecs
 import hashlib
+import importlib
 import inspect
 import io
 import json
+import pkgutil
 import sqlite3
 import threading
 import zipfile
@@ -50,6 +52,7 @@ from PIL import Image
 from starlette.requests import ClientDisconnect
 from typer.testing import CliRunner
 
+import nodum
 from nodum import assets, auth, cli, consolidate, db, http_api, ingest, service, urls
 from nodum.migrations import GARDENER_AGENT_ID
 from nodum.principal import Principal
@@ -428,6 +431,77 @@ def _cli_run_caught_exceptions() -> list[type[BaseException]]:
         if isinstance(candidate, type) and issubclass(candidate, BaseException):
             resolved.append(candidate)
     return resolved
+
+
+def _package_exception_classes() -> list[type[BaseException]]:
+    """Every exception class this package defines, found by walking the package.
+
+    Discovery, never a literal list: the defect below is a hand-maintained
+    exemption that nothing audited, and a test restating the same names by hand
+    would have missed the second case exactly as the code did.
+    """
+    classes: dict[str, type[BaseException]] = {}
+    for found in pkgutil.iter_modules(nodum.__path__):
+        module = importlib.import_module(f"{nodum.__name__}.{found.name}")
+        for value in vars(module).values():
+            if (
+                isinstance(value, type)
+                and issubclass(value, BaseException)
+                and value.__module__.startswith(f"{nodum.__name__}.")
+            ):
+                classes[f"{value.__module__}.{value.__qualname__}"] = value
+    return sorted(classes.values(), key=lambda cls: cls.__name__)
+
+
+def _mapped_row(exc_type: type[BaseException]) -> type[BaseException] | None:
+    """The :data:`http_api.EXCEPTION_STATUS` row Starlette would resolve, by MRO."""
+    return next((base for base in exc_type.__mro__ if base in http_api.EXCEPTION_STATUS), None)
+
+
+def test_no_exception_this_package_defines_is_rewritten_as_a_storage_failure():
+    """The ``OSError`` subtree, enumerated — not exempted one class at a time.
+
+    ``_failure_message`` rewrites an ``OSError`` as ``storage error: …`` because
+    the CLI's own line names the database file and this surface must not. Three
+    of this package's exceptions are ``PermissionError`` subclasses and so fell
+    into that net, and the exemption was a literal tuple that nothing audited:
+    ``PrincipalDisabled`` was added when a live pass found it, and
+    ``GrantNotPermitted`` — the gardener's "you hold no grant on space
+    'research', run ``nodum grant …``" — was still being rendered as
+    ``storage error: GrantNotPermitted`` on the one surface a human reads it,
+    with the space and the remedy both gone. Two misses out of three is the
+    exemption list itself failing, so the rule is inverted: a class this package
+    defines is a decision it made, never a storage failure, and only an
+    ``OSError`` from somewhere else is rewritten.
+
+    Both halves are asserted here — the message survives, and the class carries a
+    row of its own rather than inheriting ``OSError``'s 500, since "the server's
+    own storage failed" is the wrong status for every one of them.
+    """
+    domain = _package_exception_classes()
+    assert {cls.__name__ for cls in domain} >= {"GrantNotPermitted", "RecordNotFound"}, (
+        "the package walk found nothing, so the enumeration below proves nothing"
+    )
+
+    in_the_net = [cls for cls in domain if issubclass(cls, OSError)]
+    assert in_the_net, "no domain exception derives from OSError — has the subtree moved?"
+
+    sentence = "the gardener holds no grant on space 'research'"
+    for exc_type in in_the_net:
+        assert http_api._failure_message(exc_type(sentence)) == sentence, (
+            f"{exc_type.__name__} is rewritten as a storage failure"
+        )
+        row = _mapped_row(exc_type)
+        assert row is not None and row is not OSError, (
+            f"{exc_type.__name__} has no EXCEPTION_STATUS row and inherits OSError's 500"
+        )
+
+    # The rewrite still happens for the failures it was written for: a real
+    # storage error carries no message a human should be shown, and the CLI's
+    # own line for it names the path this surface withholds.
+    denied = PermissionError(13, "Permission denied", "/home/someone/nodum.db")
+    assert http_api._failure_message(denied) == "storage error: Permission denied"
+    assert "nodum.db" not in http_api._failure_message(denied)
 
 
 def test_an_unmapped_exception_is_a_generic_500(client, fresh_db, monkeypatch):
@@ -2843,7 +2917,7 @@ def test_an_interrupted_cycle_is_abandoned_over_http_and_only_then_rolled_back(c
     abandoned = _ok(client.post(f"/api/cycles/{cycle.id}/abandon", json={}))
 
     assert abandoned["status"] == "failed"
-    assert abandoned["report"]["op"] == "abandon_cycle"
+    assert abandoned["report"]["abandoned"] is True
     assert abandoned["report"]["abandoned_by"] == OWNER_ACTOR
     # Which is what unlocks the reversal this surface exists to offer.
     _ok(client.post(f"/api/cycles/{cycle.id}/rollback", json={}))
@@ -2951,6 +3025,35 @@ def test_an_unknown_principal_is_a_404_and_not_a_traceback(client, fresh_db):
     assert "Traceback" not in response.text
 
 
+def test_a_scope_the_gardener_cannot_reach_says_so_to_the_browser(client, fresh_db):
+    """Blocker 3's refusal, on the surface the blocker was found on.
+
+    One click of the journal's scope picker is the whole reproduction: migration
+    ``0014`` grants the gardener ``main`` and ``meta``, so every space a human
+    creates afterwards is one the gardener cannot see, and the picker offers it
+    anyway. ``nodum.consolidate`` answers that with the space's name and the
+    exact command that fixes it — and over HTTP the sentence never arrived,
+    because ``GrantNotPermitted`` is a ``PermissionError`` and
+    ``_failure_message`` rewrote it as ``storage error: GrantNotPermitted``. The
+    toast read ``GrantNotPermitted: storage error: GrantNotPermitted``: no space,
+    no remedy, and nothing to do about either.
+    """
+    service.create_space("research", principal=owner())
+
+    response = client.post("/api/cycles", json={"scope": "research"})
+
+    assert response.status_code == 403, response.text
+    error = response.json()["error"]
+    assert error["type"] == "GrantNotPermitted"
+    assert "storage error" not in response.text
+    # The name the caller typed, never the id it resolved to, and the command.
+    assert "'research'" in error["message"]
+    assert f"nodum grant {GARDENER_AGENT_ID} research edit" in error["message"]
+    # Granting it is the fix, and the fix works from here.
+    service.grant(GARDENER_AGENT_ID, "research", "edit", principal=owner())
+    assert _ok(client.post("/api/cycles", json={"scope": "research"}))["cycle"]["scope"]
+
+
 #: How long the probe below waits for the event loop to answer while a cycle is
 #: in flight. Generous for a loop that is free (it answers in microseconds) and
 #: bounded for one that is not, so the broken shape fails in seconds rather than
@@ -3036,22 +3139,29 @@ def test_a_second_cycle_is_a_409_and_not_a_400(client, fresh_db):
     same request will succeed once the graph is done doing something else, which
     is what 409 means and what a client retries on.
 
-    The lock is the real one, held here rather than simulated, so this fails if
-    the runner ever stops refusing a second caller.
+    The guard held here is the real one and it is a **row**, not a lock: an open
+    ``running`` consolidation cycle is what a second opener collides with, so
+    this is the state another process would have left behind — which is the
+    whole point of the guard living in the database. The refusal names that
+    cycle and the way out of it, because a run a ``SIGKILL`` ended never closes
+    itself and would otherwise block every later run behind advice nobody can
+    carry out.
     """
     _duplicate_pair()
-    assert consolidate._RUNNER_LOCK.acquire(blocking=False)
-    try:
-        response = client.post("/api/cycles", json={})
-    finally:
-        consolidate._RUNNER_LOCK.release()
+    blocking = service.open_cycle(trigger="manual", principal=owner())
+
+    response = client.post("/api/cycles", json={})
 
     assert response.status_code == 409, response.text
     error = response.json()["error"]
     assert error["type"] == "CycleInProgress"
     assert "already running" in error["message"]
-    # And the refusal left no journal entry behind it.
-    assert _ok(client.get("/api/cycles"))["cycles"] == []
+    assert blocking.id in error["message"]
+    assert f"nodum cycle-abandon {blocking.id}" in error["message"]
+    # And the refusal added nothing to the journal: the only entry is the one
+    # that was already there, still open.
+    listed = _ok(client.get("/api/cycles"))["cycles"]
+    assert [(entry["id"], entry["status"]) for entry in listed] == [(blocking.id, "running")]
 
 
 def test_a_cycles_event_window_is_bounded_and_says_when_it_bit(client, fresh_db):

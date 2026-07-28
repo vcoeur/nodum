@@ -29,6 +29,7 @@ from nodum import db, embeddings, projectors
 from nodum.migrations import META_SPACE_ID
 from nodum.models import SearchHit, SearchResult
 from nodum.principal import READ, Principal
+from nodum.service import require_positive_limit
 
 #: bm25() column weights for (node_id, title, content, extracted_text): node_id
 #: is unindexed (weight ignored); a title hit outranks a body hit.
@@ -438,9 +439,15 @@ def search(
         ``vector``, ``graph``).
 
     Raises:
-        ValueError: If the query has no terms, or the type or space does not
-            resolve — an ungranted space and a nonexistent one read alike.
+        ValueError: If the query has no terms, if ``k`` is below 1, or if the
+            type or space does not resolve — an ungranted space and a
+            nonexistent one read alike. ``k`` goes through
+            :func:`nodum.service.require_positive_limit`, the same helper every
+            capped read in the service layer uses: it reaches three ranked
+            queries as a SQL ``LIMIT``, so ``--k -2`` was read as *unbounded*
+            and answered with everything the index held.
     """
+    require_positive_limit(k, "k")
     match = _match_query(query)
     # Derived indexes first: the projectors are incremental, so this is cheap.
     projectors.run_projectors(names=["fts", "vec"], path=path)

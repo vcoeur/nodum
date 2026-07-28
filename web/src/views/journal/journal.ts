@@ -28,21 +28,30 @@
  *   `duplicate_candidates` by doing its job — so it does not colour one.
  * - **No server text reaches the headline.** {@link cycleWork} is the sentence
  *   the list links by and the detail page titles itself with, and a cycle's
- *   report carries failures as *strings the server wrote* — including
- *   `open_cycle`'s own `"TypeNotFound: unknown space: 909a…"`, which is the one
- *   phrasing nothing user-facing may render, plus a bare 32-hex id. So the
- *   headline counts and names failures and never quotes one; the reason belongs
- *   to {@link cycleFailures}, which routes it through
- *   {@link recordedUnknownSpace} — the *same* discriminator {@link
- *   describeRunFailure} uses on a live refusal, reading a string that never came
- *   back through `fetch`.
+ *   report carries failures as *strings the server wrote* — including the
+ *   gardener's own `"GrantNotPermitted: the gardener holds no grant on space
+ *   '14b1…'"`, which carries a bare 32-hex id twice. So the headline counts and
+ *   names failures and never quotes one; the reason belongs to
+ *   {@link cycleFailures}, which routes it through
+ *   {@link describeRecordedFailure}.
+ * - **The failure guard fails closed.** Two message shapes have now reached a
+ *   screen verbatim, so {@link describeRecordedFailure} is not a list of
+ *   rewrites to extend per message: the two refusals whose *wording* is a
+ *   decision get named copy, and **everything else has its ids taken out**
+ *   ({@link nameIdsIn}) rather than being trusted. A third shape can carry an
+ *   id, and it cannot put one on the screen.
  * - **A space is named, never spelt.** `cycles.scope` is always the **resolved
  *   id** (`open_cycle` runs it through `_resolve_space`), so every sentence
  *   about a scope takes a {@link SpaceName} the caller resolved through
  *   `nameSpace` rather than the raw reference off the row.
  */
 
-import { isUnknownSpace, recordedUnknownSpace } from "../../api/client";
+import {
+  ApiError,
+  isUnknownSpace,
+  recordedUngrantedScope,
+  recordedUnknownSpace,
+} from "../../api/client";
 import type {
   CycleMetrics,
   CycleOut,
@@ -54,7 +63,8 @@ import type {
   RollbackOut,
 } from "../../api/types";
 import type { SpaceName } from "../../components";
-import { describeError } from "../../lib";
+import { describeError, pageWindow } from "../../lib";
+import type { PageWindow } from "../../lib";
 
 /**
  * How many of a cycle's events the detail view asks for.
@@ -220,14 +230,34 @@ export interface ConsolidationReport {
   failed: JobFailureReport[];
 }
 
-/** A cycle whose report is a single operation's — a rollback, or a curative op. */
+/**
+ * The op name `service.abandon_cycle` writes into the report it closes with.
+ *
+ * An abandoned cycle wears an **operation** report — `{"op": "abandon_cycle",
+ * "abandoned_by": …, "error": …}` — because `close_cycle` replaces whatever the
+ * run had written. Read as an ordinary one-op report it comes out as *"One
+ * curative operation: abandon_cycle. It failed."*, which is wrong three ways:
+ * abandoning is not a curative operation, the operation did not fail (the run
+ * did), and the entry is a consolidation run rather than a single-row write. So
+ * every reading below branches on it.
+ */
+const ABANDON_OP = "abandon_cycle";
+
+/** A cycle whose report is a single operation's — a rollback, an abandon, or a curative op. */
 export interface OperationReport {
-  /** The operation's name, e.g. `rollback_cycle`, `merge_nodes`. */
+  /** The operation's name, e.g. `rollback_cycle`, `abandon_cycle`, `merge_nodes`. */
   op: string;
   /** The cycle this one took back, for `rollback_cycle`. */
   rolledBack: string | null;
   /** How many events it reversed, when the report recorded it. */
   reversed: number | null;
+  /**
+   * Who closed an interrupted run's entry, for `abandon_cycle`.
+   *
+   * An actor string, named through {@link actorLabel} like every other one on
+   * this screen rather than spelt.
+   */
+  abandonedBy: string | null;
   /** Set when the operation raised and the cycle closed `failed`. */
   error: string | null;
 }
@@ -300,6 +330,7 @@ export function readOperationReport(
     op,
     rolledBack: stringAt(report, "rolled_back"),
     reversed: numberAt(report, "reversed"),
+    abandonedBy: stringAt(report, "abandoned_by"),
     error: stringAt(report, "error"),
   };
 }
@@ -432,6 +463,15 @@ export function cycleWork(cycle: CycleOut): string {
 
   const operation = readOperationReport(cycle.report);
   if (operation !== null) {
+    // An abandoned run is not an operation the way a merge is: the report says
+    // how the *entry* was closed, not what the cycle did. Its own writes are the
+    // event list below, which is why the sentence points at them.
+    if (operation.op === ABANDON_OP) {
+      return (
+        "Interrupted, and never finished. Its entry was closed by hand so that what it had " +
+        "already written could be rolled back."
+      );
+    }
     // The *reason* belongs to `cycleFailures`, for the reason `failureNote`
     // gives: `report["error"]` is `str(exc)` and this is an `<h1>`.
     const failure = operation.error === null ? "" : " It failed.";
@@ -476,6 +516,19 @@ export function cycleFailures(cycle: CycleOut, scope: SpaceName | null = null): 
     );
   }
   const operation = readOperationReport(cycle.report);
+  if (operation !== null && operation.op === ABANDON_OP) {
+    // The server's own sentence says the same thing, under a prefix that is
+    // false — *"The operation abandon_cycle failed"*. The operation succeeded;
+    // the run it closed is what never finished.
+    const by =
+      operation.abandonedBy === null
+        ? ""
+        : ` ${actorLabel(operation.abandonedBy)} closed its journal entry.`;
+    return [
+      `This run was interrupted and never closed itself.${by} Nothing it wrote was undone — ` +
+        "rolling the cycle back is what takes those writes back.",
+    ];
+  }
   if (operation !== null && operation.error !== null) {
     return [`The operation ${operation.op} failed: ${describeRecordedFailure(operation.error, scope)}`];
   }
@@ -596,10 +649,26 @@ export const SCOPE_CONTROL_HINT =
  * a rehearsal and a failure, and a reader told only the first would draw the
  * wrong conclusion from the numbers above.
  *
+ * **Composing is exactly why each one branches**, the way {@link emptyEventsNote}
+ * and {@link noMetricsNote} already do. Emitted unconditionally, the two that
+ * compose most often contradicted the page around them: *"every job ran"* sat
+ * under an `<h1>` reading *"The cycle failed before any job ran"*, and *"whatever
+ * it wrote before the failure is real and stays — a rollback is what takes it
+ * back"* sat beside a **disabled** rollback button explaining that a rehearsal
+ * emitted nothing to reverse. A caveat exists to correct a misreading; one that
+ * contradicts the headline creates one.
+ *
  * @param cycle The journal entry.
  */
 export function cycleCaveats(cycle: CycleOut): string[] {
   const caveats: string[] = [];
+  const consolidation = readConsolidationReport(cycle.report);
+  // The runner writes `jobs: []` only for a cycle that died outside every job —
+  // the same shape `noMetricsNote` and `emptyEventsNote` read. Note it does not
+  // prove *nothing was written*: a `BaseException` out of `_run_jobs` (a
+  // Ctrl-C mid-run) loses the outcomes of jobs that had already written.
+  const jobsRan = consolidation !== null && consolidation.jobs.length > 0;
+
   if (cycle.status === "rolled_back") {
     caveats.push(
       cycle.rolled_back_by === null
@@ -613,14 +682,26 @@ export function cycleCaveats(cycle: CycleOut): string[] {
   }
   if (cycle.status === "failed") {
     caveats.push(
-      "The cycle closed failed. Whatever it wrote before the failure is real and stays — a " +
-        "rollback is what takes it back.",
+      cycle.dry_run
+        ? // A rehearsal emits no graph event whether it finished or not, so
+          // there is nothing standing and nothing for a rollback to take back —
+          // which is what the disabled button beside this says.
+          "The rehearsal failed. It emitted no graph event either way, so nothing is standing " +
+            "and there is nothing to reverse — what the report shows is only as far as it got."
+        : "The cycle closed failed. Whatever it wrote before the failure is real and stays — a " +
+            "rollback is what takes it back.",
     );
   }
   if (cycle.dry_run) {
     caveats.push(
-      "A rehearsal: every job ran and no graph event was written, so the counts are what it " +
-        "would have done.",
+      jobsRan
+        ? "A rehearsal: every job ran and no graph event was written, so the counts are what it " +
+            "would have done."
+        : // No job outcome was recorded — it failed outside every job, or it has
+          // not closed yet. Claiming "every job ran" here is the contradiction
+          // this branch exists to close.
+          "A rehearsal: no graph event was written, and no job has reported — so there are no " +
+            "counts here saying what it would have done.",
     );
   }
   return caveats;
@@ -658,7 +739,14 @@ export function rollbackAvailability(
   if (cycle.status === "running") {
     return {
       available: false,
-      reason: "A running cycle cannot be rolled back — it has not finished writing.",
+      // It names the way out. A cycle a crash left `running` is not going to
+      // finish, and `undo` refuses every event it stamped — so a reader given
+      // this sentence and nothing else was told the writes were unreachable and
+      // shown no door. `abandon` is the door, and it is on this screen.
+      reason:
+        "A running cycle cannot be rolled back — it has not finished writing. If nothing is " +
+        "going to finish it, abandon it first: that closes the entry and is what makes what it " +
+        "wrote reversible.",
     };
   }
   if (cycle.status === "rolled_back") {
@@ -678,14 +766,85 @@ export function rollbackAvailability(
     };
   }
   if (wroteGraphEvents === false) {
+    const operation = readOperationReport(cycle.report);
+    // Why it wrote nothing depends on what it was. A one-op curative cycle
+    // matched nothing; an abandoned run died before it got that far — and
+    // telling the second reader about a curative operation describes something
+    // their cycle is not.
+    const because =
+      operation === null
+        ? ""
+        : operation.op === ABANDON_OP
+          ? " — it was interrupted before it wrote anything"
+          : " — a curative operation that matched nothing writes none";
     return {
       available: false,
-      reason:
-        "This cycle wrote no graph event — a curative operation that matched nothing writes " +
-        "none — so there is nothing to reverse.",
+      reason: `This cycle wrote no graph event${because}, so there is nothing to reverse.`,
     };
   }
   return { available: true, reason: null };
+}
+
+/**
+ * Whether the abandon action is offered for this cycle, and why not when it is
+ * not.
+ *
+ * `service.abandon_cycle` refuses anything that is not `running`, in those
+ * words: a cycle that has said how it ended is not abandoned, and re-closing it
+ * would overwrite the record of what actually happened. That is the *only*
+ * refusal, and it is decidable from the row — so it is stated in front of the
+ * button rather than met after clicking it, exactly as
+ * {@link rollbackAvailability} states its own four.
+ *
+ * @param cycle The journal entry.
+ */
+export function abandonAvailability(cycle: CycleOut): RollbackAvailability {
+  if (cycle.status === "running") return { available: true, reason: null };
+  return {
+    available: false,
+    // `status` is a closed vocabulary the service writes (`completed`,
+    // `failed`, `rolled_back`), not free text off the wire, so it is safe to
+    // print — and it is the fact that decides the refusal.
+    reason:
+      `Only a cycle still running can be abandoned, and this one closed ${cycle.status}. A ` +
+      "cycle that has said how it ended is not abandoned; re-closing it would overwrite that.",
+  };
+}
+
+/**
+ * What the abandon confirm says it is about to do — and what it is not.
+ *
+ * Split out of the dialog because the harness renders no components, so a claim
+ * made inside one is a claim nothing checks; and every line here has to be
+ * something `service.abandon_cycle` actually delivers.
+ *
+ * The dangerous misreading is that abandoning *cancels* the run or takes its
+ * writes back. It does neither. It closes the journal row as `failed` with a
+ * report naming who closed it, and that is the whole of it — which is precisely
+ * what unlocks the rollback, since `_rollback_plan` refuses a cycle that has not
+ * closed and `undo` refuses every event a cycle stamped.
+ */
+export const ABANDON_CONFIRM: readonly string[] = [
+  "Abandoning closes this journal entry as failed and records who closed it. It does not " +
+    "reverse anything: whatever the run wrote before it stopped is still in the graph.",
+  "Closing the entry is what makes those writes reversible — a rollback refuses a cycle that " +
+    "has not finished, and undo refuses every event a cycle stamped. Roll the cycle back " +
+    "afterwards to take them back.",
+  "Only do this for a run nothing is going to finish: a server killed mid-cycle, a power cut, " +
+    "or a shutdown that cancelled the nightly task. Nothing here stops a cycle that is genuinely " +
+    "still running, and one that is would go on writing into an entry that says it failed.",
+];
+
+/**
+ * What an abandoned cycle's toast says happened.
+ *
+ * @param cycle The cycle row as the route answered with it — now `failed`.
+ */
+export function abandonOutcome(cycle: CycleOut): string {
+  return (
+    `Cycle ${shortId(cycle.id)} is closed as ${cycle.status}. Nothing it wrote has changed; it ` +
+    "can be rolled back now."
+  );
 }
 
 /**
@@ -704,6 +863,41 @@ const SCOPE_STOPS_RESOLVING =
 /** How a sentence about a refused scope names it, without printing a bare id. */
 function scopeReference(scope: SpaceName | null): string {
   return scope === null ? "the scope it named" : `the scope "${scope.label}"`;
+}
+
+/**
+ * What a raw id looks like anywhere in a server-written sentence: `uuid4().hex`.
+ *
+ * Global and case-insensitive because it is used to *replace* every occurrence —
+ * the gardener's refusal names its scope twice, once in the sentence and once in
+ * the command it suggests.
+ */
+const BARE_ID_IN_TEXT = /[0-9a-fA-F]{32}/g;
+
+/**
+ * A server sentence with every raw id in it replaced by what the page calls it.
+ *
+ * **This is the guard that fails closed**, and it exists because the alternative
+ * has now failed twice. The journal renders three kinds of string the server
+ * wrote — a recorded cycle failure, a job's own error, and a delete guard's
+ * refusal — and each was handled by recognising the message shapes known at the
+ * time and passing everything else through verbatim. Two shapes then arrived
+ * that were not on the list, and both put 32 hex characters on the screen: the
+ * scope refusal, and the gardener's ungranted-scope refusal, which prints the id
+ * twice. A rewrite rule that has to be extended per message is not a rule.
+ *
+ * So the default is inverted. Anything not covered by named copy still says what
+ * the server said — that bargain is unchanged, and it is the only thing that
+ * keeps an unfamiliar failure legible — but **no id survives it**. A row the page
+ * can name is named; anything else is shortened, which is what every other id on
+ * this screen already is.
+ *
+ * @param text The server's own sentence.
+ * @param nameRow Names a row the page knows about; the default names none, which
+ *   shortens every id.
+ */
+export function nameIdsIn(text: string, nameRow: RowNamer = () => null): string {
+  return text.replace(BARE_ID_IN_TEXT, (id) => nameRow(id) ?? shortId(id, 12));
 }
 
 /**
@@ -731,35 +925,80 @@ export function describeRunFailure(error: unknown, scope: SpaceName | null): str
       "may be out of date — reload the screen to see what is there now."
     );
   }
-  return describeError(error);
+  // The live twin of the recorded refusal below, and the one a default install
+  // actually meets: the picker offers every space, the gardener is granted two.
+  // `describeError` would render it as `type: message`, which is this sentence
+  // with a 32-hex id in it twice.
+  if (error instanceof ApiError && recordedUngrantedScope(error.message) !== null) {
+    return gardenerHoldsNoGrant(scope);
+  }
+  return nameIdsIn(describeError(error));
 }
 
 /**
- * A failure a cycle **recorded**, said without claiming a space is missing.
+ * The gardener being ungranted on a scope, said with the space **named**.
  *
- * The stored counterpart of {@link describeRunFailure}, and it asks the same
- * question through the same owner: {@link recordedUnknownSpace} is the client's
- * one unknown-space match, reading a string rather than a caught response. A
- * scoped cycle whose space stopped resolving records *"TypeNotFound: unknown
- * space: 909a3060…"* — forbidden phrasing and a bare id in one line — and it is
- * the *first* failure a real scoped run produces, so this is not a hypothetical
- * branch.
+ * Shared by the live refusal and the recorded one for the reason the space copy
+ * is: they are one event seen at two moments, and two wordings would drift.
  *
- * Anything else is the server's own line, shown as it was written. That is the
- * same bargain `describeError` strikes for a live failure: what this module
- * owns is the one refusal whose wording is a decision, not every message the
- * server can produce.
+ * Nothing here resolves the server's deliberate ambiguity about a space — this
+ * refusal is not about whether the space exists (the *caller* has already been
+ * shown to see it; `_require_gardener_scope` runs after `open_cycle`), it is
+ * about a grant the gardener does not hold. That is a fact about the gardener,
+ * so it can be stated outright.
+ *
+ * The remedy is the server's own (`nodum grant builtin-gardener <space> edit`)
+ * with the space named rather than spelt, and quoted, because a space title may
+ * contain a space character and `nodum grant` resolves an id **or** a name.
+ */
+function gardenerHoldsNoGrant(scope: SpaceName | null): string {
+  const remedy =
+    scope === null
+      ? "run nodum grant builtin-gardener <space> edit to give it one."
+      : `run nodum grant builtin-gardener '${scope.label}' edit to give it one.`;
+  return (
+    `the gardener holds no grant on ${scopeReference(scope)}, so it cannot consolidate it. ` +
+    `Migration 0014 seeds it with main and meta only and every other space is an explicit ` +
+    `grant — ${remedy}`
+  );
+}
+
+/**
+ * A failure a cycle **recorded**, said without a forbidden phrase and without an
+ * id.
+ *
+ * The stored counterpart of {@link describeRunFailure}, asking the same two
+ * questions through the same owners — {@link recordedUnknownSpace} and
+ * {@link recordedUngrantedScope}, both in `api/client.ts` beside the live
+ * discriminator, because a match with two owners is a match that drifts.
+ *
+ * The two named shapes are the two refusals a scoped cycle can record about a
+ * space, and the second is the one a default install meets: migration `0014`
+ * grants the gardener `main` and `meta`, the scope picker offers everything, and
+ * the refusal echoes *the reference the caller supplied* — which, for the one
+ * caller that reaches this path by clicking, is a 32-hex id. It was rendered
+ * verbatim in the list **and** in the detail page, twice per line.
+ *
+ * **Everything else still says what the server said, minus its ids.** That
+ * bargain is deliberate — an unfamiliar failure has to stay legible, and this
+ * module owns the refusals whose wording is a decision rather than every message
+ * the service can produce — but it is no longer a pass-through:
+ * {@link nameIdsIn} runs over it, so a *third* shape can arrive carrying an id
+ * and still cannot put one on the screen.
  *
  * @param recorded The `error` string out of the report.
  * @param scope The cycle's scope resolved through `nameSpace`, if it had one.
  */
 export function describeRecordedFailure(recorded: string, scope: SpaceName | null): string {
-  if (recordedUnknownSpace(recorded) === null) return recorded;
-  return (
-    `nodum would not resolve ${scopeReference(scope)} when this cycle ran. ` +
-    `${SCOPE_STOPS_RESOLVING}, so it may have changed between the run being asked for and the ` +
-    "gardener reaching it."
-  );
+  if (recordedUnknownSpace(recorded) !== null) {
+    return (
+      `nodum would not resolve ${scopeReference(scope)} when this cycle ran. ` +
+      `${SCOPE_STOPS_RESOLVING}, so it may have changed between the run being asked for and the ` +
+      "gardener reaching it."
+    );
+  }
+  if (recordedUngrantedScope(recorded) !== null) return gardenerHoldsNoGrant(scope);
+  return nameIdsIn(recorded);
 }
 
 /* ------------------------------------------------------------------ */
@@ -958,7 +1197,18 @@ export function noMetricsNote(cycle: CycleOut): string {
           "The reason is above."
       : "This cycle recorded no coherence metrics, and its report does not say why.";
   }
-  if (readOperationReport(cycle.report) !== null) {
+  const operation = readOperationReport(cycle.report);
+  if (operation !== null && operation.op === ABANDON_OP) {
+    // `close_cycle` replaces the report wholesale, so an abandoned run's metrics
+    // are gone whether or not it had measured anything. Saying "a rollback and a
+    // one-op curative cycle do not compute them" describes two things this is
+    // not.
+    return (
+      "This cycle recorded no coherence metrics: it was interrupted before it could write any, " +
+      "and closing its entry by hand replaced whatever report it had."
+    );
+  }
+  if (operation !== null) {
     return (
       "This cycle recorded no coherence metrics. A rollback and a one-op curative cycle do not " +
       "compute them — they change specific rows rather than sweeping the file."
@@ -1240,27 +1490,93 @@ export function referencedNodeIds(changes: readonly EventChange[]): string[] {
 }
 
 /**
+ * What one event's row is called on screen, with endpoint titles when they are
+ * known.
+ *
+ * {@link EventChange.headline} is the no-lookup fallback and is pure over ids by
+ * construction, because it is computed before any title has been fetched. That
+ * made it the wrong thing to *name a row with*: the rollback dialog printed
+ * `relates_to: 19c082d3… → db24d36d…` for an edge the event list on the same
+ * page was rendering as *"event sourcing → Event Sourcing"*, having resolved
+ * both ends. The titles are the same titles; only the dialog was not given them.
+ *
+ * @param change One reduced event.
+ * @param titles Resolved node titles by id; an absent key means the lookup has
+ *   not answered, which falls back to the shortened id exactly as the diff does.
+ */
+export function changeHeadline(
+  change: EventChange,
+  titles?: ReadonlyMap<string, string | null>,
+): string {
+  if (change.edge === null || titles === undefined) return change.headline;
+  const src = endpointLabel(change.edge.srcId, titles.get(change.edge.srcId ?? ""));
+  const dst = endpointLabel(change.edge.dstId, titles.get(change.edge.dstId ?? ""));
+  return `${change.edge.type}: ${src} → ${dst}`;
+}
+
+/**
  * What this cycle's own events call each row it touched.
  *
  * The rollback confirm lists the rows standing in the way of a reversal, and the
  * server names them by id — it is reporting on the `nodes`/`edges` tables, not
  * on anything with a title. But every conflicting row is by definition a row
- * *this cycle wrote*, so its event is on the same page, and that event's payload
- * carries the title. Naming the row *"Meeting 2026-07-01"* costs one lookup in a
- * map the page already built.
+ * *this cycle wrote*, so its event is in this list, and that event's payload
+ * carries the title.
  *
  * Newest event wins: a row the cycle touched twice is called what it was last
  * called, which is what the graph holds now.
  *
  * @param changes The cycle's events, newest first, as the API returns them.
+ * @param titles Resolved node titles, so an **edge** row is named by its
+ *   endpoints rather than by their ids — see {@link changeHeadline}. Omitted,
+ *   every edge falls back to the two shortened ids.
  */
-export function rowHeadlines(changes: readonly EventChange[]): Map<string, string> {
+export function rowHeadlines(
+  changes: readonly EventChange[],
+  titles?: ReadonlyMap<string, string | null>,
+): Map<string, string> {
   const names = new Map<string, string>();
   for (const change of changes) {
     if (change.rowId === null || names.has(change.rowId)) continue;
-    names.set(change.rowId, change.headline);
+    names.set(change.rowId, changeHeadline(change, titles));
   }
   return names;
+}
+
+/**
+ * Every node id the rollback verdict has to look up before it can name its rows.
+ *
+ * The rule behind the dialog's own title lookup, kept out of the component for
+ * the reason {@link referencedNodeIds} is: getting it wrong is invisible until
+ * you watch the network panel, and the harness renders nothing.
+ *
+ * Two sources, and they are different in kind. A **conflict** or **blocker**
+ * names a row *this cycle wrote*, so its event is in the list behind the dialog
+ * — for an edge, what has to be resolved is that event's two endpoints. A
+ * **dependant** is by definition a row the cycle did *not* write, so no event
+ * names it and the id is all there is; it is looked up directly, and answering
+ * with nothing is fine — `GET /api/nodes/{id}` 404s for the one dependant that
+ * is not a node at all (a grant's `agent_id`), and the shortened id stands.
+ *
+ * @param conflicts The verdict's conflicts.
+ * @param blockers The verdict's blockers.
+ * @param changes The cycle's reduced events.
+ */
+export function verdictNodeIds(
+  conflicts: readonly RollbackConflictOut[],
+  blockers: readonly RollbackBlockerOut[],
+  changes: readonly EventChange[],
+): string[] {
+  const rows = new Set<string>([
+    ...conflicts.map((conflict) => conflict.row_id),
+    ...blockers.map((blocker) => blocker.row_id),
+  ]);
+  const named = changes.filter((change) => change.rowId !== null && rows.has(change.rowId));
+  const ids = [
+    ...referencedNodeIds(named),
+    ...blockers.flatMap((blocker) => blocker.dependants),
+  ];
+  return [...new Set(ids.filter((id) => id !== ""))];
 }
 
 /**
@@ -1287,18 +1603,8 @@ export function eventWindowNote(count: number, truncated: boolean, limit: number
   return `${sentence(plural(count, "event"))} This cycle wrote nothing else.`;
 }
 
-/** One page of the event list, and what to call it. */
-export interface EventWindow {
-  /** Zero-based page index, clamped into range. */
-  page: number;
-  /** How many pages there are; at least 1, even for an empty list. */
-  pages: number;
-  /** Slice bounds into the event list — `[from, to)`. */
-  from: number;
-  to: number;
-  /** `Events 1–25 of 500`, one-based and inclusive, for a human. */
-  label: string;
-}
+/** One page of the event list, and what to call it — `lib/paging`'s shape. */
+export type EventWindow = PageWindow;
 
 /**
  * Which slice of a cycle's events to render, and what the pager says.
@@ -1311,23 +1617,17 @@ export interface EventWindow {
  * endpoint titles are one request per node, so what is rendered is what is
  * fetched.
  *
- * The page is clamped rather than trusted: a list that shrinks under a pager
- * (the events reload after a rollback) would otherwise leave the reader on an
- * empty page with no way back that is not the browser's.
+ * The arithmetic itself is `lib/paging.pageWindow`, shared with the review
+ * queue, which meets the same shape one screen away — a cycle that files
+ * hundreds of proposals in one run puts that list exactly here. This wrapper is
+ * the noun and nothing else.
  *
  * @param total How many events there are.
  * @param page The page asked for, zero-based.
  * @param size Events per page; anything below 1 is read as 1.
  */
 export function eventWindow(total: number, page: number, size: number): EventWindow {
-  const perPage = Math.max(1, Math.floor(size));
-  const pages = Math.max(1, Math.ceil(total / perPage));
-  const current = Math.min(Math.max(0, Math.floor(page)), pages - 1);
-  const from = current * perPage;
-  const to = Math.min(total, from + perPage);
-  const label =
-    total === 0 ? "No events" : `Events ${from + 1}–${to} of ${total}`;
-  return { page: current, pages, from, to, label };
+  return pageWindow(total, page, size, "event");
 }
 
 /**
@@ -1357,7 +1657,16 @@ export function emptyEventsNote(cycle: CycleOut): string {
       : "This cycle wrote nothing to the graph. Every job ran and none of them found anything " +
           "to change.";
   }
-  if (readOperationReport(cycle.report) !== null) {
+  const operation = readOperationReport(cycle.report);
+  if (operation !== null && operation.op === ABANDON_OP) {
+    // An abandoned run usually *did* write — that is why closing its entry
+    // matters — so an empty list here means it died before it got that far.
+    return (
+      "This run was interrupted before it wrote anything to the graph, so there is nothing here " +
+      "to reverse."
+    );
+  }
+  if (operation !== null) {
     return (
       "One curative operation ran and matched nothing, so it wrote no graph event. There is " +
       "nothing here to reverse."
@@ -1518,12 +1827,19 @@ export interface BlockerLine {
   /** How many there are in total — `dependants` is capped for reading, this is not. */
   dependantCount: number;
   /**
-   * The guard's own refusal, as the server wrote it.
+   * The guard's own refusal, in the server's words with its ids named.
    *
-   * Shown verbatim, which is the same bargain {@link describeRecordedFailure}
-   * strikes: what this module owns is the sentence *about* the refusal, not
-   * every message the service can produce. It is also the one line that says
-   * what the run will actually fail with if it is attempted anyway.
+   * The wording is the server's, which is the same bargain
+   * {@link describeRecordedFailure} strikes: what this module owns is the
+   * sentence *about* the refusal, not every message the service can produce, and
+   * this is the one line that says what the run will actually fail with if it is
+   * attempted anyway.
+   *
+   * What it may not carry is a bare id. `service._delete_blocker` writes *"space
+   * &lt;32-hex&gt; still holds 3 node(s) (&lt;32-hex&gt;, …)"* — the row and the
+   * dependants, spelt — and it sat directly beside a sentence that had carefully
+   * named both. {@link nameIdsIn} runs over it, so every id in it is the page's
+   * own name for that row or its shortened form.
    */
   reason: string;
   /** The whole of it as one sentence, for a screen reader and a copy-paste. */
@@ -1539,14 +1855,14 @@ export interface BlockerLine {
  * is used, and the ids are named through the page's own event list rather than
  * printed.
  *
- * The sentence names the row and its dependants and stops there — the `reason`
- * carries the server's own wording, ids and all, and is rendered beside the
- * sentence rather than spliced into it, so a page that could name every row does
- * not put 32 hex characters into the line a screen reader announces.
+ * The sentence names the row and its dependants and stops there; the `reason` is
+ * rendered beside it rather than spliced into it, and goes through
+ * {@link nameIdsIn} for the same reason the sentence never spells an id.
  *
  * @param blocker One row out of `RollbackOut.blockers`.
- * @param nameRow Names a row this cycle touched — {@link rowHeadlines} over the
- *   page's own event list. Omitted, the line falls back to shortened ids.
+ * @param nameRow Names a row on this page — {@link rowHeadlines} over the
+ *   cycle's own event list, and the resolved node titles for the dependants,
+ *   which no event names. Omitted, every line falls back to shortened ids.
  */
 export function describeBlocker(
   blocker: RollbackBlockerOut,
@@ -1555,9 +1871,11 @@ export function describeBlocker(
   const cycleDid = `event #${blocker.cycle_event_seq} (${blocker.cycle_event_op})`;
   const name = nameRow(blocker.row_id);
   const called = rowLabel(blocker.row_id, nameRow);
-  // A dependant is by definition a row this cycle did *not* write, so the page's
-  // event list usually cannot name it — the shortened id is the honest answer,
-  // and it is still not the 32 hex characters the server sent.
+  // A dependant is by definition a row this cycle did *not* write, so no event
+  // on this page names it — but it is a node, and the dialog resolves its title
+  // the way the diff resolves an edge's endpoints. Where that answers nothing
+  // (a grant's `agent_id` is not a node at all) the shortened id stands, which
+  // is still not the 32 hex characters the server sent.
   const dependants = blocker.dependants
     .slice(0, MAX_NAMED_DEPENDANTS)
     .map((id) => ({ id, label: rowLabel(id, nameRow, 12) }));
@@ -1575,7 +1893,7 @@ export function describeBlocker(
     cycleDid,
     dependants,
     dependantCount: total,
-    reason: blocker.reason,
+    reason: nameIdsIn(blocker.reason, nameRow),
     sentence:
       `This cycle's ${cycleDid} created the ${blocker.kind} ${called}, and ` +
       `${plural(total, "row")} ${depend} on it now (${named}). Reversing a create deletes the ` +

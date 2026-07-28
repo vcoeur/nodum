@@ -7,10 +7,13 @@ agree with each other — sleeping *is* how time passes — so the delays the lo
 asks for become assertions instead of a wait, and a test that pinned real time
 would only be measuring the machine it ran on.
 
-Four properties carry the file, and they are the four a background writer has to
+Five properties carry the file, and they are the five a background writer has to
 have: it runs on the schedule, it never overlaps itself, a crash inside a cycle
-neither kills the loop nor the server, and shutting the server down does not
-wait for a cycle that is still writing.
+neither kills the loop nor the server, shutting the server down does not wait
+for a cycle that is still writing — and a night it *skipped* because a human was
+already consolidating reads as the skip it is rather than as a fault, which is
+the one of the five that is about what a human is told rather than about what
+runs.
 """
 
 from __future__ import annotations
@@ -38,6 +41,11 @@ TASK_NAME = "nodum-consolidation"
 #: How long a test waits on a flag another thread sets before calling it a
 #: failure. Generous: it is a deadlock detector, never a timing assertion.
 FLAG_TIMEOUT = 5.0
+
+#: Stands in for the runner's own refusal text. The loop must carry the reason
+#: through to the log line, because "skipped" without it says nothing a human can
+#: act on.
+BUSY_MESSAGE = "a consolidation cycle is already running"
 
 
 class _VirtualTime:
@@ -75,7 +83,13 @@ class _FakeRunner:
     ran" and, in the shutdown test, holds a cycle open while the server stops.
     """
 
-    def __init__(self, *, signal_after: int = 1, fail_on: tuple[int, ...] = ()) -> None:
+    def __init__(
+        self,
+        *,
+        signal_after: int = 1,
+        fail_on: tuple[int, ...] = (),
+        busy_on: tuple[int, ...] = (),
+    ) -> None:
         self.calls: list[dict] = []
         self.concurrent = 0
         self.max_concurrent = 0
@@ -84,6 +98,7 @@ class _FakeRunner:
         self._lock = threading.Lock()
         self._signal_after = signal_after
         self._fail_on = set(fail_on)
+        self._busy_on = set(busy_on)
 
     def __call__(self, **kwargs: object) -> None:
         with self._lock:
@@ -95,6 +110,11 @@ class _FakeRunner:
             if index >= self._signal_after:
                 self.reached.set()
                 self.hold.wait(FLAG_TIMEOUT)
+            if index in self._busy_on:
+                # What the real runner raises when somebody else holds the
+                # cycle: a refusal, not a fault. Raised from the same place a
+                # crash is, so the loop has to tell the two apart itself.
+                raise consolidate.CycleInProgress(BUSY_MESSAGE)
             if index in self._fail_on:
                 raise RuntimeError(f"cycle {index} exploded")
         finally:
@@ -385,6 +405,80 @@ def test_a_crashing_cycle_does_not_stop_the_loop():
     assert virtual.delays[1:3] == [86400.0, 86400.0]
 
 
+def test_a_night_a_human_was_already_consolidating_is_logged_as_a_skip(caplog):
+    """A busy night is a skip, and a skip is not a failure.
+
+    ``CycleInProgress`` is a ``ValueError``, so it landed on the generic
+    ``except Exception`` below it and the night was reported as
+    ``scheduled consolidation cycle failed`` at ERROR with a full traceback. The
+    collision is not rare and is getting less rare: ``POST /api/cycles`` moved
+    off the event loop precisely so a human-triggered cycle can take minutes, and
+    a human running one across 03:00 is exactly the case the runner's refusal
+    exists for. Nothing was broken — a cycle *was* running, the runner declined
+    to start a second, and the graph is being consolidated as we speak — so an
+    ERROR-level traceback sends a human looking for a fault that is not there.
+
+    Three things are asserted, and the third is the one that matters: the level
+    is not ERROR, the record carries **no** exception info (a traceback is what
+    says "read me, something is wrong"), and the runner's own reason survives
+    into the line, because "skipped" alone is not actionable.
+    """
+    virtual = _VirtualTime(datetime(2026, 7, 27, 12, 0))
+    runner = _FakeRunner(signal_after=3, busy_on=(1, 2))
+
+    async def drive() -> None:
+        nightly = _scheduler(virtual, runner)
+        nightly.start()
+        try:
+            await _await_flag(runner.reached)
+            assert nightly.running, "a skipped night must not end the schedule"
+            await nightly.stop()
+        finally:
+            runner.release()
+
+    with caplog.at_level(logging.INFO, logger=scheduler.logger.name):
+        asyncio.run(drive())
+
+    records = [record for record in caplog.records if record.name == scheduler.logger.name]
+    assert len(records) == 2, [record.getMessage() for record in records]
+    for record in records:
+        assert record.levelno < logging.ERROR, record.levelname
+        assert record.exc_info is None, "a skip is not a fault, so it carries no traceback"
+        assert "skip" in record.getMessage().lower()
+        assert BUSY_MESSAGE in record.getMessage()
+    # And the schedule kept its shape: the third night ran a day after the second.
+    assert len(runner.calls) == 3
+    assert virtual.delays[1:3] == [86400.0, 86400.0]
+
+
+def test_a_crash_is_still_a_failure_with_its_traceback(caplog):
+    """The other half of the split: a bug in the gardener still reads as one.
+
+    Narrowing the skip out of the generic handler must not narrow the handler
+    itself — a cycle that raised something nobody predicted is still an ERROR
+    with the traceback attached, because that is a thing to go and read.
+    """
+    virtual = _VirtualTime(datetime(2026, 7, 27, 12, 0))
+    runner = _FakeRunner(signal_after=2, fail_on=(1,))
+
+    async def drive() -> None:
+        nightly = _scheduler(virtual, runner)
+        nightly.start()
+        try:
+            await _await_flag(runner.reached)
+            await nightly.stop()
+        finally:
+            runner.release()
+
+    with caplog.at_level(logging.INFO, logger=scheduler.logger.name):
+        asyncio.run(drive())
+
+    (record,) = [r for r in caplog.records if r.name == scheduler.logger.name]
+    assert record.levelno == logging.ERROR
+    assert record.exc_info is not None
+    assert "failed" in record.getMessage()
+
+
 def test_shutdown_does_not_wait_for_a_cycle_that_is_still_writing():
     """The rare case the grace period exists for, timed rather than asserted about.
 
@@ -526,3 +620,62 @@ def test_a_scheduled_run_lands_in_the_journal_as_the_clock(fresh_db):
 
     # Nothing else is wired in: the default runner is the real one.
     assert scheduler.ConsolidationScheduler(at=time(3, 0))._run is consolidate.consolidate
+
+
+def test_a_stranded_cycle_makes_every_night_a_skip_that_names_the_way_out(fresh_db, caplog):
+    """The skip path end to end, against the real runner and the real guard.
+
+    Since the serialisation moved into the database, an open ``running`` cycle
+    blocks a run **from any process** — and one a ``SIGKILL`` left behind never
+    closes itself, so it blocks the schedule every night from then on. That makes
+    the log line the whole of what a human gets, which is why it has to carry the
+    runner's own sentence rather than a summary of it: the refusal names the
+    cycle in the way and the `nodum cycle-abandon <id>` that clears it, and a
+    skip logged as "skipped" alone would be a nightly notice with no cure in it.
+
+    The cause is not invisible either — the blocking cycle is sitting in the
+    journal as ``running``, which is where a human looking for "why has nothing
+    run since Tuesday" would find it. That is the division the skip decision
+    rests on: the journal records cycles, the log records the schedule.
+    """
+    service.create_node(type="claim", title="Kafka Streams", principal=owner())
+    service.create_node(type="claim", title="Kafka Streams", principal=owner())
+    stranded = service.open_cycle(trigger="manual", principal=owner())
+    virtual = _VirtualTime(datetime(2026, 7, 27, 12, 0))
+    tried = threading.Event()
+
+    def run_and_signal(**kwargs):
+        try:
+            return consolidate.consolidate(**kwargs)
+        finally:
+            tried.set()
+
+    async def drive() -> None:
+        nightly = scheduler.ConsolidationScheduler(
+            at=time(3, 0),
+            db_path=str(fresh_db),
+            sleep=virtual.sleep,
+            clock=virtual.clock,
+            run=run_and_signal,
+        )
+        nightly.start()
+        try:
+            await _await_flag(tried)
+            assert nightly.running, "a blocked night must not end the schedule"
+        finally:
+            await nightly.stop()
+
+    with caplog.at_level(logging.INFO, logger=scheduler.logger.name):
+        asyncio.run(drive())
+
+    skips = [r for r in caplog.records if r.name == scheduler.logger.name]
+    assert skips, "a night that could not run said nothing at all"
+    for record in skips:
+        assert record.levelno == logging.WARNING
+        assert record.exc_info is None
+        assert f"nodum cycle-abandon {stranded.id}" in record.getMessage()
+    # The journal holds the cause, unchanged: no entry for the nights that were
+    # skipped, and the cycle that is blocking them still open.
+    assert [(c.id, c.status) for c in service.list_cycles(principal=owner())] == [
+        (stranded.id, "running")
+    ]

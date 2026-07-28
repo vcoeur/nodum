@@ -6,7 +6,7 @@ that claim depending on a file this repo does not ship. So the schedule lives
 where the server already is: one asyncio task in ``nodum serve``'s lifespan, no
 new dependency, no second process.
 
-Four properties, and each one is a design decision rather than an accident:
+Every property below is a design decision rather than an accident:
 
 * **It cannot overlap itself.** The loop is sequential — the next wait is
   computed only after the run it follows has *returned* — so there is no timer
@@ -23,6 +23,44 @@ Four properties, and each one is a design decision rather than an accident:
   journal; anything that escapes it is logged here and the loop waits for the
   next occurrence. A background task that dies silently is worse than one that
   fails loudly and tries again tomorrow.
+* **A night somebody else was already consolidating is a *skip*, not a
+  failure.** Consolidation cycles are serialised by a ``cycles`` row — migration
+  ``0014``'s partial unique index — so a second opener is **refused**
+  (:class:`nodum.consolidate.CycleInProgress`) rather than queued, whichever
+  process it is in. A human running a cycle across the schedule's fire time
+  therefore makes the timer bounce off it, and that is not rare and is getting
+  less so: ``POST /api/cycles`` now runs off the event loop specifically so a
+  human-triggered cycle may take minutes. ``CycleInProgress`` is a
+  ``ValueError``, so it used to land on the generic handler above and be reported
+  as ``scheduled consolidation cycle failed`` at ERROR with a full traceback — a
+  fault report for a night when the graph was being consolidated exactly as
+  intended, by somebody who asked for it. It is caught ahead of that handler and
+  logged at WARNING, without a traceback and **carrying the runner's own
+  sentence verbatim**, which is load-bearing rather than tidy: that sentence
+  names the cycle in the way and the ``nodum cycle-abandon <id>`` that clears it.
+
+  **Where a skipped night is visible is the server log, and deliberately
+  nowhere else.** The obvious alternative is a journal row saying the night was
+  skipped, and it is wrong three times over: the ``cycles`` table records cycles
+  that *ran* (what was consolidated, by whom, how it ended), a row for a
+  non-event would have no events under it — which is precisely the shape a
+  ``dry_run`` entry has, the one this system leans on as the machine-checkable
+  proof that a rehearsal changed nothing — and writing it would mean opening a
+  cycle against the very index that just refused one. The journal is not silent
+  about this either, which is the point: what a skipped night leaves behind is a
+  cycle sitting there ``running``, so "why has nothing run since Tuesday" is
+  answered by ``nodum cycle-list`` and the answer is actionable. The *cause* is
+  in the journal because it is a cycle; the skip is a note about the schedule,
+  so it goes where the schedule's other notes go — beside the "off because
+  unparseable" warning and the ``serve`` banner's announcement that a schedule
+  is on at all.
+
+  This matters more since the guard moved into the database. A run a ``SIGKILL``
+  ended never closes itself and now blocks **every** later night rather than
+  only the ones sharing its process, so the nightly WARNING is the recurring
+  signal that something needs abandoning — which is exactly why it must carry
+  the remedy and must not be an ERROR that reads like the schedule itself is
+  broken.
 * **It is off unless configured.** :data:`ENV_CONSOLIDATE_AT` is unset by
   default and an unset value means no task is created at all. A background
   process that writes to the human's graph without being asked is not something
@@ -244,6 +282,10 @@ class ConsolidationScheduler:
                 await self._run_once()
             except asyncio.CancelledError:
                 raise
+            except consolidate.CycleInProgress as busy:
+                # A skipped night, not a failed one. See the module docstring for
+                # why this is a log line and not a journal row.
+                logger.warning("scheduled consolidation cycle skipped: %s", busy)
             except Exception:
                 # The runner already records a failing cycle in the journal;
                 # anything that escapes it is a bug, and a bug in the gardener

@@ -53,6 +53,7 @@
 
 import type { ProposalOut, SpaceOut } from "../../api/types";
 import { timestampMs } from "../../lib";
+import { plural } from "./format";
 import { contextRef } from "./proposalText";
 
 /** The three things an agent can propose. `ProposalOut.kind` is a bare string. */
@@ -80,8 +81,25 @@ export interface ProposalBatch {
   key: string;
   /** The proposing actor, verbatim (`agent:researcher`, …). */
   agent: string;
-  /** Proposals in arrival order. */
+  /**
+   * Every proposal in the run, in arrival order.
+   *
+   * **The whole run, always**, whether the page renders it or not: this is what
+   * "Accept run (500)" counts and what it acts on. A batch action is defined on
+   * the run rather than on what happens to be visible, so paging must not be
+   * able to change either number.
+   */
   proposals: ProposalOut[];
+  /**
+   * The subset the current page renders — the whole run until {@link restrictToPage}
+   * has been applied.
+   *
+   * Separate from `proposals` so that paging is a rendering decision and nothing
+   * else. Folding the two together would have made every count on the screen
+   * page-local, which is the dishonesty paging was added to fix rather than a
+   * second one to introduce.
+   */
+  shown: ProposalOut[];
   /** Timestamp of the first proposal in the batch. */
   startedAt: string;
   /** Timestamp of the last proposal in the batch. */
@@ -160,6 +178,9 @@ export function groupProposals(
         key: `${agent}@${first.created_at}#${first.id}`,
         agent,
         proposals: current,
+        // Unpaged until a caller says otherwise, so every existing reading of a
+        // batch is unchanged and the pager is the only thing that narrows one.
+        shown: current,
         startedAt: first.created_at,
         endedAt: last.created_at,
         counts,
@@ -481,6 +502,135 @@ export function groupProposalsBySpace(
   selfGoverning.sort((a, b) => a.spaceId.localeCompare(b.spaceId));
 
   return [...sections, ...selfGoverning];
+}
+
+/* ------------------------------------------------------------------ */
+/* Paging, and saying how much is really there                          */
+/* ------------------------------------------------------------------ */
+
+/**
+ * How many proposal cards one page renders.
+ *
+ * The same value and the same reason as the journal's event page. A
+ * consolidation cycle files hundreds of proposals in one run, and the queue
+ * rendered every one of them: 10 673 DOM nodes on a queue of 500, on the screen
+ * whose whole job is not to lose a proposal. A card is heavier than an event
+ * row, so this is if anything generous.
+ */
+export const PROPOSAL_PAGE_SIZE = 25;
+
+/**
+ * What identifies a proposal for the page-membership test.
+ *
+ * `id` alone is not enough: an **update** proposal's id is a version row's
+ * integer id, which lives in a different id space from a node's or an edge's
+ * uuid — which is why the cards are keyed `kind:id` too.
+ *
+ * @param proposal One queue entry.
+ */
+export function proposalPageKey(proposal: ProposalOut): string {
+  return `${proposal.kind}:${proposal.id}`;
+}
+
+/**
+ * Every proposal in the exact order the sections render them.
+ *
+ * The pager slices *this*, not the flat list the server sent. They are different
+ * orders — the server answers oldest-first and the screen renders space, then
+ * agent, then newest run first — and paging over the wire order would scatter
+ * one page's rows through the whole tree.
+ *
+ * Self-governing sections contribute nothing, having no proposals: they are a
+ * statement about an absence and are rendered outside the pager entirely.
+ *
+ * @param sections The full grouping, from {@link groupProposalsBySpace}.
+ */
+export function sectionOrder(sections: readonly SpaceSection[]): ProposalOut[] {
+  return sections.flatMap((section) =>
+    section.agents.flatMap((agent) => agent.batches.flatMap((batch) => batch.proposals)),
+  );
+}
+
+/**
+ * The same sections with only one page's proposals rendered, and every count
+ * left whole.
+ *
+ * The counts are the point. A section header says how much is waiting in that
+ * space, an agent header says how much that agent is waiting on, and a batch
+ * header says how big the run is and how many "Accept run" would take — and none
+ * of those is a statement about the page. So `total`, `counts`, `crossings`,
+ * `oldestAt` and `proposals` are untouched, and the page moves exactly one field:
+ * {@link ProposalBatch.shown}.
+ *
+ * Groups with nothing on this page are dropped rather than rendered empty; a
+ * batch that straddles a page boundary appears on both, with its full count both
+ * times, which is what it is.
+ *
+ * @param sections The full grouping.
+ * @param onPage The page's keys, from {@link proposalPageKey}.
+ */
+export function restrictToPage(
+  sections: readonly SpaceSection[],
+  onPage: ReadonlySet<string>,
+): SpaceSection[] {
+  const paged: SpaceSection[] = [];
+  for (const section of sections) {
+    const agents: AgentGroup[] = [];
+    for (const agent of section.agents) {
+      const batches: ProposalBatch[] = [];
+      for (const batch of agent.batches) {
+        const shown = batch.proposals.filter((proposal) =>
+          onPage.has(proposalPageKey(proposal)),
+        );
+        if (shown.length > 0) batches.push({ ...batch, shown });
+      }
+      if (batches.length > 0) agents.push({ ...agent, batches });
+    }
+    if (agents.length > 0) paged.push({ ...section, agents });
+  }
+  return paged;
+}
+
+/**
+ * How much is waiting, said so that a filled window is not reported as a total.
+ *
+ * `GET /api/review/queue` takes a `limit` and answers `rows[:limit]` with no
+ * total and no truncation flag — the envelope's `count` is the length of what
+ * came back — so a queue of 1043 answered a request for 500 with 500, and this
+ * line read *"500 proposals waiting"*. Silent truncation, on the screen whose
+ * whole job is not to lose a proposal, while the journal two views away was
+ * already saying *"the 500-event window filled, so this may not be all of
+ * them"*.
+ *
+ * A filled window is **conservative**, exactly as `events_truncated` is: 500
+ * returned for a limit of 500 may be the last 500 there are. So the copy says
+ * *at least*, which is true either way, and never a number the client cannot
+ * know.
+ *
+ * @param shown How many survive the toolbar's filters.
+ * @param total How many came back from the server.
+ * @param truncated Whether the server's window filled.
+ */
+export function queueCount(shown: number, total: number, truncated: boolean): string {
+  const all = truncated ? `at least ${total} proposals` : plural(total, "proposal");
+  return shown === total ? all : `${shown} of ${all}`;
+}
+
+/**
+ * What to say beside {@link queueCount} when the window filled.
+ *
+ * It names the cap and what to do about it, because there *is* something to do:
+ * the queue is oldest-first, so clearing what is here and refreshing brings the
+ * next window up. A notice that only said "there may be more" would leave a
+ * reviewer unable to reach them.
+ *
+ * @param limit The window that was asked for.
+ */
+export function queueTruncationNote(limit: number): string {
+  return (
+    `The ${limit}-proposal window filled, so this may not be all of them. The queue is ` +
+    "oldest-first — accept or reject what is here and refresh to bring the rest up."
+  );
 }
 
 /** Render a counter as "3 nodes · 12 edges", skipping the zeroes. */

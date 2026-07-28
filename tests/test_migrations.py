@@ -605,6 +605,83 @@ def test_cycles_exists_on_a_database_built_from_scratch(fresh_db):
         conn.close()
 
 
+def _insert_cycle(conn, cycle_id, trigger, status="running"):
+    conn.execute(
+        "INSERT INTO cycles (id, trigger, triggered_by, status) VALUES (?, ?, 'human:owner', ?)",
+        (cycle_id, trigger, status),
+    )
+
+
+def test_only_one_consolidation_cycle_may_be_running_in_the_whole_file(fresh_db):
+    """The cross-process lock, and it is the row rather than anything in Python.
+
+    A module-level lock serialises the runner inside **one** process, which
+    covers the HTTP route, the nightly task and an in-process caller — and
+    covers a `nodum consolidate` in a second process not at all. Both runs then
+    completed and every duplicate pair was proposed twice, so the human's review
+    queue doubled from one click and one command.
+
+    The `cycles` table already *is* the cross-process state: a `running`
+    consolidation row means one is running, whoever opened it. A partial unique
+    index makes the second opener lose atomically, rather than after a read that
+    was true when it was made.
+    """
+    conn = db.connect()
+    try:
+        indexes = {row["name"] for row in conn.execute("PRAGMA index_list(cycles)")}
+        assert "idx_cycles_one_running_consolidation" in indexes
+
+        _insert_cycle(conn, "first", "scheduled")
+        with pytest.raises(sqlite3.IntegrityError, match="UNIQUE"):
+            _insert_cycle(conn, "second", "manual")
+
+        # Closing the first frees it: the index is over `running` rows only.
+        conn.execute("UPDATE cycles SET status = 'completed' WHERE id = 'first'")
+        _insert_cycle(conn, "second", "manual")
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("trigger", ["curative", "rollback"])
+def test_a_curative_or_rollback_cycle_still_runs_beside_a_consolidation(fresh_db, trigger):
+    """The guard is scoped to consolidation triggers, and that scoping is the point.
+
+    A curative cycle is one human-driven operation and a rollback is the human's
+    undo; both are short, and blocking either for the length of a nightly sweep
+    would take the curative tier offline every night. Only the two triggers the
+    runner opens — `manual` and `scheduled` — are serialised against each other.
+    """
+    conn = db.connect()
+    try:
+        _insert_cycle(conn, "sweep", "scheduled")
+        _insert_cycle(conn, "beside-it", trigger)
+        _insert_cycle(conn, "and-another", trigger)
+    finally:
+        conn.close()
+
+
+def test_a_database_recorded_at_0014_without_the_lock_index_is_refused(tmp_path, monkeypatch):
+    """0014 was amended in place while unreleased, so a dev file can be stale.
+
+    `init_db` skips a migration whose name is already recorded, so a database
+    built from the first cut of `0014` keeps the name and loses the index — and
+    the cross-process guard is then absent with nothing saying so. That is the
+    exact drift `_verify_schema_consistency` exists for, and 0014 has a
+    checkable guarantee like the four migrations already listed there.
+    """
+    path = tmp_path / "stale.db"
+    monkeypatch.setenv(db.ENV_DB_VAR, str(path))
+    service.init()
+    conn = db.connect()
+    try:
+        conn.execute("DROP INDEX idx_cycles_one_running_consolidation")
+        conn.commit()
+        with pytest.raises(db.SchemaConsistencyError, match="0014_cycles_and_gardener"):
+            db.init_db(conn)
+    finally:
+        conn.close()
+
+
 @pytest.mark.parametrize(
     ("columns", "values"),
     [

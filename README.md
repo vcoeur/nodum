@@ -273,7 +273,9 @@ degrades to BM25 + graph expansion. `NODUM_EMBED_MODEL` switches the model
   screen beside every other agent's, and which `nodum revoke builtin-gardener
   main` takes away with the command that was already there. Consolidating any
   *other* space is an explicit `nodum grant builtin-gardener <space> edit`, and
-  a cycle scoped to a space it holds no grant on says exactly that. It holds no
+  a cycle scoped to a space it holds no grant on says exactly that — on every
+  surface, the browser's own scope picker included, which is where that sentence
+  is most needed and where it used to arrive as `storage error`. It holds no
   credential at all: it authenticates by being in-process, so there is nothing
   to present and nothing to steal, and the supported way to stop it is
   `nodum agent disable builtin-gardener`. Its four jobs are arithmetic over data
@@ -306,6 +308,15 @@ degrades to BM25 + graph expansion. `NODUM_EMBED_MODEL` switches the model
   server shut down mid-cycle — `nodum cycle-abandon <id>` closes it `failed`,
   which is what makes its writes reversible at all: rollback refuses a cycle
   that is still running and `undo` refuses every cycle-stamped event.
+  **Only one consolidation cycle runs at a time against a file**, and that is a
+  uniqueness rule on the journal rather than a lock inside one process: a `nodum
+  consolidate` typed at a terminal while `nodum serve` is running one is refused
+  (`CycleInProgress`, a 409 over HTTP) rather than queued. When it was a
+  process-level lock both ran, and every duplicate pair was proposed twice into
+  the review queue. The refusal names the cycle in the way and the `nodum
+  cycle-abandon <id>` that clears it, since a run that was killed never closes
+  itself and would otherwise block every later run. Curative operations and
+  rollbacks stay outside the rule: each is one short operation you asked for.
 - **The curative tier changes structure; the additive tier only adds to it.**
   `merge-nodes` is soft — the merged-away node is archived, says where it went,
   and its edges are repointed at the survivor keeping their original endpoints,
@@ -315,9 +326,11 @@ degrades to BM25 + graph expansion. `NODUM_EMBED_MODEL` switches the model
   `bulk-relink` repoints or retypes many edges at once behind a dry run that
   writes nothing. All four are human-or-`edit`, all four are CLI-only — never
   MCP — and all four run **inside a cycle**, even when you invoke one directly.
-  That is why `undo` refuses a cycle-stamped event and points at `rollback`
-  instead: a merge is several rows from one decision, and undoing one of them
-  would leave the other half standing. A bare `nodum undo` right after a
+  That is why `undo` refuses a cycle-stamped event and points at `rollback` —
+  and at the last write belonging to no cycle, since a rollback is a cycle too
+  and "roll it back" alone is advice that loops back to the same refusal: a
+  merge is several rows from one decision, and undoing one of them would leave
+  the other half standing. A bare `nodum undo` right after a
   curative operation gets that same refusal, naming the cycle — it does not walk
   past the cycle to an older event, because "take back the last thing that
   happened" never meant something you did not name.
@@ -331,6 +344,10 @@ degrades to BM25 + graph expansion. `NODUM_EMBED_MODEL` switches the model
   never waits for a cycle to finish. "One a night" holds on the two nights a
   year that are not 24 hours long: the wait is computed in aware local time, so
   a daylight-saving change neither doubles the run nor moves it an hour.
+  And if you happen to be running a cycle yourself when the timer fires, the
+  night is **skipped** rather than queued — cycles are serialised — which is
+  logged as the skip it is and left out of the journal, since the journal
+  records the cycle that *did* run and who asked for it.
 - **Spaces: a filter for reading, a target for writing.** A space is a node of
   builtin type `space`, so its whole lifecycle is an ordinary node's
   (`space-create` / `space-rename` / `space-archive`, each event-logged,
@@ -400,7 +417,10 @@ degrades to BM25 + graph expansion. `NODUM_EMBED_MODEL` switches the model
   **409** carrying the conflicting rows, not a bare refusal, and asking for a
   cycle while one is running is a 409 too. Running one does not block the
   server: it is the one route that hands its work to a thread, so the UI stays
-  answerable for the minutes a real cycle takes. The curative tier
+  answerable for the minutes a real cycle takes — though the database is still
+  a single-writer file, so a read issued *during* a cycle queues behind it
+  (1168 ms measured, against 5 ms on an idle server). Responsive is the claim;
+  free is not. The curative tier
   is deliberately not there: it is the CLI's. With no UI bundle built, the API
   serves normally and `/` is a page telling you to run `make web-build`.
 - **Origin control, which is not the same thing as auth.** Binding loopback is

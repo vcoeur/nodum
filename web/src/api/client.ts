@@ -262,6 +262,53 @@ export function recordedUnknownSpace(recorded: string): string | null {
 }
 
 /**
+ * The gardener's own scope refusal (`consolidate._require_gardener_scope`).
+ *
+ * The **second** message shape a scoped cycle can record about a space, and the
+ * one that ships on a default install: migration `0014` seeds the gardener with
+ * `main` and `meta` only, so the first click on the journal's scope picker over
+ * any space a human created is refused here. The message echoes *the reference
+ * the caller supplied*, and the caller that reaches this path by clicking is the
+ * web UI, whose picker value is a space **id** — so the recorded failure carries
+ * a bare 32-hex id, twice, and the journal used to render it verbatim in both
+ * the list and the detail page.
+ *
+ * It lives beside {@link recordedUnknownSpace} for that function's own reason:
+ * a discriminator with two owners is a discriminator that drifts. Between them
+ * they cover every refusal in this system whose text names a space, and
+ * `journal.ts` fails closed on any *third* shape rather than waiting for it to
+ * be added here.
+ *
+ * The reference is matched out of Python's `repr` — `{reference!r}` — which is
+ * single-quoted unless the value itself holds a single quote, so both quotings
+ * are read. The exception prefix is stripped first exactly as above, and the
+ * same match works on a **live** `ApiError.message` (403), which carries the
+ * sentence with no prefix: `http_api._failure_message` exempts this package's
+ * own exceptions from the storage rewrite, so what arrives is `str(exc)`.
+ *
+ * @param recorded The `error` string out of a cycle's report, or the `message`
+ *   off a caught `ApiError`.
+ * @returns The space reference the refusal named, or null when the failure was
+ *   not the gardener being ungranted.
+ */
+export function recordedUngrantedScope(recorded: string): string | null {
+  const message = recorded.replace(RECORDED_EXCEPTION_PREFIX, "");
+  const match = UNGRANTED_SCOPE_MESSAGE.exec(message);
+  if (match === null) return null;
+  return match[1] ?? match[2] ?? null;
+}
+
+/**
+ * `consolidate._require_gardener_scope`'s literal opening, with the reference it
+ * echoes back.
+ *
+ * Anchored on the whole opening clause rather than on "gardener", so an
+ * unrelated message merely mentioning it cannot be rewritten as this refusal.
+ */
+const UNGRANTED_SCOPE_MESSAGE =
+  /^the gardener holds no grant on space (?:'([^']*)'|"([^"]*)")/i;
+
+/**
  * A rollback the graph has moved past — 409, with the rows that are in the way.
  *
  * The one refusal on this surface whose body carries more than `type` and
@@ -1281,6 +1328,31 @@ export async function runCycle(
 }
 
 /**
+ * `POST /api/cycles/{id}/abandon` — close an interrupted cycle as `failed`.
+ *
+ * The door out of a stuck run, and the **precondition** for the route below
+ * rather than a tidier journal: `service._rollback_plan` refuses a cycle that
+ * has not closed, and `undo` refuses every event a cycle stamped, so a run a
+ * `SIGKILL` or a shutdown left `running` has its writes irreversible on every
+ * surface until somebody closes the row. It changes nothing the run wrote.
+ *
+ * Takes no body. It refuses a cycle that is not `running` with
+ * `InvalidTransition` (**400**) — one that has said how it ended is not
+ * abandoned, and re-closing it would overwrite that record — and an unknown id
+ * with `RecordNotFound` (**404**). Human-only in the service, which every
+ * session on this surface satisfies by construction.
+ *
+ * @param id The cycle to abandon.
+ * @returns The cycle row, now `failed`.
+ */
+export function abandonCycle(id: string, signal?: AbortSignal): Promise<CycleOut> {
+  return request<CycleOut>(`/cycles/${encodeURIComponent(id)}/abandon`, {
+    method: "POST",
+    ...(signal ? { signal } : {}),
+  });
+}
+
+/**
  * `POST /api/cycles/{id}/rollback` — take a whole cycle back (design D7).
  *
  * **Call it with `dryRun` first.** A dry run opens no cycle, writes nothing, and
@@ -1401,6 +1473,7 @@ export const api = {
   listCycles,
   getCycle,
   runCycle,
+  abandonCycle,
   rollbackCycle,
   listEvents,
   undo,

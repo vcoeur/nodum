@@ -16,6 +16,17 @@ import type { ProposalOut } from "../../api/types";
 /** How often the queue re-polls while the tab is visible and idle. */
 export const POLL_INTERVAL_MS = 20_000;
 
+/**
+ * How many proposals one read asks for.
+ *
+ * `GET /api/review/queue` answers `rows[:limit]` and reports **no** total and no
+ * truncation flag — the list envelope's `count` is the length of what came back
+ * — so the only thing a client can know about a longer queue is that its own
+ * window filled. Named here, and reported as {@link ReviewQueue.truncated},
+ * because a number the toolbar prints as a total has to be one it can defend.
+ */
+export const REVIEW_QUEUE_LIMIT = 500;
+
 /** What the queue is currently doing. */
 export type QueueStatus = "loading" | "ready" | "error";
 
@@ -23,6 +34,14 @@ export type QueueStatus = "loading" | "ready" | "error";
 export interface ReviewQueue {
   proposals: ProposalOut[];
   status: QueueStatus;
+  /**
+   * Whether the read filled its window, so there may be more waiting.
+   *
+   * Conservative in the same way `CycleDetailOut.events_truncated` is: exactly
+   * `REVIEW_QUEUE_LIMIT` rows may well be the last ones there are. It says the
+   * list *may* be short and never that it provably is.
+   */
+  truncated: boolean;
   /** The failure that put `status` in `"error"`, if any. */
   error: unknown;
   /** True while a background poll is in flight over already-rendered data. */
@@ -42,6 +61,7 @@ export interface ReviewQueue {
  */
 export function useReviewQueue(paused: boolean): ReviewQueue {
   const [proposals, setProposals] = useState<ProposalOut[]>([]);
+  const [truncated, setTruncated] = useState(false);
   const [status, setStatus] = useState<QueueStatus>("loading");
   const [error, setError] = useState<unknown>(null);
   const [refreshing, setRefreshing] = useState(false);
@@ -67,9 +87,12 @@ export function useReviewQueue(paused: boolean): ReviewQueue {
     inFlight.current = controller;
     if (background) setRefreshing(true);
     try {
-      const next = await api.getReviewQueue({ limit: 500 }, controller.signal);
+      const next = await api.getReviewQueue({ limit: REVIEW_QUEUE_LIMIT }, controller.signal);
       if (!mounted.current || controller.signal.aborted) return;
       setProposals(next);
+      // The only truncation signal on this route: the server sends no total, so
+      // a full window is all a client can go on.
+      setTruncated(next.length >= REVIEW_QUEUE_LIMIT);
       setError(null);
       setStatus("ready");
       setLoadedAt(Date.now());
@@ -116,7 +139,7 @@ export function useReviewQueue(paused: boolean): ReviewQueue {
     };
   }, [load]);
 
-  return { proposals, status, error, refreshing, loadedAt, refresh };
+  return { proposals, truncated, status, error, refreshing, loadedAt, refresh };
 }
 
 /**

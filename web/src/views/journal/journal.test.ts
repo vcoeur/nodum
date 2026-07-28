@@ -48,6 +48,9 @@ import type {
   RollbackOut,
 } from "../../api/types";
 import {
+  ABANDON_CONFIRM,
+  abandonAvailability,
+  abandonOutcome,
   actorLabel,
   cycleCaveats,
   cycleFailures,
@@ -66,6 +69,7 @@ import {
   eventWindowNote,
   MAX_NAMED_DEPENDANTS,
   metricRows,
+  nameIdsIn,
   noMetricsNote,
   readConsolidationReport,
   referencedNodeIds,
@@ -76,6 +80,7 @@ import {
   rowHeadlines,
   SCOPE_CONTROL_HINT,
   shortId,
+  verdictNodeIds,
 } from "./journal";
 
 /* ------------------------------------------------------------------ */
@@ -448,6 +453,21 @@ describe("cycleWork", () => {
     );
   });
 
+  it("reads an abandoned run as an interrupted run, not as a curative operation", () => {
+    // The shape the new abandon control makes reachable from a browser.
+    // `close_cycle` replaces the interrupted run's report with `{"op":
+    // "abandon_cycle", …}`, so the generic one-op branch rendered "One curative
+    // operation: abandon_cycle. It failed." — wrong three ways: abandoning is
+    // not a curative operation, the operation did not fail, and the entry is a
+    // consolidation run rather than a single-row write.
+    const said = cycleWork(cycle({ trigger: "manual", status: "failed", report: ABANDON_REPORT }));
+    expect(said).toBe(
+      "Interrupted, and never finished. Its entry was closed by hand so that what it had " +
+        "already written could be rolled back.",
+    );
+    expect(said).not.toContain("curative");
+  });
+
   it("says an operation failed without quoting what came out of it", () => {
     const said = cycleWork(
       cycle({ status: "failed", report: { op: "merge_nodes", error: "node not found" } }),
@@ -475,11 +495,55 @@ describe("cycleWork", () => {
 const FORBIDDEN = ["no such space", "does not exist", "no record of", "unknown space", "not found"];
 
 /**
- * A recorded failure in the shape `nodum.consolidate` really writes
- * (`f"{type(failure).__name__}: {failure}"`), for the refusal a scoped cycle
- * actually meets first.
+ * The failure a scoped cycle really records in the whole-cycle slot, in the
+ * shape `nodum.consolidate` writes it (`f"{type(failure).__name__}: {failure}"`).
+ *
+ * `_require_gardener_scope`'s refusal, and it is the **first** thing a scoped run
+ * meets on a default install: migration `0014` grants the gardener `main` and
+ * `meta`, the journal's scope picker offers every space in the file, and the
+ * message echoes *the reference the caller supplied* — which for the one caller
+ * that reaches this path by clicking is a space **id**. It appears twice, once in
+ * the sentence and once in the remedy the message spells out. It reaches
+ * `failed[{job: "", …}]` with `jobs: []`, because it is raised inside
+ * `_consolidate_locked`'s `try` and caught by its `except BaseException`.
  */
-const REAL_REFUSAL = `TypeNotFound: unknown space: ${RESEARCH_ID}`;
+const UNGRANTED_SCOPE =
+  `GrantNotPermitted: the gardener holds no grant on space '${RESEARCH_ID}', so it cannot ` +
+  `consolidate it: migration 0014 seeds builtin-gardener with 'main' and 'meta' only, and ` +
+  `every other space is an explicit grant. Run: ` +
+  `nodum grant builtin-gardener ${RESEARCH_ID} edit`;
+
+/**
+ * The scope refusal, in the one slot that can actually carry it — a **job**.
+ *
+ * Not `failed[{job: ""}]`. `_consolidate_locked` calls `open_cycle` *outside* its
+ * own `try`, so a `TypeNotFound` raised resolving the caller's scope happens
+ * before the cycle row exists and can never be written into any report: a fixture
+ * putting this string in the whole-cycle slot asserts a shape the server cannot
+ * produce, which is the mistake this file has now paid for twice. What *can*
+ * carry it is a job — `_Context.nodes()` passes the scope to
+ * `list_nodes(space=…, principal=gardener)` on every read, so a space archived
+ * mid-run (which makes every grant on it inert) reaches `_run_jobs`'s per-job
+ * handler and is recorded under that job's name.
+ */
+const RECORDED_SCOPE_REFUSAL = `TypeNotFound: unknown space: ${RESEARCH_ID}`;
+
+/**
+ * The report an **abandoned** cycle wears, verbatim from `service.abandon_cycle`.
+ *
+ * Verified against a live `POST /api/cycles/{id}/abandon`. It matters that this
+ * is an *operation* report: `close_cycle` replaces whatever the interrupted run
+ * had written, so an abandoned consolidation run reads as `{"op": …}` rather
+ * than as a job list — and read as an ordinary one-op report it came out as
+ * *"One curative operation: abandon_cycle. It failed."*
+ */
+const ABANDON_REPORT: JsonObject = {
+  op: "abandon_cycle",
+  abandoned_by: "human:owner",
+  error:
+    "the run was interrupted and never closed itself; a human closed its journal entry so that " +
+    "what it had already written could be rolled back",
+};
 
 /** Every forbidden phrasing at once — the adversarial half of the guard. */
 const HOSTILE = `Boom: no such space, it does not exist, we have no record of it, unknown space: ${RESEARCH_ID}, not found`;
@@ -499,18 +563,27 @@ const EVERY_BRANCH: CycleOut[] = [
   cycle({ dry_run: true, report: report([job("link_maintenance")], { dry_run: true }) }),
   cycle({ report: report([job("abstraction", { proposed: ids(4) })]) }),
   cycle({ report: report([job("neglect_report", { detail: { neglected_count: 7 } })]) }),
-  // Failed outside every job: the shape that produced the blocker.
+  // Failed outside every job: the shape that produced the blocker, carrying the
+  // message the runner really writes into it.
   cycle({
     status: "failed",
     scope: RESEARCH_ID,
-    report: report([], { failed: [{ job: "", error: REAL_REFUSAL }] }),
+    report: report([], { failed: [{ job: "", error: UNGRANTED_SCOPE }] }),
   }),
   cycle({
     status: "failed",
     scope: RESEARCH_ID,
     report: report([], { failed: [{ job: "", error: HOSTILE }] }),
   }),
-  // Failed inside a job, with the same text, and with a hostile job *name*.
+  // Failed inside a job, with the scope refusal in the one slot that can hold
+  // it, the hostile text, and a hostile job *name*.
+  cycle({
+    status: "failed",
+    scope: RESEARCH_ID,
+    report: report(A_NIGHT, {
+      failed: [{ job: "link_maintenance", error: RECORDED_SCOPE_REFUSAL }],
+    }),
+  }),
   cycle({
     status: "failed",
     report: report(A_NIGHT, { failed: [{ job: "link_maintenance", error: HOSTILE }] }),
@@ -532,6 +605,13 @@ const EVERY_BRANCH: CycleOut[] = [
   // the one way a server string could otherwise reach the headline unshortened.
   cycle({ trigger: "rollback", report: { op: "rollback_cycle", rolled_back: "not found" } }),
   cycle({ trigger: "rollback", report: { op: "rollback_cycle", rolled_back: HOSTILE } }),
+  // An abandoned run: an operation report on a consolidation cycle.
+  cycle({ trigger: "manual", status: "failed", report: ABANDON_REPORT }),
+  cycle({
+    trigger: "manual",
+    status: "failed",
+    report: { op: "abandon_cycle", abandoned_by: HOSTILE, error: HOSTILE },
+  }),
   // No report at all, and one still being written.
   cycle({ report: null }),
   cycle({ status: "running", report: null, finished_at: null }),
@@ -588,14 +668,16 @@ describe("cycleFailures", () => {
   });
 
   it("says a space stopped resolving without saying it is missing", () => {
-    // The live case: `open_cycle` resolves `scope` through the ordinary space
-    // rule, so a space archived between the picker and the run records the
-    // server's own forbidden phrasing in the report.
+    // Recorded under the **job** that met it: `open_cycle` resolves the caller's
+    // scope before the cycle row exists, so this string can only reach a report
+    // through `_run_jobs`'s per-job handler — a space archived mid-run.
     const lines = cycleFailures(
       cycle({
         status: "failed",
         scope: RESEARCH_ID,
-        report: report([], { failed: [{ job: "", error: REAL_REFUSAL }] }),
+        report: report(A_NIGHT, {
+          failed: [{ job: "link_maintenance", error: RECORDED_SCOPE_REFUSAL }],
+        }),
       }),
       RESEARCH,
     );
@@ -607,10 +689,46 @@ describe("cycleFailures", () => {
     expect(lines[0]).toContain("archived or renamed");
   });
 
+  it("names the space the gardener holds no grant on, rather than spelling it twice", () => {
+    // The blocker, in the shape the server actually writes: this is the refusal
+    // a scoped run meets on a default install, and it carried a bare 32-hex id
+    // twice — once in the sentence and once in the remedy — through the list
+    // *and* the detail page.
+    const lines = cycleFailures(
+      cycle({
+        status: "failed",
+        scope: RESEARCH_ID,
+        report: report([], { failed: [{ job: "", error: UNGRANTED_SCOPE }] }),
+      }),
+      RESEARCH,
+    );
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).not.toMatch(BARE_ID);
+    expect(lines[0]).toContain("The cycle failed before any job ran:");
+    expect(lines[0]).toContain('the scope "research"');
+    expect(lines[0]).toContain("nodum grant builtin-gardener 'research' edit");
+  });
+
   it("names a curative operation's own failure", () => {
     expect(cycleFailures(cycle({ report: { op: "merge_nodes", error: "node not found" } }))).toEqual(
       ["The operation merge_nodes failed: node not found"],
     );
+  });
+
+  it("says an abandoned run was interrupted, not that the abandon failed", () => {
+    // The server's own line says the right thing under a prefix that does not:
+    // "The operation abandon_cycle failed: the run was interrupted…". The
+    // operation succeeded; the run it closed is what never finished.
+    const lines = cycleFailures(
+      cycle({ trigger: "manual", status: "failed", report: ABANDON_REPORT }),
+    );
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).not.toContain("abandon_cycle failed");
+    expect(lines[0]).toContain("interrupted and never closed itself");
+    // Who closed it, named the way every other actor on this screen is.
+    expect(lines[0]).toContain("owner closed its journal entry");
+    // And the thing a reader has to know: abandoning undid nothing.
+    expect(lines[0]).toContain("Nothing it wrote was undone");
   });
 
   it("has nothing to say about a clean cycle", () => {
@@ -625,22 +743,83 @@ describe("describeRecordedFailure", () => {
     // Not a second copy of the match: `recordedUnknownSpace` is `client.ts`'s
     // own `unknown space:` regex, reading a string that never came back through
     // `fetch`. Both wordings therefore move together.
-    const said = describeRecordedFailure(REAL_REFUSAL, RESEARCH).toLowerCase();
+    const said = describeRecordedFailure(RECORDED_SCOPE_REFUSAL, RESEARCH).toLowerCase();
     for (const phrase of FORBIDDEN) expect(said).not.toContain(phrase);
     expect(said).toContain("would not resolve");
   });
 
   it("names the scope generically when nothing has resolved it", () => {
-    const said = describeRecordedFailure(REAL_REFUSAL, null);
+    const said = describeRecordedFailure(RECORDED_SCOPE_REFUSAL, null);
     expect(said).toContain("the scope it named");
     expect(said).not.toMatch(BARE_ID);
   });
 
-  it("shows any other recorded failure as the server wrote it", () => {
-    expect(describeRecordedFailure("GrantNotPermitted: open a cycle", RESEARCH)).toBe(
-      "GrantNotPermitted: open a cycle",
-    );
+  it("rewrites the gardener's own scope refusal, naming the space and the remedy", () => {
+    // The **second** shape to reach a screen verbatim, and the one a default
+    // install meets first: migration 0014 grants the gardener main and meta, the
+    // picker offers everything, and the message echoes the caller's reference —
+    // a 32-hex id, printed twice.
+    const said = describeRecordedFailure(UNGRANTED_SCOPE, RESEARCH);
+    expect(said).not.toMatch(BARE_ID);
+    expect(said).toContain("holds no grant on the scope \"research\"");
+    // The remedy is the whole value of the server's sentence, so it survives —
+    // with the space named, and quoted, because a title may contain a space and
+    // `nodum grant` resolves an id or a name.
+    expect(said).toContain("nodum grant builtin-gardener 'research' edit");
+    for (const phrase of FORBIDDEN) expect(said.toLowerCase()).not.toContain(phrase);
+  });
+
+  it("keeps the remedy usable when nothing has resolved the scope", () => {
+    const said = describeRecordedFailure(UNGRANTED_SCOPE, null);
+    expect(said).not.toMatch(BARE_ID);
+    expect(said).toContain("the scope it named");
+    expect(said).toContain("nodum grant builtin-gardener <space> edit");
+  });
+
+  it("fails closed on a shape it does not know, rather than printing its ids", () => {
+    // The point of the fix. Two message shapes have now reached a screen
+    // verbatim, so the default is inverted: an unfamiliar failure still says
+    // what the server said — which is what keeps it legible — but no id
+    // survives it, so a *third* shape cannot ship one silently.
+    const unknown = `MergeRefused: node ${NODE_ID} was merged into ${SRC_ID} on 2026-07-27`;
+    const said = describeRecordedFailure(unknown, RESEARCH);
+    expect(said).not.toMatch(BARE_ID);
+    expect(said).toContain("MergeRefused");
+    expect(said).toContain("was merged into");
+    expect(said).toContain("a1a2b3c4d5e6…");
+  });
+
+  it("shows a recorded failure that names no row exactly as the server wrote it", () => {
+    // The bargain is unchanged for everything that carries no id: this module
+    // owns the refusals whose *wording* is a decision, not every message the
+    // service can produce.
+    const plain = "ProviderUnavailable: no embedding provider is configured";
+    expect(describeRecordedFailure(plain, RESEARCH)).toBe(plain);
     expect(describeRecordedFailure("boom", null)).toBe("boom");
+  });
+});
+
+describe("nameIdsIn", () => {
+  it("takes every raw id out of a server sentence, not only the first", () => {
+    // The gardener's refusal names its scope twice. A replace that stopped at
+    // the first match would have left the second on the screen.
+    const said = nameIdsIn(`space ${NODE_ID} still holds 1 node (${SRC_ID})`);
+    expect(said).not.toMatch(BARE_ID);
+    expect(said).toBe("space a1a2b3c4d5e6… still holds 1 node (4f2ad9c1b0e3…)");
+  });
+
+  it("uses the page's own name for a row it knows, and shortens the rest", () => {
+    const names = new Map([[NODE_ID, "note: Kafka Streams"]]);
+    const said = nameIdsIn(`node ${NODE_ID} still has 1 child node (${SRC_ID})`, (id) =>
+      names.get(id) ?? null,
+    );
+    expect(said).toContain("node note: Kafka Streams still has");
+    expect(said).toContain("4f2ad9c1b0e3…");
+    expect(said).not.toMatch(BARE_ID);
+  });
+
+  it("leaves a sentence with no id in it alone", () => {
+    expect(nameIdsIn("revoke them first")).toBe("revoke them first");
   });
 });
 
@@ -771,18 +950,122 @@ describe("cycleCaveats", () => {
   });
 
   it("says a rehearsal wrote no graph event", () => {
-    expect(cycleCaveats(cycle({ dry_run: true })).join(" ")).toContain("no graph event was written");
+    const ran = cycle({ dry_run: true, report: report(A_NIGHT, { dry_run: true }) });
+    expect(cycleCaveats(ran).join(" ")).toContain("no graph event was written");
+    expect(cycleCaveats(ran).join(" ")).toContain("every job ran");
   });
 
   it("says a failed cycle's writes are real and stay", () => {
     // The dangerous assumption is that "failed" means "nothing happened".
-    const lines = cycleCaveats(cycle({ status: "failed" })).join(" ");
+    const lines = cycleCaveats(cycle({ status: "failed", report: report(A_NIGHT) })).join(" ");
     expect(lines).toContain("is real and stays");
     expect(lines).toContain("rollback");
   });
 
   it("composes, because a failed rehearsal is both", () => {
-    expect(cycleCaveats(cycle({ status: "failed", dry_run: true }))).toHaveLength(2);
+    expect(
+      cycleCaveats(
+        cycle({ status: "failed", dry_run: true, report: report(A_NIGHT, { dry_run: true }) }),
+      ),
+    ).toHaveLength(2);
+  });
+
+  it("does not claim every job ran on a cycle whose headline says none did", () => {
+    // Both halves of the contradiction, in the one shape that produces it: a
+    // scoped rehearsal the gardener holds no grant on. `cycleWork` reads "The
+    // cycle failed before any job ran." — and the caveats under it read "every
+    // job ran".
+    const entry = cycle({
+      status: "failed",
+      dry_run: true,
+      scope: RESEARCH_ID,
+      report: report([], { dry_run: true, failed: [{ job: "", error: UNGRANTED_SCOPE }] }),
+    });
+    expect(cycleWork(entry)).toBe("The cycle failed before any job ran.");
+    const said = cycleCaveats(entry).join(" ");
+    expect(said).not.toContain("every job ran");
+    expect(said).toContain("no job has reported");
+  });
+
+  it("does not promise a rollback beside a button saying there is nothing to reverse", () => {
+    // The other half. `rollbackAvailability` disables the button on a rehearsal
+    // — "A rehearsal emitted no graph event, so there is nothing to reverse" —
+    // while this caveat told the same reader a rollback was what takes it back.
+    const rehearsal = cycle({
+      status: "failed",
+      dry_run: true,
+      report: report(A_NIGHT, { dry_run: true }),
+    });
+    const said = cycleCaveats(rehearsal).join(" ");
+    expect(said).not.toContain("is real and stays");
+    expect(said).toContain("nothing to reverse");
+    expect(rollbackAvailability(rehearsal).reason).toContain("nothing to reverse");
+  });
+
+  it("still says a real failed cycle's writes stand, which is the dangerous case", () => {
+    // The branch must not swallow the warning that matters: a `BaseException`
+    // out of `_run_jobs` empties the job list while leaving whatever the jobs
+    // had already written in the graph.
+    const said = cycleCaveats(
+      cycle({ status: "failed", report: report([], { failed: [{ job: "", error: "boom" }] }) }),
+    ).join(" ");
+    expect(said).toContain("is real and stays");
+  });
+});
+
+describe("abandonAvailability", () => {
+  it("offers the door out of a cycle a crash left running", () => {
+    // `POST /api/cycles/{id}/abandon` and `nodum cycle-abandon` both shipped and
+    // no surface here offered either, so a `running` cycle's writes were
+    // irreversible everywhere: rollback refuses one that has not closed, and
+    // undo refuses every event a cycle stamped.
+    expect(abandonAvailability(cycle({ status: "running", finished_at: null }))).toEqual({
+      available: true,
+      reason: null,
+    });
+  });
+
+  it("refuses a cycle that has already said how it ended, in those words", () => {
+    // `service.abandon_cycle`'s one refusal, stated in front of the button
+    // rather than met after clicking it.
+    for (const status of ["completed", "failed", "rolled_back"]) {
+      const verdict = abandonAvailability(cycle({ status }));
+      expect(verdict.available).toBe(false);
+      expect(verdict.reason).toContain(`closed ${status}`);
+      expect(verdict.reason).toContain("would overwrite that");
+    }
+  });
+});
+
+describe("ABANDON_CONFIRM", () => {
+  it("says outright that it reverses nothing", () => {
+    // The dangerous misreading: that abandoning cancels the run or takes its
+    // writes back. It closes the row and nothing else.
+    const said = ABANDON_CONFIRM.join(" ");
+    expect(said).toContain("does not reverse anything");
+    expect(said).toContain("still in the graph");
+  });
+
+  it("says what closing the entry is for", () => {
+    const said = ABANDON_CONFIRM.join(" ");
+    expect(said).toContain("makes those writes reversible");
+    expect(said).toContain("Roll the cycle back afterwards");
+  });
+
+  it("admits it does not stop a cycle that is genuinely still running", () => {
+    // Nothing in `abandon_cycle` checks that the process is dead, so the confirm
+    // must not imply it does.
+    expect(ABANDON_CONFIRM.join(" ")).toContain("Nothing here stops a cycle that is genuinely");
+  });
+});
+
+describe("abandonOutcome", () => {
+  it("reports the close without claiming anything was undone", () => {
+    const said = abandonOutcome(cycle({ status: "failed" }));
+    expect(said).toContain("closed as failed");
+    expect(said).toContain("Nothing it wrote has changed");
+    expect(said).toContain("rolled back now");
+    expect(said).not.toMatch(BARE_ID);
   });
 });
 
@@ -792,10 +1075,14 @@ describe("rollbackAvailability", () => {
     expect(rollbackAvailability(cycle(), true)).toEqual({ available: true, reason: null });
   });
 
-  it("refuses a running cycle, and says it has not finished writing", () => {
+  it("refuses a running cycle, and names the way out rather than stopping there", () => {
+    // The refusal used to be the whole of what this screen said about a cycle a
+    // crash left `running` — a dead end, on the one screen that displays the
+    // stuck entry, while `abandon` was a route away and a CLI command.
     const verdict = rollbackAvailability(cycle({ status: "running", finished_at: null }));
     expect(verdict.available).toBe(false);
     expect(verdict.reason).toContain("has not finished writing");
+    expect(verdict.reason).toContain("abandon it first");
   });
 
   it("refuses one already rolled back, and points at the way to re-apply it", () => {
@@ -817,9 +1104,25 @@ describe("rollbackAvailability", () => {
     // used to get a live button whose preflight then answered
     // "InvalidTransition: wrote no graph events". The page has read the event
     // list; it can say so in front of the click, as the other three do.
-    const verdict = rollbackAvailability(cycle({ trigger: "curative" }), false);
+    const verdict = rollbackAvailability(
+      cycle({ trigger: "curative", report: { op: "bulk_relink" } }),
+      false,
+    );
     expect(verdict.available).toBe(false);
     expect(verdict.reason).toContain("no graph event");
+    expect(verdict.reason).toContain("curative operation that matched nothing");
+  });
+
+  it("says why an abandoned run wrote nothing, rather than blaming a curative op", () => {
+    // The same sentence one shape along: an abandoned run that died early is not
+    // "a curative operation that matched nothing".
+    const verdict = rollbackAvailability(
+      cycle({ trigger: "manual", status: "failed", report: ABANDON_REPORT }),
+      false,
+    );
+    expect(verdict.available).toBe(false);
+    expect(verdict.reason).toContain("interrupted before it wrote anything");
+    expect(verdict.reason).not.toContain("curative");
   });
 
   it("keeps offering the action while the answer is unknown", () => {
@@ -960,7 +1263,7 @@ describe("noMetricsNote", () => {
     // do not compute them" — two things its cycle is not.
     const failed = cycle({
       status: "failed",
-      report: report([], { failed: [{ job: "", error: REAL_REFUSAL }] }),
+      report: report([], { failed: [{ job: "", error: UNGRANTED_SCOPE }] }),
     });
     expect(noMetricsNote(failed)).toContain("failed before it could measure anything");
     expect(noMetricsNote(failed)).not.toContain("rollback");
@@ -971,6 +1274,17 @@ describe("noMetricsNote", () => {
     expect(noMetricsNote(curative)).toContain("one-op curative cycle");
     const rolled = cycle({ trigger: "rollback", report: { op: "rollback_cycle" } });
     expect(noMetricsNote(rolled)).toContain("rollback");
+  });
+
+  it("tells an abandoned run apart from a rollback and a curative cycle", () => {
+    // Same defect one shape along: an abandoned consolidation run wears an
+    // operation report, and was told "a rollback and a one-op curative cycle do
+    // not compute them" — two things it is not.
+    const said = noMetricsNote(
+      cycle({ trigger: "manual", status: "failed", report: ABANDON_REPORT }),
+    );
+    expect(said).toContain("interrupted before it could write any");
+    expect(said).not.toContain("curative");
   });
 
   it("says a running cycle has not written its metrics yet", () => {
@@ -990,11 +1304,21 @@ describe("emptyEventsNote", () => {
     // false about both.
     const failed = cycle({
       status: "failed",
-      report: report([], { failed: [{ job: "", error: REAL_REFUSAL }] }),
+      report: report([], { failed: [{ job: "", error: UNGRANTED_SCOPE }] }),
     });
     const said = emptyEventsNote(failed);
     expect(said).toContain("No job ran");
     expect(said).not.toContain("Every job ran");
+  });
+
+  it("says an abandoned run died early rather than that an operation matched nothing", () => {
+    // An abandoned run usually *did* write — that is the whole reason closing
+    // its entry matters — so an empty list here means it never got that far.
+    const said = emptyEventsNote(
+      cycle({ trigger: "manual", status: "failed", report: ABANDON_REPORT }),
+    );
+    expect(said).toContain("interrupted before it wrote anything");
+    expect(said).not.toContain("curative");
   });
 
   it("says a curative cycle matched nothing rather than talking about jobs", () => {
@@ -1235,6 +1559,84 @@ describe("rowHeadlines", () => {
   it("knows nothing about a row no event on this page named", () => {
     expect(rowHeadlines([]).get(NODE_ID)).toBeUndefined();
   });
+
+  it("names an edge row by its endpoints once the titles are known", () => {
+    // The blocker: `EventChange.headline` is pure over ids by construction — it
+    // is computed before any lookup — so the rollback dialog printed
+    // "relates_to: 4f2ad9c1… → 91bc7e2d…" for an edge the event list two inches
+    // behind it was rendering as "event sourcing → Event Sourcing", having
+    // resolved both ends already.
+    const changes = [describeEvent(event({ payload: { before: null, after: edgeRow() } }))];
+    const titles = new Map([
+      [SRC_ID, "event sourcing"],
+      [DST_ID, "Event Sourcing"],
+    ]);
+    expect(rowHeadlines(changes, titles).get(EDGE_ID)).toBe(
+      "relates_to: event sourcing → Event Sourcing",
+    );
+    expect(rowHeadlines(changes, titles).get(EDGE_ID)).not.toMatch(BARE_ID);
+  });
+
+  it("falls back to the shortened endpoint id for a title still in flight", () => {
+    // An absent key is "not answered yet" and a null one is "answered with
+    // nothing"; both read the same way here, which is what lets the dialog
+    // render before the lookups land.
+    const changes = [describeEvent(event({ payload: { before: null, after: edgeRow() } }))];
+    const half = new Map<string, string | null>([
+      [SRC_ID, "event sourcing"],
+      [DST_ID, null],
+    ]);
+    expect(rowHeadlines(changes, half).get(EDGE_ID)).toBe("relates_to: event sourcing → 91bc7e2d…");
+    expect(rowHeadlines(changes, new Map()).get(EDGE_ID)).toBe(
+      "relates_to: 4f2ad9c1… → 91bc7e2d…",
+    );
+  });
+
+  it("leaves a node row named by its own payload, titles or no titles", () => {
+    // A node event carries its title; there is nothing to look up and nothing
+    // the map may override.
+    const changes = [
+      describeEvent(event({ op: "node.create", payload: { before: null, after: nodeRow() } })),
+    ];
+    const titles = new Map([[NODE_ID, "something else entirely"]]);
+    expect(rowHeadlines(changes, titles).get(NODE_ID)).toBe("note: Kafka Streams");
+  });
+});
+
+describe("verdictNodeIds", () => {
+  const edgeChange = describeEvent(event({ payload: { before: null, after: edgeRow() } }));
+  const nodeChange = describeEvent(
+    event({ seq: 43, op: "node.create", payload: { before: null, after: nodeRow() } }),
+  );
+
+  it("asks for the endpoints of the edge rows the verdict names", () => {
+    // Bounded by the verdict rather than by the cycle: a rollback dialog over a
+    // 500-event cycle that reports two conflicts looks up four titles, not a
+    // thousand.
+    expect(verdictNodeIds([conflict()], [], [edgeChange, nodeChange])).toEqual([SRC_ID, DST_ID]);
+  });
+
+  it("asks for a blocker's dependants, which no event on the page names", () => {
+    // A dependant is by definition a row the cycle did *not* write, so the event
+    // list cannot name one and the dialog printed a truncated id per dependant
+    // beside a created row it had named in full.
+    const dependants = hexIds(2);
+    const ids = verdictNodeIds([], [blocker({ dependants })], [nodeChange]);
+    expect(ids).toEqual(dependants);
+  });
+
+  it("asks for nothing at all on a clean verdict", () => {
+    expect(verdictNodeIds([], [], [edgeChange, nodeChange])).toEqual([]);
+  });
+
+  it("asks for each id once, however many rows named it", () => {
+    const ids = verdictNodeIds(
+      [conflict(), conflict({ row_id: EDGE_ID, conflicting_seq: 58 })],
+      [blocker({ dependants: [SRC_ID] })],
+      [edgeChange],
+    );
+    expect(ids).toEqual([SRC_ID, DST_ID]);
+  });
 });
 
 describe("eventWindow", () => {
@@ -1395,11 +1797,43 @@ describe("describeBlocker", () => {
     expect(line.sentence).toContain("1 row depends on it now");
   });
 
-  it("keeps the guard's own sentence verbatim, since it is what the run will say", () => {
-    // The reason is the line the rollback actually refuses with, so it is shown
-    // as written rather than paraphrased — the same bargain
-    // `describeRecordedFailure` strikes for everything but a refused space.
-    expect(describeBlocker(blocker()).reason).toBe(blocker().reason);
+  it("keeps the guard's own wording, with the ids it spells taken out", () => {
+    // The reason is the line the rollback actually refuses with, so the wording
+    // is shown rather than paraphrased — but `service._delete_blocker` writes
+    // "node <32-hex> still has 2 child node(s) (<32-hex>, <32-hex>)", and it was
+    // rendered raw, directly beside a sentence that had carefully named the same
+    // row. The words survive; the ids do not.
+    const line = describeBlocker(blocker());
+    expect(line.reason).not.toMatch(BARE_ID);
+    expect(line.reason).toContain("still has 2 child node(s)");
+    expect(line.reason).toContain("take those back first");
+    expect(line.reason).toContain("a1a2b3c4d5e6…");
+  });
+
+  it("puts the page's own name into the guard's sentence where it has one", () => {
+    const names = new Map([[NODE_ID, "note: Kafka Streams"]]);
+    const line = describeBlocker(blocker(), (rowId) => names.get(rowId) ?? null);
+    expect(line.reason).toContain("node note: Kafka Streams still has");
+    expect(line.reason).not.toMatch(BARE_ID);
+  });
+
+  it("names a dependant the dialog has resolved, rather than truncating its id", () => {
+    // A dependant is a row outside the cycle, so no event names it — but it is a
+    // node, and the dialog resolves its title the way the diff resolves an
+    // edge's endpoints. The created row was named and every dependant under it
+    // was a truncated id on the same line.
+    const dependants = hexIds(2);
+    const titles = new Map([
+      [NODE_ID, "note: Kafka Streams"],
+      [dependants[0]!, "Consumer groups"],
+    ]);
+    const line = describeBlocker(blocker({ dependants }), (id) => titles.get(id) ?? null);
+    expect(line.dependants[0]?.label).toBe("Consumer groups");
+    // The second resolved to nothing — a grant's `agent_id` is not a node at all
+    // — and the shortened id is the honest answer for it.
+    expect(line.dependants[1]?.label).toBe("c1a2b3c4d5e6…");
+    expect(line.sentence).toContain("Consumer groups");
+    expect(line.sentence).not.toMatch(BARE_ID);
   });
 
   it("reads as a dependency rather than as a later write", () => {
@@ -1590,6 +2024,28 @@ describe("describeRunFailure", () => {
     expect(said).not.toMatch(BARE_ID);
   });
 
+  it("rewrites the gardener's ungranted scope, which is the live half of the same event", () => {
+    // The refusal a default install meets on the first click of the scope
+    // picker. `http_api._failure_message` exempts this package's own exceptions
+    // from the storage rewrite, so `ApiError.message` is the gardener's sentence
+    // verbatim — and `describeError` renders it as `type: message`, id and all,
+    // straight into a toast.
+    const live = new ApiError(
+      403,
+      "GrantNotPermitted",
+      `the gardener holds no grant on space '${RESEARCH_ID}', so it cannot consolidate it: ` +
+        `migration 0014 seeds builtin-gardener with 'main' and 'meta' only, and every other ` +
+        `space is an explicit grant. Run: nodum grant builtin-gardener ${RESEARCH_ID} edit`,
+    );
+    const said = describeRunFailure(live, RESEARCH);
+    expect(said).not.toMatch(BARE_ID);
+    expect(said).toContain("holds no grant on the scope \"research\"");
+    expect(said).toContain("nodum grant builtin-gardener 'research' edit");
+    // The recorded twin says the same thing, because they are one event seen at
+    // two moments.
+    expect(said).toBe(describeRecordedFailure(UNGRANTED_SCOPE, RESEARCH));
+  });
+
   it("hands every other failure to the shared classifier unchanged", () => {
     const others: unknown[] = [
       new ApiError(503, "DatabaseBusy", "database is locked"),
@@ -1599,6 +2055,18 @@ describe("describeRunFailure", () => {
     for (const error of others) {
       expect(describeRunFailure(error, RESEARCH)).toBe(describeError(error));
     }
+  });
+
+  it("takes the ids out of a live failure it does not otherwise own", () => {
+    // The same fail-closed guard as the recorded path: `describeError` renders
+    // `type: message` and a service message names rows.
+    const said = describeRunFailure(
+      new ApiError(409, "CycleInProgress", `cycle ${CYCLE_ID} is already running`),
+      RESEARCH,
+    );
+    expect(said).not.toMatch(BARE_ID);
+    expect(said).toContain("CycleInProgress");
+    expect(said).toContain("6b1f0f2c9a4d…");
   });
 });
 

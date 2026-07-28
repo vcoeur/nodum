@@ -192,7 +192,7 @@ file; the global config stays `node`.
 Covered today: `api/client.ts` (the unknown-space normalisation and the
 two-request capability upload — the only logic in the file that is not a URL and
 a verb), `lib/time.ts`,
-`lib/failure.ts`, `lib/session.ts`, `lib/writeTarget.ts`,
+`lib/failure.ts`, `lib/session.ts`, `lib/paging.ts`, `lib/writeTarget.ts`,
 `components/spaceOptions.ts`, `components/spaceNaming.ts`,
 `views/failureRouting.ts`,
 `views/graph/filters.ts`, `views/graph/graphElements.ts`,
@@ -212,8 +212,12 @@ sanitising policies), and `views/editor/leftoverBuffer.ts`.
 is no honest way to drive them here. Their behaviour is verified by
 type-checking and in a browser, like every component — but the *rule* that
 decides what each of them fetches is a plain function with a test
-(`unresolvedSpaceIds`, `referencedNodeIds`), precisely because getting it wrong is
-invisible until you watch the network panel.
+(`unresolvedSpaceIds`, `referencedNodeIds`, `verdictNodeIds`), precisely because
+getting it wrong is invisible until you watch the network panel. `useNodeTitles`
+has two callers for that reason: the event diff asks for the endpoints on the
+page it is drawing, and the rollback dialog asks for the endpoints and
+dependants of the rows its verdict names — a clean verdict names none and fetches
+nothing.
 
 **The run pins `TZ` to `Asia/Kathmandu`, and this matters.** SQLite's
 `datetime('now')` is UTC with no zone marker, so the bug `lib/time.ts` fixes —
@@ -238,13 +242,13 @@ type-checking it and driving it in a browser.
 |---|---|
 | `src/main.tsx`, `src/App.tsx`, `src/router.tsx` | entry, app shell (header, nav, toasts, crash boundary, health pill), route table |
 | `src/api/client.ts`, `src/api/types.ts` | the only `fetch` in the app, and the types mirroring `nodum/models.py` |
-| `src/lib/` | cross-view plain functions: timestamp parsing (`time.ts`), failure classification (`failure.ts`), the 401 broadcast (`session.ts`), and the sticky write target (`writeTarget.ts`, the one module here that also exports a hook) |
+| `src/lib/` | cross-view plain functions: timestamp parsing (`time.ts`), failure classification (`failure.ts`), the 401 broadcast (`session.ts`), which slice of a long list to render (`paging.ts` — the journal's event diff and the review queue), and the sticky write target (`writeTarget.ts`, the one module here that also exports a hook) |
 | `src/components/` | shared React components: `NodeBadge`, `Toast`, `Spinner`, `EmptyState`, `ErrorBoundary`, `Modal`, plus the whole space vocabulary — `SpaceFilter.tsx` with `spaceOptions.ts` (what a picker offers, which is the active list and never more) and `useSpaces.ts` (the `GET /api/spaces` read every space surface shares), and `spaceNaming.ts` with `useArchivedSpaces.ts` (what a surface that *displays* a space calls it, including one the active listing does not carry — and what names an archived value a picker is already holding) |
 | `src/styles/` | `tokens.css`, `base.css`, `primitives.css`, `app.css` |
 | `src/views/editor/` | CodeMirror-6 Markdown source editor, slash commands, `[[` autocomplete, live Mermaid preview, autosave, the write-target picker and the landing/refusal copy (`createOutcome.ts`) |
 | `src/views/search/` | query box, ranked hits, per-signal breakdown, signal grouping, the space filter + show-meta toggle in the URL (`searchState.ts`), refused-filter copy (`spaceFailure.ts`), when a row names its space (`resultSpace.ts`) |
-| `src/views/review/` | proposal queue grouped space → agent, per-kind cards, proposed-version diffs, self-governing space sections, cross-space edge marking (`grouping.edgeCrossing`) |
-| `src/views/journal/` | the dream journal: cycles as sentences, one entry with its job report, the five coherence metrics before/after, the events it wrote as a paged diff, the run-now control, and the dry-run-then-confirm rollback — whose verdict is **two** lists, `conflicts` and `blockers`, and is clean only when both are empty (`journal.ts` owns every sentence and every reading of the untyped `report` blob; `useNodeTitles.ts` names the nodes an edge event points at) |
+| `src/views/review/` | proposal queue grouped space → agent, per-kind cards, proposed-version diffs, self-governing space sections, cross-space edge marking (`grouping.edgeCrossing`), and the pager over it (`grouping.sectionOrder` / `restrictToPage`, over `lib/pageWindow`) with the honest count above it (`grouping.queueCount`) |
+| `src/views/journal/` | the dream journal: cycles as sentences, one entry with its job report, the five coherence metrics before/after, the events it wrote as a paged diff, the run-now control, the abandon confirm for a cycle a crash left `running`, and the dry-run-then-confirm rollback — whose verdict is **two** lists, `conflicts` and `blockers`, and is clean only when both are empty (`journal.ts` owns every sentence and every reading of the untyped `report` blob; `useNodeTitles.ts` names the nodes an edge event points at) |
 | `src/views/graph/` | Cytoscape subgraph render, filters, cross-space edge styling and far-endpoint dimming, path panel |
 | `src/views/assets/` | rendition grid, lightbox, the ingesting drop-zone with its queue readout (`uploadOutcome.ts`) and its bookkeeping (`uploadQueue.ts` — batches, status labels, the refused second drop, the per-batch announcement), thin JSON export |
 | `src/views/login/` | password login against `POST /api/login` |
@@ -295,6 +299,22 @@ Conventions that hold across the tree:
   renders them hours later. `recordedUnknownSpace` reads those, and it is the
   *same* regex rather than a second copy — which is exactly why it lives in
   `api/client.ts` beside `isUnknownSpace` and not in the view that needs it.
+  `recordedUngrantedScope` is its sibling and reads the **second** shape that
+  names a space: `consolidate._require_gardener_scope`'s *"the gardener holds no
+  grant on space '…'"*, which is the refusal a default install meets on the first
+  click of the journal's scope picker (migration `0014` grants the gardener
+  `main` and `meta`; the picker offers everything) and which echoes the caller's
+  reference — a 32-hex id for the one caller that arrives by clicking. It matches
+  a **live** `ApiError.message` too, because `http_api._failure_message` exempts
+  this package's own exceptions from the storage rewrite.
+- **No server text reaches a screen carrying a raw id, known shape or not.**
+  Two message shapes have now been printed verbatim, so `journal.ts` does not
+  keep a list of rewrites to extend: the two refusals whose *wording* is a
+  decision get named copy, and every other server sentence the journal renders —
+  a recorded cycle failure, a job's own `error`, a delete guard's `reason` —
+  goes through `journal.nameIdsIn`, which replaces each `[0-9a-f]{32}` with the
+  page's own name for that row or its shortened form. A third shape can carry an
+  id; it cannot put one on the screen.
 - **Never say a space does not exist.** Nothing user-facing may render "no such
   space", "does not exist", "unknown/missing/nonexistent space", or "not found"
   for a space failure — including by handing an `UnknownSpaceError` to
@@ -384,11 +404,17 @@ Conventions that hold across the tree:
 ## The API client
 
 `src/api/client.ts` is the only place that calls `fetch`. It covers the whole
-Phase-3 endpoint surface plus the four consolidation-cycle routes, typed, and
+Phase-3 endpoint surface plus the five consolidation-cycle routes, typed, and
 every route it names is served by `nodum.http_api`.
 
 What it handles for you:
 
+- covers the **five** consolidation-cycle routes, `POST /api/cycles/{id}/abandon`
+  included — the door out of a cycle a crash left `running`, and the
+  precondition for the rollback route rather than a tidier journal: rollback
+  refuses a cycle that has not closed and `undo` refuses every event a cycle
+  stamped, so until the row is closed the run's writes are irreversible on every
+  surface;
 - prefixes `/api` (`getHealth` is the one exception — `/healthz` sits outside);
 - unwraps the `{"<plural>": [...], "count": n}` list envelope, so list calls
   return a plain array;

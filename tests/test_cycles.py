@@ -28,6 +28,18 @@ def _open(**kwargs):
     return service.open_cycle(**kwargs)
 
 
+def _closed(**kwargs):
+    """Open a cycle and close it, for a test that needs several journal entries.
+
+    Only one *consolidation* cycle may be running against a file at a time
+    (0014's partial unique index), so a test wanting three of them is a test
+    about three finished runs.
+    """
+    cycle = _open(**kwargs)
+    service.close_cycle(cycle.id, status="completed", report={}, principal=owner())
+    return cycle
+
+
 # ── The ambient stamp ─────────────────────────────────────────────────────────
 
 
@@ -88,8 +100,13 @@ def test_the_cycle_is_reset_when_the_block_raises(fresh_db):
 
 
 def test_nested_cycles_restore_the_outer_one(fresh_db):
-    """The reset is token-based, so nesting is well defined rather than lossy."""
-    outer, inner = _open(), _open()
+    """The reset is token-based, so nesting is well defined rather than lossy.
+
+    A consolidation sweep with a curative operation inside it is the shape that
+    actually nests, and it is also the pair the file admits at once: two running
+    consolidation cycles are refused.
+    """
+    outer, inner = _open(trigger="scheduled"), _open(trigger="curative")
     with service.in_cycle(outer.id):
         first = service.create_node(type="note", title="outer", principal=owner())
         with service.in_cycle(inner.id):
@@ -158,8 +175,8 @@ def test_an_unknown_trigger_is_refused(fresh_db):
 
 def test_scope_resolves_by_name_or_id_like_every_other_space_reference(fresh_db):
     space = service.create_space("research", principal=owner())
-    assert _open(scope="research").scope == space.id
-    assert _open(scope=space.id).scope == space.id
+    assert _closed(scope="research").scope == space.id
+    assert _closed(scope=space.id).scope == space.id
 
 
 def test_an_unknown_scope_and_an_unreadable_one_answer_identically(fresh_db):
@@ -176,6 +193,59 @@ def test_an_unknown_scope_and_an_unreadable_one_answer_identically(fresh_db):
     )
 
 
+def test_a_second_consolidation_cycle_is_refused_wherever_it_is_asked_for(fresh_db):
+    """One `running` consolidation row in the file, whichever process opened it.
+
+    The refusal happens on the **insert**, so it does not matter that the first
+    cycle was opened by another process, another thread, or an hour ago: two
+    runs cannot both believe they won a read.
+    """
+    running = _open(trigger="scheduled")
+
+    for trigger in ("manual", "scheduled"):
+        with pytest.raises(service.CycleInProgress, match="already running"):
+            _open(trigger=trigger)
+
+    service.close_cycle(running.id, status="completed", report={}, principal=owner())
+    assert _open(trigger="manual").status == "running"
+
+
+def test_the_refusal_names_the_cycle_in_the_way_and_the_door_out_of_it(fresh_db):
+    """A stuck `running` row blocks every later run, so the way out has to be in it.
+
+    `cycle-abandon` is that door — a cycle killed by a `SIGKILL` or a power cut
+    never closes itself, and nothing else moves the row. A refusal that says
+    "try again when it has finished" about a run that will never finish is
+    advice nobody can carry out, which is the shape this project has already
+    fixed once on `rollback`.
+    """
+    stuck = _open(trigger="scheduled")
+
+    with pytest.raises(service.CycleInProgress) as refused:
+        _open(trigger="manual")
+
+    message = str(refused.value)
+    assert stuck.id in message
+    assert f"nodum cycle-abandon {stuck.id}" in message
+
+
+def test_a_curative_or_rollback_cycle_is_not_blocked_by_a_running_consolidation(fresh_db):
+    """Blocking these would take the curative tier offline for the nightly sweep.
+
+    A curative operation is one human-driven act and a rollback is the human's
+    undo; both are short, and both open a cycle of their own. Only the two
+    triggers a consolidation run opens are serialised against each other.
+    """
+    _open(trigger="scheduled")
+
+    node = service.create_node(type="claim", title="Alpha", principal=owner())
+    retype = service.retype([node.id], "concept", principal=owner())
+
+    assert service.get_cycle(retype.cycle_id, principal=owner()).trigger == "curative"
+    rollback = service.rollback_cycle(retype.cycle_id, principal=owner())
+    assert service.get_cycle(rollback.rollback_cycle_id, principal=owner()).trigger == "rollback"
+
+
 # ── Who may open and close one ────────────────────────────────────────────────
 
 
@@ -190,6 +260,7 @@ def test_the_gardener_may_open_a_cycle_on_the_spaces_it_holds_edit_on(fresh_db):
     gardener = auth.internal_principal()
     scoped = service.open_cycle(trigger="scheduled", scope="main", principal=gardener)
     assert scoped.scope == "main"
+    service.close_cycle(scoped.id, status="completed", report={}, principal=owner())
     # And an unscoped cycle, because it holds `edit` somewhere.
     assert service.open_cycle(trigger="scheduled", principal=gardener).scope is None
 
@@ -364,9 +435,9 @@ def test_an_interrupted_cycle_can_be_abandoned_and_only_then_rolled_back(fresh_d
     assert abandoned.status == "failed"
     assert abandoned.finished_at is not None
     # The journal says what happened and who declared it dead.
-    assert abandoned.report["op"] == "abandon_cycle"
+    assert abandoned.report["abandoned"] is True
     assert abandoned.report["abandoned_by"] == "human:owner"
-    assert "interrupted" in abandoned.report["error"]
+    assert "interrupted" in abandoned.report["detail"]
     # And the writes it made are reachable again — which is the whole point.
     service.rollback_cycle(cycle.id, principal=owner())
     assert service.get_cycle(cycle.id, principal=owner()).status == "rolled_back"
@@ -374,6 +445,53 @@ def test_an_interrupted_cycle_can_be_abandoned_and_only_then_rolled_back(fresh_d
 
     with pytest.raises(NodeNotFound):
         service.get_node(node.id, principal=owner())
+
+
+def test_the_running_refusal_names_the_command_that_closes_it(fresh_db):
+    """ "Close it first" is the advice; `cycle-abandon` is the only thing that does.
+
+    A crashed run does not close itself — that is what made it crashed — so
+    `rollback` refusing with "close it first, a crashed run is closed 'failed'"
+    described a state nothing on any surface could reach. This system prints the
+    exact command everywhere else; here it printed a wish.
+    """
+    cycle = _open()
+    with service.in_cycle(cycle.id):
+        service.create_node(type="claim", title="Half-written", principal=owner())
+
+    with pytest.raises(InvalidTransition) as refused:
+        service.rollback_cycle(cycle.id, principal=owner())
+
+    assert f"nodum cycle-abandon {cycle.id}" in str(refused.value)
+
+
+def test_an_abandoned_cycle_does_not_read_as_a_failed_curative_operation(fresh_db):
+    """The abandon succeeded; the *run* failed, and the report has to say which.
+
+    The report was written in the shape a one-op curative cycle uses — an `op`
+    naming the operation and an `error` explaining it — so a nightly sweep
+    abandoned after a power cut was rendered "One curative operation:
+    abandon_cycle. It failed." Three things wrong in one line: the cycle was a
+    consolidation and not a curative op, `abandon_cycle` is not an operation the
+    cycle ran, and the abandon did not fail. The cycle's own `trigger` says what
+    it was; the report says only what is known about how it ended.
+
+    `abandoned` is the discriminator a reader branches on. The shape had none,
+    which is what forced the journal view to match `op` against a magic name;
+    `op` is still carried for that view and is the weaker of the two answers.
+    """
+    cycle = _open(trigger="scheduled")
+    with service.in_cycle(cycle.id):
+        service.create_node(type="claim", title="Half-written", principal=owner())
+
+    report = service.abandon_cycle(cycle.id, principal=owner()).report
+
+    assert report["abandoned"] is True, "an abandon must be tellable without matching a name"
+    assert "error" not in report, "the abandon succeeded — it is the run that failed"
+    assert "failed" not in str(report), "nothing in the report may say the abandon failed"
+    assert report["abandoned_by"] == "human:owner"
+    # And the entry still says what the cycle was, which the report never claims.
+    assert service.get_cycle(cycle.id, principal=owner()).trigger == "scheduled"
 
 
 def test_abandoning_a_cycle_that_already_said_how_it_ended_is_refused(fresh_db):
@@ -417,7 +535,7 @@ def test_get_cycle_on_an_unknown_id_is_a_not_found(fresh_db):
 
 
 def test_list_cycles_is_newest_first_and_capped(fresh_db):
-    first, second, third = _open(), _open(), _open()
+    first, second, third = _closed(), _closed(), _closed()
     assert [entry.id for entry in service.list_cycles(principal=owner())] == [
         third.id,
         second.id,
@@ -435,7 +553,7 @@ def test_a_limit_below_one_is_an_error_and_not_the_whole_journal(fresh_db):
     `cycle-list --limit -3` returned every row in the journal — a caller asking
     for less got everything, silently. `subgraph` states the rule this follows.
     """
-    _open(), _open()
+    _closed(), _closed()
     for limit in (0, -3):
         with pytest.raises(ValueError, match="limit must be >= 1"):
             service.list_cycles(limit=limit, principal=owner())

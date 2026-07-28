@@ -187,6 +187,26 @@ class UndoNotPossible(ValueError):
     """Raised when an event cannot be reversed against the current graph."""
 
 
+class CycleInProgress(ValueError):
+    """Raised when a consolidation cycle is asked for while one is running.
+
+    It lives here rather than in :mod:`nodum.consolidate` because the guard does:
+    the refusal comes from the ``cycles`` row a second opener cannot insert, and
+    that row is what makes the rule hold **across processes** rather than within
+    one. :mod:`nodum.consolidate` re-exports the class, so
+    ``consolidate.CycleInProgress`` — which ``http_api.EXCEPTION_STATUS`` maps to
+    409 and which every caller catches — is this exact class and not a second
+    one that would silently stop matching.
+
+    A :class:`ValueError` so every adapter already reports it as one line and a
+    status rather than a traceback: the CLI's ``_run`` catches it, and a bare
+    ``ValueError`` would render as 400. The refusal is about current state rather
+    than about the request, which is why that table carries its own **409** row
+    for this class — the shape :class:`RollbackConflict` already had — and why
+    the row lives there, not here: a domain module does not know about statuses.
+    """
+
+
 class RollbackConflict(UndoNotPossible):
     """Raised when a cycle cannot be rolled back because the graph moved on.
 
@@ -1280,22 +1300,37 @@ def _node_list_filters(
     return clauses, params
 
 
-def _require_positive_limit(limit: int) -> None:
-    """Refuse a ``LIMIT`` below 1, which SQLite would read as *unbounded*.
+def require_positive_limit(limit: int, name: str = "limit") -> None:
+    """Refuse a row cap below 1, which SQLite would read as *unbounded*.
 
-    Every capped read in this module goes through here rather than restating
-    the check, because the failure it prevents is silent and identical
-    everywhere: SQLite treats a negative ``LIMIT`` as "no limit", so a caller
-    asking for fewer rows than exist got **all** of them — the opposite of what
-    it asked for — while a ``limit`` of 0 returned nothing at all under the same
-    spelling. :func:`subgraph` stated the rule first; :func:`list_cycles`,
-    :func:`list_events` and :func:`list_nodes` say it identically.
+    Every capped read goes through here rather than restating the check —
+    :mod:`nodum.search`'s included, which is why this is the one public helper
+    in a file of private ones. The failure it prevents is silent and it is not
+    even the same failure twice. A caller asking for fewer rows than exist got
+    **all** of them wherever the number reached SQL, since SQLite treats a
+    negative ``LIMIT`` as "no limit"; where the cap is a Python slice
+    (:func:`list_proposals`, :func:`suggest_links`) a negative one instead
+    dropped that many rows off the **end** of the list and answered normally,
+    which on the review queue means losing a proposal with no sign that
+    anything was lost. A cap of 0 returned nothing at all under a spelling that
+    reads like "as few as possible". Three different wrong answers, one typo.
+
+    :func:`subgraph` stated the rule first and :func:`list_cycles`,
+    :func:`list_events` and :func:`list_nodes` followed; :func:`list_edges`,
+    :func:`list_proposals`, :func:`suggest_links` and
+    :func:`nodum.search.search` say it identically now.
+
+    Args:
+        limit: The cap the caller asked for.
+        name: What the caller called it, so the refusal names the parameter
+            that was actually typed — ``search`` spells this one ``k``, and a
+            message about ``limit`` would name a flag that does not exist.
 
     Raises:
         ValueError: If ``limit`` is below 1.
     """
     if limit < 1:
-        raise ValueError(f"limit must be >= 1, got {limit}")
+        raise ValueError(f"{name} must be >= 1, got {limit}")
 
 
 def list_nodes(
@@ -1344,7 +1379,7 @@ def list_nodes(
             reads a negative ``LIMIT`` as *unbounded*, so ``--limit -3`` handed
             back every node in scope.
     """
-    _require_positive_limit(limit)
+    require_positive_limit(limit)
     conn = _connect(path)
     try:
         store = Store(conn, principal)
@@ -1451,10 +1486,12 @@ def suggest_links(
         Matching nodes, best-ranked first, capped at ``limit``.
 
     Raises:
-        ValueError: If ``limit`` is below 1.
+        ValueError: If ``limit`` is below 1 — through
+            :func:`require_positive_limit` like every other capped read, rather
+            than restating it here, which is how the same check drifts into
+            four spellings of one rule.
     """
-    if limit < 1:
-        raise ValueError(f"limit must be >= 1, got {limit}")
+    require_positive_limit(limit)
     conn = _connect(path)
     try:
         store = Store(conn, principal)
@@ -1668,7 +1705,13 @@ def list_edges(
 
     ``node_id`` matches edges in either direction. An agent principal sees
     only edges whose endpoints are both readable.
+
+    Raises:
+        ValueError: If ``state`` is not a known state, or ``limit`` is below 1
+            (:func:`require_positive_limit` — ``limit=-3`` took the number
+            straight to SQL and handed back every edge in scope).
     """
+    require_positive_limit(limit)
     conn = _connect(path)
     try:
         store = Store(conn, principal)
@@ -2119,9 +2162,17 @@ def list_proposals(
     Returns:
         Proposals with reviewer context (edge endpoints, node parent, or the
         node an update targets).
+
+    Raises:
+        ValueError: If ``kind`` is not one of the three, or ``limit`` is below
+            1. The cap here is a Python slice rather than a SQL ``LIMIT``, so a
+            negative one was not "unbounded" but ``rows[:-3]`` — it dropped
+            proposals off the **end of the review queue** and answered normally,
+            which is the one listing that must not lose an item quietly.
     """
     if kind not in (None, "node", "edge", "update"):
         raise ValueError(f"kind must be 'node', 'edge', or 'update', got {kind!r}")
+    require_positive_limit(limit)
     conn = _connect(path)
     try:
         store = Store(conn, principal)
@@ -2595,6 +2646,78 @@ def _reinsert_rows(conn: sqlite3.Connection, rows: list[dict[str, Any]]) -> None
         )
 
 
+#: What :func:`undo` can reverse: a graph write, and not its own reversal.
+_UNDOABLE_OPS = "op != 'undo' AND (op LIKE 'node.%' OR op LIKE 'edge.%')"
+
+
+def _latest_undoable(
+    conn: sqlite3.Connection, reversed_seqs: set[int], *, unstamped: bool = False
+) -> sqlite3.Row | None:
+    """The most recent event :func:`undo` could reverse, or ``None``.
+
+    Args:
+        conn: The open connection.
+        reversed_seqs: Seqs a previous ``undo`` already took back.
+        unstamped: Narrow to events carrying no ``cycle_id`` — the ones a bare
+            ``undo`` can still reach once a cycle has landed on top of them.
+            This is what the refusal below names, and it is the *same* search
+            with one clause added rather than a second query that could drift
+            from it.
+    """
+    clauses = [_UNDOABLE_OPS]
+    if unstamped:
+        clauses.append("cycle_id IS NULL")
+    if reversed_seqs:
+        clauses.append(f"seq NOT IN ({','.join(str(seq) for seq in sorted(reversed_seqs))})")
+    return conn.execute(
+        f"SELECT * FROM events WHERE {' AND '.join(clauses)} ORDER BY seq DESC LIMIT 1"
+    ).fetchone()
+
+
+def _cycle_stamped_refusal(
+    conn: sqlite3.Connection, event: sqlite3.Row, reversed_seqs: set[int]
+) -> str:
+    """Refuse an undo of a cycle-stamped event, naming a verb that actually works.
+
+    ``nodum rollback <cycle-id>`` takes the cycle back, and that is the right
+    first sentence — but a rollback is **itself** a cycle and its own events are
+    stamped, so a human who follows that advice twice re-applies exactly what
+    they just took back. There is no state in which a bare ``nodum undo``
+    recovers; pointing only at rollback is a loop with no exit named in it. The
+    exit is the most recent undoable event carrying no cycle at all, which this
+    module's own search already knows how to find.
+
+    The merge sentence is **scoped to a cycle that wrote more than one row**. It
+    explains why a multi-row decision cannot come apart one event at a time, and
+    a cycle carrying a lone ``edge.propose`` has no other half to leave standing
+    — so on that one it was explaining the refusal with something that had not
+    happened. The refusal itself is unchanged: a cycle is taken back whole.
+    """
+    cycle_id = event["cycle_id"]
+    rows_written = conn.execute(
+        f"SELECT COUNT(*) AS written FROM events WHERE cycle_id = ? AND {_UNDOABLE_OPS}",
+        (cycle_id,),
+    ).fetchone()["written"]
+    whole = (
+        " — one event of a merge reversed on its own would leave the other half standing"
+        if rows_written > 1
+        else ""
+    )
+    outside = _latest_undoable(conn, reversed_seqs, unstamped=True)
+    alternative = (
+        f"The last write outside a cycle is event {outside['seq']} ({outside['op']}) — "
+        f"`nodum undo {outside['seq']}` takes that back."
+        if outside is not None
+        else "There is no write outside a cycle left to take back."
+    )
+    return (
+        f"cannot undo event {event['seq']} ({event['op']}): it belongs to consolidation "
+        f"cycle {cycle_id}, and a cycle is taken back whole{whole}. Roll the cycle back "
+        f"instead. Run: nodum rollback {cycle_id}. A bare `nodum undo` will keep landing "
+        f"here, because a rollback is a cycle too. {alternative}"
+    )
+
+
 def undo(
     seq: int | None = None, *, principal: Principal, path: str | Path | None = None
 ) -> UndoResult:
@@ -2632,6 +2755,13 @@ def undo(
     reversal, while a cycle is simply the most recent thing that happened, and
     reaching past it to an older event is never what the caller meant.
 
+    That refusal also names **this** verb, with a ``seq``. A rollback is itself
+    a cycle, so pointing at rollback alone is a loop: following it twice
+    re-applies what was just taken back, and no state exists in which a bare
+    ``undo`` recovers. :func:`_cycle_stamped_refusal` names the most recent
+    write carrying no cycle instead, which is the one a caller can still reverse
+    here.
+
     Raises:
         GrantNotPermitted: If the principal is not a human.
         EventNotFound: If no event matches ``seq`` (or none exist to undo).
@@ -2662,17 +2792,8 @@ def undo(
         # conflict standing between the merge and its rollback, so both reversal
         # verbs were spent and the merge was permanently unrollbackable. A
         # refusal naming the cycle costs one command; this cost the graph.
-        undoable = "(op LIKE 'node.%' OR op LIKE 'edge.%')"
         if seq is None:
-            event = conn.execute(
-                f"SELECT * FROM events WHERE op != 'undo' AND {undoable} ORDER BY seq DESC LIMIT 1"
-                if not reversed_seqs
-                else (
-                    f"SELECT * FROM events WHERE op != 'undo' AND {undoable} "
-                    f"AND seq NOT IN ({','.join(str(s) for s in sorted(reversed_seqs))}) "
-                    "ORDER BY seq DESC LIMIT 1"
-                )
-            ).fetchone()
+            event = _latest_undoable(conn, reversed_seqs)
         else:
             event = conn.execute("SELECT * FROM events WHERE seq = ?", (seq,)).fetchone()
         if event is None:
@@ -2685,12 +2806,7 @@ def undo(
                 f"event {event['seq']} ({event['op']}) is not a graph event and cannot be undone"
             )
         if event["cycle_id"] is not None:
-            raise UndoNotPossible(
-                f"cannot undo event {event['seq']} ({event['op']}): it belongs to consolidation "
-                f"cycle {event['cycle_id']}, and a cycle is taken back whole — one event of a "
-                "merge reversed on its own would leave the other half standing. Roll the cycle "
-                f"back instead. Run: nodum rollback {event['cycle_id']}"
-            )
+            raise UndoNotPossible(_cycle_stamped_refusal(conn, event, reversed_seqs))
         if event["seq"] in reversed_seqs:
             raise ValueError(f"event {event['seq']} has already been undone")
 
@@ -2792,7 +2908,7 @@ def list_events(
             the id answering with the same empty list, and exit 0, would make
             that proof unreadable.
     """
-    _require_positive_limit(limit)
+    require_positive_limit(limit)
     conn = _connect(path)
     try:
         Store(conn, principal).require_human("read the event log")
@@ -3195,7 +3311,7 @@ def subgraph(
     """
     if depth < 0:
         raise ValueError(f"depth must be >= 0, got {depth}")
-    _require_positive_limit(limit)
+    require_positive_limit(limit)
     # Clamped rather than refused: a caller asking for more than the server
     # will ever draw gets the ceiling plus an honest `truncated`.
     limit = min(limit, MAX_SUBGRAPH_LIMIT)
@@ -4127,6 +4243,13 @@ CYCLE_STATUSES = ("running", *CYCLE_CLOSED_STATUSES)
 #: put a name in the journal that is not the one that authenticated.
 SCHEDULER_ACTOR = "scheduler"
 
+#: The triggers a *consolidation run* opens, and the ones ``0014``'s partial
+#: unique index serialises against each other. ``curative`` and ``rollback`` are
+#: deliberately outside it: each is one short, human-driven operation, and
+#: blocking them for the length of a nightly sweep would take the curative tier
+#: offline every night.
+CONSOLIDATION_TRIGGERS = ("manual", "scheduled")
+
 
 def _cycle_out(row: sqlite3.Row) -> CycleOut:
     return CycleOut(
@@ -4221,6 +4344,10 @@ def open_cycle(
         TypeNotFound: If ``scope`` resolves to no space the principal can see.
         GrantNotPermitted: If the principal may not open a cycle there, or is
             not a human and asked for a ``manual`` cycle.
+        CycleInProgress: If ``trigger`` is a consolidation trigger and a
+            consolidation cycle is already ``running`` — refused on the INSERT
+            by ``0014``'s partial unique index, so the rule holds against a
+            second *process* and not only a second caller here.
     """
     if trigger not in CYCLE_TRIGGERS:
         raise ValueError(f"trigger must be one of {CYCLE_TRIGGERS}, got {trigger!r}")
@@ -4252,16 +4379,59 @@ def open_cycle(
             )
         cycle_id = uuid.uuid4().hex
         triggered_by = SCHEDULER_ACTOR if trigger == "scheduled" else principal.actor_string
-        conn.execute(
-            "INSERT INTO cycles (id, trigger, triggered_by, scope, dry_run, status)"
-            " VALUES (?, ?, ?, ?, ?, 'running')",
-            (cycle_id, trigger, triggered_by, scope_id, int(dry_run)),
-        )
+        try:
+            conn.execute(
+                "INSERT INTO cycles (id, trigger, triggered_by, scope, dry_run, status)"
+                " VALUES (?, ?, ?, ?, ?, 'running')",
+                (cycle_id, trigger, triggered_by, scope_id, int(dry_run)),
+            )
+        except sqlite3.IntegrityError as clash:
+            # `0014`'s partial unique index is the cross-process lock: at most one
+            # `running` consolidation row exists, whichever process opened it, and
+            # the loser finds out on the INSERT rather than after a `SELECT` that
+            # was true when it ran. Translated only when a running consolidation
+            # is actually there — an `IntegrityError` from anything else is a bug
+            # and must not be reported as a busy graph.
+            running = _running_consolidation(conn)
+            if running is None:
+                raise
+            raise CycleInProgress(_cycle_in_progress_message(running)) from clash
         row = _get_cycle_row(conn, cycle_id)
         conn.commit()
         return _cycle_out(row)
     finally:
         conn.close()
+
+
+def _running_consolidation(conn: sqlite3.Connection) -> sqlite3.Row | None:
+    """The consolidation cycle currently holding the file, or ``None``."""
+    placeholders = ",".join("?" * len(CONSOLIDATION_TRIGGERS))
+    return conn.execute(
+        f"SELECT * FROM cycles WHERE status = 'running' AND trigger IN ({placeholders})",
+        CONSOLIDATION_TRIGGERS,
+    ).fetchone()
+
+
+def _cycle_in_progress_message(running: sqlite3.Row) -> str:
+    """Refuse a second consolidation, naming the one in the way and the door out.
+
+    The door matters as much as the refusal. A cycle killed by a ``SIGKILL``, a
+    power cut, or a shutdown cancelling a mid-run task never closes itself, and
+    nothing else moves the row — so it blocks every later run, and "try again
+    when it has finished" is advice about a run that will never finish.
+    ``cycle-abandon`` is what closes it, and the refusal names the whole command.
+    """
+    asked_by = (
+        "the nightly schedule" if running["trigger"] == "scheduled" else running["triggered_by"]
+    )
+    return (
+        f"a consolidation cycle is already running: cycle {running['id']}, started "
+        f"{running['started_at']} for {asked_by}. Cycles are serialised across every process "
+        "that shares this file, so two runs cannot propose the same candidate twice, and this "
+        "one was refused rather than queued behind it. Try again when it has finished — or, if "
+        f"that run was interrupted and will never close itself, run: nodum cycle-abandon "
+        f"{running['id']}"
+    )
 
 
 def close_cycle(
@@ -4384,9 +4554,22 @@ def abandon_cycle(
         cycle_id,
         status="failed",
         report={
+            # `abandoned` is the discriminator, and it exists because there was
+            # none: an abandon wore the one-op curative report's shape exactly
+            # (`op` + `error`), so an abandoned nightly sweep read back as "One
+            # curative operation: abandon_cycle. It failed." — a consolidation
+            # described as a curative op, and a failure that was the *run's*.
+            # Anything reading this report should branch on `abandoned` rather
+            # than match `op` against a name; `op` stays because the journal view
+            # keys on it today, and it is the weaker of the two answers.
+            "abandoned": True,
             "op": "abandon_cycle",
             "abandoned_by": principal.actor_string,
-            "error": (
+            # **Not `error`.** The abandon succeeded — it is the run that failed,
+            # which `status = 'failed'` already says. A sentence explaining the
+            # close, filed under a key that means "this raised", is what put "It
+            # failed." on an operation that did exactly what was asked.
+            "detail": (
                 "the run was interrupted and never closed itself; a human closed its journal "
                 "entry so that what it had already written could be rolled back"
             ),
@@ -4427,7 +4610,7 @@ def list_cycles(
             :func:`subgraph`'s, said here for the same reason.
         GrantNotPermitted: If the principal is not a human.
     """
-    _require_positive_limit(limit)
+    require_positive_limit(limit)
     conn = _connect(path)
     try:
         Store(conn, principal).require_human("read the consolidation journal")
@@ -5095,11 +5278,14 @@ def bulk_relink(
     retired edge is history, and relinking it would rewrite what was once true.
     Naming ``state='archived'`` reaches one deliberately.
 
-    A matched edge is **skipped, with its reason reported**, when nothing would
-    change, when the new destination is its own source (a self-loop), when the
-    graph already carries an identical edge, or when the caller may not edit one
-    of the spaces involved. At most :data:`MAX_RELINK_EDGES` edges are selected
-    and ``truncated`` says whether that ceiling bit.
+    A matched edge is **refused, with its reason reported in** ``skipped``, when
+    the new destination is its own source (a self-loop), when the graph already
+    carries an identical edge, or when the caller may not edit one of the spaces
+    involved. An edge the change would not alter is a different thing and goes
+    in ``unchanged`` as a bare id: it is a fact about the diff, not a refusal,
+    and mixing the two under one ``error`` field left a script unable to tell
+    them apart. At most :data:`MAX_RELINK_EDGES` edges are selected and
+    ``truncated`` says whether that ceiling bit.
 
     Args:
         selector: Any of ``src_id``, ``dst_id``, ``type``, ``state``.
@@ -5110,8 +5296,9 @@ def bulk_relink(
         path: Explicit database path.
 
     Returns:
-        The matched count, the per-edge diff, the skipped edges with reasons,
-        the truncation flag, and the cycle (``None`` on a dry run).
+        The matched count, the per-edge diff, the edges nothing would change on,
+        the refused edges with reasons, the truncation flag, and the cycle
+        (``None`` on a dry run).
 
     Raises:
         NodeNotFound: If a new ``dst_id`` does not resolve, or is not readable.
@@ -5150,6 +5337,7 @@ def bulk_relink(
             {
                 "matched": result.matched,
                 "relinked": len(result.changes),
+                "unchanged": len(result.unchanged),
                 "skipped": len(result.skipped),
                 "truncated": result.truncated,
             }
@@ -5212,15 +5400,18 @@ def _relink(
             else None
         )
         diffs: list[RelinkDiff] = []
+        unchanged: list[str] = []
         skipped: list[TransitionFailure] = []
         for row in rows:
             before = _row_dict(row)
             target_type = new_type_id or before["type_id"]
             target_dst = new_dst["id"] if new_dst is not None else before["dst_id"]
             if (target_type, target_dst) == (before["type_id"], before["dst_id"]):
-                skipped.append(
-                    TransitionFailure(id=before["id"], error="nothing would change on this edge")
-                )
+                # A diff annotation, not a refusal: the edge already says what
+                # the caller asked for. It has its own list because sharing one
+                # with the refusals meant sharing a field called `error`, and a
+                # script could then only tell them apart by the sentence.
+                unchanged.append(before["id"])
                 continue
             if target_dst == before["src_id"]:
                 skipped.append(
@@ -5287,6 +5478,7 @@ def _relink(
             dry_run=dry_run,
             matched=len(rows),
             changes=diffs,
+            unchanged=unchanged,
             skipped=skipped,
             truncated=truncated,
             cycle_id=cycle_id,
@@ -5480,8 +5672,10 @@ def _rollback_plan(conn: sqlite3.Connection, cycle_id: str) -> _RollbackPlan:
     if cycle["status"] == "running":
         raise InvalidTransition(
             f"cycle {cycle_id} is still running: its event set is not closed yet, so reversing "
-            "it would race the runner still writing into it. Close it first — a crashed run is "
-            "closed 'failed', and a failed cycle rolls back like any other"
+            "it would race the runner still writing into it. If the run is still going, wait "
+            "for it to finish; if it was interrupted and will never close itself, close its "
+            f"journal entry with: nodum cycle-abandon {cycle_id} — that records it 'failed', "
+            "and a failed cycle rolls back like any other"
         )
     if cycle["status"] == "rolled_back":
         raise InvalidTransition(
@@ -5657,6 +5851,89 @@ def _conflict_message(cycle_id: str, conflicts: list[RollbackConflictOut]) -> st
     )
 
 
+def _rollback_target(
+    conn: sqlite3.Connection, cycle: dict[str, Any]
+) -> tuple[dict[str, Any], str] | None:
+    """The cycle ``cycle`` reversed and the status it held before, or ``None``.
+
+    ``None`` when ``cycle`` is not a rollback, or its report does not name a
+    cycle that still exists.
+
+    Read from the rollback's own **report**, never from ``rolled_back_by``: the
+    mark is what :func:`_restate_reversal_chain` rewrites, so it cannot also be
+    the thread that walk follows. The report is written once, when the rollback
+    closes, and nothing rewrites it.
+    """
+    if cycle["trigger"] != "rollback" or not cycle["report"]:
+        return None
+    report = json.loads(cycle["report"])
+    target_id = report.get("rolled_back")
+    if not isinstance(target_id, str):
+        return None
+    row = conn.execute("SELECT * FROM cycles WHERE id = ?", (target_id,)).fetchone()
+    if row is None:
+        return None
+    previous = report.get("previous_status")
+    if previous not in CYCLE_CLOSED_STATUSES:
+        previous = "completed"
+    return _row_dict(row), previous
+
+
+def _restate_reversal_chain(conn: sqlite3.Connection, cycle: dict[str, Any]) -> str | None:
+    """Restate the ``rolled_back`` mark down the whole chain below ``cycle``.
+
+    ``cycle`` has just been marked ``rolled_back``, and if it is itself a
+    rollback then everything it reversed has changed hands with it. The chain
+    **alternates**, which is why one hop is not enough: a rollback that is taken
+    back stops standing, so the cycle it reversed stands again and its mark
+    comes off — but that cycle may itself be a rollback, and one that stands
+    again is once more holding *its* target down, so that mark goes back on.
+    Every step flips.
+
+    Clearing exactly one hop was right for depth 2 and wrong from depth 3, where
+    it left the journal asserting the mirror of the invariant it exists to keep:
+    a cycle reported ``completed`` with no ``rolled_back_by`` while its writes
+    were reversed and standing that way. That is not only a misread entry —
+    :func:`_rollback_plan` refuses an already-``rolled_back`` cycle by reading
+    exactly this column, so a stale ``completed`` hands it a row it will happily
+    reverse a second time.
+
+    Args:
+        conn: The open write transaction.
+        cycle: The cycle just marked ``rolled_back``, as a row dict.
+
+    Returns:
+        The cycle this rollback directly put back into force, or ``None``.
+    """
+    reapplied: str | None = None
+    current = cycle
+    # `current` was just marked `rolled_back`, so its own writes are not
+    # standing; the first hop therefore *frees* whatever it was holding down.
+    taken_back = True
+    seen = {current["id"]}
+    while (target := _rollback_target(conn, current)) is not None:
+        row, previous = target
+        # The chain is report data, not schema; a malformed one must not spin.
+        if row["id"] in seen:
+            break
+        seen.add(row["id"])
+        if taken_back:
+            conn.execute(
+                "UPDATE cycles SET status = ?, rolled_back_by = NULL WHERE id = ?",
+                (previous, row["id"]),
+            )
+            if reapplied is None:
+                reapplied = row["id"]
+        else:
+            conn.execute(
+                "UPDATE cycles SET status = 'rolled_back', rolled_back_by = ? WHERE id = ?",
+                (current["id"], row["id"]),
+            )
+        current = row
+        taken_back = not taken_back
+    return reapplied
+
+
 def _apply_rollback(
     conn: sqlite3.Connection,
     plan: _RollbackPlan,
@@ -5770,22 +6047,9 @@ def _apply_rollback(
     # Rolling back a rollback re-applies what it reversed, so the cycle it
     # reversed stops being rolled back. Leaving the mark would make the journal
     # say a cycle is taken back while its writes are live again, and would leave
-    # it unrollbackable behind a status that is no longer true.
-    reapplied: str | None = None
-    if plan.cycle["trigger"] == "rollback":
-        original = conn.execute(
-            "SELECT id FROM cycles WHERE rolled_back_by = ?", (cycle_id,)
-        ).fetchone()
-        if original is not None:
-            report = json.loads(plan.cycle["report"]) if plan.cycle["report"] else {}
-            previous = report.get("previous_status")
-            if previous not in CYCLE_CLOSED_STATUSES:
-                previous = "completed"
-            conn.execute(
-                "UPDATE cycles SET status = ?, rolled_back_by = NULL WHERE id = ?",
-                (previous, original["id"]),
-            )
-            reapplied = original["id"]
+    # it unrollbackable behind a status that is no longer true. It is the whole
+    # chain and not one hop: see :func:`_restate_reversal_chain`.
+    reapplied = _restate_reversal_chain(conn, plan.cycle)
 
     _emit(
         conn,

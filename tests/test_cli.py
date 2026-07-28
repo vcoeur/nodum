@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -1190,7 +1191,7 @@ def test_cycle_abandon_is_the_door_out_of_an_interrupted_run(fresh_db):
     abandoned = _run_json("cycle-abandon", cycle.id)
 
     assert abandoned["status"] == "failed"
-    assert abandoned["report"]["op"] == "abandon_cycle"
+    assert abandoned["report"]["abandoned"] is True
     assert abandoned["report"]["abandoned_by"] == "human:owner"
     # And the writes it made are reachable again, which is the whole point.
     _run_json("rollback", cycle.id)
@@ -1512,3 +1513,119 @@ def test_schema_dump_surfaces_params():
     payload = _run_json("schema-dump")
     schema_command = next(c for c in payload["commands"] if c["name"] == "schema")
     assert any(p["kind"] == "argument" and p["name"] == "type" for p in schema_command["params"])
+
+
+# ── The docs name commands that exist ─────────────────────────────────────────
+
+#: Every prose file that spells commands at a reader. `schema-dump` is the
+#: authority they are checked against, which is the point: the CLI describes
+#: itself, so the docs can be checked against the surface rather than against a
+#: second list of it.
+DOC_SOURCES = ("README.md", "AGENTS.md", "docs")
+
+#: Hyphenated lowercase tokens the docs write in backticks that are *not*
+#: commands — a CSP directive, an HTTP header, a package, an agent id, a CI job.
+#: They share `cycle-rollback`'s exact shape, which is why the check needs them
+#: named; the test asserts every one of them is still in the docs, so an entry
+#: that stops being needed fails here instead of quietly widening the check.
+NOT_COMMANDS = frozenset(
+    {
+        "build-and-publish",  # the release workflow's job name
+        "builtin-gardener",  # the internal agent's id (`nodum grant` takes it)
+        "content-disposition",  # an HTTP response header
+        "cross-space",  # prose
+        "faster-whisper",  # the audio extra's package
+        "no-store",  # a Cache-Control directive
+        "script-src",  # a CSP directive
+    }
+)
+
+#: A backticked token shaped like a command name: lowercase, hyphenated. The
+#: shape is what makes a wrong one invisible — `cycle-rollback` reads exactly
+#: like `cycle-abandon` and `cycle-list` beside it.
+_COMMAND_SHAPED = re.compile(r"^[a-z][a-z0-9]*(?:-[a-z0-9]+)+$")
+
+#: An inline code span or a fenced block — the only places a command name is
+#: spelled. Scanning prose instead would trip over every sentence that says
+#: "nodum is a…", which is not a command and never was.
+_CODE_SPAN = re.compile(r"```.*?```|`[^`\n]+`", re.S)
+
+#: `nodum <command> [<subcommand>]` inside one of those spans. The trailing `*`
+#: is captured rather than cut off so a family reference (`nodum space-*`) can be
+#: recognised as one and skipped instead of resolving to `space-`.
+_INVOCATION = re.compile(r"\bnodum\s+([a-z][a-z0-9-]*\*?)(?:\s+([a-z][a-z0-9-]*\*?))?")
+
+
+def _doc_files() -> list[Path]:
+    """Every documentation file a reader could copy a command out of."""
+    repo = Path(__file__).resolve().parent.parent
+    files: list[Path] = []
+    for source in DOC_SOURCES:
+        target = repo / source
+        files.extend(sorted(target.rglob("*.md")) if target.is_dir() else [target])
+    files.append(repo / "docs" / "llms.txt")
+    return [path for path in files if path.exists()]
+
+
+def _command_tree() -> dict[str, dict]:
+    """The CLI's own command tree, keyed by name, from ``schema-dump``."""
+
+    def index(commands: list[dict]) -> dict[str, dict]:
+        return {c["name"]: index(c.get("subcommands", [])) for c in commands}
+
+    return index(_run_json("schema-dump")["commands"])
+
+
+def test_every_command_the_docs_name_exists():
+    """A documented command that does not resolve is worse than an undocumented one.
+
+    ``docs/commands.md`` told a reader that "an interrupted run is still one a
+    ``cycle-rollback`` can take back". There is no ``cycle-rollback``: the verb
+    is ``nodum rollback``, and the name appears nowhere in ``nodum/``. It reads
+    like a command because it is shaped like three real ones sitting beside it
+    (``cycle-list``, ``cycle-get``, ``cycle-abandon``), which is exactly why
+    nobody caught it — and a reader who types it gets "No such command", after
+    which the paragraph's actual advice is worth nothing.
+
+    Two passes, because the docs spell a command two ways. Full invocations
+    (``nodum grant builtin-gardener <space> edit``) are checked head and
+    subcommand against the tree. Bare, command-shaped names in backticks
+    (``space-list``, ``bulk-relink``) are checked against every name in the tree
+    at any depth, since the docs write ``token-rotate`` for ``agent
+    token-rotate``. Only code spans are read: prose says "nodum is a DB-native
+    knowledge graph", and "is" is not a command.
+    """
+    tree = _command_tree()
+    every_name = set(tree)
+    for group in tree.values():
+        every_name |= set(group)
+
+    unknown: list[str] = []
+    seen_exemptions: set[str] = set()
+    for path in _doc_files():
+        text = path.read_text(encoding="utf-8")
+        for span in _CODE_SPAN.finditer(text):
+            body = span.group(0)
+            for match in _INVOCATION.finditer(body):
+                head, sub = match.group(1), match.group(2)
+                # `pipx install nodum` on the line above a real invocation, and
+                # `nodum space-*`, which names a family rather than a command.
+                if head == "nodum" or head.endswith("*"):
+                    continue
+                sub = None if sub and sub.endswith("*") else sub
+                if head not in tree:
+                    unknown.append(f"{path.name}: nodum {head}")
+                elif tree[head] and sub and sub not in tree[head]:
+                    unknown.append(f"{path.name}: nodum {head} {sub}")
+            token = body.strip("`").strip().split(" ")[0] if "\n" not in body else ""
+            if not _COMMAND_SHAPED.match(token):
+                continue
+            if token in NOT_COMMANDS:
+                seen_exemptions.add(token)
+            elif token not in every_name:
+                unknown.append(f"{path.name}: `{token}`")
+
+    assert not unknown, f"the docs name commands that do not exist: {sorted(set(unknown))}"
+    assert seen_exemptions == set(NOT_COMMANDS), (
+        f"NOT_COMMANDS lists names the docs no longer use: {sorted(NOT_COMMANDS - seen_exemptions)}"
+    )

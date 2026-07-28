@@ -15,6 +15,9 @@ from __future__ import annotations
 
 import ast
 import math
+import os
+import subprocess
+import sys
 import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -1017,6 +1020,45 @@ def test_a_second_cycle_is_refused_while_one_is_running(fresh_db, monkeypatch):
     assert [type(result) for result in results] == [consolidate.ConsolidationOut]
     # The refused caller opened no cycle, so the journal records one run.
     assert len(service.list_cycles(principal=owner())) == 1
+
+
+def test_a_second_process_is_refused_too(fresh_db, tmp_path):
+    """The half a process lock never covered, driven through a real second process.
+
+    A `nodum consolidate` fired while the server ran one is two processes, and a
+    module-level lock is in neither of the other's. Both completed: 1580
+    `duplicate_of` edges over 790 pairs, every pair proposed twice, and two
+    journal rows for one human intention. The review queue is the human's, and
+    doubling it is precisely the defect the in-process lock was raised against —
+    so the guard has to live where both processes can see it, which is the
+    `cycles` row.
+
+    This test is deliberately a **subprocess** rather than a second thread: a
+    thread shares the lock that was there before, so it could not tell a guard
+    in Python apart from a guard in the database, which is the whole question.
+    """
+    open_cycle = service.open_cycle(trigger="scheduled", principal=owner())
+    assert open_cycle.status == "running"
+
+    program = (
+        "from nodum import consolidate\n"
+        "from nodum import auth\n"
+        "consolidate.consolidate(triggered_by=auth.OWNER_ACTOR, jobs=['neglect_report'])\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", program],
+        capture_output=True,
+        text=True,
+        env={**os.environ, db.ENV_DB_VAR: str(fresh_db), "NODUM_CONSOLIDATE_AT": ""},
+        cwd=tmp_path,
+        timeout=120,
+    )
+
+    assert result.returncode != 0, result.stdout
+    assert "CycleInProgress" in result.stderr
+    assert "already running" in result.stderr
+    # The second process opened no cycle, so the journal still records one run.
+    assert [cycle.id for cycle in service.list_cycles(principal=owner())] == [open_cycle.id]
 
 
 def test_the_lock_is_released_when_a_cycle_fails(fresh_db, monkeypatch):

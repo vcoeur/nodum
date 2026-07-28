@@ -131,9 +131,12 @@ def _emit_batch(result: BaseModel, failures: Sequence[TransitionFailure]) -> Non
 
     Args:
         result: The batch outcome to print as the command's one JSON object.
-        failures: Its per-item failures — the ``failed`` list, never a list of
-            benign skips (``bulk_relink``'s ``skipped`` carries "nothing would
-            change on this edge", which is a diff annotation and not a refusal).
+        failures: Its per-item failures — the ``failed`` list. ``bulk_relink``
+            does not use this helper: its diff annotation ("nothing would change
+            on this edge") is reported apart from its refusals now, in
+            ``unchanged``, but its exit code stays 0 either way because a relink
+            that matched an edge already saying what was asked for is a diff a
+            human is reading, not a batch that lost an item.
     """
     _emit(result)
     for failure in failures:

@@ -24,14 +24,17 @@ import {
   useToast,
 } from "../../components";
 import type { SpaceName } from "../../components";
-import type { CycleDetailOut, RollbackOut } from "../../api/types";
+import type { CycleDetailOut, CycleOut, RollbackOut } from "../../api/types";
 import { describeFailure, formatTimestamp, formatTimestampLong } from "../../lib";
 import type { FailureDescription } from "../../lib";
+import { AbandonDialog } from "./AbandonDialog";
 import { CycleBadges } from "./CycleBadges";
 import { EventDiff } from "./EventDiff";
 import { MetricTable } from "./MetricTable";
 import { RollbackDialog } from "./RollbackDialog";
 import {
+  abandonAvailability,
+  abandonOutcome,
   CYCLE_EVENT_LIMIT,
   cycleCaveats,
   cycleFailures,
@@ -44,7 +47,6 @@ import {
   readConsolidationReport,
   rollbackAvailability,
   rollbackOutcome,
-  rowHeadlines,
 } from "./journal";
 import type { ConsolidationReport } from "./journal";
 import "./journal.css";
@@ -61,6 +63,7 @@ export default function CycleView() {
   const toast = useToast();
   const [load, setLoad] = useState<LoadState>({ status: "loading" });
   const [confirming, setConfirming] = useState(false);
+  const [abandoning, setAbandoning] = useState(false);
   const [attempt, setAttempt] = useState(0);
   /**
    * Where the keyboard goes once the rollback has happened.
@@ -98,6 +101,19 @@ export default function CycleView() {
     [reload, toast],
   );
 
+  // Same landing as a rollback, and for the same reason: the button that opened
+  // the dialog is about to be disabled (the cycle is no longer `running`), and
+  // `Modal` deliberately will not restore focus onto a control that cannot be
+  // used. The heading is also the sentence that has just changed.
+  const onAbandoned = useCallback(
+    (closed: CycleOut) => {
+      toast.show("info", "Cycle abandoned", abandonOutcome(closed));
+      heading.current?.focus();
+      reload();
+    },
+    [reload, toast],
+  );
+
   // Everything below has to be computed before the early returns: hooks do not
   // get to be conditional. `detail` is null until the read lands, and every
   // derivation tolerates that.
@@ -127,8 +143,6 @@ export default function CycleView() {
   // availability check and the confirm dialog's row names — three readings of
   // the same log that must not disagree.
   const changes = useMemo(() => (detail?.events ?? []).map(describeEvent), [detail?.events]);
-  const rowNames = useMemo(() => rowHeadlines(changes), [changes]);
-  const nameRow = useCallback((rowId: string) => rowNames.get(rowId) ?? null, [rowNames]);
 
   if (!cycleId) {
     return (
@@ -194,6 +208,11 @@ export default function CycleView() {
       ? null
       : false;
   const rollback = rollbackAvailability(cycle, wroteGraphEvents);
+  // The door out of an interrupted run. `POST /api/cycles/{id}/abandon` and
+  // `nodum cycle-abandon` both shipped and no surface here offered either, so a
+  // cycle a crash left `running` had its writes irreversible on every surface —
+  // on the one screen that displays the stuck entry.
+  const abandon = abandonAvailability(cycle);
 
   return (
     <div className="nd-view nd-jn">
@@ -223,6 +242,20 @@ export default function CycleView() {
           <CycleBadges cycle={cycle} />
         </div>
         <div className="nd-jn-detail__actions">
+          {/* Offered only while it is possible, rather than always and mostly
+              disabled: abandoning is for one situation — a run nothing is going
+              to finish — and a permanently greyed control beside the rollback
+              would read as a second way to undo a cycle. */}
+          {abandon.available ? (
+            <button
+              type="button"
+              className="nd-button nd-button--danger"
+              onClick={() => setAbandoning(true)}
+              title="Close this interrupted entry so what it wrote can be rolled back"
+            >
+              Abandon this cycle
+            </button>
+          ) : null}
           <button
             type="button"
             className="nd-button nd-button--danger"
@@ -268,9 +301,17 @@ export default function CycleView() {
       {confirming ? (
         <RollbackDialog
           cycle={cycle}
-          nameRow={nameRow}
+          changes={changes}
           onRolledBack={onRolledBack}
           onClose={() => setConfirming(false)}
+        />
+      ) : null}
+
+      {abandoning ? (
+        <AbandonDialog
+          cycle={cycle}
+          onAbandoned={onAbandoned}
+          onClose={() => setAbandoning(false)}
         />
       ) : null}
     </div>

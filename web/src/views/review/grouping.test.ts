@@ -57,8 +57,14 @@ import {
   groupProposals,
   groupProposalsBySpace,
   PROPOSAL_KINDS,
+  PROPOSAL_PAGE_SIZE,
   proposalKind,
+  proposalPageKey,
   proposalSpace,
+  queueCount,
+  queueTruncationNote,
+  restrictToPage,
+  sectionOrder,
   selfGoverningNote,
   UNREPORTED_SPACE,
 } from "./grouping";
@@ -748,5 +754,164 @@ describe("selfGoverningNote", () => {
     expect(note).toContain("not an");
     expect(note).toContain("empty inbox");
     expect(selfGoverningNote(3)).toContain("3 spaces");
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* Paging, and saying how much is really there                          */
+/* ------------------------------------------------------------------ */
+
+describe("proposalPageKey", () => {
+  it("tells two kinds sharing an id apart", () => {
+    // An update proposal's id is a version row's integer, which lives in a
+    // different id space from a node's or an edge's uuid — so `id` alone is not
+    // a page-membership test, and the cards are keyed the same way.
+    const one = { ...proposal("agent:a", 0, "node"), id: "7" };
+    const other = { ...proposal("agent:a", 0, "update"), id: "7" };
+    expect(proposalPageKey(one)).not.toBe(proposalPageKey(other));
+  });
+});
+
+describe("sectionOrder", () => {
+  it("flattens the sections in the order the screen draws them", () => {
+    // The pager slices *this*, not the wire order. The server answers
+    // oldest-first and the screen renders space, then agent, then newest run
+    // first — so paging over the wire order would scatter one page's rows
+    // through the whole tree.
+    const sections = groupProposalsBySpace(
+      [
+        nodeProposal("agent:a", 0, "n1", "research"),
+        nodeProposal("agent:b", 1_000, "n2", "main"),
+        // A second run of agent:a, well past the batch gap.
+        nodeProposal("agent:a", BATCH_GAP_MS * 3, "n3", "research"),
+      ],
+      [space("research", "research"), space("main", "main")],
+    );
+    const drawn = sections.flatMap((section) =>
+      section.agents.flatMap((agent) => agent.batches.flatMap((batch) => batch.proposals)),
+    );
+    expect(sectionOrder(sections)).toEqual(drawn);
+    expect(sectionOrder(sections)).toHaveLength(3);
+  });
+
+  it("counts nothing for a self-governing section, which holds nothing", () => {
+    const sections = groupProposalsBySpace([], [space("main", "main", [grant("g", "main", "edit")])]);
+    expect(sections.some((section) => section.kind === "self-governing")).toBe(true);
+    expect(sectionOrder(sections)).toEqual([]);
+  });
+});
+
+describe("restrictToPage", () => {
+  /** One agent's run of `count` proposals, filed into one space. */
+  function oneRun(count: number) {
+    return groupProposalsBySpace(
+      Array.from({ length: count }, (_unused, index) =>
+        nodeProposal("agent:gardener", index * 1_000, `n${index}`, "main"),
+      ),
+      [space("main", "main")],
+    );
+  }
+
+  it("renders one page of a run and leaves every count whole", () => {
+    // The defect: a cycle files hundreds of proposals in one run and the queue
+    // rendered a card for each — 10 673 DOM nodes, no paging, on the screen
+    // whose whole job is not to lose a proposal.
+    const sections = oneRun(60);
+    const order = sectionOrder(sections);
+    const onPage = new Set(order.slice(0, PROPOSAL_PAGE_SIZE).map(proposalPageKey));
+    const paged = restrictToPage(sections, onPage);
+
+    const batch = paged[0]?.agents[0]?.batches[0];
+    expect(batch?.shown).toHaveLength(PROPOSAL_PAGE_SIZE);
+    // Every number a header prints stays the run's, because none of them is a
+    // statement about the page: "Accept run (60)" accepts sixty.
+    expect(batch?.proposals).toHaveLength(60);
+    expect(batch?.counts.node).toBe(60);
+    expect(paged[0]?.total).toBe(60);
+    expect(paged[0]?.agents[0]?.total).toBe(60);
+  });
+
+  it("drops the groups with nothing on this page", () => {
+    const sections = groupProposalsBySpace(
+      [
+        nodeProposal("agent:a", 0, "n1", "research"),
+        nodeProposal("agent:b", BATCH_GAP_MS * 3, "n2", "main"),
+      ],
+      [space("research", "research"), space("main", "main")],
+    );
+    const order = sectionOrder(sections);
+    const first = new Set([proposalPageKey(order[0]!)]);
+    const paged = restrictToPage(sections, first);
+    expect(paged).toHaveLength(1);
+    expect(paged[0]?.agents).toHaveLength(1);
+    expect(paged[0]?.agents[0]?.batches[0]?.shown).toHaveLength(1);
+  });
+
+  it("leaves the whole tree alone when the page holds all of it", () => {
+    const sections = oneRun(3);
+    const all = new Set(sectionOrder(sections).map(proposalPageKey));
+    const paged = restrictToPage(sections, all);
+    expect(paged[0]?.agents[0]?.batches[0]?.shown).toEqual(
+      sections[0]?.agents[0]?.batches[0]?.proposals,
+    );
+  });
+
+  it("shows a straddling run on both pages, with its full count each time", () => {
+    const sections = oneRun(4);
+    const order = sectionOrder(sections);
+    const firstHalf = new Set(order.slice(0, 2).map(proposalPageKey));
+    const secondHalf = new Set(order.slice(2).map(proposalPageKey));
+    for (const page of [firstHalf, secondHalf]) {
+      const batch = restrictToPage(sections, page)[0]?.agents[0]?.batches[0];
+      expect(batch?.shown).toHaveLength(2);
+      expect(batch?.proposals).toHaveLength(4);
+    }
+  });
+});
+
+describe("groupProposalsBySpace, unpaged", () => {
+  it("shows every proposal in a run until a page narrows it", () => {
+    // `shown` defaults to the whole run, so nothing that reads a batch changes
+    // behaviour until the pager is actually applied.
+    const sections = groupProposalsBySpace(
+      [nodeProposal("agent:a", 0, "n1", "main"), nodeProposal("agent:a", 1_000, "n2", "main")],
+      [space("main", "main")],
+    );
+    const batch = sections[0]?.agents[0]?.batches[0];
+    expect(batch?.shown).toEqual(batch?.proposals);
+  });
+});
+
+describe("queueCount", () => {
+  it("counts a queue the window did not cut", () => {
+    expect(queueCount(12, 12, false)).toBe("12 proposals");
+    expect(queueCount(1, 1, false)).toBe("1 proposal");
+    expect(queueCount(8, 12, false)).toBe("8 of 12 proposals");
+  });
+
+  it("never reports a filled window as a total", () => {
+    // The defect: `GET /api/review/queue` answers `rows[:limit]` and reports no
+    // total, so a queue of 1043 answered a request for 500 with 500 — and this
+    // line read "500 proposals waiting", silent truncation on the screen whose
+    // whole job is not to lose a proposal.
+    expect(queueCount(500, 500, true)).toBe("at least 500 proposals");
+    expect(queueCount(120, 500, true)).toBe("120 of at least 500 proposals");
+  });
+});
+
+describe("queueTruncationNote", () => {
+  it("says the window filled without claiming there is definitely more", () => {
+    // Conservative in the same way `events_truncated` is: exactly 500 rows for a
+    // limit of 500 may be the last 500 there are.
+    const note = queueTruncationNote(500);
+    expect(note).toContain("500-proposal window filled");
+    expect(note).toContain("may not be all of them");
+    expect(note).not.toMatch(/there are more|this is all/i);
+  });
+
+  it("says how to reach the rest, because there is a way", () => {
+    // The queue is oldest-first, so clearing this window brings the next up. A
+    // notice that only said "there may be more" would leave a reviewer stuck.
+    expect(queueTruncationNote(500)).toContain("refresh");
   });
 });

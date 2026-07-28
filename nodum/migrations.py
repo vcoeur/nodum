@@ -777,6 +777,39 @@ CREATE TABLE cycles (
 -- is looked up by anything but the primary key.
 CREATE INDEX idx_cycles_started ON cycles(started_at);
 
+-- **One consolidation cycle at a time, in the whole file.** This index is the
+-- lock, and it is here rather than in Python because the thing it serialises
+-- crosses processes: a `nodum consolidate` fired while `nodum serve` runs one is
+-- two interpreters, and a module-level lock is in neither of the other's. Both
+-- runs completed, and since every job's "leave what is already there alone" is a
+-- read followed by a write with no transaction spanning it, every duplicate pair
+-- was proposed twice — 1580 `duplicate_of` edges over 790 pairs, and two journal
+-- rows for one human intention. The review queue is the human's; doubling it is
+-- the defect the in-process lock was raised against, and a lock that covers one
+-- process covers the wrong half of it.
+--
+-- The `cycles` table already *is* the cross-process state — a `running`
+-- consolidation row means one is running, whoever opened it — so the guard is a
+-- uniqueness constraint over exactly that, and the second opener loses on the
+-- INSERT. That matters: a `SELECT` then an `INSERT` is two statements with a
+-- window between them, and two runners racing that window is the case this
+-- exists for. `status` is the indexed column and it is constant 'running' across
+-- every indexed row, so the index admits at most one.
+--
+-- **Scoped to the two triggers a consolidation run opens.** A `curative` cycle
+-- is one human-driven operation and a `rollback` is the human's undo; both are
+-- short, both open a cycle of their own, and blocking either for the length of a
+-- nightly sweep would take the curative tier offline every night. They are not
+-- what proposes a duplicate pair twice.
+--
+-- A cycle left `running` by a `SIGKILL` or a power cut therefore blocks every
+-- later run, which is what `nodum cycle-abandon <id>` is the door out of —
+-- named in the refusal itself, since advice nobody can carry out is the failure
+-- shape this repo has already fixed once.
+CREATE UNIQUE INDEX idx_cycles_one_running_consolidation
+    ON cycles(status)
+    WHERE status = 'running' AND trigger IN ('manual', 'scheduled');
+
 -- The gardener's own account. D7 is "auto-apply by default", and a gardener
 -- with no grant does nothing at all — every write it makes goes through the
 -- same scope-bound store as an external agent's, so seeding the identity

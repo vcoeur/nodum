@@ -44,20 +44,35 @@ the cycle *changed* is ``service.list_events(cycle_id=…)`` — the same append
 log everything else reads — so the dream journal can never drift from what
 actually happened.
 
-**One cycle at a time, per process.** :func:`consolidate` holds
-:data:`_RUNNER_LOCK` for its whole length and a second caller is **refused**
-(:class:`CycleInProgress`) rather than queued. The scheduler's no-overlap
-property only ever guarded the nightly task against itself; nothing serialised
-it against ``POST /api/cycles`` or ``nodum consolidate``, and every job's "leave
-what is already there alone" is a read followed by a write with no transaction
-spanning it — so two concurrent runs proposed every duplicate pair twice, and
-rolling one cycle back left the other's copies standing. The refusal is
-immediate and says so: a blocking wait would hang a request thread for the
-length of a cycle and then run a second cycle over a graph the first had just
-changed, which is two journal entries for one human intention. The lock is
-**process-wide**, which covers the surfaces that share one: the HTTP route, the
-nightly task and an in-process caller. A ``nodum consolidate`` in a *separate*
-process is not covered by it and is not claimed to be.
+**One cycle at a time, in the whole file.** The guard is a row, not a lock:
+``0014``'s partial unique index admits at most one ``running`` cycle whose
+trigger is a consolidation trigger, so :func:`nodum.service.open_cycle` refuses
+the second opener on the INSERT with :class:`CycleInProgress`. Every job's
+"leave what is already there alone" is a read followed by a write with no
+transaction spanning it, so two concurrent runs proposed every duplicate pair
+twice — and rolling one cycle back left the other's copies standing.
+
+A module-level lock was the first cut and it guarded the wrong half. It covered
+the surfaces sharing one interpreter — the HTTP route, the nightly task, an
+in-process caller — and covered a ``nodum consolidate`` fired at a terminal
+while the server ran one not at all: both completed, 1580 ``duplicate_of`` edges
+over 790 pairs, two journal rows for one human intention. It is **gone** rather
+than kept beside the index: it enforced the same rule one layer higher, with a
+second sentence for the identical condition and no ability to name the cycle in
+the way, and it was also *too wide* — two runs over two different database files
+in one process are not a conflict and it refused them anyway.
+
+The refusal is immediate and says so: a blocking wait would hang a request
+thread for the length of a cycle and then run a second cycle over a graph the
+first had just changed, which is two journal entries for one human intention.
+It names the cycle holding the file and ``nodum cycle-abandon <id>``, because a
+run killed by a ``SIGKILL`` never closes itself and would otherwise block every
+later run behind advice nobody can carry out.
+
+**A curative cycle and a rollback are deliberately outside it.** Each is one
+short, human-driven operation, and blocking them for the length of a nightly
+sweep would take the curative tier offline every night; neither is what proposes
+a duplicate pair twice.
 
 **Revocation bites at the next cycle, not mid-flight.** The gardener's principal
 — and with it its grant set — is minted once, when the run starts, so a grant
@@ -82,7 +97,6 @@ from __future__ import annotations
 import difflib
 import itertools
 import math
-import threading
 import unicodedata
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -97,23 +111,12 @@ from nodum.models import CycleOut, EdgeOut, NodeOut
 from nodum.principal import Principal
 from nodum.store import GrantNotPermitted
 
-
-class CycleInProgress(ValueError):
-    """Raised when a consolidation cycle is asked for while one is running.
-
-    A :class:`ValueError` so every adapter already reports it as one line and a
-    status rather than a traceback: the CLI's ``_run`` catches it, and
-    ``http_api.EXCEPTION_STATUS`` would map a bare ``ValueError`` to 400. The
-    refusal is about current state rather than about the request, so that table
-    now carries its own **409** row for this class — the shape
-    ``RollbackConflict`` already had — and the row lives there, not here,
-    because a domain module does not know about statuses.
-    """
-
-
-#: Serialises the whole runner within one process. See the module docstring for
-#: why a second caller is refused rather than made to wait.
-_RUNNER_LOCK = threading.Lock()
+#: Re-exported from :mod:`nodum.service`, where the guard now lives: the refusal
+#: is the ``cycles`` row a second opener cannot insert. It stays reachable under
+#: this name because that is what every caller catches and what
+#: ``http_api.EXCEPTION_STATUS`` maps to 409 — and it is the *same class*, not a
+#: second one, so a surface holding either reference is holding the one thing.
+CycleInProgress = service.CycleInProgress
 
 # ── Job names (the `jobs=` selector's vocabulary) ─────────────────────────────
 
@@ -1065,10 +1068,10 @@ def consolidate(
     closes it with the report. Writes are the gardener's;
     ``cycles.triggered_by`` is whoever asked.
 
-    **One cycle at a time.** The runner is serialised by a process-wide lock and
-    a second caller is refused with :class:`CycleInProgress` rather than made to
-    wait — see the module docstring for the argument, and for what a lock in one
-    process does and does not cover.
+    **One cycle at a time, in the whole file.** The serialisation is the
+    ``cycles`` row itself, so a second caller is refused with
+    :class:`CycleInProgress` whether it is in this process or another one — see
+    the module docstring for why that replaced a lock rather than joining it.
 
     A job that raises does not lose the run: its own outcome carries the error,
     the other jobs still run and still report, the after-metrics are still
@@ -1106,31 +1109,23 @@ def consolidate(
 
     Raises:
         ValueError: If a job name is not registered.
-        CycleInProgress: If this process is already running a cycle.
+        CycleInProgress: If a consolidation cycle is already running against
+            this database — in this process or any other.
         UnknownPrincipal: If ``triggered_by`` names no account.
         PrincipalDisabled: If it names a disabled one, or if the gardener is
             disabled — the supported way to stop it.
         GrantNotPermitted: If the trigger may not open a cycle over ``scope``,
             or if the gardener holds no grant on it.
     """
-    # Job names are resolved before the lock so a typo is still reported as a
-    # typo while another cycle is running, rather than as "already running".
+    # Job names are resolved before anything else so a typo is still reported as
+    # a typo while another cycle is running, rather than as "already running".
     selected = _resolve_jobs(jobs)
-    if not _RUNNER_LOCK.acquire(blocking=False):
-        raise CycleInProgress(
-            "a consolidation cycle is already running: cycles are serialised so two runs "
-            "cannot propose the same candidate twice, and this one was refused rather than "
-            "queued behind it. Try again when it has finished."
-        )
-    try:
-        return _consolidate_locked(
-            scope=scope, dry_run=dry_run, selected=selected, triggered_by=triggered_by, path=path
-        )
-    finally:
-        _RUNNER_LOCK.release()
+    return _run_cycle(
+        scope=scope, dry_run=dry_run, selected=selected, triggered_by=triggered_by, path=path
+    )
 
 
-def _consolidate_locked(
+def _run_cycle(
     *,
     scope: str | None,
     dry_run: bool,
@@ -1138,7 +1133,7 @@ def _consolidate_locked(
     triggered_by: str,
     path: str | Path | None,
 ) -> ConsolidationOut:
-    """The body of :func:`consolidate`, run with :data:`_RUNNER_LOCK` held."""
+    """The body of :func:`consolidate`, once the job names have been resolved."""
     gardener = auth.internal_principal(path=path)
     trigger, opener = _opener(triggered_by, gardener, path)
     cycle = service.open_cycle(
@@ -1188,7 +1183,7 @@ def _run_jobs(context: _Context, cycle: CycleOut, selected: list[str]) -> Consol
         try:
             outcomes.append(JOBS[name](context))
         # `Exception` and not `BaseException`, deliberately unlike the guard in
-        # `_consolidate_locked`: one job falling over must not lose the others,
+        # `_run_cycle`: one job falling over must not lose the others,
         # but an interrupt is a request to stop the *run*, not a job result.
         except Exception as failure:
             message = f"{type(failure).__name__}: {failure}"

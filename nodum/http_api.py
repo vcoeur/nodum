@@ -469,16 +469,21 @@ EXCEPTION_STATUS: dict[type[Exception], int] = {
     # Listed explicitly because InvalidCredentials derives from OSError via
     # PermissionError and would otherwise inherit the 500 below.
     auth.InvalidCredentials: 401,
-    # 403 — the grant model refused a write. Sessions mint human principals
-    # only, and humans are unfiltered, so this is unreachable from this
-    # surface by construction; mapped so it could never surface as a 500.
+    # 403 — the grant model refused. Sessions mint human principals only and
+    # humans are unfiltered, so this was once unreachable here by construction —
+    # `POST /api/cycles` ended that: the runner's writes are the *gardener's*,
+    # and migration `0014` grants it `main` and `meta` alone, so a cycle scoped
+    # to any space created since is refused with the space's name and the `nodum
+    # grant builtin-gardener <space> edit` that fixes it. Getting that sentence
+    # to the browser intact is what `_failure_message` is scoped for.
     GrantNotPermitted: 403,
-    # 403 too, and reachable: `PUT /api/uploads/{token}` re-mints the grant's
-    # principal inside `ingest.ingest_upload`, so a capability outliving the
-    # account that authorised it fails there. `PrincipalDisabled` derives from
-    # OSError (via PermissionError) and inherited the 500 below, which rewrote it
-    # as `storage error: PrincipalDisabled` — a sentence a browser now shows a
-    # human, and not a storage failure at all.
+    # 403 too, and reachable a second way: `PUT /api/uploads/{token}` re-mints
+    # the grant's principal inside `ingest.ingest_upload`, so a capability
+    # outliving the account that authorised it fails there. Like
+    # `GrantNotPermitted` it derives from OSError (via PermissionError) and
+    # inherited the 500 below, which rewrote it as `storage error:
+    # PrincipalDisabled` — a sentence a browser shows a human, and not a storage
+    # failure at all.
     auth.PrincipalDisabled: 403,
     # 409 — the graph has grown past the event being undone, or a name is
     # taken: an account's, or a space's (including one an archived space still
@@ -668,23 +673,50 @@ def _error(status_code: int, error_type: str, message: str) -> EnvelopeResponse:
     )
 
 
+#: This package's own name, read off ``__name__`` so it cannot drift from where
+#: this module actually lives. It is the root of every module whose exceptions
+#: are decisions rather than storage failures.
+_PACKAGE_ROOT = __name__.partition(".")[0]
+
+
+def _is_domain_failure(exc: Exception) -> bool:
+    """Whether this exception is one ``nodum`` raised deliberately.
+
+    The test is where the class was **defined**, which is the whole of the rule:
+    a class this package declares is a decision this package made and its message
+    is written for a human to read, while an ``OSError`` from ``builtins``, the
+    OS, or a library is a failure whose text nobody here chose.
+    """
+    return type(exc).__module__.partition(".")[0] == _PACKAGE_ROOT
+
+
 def _failure_message(exc: Exception) -> str:
     """Render one exception as the single line both surfaces report it with.
 
     ``database error: …`` is what the CLI prints for a SQLite failure. An
     ``OSError`` is the one deliberate divergence: ``cli._run`` appends the
     filename, and this surface must not — the path is the operator's on a
-    terminal and a stranger's over a socket. Both ``auth`` failures derive from
-    ``OSError`` (via ``PermissionError``) and are checked first: a wrong password
-    and a disabled account are decisions about a principal, never storage
-    failures, and ``storage error: PrincipalDisabled`` is what the fall-through
-    made of the second one.
+    terminal and a stranger's over a socket.
+
+    That rewrite is scoped by :func:`_is_domain_failure`, and the scoping is the
+    fix for a defect found twice. Three of this package's exceptions are
+    ``PermissionError`` subclasses — ``auth.InvalidCredentials``,
+    ``auth.PrincipalDisabled`` and ``store.GrantNotPermitted`` — so all three
+    fell into the ``OSError`` net, and the exemption used to be a literal tuple
+    that nothing audited. ``PrincipalDisabled`` joined it when a live pass caught
+    ``storage error: PrincipalDisabled`` in a browser; ``GrantNotPermitted`` was
+    still missing, so the gardener's "you hold no grant on space 'research', run
+    ``nodum grant builtin-gardener research edit``" reached the journal's toast
+    as ``storage error: GrantNotPermitted`` — the space and the remedy both
+    dropped, on the exact click the message was written for. A per-class
+    exemption list is the defect; naming the *domain* instead means the next
+    such class is exempt the day it is written.
+    ``test_no_exception_this_package_defines_is_rewritten_as_a_storage_failure``
+    enumerates the subtree by walking the package rather than restating a list.
     """
-    if isinstance(exc, (auth.InvalidCredentials, auth.PrincipalDisabled)):
-        return str(exc)
     if isinstance(exc, sqlite3.Error):
         return f"database error: {exc}"
-    if isinstance(exc, OSError):
+    if isinstance(exc, OSError) and not _is_domain_failure(exc):
         return f"storage error: {exc.strerror or type(exc).__name__}"
     return str(exc)
 

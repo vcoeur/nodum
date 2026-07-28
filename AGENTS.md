@@ -243,7 +243,13 @@ commands on a saved node for exactly this reason.
   has said how it ended is not abandoned and re-closing it would overwrite that
   record. It is reachable on both human surfaces — `nodum cycle-abandon <id>`
   and `POST /api/cycles/{id}/abandon` — because a door nothing opens is not a
-  door; it stays off MCP with the rest of `HUMAN_ONLY_TOOLS`. The stamp itself is `in_cycle`, a `ContextVar` that
+  door; it stays off MCP with the rest of `HUMAN_ONLY_TOOLS`. **And every
+  refusal a stranded cycle causes now names it, with the id filled in**: the
+  rollback refusal on a `running` cycle, and `open_cycle`'s "a consolidation
+  cycle is already running" — which matters more since the guard became a
+  database index, because one interrupted run blocks every later run in every
+  process rather than only the ones sharing its interpreter. A door exists once
+  the thing that sends you to it says its name. The stamp itself is `in_cycle`, a `ContextVar` that
   `_emit` reads, so a cycle's writes go through the *ordinary* public functions
   and are stamped without any call site naming a cycle — a per-task variable
   rather than a module global, so the HTTP server handling a normal request
@@ -311,7 +317,19 @@ commands on a saved node for exactly this reason.
   third, because a rollback that re-applies a merge writes that same before/after
   pair under the name `node.rollback` — so reversing it restored the node and
   stranded the redirect, after which the tombstone's create was un-undoable
-  for good and merging it again died on the redirect's primary key. Finally,
+  for good and merging it again died on the redirect's primary key. **The
+  journal's own `rolled_back` bookkeeping has to hold at every depth too**
+  (`_restate_reversal_chain`), and the chain *alternates*: a rollback that is
+  itself taken back stops standing, so the cycle it reversed stands again and
+  its mark comes off — but that cycle may be a rollback in turn, and one that
+  stands again is once more holding *its* target down, so that mark goes back
+  on. Every step flips. Clearing exactly one hop was right at depth 2 and wrong
+  from depth 3, where the journal ended up asserting the mirror of the
+  invariant it exists to keep: a cycle reported `completed` with no
+  `rolled_back_by` while its writes were reversed and standing that way. That
+  is not only an entry a human misreads — `_rollback_plan` refuses an already
+  `rolled_back` cycle by reading exactly that column, so a stale `completed`
+  handed it a row it would cheerfully reverse a second time. Finally,
   the **landing seam**: `Store.cap_landing` and a
   keyword-only `landing=` on `create_edge`/`propose_edges` let a writer file
   below its own grant (§8.3 — a grant is a **ceiling, not a mandate**). It only
@@ -420,15 +438,33 @@ commands on a saved node for exactly this reason.
   `DataError` land on a status rather than a generic 500 — plus
   `sqlite3.OperationalError` → 503, `OverflowError` → 400,
   `urls.PayloadTooLarge` → 413 and `ClientDisconnect` → 499, which only a network
-  surface meets. Both `auth` failures are listed too, because both derive from
-  `OSError` through `PermissionError` and would otherwise inherit its 500:
-  `InvalidCredentials` → 401 and `PrincipalDisabled` → **403**, which the
-  capability upload route reaches for real when a grant outlives the account that
-  minted it — it used to be rewritten as `storage error: PrincipalDisabled`, and
-  `_failure_message` now exempts it from the storage rewrite as well as mapping
-  it, since neither is a storage failure.
+  surface meets. **Three of this package's exceptions sit in the `OSError`
+  subtree**, because `PermissionError` derives from it: `auth.InvalidCredentials`
+  → 401, `auth.PrincipalDisabled` → **403** (reached for real when a capability
+  outlives the account that minted it), and `store.GrantNotPermitted` → **403**
+  (reached for real by `POST /api/cycles`, since the runner writes as the
+  *gardener* and `0014` grants it `main` and `meta` alone). Each needs a row of
+  its own or it inherits `OSError`'s 500 — and each also needs `_failure_message`
+  to leave its message alone, because that function rewrites an `OSError` as
+  `storage error: <strerror>` so this surface never prints the operator's
+  database path to a stranger. **That exemption used to be a literal tuple, and
+  it was wrong twice.** `PrincipalDisabled` was added when a live pass caught
+  `storage error: PrincipalDisabled` in a browser; `GrantNotPermitted` was
+  missed, so the gardener's "the gardener holds no grant on space 'research' …
+  Run: `nodum grant builtin-gardener research edit`" — a sentence written
+  specifically for the one click that produces it — reached the journal's toast
+  as `GrantNotPermitted: storage error: GrantNotPermitted`, with the space and
+  the remedy both gone. Two misses out of three is the *list* failing, so the
+  rule is inverted: `_is_domain_failure` asks whether the class was defined in
+  this package, and only an `OSError` from somewhere else is rewritten. A domain
+  exception added tomorrow is exempt the day it is written.
   `test_every_exception_cli_run_catches_is_mapped` reads `cli._run`'s own
-  except clauses and asserts the claim instead of restating it. Unmapped
+  except clauses and asserts the claim instead of restating it, and
+  `test_no_exception_this_package_defines_is_rewritten_as_a_storage_failure`
+  **walks the package** for exception classes rather than listing them, so the
+  fourth `PermissionError` subclass is audited before anyone notices it exists —
+  it must render its own message *and* carry a status row that is not the
+  `OSError` 500. Unmapped
   exceptions are a generic 500 with no traceback in the body.
   `RequestGuardMiddleware` is the origin control under all of it (see the
   HTTP contract below) — binding loopback keeps other machines out, not other
@@ -444,7 +480,12 @@ commands on a saved node for exactly this reason.
   `message`, rendered by `_rollback_conflict_handler` while its status stays the
   table's. `consolidate.CycleInProgress` is **409** for the same reason and not
   the 400 it inherited from `ValueError`: the request was fine and the graph was
-  busy, which is what a client retries on. `auth.UnknownPrincipal` is **404**: it
+  busy, which is what a client retries on — and the retry advice is real, since
+  the class now comes from the `cycles` row a second opener could not insert
+  rather than from a lock in this process, so a client that gives up on 400 and
+  retries on 409 is being told the truth about a conflict another process
+  created. It is a `nodum.service` class that `nodum.consolidate` re-exports; the
+  table's row is on that one class either way. `auth.UnknownPrincipal` is **404**: it
   is a `LookupError`, so it
   inherited neither the `RecordNotFound` nor the `ValueError` row and escaped as
   a traceback and a generic 500 — a shape a cycle meets for real, since the
@@ -462,7 +503,16 @@ commands on a saved node for exactly this reason.
   `/healthz`, the SPA and every other tab for the length of the run —
   `nodum.scheduler`'s own docstring had made exactly this argument for the
   nightly half. What is handed to the thread is `_write`, so the principal is
-  still bound in the one place this module binds one.
+  still bound in the one place this module binds one. **It frees the loop and
+  not the database, and the difference was measured rather than assumed**: with
+  the cycle on a worker thread a live pass had `/healthz` and the SPA answering
+  throughout, while a concurrent `GET /api/nodes` against the same file took
+  **1168 ms** where it takes **5 ms** on an idle server. SQLite has one writer,
+  the cycle holds it in bursts, and a reader is behind it for as long as a burst
+  lasts — so the honest claim is "the server keeps answering", never "a cycle
+  costs other requests nothing". Do not describe this change as making a cycle
+  free; the thread moved a total freeze to a slow read, which is the whole of
+  what it bought.
 - **`nodum.consolidate`** — the consolidation runner (design §8.4/§8.5), and
   everything on the near side of the LLM line: four deterministic jobs and five
   coherence metrics, with no provider, no generation and no judgement anywhere
@@ -501,19 +551,41 @@ commands on a saved node for exactly this reason.
   computed, and the cycle closes `failed` with all of it. Determinism is a
   rule here: no randomness, one clock captured when the cycle opens, and every
   pair, group and list ordered before it is written.
-  Three rules guard the run itself. **One cycle at a time, per process**: a
-  module-level lock is held for the length of `consolidate()` and a second
-  caller is **refused** (`CycleInProgress`, a `ValueError`) rather than queued —
-  the scheduler's no-overlap property only ever guarded the nightly task against
-  itself, nothing serialised it against `POST /api/cycles` or `nodum
-  consolidate`, and every job's "leave what is already there alone" is a
-  read-then-write with no transaction spanning it, so two concurrent runs
-  proposed every duplicate pair twice. Refusing rather than waiting is the point:
-  a blocking wait would hang a request thread for the length of a cycle and then
-  run a second cycle over a graph the first had just changed, which is two
-  journal entries for one human intention. A `nodum consolidate` in a *separate*
-  process is outside a process lock, and that is stated rather than claimed
-  otherwise. **A scoped cycle checks the gardener's own grant** right after
+  Three rules guard the run itself. **One cycle at a time, in the whole file —
+  and the guard is a row, not a lock.** Migration `0014` carries a partial
+  unique index over `cycles(status)` where `status = 'running' AND trigger IN
+  ('manual','scheduled')`, so at most one consolidation row can be open at a
+  time and `service.open_cycle` refuses the second opener **on the INSERT**
+  (`CycleInProgress`, a `ValueError`, now defined in `nodum.service` beside the
+  guard and re-exported as `consolidate.CycleInProgress` — the *same* class, so
+  every existing `except` and the 409 row still match). The class of bug is a
+  read-then-write with no transaction spanning it: every job's "leave what is
+  already there alone" is one, so two concurrent runs propose every duplicate
+  pair twice. `SELECT` then `INSERT` would have reproduced that shape in the
+  guard itself, which is why the index does the deciding. **The first cut was a
+  module-level lock and it guarded the wrong half.** It covered the surfaces
+  sharing one interpreter — the HTTP route, the nightly task, an in-process
+  caller — and covered a `nodum consolidate` typed at a terminal while `nodum
+  serve` ran one **not at all**: both completed, and the measured result was
+  1580 `duplicate_of` edges over 790 pairs and two journal rows for one human
+  intention, on the review queue, which is the human's. The lock is **gone**
+  rather than kept underneath: it stated the same rule one layer up with a
+  second sentence for the identical condition and no way to name the cycle in
+  the way, and it was also too *wide* — two runs against two different database
+  files in one process are not a conflict and it refused them anyway. Refusing
+  rather than waiting is still the point: a blocking wait would hang a request
+  thread for the length of a cycle and then run a second cycle over a graph the
+  first had just changed. And the refusal **names the cycle holding the file and
+  `nodum cycle-abandon <id>`**, because a run a `SIGKILL` ended never closes
+  itself, now blocks every later run in every process, and "try again when it
+  has finished" would be advice about a run that will never finish. `curative`
+  and `rollback` cycles are deliberately **outside** the index: each is one
+  short human-driven operation, neither is what proposes a duplicate pair twice,
+  and blocking them for the length of a nightly sweep would take the curative
+  tier offline every night. `db._cycles_problems` checks the index exists on any
+  file recording `0014`, because `0014` was amended in place while unreleased and
+  `init_db` skips a migration whose name it already has. **A scoped cycle checks
+  the gardener's own grant** right after
   `open_cycle` and raises `GrantNotPermitted` naming `nodum grant
   builtin-gardener <space> edit` — every space created after `0014` is invisible
   to the gardener, so the first click on the UI's scope picker used to reach
@@ -538,13 +610,32 @@ commands on a saved node for exactly this reason.
   can do nothing the moment a space is archived.
 - **`nodum.scheduler`** — the nightly schedule (decision J1): one asyncio task
   in `nodum serve`'s lifespan, no `cron` file this repo does not ship, no second
-  process, no new dependency. Four properties, each a decision. It **cannot
+  process, no new dependency. Six properties, each a decision. It **cannot
   overlap itself** — the next wait is computed only after the run it follows
   has returned, so no timer can fire into a cycle still in progress, which
   against a single-writer database would be a lock fight at 3am nobody is awake
   to read. A **crash neither takes the server down nor stops the schedule**: the
   runner already closes a failing cycle `failed`, anything escaping it is logged
-  and the loop waits for tomorrow. **"One cycle a night" holds on the two nights
+  and the loop waits for tomorrow. **A night the runner *refused* is a skip, not
+  a failure**: cycles are serialised and a second caller is refused
+  (`CycleInProgress`) rather than queued, so a human running a cycle across the
+  schedule's fire time makes the timer bounce off it — which is not rare and is
+  getting less rare, since `POST /api/cycles` moved off the event loop precisely
+  so a human-triggered cycle may take minutes. `CycleInProgress` is a
+  `ValueError`, so it landed on the generic `except Exception` and the night was
+  reported as `scheduled consolidation cycle failed` at **ERROR with a full
+  traceback** — a fault report for a night on which the graph was being
+  consolidated exactly as intended, by somebody who asked for it. It is caught
+  ahead of that handler and logged at WARNING with the runner's own reason and
+  no traceback. **A skipped night is visible in the server log and deliberately
+  nowhere else**: the obvious alternative is a journal row, and it is wrong three
+  times over — `cycles` records runs that *happened*, a row for a non-event would
+  carry no events, which is exactly the shape a `dry_run` entry has and this file
+  leans on that shape as the machine-checkable proof a rehearsal changed nothing,
+  and writing one would mean opening a cycle while the guard it just bounced off
+  is still held. The journal already answers the question the human would ask: a
+  cycle *did* run that night, listed with whoever triggered it. **"One cycle a
+  night" holds on the two nights
   a year that are not 24 hours long**: `NODUM_CONSOLIDATE_AT` is a *wall clock*
   time and a wall clock does not advance uniformly, so `seconds_until` does its
   arithmetic in **aware local time** (`datetime.astimezone`, which reads a naive
@@ -556,7 +647,18 @@ commands on a saved node for exactly this reason.
   overlapped — the loop is sequential — but the property is the property. The
   two pathological wall-clock times are answered rather than special-cased: one
   that occurs twice resolves to its first occurrence, one that does not occur at
-  all resolves an hour later, and each runs exactly once on the right date. It
+  all resolves an hour later, and each runs exactly once on the right date.
+  **The suite could not see that bug, and the reason is a rule for every
+  clock-driven test here.** The fast harness (`_VirtualTime`) is a naive clock
+  and a sleep that agree — sleeping *is* how time passes, `now += delay` — so a
+  wall clock that repeats or skips an hour is not merely untested in it, it is
+  **unrepresentable**: the harness could only ever confirm the arithmetic the
+  code was already doing. The DST tests hold an aware **UTC instant** (what a
+  real `asyncio.sleep` advances) and render it as `datetime.now()` would on a
+  machine in `Europe/Paris` — plus `TZ` set for real via `tzset`, since the
+  scheduler reads the *process's* local zone and cannot be driven by handing it
+  aware values. A test whose fixture cannot express the failure is not coverage
+  of it. It
   is **off unless configured** —
   `NODUM_CONSOLIDATE_AT` (`HH:MM`, local wall clock) is unset by default and
   unset means no task is created at all, because a background process writing
@@ -581,11 +683,20 @@ commands on a saved node for exactly this reason.
   out of the initial bundle. The tenth is Phase 5a's **dream journal**: the
   cycle list (`GET /api/cycles`), one entry with its metrics and the events it
   wrote (`GET /api/cycles/{id}`), a run button (`POST /api/cycles`, with the
-  dry run beside it) and the rollback confirm — which is the only place a human
+  dry run beside it), the **abandon** confirm
+  (`POST /api/cycles/{id}/abandon`, offered only on a `running` entry — the
+  browser half of "a door nothing opens is not a door", and the thing that turns
+  the rollback button's refusal from a dead end into a route) and the rollback
+  confirm — which is the only place a human
   meets a 409 with a `conflicts` list, so it has to render *both* ends of each
   collision rather than a count. It reads the journal; it does not summarise
   it, because the cycle report and the event list are two different records and
-  neither is a substitute for the other. `src/api/client.ts` is the only `fetch` in the
+  neither is a substitute for the other. **No sentence on either journal screen
+  carries a raw id or a server refusal it has not read**: the two refusals that
+  name a space (`unknown space:` and the gardener's ungranted scope) get copy of
+  the view's own, and every other server string it renders has its 32-hex ids
+  replaced by the page's name for that row — so a message shape nobody
+  anticipated cannot put one on the screen. Full rules: `web/README.md`. `src/api/client.ts` is the only `fetch` in the
   app and has **no identity parameter anywhere** — the server's structural
   rule, mirrored in the client. It sends `Content-Type: application/json` on every
   non-GET request that goes to a JSON route, bodyless ones included, because the
@@ -1059,6 +1170,20 @@ Phase-1 decision log.
   unrollbackable. The only thing still skipped there is an event a previous
   `undo` already reversed: that one has a reversal, while a cycle is simply the
   most recent thing that happened.
+  **That refusal names a verb that actually works** (`_cycle_stamped_refusal`).
+  Pointing only at `nodum rollback <cycle-id>` was a loop with no exit written
+  in it: a rollback is *itself* a cycle and its own events are stamped, so a
+  human who follows the advice and then types `nodum undo` again lands on the
+  identical sentence — and following it twice re-applies exactly what they just
+  took back. There is no state in which a bare `nodum undo` recovers, so the
+  message says that and names **the last write carrying no cycle at all**
+  (`nodum undo <seq>`), found by the module's own search rather than by a
+  second one that could disagree with it. The merge sentence is now
+  **conditional on the cycle having written more than one row**: it exists to
+  explain why a multi-row decision cannot come apart one event at a time, and a
+  cycle carrying a lone `edge.propose` has no other half to leave standing — so
+  on that one it was justifying the refusal with something that never happened.
+  The refusal itself is unchanged; a cycle is taken back whole either way.
 - Errors are always one line on stderr with exit 1, never a traceback — that
   includes a missing file (`asset register /missing.png`), a database another
   writer holds (`database error: database is locked`), and an undo the graph
@@ -1233,12 +1358,23 @@ Phase-1 decision log.
   that. A limit below 1 is still an error rather than SQL's "unbounded". Every
   filter composes as one conjunction, and an edge whose far node is filtered
   out is dropped with it — the result never names an edge endpoint it does not
-  also return. **That last rule is now every capped read's**
-  (`service._require_positive_limit`): `subgraph` stated it, `list_cycles`
-  followed it, and `list_events` and `list_nodes` took the number straight to
-  SQL — so `events --limit -3` and `node list --limit -3` handed back the whole
-  log and the whole listing, which is the opposite of what was asked for. One
-  helper, one message, four callers. The edge list is also *closed* over the node list: an edge
+  also return. **A limit below 1 is now every capped read's error**
+  (`service.require_positive_limit` — the one *public* helper in a file of
+  private ones, because `nodum.search` imports it too). `subgraph` stated the
+  rule, `list_cycles` followed it, and the rest took the number straight through
+  — so `events --limit -3` and `node list --limit -3` handed back the whole log
+  and the whole listing, the opposite of what was asked for. It now covers
+  `list_nodes`, `list_edges`, `list_events`, `list_proposals`, `suggest_links`,
+  `subgraph`, `list_cycles` and `search` (which spells it `k`, hence the helper's
+  `name=` argument: a message about `limit` would name a flag that does not
+  exist). **The bug is not the same bug everywhere, which is why "one message"
+  matters more than it looks**: where the number reaches SQL a negative cap is
+  *unbounded*, but where the cap is a Python slice (`list_proposals`,
+  `suggest_links`) a negative one silently drops that many rows off the **end**
+  and answers normally — on the review queue that is a proposal that vanishes
+  with nothing to say it did. Three different wrong answers from one typo, and
+  now one refusal. Any new capped read calls the helper; do not restate the
+  check. The edge list is also *closed* over the node list: an edge
   between two returned nodes comes back even when the walk never traversed it
   (the B–C edge of a triangle read at depth 1), which the uncapped `traverse`
   does not do.
@@ -1274,10 +1410,24 @@ Phase-1 decision log.
   with zero events — reported success to the one thing a script reads. Now the
   envelope is on stdout as before (the successes are the point of not aborting),
   each skipped id is named on stderr as `  failed <id>: <reason>`, and the exit
-  code is 1 if any item was skipped. `bulk-relink` is deliberately **not** in
-  this rule: its `skipped[]` is a diff annotation carrying "nothing would change
-  on this edge" beside real refusals, so it is not a failure list and an exit
-  code derived from it would be wrong more often than right.
+  code is 1 if any item was skipped. **`bulk-relink` is the exception, and its
+  exemption no longer rests on what it used to rest on.** The original reason
+  was that its `skipped[]` mixed two things: "nothing would change on this edge"
+  sat beside real refusals under one field called `error`, so a script could
+  tell them apart only by matching the sentence and an exit code derived from
+  the list would have been wrong more often than right. That mixture is
+  **gone** — `BulkRelinkOut` now reports `unchanged` (bare edge ids the change
+  would not alter: a diff annotation) apart from `skipped` (the refusals, each
+  with a reason: a self-loop, a duplicate the graph already carries, or a space
+  the caller may not edit). So `skipped` *is* a failure list now, and
+  `bulk-relink` still exits **0** whatever is in it. **That is a live
+  inconsistency, recorded here rather than papered over**: a run that could not
+  relink three edges because the caller lacks `edit` on their space reports
+  success to the one thing a script reads, which is precisely the `retype` bug
+  above. Whoever picks this up should note that the dry run is the wrinkle — its
+  `skipped[]` is a *prediction*, nothing was attempted and nothing was lost, so
+  a rule here has to be "non-empty `skipped` **and** not a dry run" rather than
+  the flat one every other batch verb uses.
 - `ingest url` fetches `http`/`https` only, once, with a timeout and a size
   ceiling, and refuses a redirect that leaves those two schemes. It does *not*
   block loopback or private ranges — this is itself a loopback service — so
@@ -1480,7 +1630,12 @@ Phase-1 decision log.
   the service inline, because a cycle is minutes of work on a real graph and the
   loop is single-threaded, so inline it stalled `/healthz`, the SPA and every
   other request for the whole run. `_write` is what goes to the thread, so the
-  principal boundary is unchanged. Do not
+  principal boundary is unchanged. **The caveat is the write lock, and it is
+  measured**: the loop is free, but a `GET /api/nodes` issued while a cycle runs
+  waited **1168 ms** against **5 ms** on an idle server, because SQLite has one
+  writer and a reader queues behind the burst holding it. A client that times
+  out reads at a second will see those timeouts during a cycle; the fix bought a
+  responsive server, not a free one. Do not
   add `merge_nodes`, `retype`, `supersede_edge` or `bulk_relink` here: they are
   the curative tier and they belong to the CLI, and `PATCH /api/nodes/{id}`
   still cannot retype a node.
