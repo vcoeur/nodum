@@ -512,6 +512,32 @@ class CycleOut(BaseModel):
     rolled_back_by: str | None
 
 
+class CycleDetailOut(BaseModel):
+    """One journal entry with the diff a reviewer reads it by (design §8.4).
+
+    :class:`CycleOut` is the row; this is the row plus the two things a journal
+    view has to render beside it, and **neither is a second record**.
+
+    ``events`` is ``list_events(cycle_id=…)`` — the append-only log itself,
+    newest first, exactly as ``GET /api/events`` returns it — so the "what
+    changed" a reader sees is the log and cannot disagree with it.
+    ``events_truncated`` is true when the read hit its limit and is
+    deliberately conservative (the same rule :class:`SubgraphOut` follows): it
+    says the list may be short, not that it provably is.
+
+    ``metrics`` is a *projection* of ``cycle.report["metrics"]``, lifted out so
+    the before/after coherence numbers are one field rather than a path into an
+    untyped blob. It is read from the report on every request and stored
+    nowhere, so it cannot drift from it; a cycle whose report carries no metrics
+    — a rollback, or a one-op curative cycle — reports ``{}``.
+    """
+
+    cycle: CycleOut
+    metrics: dict[str, dict[str, float]] = {}
+    events: list[EventOut] = []
+    events_truncated: bool = False
+
+
 class MergeRedirectOut(BaseModel):
     """One ``merge_redirects`` row: where a tombstone went, and on which event.
 

@@ -50,11 +50,19 @@ from PIL import Image
 from starlette.requests import ClientDisconnect
 from typer.testing import CliRunner
 
-from nodum import assets, auth, cli, db, http_api, ingest, service, urls
+from nodum import assets, auth, cli, consolidate, db, http_api, ingest, service, urls
 from nodum.migrations import GARDENER_AGENT_ID
 from nodum.principal import Principal
 
 AGENT = "agent:researcher"
+#: The in-process gardener, seeded by migration ``0014``. It is the one
+#: principal besides the session's human that a request on this surface can
+#: cause a write under — ``POST /api/cycles`` asks the runner to run, and the
+#: runner's writes are the gardener's by design (decision G4: the gardener
+#: acts, the human asks). Nothing a request says can name it, and
+#: ``test_the_only_credential_path_is_the_session`` forbids this module's
+#: subject from minting it at all.
+GARDENER_ACTOR = f"agent:{GARDENER_AGENT_ID}"
 #: The login the default client authenticates with (set on the seeded owner).
 OWNER_PASSWORD = "correct horse battery"
 #: The tests are a non-browser client on the loopback interface, which is what
@@ -267,6 +275,7 @@ def test_every_list_endpoint_uses_the_named_key_plus_count(client, fresh_db):
         ("/api/agents", "agents"),
         ("/api/grants", "grants"),
         ("/api/spaces", "spaces"),
+        ("/api/cycles", "cycles"),
     ]:
         payload = _ok(client.get(path))
         assert set(payload) == {key, "count"}, path
@@ -521,6 +530,16 @@ WRITE_FUNCTIONS = {
     "retype",
     "supersede_edge",
     "bulk_relink",
+    # Consolidation cycles. `rollback_cycle` is reached by
+    # `POST /api/cycles/{id}/rollback` and is the heaviest write on the surface
+    # — it writes recorded payloads back verbatim, `state = 'active'` included,
+    # across spaces, for a whole cycle at once. `open_cycle`/`close_cycle` are
+    # here for the reason the curative tier was listed before it had a route:
+    # they write the journal row, and a handler that opened a cycle of its own
+    # would be inventing a second lifecycle beside the runner's.
+    "open_cycle",
+    "close_cycle",
+    "rollback_cycle",
 }
 
 
@@ -639,6 +658,18 @@ def test_writes_are_attributed_to_the_sessions_human_and_nothing_else(fresh_db):
     passed) — while ``POST`` with ``{"actor": "agent:evil"}`` produced
     ``created_by: "agent:evil"``. This test fails on it, because the row it
     writes is in the same database the assertion reads.
+
+    **One principal besides the session's human is allowed, and it is named.**
+    ``POST /api/cycles`` asks the consolidation runner to run, and the runner
+    writes as the in-process gardener because the gardener made those edits
+    (decision G4). That is a *domain* fact, not something the request chose:
+    the sweep therefore keeps asking its question of the thing a request could
+    actually influence — who **asked** — and asserts that every journal entry
+    the sweep produced records the session's human as the trigger, never the
+    agent identity every body, query and header claimed. The hole that
+    exemption could open is closed from the other side by
+    ``test_the_only_credential_path_is_the_session``, which forbids this module
+    from minting the gardener itself.
     """
     app = http_api.create_app()
     second = service.create_human("second", principal=owner())
@@ -652,6 +683,7 @@ def test_writes_are_attributed_to_the_sessions_human_and_nothing_else(fresh_db):
     before_seq = max((event.seq for event in service.list_events(owner(), limit=5000)), default=0)
     before_nodes = {row.id for row in service.list_nodes(principal=owner(), limit=5000)}
     before_edges = {row.id for row in service.list_edges(principal=owner(), limit=5000)}
+    before_cycles = {entry.id for entry in service.list_cycles(limit=5000, principal=owner())}
 
     fired = _swept_requests(app, ids, "second", "second-pw")
 
@@ -666,8 +698,9 @@ def test_writes_are_attributed_to_the_sessions_human_and_nothing_else(fresh_db):
         event for event in service.list_events(owner(), limit=5000) if event.seq > before_seq
     ]
     assert new_events, "the sweep wrote nothing, so it proves nothing"
+    allowed = {second_actor, GARDENER_ACTOR}
     offenders = [
-        (event.op, event.seq, event.actor) for event in new_events if event.actor != second_actor
+        (event.op, event.seq, event.actor) for event in new_events if event.actor not in allowed
     ]
     assert offenders == [], f"writes attributed outside the session's human: {offenders}"
 
@@ -681,8 +714,20 @@ def test_writes_are_attributed_to_the_sessions_human_and_nothing_else(fresh_db):
         for row in service.list_edges(principal=owner(), limit=5000)
         if row.id not in before_edges
     ]
-    assert {row.created_by for row in written_nodes} <= {second_actor}
-    assert {row.created_by for row in written_edges} <= {second_actor}
+    assert {row.created_by for row in written_nodes} <= allowed
+    assert {row.created_by for row in written_edges} <= allowed
+
+    # The gardener exemption above is only sound if a request cannot say who
+    # asked for the cycle. The sweep ran some — it claimed an agent identity in
+    # every body, query string and header while doing it — and every journal
+    # entry it produced still records the session's human.
+    swept_cycles = [
+        entry
+        for entry in service.list_cycles(limit=5000, principal=owner())
+        if entry.id not in before_cycles
+    ]
+    assert swept_cycles, "the sweep opened no cycle, so the gardener exemption proves nothing"
+    assert {entry.triggered_by for entry in swept_cycles} == {second_actor}
 
 
 def test_every_api_route_but_login_refuses_a_request_without_a_session(fresh_db):
@@ -820,11 +865,23 @@ def test_the_only_credential_path_is_the_session():
     ``auth.verify_agent_token`` is the MCP one; either in this module would be
     a principal without a verified session. The allowed set is exactly the
     session lifecycle: login, resolve, delete.
+
+    ``internal_principal`` is the newest and now the most load-bearing entry in
+    the list: it is the gardener's door, it takes no credential because there is
+    none to take, and the attribution sweep above deliberately tolerates writes
+    made under it. That tolerance is only safe while the gardener can be minted
+    by the *domain* alone — the runner and the scheduler — and never by a
+    handler here. ``principal_from_actor`` sits beside it for the same reason:
+    minting a principal from a string is what the runner does with the string
+    this surface hands it, one layer down, where the value came from a verified
+    session and not from a request.
     """
     forbidden = {
         "owner_principal",
         "agent_principal",
         "verify_agent_token",
+        "internal_principal",
+        "principal_from_actor",
         "set_password",
         "store_token",
     }
@@ -2646,6 +2703,215 @@ def test_events_and_undo(client, fresh_db):
     assert result["undone_op"] == "node.create"
     assert client.get(f"/api/nodes/{node['id']}").status_code == 404
     assert client.post("/api/undo", json={"seq": "nope"}).status_code == 400
+
+
+# ── 6b. The dream journal: cycles, the runner, and rollback ──────────────────
+
+
+def _curative_cycle(title: str = "Alpha") -> tuple[str, str]:
+    """A closed one-op curative cycle, as ``(cycle_id, node_id)``.
+
+    ``retype`` is the cheapest way to get a real cycle with a real graph write
+    in it: every curative operation opens a cycle of its own when no runner has
+    set one (decision C2), which is precisely what makes rollback the single
+    reverse for the whole tier.
+    """
+    node = service.create_node(type="claim", title=title, principal=owner())
+    return service.retype([node.id], "concept", principal=owner()).cycle_id, node.id
+
+
+def _duplicate_pair(title: str = "Kafka Streams") -> None:
+    """Two identically titled nodes, so a cycle has something to propose."""
+    service.create_node(type="claim", title=title, principal=owner())
+    service.create_node(type="claim", title=title, principal=owner())
+
+
+def test_the_journal_runs_a_cycle_lists_it_and_reads_it_back(client, fresh_db):
+    """The three reads a journal view is built from, over one real run.
+
+    ``POST /api/cycles`` is the "run one now" the phase's exit criterion needs
+    on this surface: the schedule is off unless configured, so without it the
+    human's own journal could stay empty forever.
+    """
+    _duplicate_pair()
+
+    ran = _ok(client.post("/api/cycles", json={}))
+    assert ran["cycle"]["status"] == "completed"
+    assert ran["cycle"]["trigger"] == "manual"
+    assert ran["cycle"]["dry_run"] is False
+    # Who asked is the session's human; who acted is the gardener, below.
+    assert ran["cycle"]["triggered_by"] == OWNER_ACTOR
+    assert {job["name"] for job in ran["report"]["jobs"]} == set(consolidate.JOBS)
+
+    listing = _ok(client.get("/api/cycles"))
+    assert [entry["id"] for entry in listing["cycles"]] == [ran["cycle"]["id"]]
+
+    entry = _ok(client.get(f"/api/cycles/{ran['cycle']['id']}"))
+    assert entry["cycle"] == ran["cycle"]
+    assert set(entry["metrics"]) == {"before", "after"}
+    assert "orphan_rate" in entry["metrics"]["before"]
+    assert entry["events_truncated"] is False
+    # The diff is the append-only log narrowed to the cycle, not a second copy
+    # of it — and the writes inside are the gardener's, by design.
+    assert entry["events"], "a cycle that proposed a duplicate wrote events"
+    assert {event["cycle_id"] for event in entry["events"]} == {ran["cycle"]["id"]}
+    assert {event["actor"] for event in entry["events"]} == {GARDENER_ACTOR}
+    whole_log = _ok(client.get("/api/events?limit=500"))["events"]
+    assert entry["events"] == whole_log[: len(entry["events"])]
+
+
+def test_a_dry_run_is_in_the_journal_and_emitted_no_event(client, fresh_db):
+    """A rehearsal is *in* the journal — the journal has to say which it was."""
+    _duplicate_pair()
+
+    ran = _ok(client.post("/api/cycles", json={"dry_run": True, "scope": "main"}))
+
+    assert ran["cycle"]["dry_run"] is True
+    assert ran["cycle"]["scope"] == "main"
+    entry = _ok(client.get(f"/api/cycles/{ran['cycle']['id']}"))
+    # The checkable form of "it changed nothing".
+    assert entry["events"] == []
+    assert entry["cycle"]["status"] == "completed"
+    # A string is not a boolean: silently reading "false" as *run for real* is
+    # exactly the coercion a rehearsal flag must not have.
+    assert client.post("/api/cycles", json={"dry_run": "false"}).status_code == 400
+    assert client.post("/api/cycles", json={"scope": "nowhere"}).status_code == 404
+
+
+def test_a_cycle_rolls_back_over_http(client, fresh_db):
+    """The one-click reversal, and the preview a confirm dialog asks for first."""
+    cycle_id, node_id = _curative_cycle()
+    assert _ok(client.get(f"/api/nodes/{node_id}"))["type"] == "concept"
+
+    preview = _ok(client.post(f"/api/cycles/{cycle_id}/rollback", json={"dry_run": True}))
+    assert (preview["dry_run"], preview["rollback_cycle_id"], preview["conflicts"]) == (
+        True,
+        None,
+        [],
+    )
+    assert preview["reversed_events"]
+    # A dry run opens no cycle and writes nothing at all.
+    assert [entry["id"] for entry in _ok(client.get("/api/cycles"))["cycles"]] == [cycle_id]
+    assert _ok(client.get(f"/api/nodes/{node_id}"))["type"] == "concept"
+
+    result = _ok(client.post(f"/api/cycles/{cycle_id}/rollback", json={}))
+
+    assert result["dry_run"] is False
+    assert result["conflicts"] == []
+    assert _ok(client.get(f"/api/nodes/{node_id}"))["type"] == "claim"
+    entry = _ok(client.get(f"/api/cycles/{cycle_id}"))
+    assert entry["cycle"]["status"] == "rolled_back"
+    assert entry["cycle"]["rolled_back_by"] == result["rollback_cycle_id"]
+    # The rollback is itself a journal entry, which is how it is reversed.
+    assert _ok(client.get(f"/api/cycles/{result['rollback_cycle_id']}"))["cycle"]["trigger"] == (
+        "rollback"
+    )
+    assert client.post("/api/cycles/nope/rollback", json={}).status_code == 404
+
+
+def test_a_refused_rollback_is_a_409_that_names_the_rows(client, fresh_db):
+    """Decision C4 over the wire: it refuses rather than clobbers, and says what.
+
+    The body carries ``conflicts`` because that list is what the journal
+    renders — a UI that had to parse the message back out could not offer the
+    human the four rows that are in the way.
+    """
+    cycle_id, node_id = _curative_cycle()
+    _ok(client.patch(f"/api/nodes/{node_id}", json={"title": "Edited after the cycle"}))
+
+    response = client.post(f"/api/cycles/{cycle_id}/rollback", json={})
+
+    assert response.status_code == 409
+    error = response.json()["error"]
+    assert error["type"] == "RollbackConflict"
+    assert node_id in error["message"]
+    (conflict,) = error["conflicts"]
+    assert conflict["kind"] == "node"
+    assert conflict["row_id"] == node_id
+    assert conflict["cycle_event_op"] == "node.retype"
+    assert conflict["conflicting_op"] == "node.update"
+    assert conflict["conflicting_actor"] == OWNER_ACTOR
+    assert conflict["conflicting_cycle_id"] is None
+    assert conflict["conflicting_seq"] > conflict["cycle_event_seq"]
+    # Refused means nothing was written: the retype still stands.
+    assert _ok(client.get(f"/api/nodes/{node_id}"))["type"] == "concept"
+
+    # The dry run answers the same question without raising — the "would this
+    # succeed?" a confirm dialog asks before it offers the button at all.
+    preview = _ok(client.post(f"/api/cycles/{cycle_id}/rollback", json={"dry_run": True}))
+    assert [row["row_id"] for row in preview["conflicts"]] == [node_id]
+
+
+def test_a_conflict_with_another_cycle_names_that_cycle(client, fresh_db):
+    """``conflicting_cycle_id`` is the field that tells a human where to start."""
+    node = service.create_node(type="claim", title="Alpha", principal=owner())
+    first = service.retype([node.id], "concept", principal=owner())
+    second = service.retype([node.id], "person", principal=owner())
+
+    response = client.post(f"/api/cycles/{first.cycle_id}/rollback", json={})
+
+    assert response.status_code == 409
+    (conflict,) = response.json()["error"]["conflicts"]
+    assert conflict["conflicting_cycle_id"] == second.cycle_id
+
+
+def test_the_journal_and_its_rollback_are_human_only(client, fresh_db):
+    """Sessions here mint humans only, so the gate is met by construction — and
+    enforced in the service regardless, which is what keeps it true on every
+    other surface. A grant does not delegate writing recorded payloads back."""
+    cycle_id, _ = _curative_cycle()
+    granted = agent(AGENT, grants={"main": "edit"})
+
+    for call in (
+        lambda: service.rollback_cycle(cycle_id, principal=granted),
+        lambda: service.get_cycle(cycle_id, principal=granted),
+        lambda: service.list_cycles(principal=granted),
+    ):
+        with pytest.raises(service.GrantNotPermitted):
+            call()
+
+    assert http_api.EXCEPTION_STATUS[service.GrantNotPermitted] == 403
+    anonymous = Client(client.app)
+    assert anonymous.post(f"/api/cycles/{cycle_id}/rollback", json={}).status_code == 401
+    assert anonymous.get("/api/cycles").status_code == 401
+
+
+def test_an_unknown_principal_is_a_404_and_not_a_traceback(client, fresh_db):
+    """The carried defect, on the route that can actually reach it.
+
+    ``auth.UnknownPrincipal`` is a ``LookupError``, so it inherited no row in
+    :data:`http_api.EXCEPTION_STATUS` and escaped as the generic 500 with a
+    traceback in the server log. The runner loads the gardener by kind, so a
+    file with no internal agent is the reachable flavour of it.
+    """
+    conn = db.connect()
+    try:
+        conn.execute(
+            "UPDATE agents SET kind = 'external', owner_human_id = 'owner' WHERE kind = 'internal'"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    response = client.post("/api/cycles", json={})
+
+    assert response.status_code == 404
+    error = response.json()["error"]
+    assert error["type"] == "UnknownPrincipal"
+    assert "0014" in error["message"]
+    assert "Traceback" not in response.text
+
+
+def test_a_cycles_event_window_is_bounded_and_says_when_it_bit(client, fresh_db):
+    """A nightly run can emit thousands of events; the journal reads a window."""
+    _duplicate_pair()
+    ran = _ok(client.post("/api/cycles", json={}))
+
+    entry = _ok(client.get(f"/api/cycles/{ran['cycle']['id']}?limit=1"))
+
+    assert len(entry["events"]) == 1
+    assert entry["events_truncated"] is True
+    assert client.get(f"/api/cycles/{ran['cycle']['id']}?limit=nope").status_code == 400
 
 
 def test_export_downloads_the_node_as_json(client, fresh_db):

@@ -11,6 +11,7 @@ import pytest
 from helpers import agent, seed_space
 from typer.testing import CliRunner
 
+from nodum import consolidate as consolidate_module
 from nodum import db, extract, service
 from nodum.cli import app
 from nodum.migrations import GARDENER_AGENT_ID
@@ -159,6 +160,7 @@ def test_every_list_command_reports_a_count(fresh_db):
         (("ingest", "handlers"), "handlers"),
         (("projector", "run"), "projectors"),
         (("projector", "status"), "projectors"),
+        (("cycle-list",), "cycles"),
     ):
         payload = _run_json(*args)
         assert payload["count"] == len(payload[key]), args
@@ -1042,6 +1044,299 @@ def test_ingest_handlers_needs_no_principal_and_no_database(tmp_path, monkeypatc
     assert result.exit_code == 0, result.output
     assert json.loads(result.stdout)["count"] > 0
     assert not (tmp_path / "never-created.db").exists()
+
+
+# ── Consolidation cycles, the journal, and the curative tier (§8.2/§8.4) ─────
+
+
+def _claim(title):
+    """One active claim node, written over the CLI like everything else here."""
+    return _run_json("node", "create", "--type", "claim", "--title", title)
+
+
+def test_consolidate_runs_the_gardeners_jobs_and_journals_them(fresh_db):
+    """The gardener acts, the human asks — and the journal records both."""
+    _claim("Kafka Stream")
+    _claim("Kafka Streams")
+
+    outcome = _run_json("consolidate")
+
+    cycle = outcome["cycle"]
+    assert cycle["trigger"] == "manual"
+    assert cycle["triggered_by"] == "human:owner"  # who asked
+    assert (cycle["status"], cycle["dry_run"]) == ("completed", False)
+    assert [job["name"] for job in outcome["report"]["jobs"]] == list(consolidate_module.JOBS)
+
+    jobs = {job["name"]: job for job in outcome["report"]["jobs"]}
+    (proposed,) = jobs["duplicate_candidates"]["proposed"]
+
+    # The diff is the log, never the report: the edge the cycle proposed is
+    # attributed to the gardener and stamped with the cycle.
+    diff = _run_json("events", "--cycle", cycle["id"])
+    assert [event["op"] for event in diff["events"]] == ["edge.propose"]
+    assert diff["events"][0]["actor"] == f"agent:{GARDENER_AGENT_ID}"
+    assert _run_json("edge", "list")["edges"][0]["id"] == proposed
+
+
+def test_consolidate_dry_run_journals_the_rehearsal_and_emits_no_event(fresh_db):
+    """A rehearsal is in the journal, and its event list is empty.
+
+    That emptiness is the machine-checkable form of "it changed nothing".
+    """
+    _claim("Kafka Stream")
+    _claim("Kafka Streams")
+
+    outcome = _run_json("consolidate", "--dry-run")
+
+    assert outcome["cycle"]["dry_run"] is True
+    assert outcome["cycle"]["status"] == "completed"
+    assert _run_json("events", "--cycle", outcome["cycle"]["id"])["count"] == 0
+    assert _run_json("edge", "list")["count"] == 0
+
+
+def test_consolidate_selects_jobs_and_a_scope(fresh_db):
+    scoped = _run_json("consolidate", "--job", "neglect_report", "--scope", "main")
+
+    assert [job["name"] for job in scoped["report"]["jobs"]] == ["neglect_report"]
+    assert scoped["cycle"]["scope"] == "main"
+    assert scoped["report"]["scope"] == "main"
+
+
+def test_cycle_list_and_cycle_get_are_the_journal(fresh_db):
+    first = _run_json("consolidate", "--dry-run")["cycle"]
+    second = _run_json("consolidate")["cycle"]
+
+    listing = _run_json("cycle-list")
+    assert [row["id"] for row in listing["cycles"]] == [second["id"], first["id"]]
+
+    assert _run_json("cycle-get", first["id"]) == first
+
+
+def test_merge_nodes_over_the_cli(fresh_db):
+    survivor, duplicate, citer = _claim("Alpha"), _claim("Alpha (dup)"), _claim("Cites")
+    edge = _run_json("edge", "create", citer["id"], duplicate["id"], "--type", "supports")
+
+    merged = _run_json("merge-nodes", duplicate["id"], "--into", survivor["id"])
+
+    assert merged["into"]["id"] == survivor["id"]
+    assert [node["id"] for node in merged["tombstones"]] == [duplicate["id"]]
+    assert [row["id"] for row in merged["relinked"]] == [edge["id"]]
+    assert [row["tombstone_id"] for row in merged["redirects"]] == [duplicate["id"]]
+
+    # The read path is unchanged: the tombstone comes back and says where it went.
+    tombstone = _run_json("node", "get", duplicate["id"])
+    assert tombstone["state"] == "archived"
+    assert tombstone["props"]["merged_into"] == survivor["id"]
+
+    # And the reversal is the cycle, not `undo`: naming one of its events is
+    # refused and says what to use instead, because reversing one row of a merge
+    # would leave the other half standing.
+    stamped = _run_json("events", "--cycle", merged["cycle_id"])["events"][0]
+    refused = runner.invoke(app, ["undo", str(stamped["seq"]), "--as", "owner"])
+    assert refused.exit_code == 1
+    assert "Roll the cycle back instead." in refused.stderr
+    assert "Traceback" not in refused.output
+
+
+def test_retype_over_the_cli_and_its_per_item_failures(fresh_db):
+    node = _claim("Alpha")
+
+    retyped = _run_json("retype", node["id"], "missing", "--type", "note")
+
+    assert retyped["new_type"] == "note"
+    assert retyped["transitioned"] == [node["id"]]
+    assert [failure["id"] for failure in retyped["failed"]] == ["missing"]
+    assert retyped["cycle_id"]
+    assert _run_json("node", "get", node["id"])["type"] == "note"
+
+
+def test_supersede_edge_with_and_without_a_replacement(fresh_db):
+    first, second = _claim("A"), _claim("B")
+    edge = _run_json("edge", "create", first["id"], second["id"], "--type", "supports")
+
+    result = _run_json("supersede-edge", edge["id"], "--confidence", "0.4")
+
+    # Two facts, both recorded: when it stopped being true, and that it is gone.
+    assert result["superseded"]["state"] == "archived"
+    assert result["superseded"]["valid_to"]
+    replacement = result["replacement"]
+    # Every field the replacement does not name is inherited from the original.
+    assert (replacement["src_id"], replacement["dst_id"], replacement["type"]) == (
+        first["id"],
+        second["id"],
+        "supports",
+    )
+    assert replacement["confidence"] == 0.4
+    assert replacement["props"]["supersedes"] == edge["id"]
+    assert result["superseded"]["props"]["superseded_by"] == replacement["id"]
+
+    # Naming no replacement option retires the edge with no successor at all.
+    plain = _run_json("edge", "create", first["id"], second["id"], "--type", "relates_to")
+    assert _run_json("supersede-edge", plain["id"])["replacement"] is None
+
+
+def test_bulk_relink_previews_before_it_writes(fresh_db):
+    first, second, third = _claim("A"), _claim("B"), _claim("C")
+    edge = _run_json("edge", "create", first["id"], second["id"], "--type", "supports")
+
+    preview = _run_json("bulk-relink", "--src", first["id"], "--to-dst", third["id"], "--dry-run")
+
+    assert (preview["dry_run"], preview["cycle_id"]) == (True, None)
+    assert [change["edge_id"] for change in preview["changes"]] == [edge["id"]]
+    assert _run_json("edge", "list", "--node", third["id"])["count"] == 0
+
+    applied = _run_json("bulk-relink", "--src", first["id"], "--to-dst", third["id"])
+
+    assert applied["dry_run"] is False
+    assert applied["cycle_id"]
+    assert _run_json("edge", "list", "--node", third["id"])["count"] == 1
+
+
+def test_rollback_takes_a_curative_cycle_back_whole(fresh_db):
+    survivor, duplicate = _claim("Alpha"), _claim("Alpha (dup)")
+    merged = _run_json("merge-nodes", duplicate["id"], "--into", survivor["id"])
+    assert _run_json("node", "get", duplicate["id"])["state"] == "archived"
+
+    rolled = _run_json("rollback", merged["cycle_id"])
+
+    assert rolled["dry_run"] is False
+    assert rolled["conflicts"] == []
+    assert rolled["rollback_cycle_id"]
+    assert _run_json("node", "get", duplicate["id"])["state"] == "active"
+
+    taken_back = _run_json("cycle-get", merged["cycle_id"])
+    assert taken_back["status"] == "rolled_back"
+    assert taken_back["rolled_back_by"] == rolled["rollback_cycle_id"]
+
+
+def test_a_refused_rollback_prints_its_conflicts_as_one_json_object(fresh_db):
+    """The one refusal in this CLI that is a list rather than a sentence.
+
+    `RollbackConflict`'s message names the first few rows and drops the actor
+    and the cycle behind the later work entirely, so the structured list is what
+    the command prints — and the message still goes to stderr with exit 1, like
+    every other refusal here.
+    """
+    node = _claim("Alpha")
+    retyped = _run_json("retype", node["id"], "--type", "note")
+    # Work outside the cycle touches a row the cycle wrote.
+    _run_json("node", "update", node["id"], "--content", "moved on")
+
+    result = runner.invoke(app, ["rollback", retyped["cycle_id"], "--as", "owner"])
+
+    assert result.exit_code == 1
+    assert "Traceback" not in result.output
+    assert "cannot roll back cycle" in result.stderr
+    refusal = json.loads(result.stdout)["error"]
+    assert refusal["type"] == "RollbackConflict"
+    (conflict,) = refusal["conflicts"]
+    assert conflict == {
+        "kind": "node",
+        "row_id": node["id"],
+        "cycle_event_seq": conflict["cycle_event_seq"],
+        "cycle_event_op": "node.retype",
+        "conflicting_seq": conflict["conflicting_seq"],
+        "conflicting_op": "node.update",
+        "conflicting_actor": "human:owner",
+        "conflicting_cycle_id": None,
+    }
+    assert conflict["conflicting_seq"] > conflict["cycle_event_seq"]
+    # Nothing was written: the node still carries the later edit.
+    assert _run_json("node", "get", node["id"])["content"] == "moved on"
+
+    # The same question asked as a dry run is an answer, not a refusal.
+    preview = _run_json("rollback", retyped["cycle_id"], "--dry-run")
+    assert [row["row_id"] for row in preview["conflicts"]] == [node["id"]]
+    assert preview["rollback_cycle_id"] is None
+
+
+def test_an_unknown_principal_is_one_readable_line_and_never_a_traceback(fresh_db):
+    """`--as` is evaluated in the argument list, before `_run` is even entered.
+
+    That is why an unknown account used to print a full traceback: the
+    resolution sat outside the error boundary the command's own call goes
+    through. Phase 5a's verbs are all `--as`-taking, so the sweep covers them.
+    """
+    for command in (
+        ["node", "list"],
+        ["consolidate"],
+        ["cycle-list"],
+        ["cycle-get", "whatever"],
+        ["rollback", "whatever"],
+        ["merge-nodes", "a", "--into", "b"],
+        ["retype", "a", "--type", "note"],
+        ["supersede-edge", "a"],
+        ["bulk-relink", "--src", "a", "--to-type", "supports"],
+    ):
+        result = runner.invoke(app, [*command, "--as", "human:nope"])
+
+        assert result.exit_code == 1, command
+        assert result.stderr.splitlines() == ["unknown human account: nope"], command
+        assert result.stdout == "", command
+        assert "Traceback" not in result.output, command
+
+
+def test_a_disabled_human_is_refused_the_same_way(fresh_db):
+    """The sibling branch: `PrincipalDisabled` is an OSError, and still one line."""
+    alice = _run_json("human", "create", "alice")
+    _run_json("human", "disable", alice["id"])
+
+    result = runner.invoke(app, ["consolidate", "--as", alice["id"]])
+
+    assert result.exit_code == 1
+    assert result.stderr.splitlines() == [f"human account is disabled: {alice['id']}"]
+    assert "Traceback" not in result.output
+
+
+def test_consolidate_is_refused_on_a_scope_the_gardener_holds_nothing_on(fresh_db):
+    """The grant that has to be there is the gardener's, not the asker's.
+
+    A human passes `require_review` unconditionally, so no curative verb on this
+    surface can be refused for want of the *caller's* grant. The gardener's is
+    the one that bites: migration `0014` gives it `main` and `meta` and nothing
+    else, and a space it holds nothing on reads exactly like one that does not
+    exist — a cycle is not an existence oracle either.
+    """
+    _run_json("space-create", "research")
+
+    result = runner.invoke(app, ["consolidate", "--scope", "research", "--as", "owner"])
+
+    assert result.exit_code == 1
+    assert "unknown space" in result.stderr
+    assert "Traceback" not in result.output
+    assert _run_json("cycle-list")["cycles"][0]["status"] == "failed"
+
+
+def test_consolidate_stops_when_the_gardener_is_disabled(fresh_db):
+    """Disabling the gardener is the supported way to stop it running."""
+    _run_json("agent", "disable", GARDENER_AGENT_ID)
+
+    result = runner.invoke(app, ["consolidate", "--as", "owner"])
+
+    assert result.exit_code == 1
+    assert result.stderr.splitlines() == [f"agent account is disabled: {GARDENER_AGENT_ID}"]
+    assert "Traceback" not in result.output
+
+
+def test_every_curative_refusal_is_one_line_and_never_a_traceback(fresh_db):
+    node, other = _claim("Alpha"), _claim("Beta")
+    proposed = service.create_edge(node["id"], other["id"], "supports", principal=agent("bot"))
+
+    for command, expected in (
+        (["merge-nodes", node["id"], "--into", node["id"]], "into itself"),
+        (["retype", node["id"], "--type", "space"], "cannot retype anything into"),
+        (["supersede-edge", proposed.id], "cannot supersede an edge in state 'proposed'"),
+        (["bulk-relink", "--to-type", "supports"], "needs a selector"),
+        (["bulk-relink", "--src", node["id"]], "needs changes"),
+        (["cycle-get", "missing"], "no cycles row with id"),
+        (["rollback", "missing"], "no cycles row with id"),
+        (["consolidate", "--job", "nope"], "unknown consolidation job"),
+    ):
+        result = runner.invoke(app, [*command, "--as", "owner"])
+
+        assert result.exit_code == 1, command
+        assert expected in result.stderr, command
+        assert "Traceback" not in result.output, command
 
 
 def test_version_flag_short_circuits():

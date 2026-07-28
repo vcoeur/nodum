@@ -39,7 +39,10 @@ Everything else is convention, shared rather than re-stated:
   network surface can meet, and echoes the CLI's one-line message as
   ``{"error": {"type", "message"}}``. Anything unmapped is a 500 with a
   generic message; the traceback goes to the server log, never into a
-  response body.
+  response body. One failure carries more than those two keys, and only
+  one: a refused rollback adds ``conflicts``, because decision C4 is that it
+  *names* what is in the way rather than saying it failed
+  (:func:`_rollback_conflict_handler`).
 * **Auth is not the same thing as origin control.** Password login
   (``POST /api/login``) verifies an argon2id hash, creates a server-side
   session row (30-day sliding expiry) and sets an ``HttpOnly;
@@ -84,6 +87,14 @@ Everything else is convention, shared rather than re-stated:
   is written by agents and rendered in this origin, which is also the origin
   that may write to the API.
 
+* **The nightly cycle** — this app owns one optional background task
+  (:mod:`nodum.scheduler`), created by the lifespan and cancelled by it. It is
+  the only thing on this surface that writes without a request, it is **off**
+  unless ``NODUM_CONSOLIDATE_AT`` names a time, and shutdown is bounded rather
+  than blocked on a cycle in flight. Its writes are the in-process gardener's,
+  exactly as ``POST /api/cycles`` produces on demand: the identity boundary
+  above is about what a *request* can claim, and neither of these takes one.
+
 **What this surface still does not defend against, on purpose.** Login is
 the whole boundary: any process that can open a socket on this port may
 *attempt* one, so the strength of the human's password is the strength of
@@ -98,12 +109,15 @@ stays much easier to reason about.
 
 from __future__ import annotations
 
+import contextlib
 import http.cookies
 import json
+import logging
 import re
 import sqlite3
 import tempfile
 from collections.abc import AsyncIterator, Iterable, Sequence
+from datetime import time
 from http import HTTPStatus
 from importlib import metadata
 from pathlib import Path
@@ -118,7 +132,7 @@ from starlette.responses import FileResponse, JSONResponse, Response, StreamingR
 from starlette.routing import Match, Route
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from nodum import assets, auth, db, ingest, service, urls
+from nodum import assets, auth, consolidate, db, ingest, scheduler, service, urls
 from nodum import search as search_module
 from nodum.assets import (
     AssetNotFound,
@@ -128,6 +142,7 @@ from nodum.assets import (
     UnsupportedRendition,
 )
 from nodum.envelope import envelope, list_envelope, render_json
+from nodum.models import CycleDetailOut
 from nodum.principal import Principal
 from nodum.service import (
     AccountExists,
@@ -372,6 +387,13 @@ PATCHABLE_FIELDS = ("title", "content", "props")
 #: batch accept/reject.
 PROPOSAL_FILTERS = ("created_by", "type", "kind", "created_before", "created_after")
 
+#: How many of a cycle's events ``GET /api/cycles/{id}`` returns by default. A
+#: cycle's diff *is* its event list, and a nightly run over a large graph can
+#: emit thousands, so the journal reads a bounded window and says when the
+#: bound bit (``events_truncated``) rather than presenting a short list as the
+#: whole of it.
+CYCLE_EVENT_LIMIT = 500
+
 #: Methods the ``/api`` catch-all answers, so a wrong verb on an unknown route
 #: is a JSON 404 rather than a bare 405 from the router.
 ALL_METHODS = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
@@ -402,6 +424,14 @@ EXCEPTION_STATUS: dict[type[Exception], int] = {
     TypeNotFound: 404,
     EventNotFound: 404,
     AssetNotFound: 404,
+    # 404 too: a named account that resolves to nothing. It is a `LookupError`
+    # rather than a `ValueError`, so it inherited neither of the rows above and
+    # escaped as a traceback and a generic 500 — the shape a consolidation
+    # cycle meets, since the runner re-mints whoever asked for it from stored
+    # state. The one flavour that is not a caller's bad name is a file holding
+    # no internal agent at all, which cannot happen behind a migration runner
+    # and whose message names migration `0014` rather than hiding behind a 500.
+    auth.UnknownPrincipal: 404,
     # 400 — the request itself is wrong: a bad value, an impossible transition,
     # an asset that cannot be stored or rendered. OverflowError is a caller's
     # integer that no SQLite parameter can hold (`?limit=9999…`), which reached
@@ -477,6 +507,10 @@ EXCEPTION_STATUS: dict[type[Exception], int] = {
 #: server log, not in a response.
 INTERNAL_ERROR = {"type": "InternalError", "message": "internal server error"}
 
+#: Where this module says the things nobody asked for: a misconfigured nightly
+#: schedule at startup. Requests report failures in their own response body.
+logger = logging.getLogger(__name__)
+
 try:
     VERSION = metadata.version("nodum")
 except metadata.PackageNotFoundError:  # pragma: no cover - uninstalled source checkout
@@ -517,6 +551,76 @@ def _write(request: Request, operation: Any, /, *args: Any, **kwargs: Any) -> An
             "identity comes from the authenticated session, never the request"
         )
     return operation(*args, principal=_session_principal(request), **kwargs)
+
+
+def _run_consolidation(
+    *,
+    scope: str | None,
+    dry_run: bool,
+    principal: Principal,
+    path: str | Path | None,
+) -> consolidate.ConsolidationOut:
+    """Run a consolidation cycle on behalf of a principal :func:`_write` bound.
+
+    The runner is the one domain entry point this surface reaches that takes
+    *who asked* as a string rather than as a :class:`Principal`, and that is the
+    runner's shape rather than a convenience here: the nightly scheduler calls
+    the same function with no principal at all — nobody asked, the clock did —
+    so the parameter has to be able to say ``scheduler``.
+
+    Nothing about the round trip weakens the boundary, and two things make that
+    true. The string comes from the principal :class:`SessionMiddleware`
+    verified into this request's scope, which is the only identity this module
+    can reach at all; and the runner re-mints it from *stored* state
+    (``nodum.auth.principal_from_actor``), so a session whose account was
+    disabled since login cannot start a cycle. The writes the cycle then makes
+    are the in-process gardener's, because the gardener made them, and the
+    journal row records the human who asked beside them — two questions, two
+    answers, which is the whole of design decision G4.
+
+    Args:
+        scope: A space to confine the cycle to, or ``None`` for the whole file.
+        dry_run: Rehearse it — every job computed, the report written, no graph
+            event emitted.
+        principal: Bound by :func:`_write`; never supplied by a caller.
+        path: Explicit database path.
+
+    Returns:
+        The closed cycle and its typed report.
+    """
+    return consolidate.consolidate(
+        scope=scope,
+        dry_run=dry_run,
+        triggered_by=principal.actor_string,
+        path=path,
+    )
+
+
+def _consolidation_scheduler(
+    at: time | None, db_path: str | Path | None
+) -> scheduler.ConsolidationScheduler | None:
+    """Build the nightly scheduler for this app, or ``None`` when it is off.
+
+    ``at`` given wins; otherwise the environment decides
+    (:data:`nodum.scheduler.ENV_CONSOLIDATE_AT`), and unset means off — a
+    background process that writes to the graph without being asked is not
+    something to enable by surprise (design decision J1).
+
+    A value that is set but unparseable is **reported and then ignored**. The
+    alternative is a server that refuses to start over a stray character in an
+    optional schedule, and this one is announced on the console beside the two
+    banners ``nodum serve`` already prints, so it is not the silent-disable that
+    nobody notices for a month.
+    """
+    if at is None:
+        try:
+            at = scheduler.configured_time()
+        except ValueError as exc:
+            logger.warning("%s — the nightly consolidation cycle is off", exc)
+            return None
+    if at is None:
+        return None
+    return scheduler.ConsolidationScheduler(at=at, db_path=db_path)
 
 
 # ── Responses ─────────────────────────────────────────────────────────────────
@@ -571,6 +675,35 @@ def _exception_handler(status_code: int) -> Any:
         return _error(status_code, type(exc).__name__, _failure_message(exc))
 
     return handler
+
+
+async def _rollback_conflict_handler(request: Request, exc: Exception) -> Response:
+    """Render a refused rollback together with the rows that refused it.
+
+    The one failure on this surface whose body carries more than ``type`` and
+    ``message``, and the reason is decision C4: a rollback that cannot run
+    **names what is in the way** instead of reporting that it failed, because a
+    human told which four rows are blocking it can act and one told "rollback
+    failed" cannot. ``conflicts`` is the
+    :class:`~nodum.models.RollbackConflictOut` list verbatim — row id, kind,
+    both event seqs and ops, who made the conflicting write, and the cycle it
+    belonged to when it was another cycle's — which is exactly what the journal
+    renders. Parsing that back out of a sentence is the alternative this avoids.
+
+    The status still comes from :data:`EXCEPTION_STATUS`, so the code and the
+    body cannot drift; only the body is richer.
+    """
+    conflicts = exc.conflicts if isinstance(exc, RollbackConflict) else []
+    return EnvelopeResponse(
+        {
+            "error": {
+                "type": type(exc).__name__,
+                "message": _failure_message(exc),
+                "conflicts": [conflict.model_dump(mode="json") for conflict in conflicts],
+            }
+        },
+        status_code=EXCEPTION_STATUS[RollbackConflict],
+    )
 
 
 async def _http_exception_handler(request: Request, exc: Exception) -> Response:
@@ -1045,6 +1178,25 @@ def _optional_str(body: dict[str, Any], key: str) -> str | None:
     return value
 
 
+def _optional_bool(body: dict[str, Any], key: str, *, default: bool = False) -> bool:
+    """Return an optional boolean body field, defaulting when absent or null.
+
+    A string ``"false"`` is refused rather than coerced: this is a JSON body,
+    where ``false`` exists, and every non-empty string is truthy — silently
+    reading ``"false"`` as *run for real* is the kind of coercion a rehearsal
+    flag must not have.
+
+    Raises:
+        ValueError: If the key is present, non-null, and not a boolean.
+    """
+    value = body.get(key)
+    if value is None:
+        return default
+    if not isinstance(value, bool):
+        raise ValueError(f"field {key!r} must be true or false")
+    return value
+
+
 def _param(params: QueryParams, *names: str) -> str | None:
     """Return the first of ``names`` present in the query string.
 
@@ -1422,6 +1574,7 @@ def create_app(
     allowed_hosts: Sequence[str] | frozenset[str] | None = None,
     max_body_bytes: int | None = None,
     secure_cookies: bool = False,
+    consolidate_at: time | None = None,
 ) -> Starlette:
     """Build the nodum HTTP app: the JSON API plus the human web UI.
 
@@ -1437,6 +1590,10 @@ def create_app(
             sets it for a non-loopback bind (a LAN hostname will be served
             over TLS in front); loopback stays plain HTTP, where a ``Secure``
             cookie would never be stored at all.
+        consolidate_at: Local wall-clock time to run the nightly consolidation
+            cycle at. ``None`` reads :data:`nodum.scheduler.ENV_CONSOLIDATE_AT`,
+            which is unset by default — so the schedule is off unless somebody
+            asked for it, and ``nodum serve`` needs no flag to keep it that way.
 
     Returns:
         The configured Starlette application. Every ``/api`` route but
@@ -2059,6 +2216,102 @@ def create_app(
         response.headers["content-disposition"] = f'attachment; filename="nodum-{safe_id}.json"'
         return response
 
+    # ── Consolidation cycles: the dream journal (design §8.4) ─────────────
+
+    async def list_cycles(request: Request) -> Response:
+        """The consolidation journal, newest first.
+
+        Human-only in the service for the reason the event log is: a journal
+        entry says what the gardener did across every space in the file.
+        """
+        limit = _int_param(request.query_params, "limit", default=50)
+        cycles = service.list_cycles(
+            limit=limit, principal=_session_principal(request), path=db_path
+        )
+        return EnvelopeResponse(list_envelope("cycles", cycles))
+
+    async def run_cycle(request: Request) -> Response:
+        """Run a consolidation cycle now and answer with its journal entry.
+
+        The on-demand half of "a cycle runs, on demand and on a schedule". The
+        schedule is off unless configured, so without this the human surface
+        could never produce a journal entry at all — a dream journal that can
+        only fill itself up overnight, on an install that has not opted into
+        overnight, shows an empty table forever.
+
+        ``scope`` confines the cycle to one space and ``dry_run`` rehearses it:
+        every job computed, the report written, and **no graph event emitted**,
+        which is the checkable form of "it changed nothing". Both are the
+        runner's own parameters; this route invents neither.
+
+        The response is the closed cycle plus its report typed — the same two
+        things ``GET /api/cycles/{id}`` returns, so a caller that just ran one
+        needs no second request to render it.
+        """
+        body = await _json_body(request)
+        result = _write(
+            request,
+            _run_consolidation,
+            scope=_optional_str(body, "scope"),
+            dry_run=_optional_bool(body, "dry_run"),
+            path=db_path,
+        )
+        return EnvelopeResponse(envelope(result))
+
+    async def get_cycle(request: Request) -> Response:
+        """One journal entry: the row, its metrics, and the events it wrote.
+
+        The diff a journal renders is ``list_events`` narrowed to this cycle —
+        the same append-only log every other read comes from — so the entry
+        cannot become a second record that disagrees with what happened. The
+        cycle row stores no diff of its own, and this route builds none: it
+        composes two reads into one round trip and nothing else. ``?limit=``
+        bounds the event window and ``events_truncated`` says when it bit.
+        """
+        cycle_id = request.path_params["id"]
+        limit = _int_param(request.query_params, "limit", default=CYCLE_EVENT_LIMIT)
+        cycle = service.get_cycle(cycle_id, principal=_session_principal(request), path=db_path)
+        events = service.list_events(
+            _session_principal(request), limit=limit, cycle_id=cycle_id, path=db_path
+        )
+        metrics = (cycle.report or {}).get("metrics")
+        return EnvelopeResponse(
+            envelope(
+                CycleDetailOut(
+                    cycle=cycle,
+                    metrics=metrics if isinstance(metrics, dict) else {},
+                    events=events,
+                    events_truncated=len(events) >= limit,
+                )
+            )
+        )
+
+    async def roll_cycle_back(request: Request) -> Response:
+        """Take a whole cycle back — all of it, or none of it (design D7).
+
+        Human-only in the service, for a stronger version of ``undo``'s own
+        reason: it writes recorded payloads back verbatim, ``state = 'active'``
+        included, across spaces, for a whole cycle at once. Sessions on this
+        surface mint human principals and nothing else, so the gate is met here
+        by construction and enforced there regardless.
+
+        ``dry_run`` is the "would this succeed?" a confirm dialog needs: it
+        opens no cycle, writes nothing, and returns any conflicts in
+        ``conflicts`` instead of raising. A real rollback that meets one refuses
+        with **409** and the same list in the error body
+        (:func:`_rollback_conflict_handler`) — the graph moved on, which is a
+        conflict with current state and not a bad request.
+        """
+        body = await _json_body(request)
+        result = _write(
+            request,
+            service.rollback_cycle,
+            request.path_params["id"],
+            dry_run=_optional_bool(body, "dry_run"),
+            path=db_path,
+        )
+        return EnvelopeResponse(envelope(result))
+
     # ── Accounts and grants (the human administering their file) ──────────
 
     async def get_me(request: Request) -> Response:
@@ -2317,6 +2570,13 @@ def create_app(
         Route("/api/events", list_events),
         Route("/api/undo", undo, methods=["POST"]),
         Route("/api/export/node/{id}", export_node),
+        # The dream journal. A cycle is history rather than knowledge (decision
+        # C1), so it is its own collection and not a node listing, and its diff
+        # is the event log narrowed to it rather than anything stored twice.
+        Route("/api/cycles", list_cycles),
+        Route("/api/cycles", run_cycle, methods=["POST"]),
+        Route("/api/cycles/{id}", get_cycle),
+        Route("/api/cycles/{id}/rollback", roll_cycle_back, methods=["POST"]),
         Route("/api/me", get_me),
         Route("/api/humans", list_humans),
         Route("/api/humans", create_human, methods=["POST"]),
@@ -2352,8 +2612,35 @@ def create_app(
     exception_handlers: dict[Any, Any] = {
         exception: _exception_handler(status) for exception, status in EXCEPTION_STATUS.items()
     }
+    # The one failure whose body says more than type and message; its status is
+    # still the table's, so this replaces the rendering and not the code.
+    exception_handlers[RollbackConflict] = _rollback_conflict_handler
     exception_handlers[HTTPException] = _http_exception_handler
     exception_handlers[Exception] = _server_error_handler
+
+    consolidation = _consolidation_scheduler(consolidate_at, db_path)
+
+    @contextlib.asynccontextmanager
+    async def lifespan(app: Starlette) -> AsyncIterator[None]:
+        """Own the nightly consolidation task for the life of the server.
+
+        The whole of the schedule (design decision J1): one asyncio task in the
+        server that is already running, started here and cancelled here, with
+        no second process and no dependency. It is ``None`` unless the schedule
+        was configured, which is the default — so an ordinary ``nodum serve``
+        creates no background writer at all.
+
+        Shutdown is bounded by :meth:`~nodum.scheduler.ConsolidationScheduler.stop`
+        rather than by the cycle: a server must not take minutes to stop because
+        it happened to be tidying up when the signal arrived.
+        """
+        if consolidation is not None:
+            consolidation.start()
+        try:
+            yield
+        finally:
+            if consolidation is not None:
+                await consolidation.stop()
 
     # Outermost first: the guard normalises the path every inner layer keys on,
     # and refuses cross-origin and oversized requests before auth even looks at
@@ -2365,4 +2652,9 @@ def create_app(
         Middleware(SessionMiddleware, db_path=db_path),
     ]
 
-    return Starlette(routes=routes, middleware=middleware, exception_handlers=exception_handlers)
+    return Starlette(
+        routes=routes,
+        middleware=middleware,
+        exception_handlers=exception_handlers,
+        lifespan=lifespan,
+    )
