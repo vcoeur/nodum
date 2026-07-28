@@ -16,14 +16,25 @@
  *
  * ## Why space is the outer level
  *
- * Not for tidiness. **An `edit`-granted space never reaches this queue at
- * all** — its agents write `active` directly, so they file no proposals. Group
- * by agent alone and that territory becomes invisible: the human sees nothing
- * and cannot tell "nothing has been proposed here" from "this space governs
- * itself". A section that says *self-governing — no review* is the only place
- * that fact can surface, so {@link groupProposalsBySpace} emits one for every
- * edit-granted space with an empty queue, and the emptiness is the point rather
- * than a reason to leave it out.
+ * Not for tidiness. **An `edit` grant is the only thing that can keep a space's
+ * writes out of this queue**, because `edit` is the level that lands `active`
+ * rather than `proposed`. Group by agent alone and such a space can be entirely
+ * absent, and the human cannot tell "nothing has been proposed here" from
+ * "everything written here lands without review". A section naming the agents
+ * that hold `edit` is the only place that fact can surface, so
+ * {@link groupProposalsBySpace} emits one for every edit-granted space with an
+ * empty queue, and the emptiness is the point rather than a reason to leave it
+ * out.
+ *
+ * **What that section may not say is that such an agent never appears here.**
+ * Phase 5a's landing seam (`Store.cap_landing`, §8.3) made a grant a *ceiling
+ * rather than a mandate*: a writer may file **below** its own grant, and the
+ * consolidation runner does exactly that for every inference it makes — the
+ * gardener holds `edit` on `main` and files every suggested edge `proposed`
+ * anyway, because the inferences are the uncertain half by construction. So the
+ * queue can and does hold work from an `edit`-granted agent, right under a
+ * section header that used to claim otherwise. What an `edit` grant states is a
+ * *permission*: those writes **may** land active without review.
  *
  * ## Where a proposal's space comes from
  *
@@ -199,7 +210,11 @@ export type SpaceSectionKind =
   | "queue"
   /** It holds proposals whose referenced node no longer resolves. */
   | "unreported"
-  /** It holds none, and never will: every agent on it writes `active` directly. */
+  /**
+   * It holds none, and an agent on it holds `edit` — so its writes *may* land
+   * `active` without passing through here. Not a promise that they always do:
+   * a writer may file below its own grant (§8.3), and the gardener does.
+   */
   | "self-governing";
 
 /** One space's whole share of the queue, or its documented absence from it. */
@@ -224,19 +239,22 @@ export interface SpaceSection {
    */
   crossings: number;
   /**
-   * Agents holding `edit` here — they land writes `active`, so nothing they do
-   * reaches this queue. Populated on a queue section too: a space with both an
-   * `edit` agent and waiting proposals means some *other* agent holds only
-   * `suggest`, which is worth seeing rather than inferring.
+   * Agents holding `edit` here — their writes *may* land `active` without
+   * reaching this queue. Populated on a queue section too, and the section may
+   * well hold their proposals: a grant is a ceiling, so an `edit` agent that
+   * files below it appears here like any other.
    */
   editAgents: string[];
 }
 
 /**
- * The agents that write directly into a space.
+ * The agents allowed to write directly into a space.
  *
- * `edit` is the level that lands `active` rather than `proposed`, so these are
- * exactly the agents whose work never appears in the review queue.
+ * `edit` is the level that *can* land `active` rather than `proposed`. It is a
+ * ceiling and not a mandate — `Store.cap_landing` lets a writer file below its
+ * own grant, and the consolidation runner files every inference `proposed`
+ * whatever the gardener holds — so this answers "who may write here without
+ * review", never "whose work is absent below".
  *
  * @param space One row of `GET /api/spaces`.
  * @returns Agent ids holding `edit`, sorted.
@@ -246,6 +264,64 @@ export function editGrantedAgents(space: SpaceOut): string[] {
     .filter((grant) => grant.level === "edit")
     .map((grant) => grant.agent_id)
     .sort();
+}
+
+/**
+ * What a section header says about the agents holding `edit` on its space.
+ *
+ * A sentence rather than a component, because it is the sentence that was
+ * **wrong**: it read *"builtin-gardener hold `edit` here and write directly —
+ * nothing below was filed by it"*, and was printed immediately above a section
+ * headed `agent:builtin-gardener` holding four of the gardener's own edges. Two
+ * faults in one line: an inference the landing seam invalidated, and a plural
+ * verb on a single agent.
+ *
+ * @param editAgents Agent ids holding `edit` here, from {@link editGrantedAgents}.
+ * @param hasProposals Whether this section is currently holding any — a header
+ *   over a queue has to account for the work that is visibly there.
+ * @returns The sentence, or null when nobody holds `edit` and there is nothing
+ *   to say.
+ */
+export function editGrantNote(
+  editAgents: readonly string[],
+  hasProposals: boolean,
+): string | null {
+  if (editAgents.length === 0) return null;
+  const who = editAgents.join(", ");
+  const holds = editAgents.length === 1 ? "holds" : "hold";
+  const their = editAgents.length === 1 ? "its" : "their";
+  const permission =
+    `${who} ${holds} edit here, so ${their} writes may land active without passing through ` +
+    "this queue.";
+  // A grant is a ceiling, not a mandate: a writer may file below it, and the
+  // gardener files every inference as a proposal however it is granted. So the
+  // header states the permission and then says what it does *not* imply.
+  const ceiling = hasProposals
+    ? "A grant is a ceiling rather than a mandate, though — a writer may file below its own " +
+      "grant, and some of what is waiting here may be exactly that."
+    : "A grant is a ceiling rather than a mandate, though: an agent may still file a proposal " +
+      "below its own grant, and the gardener does that for every link it infers.";
+  return `${permission} ${ceiling}`;
+}
+
+/**
+ * The intro over the sections that hold nothing but name an `edit` grant.
+ *
+ * Its old wording — *"Those writes land `active` immediately, so nothing from
+ * them ever reaches this queue"* — is the same false inference
+ * {@link editGrantNote} exists to correct, one level up.
+ *
+ * @param spaceCount How many such sections there are.
+ */
+export function selfGoverningNote(spaceCount: number): string {
+  const spaces = `${spaceCount} space${spaceCount === 1 ? "" : "s"}`;
+  return (
+    `${spaces} where an agent holds edit. Those writes may land active immediately, so work ` +
+    "done there can bypass this queue entirely — the zero below is that permission and not an " +
+    "empty inbox, and it is not a claim that nothing has been written there. Nor is it a " +
+    "promise: a grant is a ceiling, so an agent may still file a proposal below it, and one " +
+    "that does appears in the queue above like any other."
+  );
 }
 
 /**
@@ -333,11 +409,14 @@ export interface SpaceGroupingOptions {
  * work rather than explain it.
  *
  * **Self-governing sections come last and hold nothing.** They exist to say
- * that an `edit`-granted space is absent from this queue *by design* rather
- * than by chance, which is the whole of D4. They are emitted only when the
- * space list is known: with `spaces` null (still loading, or the request
- * failed) the view has no way to tell a self-governing space from any other,
- * and inventing the distinction would be worse than admitting it is unknown.
+ * that an `edit`-granted space's silence here is a *permission* rather than
+ * chance — work done there may land without review — which is the whole of D4.
+ * What they may not say is that such a space can never appear above: a grant is
+ * a ceiling, and a writer that files below it queues up like any other. They are
+ * emitted only when the space list is known: with `spaces` null (still loading,
+ * or the request failed) the view has no way to tell an edit-granted space from
+ * any other, and inventing the distinction would be worse than admitting it is
+ * unknown.
  *
  * A space that is merely empty — no proposals, no `edit` grant — gets no
  * section. Nothing has been proposed there and nothing governs it, so there is

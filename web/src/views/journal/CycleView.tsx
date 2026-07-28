@@ -11,10 +11,19 @@
  * stored — so this page cannot disagree with the file.
  */
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { api } from "../../api/client";
-import { EmptyState, Spinner, useToast } from "../../components";
+import {
+  EmptyState,
+  nameSpace,
+  Spinner,
+  unresolvedSpaceIds,
+  useArchivedSpaces,
+  useSpaces,
+  useToast,
+} from "../../components";
+import type { SpaceName } from "../../components";
 import type { CycleDetailOut, RollbackOut } from "../../api/types";
 import { describeFailure, formatTimestamp, formatTimestampLong } from "../../lib";
 import type { FailureDescription } from "../../lib";
@@ -25,11 +34,17 @@ import { RollbackDialog } from "./RollbackDialog";
 import {
   CYCLE_EVENT_LIMIT,
   cycleCaveats,
+  cycleFailures,
   cycleProvenance,
   cycleWork,
+  describeEvent,
+  describeRecordedFailure,
+  emptyEventsNote,
+  noMetricsNote,
   readConsolidationReport,
   rollbackAvailability,
   rollbackOutcome,
+  rowHeadlines,
 } from "./journal";
 import type { ConsolidationReport } from "./journal";
 import "./journal.css";
@@ -83,6 +98,38 @@ export default function CycleView() {
     [reload, toast],
   );
 
+  // Everything below has to be computed before the early returns: hooks do not
+  // get to be conditional. `detail` is null until the read lands, and every
+  // derivation tolerates that.
+  const detail = load.status === "ready" ? load.detail : null;
+
+  // The cycle's scope is the **resolved space id** (`open_cycle` runs it through
+  // `_resolve_space`), so the header names it through the shared vocabulary
+  // rather than printing 32 hex characters. The archived read is lazy: a cycle
+  // may have run over a space retired since, and nothing else on this page needs
+  // it.
+  const spaceList = useSpaces();
+  const scopes = useMemo(
+    () => (detail?.cycle.scope == null ? [] : [detail.cycle.scope]),
+    [detail?.cycle.scope],
+  );
+  const unresolved = useMemo(
+    () => unresolvedSpaceIds(scopes, spaceList.spaces),
+    [scopes, spaceList.spaces],
+  );
+  const archived = useArchivedSpaces(unresolved.length > 0);
+  const scope: SpaceName | null =
+    detail === null || detail.cycle.scope === null
+      ? null
+      : nameSpace(detail.cycle.scope, spaceList.spaces, archived.spaces);
+
+  // One reduction of the event list, shared by the diff, the rollback
+  // availability check and the confirm dialog's row names — three readings of
+  // the same log that must not disagree.
+  const changes = useMemo(() => (detail?.events ?? []).map(describeEvent), [detail?.events]);
+  const rowNames = useMemo(() => rowHeadlines(changes), [changes]);
+  const nameRow = useCallback((rowId: string) => rowNames.get(rowId) ?? null, [rowNames]);
+
   if (!cycleId) {
     return (
       <div className="nd-view">
@@ -131,10 +178,22 @@ export default function CycleView() {
     );
   }
 
-  const { cycle, metrics, events, events_truncated: truncated } = load.detail;
+  const { cycle, metrics, events_truncated: truncated } = load.detail;
   const caveats = cycleCaveats(cycle);
-  const rollback = rollbackAvailability(cycle);
+  const failures = cycleFailures(cycle, scope);
   const report = readConsolidationReport(cycle.report);
+  // The service's fourth rollback refusal — "wrote no graph events" — is not
+  // decidable from the cycle row, but it *is* decidable from this page's own
+  // event list: `undo`'s own rule is that a `node.*`/`edge.*` event has a graph
+  // effect and anything else is an audit entry. A filled window that carried
+  // only audit entries proves nothing either way, so that answers `null` and
+  // leaves the refusal to the preflight where it belongs.
+  const wroteGraphEvents = changes.some((change) => change.subject !== "other")
+    ? true
+    : truncated
+      ? null
+      : false;
+  const rollback = rollbackAvailability(cycle, wroteGraphEvents);
 
   return (
     <div className="nd-view nd-jn">
@@ -146,7 +205,7 @@ export default function CycleView() {
           <h1 ref={heading} tabIndex={-1}>
             {cycleWork(cycle)}
           </h1>
-          <p className="nd-meta">{cycleProvenance(cycle)}</p>
+          <p className="nd-meta">{cycleProvenance(cycle, scope)}</p>
           <p className="nd-meta">
             Started <span title={formatTimestampLong(cycle.started_at)}>{formatTimestamp(cycle.started_at)}</span>
             {cycle.finished_at === null ? (
@@ -179,6 +238,14 @@ export default function CycleView() {
         </div>
       </header>
 
+      {failures.length > 0 ? (
+        <ul className="nd-jn-failures">
+          {failures.map((failure) => (
+            <li key={failure}>{failure}</li>
+          ))}
+        </ul>
+      ) : null}
+
       {caveats.length > 0 ? (
         <ul className="nd-jn-caveats">
           {caveats.map((caveat) => (
@@ -187,20 +254,21 @@ export default function CycleView() {
         </ul>
       ) : null}
 
-      {report === null ? null : <JobReports report={report} />}
+      {report === null ? null : <JobReports report={report} scope={scope} />}
 
-      <MetricTable metrics={metrics} />
+      <MetricTable metrics={metrics} noneNote={noMetricsNote(cycle)} />
 
       <EventDiff
-        events={events}
+        changes={changes}
         truncated={truncated}
         limit={CYCLE_EVENT_LIMIT}
-        dryRun={cycle.dry_run}
+        emptyNote={emptyEventsNote(cycle)}
       />
 
       {confirming ? (
         <RollbackDialog
           cycle={cycle}
+          nameRow={nameRow}
           onRolledBack={onRolledBack}
           onClose={() => setConfirming(false)}
         />
@@ -218,8 +286,13 @@ export default function CycleView() {
  * says what actually changed. The `notes` are the sentences that make the
  * numbers readable (a degraded signal, a rehearsal, a no-op that is correct),
  * so they are rendered rather than summarised.
+ *
+ * A job's `error` is a string the server wrote, so it goes through the same
+ * space-safe reading the headline's failures do — a job that tripped over a
+ * space archived mid-cycle would otherwise print the server's own *"unknown
+ * space: …"* here instead.
  */
-function JobReports({ report }: { report: ConsolidationReport }) {
+function JobReports({ report, scope }: { report: ConsolidationReport; scope: SpaceName | null }) {
   if (report.jobs.length === 0) return null;
 
   return (
@@ -241,7 +314,9 @@ function JobReports({ report }: { report: ConsolidationReport }) {
               </p>
             ) : null}
             {job.error === null ? null : (
-              <p className="nd-jn-job__error">This job raised: {job.error}</p>
+              <p className="nd-jn-job__error">
+                This job raised: {describeRecordedFailure(job.error, scope)}
+              </p>
             )}
             {job.notes.length === 0 ? null : (
               <ul className="nd-jn-job__notes">

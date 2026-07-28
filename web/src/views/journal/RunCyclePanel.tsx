@@ -13,18 +13,35 @@
  * only way to see what a cycle *would* do on a file whose contents you are not
  * yet willing to let an agent touch.
  *
- * A cycle is a long synchronous write against SQLite's single writer, so the
- * button stays busy for its whole duration rather than returning optimistically.
+ * **The scope control is a `SpaceFilter` doing a different job, and it says so.**
+ * Everywhere else that component narrows a *read* and promises it "never widens
+ * what you can see"; here the choice decides what the gardener will **act on**,
+ * so the tooltip is the panel's rather than the component's default. The
+ * vocabulary is narrowed too: `meta` is dropped, because
+ * `consolidate._is_curatable` excludes every node in it and a cycle scoped there
+ * is a guaranteed no-op that reports itself as a clean night.
  */
 
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { api } from "../../api/client";
-import { SpaceFilter, useSpaces, useToast } from "../../components";
-import { cycleWork, describeRunFailure } from "./journal";
+import { nameSpace, SpaceFilter, useToast } from "../../components";
+import type { NodeOut, SpaceOut } from "../../api/types";
+import {
+  cycleScopeSpaces,
+  cycleWork,
+  describeRunFailure,
+  SCOPE_CONTROL_HINT,
+} from "./journal";
 
 interface RunCyclePanelProps {
   /** Called after a cycle closes, so the journal can pick the new entry up. */
   onRan: () => Promise<void> | void;
+  /** Active spaces from the shared read, or null while it is unknown. */
+  spaces: SpaceOut[] | null;
+  /** Archived space nodes, for naming a scope retired since the picker filled. */
+  archivedSpaces: readonly NodeOut[];
+  /** True once the space read failed — the picker says so rather than offering "any". */
+  spacesFailed: boolean;
 }
 
 /**
@@ -32,13 +49,27 @@ interface RunCyclePanelProps {
  *
  * @param onRan Refresh hook, awaited before the toast so the new entry is on
  *   screen by the time the notification names it.
+ * @param spaces The active space list, or null while it is unknown. Passed in
+ *   rather than read here: the view around this panel already holds it for the
+ *   entries' own scopes, and a second `GET /api/spaces` on one screen is the
+ *   duplication `useSpaces` exists to have collapsed.
+ * @param archivedSpaces Archived space nodes, for the one case that matters
+ *   here — a scope archived between the picker being filled and the button
+ *   being pressed, which is the live way this run gets refused.
+ * @param spacesFailed Whether that read failed.
  */
-export function RunCyclePanel({ onRan }: RunCyclePanelProps) {
+export function RunCyclePanel({
+  onRan,
+  spaces,
+  archivedSpaces,
+  spacesFailed,
+}: RunCyclePanelProps) {
   const toast = useToast();
-  const { spaces, failed } = useSpaces();
   const [scope, setScope] = useState("");
   const [dryRun, setDryRun] = useState(false);
   const [running, setRunning] = useState(false);
+
+  const choosable = useMemo(() => cycleScopeSpaces(spaces), [spaces]);
 
   const run = () => {
     setRunning(true);
@@ -59,8 +90,16 @@ export function RunCyclePanel({ onRan }: RunCyclePanelProps) {
           // Through the scope-aware wording, never `toast.showError`: that
           // renders an ApiError as `type: message` and would print the server's
           // own "unknown space: research" verbatim — the one phrasing no
-          // surface here may say about a space.
-          toast.show("error", "The cycle could not be run", describeRunFailure(error, scope));
+          // surface here may say about a space. The scope is *named* rather
+          // than quoted, because the picker's value is a space id.
+          toast.show(
+            "error",
+            "The cycle could not be run",
+            describeRunFailure(
+              error,
+              scope === "" ? null : nameSpace(scope, spaces, archivedSpaces),
+            ),
+          );
         },
       );
   };
@@ -71,11 +110,13 @@ export function RunCyclePanel({ onRan }: RunCyclePanelProps) {
         <SpaceFilter
           value={scope}
           onChange={setScope}
-          spaces={spaces}
-          failed={failed}
+          spaces={choosable}
+          archivedSpaces={archivedSpaces}
+          failed={spacesFailed}
           label="Scope"
           name="cycle-scope"
           className="nd-jn-run__scope"
+          title={SCOPE_CONTROL_HINT}
         />
         <label className="nd-jn-run__rehearse">
           <input
@@ -99,6 +140,11 @@ export function RunCyclePanel({ onRan }: RunCyclePanelProps) {
         {dryRun
           ? "A rehearsal computes every job and writes no graph event, so nothing lands in the review queue. It still appears here, marked as a rehearsal."
           : "The gardener proposes duplicates and links and retires the two kinds of edge a machine can be right about. Everything it suggests waits in the review queue. A cycle holds the single database writer while it runs."}
+      </p>
+      <p className="nd-meta nd-jn-run__note">
+        The scope picker leaves out <code>meta</code>: consolidation skips every node there — it
+        is the vocabulary and the territory, not knowledge — so a cycle confined to it would
+        examine nothing and report a clean night.
       </p>
     </section>
   );

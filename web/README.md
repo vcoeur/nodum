@@ -33,7 +33,10 @@ belongs in none of them. Plenty of surfaces still have to name a space that
 listing will not carry: the review queue (a space archived while its proposals
 waited), search, the editor's meta bar, the graph inspector, `/admin`'s grant
 table (archiving makes a grant inert and keeps the row precisely so it can be
-revoked), the write-target and space-filter pickers, and every sentence the
+revoked), the write-target and space-filter pickers, **the journal** (a cycle's
+`scope` is the *resolved space id* — `open_cycle` runs the reference through
+`_resolve_space` before the row is written — so every scoped entry reports an id
+and nothing else), and every sentence the
 editor and search write about a write target or filter the server refused. They
 all go through `components/spaceNaming.ts` over two lists — the shared active
 one and `components/useArchivedSpaces.ts`, a lazy read of the archived space
@@ -203,12 +206,13 @@ a verb), `lib/time.ts`,
 `views/editor/markdownRender.ts` + `views/editor/mermaidRender.ts` (the
 sanitising policies), and `views/editor/leftoverBuffer.ts`.
 
-`components/useSpaces.ts` and `components/useArchivedSpaces.ts` are deliberately
+`components/useSpaces.ts`, `components/useArchivedSpaces.ts` and
+`views/journal/useNodeTitles.ts` are deliberately
 **not** in that list: they are hooks, and the harness renders nothing, so there
 is no honest way to drive them here. Their behaviour is verified by
 type-checking and in a browser, like every component — but the *rule* that
-decides whether the archived read fires at all is a plain function
-(`unresolvedSpaceIds`) with a test, precisely because getting it wrong is
+decides what each of them fetches is a plain function with a test
+(`unresolvedSpaceIds`, `referencedNodeIds`), precisely because getting it wrong is
 invisible until you watch the network panel.
 
 **The run pins `TZ` to `Asia/Kathmandu`, and this matters.** SQLite's
@@ -240,7 +244,7 @@ type-checking it and driving it in a browser.
 | `src/views/editor/` | CodeMirror-6 Markdown source editor, slash commands, `[[` autocomplete, live Mermaid preview, autosave, the write-target picker and the landing/refusal copy (`createOutcome.ts`) |
 | `src/views/search/` | query box, ranked hits, per-signal breakdown, signal grouping, the space filter + show-meta toggle in the URL (`searchState.ts`), refused-filter copy (`spaceFailure.ts`), when a row names its space (`resultSpace.ts`) |
 | `src/views/review/` | proposal queue grouped space → agent, per-kind cards, proposed-version diffs, self-governing space sections, cross-space edge marking (`grouping.edgeCrossing`) |
-| `src/views/journal/` | the dream journal: cycles as sentences, one entry with its job report, the five coherence metrics before/after, the events it wrote as a diff, the run-now control, and the dry-run-then-confirm rollback (`journal.ts` owns every sentence and every reading of the untyped `report` blob) |
+| `src/views/journal/` | the dream journal: cycles as sentences, one entry with its job report, the five coherence metrics before/after, the events it wrote as a paged diff, the run-now control, and the dry-run-then-confirm rollback (`journal.ts` owns every sentence and every reading of the untyped `report` blob; `useNodeTitles.ts` names the nodes an edge event points at) |
 | `src/views/graph/` | Cytoscape subgraph render, filters, cross-space edge styling and far-endpoint dimming, path panel |
 | `src/views/assets/` | rendition grid, lightbox, the ingesting drop-zone with its queue readout (`uploadOutcome.ts`) and its bookkeeping (`uploadQueue.ts` — batches, status labels, the refused second drop, the per-batch announcement), thin JSON export |
 | `src/views/login/` | password login against `POST /api/login` |
@@ -286,6 +290,11 @@ Conventions that hold across the tree:
   space-ness ride on a subclass rather than on a second test:
   `UnknownUploadSpaceError.phase` says which of the upload's two requests refused,
   and `isUnknownSpace` answers true for it too.
+  One refusal never arrives as a caught response at all: a cycle **records** its
+  failures as strings (`f"{type(failure).__name__}: {failure}"`), and the journal
+  renders them hours later. `recordedUnknownSpace` reads those, and it is the
+  *same* regex rather than a second copy — which is exactly why it lives in
+  `api/client.ts` beside `isUnknownSpace` and not in the view that needs it.
 - **Never say a space does not exist.** Nothing user-facing may render "no such
   space", "does not exist", "unknown/missing/nonexistent space", or "not found"
   for a space failure — including by handing an `UnknownSpaceError` to
@@ -301,8 +310,17 @@ Conventions that hold across the tree:
   read. Say what changed instead — a space stops resolving once it is archived,
   and a renamed one stops answering to its old name. `views/search/spaceFailure.ts`,
   `views/editor/createOutcome.ts`, `views/spaces/spaces.ts` and
-  `views/journal/journal.ts`'s `describeRunFailure` — a cycle's `scope` names a
-  space too — own that copy and pin it with tests. The one refusal that *does* name a space — creating one
+  `views/journal/journal.ts`'s `describeRunFailure` **and
+  `describeRecordedFailure`** — a cycle's `scope` names a space, both when the run
+  is refused now and when the report says it was refused then — own that copy and
+  pin it with tests. The journal's headline (`cycleWork`) is the harder half of
+  the same rule and is solved by construction: it is built from counts and
+  registered names and **quotes no server text at all**, the reason moving to
+  `cycleFailures` one line below, where the copy rules reach it. `journal.test.ts`'s
+  `FORBIDDEN` guard therefore runs over every branch of `cycleWork` rather than
+  over one function's happy path — it used to cover `describeRunFailure` alone,
+  while the sentence that actually broke the rule was three functions away.
+  The one refusal that *does* name a space — creating one
   whose name an **archived** space still holds (a space title is reserved for
   good) — is not an exception to this: it is the server's message, shown
   verbatim, and creating a space means writing `meta`, which is exactly the

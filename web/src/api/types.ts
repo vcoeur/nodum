@@ -462,8 +462,11 @@ export interface GrantOut {
  *   A space holding nothing but an agent's proposals is not empty, so this is
  *   deliberately not a count of `active` alone.
  * - `grants` lists the agents holding a grant on the space. It is how a human
- *   sees delegated territory at a glance — and an `edit`-granted space governs
- *   itself, so it never reaches the review queue at all.
+ *   sees delegated territory at a glance — and an `edit` grant is what lets a
+ *   write land `active` without reaching the review queue. It is a ceiling
+ *   rather than a mandate (`Store.cap_landing`, §8.3): a writer may file below
+ *   its own grant, and the consolidation runner does for every inference, so an
+ *   edit-granted space can still hold queued proposals.
  */
 export interface SpaceOut extends NodeOut {
   node_count: number;

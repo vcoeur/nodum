@@ -70,6 +70,22 @@ interface SpaceFilterProps {
    * named thing rather than an anonymous one.
    */
   name?: string;
+  /**
+   * What the control says it does, for the `title` tooltip.
+   *
+   * The default is the read filter's promise — *it narrows, and never widens
+   * what you can see* — which is true of every view that filters a listing with
+   * it. It is **not** true of the one surface that reuses the control to choose
+   * what a write will act on: the journal's run-now scope decides where the
+   * gardener writes, so a tooltip inherited from a read filter would tell the
+   * human the opposite of what the button underneath it is about to do. A
+   * caller with a different job says so here rather than the component guessing
+   * from its label.
+   *
+   * A failed space list overrides it either way — that sentence is about the
+   * control being unusable, which outranks whatever it would otherwise do.
+   */
+  title?: string;
 }
 
 /**
@@ -86,6 +102,8 @@ interface SpaceFilterProps {
  * @param controlClassName Extra class for the `<select>`, for a filter row that
  *   sizes its controls.
  * @param name `name` on the `<select>`; defaults to `space`.
+ * @param title What the control does, for the tooltip; defaults to the read
+ *   filter's promise. A surface where the choice drives a *write* says so.
  */
 export function SpaceFilter({
   value,
@@ -97,6 +115,7 @@ export function SpaceFilter({
   className,
   controlClassName,
   name = "space",
+  title = "Narrow this view to one space. It never widens what you can see.",
 }: SpaceFilterProps) {
   const known = spaces ?? [];
   // Resolved for the *selection only*, and handed to `spaceOptions` as a name
@@ -124,11 +143,7 @@ export function SpaceFilter({
         className={controlClassName ? `nd-select ${controlClassName}` : "nd-select"}
         value={selected}
         disabled={spaces === null && !failed}
-        title={
-          failed
-            ? "The space list could not be loaded — is the server running?"
-            : "Narrow this view to one space. It never widens what you can see."
-        }
+        title={failed ? "The space list could not be loaded — is the server running?" : title}
         onChange={(event) => onChange(event.target.value)}
       >
         {options.map((option) => (

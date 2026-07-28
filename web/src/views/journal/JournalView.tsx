@@ -14,17 +14,39 @@
  *
  * The list is the whole screen, so a failed read is the screen's failure rather
  * than a degraded control.
+ *
+ * **A cycle's scope is an id and is never rendered as one.** `open_cycle` runs
+ * `scope` through `_resolve_space` before the row is written, so every scoped
+ * entry reports a 32-hex string — *"confined to the space f7394465…"* on every
+ * row of the list. It goes through the shared `nameSpace` over two lists, the
+ * active one and the lazy archived read, because a cycle can perfectly well have
+ * run over a space retired since.
  */
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { api } from "../../api/client";
-import { EmptyState, Spinner } from "../../components";
+import {
+  EmptyState,
+  nameSpace,
+  Spinner,
+  unresolvedSpaceIds,
+  useArchivedSpaces,
+  useSpaces,
+} from "../../components";
+import type { SpaceName } from "../../components";
 import type { CycleOut } from "../../api/types";
 import { describeFailure, formatRelative, formatTimestampLong } from "../../lib";
 import type { FailureDescription } from "../../lib";
 import { CycleBadges } from "./CycleBadges";
-import { CYCLE_LIST_LIMIT, cycleCaveats, cycleProvenance, cycleWork } from "./journal";
+import {
+  CYCLE_LIST_LIMIT,
+  cycleCaveats,
+  cycleFailures,
+  cycleProvenance,
+  cycleScopeIds,
+  cycleWork,
+} from "./journal";
 import { RunCyclePanel } from "./RunCyclePanel";
 import "./journal.css";
 
@@ -57,6 +79,27 @@ export default function JournalView() {
     setAttempt((count) => count + 1);
   }, []);
 
+  // Every scope on screen, resolved through the shared vocabulary. The archived
+  // read is lazy and fires only when a cycle names a space no picker lists —
+  // `spaceList.spaces` is passed through **null and all**, because reading a
+  // list still in flight as empty would report every scope as unresolved and
+  // fire that read on a perfectly healthy file.
+  const spaceList = useSpaces();
+  const scopes = useMemo(
+    () => (load.status === "ready" ? cycleScopeIds(load.cycles) : []),
+    [load],
+  );
+  const unresolved = useMemo(
+    () => unresolvedSpaceIds(scopes, spaceList.spaces),
+    [scopes, spaceList.spaces],
+  );
+  const archived = useArchivedSpaces(unresolved.length > 0);
+  const spaceName = useCallback(
+    (scope: string | null): SpaceName | null =>
+      scope === null ? null : nameSpace(scope, spaceList.spaces, archived.spaces),
+    [spaceList.spaces, archived.spaces],
+  );
+
   return (
     <div className="nd-view nd-jn">
       <header className="nd-view__header">
@@ -71,7 +114,12 @@ export default function JournalView() {
         </div>
       </header>
 
-      <RunCyclePanel onRan={reload} />
+      <RunCyclePanel
+        onRan={reload}
+        spaces={spaceList.spaces}
+        archivedSpaces={archived.spaces}
+        spacesFailed={spaceList.failed}
+      />
 
       {load.status === "loading" ? (
         <div className="nd-empty">
@@ -101,7 +149,7 @@ export default function JournalView() {
           <ol className="nd-jn__list">
             {load.cycles.map((cycle) => (
               <li key={cycle.id}>
-                <JournalEntry cycle={cycle} />
+                <JournalEntry cycle={cycle} scope={spaceName(cycle.scope)} />
               </li>
             ))}
           </ol>
@@ -111,9 +159,19 @@ export default function JournalView() {
   );
 }
 
-/** One entry in the list: the sentence, who asked, and any caveat on reading it. */
-function JournalEntry({ cycle }: { cycle: CycleOut }) {
+/**
+ * One entry in the list: the sentence, who asked, any caveat on reading it —
+ * and, when it failed, why.
+ *
+ * The reason is a line of its own rather than part of the headline, and that is
+ * the fix rather than a layout preference: a cycle's recorded failure is a
+ * string the *server* wrote, and splicing it into the link text put *"The cycle
+ * failed before any job ran: TypeNotFound: unknown space: 909a3060…"* on this
+ * row. `cycleFailures` is where the space-safe copy rules reach it.
+ */
+function JournalEntry({ cycle, scope }: { cycle: CycleOut; scope: SpaceName | null }) {
   const caveats = cycleCaveats(cycle);
+  const failures = cycleFailures(cycle, scope);
 
   return (
     <article className="nd-card nd-jn-entry">
@@ -125,8 +183,15 @@ function JournalEntry({ cycle }: { cycle: CycleOut }) {
           {formatRelative(cycle.started_at)}
         </span>
       </div>
-      <p className="nd-meta">{cycleProvenance(cycle)}</p>
+      <p className="nd-meta">{cycleProvenance(cycle, scope)}</p>
       <CycleBadges cycle={cycle} />
+      {failures.length > 0 ? (
+        <ul className="nd-jn-entry__failures">
+          {failures.map((failure) => (
+            <li key={failure}>{failure}</li>
+          ))}
+        </ul>
+      ) : null}
       {caveats.length > 0 ? (
         <ul className="nd-jn-entry__caveats">
           {caveats.map((caveat) => (

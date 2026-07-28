@@ -74,8 +74,13 @@ export interface SpaceRow {
   /** The agents granted on it, strongest level first. */
   holders: GrantHolder[];
   /**
-   * True when some agent holds `edit` here — the space governs itself: those
-   * writes land `active` and never reach the review queue (design D4).
+   * True when some agent holds `edit` here — those writes **may** land `active`
+   * without reaching the review queue (design D4).
+   *
+   * A permission, not a prediction. Phase 5a's landing seam (`Store.cap_landing`,
+   * §8.3) made a grant a ceiling rather than a mandate: a writer may file below
+   * its own grant, and the consolidation runner does it for every inference. So
+   * an edit-granted space can hold queued proposals like any other.
    */
   selfGoverning: boolean;
   /** True for `main` and `meta`: renameable, never archivable. */

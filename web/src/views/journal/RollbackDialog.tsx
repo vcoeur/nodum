@@ -26,7 +26,7 @@ import type { CycleOut, RollbackOut } from "../../api/types";
 import { describeError, describeFailure } from "../../lib";
 import type { FailureDescription } from "../../lib";
 import { rollbackPlan, rollbackRefusal, shortId } from "./journal";
-import type { RollbackPlan } from "./journal";
+import type { RollbackPlan, RowNamer } from "./journal";
 
 /** Where the dialog is: rehearsing, showing a verdict, or refusing to plan. */
 type PreflightState =
@@ -37,6 +37,17 @@ type PreflightState =
 interface RollbackDialogProps {
   /** The cycle being taken back. */
   cycle: CycleOut;
+  /**
+   * Names a row this cycle touched, from the page's own event list.
+   *
+   * The server reports a conflict by row id, because it is reporting on the
+   * `nodes`/`edges` tables. The page behind this dialog is not: every
+   * conflicting row is a row the cycle wrote, so its event is in the list and
+   * that payload already carries the title. Showing `e1a2b3c4…` while the list
+   * two inches away says *"Meeting 2026-07-01"* makes the reader do a lookup the
+   * page had already done.
+   */
+  nameRow: RowNamer;
   /** Called with the result once a rollback has actually happened. */
   onRolledBack: (result: RollbackOut) => Promise<void> | void;
   /** Cancel handler for every dismissal route. */
@@ -47,10 +58,11 @@ interface RollbackDialogProps {
  * Confirm a rollback, having first asked the server whether it would work.
  *
  * @param cycle The cycle being taken back.
+ * @param nameRow Names a row this cycle touched; see the prop's own note.
  * @param onRolledBack Called with the outcome; the dialog closes after it.
  * @param onClose Cancel handler.
  */
-export function RollbackDialog({ cycle, onRolledBack, onClose }: RollbackDialogProps) {
+export function RollbackDialog({ cycle, nameRow, onRolledBack, onClose }: RollbackDialogProps) {
   const toast = useToast();
   const [preflight, setPreflight] = useState<PreflightState>({ status: "checking" });
   const [committing, setCommitting] = useState(false);
@@ -59,7 +71,7 @@ export function RollbackDialog({ cycle, onRolledBack, onClose }: RollbackDialogP
     const controller = new AbortController();
     api
       .rollbackCycle(cycle.id, { dryRun: true }, controller.signal)
-      .then((result) => setPreflight({ status: "ready", plan: rollbackPlan(result) }))
+      .then((result) => setPreflight({ status: "ready", plan: rollbackPlan(result, nameRow) }))
       .catch((error: unknown) => {
         if (controller.signal.aborted) return;
         // Every refusal other than a conflict is raised on the dry run too — a
@@ -69,7 +81,9 @@ export function RollbackDialog({ cycle, onRolledBack, onClose }: RollbackDialogP
         setPreflight({ status: "failed", failure: describeFailure(error, "this cycle") });
       });
     return () => controller.abort();
-  }, [cycle.id]);
+    // `nameRow` is memoised by the view; it changes only when the event list it
+    // reads does, which is exactly when the preflight is worth re-running.
+  }, [cycle.id, nameRow]);
 
   const commit = () => {
     setCommitting(true);
@@ -85,7 +99,7 @@ export function RollbackDialog({ cycle, onRolledBack, onClose }: RollbackDialogP
           // The race: the preflight passed and the graph moved before the
           // commit. Nothing was written, so the dialog stays up with the new
           // verdict rather than reporting a failure and closing.
-          setPreflight({ status: "ready", plan: rollbackRefusal(error.conflicts) });
+          setPreflight({ status: "ready", plan: rollbackRefusal(error.conflicts, nameRow) });
           return;
         }
         toast.show("error", "The rollback did not happen", describeError(error));
@@ -155,8 +169,11 @@ export function RollbackDialog({ cycle, onRolledBack, onClose }: RollbackDialogP
                 <li key={`${conflict.rowId}:${conflict.sinceDid}`} className="nd-jn-conflict">
                   <p className="nd-jn-conflict__row">
                     <span className="nd-badge nd-badge--type">{conflict.kind}</span>
+                    {conflict.name === null ? null : (
+                      <span className="nd-jn-conflict__name">{conflict.name}</span>
+                    )}
                     <span className="nd-mono nd-truncate" title={conflict.rowId}>
-                      {conflict.rowId}
+                      {conflict.name === null ? conflict.rowId : shortId(conflict.rowId, 12)}
                     </span>
                   </p>
                   <dl className="nd-jn-conflict__facts">

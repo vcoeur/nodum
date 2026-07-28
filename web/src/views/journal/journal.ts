@@ -26,17 +26,33 @@
  *   each measures. Whether a rise is good is a question this view is not in a
  *   position to answer — a cycle that flags duplicates *raises*
  *   `duplicate_candidates` by doing its job — so it does not colour one.
+ * - **No server text reaches the headline.** {@link cycleWork} is the sentence
+ *   the list links by and the detail page titles itself with, and a cycle's
+ *   report carries failures as *strings the server wrote* — including
+ *   `open_cycle`'s own `"TypeNotFound: unknown space: 909a…"`, which is the one
+ *   phrasing nothing user-facing may render, plus a bare 32-hex id. So the
+ *   headline counts and names failures and never quotes one; the reason belongs
+ *   to {@link cycleFailures}, which routes it through
+ *   {@link recordedUnknownSpace} — the *same* discriminator {@link
+ *   describeRunFailure} uses on a live refusal, reading a string that never came
+ *   back through `fetch`.
+ * - **A space is named, never spelt.** `cycles.scope` is always the **resolved
+ *   id** (`open_cycle` runs it through `_resolve_space`), so every sentence
+ *   about a scope takes a {@link SpaceName} the caller resolved through
+ *   `nameSpace` rather than the raw reference off the row.
  */
 
-import { isUnknownSpace } from "../../api/client";
+import { isUnknownSpace, recordedUnknownSpace } from "../../api/client";
 import type {
   CycleMetrics,
   CycleOut,
   EventOut,
   JsonObject,
+  NodeOut,
   RollbackConflictOut,
   RollbackOut,
 } from "../../api/types";
+import type { SpaceName } from "../../components";
 import { describeError } from "../../lib";
 
 /**
@@ -49,6 +65,27 @@ export const CYCLE_EVENT_LIMIT = 500;
 
 /** How many cycles the journal lists. */
 export const CYCLE_LIST_LIMIT = 100;
+
+/**
+ * How many events one page of the diff renders.
+ *
+ * The server caps a cycle's event list at {@link CYCLE_EVENT_LIMIT}; the *page*
+ * caps what the browser is asked to lay out. A 500-event cycle rendered whole
+ * came to 12 066 DOM nodes and 79 055 px of scroll, which is not a page a
+ * reviewer can read and not one Chrome can screenshot — and a nightly cycle on a
+ * real graph reaches the cap by design.
+ */
+export const EVENT_PAGE_SIZE = 25;
+
+/**
+ * The meta space, which a cycle may name and may never usefully act on.
+ *
+ * `consolidate._is_curatable` excludes every node in meta — it is the vocabulary
+ * and the territory, not knowledge — so a cycle scoped there examines nothing
+ * and closes reporting *"Ran 4 jobs and found nothing to change"*, which is true
+ * about a run that could never have found anything.
+ */
+export const META_SPACE_ID = "meta";
 
 /* ------------------------------------------------------------------ */
 /* Small formatters                                                     */
@@ -68,6 +105,43 @@ function joined(parts: readonly string[]): string {
 /** Sentence case for a clause list that starts mid-verb. */
 function sentence(text: string): string {
   return text === "" ? "" : `${text[0]?.toUpperCase() ?? ""}${text.slice(1)}.`;
+}
+
+/** What a registered job or operation name is allowed to look like. */
+const REGISTERED_NAME = /^[A-Za-z_][A-Za-z0-9_.-]{0,63}$/;
+
+/**
+ * A registered name, or a neutral word when the report carried something else.
+ *
+ * Job names and curative op names are registry keys (`link_maintenance`,
+ * `merge_nodes`), and they are the only server-written strings {@link cycleWork}
+ * prints — a job this build does not recognise still earns a clause, because
+ * silently dropping one would under-report a night's work. That tolerance is
+ * what makes the shape check worth having: *safe to print* is a property of the
+ * shape rather than of the source, and this headline has to hold whatever comes
+ * back on the wire.
+ *
+ * @param name The name the report carried.
+ * @param fallback What to print when it is not identifier-shaped.
+ */
+function registeredName(name: string, fallback: string): string {
+  return REGISTERED_NAME.test(name) ? name : fallback;
+}
+
+/** What an id is allowed to look like: `uuid4().hex`, and nothing with a space in it. */
+const ID_SHAPE = /^[A-Za-z0-9_-]{1,64}$/;
+
+/**
+ * An id shortened for a sentence, or a neutral phrase for anything that is not
+ * one.
+ *
+ * {@link shortId} leaves a short value whole, by design — `main` is a space id
+ * and must not be turned into `main…`. That makes it the one place a *short*
+ * server string can reach the headline unshortened, so the shape is checked
+ * before it is printed rather than after.
+ */
+function shortIdOr(value: string | null, fallback: string): string {
+  return value !== null && ID_SHAPE.test(value) ? shortId(value) : fallback;
 }
 
 /**
@@ -280,28 +354,36 @@ function jobClauses(job: JobReport, dryRun: boolean): string[] {
     return clauses;
   }
 
-  if (job.proposed > 0) clauses.push(`proposed ${plural(job.proposed, "row")} (${job.name})`);
-  if (job.applied > 0) clauses.push(`changed ${plural(job.applied, "row")} (${job.name})`);
+  const named = registeredName(job.name, "an unnamed job");
+  if (job.proposed > 0) clauses.push(`proposed ${plural(job.proposed, "row")} (${named})`);
+  if (job.applied > 0) clauses.push(`changed ${plural(job.applied, "row")} (${named})`);
   return clauses;
 }
 
 /**
  * The failure clause appended to an entry's sentence, or `""` for a clean run.
  *
- * Named failures are counted together; an unnamed one is written out, because a
- * failure outside every job is the *whole* story of that cycle rather than a
- * footnote to what it did.
+ * **It counts and names; it never quotes.** A failure's `error` is a string the
+ * server wrote (`f"{type(failure).__name__}: {failure}"`), and splicing one into
+ * the headline put *"The cycle failed before any job ran: TypeNotFound: unknown
+ * space: 909a3060…"* into an `<h1>` and into the list's link text — the phrasing
+ * the never-say-it-does-not-exist rule names outright, plus a bare 32-hex id.
+ * The reason is not dropped: it moves to {@link cycleFailures}, one line below,
+ * where the space-safe copy rules apply to it.
+ *
+ * Named failures are counted together; an unnamed one still gets its own clause,
+ * because a failure outside every job is the *whole* story of that cycle rather
+ * than a footnote to what it did.
  */
 function failureNote(failures: readonly JobFailureReport[]): string {
   const named = failures.filter((failure) => failure.job !== "");
   const unnamed = failures.filter((failure) => failure.job === "");
   const parts: string[] = [];
   if (named.length > 0) {
-    parts.push(`${plural(named.length, "job")} failed: ${joined(named.map((one) => one.job))}.`);
+    const names = named.map((one) => registeredName(one.job, "an unnamed job"));
+    parts.push(`${plural(named.length, "job")} failed: ${joined(names)}.`);
   }
-  for (const failure of unnamed) {
-    parts.push(`The cycle failed before any job ran: ${failure.error}`);
-  }
+  if (unnamed.length > 0) parts.push("The cycle failed before any job ran.");
   return parts.length === 0 ? "" : ` ${parts.join(" ")}`;
 }
 
@@ -311,6 +393,11 @@ function failureNote(failures: readonly JobFailureReport[]): string {
  * This is the journal's headline and the reason the view exists: *"flagged 3
  * duplicate candidates, proposed 14 links and retired 2 stale edges"* is what a
  * human wakes to, and a table of job names and counts is not.
+ *
+ * Nothing the *server* wrote appears in it — see {@link failureNote}. Every
+ * string below is this module's own, over counts and registered job names, so
+ * the headline is safe whatever comes back on the wire, which is the property
+ * `journal.test.ts`'s `FORBIDDEN` guard pins branch by branch.
  *
  * @param cycle The journal entry.
  */
@@ -344,18 +431,94 @@ export function cycleWork(cycle: CycleOut): string {
 
   const operation = readOperationReport(cycle.report);
   if (operation !== null) {
-    const failure = operation.error === null ? "" : ` It failed: ${operation.error}`;
+    // The *reason* belongs to `cycleFailures`, for the reason `failureNote`
+    // gives: `report["error"]` is `str(exc)` and this is an `<h1>`.
+    const failure = operation.error === null ? "" : " It failed.";
     if (operation.op === "rollback_cycle") {
-      const target = operation.rolledBack === null ? "another cycle" : shortId(operation.rolledBack);
+      const target = shortIdOr(operation.rolledBack, "another cycle");
       const count =
         operation.reversed === null ? "" : ` — ${plural(operation.reversed, "event")} reversed`;
       return `Took ${target} back${count}.${failure}`;
     }
-    return `One curative operation: ${operation.op}.${failure}`;
+    return `One curative operation: ${registeredName(operation.op, "unnamed")}.${failure}`;
   }
 
   if (cycle.status === "running") return "Running now — the report lands when it closes.";
   return "No report was recorded for this cycle.";
+}
+
+/**
+ * Why this cycle failed, one line per failure, said without naming a space.
+ *
+ * Split out of {@link cycleWork} deliberately, and this is the half where the
+ * copy rules live. A cycle's failures are strings the server wrote, and the
+ * first one a scoped run actually produces is `open_cycle`'s own refusal of an
+ * unresolvable `scope` — *"TypeNotFound: unknown space: 909a…"*, verbatim. So
+ * every recorded failure goes through {@link describeRecordedFailure}, and the
+ * headline above carries only counts and job names.
+ *
+ * Rendered beneath the sentence in both the list and the detail page, so nothing
+ * is hidden by the split — the reason is one line down, not one click away.
+ *
+ * @param cycle The journal entry.
+ * @param scope The cycle's scope resolved through `nameSpace`, or null when the
+ *   cycle named none (or nothing has resolved it yet).
+ * @returns One sentence per recorded failure; empty for a cycle that had none.
+ */
+export function cycleFailures(cycle: CycleOut, scope: SpaceName | null = null): string[] {
+  const consolidation = readConsolidationReport(cycle.report);
+  if (consolidation !== null) {
+    return consolidation.failed.map((failure) =>
+      failure.job === ""
+        ? `The cycle failed before any job ran: ${describeRecordedFailure(failure.error, scope)}`
+        : `The job ${failure.job} raised: ${describeRecordedFailure(failure.error, scope)}`,
+    );
+  }
+  const operation = readOperationReport(cycle.report);
+  if (operation !== null && operation.error !== null) {
+    return [`The operation ${operation.op} failed: ${describeRecordedFailure(operation.error, scope)}`];
+  }
+  return [];
+}
+
+/**
+ * Name a principal the way the rest of the interface does: without its kind
+ * prefix.
+ *
+ * `triggered_by` is an actor string — `human:owner`, `agent:builtin-gardener` —
+ * because that is what the event log stores and what makes a write attributable.
+ * The header greets the same person as *owner*, so a sentence reading *"Run on
+ * demand by human:owner"* prints an id at someone who has a name on screen two
+ * inches above it. The kind is not lost, it is said in words.
+ *
+ * @param actor An actor string, or anything else (returned unchanged).
+ */
+export function actorLabel(actor: string): string {
+  const separator = actor.indexOf(":");
+  if (separator <= 0) return actor;
+  const kind = actor.slice(0, separator);
+  const id = actor.slice(separator + 1);
+  if (id === "") return actor;
+  if (kind === "human") return id;
+  if (kind === "agent") return `the agent ${id}`;
+  return actor;
+}
+
+/**
+ * How a sentence says what territory a cycle covered.
+ *
+ * `cycles.scope` is the **resolved space id** and never the reference a human
+ * typed — `open_cycle` runs it through `_resolve_space` before the row is
+ * written — so this takes the resolution rather than the row's own string. An
+ * archived scope is named *and* marked: a cycle can perfectly well have run over
+ * a space retired since, and a bare name would say nothing about why no picker
+ * offers it now.
+ */
+function scopeClause(scope: string | null, name: SpaceName | null): string {
+  if (scope === null) return "across the whole file";
+  if (name === null) return `confined to the space ${scope}`;
+  const mark = name.kind === "archived" ? ", archived since" : "";
+  return `confined to the space ${name.label}${mark}`;
 }
 
 /**
@@ -367,17 +530,63 @@ export function cycleWork(cycle: CycleOut): string {
  * journal exists to keep apart, so this sentence names the trigger explicitly.
  *
  * @param cycle The journal entry.
+ * @param scope `cycle.scope` resolved through `nameSpace`; null when the cycle
+ *   named no space, or while the space list has not answered.
  */
-export function cycleProvenance(cycle: CycleOut): string {
-  const scope =
-    cycle.scope === null ? "across the whole file" : `confined to the space ${cycle.scope}`;
-  if (cycle.trigger === "scheduled") return `Run on the nightly schedule, ${scope}.`;
-  if (cycle.trigger === "rollback") return `Opened by a rollback, ${scope}.`;
+export function cycleProvenance(cycle: CycleOut, scope: SpaceName | null = null): string {
+  const where = scopeClause(cycle.scope, scope);
+  if (cycle.trigger === "scheduled") return `Run on the nightly schedule, ${where}.`;
+  if (cycle.trigger === "rollback") return `Opened by a rollback, ${where}.`;
   if (cycle.trigger === "curative") {
-    return `Opened by a curative operation ${cycle.triggered_by} asked for, ${scope}.`;
+    return `Opened by a curative operation ${actorLabel(cycle.triggered_by)} asked for, ${where}.`;
   }
-  return `Run on demand by ${cycle.triggered_by}, ${scope}.`;
+  return `Run on demand by ${actorLabel(cycle.triggered_by)}, ${where}.`;
 }
+
+/**
+ * Every space id this set of journal entries names, for the archived-space read.
+ *
+ * A cycle's scope outlives the listing that names it: `GET /api/spaces` is
+ * active-only, and a cycle that ran over `research` goes on reporting that id
+ * long after the space was retired. `components/unresolvedSpaceIds` decides
+ * whether the lazy archived read fires; this is what it is handed.
+ *
+ * @param cycles The entries on screen.
+ */
+export function cycleScopeIds(cycles: readonly CycleOut[]): string[] {
+  return [...new Set(cycles.map((cycle) => cycle.scope).filter((scope): scope is string => scope !== null))];
+}
+
+/**
+ * The spaces a cycle may sensibly be scoped to.
+ *
+ * `meta` is dropped, and not for tidiness: `consolidate._is_curatable` excludes
+ * every node in it, so a cycle scoped there examines nothing whatever the file
+ * holds and closes reporting *"Ran 4 jobs and found nothing to change"* — a
+ * sentence that reads as a clean night and is really a control that could never
+ * have done anything. A picker offering it is offering a guaranteed no-op.
+ *
+ * `main` stays: it is ordinary territory and the default write target.
+ *
+ * @param spaces The active space list, or null while it is unknown.
+ * @returns The same list without meta, or null when the list is unknown.
+ */
+export function cycleScopeSpaces<T extends NodeOut>(spaces: readonly T[] | null): T[] | null {
+  return spaces === null ? null : spaces.filter((space) => space.id !== META_SPACE_ID);
+}
+
+/**
+ * What the run panel's scope control says it does.
+ *
+ * It is a `SpaceFilter`, and everywhere else that component narrows a **read**
+ * and promises *"it never widens what you can see"*. Here the same control
+ * decides what the gardener **writes to** — the inherited tooltip described the
+ * opposite of what the button beside it was about to do. The string lives here
+ * rather than inline in the panel so the claim can be asserted: the harness
+ * renders no components, so a sentence inside one is a sentence nothing checks.
+ */
+export const SCOPE_CONTROL_HINT =
+  "Confine the cycle to one space. This decides what the gardener acts on, not what you can see.";
 
 /**
  * Every caveat that changes how this entry should be read, strongest first.
@@ -426,14 +635,25 @@ export interface RollbackAvailability {
 /**
  * Whether the rollback action is offered for this cycle.
  *
- * Three of the service's own refusals (`_rollback_plan`), stated in front of
+ * All four of the service's own refusals (`_rollback_plan`), stated in front of
  * the button rather than met after clicking it. The fourth — a cycle that wrote
- * no graph events at all — is not decidable from the row, so it is left to the
- * dry-run preflight, which is where an undecidable refusal belongs.
+ * no graph event at all — is not decidable from the row, which is why it takes
+ * an argument: the detail page has read the cycle's events and can answer it,
+ * the list has not. A one-op curative cycle that matched nothing (a `bulk_relink`
+ * whose selector hit no edge) is exactly that case, and it used to be offered a
+ * live button whose preflight then refused with *"InvalidTransition: wrote no
+ * graph events"* — a refusal the page already had everything it needed to state.
  *
  * @param cycle The journal entry.
+ * @param wroteGraphEvents Whether the cycle emitted any `node.*` / `edge.*`
+ *   event. `null` means unknown — no event list has been read, or the window
+ *   filled and carried only audit entries — and leaves the action offered, since
+ *   an undecidable refusal belongs to the dry-run preflight.
  */
-export function rollbackAvailability(cycle: CycleOut): RollbackAvailability {
+export function rollbackAvailability(
+  cycle: CycleOut,
+  wroteGraphEvents: boolean | null = null,
+): RollbackAvailability {
   if (cycle.status === "running") {
     return {
       available: false,
@@ -456,7 +676,33 @@ export function rollbackAvailability(cycle: CycleOut): RollbackAvailability {
       reason: "A rehearsal emitted no graph event, so there is nothing to reverse.",
     };
   }
+  if (wroteGraphEvents === false) {
+    return {
+      available: false,
+      reason:
+        "This cycle wrote no graph event — a curative operation that matched nothing writes " +
+        "none — so there is nothing to reverse.",
+    };
+  }
   return { available: true, reason: null };
+}
+
+/**
+ * The half of the space-refusal copy that is true whenever a scope stops
+ * resolving, shared by the live refusal and the recorded one.
+ *
+ * It states what *changed* rather than what is missing, which is the whole of
+ * the never-say-it-does-not-exist rule: the server answers a space that was
+ * never created and a space the caller holds no grant on with word-for-word
+ * identical text on purpose, and copy that resolved the ambiguity would be an
+ * existence oracle over every space in the file.
+ */
+const SCOPE_STOPS_RESOLVING =
+  "A space stops resolving once it is archived or renamed";
+
+/** How a sentence about a refused scope names it, without printing a bare id. */
+function scopeReference(scope: SpaceName | null): string {
+  return scope === null ? "the scope it named" : `the scope "${scope.label}"`;
 }
 
 /**
@@ -473,17 +719,46 @@ export function rollbackAvailability(cycle: CycleOut): RollbackAvailability {
  * unchanged; this module does not re-derive what kind of failure something was.
  *
  * @param error The caught value.
- * @param scopeRef The scope the run named, if it named one.
+ * @param scope The scope the run named, resolved through `nameSpace` — the
+ *   picker's value is a space **id**, so an unresolved reference here would put
+ *   the 32-hex string back on the screen the resolution exists to keep it off.
  */
-export function describeRunFailure(error: unknown, scopeRef: string): string {
+export function describeRunFailure(error: unknown, scope: SpaceName | null): string {
   if (isUnknownSpace(error)) {
     return (
-      `nodum would not resolve the scope "${scopeRef}". A space stops resolving once it is ` +
-      "archived or renamed, so the picker may be out of date — reload the screen to see what is " +
-      "there now."
+      `nodum would not resolve ${scopeReference(scope)}. ${SCOPE_STOPS_RESOLVING}, so the picker ` +
+      "may be out of date — reload the screen to see what is there now."
     );
   }
   return describeError(error);
+}
+
+/**
+ * A failure a cycle **recorded**, said without claiming a space is missing.
+ *
+ * The stored counterpart of {@link describeRunFailure}, and it asks the same
+ * question through the same owner: {@link recordedUnknownSpace} is the client's
+ * one unknown-space match, reading a string rather than a caught response. A
+ * scoped cycle whose space stopped resolving records *"TypeNotFound: unknown
+ * space: 909a3060…"* — forbidden phrasing and a bare id in one line — and it is
+ * the *first* failure a real scoped run produces, so this is not a hypothetical
+ * branch.
+ *
+ * Anything else is the server's own line, shown as it was written. That is the
+ * same bargain `describeError` strikes for a live failure: what this module
+ * owns is the one refusal whose wording is a decision, not every message the
+ * server can produce.
+ *
+ * @param recorded The `error` string out of the report.
+ * @param scope The cycle's scope resolved through `nameSpace`, if it had one.
+ */
+export function describeRecordedFailure(recorded: string, scope: SpaceName | null): string {
+  if (recordedUnknownSpace(recorded) === null) return recorded;
+  return (
+    `nodum would not resolve ${scopeReference(scope)} when this cycle ran. ` +
+    `${SCOPE_STOPS_RESOLVING}, so it may have changed between the run being asked for and the ` +
+    "gardener reaching it."
+  );
 }
 
 /* ------------------------------------------------------------------ */
@@ -529,7 +804,15 @@ const METRICS: Record<string, MetricDefinition> = {
   queue_age_days: {
     label: "Review queue age",
     unit: "days",
-    note: "Median age of everything waiting in the review queue.",
+    // The note carries the direction warning because the table deliberately
+    // does not colour a movement: this is the one metric a *cycle* can push
+    // down by making the queue worse, since every fresh proposal it files is a
+    // zero-day item dragging the median with it. A reader who takes a fall for
+    // an improvement reads it exactly backwards.
+    note:
+      "Median age of everything waiting in the review queue. Fresh proposals are the youngest " +
+      "items in it, so a cycle that files seven of them pulls this down while making the queue " +
+      "longer.",
   },
   neglect_rate: {
     label: "Neglect rate",
@@ -541,9 +824,6 @@ const METRICS: Record<string, MetricDefinition> = {
 /** Reading order for the known metrics; unknown keys follow, sorted. */
 const METRIC_ORDER = Object.keys(METRICS);
 
-/** Below this a delta is reported as no change — these are rounded floats. */
-const DELTA_EPSILON = 1e-9;
-
 /** Render one metric value in its own unit. */
 function formatMetric(value: number, unit: MetricUnit): string {
   if (unit === "ratio") return `${(value * 100).toFixed(1)}%`;
@@ -552,17 +832,38 @@ function formatMetric(value: number, unit: MetricUnit): string {
   return value.toFixed(2);
 }
 
+/** A delta's magnitude, rounded exactly as this table prints it. */
+function deltaMagnitude(magnitude: number, unit: MetricUnit): string {
+  if (unit === "ratio") return (magnitude * 100).toFixed(1);
+  if (unit === "days") return magnitude.toFixed(1);
+  if (unit === "count") {
+    return Number.isInteger(magnitude) ? String(magnitude) : magnitude.toFixed(2);
+  }
+  return magnitude.toFixed(2);
+}
+
+/**
+ * Whether a delta rounds away to nothing **at the precision this table prints**.
+ *
+ * A fixed epsilon in raw units is the wrong test, and the wrongness is visible:
+ * `queue_age_days` is a median over timestamps, so an unchanged queue re-measured
+ * a few seconds later moves by microseconds — far above any epsilon, and far
+ * below the tenth of a day the cell renders. That rendered as **"−0.0 d"**, with
+ * a down arrow, beside four other unchanged metrics all reading "no change".
+ * Rounding first is the only test that cannot disagree with what is on screen.
+ */
+function isNoChange(delta: number, unit: MetricUnit): boolean {
+  return Number(deltaMagnitude(Math.abs(delta), unit)) === 0;
+}
+
 /** Render a signed delta, in percentage points for a ratio. */
 function formatDelta(delta: number, unit: MetricUnit): string {
-  if (Math.abs(delta) < DELTA_EPSILON) return "no change";
+  if (isNoChange(delta, unit)) return "no change";
   const sign = delta > 0 ? "+" : "−";
-  const magnitude = Math.abs(delta);
-  if (unit === "ratio") return `${sign}${(magnitude * 100).toFixed(1)} pp`;
-  if (unit === "days") return `${sign}${magnitude.toFixed(1)} d`;
-  if (unit === "count") {
-    return `${sign}${Number.isInteger(magnitude) ? magnitude : magnitude.toFixed(2)}`;
-  }
-  return `${sign}${magnitude.toFixed(2)}`;
+  const magnitude = deltaMagnitude(Math.abs(delta), unit);
+  if (unit === "ratio") return `${sign}${magnitude} pp`;
+  if (unit === "days") return `${sign}${magnitude} d`;
+  return `${sign}${magnitude}`;
 }
 
 /** One metric, before and after, as the table renders it. */
@@ -618,16 +919,54 @@ export function metricRows(metrics: CycleMetrics): MetricRow[] {
       before: from === null ? "—" : formatMetric(from, definition.unit),
       after: to === null ? "—" : formatMetric(to, definition.unit),
       delta: delta === null ? "—" : formatDelta(delta, definition.unit),
+      // Read through the same rounding the text is, so the arrow can never
+      // point at a movement the cell beside it calls "no change".
       direction:
         delta === null
           ? ("unknown" as const)
-          : Math.abs(delta) < DELTA_EPSILON
+          : isNoChange(delta, definition.unit)
             ? ("flat" as const)
             : delta > 0
               ? ("up" as const)
               : ("down" as const),
     };
   });
+}
+
+/**
+ * What to say instead of a metric table when a cycle recorded none.
+ *
+ * `{}` is a real answer rather than missing data, but it is **three** real
+ * answers and they are not interchangeable. A rollback and a one-op curative
+ * cycle compute no metrics because they touch specific rows; a consolidation
+ * cycle that failed before any job ran computes none because it never got as far
+ * as measuring anything — and telling that reader "a rollback and a one-op
+ * curative cycle do not compute them" describes two things their cycle is not.
+ *
+ * @param cycle The journal entry.
+ */
+export function noMetricsNote(cycle: CycleOut): string {
+  const consolidation = readConsolidationReport(cycle.report);
+  if (consolidation !== null) {
+    // `_metrics` is well defined on an empty graph and runs on both sides of
+    // every job list, so the only consolidation report that carries none is the
+    // one the runner writes when the cycle died outside a job — which is also
+    // the one that carries no jobs.
+    return consolidation.jobs.length === 0
+      ? "This cycle recorded no coherence metrics: it failed before it could measure anything. " +
+          "The reason is above."
+      : "This cycle recorded no coherence metrics, and its report does not say why.";
+  }
+  if (readOperationReport(cycle.report) !== null) {
+    return (
+      "This cycle recorded no coherence metrics. A rollback and a one-op curative cycle do not " +
+      "compute them — they change specific rows rather than sweeping the file."
+    );
+  }
+  if (cycle.status === "running") {
+    return "The metrics are written when the cycle closes, and this one is still running.";
+  }
+  return "This cycle recorded no coherence metrics, and no report saying why.";
 }
 
 /* ------------------------------------------------------------------ */
@@ -660,6 +999,25 @@ export interface FieldChange {
   after: string | null;
 }
 
+/**
+ * The two nodes an edge event is about, kept as ids rather than as a sentence.
+ *
+ * The headline used to be built here as `relates_to: cba85bd8… → 9310f1b3…`,
+ * and **every event a consolidation cycle writes is an edge**, so the headline
+ * feature of this view was a column of truncated ids with nothing to click. A
+ * node's title rides in its own payload; an edge's endpoints are ids and the
+ * titles have to be fetched — so the ids come out structured and the view names
+ * them, exactly as the review queue names both ends of an edge proposal.
+ */
+export interface EventEdge {
+  /** The edge type, e.g. `duplicate_of`. */
+  type: string;
+  /** The source node's id, or null when the payload did not carry one. */
+  srcId: string | null;
+  /** The target node's id, or null when the payload did not carry one. */
+  dstId: string | null;
+}
+
 /** One event, reduced to what the diff renders. */
 export interface EventChange {
   seq: number;
@@ -668,18 +1026,46 @@ export interface EventChange {
   createdAt: string;
   subject: EventSubject;
   shape: EventShape;
-  /** The row named in words: `relates_to: 4f2a… → 91bc…`, or a node's title. */
+  /**
+   * The row named in words, with no lookup: `relates_to: 4f2a… → 91bc…`, or a
+   * node's title. The fallback the view falls back *to* — a screen reader label,
+   * a `title` attribute, the rollback dialog's name for a row — and what it
+   * renders while the titles are still in flight.
+   */
   headline: string;
   /** The row's id, or null for an audit entry that names none. */
   rowId: string | null;
+  /** Both endpoints, for an edge event; null for anything else. */
+  edge: EventEdge | null;
+  /** The node's title, for a node event; null when it has none or is not one. */
+  nodeTitle: string | null;
   fields: FieldChange[];
 }
 
 /** Node columns the diff compares, in reading order. */
 const NODE_FIELDS = ["title", "state", "type_id", "space_id", "parent_id", "content", "props"];
 
-/** Edge columns the diff compares, in reading order. */
-const EDGE_FIELDS = ["state", "type_id", "src_id", "dst_id", "confidence", "props"];
+/**
+ * Edge columns the diff compares, in reading order.
+ *
+ * `valid_from` and `valid_to` sit next to `state` because that adjacency is the
+ * point: `supersede_edge` records **two** facts as two, `valid_to` closed (when
+ * the edge stopped being true) *and* `archived` (it is no longer live), and a
+ * diff that showed the second without the first showed half of the only write
+ * this wave gave that column. `valid_from` still has no writer anywhere in the
+ * system and costs nothing to list — {@link describeEvent} drops a row that did
+ * not change, so it appears the day something starts writing it and not before.
+ */
+const EDGE_FIELDS = [
+  "state",
+  "valid_from",
+  "valid_to",
+  "type_id",
+  "src_id",
+  "dst_id",
+  "confidence",
+  "props",
+];
 
 /** Longest field value the diff prints before cutting it. */
 const FIELD_VALUE_LIMIT = 200;
@@ -782,6 +1168,8 @@ export function describeEvent(event: EventOut): EventChange {
     fields.push({ field, before: left, after: right });
   }
 
+  const title = row !== null && typeof row.title === "string" ? row.title.trim() : "";
+
   return {
     seq: event.seq,
     op: event.op,
@@ -791,8 +1179,87 @@ export function describeEvent(event: EventOut): EventChange {
     shape,
     headline: eventHeadline(subject, event.op, row),
     rowId: row !== null && typeof row.id === "string" ? row.id : null,
+    edge: subject === "edge" && row !== null ? eventEdge(row) : null,
+    nodeTitle: subject === "node" && title !== "" ? title : null,
     fields,
   };
+}
+
+/** Both endpoints of an edge event's row, as ids the view can name and link. */
+function eventEdge(row: JsonObject): EventEdge {
+  return {
+    type: typeof row.type_id === "string" ? row.type_id : "edge",
+    srcId: typeof row.src_id === "string" ? row.src_id : null,
+    dstId: typeof row.dst_id === "string" ? row.dst_id : null,
+  };
+}
+
+/**
+ * What to call one end of an edge on screen.
+ *
+ * The review queue renders the same edges as *"event sourcing → Event Sourcing"*
+ * because the server hands it `{id, title, space_id}` per referenced node; the
+ * event log carries the row and nothing else, so the journal resolves the titles
+ * itself and falls back to the shortened id for the ones it has not got. An
+ * untitled node falls back the same way — its id is genuinely all there is.
+ *
+ * @param nodeId The endpoint's id, or null when the payload named none.
+ * @param title The title if it has been resolved; `undefined` while the lookup
+ *   is in flight, `null` once it has answered with nothing.
+ */
+export function endpointLabel(nodeId: string | null, title: string | null | undefined): string {
+  if (nodeId === null) return "?";
+  const named = typeof title === "string" ? title.trim() : "";
+  return named === "" ? shortId(nodeId) : named;
+}
+
+/**
+ * Every node id a page of the diff has to name, deduplicated, in reading order.
+ *
+ * The rule behind the title lookup, pulled out of the component because getting
+ * it wrong is invisible until you watch the network panel — the same reason
+ * `unresolvedSpaceIds` is a plain function beside `useArchivedSpaces`.
+ *
+ * It reads a **page**, never the whole cycle: 500 events is 1 000 endpoints and
+ * `GET /api/nodes` has no id filter, so the lookup is one request per node and
+ * has to be bounded by what is actually on screen. A node event needs no lookup
+ * at all — its title is in its own payload.
+ *
+ * @param changes The events currently rendered.
+ */
+export function referencedNodeIds(changes: readonly EventChange[]): string[] {
+  const ids: string[] = [];
+  for (const change of changes) {
+    if (change.edge === null) continue;
+    for (const id of [change.edge.srcId, change.edge.dstId]) {
+      if (id !== null && id !== "") ids.push(id);
+    }
+  }
+  return [...new Set(ids)];
+}
+
+/**
+ * What this cycle's own events call each row it touched.
+ *
+ * The rollback confirm lists the rows standing in the way of a reversal, and the
+ * server names them by id — it is reporting on the `nodes`/`edges` tables, not
+ * on anything with a title. But every conflicting row is by definition a row
+ * *this cycle wrote*, so its event is on the same page, and that event's payload
+ * carries the title. Naming the row *"Meeting 2026-07-01"* costs one lookup in a
+ * map the page already built.
+ *
+ * Newest event wins: a row the cycle touched twice is called what it was last
+ * called, which is what the graph holds now.
+ *
+ * @param changes The cycle's events, newest first, as the API returns them.
+ */
+export function rowHeadlines(changes: readonly EventChange[]): Map<string, string> {
+  const names = new Map<string, string>();
+  for (const change of changes) {
+    if (change.rowId === null || names.has(change.rowId)) continue;
+    names.set(change.rowId, change.headline);
+  }
+  return names;
 }
 
 /**
@@ -819,9 +1286,94 @@ export function eventWindowNote(count: number, truncated: boolean, limit: number
   return `${sentence(plural(count, "event"))} This cycle wrote nothing else.`;
 }
 
+/** One page of the event list, and what to call it. */
+export interface EventWindow {
+  /** Zero-based page index, clamped into range. */
+  page: number;
+  /** How many pages there are; at least 1, even for an empty list. */
+  pages: number;
+  /** Slice bounds into the event list — `[from, to)`. */
+  from: number;
+  to: number;
+  /** `Events 1–25 of 500`, one-based and inclusive, for a human. */
+  label: string;
+}
+
+/**
+ * Which slice of a cycle's events to render, and what the pager says.
+ *
+ * The server's cap works and the presentation had none: a 500-event cycle
+ * rendered every diff table expanded, 12 066 DOM nodes and 79 055 px tall, which
+ * Chrome could not screenshot and a reviewer could not read — and a nightly
+ * cycle on a real graph reaches that cap by design rather than by accident.
+ * Paging rather than collapsing, because it bounds the *lookups* too: the
+ * endpoint titles are one request per node, so what is rendered is what is
+ * fetched.
+ *
+ * The page is clamped rather than trusted: a list that shrinks under a pager
+ * (the events reload after a rollback) would otherwise leave the reader on an
+ * empty page with no way back that is not the browser's.
+ *
+ * @param total How many events there are.
+ * @param page The page asked for, zero-based.
+ * @param size Events per page; anything below 1 is read as 1.
+ */
+export function eventWindow(total: number, page: number, size: number): EventWindow {
+  const perPage = Math.max(1, Math.floor(size));
+  const pages = Math.max(1, Math.ceil(total / perPage));
+  const current = Math.min(Math.max(0, Math.floor(page)), pages - 1);
+  const from = current * perPage;
+  const to = Math.min(total, from + perPage);
+  const label =
+    total === 0 ? "No events" : `Events ${from + 1}–${to} of ${total}`;
+  return { page: current, pages, from, to, label };
+}
+
+/**
+ * What an empty event list means for *this* cycle.
+ *
+ * Three different facts wear the same empty list, and the copy used to state one
+ * of them for all three: *"This cycle wrote nothing to the graph. Every job ran
+ * and none of them found anything to change."* is false about a cycle that
+ * failed before a job started — the page's own headline says so two inches above
+ * — and false about a curative operation, where no job exists to have run.
+ * {@link cycleWork} already tells the three apart, so the empty state does too.
+ *
+ * @param cycle The journal entry.
+ */
+export function emptyEventsNote(cycle: CycleOut): string {
+  if (cycle.dry_run) {
+    return (
+      "A rehearsal emits no graph event — an empty list here is the checkable form of " +
+      "“it changed nothing”."
+    );
+  }
+  const consolidation = readConsolidationReport(cycle.report);
+  if (consolidation !== null) {
+    return consolidation.jobs.length === 0
+      ? "No job ran, so nothing was written. The cycle failed before it could start one — the " +
+          "reason is at the top of this page."
+      : "This cycle wrote nothing to the graph. Every job ran and none of them found anything " +
+          "to change.";
+  }
+  if (readOperationReport(cycle.report) !== null) {
+    return (
+      "One curative operation ran and matched nothing, so it wrote no graph event. There is " +
+      "nothing here to reverse."
+    );
+  }
+  if (cycle.status === "running") {
+    return "Still running: what it has written so far appears here as it goes.";
+  }
+  return "This cycle wrote nothing to the graph, and recorded no report saying what it tried.";
+}
+
 /* ------------------------------------------------------------------ */
 /* Rollback: the preflight verdict and the conflicts                    */
 /* ------------------------------------------------------------------ */
+
+/** Names a row this cycle touched, for a surface holding only its id. */
+export type RowNamer = (rowId: string) => string | null;
 
 /** One conflict, in the four facts a human needs to act on it. */
 export interface ConflictLine {
@@ -829,11 +1381,28 @@ export interface ConflictLine {
   kind: string;
   /** The row that has moved. */
   rowId: string;
+  /**
+   * What this cycle's own events call that row, or null when nothing does.
+   *
+   * The server names a conflict by id because it is reporting on a table. The
+   * page around this dialog is not: the row is one the cycle wrote, so its event
+   * is in the list behind the dialog and already knows it as *"Meeting
+   * 2026-07-01"*. Showing the id alone while the page behind it shows the title
+   * makes the reader do a lookup the page had already done.
+   */
+  name: string | null;
   /** What this cycle did to it. */
   cycleDid: string;
   /** What has happened to it since. */
   sinceDid: string;
-  /** Who made that later write. */
+  /**
+   * Who made that later write, named rather than spelt ({@link actorLabel}).
+   *
+   * This is a confirm dialog rather than the event log — the log line keeps the
+   * raw actor string, because that is the record — and *"human:owner"* beside a
+   * header that greets the same person as *owner* is an id printed at someone
+   * whose name is already on the screen.
+   */
   who: string;
   /** The cycle that later write belonged to, or null when it belonged to none. */
   inCycle: string | null;
@@ -851,11 +1420,18 @@ export interface ConflictLine {
  * that cycle is what tells the reader that rolling *it* back may clear the way.
  *
  * @param conflict One row out of `RollbackOut.conflicts` or the 409 body.
+ * @param nameRow Names a row this cycle touched — {@link rowHeadlines} over the
+ *   page's own event list. Omitted, the line falls back to the shortened id.
  */
-export function describeConflict(conflict: RollbackConflictOut): ConflictLine {
+export function describeConflict(
+  conflict: RollbackConflictOut,
+  nameRow: RowNamer = () => null,
+): ConflictLine {
   const cycleDid = `event #${conflict.cycle_event_seq} (${conflict.cycle_event_op})`;
   const sinceDid = `event #${conflict.conflicting_seq} (${conflict.conflicting_op})`;
   const inCycle = conflict.conflicting_cycle_id;
+  const name = nameRow(conflict.row_id);
+  const called = name === null ? shortId(conflict.row_id) : name;
   const provenance =
     inCycle === null
       ? ""
@@ -863,14 +1439,15 @@ export function describeConflict(conflict: RollbackConflictOut): ConflictLine {
   return {
     kind: conflict.kind,
     rowId: conflict.row_id,
+    name,
     cycleDid,
     sinceDid,
-    who: conflict.conflicting_actor,
+    who: actorLabel(conflict.conflicting_actor),
     inCycle,
     sentence:
-      `This cycle's ${cycleDid} touched the ${conflict.kind} ${shortId(conflict.row_id)}; ` +
-      `${sinceDid} by ${conflict.conflicting_actor} has changed it since, so reversing the ` +
-      `cycle would overwrite that.${provenance}`,
+      `This cycle's ${cycleDid} touched the ${conflict.kind} ${called}; ` +
+      `${sinceDid} by ${actorLabel(conflict.conflicting_actor)} has changed it since, so ` +
+      `reversing the cycle would overwrite that.${provenance}`,
   };
 }
 
@@ -892,9 +1469,10 @@ export interface RollbackPlan {
  * rather than as a 409 afterwards.
  *
  * @param result The `dry_run: true` response.
+ * @param nameRow Names a row this cycle touched; see {@link describeConflict}.
  */
-export function rollbackPlan(result: RollbackOut): RollbackPlan {
-  const conflicts = result.conflicts.map(describeConflict);
+export function rollbackPlan(result: RollbackOut, nameRow?: RowNamer): RollbackPlan {
+  const conflicts = result.conflicts.map((conflict) => describeConflict(conflict, nameRow));
   if (conflicts.length > 0) {
     return {
       blocked: true,
@@ -931,15 +1509,19 @@ export function rollbackPlan(result: RollbackOut): RollbackPlan {
  * a check that had just said none had.
  *
  * @param conflicts The `conflicts` list out of the 409 error body.
+ * @param nameRow Names a row this cycle touched; see {@link describeConflict}.
  */
-export function rollbackRefusal(conflicts: readonly RollbackConflictOut[]): RollbackPlan {
+export function rollbackRefusal(
+  conflicts: readonly RollbackConflictOut[],
+  nameRow?: RowNamer,
+): RollbackPlan {
   return {
     blocked: true,
     headline: `${plural(conflicts.length, "row")} moved while you were reading this.`,
     detail:
       "The check above passed, and then something wrote to a row this cycle had touched. " +
       "Nothing was rolled back — a rollback is all of it or none of it.",
-    conflicts: conflicts.map(describeConflict),
+    conflicts: conflicts.map((conflict) => describeConflict(conflict, nameRow)),
   };
 }
 

@@ -226,6 +226,42 @@ function unknownSpaceReference(error: unknown): string | null {
 }
 
 /**
+ * A Python exception name and the `": "` a stored failure puts after it.
+ *
+ * `nodum.consolidate` records a failure as `f"{type(failure).__name__}: {failure}"`,
+ * so the stored text is one prefix away from the message a response would have
+ * carried. Anchored and identifier-shaped, so a message that merely *contains* a
+ * colon (`unknown space: research`) is left whole.
+ */
+const RECORDED_EXCEPTION_PREFIX = /^[A-Za-z_][A-Za-z0-9_]*:\s*/;
+
+/**
+ * The same refusal, recognised in a failure a **cycle report recorded** rather
+ * than in a response this client received.
+ *
+ * A cycle's report carries its failures as strings — there is no response left
+ * to catch, and by the time the journal renders one the request that produced it
+ * finished hours ago. The journal still has to keep that text out of its copy,
+ * because `open_cycle` resolves a cycle's `scope` through the ordinary space
+ * rule and so records the server's own *"TypeNotFound: unknown space: 909a…"*
+ * verbatim — the one phrasing nothing user-facing may render.
+ *
+ * It lives **here**, beside {@link isUnknownSpace}, for the reason that
+ * discriminator is a singleton at all: the match is one regex with one owner,
+ * and a second copy of it in a view is how the two drift apart. This is not a
+ * second discriminator — it is the same one, reading a string that never came
+ * back through `fetch`.
+ *
+ * @param recorded The `error` string out of a cycle's report.
+ * @returns The space reference the refusal named, or null when the recorded
+ *   failure was not an unresolvable space.
+ */
+export function recordedUnknownSpace(recorded: string): string | null {
+  const message = recorded.replace(RECORDED_EXCEPTION_PREFIX, "");
+  return UNKNOWN_SPACE_MESSAGE.exec(message)?.[1] ?? null;
+}
+
+/**
  * A rollback the graph has moved past — 409, with the rows that are in the way.
  *
  * The one refusal on this surface whose body carries more than `type` and

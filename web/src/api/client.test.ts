@@ -38,6 +38,7 @@ import {
   isUnknownSpace,
   listCycles,
   listNodes,
+  recordedUnknownSpace,
   redeemUploadGrant,
   renameSpace,
   rollbackCycle,
@@ -639,5 +640,45 @@ describe("the consolidation cycle routes", () => {
 
     expect(error).toBeInstanceOf(ApiError);
     expect(isRollbackConflict(error)).toBe(false);
+  });
+});
+
+describe("the same refusal, recorded rather than caught", () => {
+  /**
+   * What `nodum.consolidate` stores for a failure — `f"{type(failure).__name__}:
+   * {failure}"` — for the refusal a scoped cycle actually meets first.
+   */
+  const RECORDED = "TypeNotFound: unknown space: f73944650d5c4255a0aa5421308f62b0";
+
+  it("recognises an unresolvable space in a cycle report's own error string", () => {
+    // The journal renders failures that were caught hours ago on the server, so
+    // there is no response left for `isUnknownSpace` to test — and the copy rule
+    // applies to that text exactly as it does to a live refusal. This is the
+    // same regex, not a second copy of it.
+    expect(recordedUnknownSpace(RECORDED)).toBe("f73944650d5c4255a0aa5421308f62b0");
+  });
+
+  it("reads the message with no exception prefix in front of it too", () => {
+    expect(recordedUnknownSpace("unknown space: research")).toBe("research");
+  });
+
+  it("answers null for a recorded failure that is about something else", () => {
+    expect(recordedUnknownSpace("GrantNotPermitted: open a consolidation cycle")).toBeNull();
+    expect(recordedUnknownSpace("boom")).toBeNull();
+    expect(recordedUnknownSpace("")).toBeNull();
+  });
+
+  it("does not eat a colon that is part of the message", () => {
+    // The prefix strip is identifier-shaped and anchored, so a message that
+    // merely contains a colon keeps all of itself.
+    expect(recordedUnknownSpace("unknown type: note")).toBeNull();
+  });
+
+  it("agrees with the live discriminator on the same wire message", () => {
+    // The property that matters: whichever way the refusal reaches a view, the
+    // answer to "was this a space that would not resolve" is one answer.
+    const live = new UnknownSpaceError("research", 404, "unknown space: research");
+    expect(isUnknownSpace(live)).toBe(true);
+    expect(recordedUnknownSpace(`TypeNotFound: ${live.message}`)).toBe("research");
   });
 });

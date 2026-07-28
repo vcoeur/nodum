@@ -101,6 +101,25 @@
   font-size: var(--nd-text-sm);
 }
 
+/* Why a cycle failed, one line per recorded failure. Kept out of the headline
+ * on purpose — see `journal.failureNote` — so it needs to read as the reason
+ * rather than as another caveat. */
+.nd-jn-entry__failures,
+.nd-jn-failures {
+  display: flex;
+  flex-direction: column;
+  gap: var(--nd-space-3);
+  padding-left: var(--nd-space-12);
+  list-style: disc;
+  font-size: var(--nd-text-xs);
+  color: var(--nd-danger);
+  max-width: 80ch;
+}
+
+.nd-jn-failures {
+  font-size: var(--nd-text-sm);
+}
+
 /* --- Status pills ----------------------------------------------------- */
 
 .nd-jn-badges {
@@ -343,6 +362,24 @@
   overflow-wrap: anywhere;
 }
 
+.nd-jn-event__type {
+  font-size: var(--nd-text-xs);
+  color: var(--nd-text-muted);
+}
+
+/* --- Paging the event list -------------------------------------------- */
+
+.nd-jn-pager {
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: var(--nd-space-4);
+}
+
+.nd-jn-pager__range {
+  white-space: nowrap;
+}
+
 .nd-jn-event__meta {
   overflow-wrap: anywhere;
 }
@@ -433,6 +470,11 @@
   align-items: center;
   gap: var(--nd-space-4);
   min-width: 0;
+}
+
+.nd-jn-conflict__name {
+  font-weight: var(--nd-weight-medium);
+  overflow-wrap: anywhere;
 }
 
 .nd-jn-conflict__facts {

@@ -7,9 +7,13 @@
  * red-up ramp would call that a regression. So the table reports the movement
  * and says what each metric measures, and leaves the reading to the human.
  *
- * `{}` is a real answer rather than missing data — a rollback and a one-op
- * curative cycle compute no metrics — so it gets a sentence saying so instead of
- * a table of dashes.
+ * `{}` is a real answer rather than missing data — so it gets a sentence saying
+ * so instead of a table of dashes. **Which** sentence is the cycle's to decide,
+ * not this component's: a rollback and a one-op curative cycle compute no
+ * metrics because they touch specific rows, while a consolidation cycle that
+ * failed before any job ran computes none because it never got as far as
+ * measuring anything, and telling that reader about rollbacks describes two
+ * things their cycle is not. `journal.noMetricsNote` owns the branching.
  */
 
 import type { CycleMetrics } from "../../api/types";
@@ -18,18 +22,21 @@ import { metricRows } from "./journal";
 /** Arrow per direction; `aria-hidden`, since the delta text already says it. */
 const ARROW: Record<string, string> = { up: "↑", down: "↓", flat: "→", unknown: "" };
 
-/** Render the before/after metric table for one cycle. */
-export function MetricTable({ metrics }: { metrics: CycleMetrics }) {
+/**
+ * Render the before/after metric table for one cycle.
+ *
+ * @param metrics `CycleDetailOut.metrics`.
+ * @param noneNote What to say when there are none — `journal.noMetricsNote` over
+ *   the cycle this table belongs to.
+ */
+export function MetricTable({ metrics, noneNote }: { metrics: CycleMetrics; noneNote: string }) {
   const rows = metricRows(metrics);
 
   return (
     <section className="nd-jn-section" aria-label="Coherence metrics">
       <h2 className="nd-jn-section__title">Coherence</h2>
       {rows.length === 0 ? (
-        <p className="nd-meta nd-jn-section__note">
-          This cycle recorded no coherence metrics. A rollback and a one-op curative cycle do not
-          compute them — they change specific rows rather than sweeping the file.
-        </p>
+        <p className="nd-meta nd-jn-section__note">{noneNote}</p>
       ) : (
         <div className="nd-jn-scroll">
           <table className="nd-jn-metrics">
