@@ -1,0 +1,186 @@
+/**
+ * The confirm in front of rolling a whole cycle back.
+ *
+ * **It calls the API before it asks.** `POST /api/cycles/{id}/rollback` with
+ * `dry_run: true` opens no cycle, writes nothing, and answers the conflicts
+ * under a **200** rather than raising — which is the "would this succeed?" a
+ * confirm dialog exists for. So this dialog runs the rehearsal the moment it
+ * opens and shows its verdict: how many events would be reversed, or which rows
+ * stand in the way. A human meeting a conflict here has lost nothing; a human
+ * meeting it as a 409 afterwards has already decided.
+ *
+ * A real 409 is still handled, because it is a real race: the preflight and the
+ * commit are two requests, and the graph can move between them. Its conflicts
+ * come back in the error body verbatim and are rendered exactly as the
+ * preflight's are, under wording that says which of the two happened.
+ *
+ * Modelled on `views/spaces/ArchiveDialog.tsx` — busy state on the affirmative
+ * button, the dialog left standing on failure, Escape and the backdrop
+ * cancelling, nothing confirming on a keypress (the `Modal` contract).
+ */
+
+import { useEffect, useState } from "react";
+import { api, isRollbackConflict } from "../../api/client";
+import { Modal, Spinner, useToast } from "../../components";
+import type { CycleOut, RollbackOut } from "../../api/types";
+import { describeError, describeFailure } from "../../lib";
+import type { FailureDescription } from "../../lib";
+import { rollbackPlan, rollbackRefusal, shortId } from "./journal";
+import type { RollbackPlan } from "./journal";
+
+/** Where the dialog is: rehearsing, showing a verdict, or refusing to plan. */
+type PreflightState =
+  | { status: "checking" }
+  | { status: "ready"; plan: RollbackPlan }
+  | { status: "failed"; failure: FailureDescription };
+
+interface RollbackDialogProps {
+  /** The cycle being taken back. */
+  cycle: CycleOut;
+  /** Called with the result once a rollback has actually happened. */
+  onRolledBack: (result: RollbackOut) => Promise<void> | void;
+  /** Cancel handler for every dismissal route. */
+  onClose: () => void;
+}
+
+/**
+ * Confirm a rollback, having first asked the server whether it would work.
+ *
+ * @param cycle The cycle being taken back.
+ * @param onRolledBack Called with the outcome; the dialog closes after it.
+ * @param onClose Cancel handler.
+ */
+export function RollbackDialog({ cycle, onRolledBack, onClose }: RollbackDialogProps) {
+  const toast = useToast();
+  const [preflight, setPreflight] = useState<PreflightState>({ status: "checking" });
+  const [committing, setCommitting] = useState(false);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    api
+      .rollbackCycle(cycle.id, { dryRun: true }, controller.signal)
+      .then((result) => setPreflight({ status: "ready", plan: rollbackPlan(result) }))
+      .catch((error: unknown) => {
+        if (controller.signal.aborted) return;
+        // Every refusal other than a conflict is raised on the dry run too — a
+        // cycle still running, one already rolled back, one that wrote no graph
+        // event. Those are refusals to *plan*, so they belong here rather than
+        // as a toast over a dialog still offering the button.
+        setPreflight({ status: "failed", failure: describeFailure(error, "this cycle") });
+      });
+    return () => controller.abort();
+  }, [cycle.id]);
+
+  const commit = () => {
+    setCommitting(true);
+    void api.rollbackCycle(cycle.id, { dryRun: false }).then(
+      async (result) => {
+        setCommitting(false);
+        await onRolledBack(result);
+        onClose();
+      },
+      (error: unknown) => {
+        setCommitting(false);
+        if (isRollbackConflict(error)) {
+          // The race: the preflight passed and the graph moved before the
+          // commit. Nothing was written, so the dialog stays up with the new
+          // verdict rather than reporting a failure and closing.
+          setPreflight({ status: "ready", plan: rollbackRefusal(error.conflicts) });
+          return;
+        }
+        toast.show("error", "The rollback did not happen", describeError(error));
+      },
+    );
+  };
+
+  const plan = preflight.status === "ready" ? preflight.plan : null;
+  const canConfirm = plan !== null && !plan.blocked && !committing;
+
+  return (
+    <Modal
+      title={`Roll back cycle ${shortId(cycle.id)}?`}
+      onClose={onClose}
+      wide
+      footer={
+        <>
+          <button type="button" className="nd-button nd-button--ghost" onClick={onClose}>
+            Cancel
+          </button>
+          <button
+            type="button"
+            className="nd-button nd-button--danger"
+            onClick={commit}
+            disabled={!canConfirm}
+          >
+            {committing ? "Rolling back…" : "Roll the cycle back"}
+          </button>
+        </>
+      }
+    >
+      {preflight.status === "checking" ? (
+        <div className="nd-empty">
+          <Spinner large label="Checking whether this can be rolled back" />
+        </div>
+      ) : null}
+
+      {preflight.status === "failed" ? (
+        <div className="nd-jn-verdict nd-jn-verdict--blocked">
+          <p className="nd-jn-verdict__headline">{preflight.failure.title}</p>
+          <p>{preflight.failure.body}</p>
+        </div>
+      ) : null}
+
+      {plan === null ? null : (
+        <>
+          <div
+            className={
+              plan.blocked
+                ? "nd-jn-verdict nd-jn-verdict--blocked"
+                : "nd-jn-verdict nd-jn-verdict--clear"
+            }
+          >
+            <p className="nd-jn-verdict__headline">{plan.headline}</p>
+            <p>{plan.detail}</p>
+          </div>
+
+          {plan.conflicts.length === 0 ? (
+            <p className="nd-meta">
+              Rolling back writes the recorded payloads back verbatim, across every space the cycle
+              touched. It is not undone by undo — a rollback is itself a cycle, and rolling{" "}
+              <em>that</em> back re-applies this one.
+            </p>
+          ) : (
+            <ul className="nd-jn-conflicts">
+              {plan.conflicts.map((conflict) => (
+                <li key={`${conflict.rowId}:${conflict.sinceDid}`} className="nd-jn-conflict">
+                  <p className="nd-jn-conflict__row">
+                    <span className="nd-badge nd-badge--type">{conflict.kind}</span>
+                    <span className="nd-mono nd-truncate" title={conflict.rowId}>
+                      {conflict.rowId}
+                    </span>
+                  </p>
+                  <dl className="nd-jn-conflict__facts">
+                    <dt>This cycle</dt>
+                    <dd>{conflict.cycleDid}</dd>
+                    <dt>Changed since by</dt>
+                    <dd>
+                      {conflict.sinceDid} — {conflict.who}
+                      {conflict.inCycle === null
+                        ? ", outside any cycle"
+                        : `, in cycle ${shortId(conflict.inCycle)}`}
+                    </dd>
+                  </dl>
+                  {conflict.inCycle === null ? null : (
+                    <p className="nd-meta">
+                      Rolling that cycle back may clear this one out of the way.
+                    </p>
+                  )}
+                </li>
+              ))}
+            </ul>
+          )}
+        </>
+      )}
+    </Modal>
+  );
+}

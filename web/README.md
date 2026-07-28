@@ -1,13 +1,15 @@
 # nodum web UI
 
-The human web UI for nodum (Phase 3). React 19 + TypeScript, built by Vite into
+The human web UI for nodum (Phase 3, plus Phase 5's dream journal). React 19 +
+TypeScript, built by Vite into
 `../nodum/_web/`, which the Python process serves at `/` — one process, one
 origin, no CORS.
 
-Nine views ship: **login** (`/login`), **editor** (`/editor`,
+Eleven views ship: **login** (`/login`), **editor** (`/editor`,
 `/editor/:nodeId`), **search** (`/search`, also the landing view), **review**
-(`/review`), **graph** (`/graph`, `/graph/:rootId`), **assets** (`/assets`),
-**spaces** (`/spaces`), **admin** (`/admin`), and **history**
+(`/review`), **journal** (`/journal`) with one entry in full
+(`/journal/:cycleId`), **graph** (`/graph`, `/graph/:rootId`), **assets**
+(`/assets`), **spaces** (`/spaces`), **admin** (`/admin`), and **history**
 (`/history/:nodeId`).
 
 **A space is two independent controls, not a mode** (design decision D1), and
@@ -196,7 +198,7 @@ a verb), `lib/time.ts`,
 `views/search/spaceFailure.ts`, `views/review/grouping.ts`,
 `views/spaces/spaces.ts`, `views/admin/grants.ts`,
 `views/search/resultSpace.ts`, `views/login/credentials.ts`,
-`views/editor/createOutcome.ts`,
+`views/editor/createOutcome.ts`, `views/journal/journal.ts`,
 `views/assets/uploadOutcome.ts`, `views/assets/uploadQueue.ts`,
 `views/editor/markdownRender.ts` + `views/editor/mermaidRender.ts` (the
 sanitising policies), and `views/editor/leftoverBuffer.ts`.
@@ -238,6 +240,7 @@ type-checking it and driving it in a browser.
 | `src/views/editor/` | CodeMirror-6 Markdown source editor, slash commands, `[[` autocomplete, live Mermaid preview, autosave, the write-target picker and the landing/refusal copy (`createOutcome.ts`) |
 | `src/views/search/` | query box, ranked hits, per-signal breakdown, signal grouping, the space filter + show-meta toggle in the URL (`searchState.ts`), refused-filter copy (`spaceFailure.ts`), when a row names its space (`resultSpace.ts`) |
 | `src/views/review/` | proposal queue grouped space → agent, per-kind cards, proposed-version diffs, self-governing space sections, cross-space edge marking (`grouping.edgeCrossing`) |
+| `src/views/journal/` | the dream journal: cycles as sentences, one entry with its job report, the five coherence metrics before/after, the events it wrote as a diff, the run-now control, and the dry-run-then-confirm rollback (`journal.ts` owns every sentence and every reading of the untyped `report` blob) |
 | `src/views/graph/` | Cytoscape subgraph render, filters, cross-space edge styling and far-endpoint dimming, path panel |
 | `src/views/assets/` | rendition grid, lightbox, the ingesting drop-zone with its queue readout (`uploadOutcome.ts`) and its bookkeeping (`uploadQueue.ts` — batches, status labels, the refused second drop, the per-batch announcement), thin JSON export |
 | `src/views/login/` | password login against `POST /api/login` |
@@ -274,8 +277,9 @@ Conventions that hold across the tree:
   it.
 - **A refused space is `isUnknownSpace`, and only that.** `api/client.ts`
   normalises the refusal on every call that names a space — the two filtered
-  reads, the write target on `createNode`, all three lifecycle calls, and both
-  halves of the upload — into one `UnknownSpaceError`. Two views once kept their
+  reads, the write target on `createNode`, all three lifecycle calls, both
+  halves of the upload, and a cycle's `scope` on `runCycle` — into one
+  `UnknownSpaceError`. Two views once kept their
   own `^unknown space:` match because the write path was not wrapped; both are
   gone, and a third would be the bug, not the belt. If a call ever throws a bare
   `ApiError` carrying that message, fix the client. Facts a view needs *beyond*
@@ -296,8 +300,9 @@ Conventions that hold across the tree:
   would turn the filter into an existence oracle over spaces the reader cannot
   read. Say what changed instead — a space stops resolving once it is archived,
   and a renamed one stops answering to its old name. `views/search/spaceFailure.ts`,
-  `views/editor/createOutcome.ts` and `views/spaces/spaces.ts` own that copy and
-  pin it with tests. The one refusal that *does* name a space — creating one
+  `views/editor/createOutcome.ts`, `views/spaces/spaces.ts` and
+  `views/journal/journal.ts`'s `describeRunFailure` — a cycle's `scope` names a
+  space too — own that copy and pin it with tests. The one refusal that *does* name a space — creating one
   whose name an **archived** space still holds (a space title is reserved for
   good) — is not an exception to this: it is the server's message, shown
   verbatim, and creating a space means writing `meta`, which is exactly the
@@ -361,8 +366,8 @@ Conventions that hold across the tree:
 ## The API client
 
 `src/api/client.ts` is the only place that calls `fetch`. It covers the whole
-Phase-3 endpoint surface, typed, and every route it names is served by
-`nodum.http_api`.
+Phase-3 endpoint surface plus the four consolidation-cycle routes, typed, and
+every route it names is served by `nodum.http_api`.
 
 What it handles for you:
 
@@ -371,6 +376,15 @@ What it handles for you:
   return a plain array;
 - raises `ApiError` (carrying `status`, `type`, `message`) on any non-2xx, with
   `isNotFound` / `isForbidden` / `isRetryable` helpers;
+- raises `RollbackConflictError` (test it with `isRollbackConflict`) for the one
+  failure whose body carries more than `type` and `message`: a refused rollback
+  names the rows standing in its way, and those rows exist nowhere else once the
+  response is parsed. That is why the branch sits in `toApiError` rather than in
+  the calling route, unlike the unknown-space normalisation, which only re-reads
+  a message the caller already has. In practice a view rarely sees one — the
+  confirm dialog calls the same route with `dry_run: true` first, which answers
+  the same list under a 200 — so a 409 means the graph moved between the check
+  and the commit;
 - raises `UnknownSpaceError` (test it with `isUnknownSpace`) whenever a call
   that named a space could not resolve it. The wire is inconsistent here by
   accretion — the node listing refuses with a **404** (the service's

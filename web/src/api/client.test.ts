@@ -32,17 +32,22 @@ import {
   archiveSpace,
   createNode,
   createSpace,
+  getCycle,
   ingestUpload,
+  isRollbackConflict,
   isUnknownSpace,
+  listCycles,
   listNodes,
   redeemUploadGrant,
   renameSpace,
+  rollbackCycle,
+  runCycle,
   search,
   UnknownSpaceError,
   uploadRefusalPhase,
 } from "./client";
 import { describeFailure } from "../lib/failure";
-import type { IngestOut, UploadGrantOut } from "./types";
+import type { IngestOut, RollbackConflictOut, UploadGrantOut } from "./types";
 
 /** Answer the next request with one status and one error envelope. */
 function stubFetch(status: number, type: string, message: string) {
@@ -510,5 +515,129 @@ describe("the space controls reach the wire", () => {
     await listNodes({ type: "note" });
 
     expect(urls[0]).toBe("/api/nodes?type=note");
+  });
+});
+
+describe("the consolidation cycle routes", () => {
+  /** One captured request. */
+  interface Call {
+    url: string;
+    init: RequestInit;
+  }
+
+  /** Answer every request with one body, capturing what was sent. */
+  function capture(body: unknown, status = 200): Call[] {
+    const calls: Call[] = [];
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL, init: RequestInit = {}) => {
+      calls.push({ url: String(input), init });
+      return new Response(JSON.stringify(body), {
+        status,
+        headers: { "content-type": "application/json" },
+      });
+    });
+    return calls;
+  }
+
+  /** The JSON body of a captured call. */
+  function sentBody(call: Call | undefined): unknown {
+    return JSON.parse(String(call?.init.body ?? "null"));
+  }
+
+  it("unwraps the journal's list envelope", async () => {
+    const calls = capture({ cycles: [{ id: "cy-1" }], count: 1 });
+    const cycles = await listCycles(100);
+
+    expect(calls[0]?.url).toBe("/api/cycles?limit=100");
+    expect(cycles).toHaveLength(1);
+  });
+
+  it("sends the event window on the detail read, so the notice can name it", async () => {
+    const calls = capture({ cycle: { id: "cy-1" }, metrics: {}, events: [], events_truncated: false });
+    await getCycle("cy-1", { limit: 500 });
+
+    expect(calls[0]?.url).toBe("/api/cycles/cy-1?limit=500");
+  });
+
+  it("runs a cycle with dry_run as a real boolean, never a string", async () => {
+    // The server refuses `"false"` rather than coercing it, which is the right
+    // posture for a rehearsal flag — and the reason the client must not stringify.
+    const calls = capture({ cycle: { id: "cy-2" }, report: {} });
+    await runCycle({ dry_run: false });
+
+    expect(calls[0]?.url).toBe("/api/cycles");
+    expect(calls[0]?.init.method).toBe("POST");
+    expect(sentBody(calls[0])).toEqual({ dry_run: false });
+  });
+
+  it("names a scope only when one was chosen, so the server's default applies", async () => {
+    const scoped = capture({ cycle: { id: "cy-3" }, report: {} });
+    await runCycle({ scope: "research", dry_run: true });
+    expect(sentBody(scoped[0])).toEqual({ scope: "research", dry_run: true });
+
+    vi.unstubAllGlobals();
+    const unscoped = capture({ cycle: { id: "cy-4" }, report: {} });
+    await runCycle();
+    expect(sentBody(unscoped[0])).toEqual({});
+  });
+
+  it("normalises a scope the server would not resolve, like every other space call", async () => {
+    // `open_cycle` resolves the scope through the ordinary space rule, so a
+    // space archived since the picker was filled is refused here — and a bare
+    // ApiError would leave the view with nothing but the message to match on.
+    capture({ error: { type: "TypeNotFound", message: "unknown space: research" } }, 404);
+    const error = await runCycle({ scope: "research" }).catch((caught: unknown) => caught);
+
+    expect(isUnknownSpace(error)).toBe(true);
+    expect((error as UnknownSpaceError).space).toBe("research");
+  });
+
+  it("leaves a refusal alone when the run named no scope", async () => {
+    capture({ error: { type: "GrantNotPermitted", message: "open a cycle" } }, 403);
+    const error = await runCycle().catch((caught: unknown) => caught);
+
+    expect(isUnknownSpace(error)).toBe(false);
+  });
+
+  it("asks the rollback route to rehearse, which is what the confirm dialog needs", async () => {
+    const calls = capture({ cycle_id: "cy-1", dry_run: true, conflicts: [] });
+    await rollbackCycle("cy-1", { dryRun: true });
+
+    expect(calls[0]?.url).toBe("/api/cycles/cy-1/rollback");
+    expect(sentBody(calls[0])).toEqual({ dry_run: true });
+  });
+
+  it("keeps a refused rollback's conflicts, which live nowhere but the error body", async () => {
+    // The one failure on this surface carrying more than type and message. A
+    // generic ApiError would drop the rows, and "rollback failed" is exactly
+    // the message decision C4 exists to avoid.
+    const conflicts: RollbackConflictOut[] = [
+      {
+        kind: "edge",
+        row_id: "e1",
+        cycle_event_seq: 42,
+        cycle_event_op: "edge.propose",
+        conflicting_seq: 57,
+        conflicting_op: "edge.accept",
+        conflicting_actor: "human:alice",
+        conflicting_cycle_id: null,
+      },
+    ];
+    capture(
+      { error: { type: "RollbackConflict", message: "the graph has moved on", conflicts } },
+      409,
+    );
+    const error = await rollbackCycle("cy-1").catch((caught: unknown) => caught);
+
+    expect(isRollbackConflict(error)).toBe(true);
+    expect((error as ApiError).status).toBe(409);
+    expect(isRollbackConflict(error) ? error.conflicts : []).toEqual(conflicts);
+  });
+
+  it("leaves every other failure an ordinary ApiError", async () => {
+    capture({ error: { type: "InvalidTransition", message: "cycle cy-1 is already running" } }, 409);
+    const error = await rollbackCycle("cy-1").catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(ApiError);
+    expect(isRollbackConflict(error)).toBe(false);
   });
 });

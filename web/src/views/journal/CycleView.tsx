@@ -1,0 +1,260 @@
+/**
+ * Route `/journal/:cycleId` — one journal entry in full.
+ *
+ * Three things, in the order a reviewer needs them: what the cycle did and who
+ * asked for it, what it cost or gained in coherence, and exactly what it wrote.
+ * Then the one action that undoes all of it.
+ *
+ * Everything comes from a single `GET /api/cycles/{id}`, which composes the
+ * cycle row, its metrics and the events it wrote into one round trip. The
+ * events are the append-only log narrowed to this cycle — not a diff the cycle
+ * stored — so this page cannot disagree with the file.
+ */
+
+import { useCallback, useEffect, useRef, useState } from "react";
+import { Link, useParams } from "react-router-dom";
+import { api } from "../../api/client";
+import { EmptyState, Spinner, useToast } from "../../components";
+import type { CycleDetailOut, RollbackOut } from "../../api/types";
+import { describeFailure, formatTimestamp, formatTimestampLong } from "../../lib";
+import type { FailureDescription } from "../../lib";
+import { CycleBadges } from "./CycleBadges";
+import { EventDiff } from "./EventDiff";
+import { MetricTable } from "./MetricTable";
+import { RollbackDialog } from "./RollbackDialog";
+import {
+  CYCLE_EVENT_LIMIT,
+  cycleCaveats,
+  cycleProvenance,
+  cycleWork,
+  readConsolidationReport,
+  rollbackAvailability,
+  rollbackOutcome,
+} from "./journal";
+import type { ConsolidationReport } from "./journal";
+import "./journal.css";
+
+/** Loading / loaded / failed for the entry. */
+type LoadState =
+  | { status: "loading" }
+  | { status: "ready"; detail: CycleDetailOut }
+  | { status: "failed"; failure: FailureDescription };
+
+/** The cycle-detail route. Default-exported because the route is lazily loaded. */
+export default function CycleView() {
+  const { cycleId } = useParams<{ cycleId: string }>();
+  const toast = useToast();
+  const [load, setLoad] = useState<LoadState>({ status: "loading" });
+  const [confirming, setConfirming] = useState(false);
+  const [attempt, setAttempt] = useState(0);
+  /**
+   * Where the keyboard goes once the rollback has happened.
+   *
+   * `Modal` restores focus to its opener only when the opener is still usable,
+   * and a confirmed rollback leaves that button *disabled* — the cycle is now
+   * `rolled_back`, so there is nothing left to roll back. Focusing a disabled
+   * button drops the user on `<body>`, so the view places focus on the heading,
+   * which is also the sentence that has just changed.
+   */
+  const heading = useRef<HTMLHeadingElement>(null);
+
+  useEffect(() => {
+    if (!cycleId) return;
+    const controller = new AbortController();
+    setLoad({ status: "loading" });
+    api
+      .getCycle(cycleId, { limit: CYCLE_EVENT_LIMIT }, controller.signal)
+      .then((detail) => setLoad({ status: "ready", detail }))
+      .catch((error: unknown) => {
+        if (controller.signal.aborted) return;
+        setLoad({ status: "failed", failure: describeFailure(error, "this cycle") });
+      });
+    return () => controller.abort();
+  }, [cycleId, attempt]);
+
+  const reload = useCallback(() => setAttempt((count) => count + 1), []);
+
+  const onRolledBack = useCallback(
+    (result: RollbackOut) => {
+      toast.show("success", "Cycle rolled back", rollbackOutcome(result));
+      heading.current?.focus();
+      reload();
+    },
+    [reload, toast],
+  );
+
+  if (!cycleId) {
+    return (
+      <div className="nd-view">
+        <EmptyState
+          title="No cycle given"
+          body="A journal entry is per cycle. Pick one from the journal."
+          action={
+            <Link to="/journal" className="nd-button">
+              Open the journal
+            </Link>
+          }
+        />
+      </div>
+    );
+  }
+
+  if (load.status === "loading") {
+    return (
+      <div className="nd-view nd-jn">
+        <div className="nd-empty">
+          <Spinner large label="Loading the cycle" />
+        </div>
+      </div>
+    );
+  }
+
+  if (load.status === "failed") {
+    return (
+      <div className="nd-view nd-jn">
+        <EmptyState
+          title={load.failure.title}
+          body={load.failure.body}
+          action={
+            load.failure.kind === "not-found" ? (
+              <Link to="/journal" className="nd-button">
+                Back to the journal
+              </Link>
+            ) : (
+              <button type="button" className="nd-button" onClick={reload}>
+                Try again
+              </button>
+            )
+          }
+        />
+      </div>
+    );
+  }
+
+  const { cycle, metrics, events, events_truncated: truncated } = load.detail;
+  const caveats = cycleCaveats(cycle);
+  const rollback = rollbackAvailability(cycle);
+  const report = readConsolidationReport(cycle.report);
+
+  return (
+    <div className="nd-view nd-jn">
+      <header className="nd-view__header">
+        <div className="nd-jn-detail__heading">
+          <p className="nd-jn-detail__back">
+            <Link to="/journal">← All cycles</Link>
+          </p>
+          <h1 ref={heading} tabIndex={-1}>
+            {cycleWork(cycle)}
+          </h1>
+          <p className="nd-meta">{cycleProvenance(cycle)}</p>
+          <p className="nd-meta">
+            Started <span title={formatTimestampLong(cycle.started_at)}>{formatTimestamp(cycle.started_at)}</span>
+            {cycle.finished_at === null ? (
+              ", still running"
+            ) : (
+              <>
+                {", finished "}
+                <span title={formatTimestampLong(cycle.finished_at)}>
+                  {formatTimestamp(cycle.finished_at)}
+                </span>
+              </>
+            )}
+            .
+          </p>
+          <CycleBadges cycle={cycle} />
+        </div>
+        <div className="nd-jn-detail__actions">
+          <button
+            type="button"
+            className="nd-button nd-button--danger"
+            onClick={() => setConfirming(true)}
+            disabled={!rollback.available}
+            title={rollback.reason ?? "Reverse every event this cycle wrote, in one action"}
+          >
+            Roll this cycle back
+          </button>
+          {rollback.reason === null ? null : (
+            <p className="nd-meta nd-jn-detail__reason">{rollback.reason}</p>
+          )}
+        </div>
+      </header>
+
+      {caveats.length > 0 ? (
+        <ul className="nd-jn-caveats">
+          {caveats.map((caveat) => (
+            <li key={caveat}>{caveat}</li>
+          ))}
+        </ul>
+      ) : null}
+
+      {report === null ? null : <JobReports report={report} />}
+
+      <MetricTable metrics={metrics} />
+
+      <EventDiff
+        events={events}
+        truncated={truncated}
+        limit={CYCLE_EVENT_LIMIT}
+        dryRun={cycle.dry_run}
+      />
+
+      {confirming ? (
+        <RollbackDialog
+          cycle={cycle}
+          onRolledBack={onRolledBack}
+          onClose={() => setConfirming(false)}
+        />
+      ) : null}
+    </div>
+  );
+}
+
+/**
+ * The runner's own report, job by job.
+ *
+ * Shown beside the event list rather than instead of it: the report says what
+ * each job *examined and decided*, which the log cannot tell you — a job that
+ * looked at 400 nodes and wrote nothing leaves no event at all — while the log
+ * says what actually changed. The `notes` are the sentences that make the
+ * numbers readable (a degraded signal, a rehearsal, a no-op that is correct),
+ * so they are rendered rather than summarised.
+ */
+function JobReports({ report }: { report: ConsolidationReport }) {
+  if (report.jobs.length === 0) return null;
+
+  return (
+    <section className="nd-jn-section" aria-label="The runner's report">
+      <h2 className="nd-jn-section__title">Jobs</h2>
+      <ul className="nd-jn-jobs">
+        {report.jobs.map((job) => (
+          <li key={job.name} className="nd-jn-job">
+            <div className="nd-jn-job__head">
+              <span className="nd-mono nd-jn-job__name">{job.name}</span>
+              <span className="nd-meta">
+                examined {job.examined} · proposed {job.proposed} · applied {job.applied} · skipped{" "}
+                {job.skipped}
+              </span>
+            </div>
+            {job.truncated ? (
+              <p className="nd-meta nd-jn-job__warn">
+                A scan reached its cap, so this job did not see everything in scope.
+              </p>
+            ) : null}
+            {job.error === null ? null : (
+              <p className="nd-jn-job__error">This job raised: {job.error}</p>
+            )}
+            {job.notes.length === 0 ? null : (
+              <ul className="nd-jn-job__notes">
+                {job.notes.map((note) => (
+                  <li key={note}>{note}</li>
+                ))}
+              </ul>
+            )}
+          </li>
+        ))}
+      </ul>
+    </section>
+  );
+}
+
+export { CycleView };

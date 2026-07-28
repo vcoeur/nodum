@@ -471,6 +471,152 @@ export interface SpaceOut extends NodeOut {
 }
 
 /* ------------------------------------------------------------------ */
+/* Consolidation cycles — the dream journal (design §8.4)               */
+/* ------------------------------------------------------------------ */
+
+/** How a cycle came to exist — `service.CYCLE_TRIGGERS`. */
+export type CycleTrigger = "manual" | "scheduled" | "curative" | "rollback";
+
+/** Where a cycle is in its life — `service.CYCLE_STATUSES`. */
+export type CycleStatus = "running" | "completed" | "failed" | "rolled_back";
+
+/**
+ * One consolidation cycle — a dream-journal entry.
+ *
+ * The omission is the design's, not an oversight: there is **no diff here**.
+ * What the cycle changed is `list_events(cycle_id=…)`, which
+ * {@link CycleDetailOut} carries, so the journal can never become a second
+ * record that disagrees with the append-only log.
+ *
+ * `triggered_by` is who *asked* — a `human:<id>`, or the literal `scheduler` —
+ * and is deliberately not the actor on the events inside, which is who *acted*
+ * (the gardener). `report` is null while the cycle is still running, as
+ * `finished_at` is, and `rolled_back_by` names the rollback cycle that reversed
+ * this one.
+ *
+ * `trigger` and `status` are typed as plain strings for the same reason every
+ * other enum-shaped field here is: the server may add a value, and a union that
+ * silently excludes it would make a real row unrepresentable.
+ */
+export interface CycleOut {
+  id: string;
+  trigger: string;
+  triggered_by: string;
+  scope: string | null;
+  dry_run: boolean;
+  status: string;
+  report: JsonObject | null;
+  started_at: string;
+  finished_at: string | null;
+  rolled_back_by: string | null;
+}
+
+/**
+ * The coherence metrics, one snapshot per key: `{before: {...}, after: {...}}`.
+ *
+ * Keyed rather than fixed on purpose (`ConsolidationReport.metrics`): 5b's two
+ * judgement-dependent metrics join the object when they can be computed, with
+ * no migration and no change here.
+ */
+export type CycleMetrics = Record<string, Record<string, number>>;
+
+/**
+ * `GET /api/cycles/{id}` — one journal entry with the diff a reviewer reads it by.
+ *
+ * `events` is the append-only log narrowed to this cycle, newest first, and
+ * `events_truncated` is true when the read hit its limit. It is deliberately
+ * conservative — it says the list may be short, not that it provably is — so a
+ * surface must say the list may be incomplete rather than that it certainly is.
+ *
+ * `metrics` is a projection of `cycle.report["metrics"]`, `{}` for a cycle whose
+ * report carries none: a rollback, or a one-op curative cycle.
+ */
+export interface CycleDetailOut {
+  cycle: CycleOut;
+  metrics: CycleMetrics;
+  events: EventOut[];
+  events_truncated: boolean;
+}
+
+/**
+ * `POST /api/cycles` — the closed cycle plus its report typed.
+ *
+ * `cycle.report` and `report` are the same data, so a caller that just ran a
+ * cycle needs no second request to render it.
+ */
+export interface ConsolidationOut {
+  cycle: CycleOut;
+  report: JsonObject;
+}
+
+/** `POST /api/cycles` body. Both fields are the runner's own parameters. */
+export interface RunCycleBody {
+  /** Confine the cycle to one space, by id or name; absent is the whole file. */
+  scope?: string;
+  /**
+   * Rehearse it: every job computed, the report written, **no graph event
+   * emitted**. A real boolean — the server refuses the string `"false"` rather
+   * than coercing it, which is the right posture for a rehearsal flag.
+   */
+  dry_run?: boolean;
+}
+
+/**
+ * One row standing between a cycle and its rollback (decision C4).
+ *
+ * Rollback refuses rather than clobbers, so the refusal names both ends of the
+ * collision: the cycle's own event, and the event that moved the row since.
+ * `kind` is `node` or `edge`; `conflicting_cycle_id` is set when the later work
+ * was itself a cycle's — still outside this cycle, and still a conflict.
+ */
+export interface RollbackConflictOut {
+  kind: string;
+  row_id: string;
+  cycle_event_seq: number;
+  cycle_event_op: string;
+  conflicting_seq: number;
+  conflicting_op: string;
+  conflicting_actor: string;
+  conflicting_cycle_id: string | null;
+}
+
+/**
+ * `POST /api/cycles/{id}/rollback` — the outcome, or on a dry run the verdict.
+ *
+ * `rollback_cycle_id` names the new `trigger='rollback'` cycle every reversal
+ * event is stamped with, and is null on a dry run, which opens no cycle and
+ * writes nothing. `skipped_events` are the cycle's non-graph events — audit
+ * records with no graph effect to reverse.
+ *
+ * `conflicts` is empty on a rollback that happened; on a dry run it is the
+ * reason it would not. A **real** rollback that meets one refuses with 409 and
+ * the same list in the error body — see `RollbackConflictError`.
+ */
+export interface RollbackOut {
+  cycle_id: string;
+  rollback_cycle_id: string | null;
+  dry_run: boolean;
+  reversed_events: number[];
+  skipped_events: number[];
+  restored_nodes: string[];
+  restored_edges: string[];
+  deleted_nodes: string[];
+  deleted_edges: string[];
+  redirects_removed: string[];
+  conflicts: RollbackConflictOut[];
+}
+
+/** `POST /api/cycles/{id}/rollback` body. */
+export interface RollbackCycleBody {
+  /**
+   * Compute the plan and return it without writing anything — the "would this
+   * succeed?" a confirm dialog needs, which answers **200** with the conflicts
+   * in `conflicts` instead of raising.
+   */
+  dry_run?: boolean;
+}
+
+/* ------------------------------------------------------------------ */
 /* Shapes the HTTP surface adds on top of models.py                     */
 /* ------------------------------------------------------------------ */
 
@@ -512,11 +658,19 @@ export type LinkSuggestion = NodeOut;
 /** The list envelope every nodum surface uses: `{"<plural>": [...], "count": n}`. */
 export type ListEnvelope<K extends string, T> = { [P in K]: T[] } & { count: number };
 
-/** The error body every non-2xx response carries. */
+/**
+ * The error body every non-2xx response carries.
+ *
+ * `conflicts` is the one failure on this surface whose body carries more than
+ * `type` and `message`: a refused rollback names the rows in the way, because a
+ * human told which four rows are blocking it can act and one told "rollback
+ * failed" cannot. Every other failure omits the key.
+ */
 export interface ApiErrorBody {
   error: {
     type: string;
     message: string;
+    conflicts?: RollbackConflictOut[];
   };
 }
 

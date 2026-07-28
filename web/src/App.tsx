@@ -26,6 +26,7 @@ const VIEWS = [
   { to: "/search", label: "Search" },
   { to: "/editor", label: "Editor" },
   { to: "/review", label: "Review" },
+  { to: "/journal", label: "Journal" },
   { to: "/graph", label: "Graph" },
   { to: "/assets", label: "Assets" },
   { to: "/spaces", label: "Spaces" },

@@ -34,8 +34,11 @@ import type {
   ApiErrorBody,
   AssetOut,
   BatchTransitionOut,
+  ConsolidationOut,
   CreateEdgeBody,
   CreateNodeBody,
+  CycleDetailOut,
+  CycleOut,
   DiffOut,
   EdgeFilters,
   EdgeOut,
@@ -56,7 +59,11 @@ import type {
   RequestUploadBody,
   ReviewQueueFilters,
   RevokeGrantBody,
+  RollbackConflictOut,
+  RollbackCycleBody,
+  RollbackOut,
   RotatedTokenOut,
+  RunCycleBody,
   SearchFilters,
   SearchResult,
   SetGrantBody,
@@ -186,7 +193,7 @@ const SPACE_HOME = "meta";
  * `POST /api/nodes` is equally an unknown node *type*.
  *
  * Applied to **every** call that names a space — the two filtered reads, the
- * write target, and the three lifecycle routes — so that
+ * write target, the three lifecycle routes, and a cycle's `scope` — so that
  * {@link isUnknownSpace} is a complete answer and no view has to keep a second
  * copy of this test.
  *
@@ -219,6 +226,39 @@ function unknownSpaceReference(error: unknown): string | null {
 }
 
 /**
+ * A rollback the graph has moved past — 409, with the rows that are in the way.
+ *
+ * The one refusal on this surface whose body carries more than `type` and
+ * `message` (`http_api._rollback_conflict_handler`), and the extra is the whole
+ * point of decision C4: rollback is atomic and refuses rather than clobbers, so
+ * it **names what is blocking it** rather than reporting that it failed. Parsing
+ * that back out of the message is the alternative this class avoids.
+ *
+ * A caller normally never sees one, because the dry-run preflight answers the
+ * same list under a 200 — see {@link rollbackCycle}. This is the race: the graph
+ * moved between the preflight and the commit.
+ */
+export class RollbackConflictError extends ApiError {
+  /** The rows standing between the cycle and its reversal, verbatim. */
+  readonly conflicts: RollbackConflictOut[];
+
+  constructor(status: number, type: string, message: string, conflicts: RollbackConflictOut[]) {
+    super(status, type, message);
+    this.name = "RollbackConflictError";
+    this.conflicts = conflicts;
+  }
+}
+
+/**
+ * Whether a caught value is a refused rollback carrying its conflicts.
+ *
+ * @param error The caught value.
+ */
+export function isRollbackConflict(error: unknown): error is RollbackConflictError {
+  return error instanceof RollbackConflictError;
+}
+
+/**
  * Build a query string, dropping undefined/null and repeating array values.
  *
  * Takes a plain object rather than a `Record`, so the typed filter interfaces
@@ -248,18 +288,29 @@ function query(params: object | undefined): string {
  *
  * A proxy or a crash can return HTML or nothing at all; the status is then the
  * only signal we have, and it still has to become an ApiError.
+ *
+ * The `conflicts` branch is here rather than in the calling route because this
+ * is the **only** place an error body is parsed, and the rows it carries exist
+ * nowhere else once it returns — unlike the unknown-space normalisation, which
+ * re-reads the message a caller already has. That is the whole difference
+ * between the two shapes.
  */
 async function toApiError(response: Response): Promise<ApiError> {
   let type = "HTTPError";
   let message = `${response.status} ${response.statusText}`.trim();
+  let conflicts: RollbackConflictOut[] | null = null;
   try {
     const body = (await response.json()) as Partial<ApiErrorBody>;
     if (body && typeof body === "object" && body.error) {
       type = body.error.type ?? type;
       message = body.error.message ?? message;
+      if (Array.isArray(body.error.conflicts)) conflicts = body.error.conflicts;
     }
   } catch {
     // Body was not JSON — keep the status-derived message.
+  }
+  if (conflicts !== null) {
+    return new RollbackConflictError(response.status, type, message, conflicts);
   }
   return new ApiError(response.status, type, message);
 }
@@ -1129,6 +1180,98 @@ function relabelUploadSpace(error: unknown, space: string | undefined): unknown 
 }
 
 /* ------------------------------------------------------------------ */
+/* Consolidation cycles — the dream journal (design §8.4)               */
+/* ------------------------------------------------------------------ */
+
+/**
+ * `GET /api/cycles` — the consolidation journal, newest first.
+ *
+ * Human-only server-side, for the reason the event log is: a journal entry says
+ * what the gardener did across every space in the file.
+ */
+export function listCycles(limit?: number, signal?: AbortSignal): Promise<CycleOut[]> {
+  return requestList<CycleOut>("cycles", `/cycles${query({ limit })}`, signal ? { signal } : {});
+}
+
+/**
+ * `GET /api/cycles/{id}` — one entry, its metrics, and the events it wrote.
+ *
+ * The diff is `list_events` narrowed to the cycle — the same append-only log
+ * every other read comes from — so the entry cannot become a second record that
+ * disagrees with what happened. `limit` bounds the event window and
+ * `events_truncated` says when it bit.
+ */
+export function getCycle(
+  id: string,
+  options?: { limit?: number },
+  signal?: AbortSignal,
+): Promise<CycleDetailOut> {
+  return request<CycleDetailOut>(
+    `/cycles/${encodeURIComponent(id)}${query({ limit: options?.limit })}`,
+    signal ? { signal } : {},
+  );
+}
+
+/**
+ * `POST /api/cycles` — run a consolidation cycle now.
+ *
+ * The on-demand half of "a cycle runs, on demand and on a schedule". The
+ * schedule is off unless configured, so without this a fresh install's journal
+ * stays empty forever.
+ *
+ * `dry_run` rehearses it: every job computed, the report written, and **no graph
+ * event emitted**, which is the checkable form of "it changed nothing". It is
+ * sent as a real boolean because the server refuses a string there rather than
+ * coercing it.
+ *
+ * `scope` names a space, so a target the server will not resolve throws
+ * {@link UnknownSpaceError} exactly as every other space-naming call in this
+ * file does — `open_cycle` resolves the scope through the ordinary space rule,
+ * and a space archived since the picker was filled is the live case.
+ */
+export async function runCycle(
+  body: RunCycleBody = {},
+  signal?: AbortSignal,
+): Promise<ConsolidationOut> {
+  try {
+    return await request<ConsolidationOut>("/cycles", {
+      method: "POST",
+      body,
+      ...(signal ? { signal } : {}),
+    });
+  } catch (error) {
+    throw asUnknownSpace(error, body.scope);
+  }
+}
+
+/**
+ * `POST /api/cycles/{id}/rollback` — take a whole cycle back (design D7).
+ *
+ * **Call it with `dryRun` first.** A dry run opens no cycle, writes nothing, and
+ * returns any conflicts in `conflicts` under a **200** — which is the "would
+ * this succeed?" a confirm dialog needs, so the human meets a conflict *before*
+ * committing rather than after. A real rollback that meets one refuses with 409
+ * and the same list, raised as {@link RollbackConflictError}; that path is the
+ * race where the graph moved between the two calls, not the ordinary one.
+ *
+ * @param id The cycle to take back.
+ * @param options `dryRun` rehearses the reversal.
+ */
+export function rollbackCycle(
+  id: string,
+  options: { dryRun?: boolean } = {},
+  signal?: AbortSignal,
+): Promise<RollbackOut> {
+  const body: RollbackCycleBody =
+    options.dryRun === undefined ? {} : { dry_run: options.dryRun };
+  return request<RollbackOut>(`/cycles/${encodeURIComponent(id)}/rollback`, {
+    method: "POST",
+    body,
+    ...(signal ? { signal } : {}),
+  });
+}
+
+/* ------------------------------------------------------------------ */
 /* Event log + export                                                   */
 /* ------------------------------------------------------------------ */
 
@@ -1213,6 +1356,10 @@ export const api = {
   requestUploadUrl,
   redeemUploadGrant,
   ingestUpload,
+  listCycles,
+  getCycle,
+  runCycle,
+  rollbackCycle,
   listEvents,
   undo,
   exportNode,
