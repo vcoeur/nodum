@@ -105,6 +105,19 @@ Handlers call the service inline rather than through a thread pool: the service
 opens one short-lived connection per call and SQLite has a single writer
 anyway, so a local single-user server gains nothing from concurrency here and
 stays much easier to reason about.
+
+**One handler is the exception, and it is the one that is not a read of a
+row.** ``POST /api/cycles`` runs a whole consolidation cycle, which is every
+job over every node in scope — measured at 3.75 s on 450 nodes with no
+embedding provider, and minutes on a real graph with one. Inline, that is not a
+slow request, it is a **stopped server**: the event loop is single-threaded, so
+``/healthz``, the SPA and every other tab stall for exactly as long as the
+cycle runs. :mod:`nodum.scheduler` already made this argument for the nightly
+half and answered it with :func:`asyncio.to_thread`; the on-demand half is the
+one a human is actually watching, so it runs through
+:func:`~starlette.concurrency.run_in_threadpool` for the same reason. The
+identity boundary is untouched: what goes to the thread is :func:`_write`
+itself, so the principal is still bound in the one place this module binds one.
 """
 
 from __future__ import annotations
@@ -124,6 +137,7 @@ from pathlib import Path
 from typing import Any
 
 from starlette.applications import Starlette
+from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import Headers, QueryParams, UploadFile
 from starlette.exceptions import HTTPException
 from starlette.middleware import Middleware
@@ -480,6 +494,13 @@ EXCEPTION_STATUS: dict[type[Exception], int] = {
     RollbackConflict: 409,
     AccountExists: 409,
     SpaceNameTaken: 409,
+    # 409 too, and the class says so itself: a cycle was asked for while one is
+    # already running. It derives from `ValueError`, so it already rendered as a
+    # clean 400 with the right message — but "a cycle is in progress" is a
+    # conflict with current state, exactly `RollbackConflict`'s shape, and not a
+    # malformed request. A client that retries on 409 and gives up on 400 was
+    # being told the wrong thing.
+    consolidate.CycleInProgress: 409,
     # 413 — the body passed the ceiling this server is willing to read, whether
     # it was declared at mint time (`urls.mint_upload`) or delivered here. Both
     # raise `urls.PayloadTooLarge`, which derives from ValueError; this row is
@@ -2247,9 +2268,18 @@ def create_app(
         The response is the closed cycle plus its report typed — the same two
         things ``GET /api/cycles/{id}`` returns, so a caller that just ran one
         needs no second request to render it.
+
+        **It runs off the event loop.** Every other handler here calls the
+        service inline, which is right for a read of a row; a cycle is every job
+        over every node in scope, and inline it would hold the single-threaded
+        loop for its whole length — 3.75 s measured on 450 nodes without
+        embeddings, minutes with them — so ``/healthz`` and the SPA would freeze
+        with it. What is handed to the thread is :func:`_write`, not the runner,
+        so the principal is still bound where this module binds every principal.
         """
         body = await _json_body(request)
-        result = _write(
+        result = await run_in_threadpool(
+            _write,
             request,
             _run_consolidation,
             scope=_optional_str(body, "scope"),
@@ -2285,6 +2315,24 @@ def create_app(
                 )
             )
         )
+
+    async def abandon_cycle(request: Request) -> Response:
+        """Close an interrupted cycle as ``failed`` — the door out of a stuck run.
+
+        A cycle left ``running`` by a ``SIGKILL``, a power cut, or a shutdown
+        that cancelled the nightly task in flight makes its own writes
+        irreversible: ``rollback`` refuses a cycle that has not closed and
+        ``undo`` refuses every event a cycle stamped. Without this the advice
+        ("close it first") named an operation no surface offered.
+
+        Human-only in the service, which sessions satisfy by construction here.
+        It refuses a cycle that is not ``running`` (400): one that has said how
+        it ended is not abandoned, and re-closing it would overwrite that
+        record. What the run already wrote is untouched — taking that back is
+        ``POST /api/cycles/{id}/rollback``, which this is what unlocks.
+        """
+        cycle = _write(request, service.abandon_cycle, request.path_params["id"], path=db_path)
+        return EnvelopeResponse(envelope(cycle))
 
     async def roll_cycle_back(request: Request) -> Response:
         """Take a whole cycle back — all of it, or none of it (design D7).
@@ -2576,6 +2624,7 @@ def create_app(
         Route("/api/cycles", list_cycles),
         Route("/api/cycles", run_cycle, methods=["POST"]),
         Route("/api/cycles/{id}", get_cycle),
+        Route("/api/cycles/{id}/abandon", abandon_cycle, methods=["POST"]),
         Route("/api/cycles/{id}/rollback", roll_cycle_back, methods=["POST"]),
         Route("/api/me", get_me),
         Route("/api/humans", list_humans),

@@ -13,6 +13,11 @@ Four properties, and each one is a design decision rather than an accident:
   that can fire into a cycle still in progress. A cycle is a writer against a
   single-writer database, and two of them at once would be a lock fight at 3am
   that nobody is awake to read.
+* **It runs once a night, on the two nights a year that are not 24 hours
+  long.** ``NODUM_CONSOLIDATE_AT`` is a *wall clock* time and a wall clock does
+  not advance uniformly, so :func:`seconds_until` does its arithmetic in aware
+  local time — see its docstring for the two transitions and what the naive
+  version did on each.
 * **A crash does not take the server down, and does not stop the schedule.**
   The runner already closes a failing cycle ``failed`` and leaves it in the
   journal; anything that escapes it is logged here and the loop waits for the
@@ -116,11 +121,41 @@ def seconds_until(now: datetime, at: time) -> float:
 
     The result is always strictly positive: firing at the instant the run
     finished would spin the loop, so an exact match rolls to tomorrow.
+
+    **The arithmetic is done in aware local time, and that is what makes "one
+    cycle a night" literally true.** ``at`` is a *wall clock* time, and a wall
+    clock does not advance uniformly: on a DST fall-back the local day is 25
+    hours long and on a spring-forward it is 23. Subtracting two naive
+    datetimes measures neither — it measures the calendar — so the loop asked
+    for 86400 seconds and got a wall clock an hour off at the far end. Driven
+    over a real ``Europe/Paris`` timeline that ran the schedule **twice on the
+    autumn fall-back** (waking an hour early, then again at the hour it was
+    asked for) and **an hour late on the spring-forward**. Neither crashed and
+    neither overlapped — the loop is sequential — but "one cycle a night" is the
+    property, and it did not hold.
+
+    :meth:`datetime.astimezone` on a naive value reads it as local wall time and
+    attaches the offset in force *at that instant*, which is exactly the
+    question here, so the difference is real elapsed seconds. Two wall-clock
+    times are pathological by nature and answered rather than special-cased: a
+    time that occurs **twice** (02:30 on a fall-back night) resolves to its
+    first occurrence, so the cycle runs once; a time that occurs **not at all**
+    (02:30 on a spring-forward night) resolves an hour later, so the cycle still
+    runs once, on the right date.
+
+    Args:
+        now: The current local time, naive (as :func:`datetime.now` returns it)
+            or aware.
+        at: The local wall-clock time to run at.
+
+    Returns:
+        Real seconds until the next occurrence — never zero or negative.
     """
-    target = datetime.combine(now.date(), at)
-    if target <= now:
-        target = datetime.combine(now.date() + timedelta(days=1), at)
-    return (target - now).total_seconds()
+    local_now = now.astimezone()
+    target = datetime.combine(local_now.date(), at).astimezone()
+    if target <= local_now:
+        target = datetime.combine(local_now.date() + timedelta(days=1), at).astimezone()
+    return (target - local_now).total_seconds()
 
 
 class ConsolidationScheduler:

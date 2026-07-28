@@ -17,14 +17,18 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import threading
 import time as time_module
-from datetime import datetime, time, timedelta
+from contextlib import contextmanager
+from datetime import UTC, date, datetime, time, timedelta
+from zoneinfo import ZoneInfo
 
 import pytest
 from helpers import owner
+from typer.testing import CliRunner
 
-from nodum import consolidate, http_api, scheduler, service
+from nodum import cli, consolidate, http_api, scheduler, service
 from nodum.migrations import GARDENER_AGENT_ID
 
 #: The name the loop task carries, so the lifespan tests can find it in
@@ -134,6 +138,115 @@ def test_the_next_occurrence_is_always_strictly_in_the_future(now, at, expected_
     assert scheduler.seconds_until(now, at) == expected_hours * 3600
 
 
+# ── The two nights a year that are not 24 hours long ──────────────────────────
+
+
+@contextmanager
+def _local_zone(name: str):
+    """Run the block with the *process's* local zone set to ``name``.
+
+    The scheduler reads a local wall clock, because that is what
+    ``datetime.now()`` gives it, so a DST property cannot be driven by handing
+    it aware datetimes — it has to be driven by a process whose local zone
+    actually has DST. The ambient zone is restored on the way out, so this
+    depends on the zone it names and never on the one CI happens to run in.
+    """
+    previous = os.environ.get("TZ")
+    os.environ["TZ"] = name
+    time_module.tzset()
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = previous
+        time_module.tzset()
+
+
+class _ZonedVirtualTime:
+    """Virtual time over a **real** instant, reported as local wall time.
+
+    :class:`_VirtualTime` is a naive clock, which is exactly why it cannot see
+    this bug: it advances the wall clock by the delay asked for, so a wall clock
+    that skips or repeats an hour is unrepresentable in it. Here the state is an
+    aware UTC instant — what a real ``asyncio.sleep`` advances — and
+    :meth:`clock` renders it the way ``datetime.now()`` would on a machine in
+    this zone: naive local wall time.
+    """
+
+    def __init__(self, instant: datetime, zone: ZoneInfo) -> None:
+        self.instant = instant
+        self.zone = zone
+        self.delays: list[float] = []
+
+    def clock(self) -> datetime:
+        return self.instant.astimezone(self.zone).replace(tzinfo=None)
+
+    async def sleep(self, delay: float) -> None:
+        self.delays.append(delay)
+        self.instant += timedelta(seconds=delay)
+        await asyncio.sleep(0)
+
+
+@pytest.mark.parametrize(
+    ("start_utc", "nights"),
+    [
+        # The autumn fall-back: 2026-10-25 03:00 CEST becomes 02:00 CET, so the
+        # local day is 25 hours. Naive arithmetic asked for 86400 seconds and
+        # woke an hour early, ran, then ran *again* at the hour it was asked
+        # for — two cycles on one night.
+        (
+            datetime(2026, 10, 23, 12, 0, tzinfo=UTC),
+            [date(2026, 10, 24), date(2026, 10, 25), date(2026, 10, 26)],
+        ),
+        # The spring-forward: 2026-03-29 02:00 CET becomes 03:00 CEST, a
+        # 23-hour day. Naive arithmetic ran the cycle an hour late.
+        (
+            datetime(2026, 3, 27, 12, 0, tzinfo=UTC),
+            [date(2026, 3, 28), date(2026, 3, 29), date(2026, 3, 30)],
+        ),
+    ],
+    ids=["autumn-fall-back", "spring-forward"],
+)
+def test_one_cycle_a_night_holds_across_a_dst_transition(start_utc, nights):
+    """The property is "one cycle a night", and a wall clock is not a duration.
+
+    Driven over a real ``Europe/Paris`` timeline: each run's local wall clock
+    must be the configured 03:00, and the dates must be consecutive with no
+    repeat. The naive version failed both halves — twice on one date in autumn,
+    at 04:00 in spring.
+    """
+    with _local_zone("Europe/Paris"):
+        virtual = _ZonedVirtualTime(start_utc, ZoneInfo("Europe/Paris"))
+        runs: list[datetime] = []
+        reached, hold = threading.Event(), threading.Event()
+
+        def record(**kwargs: object) -> None:
+            runs.append(virtual.clock())
+            if len(runs) >= len(nights):
+                # Held open, as `_FakeRunner` does: the loop's sleeps are
+                # virtual, so without this it would race ahead through further
+                # nights while the test was still stopping it.
+                reached.set()
+                hold.wait(FLAG_TIMEOUT)
+
+        nightly = _scheduler(virtual, record, at=time(3, 0))
+
+        async def drive() -> None:
+            nightly.start()
+            try:
+                await _await_flag(reached)
+                await nightly.stop()
+            finally:
+                hold.set()
+
+        asyncio.run(drive())
+
+    assert [moment.date() for moment in runs] == nights
+    assert {moment.time() for moment in runs} == {time(3, 0)}
+
+
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 
@@ -173,6 +286,47 @@ def test_a_misconfigured_schedule_is_announced_and_the_server_still_starts(monke
     assert scheduler.ENV_CONSOLIDATE_AT in caplog.text
     assert "off" in caplog.text
     assert asyncio.run(_lifespan_task_names(app)) == set()
+
+
+def test_a_configured_schedule_is_announced_by_the_serve_banner(fresh_db, monkeypatch):
+    """The setting that *works* was the silent one, which is the wrong way round.
+
+    An unparseable ``NODUM_CONSOLIDATE_AT`` got a warning; a valid one produced
+    nothing at all on the console — so the one setting that starts a background
+    writer on the human's graph could be on, at 03:00, with no line anywhere
+    saying so. ``serve`` prints the database path and the auth posture already;
+    this belongs beside them.
+    """
+    monkeypatch.setenv(scheduler.ENV_CONSOLIDATE_AT, "03:30")
+    monkeypatch.setattr("uvicorn.run", lambda *args, **kwargs: None)
+
+    result = CliRunner().invoke(cli.app, ["serve"])
+
+    assert result.exit_code == 0, result.output
+    assert "nightly consolidation cycle: 03:30 local time" in result.stderr
+    assert scheduler.ENV_CONSOLIDATE_AT in result.stderr
+
+
+def test_an_unconfigured_schedule_says_nothing_at_all(fresh_db, monkeypatch):
+    """Off by default is the default, and a banner for it would be noise."""
+    monkeypatch.delenv(scheduler.ENV_CONSOLIDATE_AT, raising=False)
+    monkeypatch.setattr("uvicorn.run", lambda *args, **kwargs: None)
+
+    result = CliRunner().invoke(cli.app, ["serve"])
+
+    assert result.exit_code == 0, result.output
+    assert "nightly consolidation cycle" not in result.stderr
+
+
+def test_a_misconfigured_schedule_is_not_announced_twice(fresh_db, monkeypatch):
+    """One voice per fact: ``create_app`` owns the "ignored, and here is why" line."""
+    monkeypatch.setenv(scheduler.ENV_CONSOLIDATE_AT, "half past three")
+    monkeypatch.setattr("uvicorn.run", lambda *args, **kwargs: None)
+
+    result = CliRunner().invoke(cli.app, ["serve"])
+
+    assert result.exit_code == 0, result.output
+    assert "nightly consolidation cycle:" not in result.stderr
 
 
 # ── The loop ──────────────────────────────────────────────────────────────────

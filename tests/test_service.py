@@ -425,3 +425,65 @@ def test_the_reserved_prefix_is_still_answered_first(fresh_db):
     """A `builtin-` name is refused for what it is *called*, whatever kind it asked to be."""
     with pytest.raises(ValueError, match="reserved"):
         service.create_agent("builtin-anything", kind="internal", grants={}, principal=owner())
+
+
+# ── Capped reads: a limit below 1 is a refusal, never "unbounded" ─────────────
+
+
+def test_a_limit_below_one_is_refused_by_every_capped_read(fresh_db):
+    """SQLite reads a negative ``LIMIT`` as *unbounded* — the opposite answer.
+
+    `subgraph` stated the rule and `list_cycles` followed it, but `list_events`
+    and `list_nodes` took the number straight to SQL: `--limit -3` handed back
+    the entire log and the entire node list, so a caller asking for **less**
+    silently got **everything**. A `limit` of 0 was the mirror image, returning
+    nothing under a spelling that reads like "as few as possible".
+    """
+    for index in range(3):
+        service.create_node(type="note", title=f"n{index}", principal=owner())
+
+    for limit in (0, -3):
+        with pytest.raises(ValueError, match="limit must be >= 1"):
+            service.list_nodes(principal=owner(), limit=limit)
+        with pytest.raises(ValueError, match="limit must be >= 1"):
+            service.list_events(owner(), limit=limit)
+
+    # The guard refuses the bad value and nothing else: 1 still means one.
+    assert len(service.list_nodes(principal=owner(), limit=1)) == 1
+    assert len(service.list_events(owner(), limit=1)) == 1
+
+
+def test_a_missing_human_is_named_without_naming_the_table_it_lives_in(fresh_db):
+    """`no humans row with id` is schema vocabulary reaching a human at a prompt.
+
+    The convention `_get_cycle_row` states — `<thing> not found: <id>` — and the
+    person who typed `nodum human passwd <id>` or `nodum agent create bot
+    --owner <id>` has no reason to know the table is called `humans`.
+    """
+    for call in (
+        lambda: service.set_human_password("nope", "a-long-enough-password", principal=owner()),
+        lambda: service.create_agent("bot", owner_human_id="nope", principal=owner()),
+    ):
+        with pytest.raises(RecordNotFound) as missing:
+            call()
+        assert str(missing.value) == "human not found: nope"
+        assert "humans row" not in str(missing.value)
+
+
+def test_a_missing_agent_is_named_the_same_way_on_every_path_that_looks_one_up(fresh_db):
+    """The same leak, in the four places the human-facing fix first missed.
+
+    `disable`/`enable` reach it through the generic `_set_disabled`, which built
+    the message out of the table name it was handed — so the convention has to
+    hold there too, not only where the message is written out longhand.
+    """
+    for call in (
+        lambda: service.rotate_agent_token("nope", principal=owner()),
+        lambda: service.grant("nope", "main", "read", principal=owner()),
+        lambda: service.disable_agent("nope", principal=owner()),
+        lambda: service.enable_agent("nope", principal=owner()),
+    ):
+        with pytest.raises(RecordNotFound) as missing:
+            call()
+        assert str(missing.value) == "agent not found: nope"
+        assert "agents row" not in str(missing.value)

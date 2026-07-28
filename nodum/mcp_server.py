@@ -21,15 +21,36 @@ fetches the URL itself, and a host that shares no filesystem with the server
 asks ``request_upload_url`` for somewhere to PUT the bytes. No base64 ever
 crosses MCP in either direction.
 
-**Neither the review tier nor the curative tier is ever registered.** The
-review tools (``accept``, ``reject``) belong to the §8.1 "write
-(human)" tier — accepting is a *destructive* effect (it makes proposed
-structure live and archives what that structure replaces), so it stays with
-the human, on the CLI and the review API. The curative tools
-(``merge_nodes``, ``retype``, ``supersede_edge``, ``bulk_relink``,
-``consolidate``) are §8.2. Both groups are enforced the same way: they simply
-do not exist here, so there is no runtime check to argue around — and
-:mod:`nodum.service` refuses a non-human reviewer regardless of surface.
+**A tool that writes a node takes a ``space``, because the SDK will not say a
+word if it does not.** ``create_node`` had no such parameter while
+``ingest_file``/``ingest_url``/``request_upload_url`` did, and an agent asking
+for ``research`` got a 200-shaped response describing a node in ``main``: the
+generated argument model ignores unknown keys (``ArgModelBase`` is an ordinary
+pydantic model, so extras are dropped, and there is no per-tool hook to forbid
+them short of mutating a dependency's base class). The answer is a real
+parameter rather than a rejection — an agent that cannot *name* a space is not
+helped by being told its spelling was wrong — but the general shape stands:
+**anything an agent must be able to say has to be in a signature here**, since a
+keyword this module does not declare is silently discarded rather than refused.
+Every write result carries the ``space_id`` it actually landed in, which is the
+other half of that: it can be checked rather than assumed.
+
+**Three tiers are never registered, and each one is a named absence.** The
+review tools (``accept``, ``reject`` — :data:`REVIEW_TOOLS`) belong to the §8.1
+"write (human)" tier: accepting is a *destructive* effect (it makes proposed
+structure live and archives what that structure replaces), so it stays with the
+human, on the CLI and the review API. The curative tools (``merge_nodes``,
+``retype``, ``supersede_edge``, ``bulk_relink``, ``consolidate`` —
+:data:`CURATIVE_TOOLS`) are §8.2. And reversal plus the journal that records it
+(``undo``, ``rollback``, ``abandon_cycle``, ``get_cycle``, ``list_cycles`` —
+:data:`HUMAN_ONLY_TOOLS`) is the third: reversal writes recorded payloads back
+verbatim and no grant delegates that, while a journal entry says what the
+gardener did across every space in the file. All three are enforced the same
+way: they simply do not exist here, so there is no runtime check to argue
+around — and :mod:`nodum.service` refuses a non-human regardless of surface.
+The lists exist so ``tests/test_mcp_server.py`` can assert the registry stays
+disjoint from :data:`UNREGISTERED_TOOLS`; adding an operation to any of those
+tiers means adding its name to a list, never to the registry.
 
 Identity: the agent's bearer token, from the ``NODUM_AGENT_TOKEN``
 environment variable (the shape MCP client configs carry in their ``env``
@@ -96,6 +117,44 @@ CURATIVE_TOOLS = ("merge_nodes", "retype", "supersede_edge", "bulk_relink", "con
 #: archives the active structure a proposal replaces, so it is destructive and
 #: human-only; the CLI (``nodum review …``) is where it lives.
 REVIEW_TOOLS = ("accept", "reject")
+
+#: The third named absence: reversal, and the journal that records it. Never
+#: registered, asserted absent in tests, and listed here as **one decision**
+#: rather than four omissions — which is what they were. ``rollback_cycle`` is
+#: the most destructive operation in the system and was in no absence list at
+#: all, so the disjointness assertions beside :data:`CURATIVE_TOOLS` would have
+#: watched a future tool expose it without a word.
+#:
+#: Two reasons, and both are the service's own, enforced there whatever this
+#: registry says:
+#:
+#: * **Reversal is human-only** (``undo``, ``rollback``, ``abandon_cycle``).
+#:   ``undo`` writes a recorded payload back verbatim, ``state = 'active'``
+#:   included, and no grant delegates that; ``rollback_cycle`` does it for a
+#:   whole cycle at once, across spaces, and an operation strictly more powerful
+#:   than ``undo`` cannot be gated more weakly. ``abandon_cycle`` is the door
+#:   that *makes* an interrupted cycle's writes reversible — declaring somebody
+#:   else's run dead — so it is gated with them.
+#: * **The journal spans the whole file** (``get_cycle``, ``list_cycles``). An
+#:   entry says what the gardener did across every space there is, so an agent
+#:   reading it would learn the shape of territory it holds no grant on — the
+#:   reason the event log is not on this surface either.
+#:
+#: Short spellings sit beside the service's own names on purpose: this is an
+#: absence list, so it has to name what a tool would plausibly be *called*.
+HUMAN_ONLY_TOOLS = (
+    "undo",
+    "rollback",
+    "rollback_cycle",
+    "abandon_cycle",
+    "get_cycle",
+    "list_cycles",
+)
+
+#: Every name that must never appear in the registry, in one place — what the
+#: disjointness assertions ask about. A new human-only or curative operation
+#: joins one of the three lists above; it never joins the registry.
+UNREGISTERED_TOOLS = CURATIVE_TOOLS + REVIEW_TOOLS + HUMAN_ONLY_TOOLS
 
 #: The tools this server registers, by tier (documentation + test anchor).
 #:
@@ -392,12 +451,19 @@ def create_server(*, token: str, db_path: str | Path | None = None) -> FastMCP:
         content: str = "",
         parent: str | None = None,
         props: dict[str, Any] | None = None,
+        space: str | None = None,
     ) -> dict[str, Any]:
         """Create a node. Where it lands depends on your grant on the space.
 
         With a `suggest` grant the node is `proposed` and waits for review;
         with `edit` it lands `active` immediately — the grant is the whole
         difference, and nothing on this surface reports which you hold.
+
+        `space` is where the node goes — a space id or name, defaulting to
+        `main` — and you must hold a grant on it: one you cannot write refuses,
+        and one you cannot read is refused in the same words as a space that
+        does not exist. The returned node carries the `space_id` it actually
+        landed in, so check it rather than assuming.
 
         Any `[[wikilinks]]` in `content` materialise as `mentions` edges in
         the same way, and a link into a space you may only suggest in stays
@@ -410,6 +476,7 @@ def create_server(*, token: str, db_path: str | Path | None = None) -> FastMCP:
                 content=content,
                 parent_id=parent,
                 props=props,
+                space=space,
                 principal=principal,
                 path=db_path,
             )

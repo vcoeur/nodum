@@ -8,7 +8,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 import pytest
-from helpers import agent, seed_space
+from helpers import agent, owner, seed_space
 from typer.testing import CliRunner
 
 from nodum import consolidate as consolidate_module
@@ -273,6 +273,36 @@ def test_asset_register_missing_file_exits_1(fresh_db, tmp_path):
     assert "Traceback" not in result.stderr
 
 
+def test_every_command_that_reads_a_file_reports_a_missing_one_in_one_line(fresh_db, tmp_path):
+    """A missing file is the CLI contract's own example of what must never be a traceback.
+
+    ``asset register`` and ``ingest file`` already held it; these three read
+    their file *outside* ``_run`` — ``Path(...).read_text()`` evaluated in the
+    argument list of the command's own ``_run(...)``, which Python builds before
+    ``_run`` is entered — so a missing path raised ``FileNotFoundError`` past the
+    error boundary and printed a full Rich traceback with an exit code that was
+    not 1. Exactly the trap ``_principal`` was moved inside ``_run`` to close.
+    """
+    missing = str(tmp_path / "missing.md")
+    node = _run_json("node", "create", "--type", "note", "--title", "Target")
+    for command in (
+        ["node", "create", "--type", "note", "--title", "T", "--content-file", missing],
+        ["node", "update", node["id"], "--content-file", missing],
+        ["edge", "create-batch", str(tmp_path / "missing.json")],
+        # The two that already behaved, swept with the rest so the rule is one
+        # rule rather than two commands that happen to agree.
+        ["asset", "register", str(tmp_path / "missing.png")],
+        ["ingest", "file", str(tmp_path / "missing.pdf")],
+    ):
+        args = [*command, "--as", "owner"] if _needs_as(command) else list(command)
+        result = runner.invoke(app, args)
+
+        assert result.exit_code == 1, command
+        assert "missing." in result.stderr, command
+        assert "Traceback" not in result.output, command
+        assert result.stdout == "", command
+
+
 def test_locked_database_exits_1(fresh_db, monkeypatch):
     """SQLite has one writer: contention is a message, not a stack trace."""
     real_connect = db.connect
@@ -496,6 +526,34 @@ def test_human_and_agent_admin_over_the_cli(fresh_db):
     _run_json("agent", "disable", "researcher", "--as", "owner")
     disabled = {row["id"]: row for row in _run_json("agent", "list", "--as", "owner")["agents"]}
     assert disabled["researcher"]["disabled"] is True
+
+
+def test_agent_create_has_no_kind_flag_at_all(fresh_db):
+    """The flag's one non-default value became a permanent refusal, so it is gone.
+
+    `service.create_agent` refuses `kind="internal"` outright — a second
+    internal agent does not add a gardener, it takes the existing one away, and
+    with no `agent delete` the install was recoverable only by hand-editing the
+    database. What was left was a flag with exactly one accepted value, offering
+    a choice the service does not have; HTTP already hardcoded `external`.
+    """
+    refused = runner.invoke(
+        app, ["agent", "create", "mygardener", "--kind", "internal", "--as", "owner"]
+    )
+
+    assert refused.exit_code == 2  # typer: no such option
+    assert "--kind" in refused.output
+    assert "mygardener" not in {row["id"] for row in _run_json("agent", "list")["agents"]}
+    # And the flag is gone from the self-describing surface too.
+    payload = _run_json("schema-dump")
+    agent_group = next(row for row in payload["commands"] if row["name"] == "agent")
+    create = next(row for row in agent_group["subcommands"] if row["name"] == "create")
+    assert "--kind" not in {flag for param in create["params"] for flag in param.get("flags", ())}
+
+    # An ordinary create still works, and is external.
+    made = runner.invoke(app, ["agent", "create", "researcher", "--as", "owner"])
+    assert made.exit_code == 0, made.output
+    assert json.loads(made.stdout)["agent"]["kind"] == "external"
 
 
 def test_space_admin_over_the_cli(fresh_db):
@@ -1112,6 +1170,47 @@ def test_cycle_list_and_cycle_get_are_the_journal(fresh_db):
     assert _run_json("cycle-get", first["id"]) == first
 
 
+def test_cycle_abandon_is_the_door_out_of_an_interrupted_run(fresh_db):
+    """A cycle left `running` makes its own writes irreversible on every surface.
+
+    `rollback` refuses a cycle whose event set is not closed and `undo` refuses
+    every event a cycle stamped, so a run killed by a `SIGKILL`, a power cut, or
+    a server shutdown cancelling the nightly task stranded its writes behind
+    advice ("close it first") that no verb could carry out. `service.abandon_
+    cycle` existed and nothing called it.
+    """
+    cycle = service.open_cycle(trigger="manual", principal=owner())
+    with service.in_cycle(cycle.id):
+        node = service.create_node(type="claim", title="Half-written", principal=owner())
+
+    stuck = runner.invoke(app, ["rollback", cycle.id, "--as", "owner"])
+    assert stuck.exit_code == 1
+    assert "still running" in stuck.stderr
+
+    abandoned = _run_json("cycle-abandon", cycle.id)
+
+    assert abandoned["status"] == "failed"
+    assert abandoned["report"]["op"] == "abandon_cycle"
+    assert abandoned["report"]["abandoned_by"] == "human:owner"
+    # And the writes it made are reachable again, which is the whole point.
+    _run_json("rollback", cycle.id)
+    assert _run_json("cycle-get", cycle.id)["status"] == "rolled_back"
+    gone = runner.invoke(app, ["node", "get", node.id, "--as", "owner"])
+    assert gone.exit_code == 1
+
+
+def test_cycle_abandon_refuses_a_cycle_that_already_ended(fresh_db):
+    """Not a general "close this" verb: re-closing would overwrite the record."""
+    finished = _run_json("consolidate")["cycle"]
+
+    result = runner.invoke(app, ["cycle-abandon", finished["id"], "--as", "owner"])
+
+    assert result.exit_code == 1
+    assert "already completed, not running" in result.stderr
+    assert "Traceback" not in result.output
+    assert _run_json("cycle-get", finished["id"])["status"] == "completed"
+
+
 def test_merge_nodes_over_the_cli(fresh_db):
     survivor, duplicate, citer = _claim("Alpha"), _claim("Alpha (dup)"), _claim("Cites")
     edge = _run_json("edge", "create", citer["id"], duplicate["id"], "--type", "supports")
@@ -1139,15 +1238,50 @@ def test_merge_nodes_over_the_cli(fresh_db):
 
 
 def test_retype_over_the_cli_and_its_per_item_failures(fresh_db):
+    """A batch keeps its successes on stdout and pays for its failures in the exit code.
+
+    `ingest file`'s rule, which the curative tier did not follow: the envelope
+    is printed whatever happened, each skipped item is named on stderr, and the
+    exit code is 1 if any of them was — so a script reading only the code is not
+    told a run succeeded when part of it did not happen.
+    """
     node = _claim("Alpha")
 
-    retyped = _run_json("retype", node["id"], "missing", "--type", "note")
+    result = runner.invoke(
+        app, ["retype", node["id"], "missing", "--type", "note", "--as", "owner"]
+    )
 
+    assert result.exit_code == 1
+    retyped = json.loads(result.stdout)
     assert retyped["new_type"] == "note"
     assert retyped["transitioned"] == [node["id"]]
     assert [failure["id"] for failure in retyped["failed"]] == ["missing"]
     assert retyped["cycle_id"]
+    # The reason is on stderr too: an exit code of 1 with a silent stderr breaks
+    # the other half of the contract.
+    assert "failed missing:" in result.stderr
+    assert "Traceback" not in result.output
+    # The success still landed — that is what "never loses its successes" means.
     assert _run_json("node", "get", node["id"])["type"] == "note"
+
+
+def test_a_retype_that_changed_nothing_does_not_exit_zero(fresh_db):
+    """`nodum retype main --type note` accomplishes nothing and used to report success.
+
+    It reported the refusal in `failed[]`, opened a curative cycle that closed
+    `completed` with zero events, and exited **0** — the one thing a script
+    reads. `ingest file` had set exit 1 in exactly this situation since Phase 4.
+    """
+    result = runner.invoke(app, ["retype", "main", "--type", "note", "--as", "owner"])
+
+    assert result.exit_code == 1
+    payload = json.loads(result.stdout)
+    assert payload["transitioned"] == []
+    assert [failure["id"] for failure in payload["failed"]] == ["main"]
+    assert "failed main:" in result.stderr
+    assert "Traceback" not in result.output
+    # The cycle is still in the journal, and still says it changed nothing.
+    assert _run_json("events", "--cycle", payload["cycle_id"])["events"] == []
 
 
 def test_supersede_edge_with_and_without_a_replacement(fresh_db):

@@ -19,7 +19,10 @@ List-returning commands wrap their rows in a named key plus a `count`:
 { "nodes": [ … ], "count": 2 }
 ```
 
-Errors are always one line on stderr with exit 1 — never a traceback.
+Errors are always one line on stderr with exit 1 — never a traceback. That
+includes a missing file, whichever command reads one: `asset register
+/missing.png`, `ingest file /missing.pdf`, `edge create-batch /missing.json`,
+and `node create|update --content-file /missing.md`.
 
 ## Conventions
 
@@ -34,7 +37,7 @@ MCP, never the CLI, and land per their grants (`suggest` → `proposed`, `edit` 
 `active`).
 
 **Human-only operations** — `accept`, `reject`, `archive`, `undo`, `rollback`,
-every
+`cycle-abandon`, `cycle-list`, `cycle-get`, every
 `review` subcommand, and all account/grant administration (`human`, `agent`,
 `grant`, `revoke`, `space-*` commands) require a human principal. Review
 (`accept`/`reject`/`archive`) and the curative tier (`merge-nodes`, `retype`,
@@ -125,7 +128,10 @@ including every parameter.
   enabled, no surface can mint a principal at all, the CLI's trusted-local path
   included.
 - `agent create/list/token-rotate/disable/enable` — Manage agent accounts
-  (`create`/`token-rotate` print the show-once token to stderr).
+  (`create`/`token-rotate` print the show-once token to stderr). Every account
+  created here is **external** and there is no flag for anything else: the
+  service refuses an internal one, because the gardener is selected by being the
+  only row of that kind and a second one takes it away rather than adding to it.
 - `grant <agent> <space> <level>` / `revoke <agent> <space>` / `grants [--agent]` —
   Event-logged grant administration, levels `read`/`suggest`/`edit`. `revoke`
   reaches an **archived** space, by id or by name: archiving makes a grant
@@ -188,15 +194,25 @@ including every parameter.
   (repeatable; default is all of them, in order), `--dry-run` computes
   everything and emits **no** event at all.
 - `cycle-list` — List cycles, newest first: the dream journal. Human-only.
+  `--limit` below 1 is an error, not SQL's "unbounded".
 - `cycle-get <id>` — One journal entry: what ran, what it measured, how it
-  ended. Human-only.
+  ended. Human-only. It returns the **row alone**; what the cycle *changed* is
+  `events --cycle <id>`, because the row stores no diff of its own.
+- `cycle-abandon <id>` — Close a cycle a crash left `running`, as `failed`.
+  Human-only, and the door out of an interrupted run: `rollback` refuses a cycle
+  that has not closed and `undo` refuses every cycle-stamped event, so until it
+  is closed the run's writes are irreversible on every surface. A cycle that
+  already said how it ended is refused rather than re-closed.
 - `rollback <cycle-id>` — Take a whole cycle back, all of it or none of it.
   `--dry-run` reports what would be reversed and what stands in the way.
   Human-only.
 - `merge-nodes <ids…> --into <id>` — Merge nodes into a survivor. Soft and
   reversible: nothing is destroyed.
 - `retype <ids…> --type <t>` — Change nodes' type. The one sanctioned exception
-  to a node's type being fixed at creation.
+  to a node's type being fixed at creation. Per-item failures are reported in
+  `failed[]`, named on stderr, **and in the exit code**: 1 if any node was
+  skipped, exactly as `ingest file` does, so a run that accomplished nothing
+  cannot report success.
 - `supersede-edge <edge-id>` — Retire an edge that stopped being true,
   optionally naming its successor with `--src`, `--dst`, `--type`,
   `--confidence` and `--set`.
@@ -356,12 +372,21 @@ Spaces mirror their commands the same way: `GET /api/nodes` and
 `POST /api/spaces/{id}/rename` and `POST /api/spaces/{id}/archive`, with
 `GET /api/spaces` returning exactly what `nodum space-list` prints.
 `POST /api/ingest` mirrors `nodum ingest`, taking exactly one of `path` and
-`url`. The consolidation journal is there too: `GET /api/cycles` (newest first),
+`url`. The consolidation journal is there too: `GET /api/cycles` (newest first,
+byte-identical to `nodum cycle-list`),
 `POST /api/cycles` (run one now, with optional `scope` and `dry_run`),
-`GET /api/cycles/{id}` (the entry plus the events it wrote, bounded by `?limit=`
-with `events_truncated` when it bit) and `POST /api/cycles/{id}/rollback`, where
+`GET /api/cycles/{id}`, `POST /api/cycles/{id}/abandon` (close a run that never
+finished) and `POST /api/cycles/{id}/rollback`, where
 a graph that has moved on is a **409** carrying the conflicting rows rather than
-a bare refusal. The curative tier has no HTTP routes at all — it is the CLI's.
+a bare refusal — and asking for a cycle while one is running is a 409 too, since
+the request was fine and the graph was busy. `GET /api/cycles/{id}` is the one
+place the two surfaces deliberately differ: it composes the row, its metrics and
+`events --cycle` (bounded by `?limit=`, with `events_truncated` when it bit)
+into one round trip, because a browser paints one screen from one request, while
+`nodum cycle-get` returns the row and leaves the diff to `nodum events --cycle`.
+`POST /api/cycles` runs the cycle **off the event loop**, so the rest of the
+server keeps answering for the minutes a real cycle takes.
+The curative tier has no HTTP routes at all — it is the CLI's.
 The two capability-URL redemption routes — `GET /api/download/{token}`
 and `PUT /api/uploads/{token}` — are the only `/api` routes outside the session
 gate: the single-use token in the path *is* the authorisation, so there is no
@@ -378,7 +403,11 @@ process. Unset means **off**, which is the default: a background process that
 writes to the graph without being asked is not something to enable by surprise,
 and a flag would put that one keystroke away from an ordinary `serve`. A value
 that is set but unreadable is announced on stderr and ignored, rather than
-stopping the server from booting.
+stopping the server from booting — and a value that **works** is announced too,
+in the startup banner beside the database path, since a background writer on the
+graph is the last thing that should start silently. "One a night" holds across
+daylight-saving changes: the wait is computed in aware local time, so the
+25-hour night does not run two cycles and the 23-hour one does not run late.
 
 ```sh
 NODUM_CONSOLIDATE_AT=03:30 nodum serve

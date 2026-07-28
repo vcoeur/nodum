@@ -25,9 +25,11 @@ from nodum import assets, auth, ingest, mcp_server, service, urls
 from nodum.mcp_server import (
     ADDITIVE_TOOLS,
     CURATIVE_TOOLS,
+    HUMAN_ONLY_TOOLS,
     OVERWRITING_TOOLS,
     READ_TOOLS,
     REVIEW_TOOLS,
+    UNREGISTERED_TOOLS,
     create_server,
 )
 
@@ -152,12 +154,45 @@ def test_ingestion_is_annotated_additive_because_it_only_ever_adds(fresh_db):
 
 
 def test_the_grown_registry_still_holds_no_review_or_curative_tool(fresh_db):
-    """Four tools bigger, and the two absent tiers are still absent."""
+    """Four tools bigger, and the absent tiers are still absent."""
     names = {tool.name for tool in _run(lambda session: session.list_tools()).tools}
 
     assert names.isdisjoint(REVIEW_TOOLS)
     assert names.isdisjoint(CURATIVE_TOOLS)
+    assert names.isdisjoint(HUMAN_ONLY_TOOLS)
     assert names == set(READ_TOOLS) | set(ADDITIVE_TOOLS)
+
+
+def test_reversal_and_the_journal_are_a_named_absence_too(fresh_db):
+    """The disjointness assertions only cover what a list names — and these were nameless.
+
+    `rollback_cycle` is the most destructive operation in the system: it writes
+    recorded payloads back verbatim, `state = 'active'` included, across spaces,
+    for a whole cycle at once. It was in no absence list, and neither were
+    `undo`, `abandon_cycle`, or the two journal reads — so a future tool
+    exposing any of them would have passed every assertion in this file. That is
+    the gap this closes: their absence is now a **decision** with a name on it.
+    """
+    assert {"undo", "rollback_cycle", "abandon_cycle", "get_cycle", "list_cycles"} <= set(
+        HUMAN_ONLY_TOOLS
+    )
+    # The three absence lists are one surface, and nothing may be in two tiers.
+    assert set(UNREGISTERED_TOOLS) == (
+        set(CURATIVE_TOOLS) | set(REVIEW_TOOLS) | set(HUMAN_ONLY_TOOLS)
+    )
+    assert len(UNREGISTERED_TOOLS) == len(set(UNREGISTERED_TOOLS))
+    # And no absence list may name something the registry actually serves.
+    assert set(UNREGISTERED_TOOLS).isdisjoint(set(READ_TOOLS) | set(ADDITIVE_TOOLS))
+
+    names = {tool.name for tool in _run(lambda session: session.list_tools()).tools}
+    assert names.isdisjoint(UNREGISTERED_TOOLS)
+
+    async def scenario(session):
+        return [await _call(session, name, {}) for name in HUMAN_ONLY_TOOLS]
+
+    for result in _run(scenario):
+        assert result.isError
+        assert "unknown tool" in result.content[0].text.lower()
 
 
 # ── Token authentication: the MCP surface verifies before it serves ───────────
@@ -195,6 +230,68 @@ def test_create_node_lands_proposed_with_the_configured_actor(fresh_db):
     node = _run(scenario)
     assert node["state"] == "proposed"
     assert node["created_by"] == AGENT
+
+
+def test_create_node_files_into_the_space_it_was_asked_for(fresh_db):
+    """`space` was not a parameter, and the SDK dropped it without a word.
+
+    Three nodes asked for in `research` landed in `main` behind a 200-shaped
+    response naming `space_id: "main"` — the generated argument model ignores
+    unknown keys, so an agent had no way to choose a space and no way to learn
+    it had not got one. `ingest_file` had taken `space` since Phase 4; this is
+    the tool that writes a plain node.
+    """
+    seed_space("research")
+    grants = {"meta": "read", "main": "suggest", "research": "suggest"}
+
+    async def scenario(session):
+        return [
+            (
+                await _call(session, "create_node", {"type": "note", "title": "Filed"})
+            ).structuredContent,
+            (
+                await _call(
+                    session, "create_node", {"type": "note", "title": "Filed", "space": "research"}
+                )
+            ).structuredContent,
+        ]
+
+    default, chosen = _run(scenario, grants=grants)
+
+    assert default["space_id"] == "main"
+    assert chosen["space_id"] == "research"
+    # And an agent can discover it: the published schema is the only contract it
+    # reads before calling, so a parameter nobody advertises is one nobody uses.
+    tools = {tool.name: tool for tool in _run(lambda session: session.list_tools()).tools}
+    assert "space" in tools["create_node"].inputSchema["properties"]
+
+
+def test_create_node_cannot_reach_a_space_it_holds_nothing_on(fresh_db):
+    """The parameter narrows within the grant set; it never widens it.
+
+    A space the agent holds no grant on reads exactly like one that was never
+    created (Q13's non-oracle rule), so naming it is a refusal and not a hint.
+    """
+    seed_space("research")
+
+    async def scenario(session):
+        return [
+            await _call(
+                session, "create_node", {"type": "note", "title": "Trespass", "space": "research"}
+            ),
+            await _call(
+                session, "create_node", {"type": "note", "title": "Trespass", "space": "nowhere"}
+            ),
+        ]
+
+    ungranted, nonexistent = _run(scenario)
+
+    assert ungranted.isError and nonexistent.isError
+    # Word for word the same refusal, with only the caller's own reference
+    # echoed back — which is the whole of the non-oracle rule.
+    assert ungranted.content[0].text.replace("research", "nowhere") == nonexistent.content[0].text
+    assert "unknown space" in ungranted.content[0].text
+    assert service.list_nodes(space="research", principal=owner(), limit=50) == []
 
 
 def test_update_node_stages_a_proposed_version(fresh_db):

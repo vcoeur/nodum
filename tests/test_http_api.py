@@ -235,6 +235,11 @@ def test_node_get_is_byte_identical_to_the_cli(client, fresh_db):
         ("/api/agents", ["agent", "list", "--as", "owner"]),
         ("/api/grants", ["grants", "--as", "owner"]),
         ("/api/spaces", ["space-list", "--as", "owner"]),
+        # The journal listing. Both sides are one `list_envelope("cycles", …)`
+        # over `service.list_cycles` with the same default limit of 50; it was
+        # left out of this sweep only because the CLI command's name was still
+        # unsettled when the route landed, and it has been `cycle-list` since.
+        ("/api/cycles", ["cycle-list", "--as", "owner"]),
     ],
 )
 def test_list_envelopes_are_byte_identical_to_the_cli(client, fresh_db, http_path, cli_args):
@@ -245,6 +250,8 @@ def test_list_envelopes_are_byte_identical_to_the_cli(client, fresh_db, http_pat
         content="about [[Graph Theory]]",
         principal=owner(),
     )
+    closed = service.open_cycle(trigger="manual", principal=owner())
+    service.close_cycle(closed.id, status="completed", report={"jobs": []}, principal=owner())
 
     result = runner.invoke(cli.app, cli_args)
     assert result.exit_code == 0, result.output
@@ -255,6 +262,9 @@ def test_list_envelopes_are_byte_identical_to_the_cli(client, fresh_db, http_pat
     payload = response.json()
     key = next(name for name in payload if name != "count")
     assert payload["count"] == len(payload[key])
+    # Byte parity over two empty lists proves nothing, so every endpoint in the
+    # sweep has something to render.
+    assert payload["count"] >= 1, http_path
 
 
 def test_every_list_endpoint_uses_the_named_key_plus_count(client, fresh_db):
@@ -2813,6 +2823,41 @@ def test_a_cycle_rolls_back_over_http(client, fresh_db):
     assert client.post("/api/cycles/nope/rollback", json={}).status_code == 404
 
 
+def test_an_interrupted_cycle_is_abandoned_over_http_and_only_then_rolled_back(client, fresh_db):
+    """The stuck-run door on the surface that owns the reversal.
+
+    A cycle left ``running`` by a ``SIGKILL``, a power cut, or a shutdown that
+    cancelled the nightly task in flight is not cosmetic: rollback refuses it
+    (its event set is not closed) and ``undo`` refuses every event it stamped,
+    so its writes were irreversible on **every** surface. ``abandon_cycle``
+    existed in the service and no route reached it.
+    """
+    cycle = service.open_cycle(trigger="manual", principal=owner())
+    with service.in_cycle(cycle.id):
+        node = service.create_node(type="claim", title="Half-written", principal=owner())
+
+    stuck = client.post(f"/api/cycles/{cycle.id}/rollback", json={})
+    assert stuck.status_code == 400
+    assert "still running" in stuck.json()["error"]["message"]
+
+    abandoned = _ok(client.post(f"/api/cycles/{cycle.id}/abandon", json={}))
+
+    assert abandoned["status"] == "failed"
+    assert abandoned["report"]["op"] == "abandon_cycle"
+    assert abandoned["report"]["abandoned_by"] == OWNER_ACTOR
+    # Which is what unlocks the reversal this surface exists to offer.
+    _ok(client.post(f"/api/cycles/{cycle.id}/rollback", json={}))
+    assert _ok(client.get(f"/api/cycles/{cycle.id}"))["cycle"]["status"] == "rolled_back"
+    assert client.get(f"/api/nodes/{node.id}").status_code == 404
+
+    # It is not a general "close this cycle": one that already said how it ended
+    # is refused rather than having that record overwritten.
+    refused = client.post(f"/api/cycles/{cycle.id}/abandon", json={})
+    assert refused.status_code == 400
+    assert "not running" in refused.json()["error"]["message"]
+    assert client.post("/api/cycles/nope/abandon", json={}).status_code == 404
+
+
 def test_a_refused_rollback_is_a_409_that_names_the_rows(client, fresh_db):
     """Decision C4 over the wire: it refuses rather than clobbers, and says what.
 
@@ -2904,6 +2949,109 @@ def test_an_unknown_principal_is_a_404_and_not_a_traceback(client, fresh_db):
     assert error["type"] == "UnknownPrincipal"
     assert "0014" in error["message"]
     assert "Traceback" not in response.text
+
+
+#: How long the probe below waits for the event loop to answer while a cycle is
+#: in flight. Generous for a loop that is free (it answers in microseconds) and
+#: bounded for one that is not, so the broken shape fails in seconds rather than
+#: hanging the suite.
+LOOP_PROBE_TIMEOUT = 5.0
+
+
+def test_running_a_cycle_does_not_stall_the_rest_of_the_server(fresh_db, monkeypatch):
+    """``POST /api/cycles`` must not hold the event loop for the length of a cycle.
+
+    The handler used to call the runner inline, like every other handler here.
+    That is right for a read of a row and wrong for this one: a cycle is every
+    job over every node in scope — 3.75 s measured against a real ``nodum
+    serve`` on 450 nodes with no embedding provider, minutes on a graph with one
+    — and the loop is single-threaded, so ``/healthz``, the SPA and every other
+    tab froze for exactly that long. ``nodum.scheduler``'s own docstring is the
+    argument, made for the nightly half and unmade for the half a human clicks.
+
+    The proof is a probe fired **from inside the running cycle**: the patched
+    runner asks the event loop to serve ``/healthz`` and waits a bounded time
+    for the answer. A loop that is free answers at once; a loop executing the
+    cycle cannot answer at all, so this fails with a timeout rather than passing
+    slowly, which is what a test of "did it block?" has to do.
+    """
+    app = http_api.create_app()
+    service.set_human_password("owner", OWNER_PASSWORD, principal=owner())
+    session = _login(app)
+    _duplicate_pair()
+
+    real_consolidate = consolidate.consolidate
+    loop_box: dict[str, object] = {}
+    probes: list[httpx.Response] = []
+    ran_off_the_loop: list[bool] = []
+
+    def probing_runner(**kwargs):
+        """Stand in for the runner and ask the loop for a page while we hold it."""
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            ran_off_the_loop.append(True)
+        else:
+            ran_off_the_loop.append(False)
+
+        async def probe():
+            return await loop_box["client"].get("/healthz")
+
+        future = asyncio.run_coroutine_threadsafe(probe(), loop_box["loop"])
+        probes.append(future.result(timeout=LOOP_PROBE_TIMEOUT))
+        return real_consolidate(**kwargs)
+
+    monkeypatch.setattr(consolidate, "consolidate", probing_runner)
+
+    async def drive() -> httpx.Response:
+        transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+        async with httpx.AsyncClient(transport=transport, base_url=BASE_URL) as http_client:
+            loop_box["loop"] = asyncio.get_running_loop()
+            loop_box["client"] = http_client
+            return await http_client.post(
+                "/api/cycles",
+                json={},
+                headers={
+                    "Cookie": f"{http_api.SESSION_COOKIE}={session}",
+                    **CLIENT_HEADERS,
+                },
+            )
+
+    response = asyncio.run(drive())
+
+    assert response.status_code == 200, response.text
+    assert response.json()["cycle"]["status"] == "completed"
+    # The loop answered a second request while the cycle was still running.
+    assert [probe.status_code for probe in probes] == [200]
+    # And it could, because the cycle was never on it in the first place.
+    assert ran_off_the_loop == [True]
+
+
+def test_a_second_cycle_is_a_409_and_not_a_400(client, fresh_db):
+    """ "A cycle is already running" is a conflict with current state, not a bad request.
+
+    ``CycleInProgress`` derives from ``ValueError``, so it rendered as a clean
+    400 carrying the right sentence — and 400 tells a client its *request* was
+    malformed, which this one was not. It is ``RollbackConflict``'s shape: the
+    same request will succeed once the graph is done doing something else, which
+    is what 409 means and what a client retries on.
+
+    The lock is the real one, held here rather than simulated, so this fails if
+    the runner ever stops refusing a second caller.
+    """
+    _duplicate_pair()
+    assert consolidate._RUNNER_LOCK.acquire(blocking=False)
+    try:
+        response = client.post("/api/cycles", json={})
+    finally:
+        consolidate._RUNNER_LOCK.release()
+
+    assert response.status_code == 409, response.text
+    error = response.json()["error"]
+    assert error["type"] == "CycleInProgress"
+    assert "already running" in error["message"]
+    # And the refusal left no journal entry behind it.
+    assert _ok(client.get("/api/cycles"))["cycles"] == []
 
 
 def test_a_cycles_event_window_is_bounded_and_says_when_it_bit(client, fresh_db):

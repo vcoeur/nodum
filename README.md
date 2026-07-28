@@ -168,6 +168,7 @@ uv run nodum consolidate --as owner             # for real: candidates land in t
 uv run nodum cycle-list --as owner              # the dream journal, newest first
 uv run nodum cycle-get <cycle-id> --as owner    # what ran, what it measured, how it ended
 uv run nodum events --cycle <cycle-id> --as owner   # what it changed — the log, not a copy
+uv run nodum cycle-abandon <cycle-id> --as owner   # close a run a SIGKILL left open
 uv run nodum rollback <cycle-id> --dry-run --as owner   # would this succeed?
 uv run nodum rollback <cycle-id> --as owner     # all of it, or none of it
 
@@ -301,7 +302,10 @@ degrades to BM25 + graph expansion. `NODUM_EMBED_MODEL` switches the model
   are the journal — what ran, who asked, what it measured, how it ended — and
   what a cycle *changed* is `nodum events --cycle <id>`, read off the same
   append-only log as everything else, so the journal can never become a second
-  record that disagrees.
+  record that disagrees. If a run never closed — a `SIGKILL`, a power cut, a
+  server shut down mid-cycle — `nodum cycle-abandon <id>` closes it `failed`,
+  which is what makes its writes reversible at all: rollback refuses a cycle
+  that is still running and `undo` refuses every cycle-stamped event.
 - **The curative tier changes structure; the additive tier only adds to it.**
   `merge-nodes` is soft — the merged-away node is archived, says where it went,
   and its edges are repointed at the survivor keeping their original endpoints,
@@ -319,11 +323,14 @@ degrades to BM25 + graph expansion. `NODUM_EMBED_MODEL` switches the model
   happened" never meant something you did not name.
 - **A schedule, if you ask for one.** Set `NODUM_CONSOLIDATE_AT=03:30` and
   `nodum serve` runs one cycle a night, in the process that is already running —
-  no cron, no second process, no new dependency. Unset means off, which is the
+  no cron, no second process, no new dependency, and the banner says so at
+  startup. Unset means off, which is the
   default: a background process that writes to your graph without being asked is
   not something to enable by surprise. The run cannot overlap itself, a crash
   leaves a `failed` entry in the journal and tries again tomorrow, and shutdown
-  never waits for a cycle to finish.
+  never waits for a cycle to finish. "One a night" holds on the two nights a
+  year that are not 24 hours long: the wait is computed in aware local time, so
+  a daylight-saving change neither doubles the run nor moves it an hour.
 - **Spaces: a filter for reading, a target for writing.** A space is a node of
   builtin type `space`, so its whole lifecycle is an ordinary node's
   (`space-create` / `space-rename` / `space-archive`, each event-logged,
@@ -363,9 +370,14 @@ degrades to BM25 + graph expansion. `NODUM_EMBED_MODEL` switches the model
   `request_upload_url`). Ingestion is **by reference** — the tool takes a path
   the server can read or a URL it can fetch, and no base64 ever crosses MCP; a
   host with no filesystem in common asks `request_upload_url` for somewhere to
-  PUT instead. That is the entire registry: the review tools
-  (`accept`/`reject`) and the curative tools (`merge_nodes`, `retype`,
-  `supersede_edge`, `bulk_relink`, `consolidate`) are **never registered** —
+  PUT instead. `create_node` takes a `space` like the ingestion tools do —
+  anything an agent has to be able to say is a real parameter here, because the
+  SDK drops an undeclared keyword rather than refusing it. That is the entire
+  registry: the review tools
+  (`accept`/`reject`), the curative tools (`merge_nodes`, `retype`,
+  `supersede_edge`, `bulk_relink`, `consolidate`) and reversal with the journal
+  that records it (`undo`, `rollback`, `abandon_cycle`, `get_cycle`,
+  `list_cycles`) are **never registered** —
   structural enforcement of §8.1/§8.2. The curative tier is built and in use;
   keeping it off MCP is a decision about a surface that exists, not a note about
   code that does not. One call there could merge two nodes or rewrite five
@@ -382,9 +394,13 @@ degrades to BM25 + graph expansion. `NODUM_EMBED_MODEL` switches the model
   (missing id → 404, bad value → 400, human-only → 403, impossible undo → 409,
   database busy → a retryable 503). The consolidation journal is on it as
   `GET /api/cycles`, `POST /api/cycles` (run one now, `dry_run` to rehearse),
-  `GET /api/cycles/{id}` (the entry plus the events it wrote) and
+  `GET /api/cycles/{id}` (the entry plus the events it wrote),
+  `POST /api/cycles/{id}/abandon` (close a run that never finished) and
   `POST /api/cycles/{id}/rollback` — where a graph that has moved on is a
-  **409** carrying the conflicting rows, not a bare refusal. The curative tier
+  **409** carrying the conflicting rows, not a bare refusal, and asking for a
+  cycle while one is running is a 409 too. Running one does not block the
+  server: it is the one route that hands its work to a thread, so the UI stays
+  answerable for the minutes a real cycle takes. The curative tier
   is deliberately not there: it is the CLI's. With no UI bundle built, the API
   serves normally and `/` is a page telling you to run `make web-build`.
 - **Origin control, which is not the same thing as auth.** Binding loopback is

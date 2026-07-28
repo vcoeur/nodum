@@ -226,6 +226,14 @@ question with a separate answer — `nodum events --cycle <id>`, read off the sa
 append-only log as everything else. The journal stores no diff of its own,
 because two records of one event are two records that can disagree.
 
+A cycle that never closed — a `SIGKILL`, a power cut, a server stopped
+mid-cycle — is not a cosmetic wart in that journal: it makes the run's own
+writes irreversible, because `rollback` refuses a cycle whose event set is not
+closed and `undo` refuses every cycle-stamped event. `nodum cycle-abandon <id>`
+closes it `failed`, with a report naming who declared it dead, and `rollback`
+then works normally. A cycle that already said how it ended is refused rather
+than re-closed.
+
 The **curative tier** is the human-facing half of the same machinery:
 `merge-nodes`, `retype`, `supersede-edge` and `bulk-relink` change structure
 rather than adding to it. Each runs inside a cycle even when you type it
@@ -235,7 +243,9 @@ of them would leave the other half standing.
 
 Cycles run on demand (`nodum consolidate`, or a button in the web UI) and
 nightly when `NODUM_CONSOLIDATE_AT` is set. Unset means off, which is the
-default.
+default; when it is set, `nodum serve` says so in its startup banner. Only one
+cycle runs at a time in a process — a second caller is refused rather than
+queued, since queueing would run it over a graph the first had just changed.
 
 ## Projectors and derived indexes
 

@@ -1280,6 +1280,24 @@ def _node_list_filters(
     return clauses, params
 
 
+def _require_positive_limit(limit: int) -> None:
+    """Refuse a ``LIMIT`` below 1, which SQLite would read as *unbounded*.
+
+    Every capped read in this module goes through here rather than restating
+    the check, because the failure it prevents is silent and identical
+    everywhere: SQLite treats a negative ``LIMIT`` as "no limit", so a caller
+    asking for fewer rows than exist got **all** of them — the opposite of what
+    it asked for — while a ``limit`` of 0 returned nothing at all under the same
+    spelling. :func:`subgraph` stated the rule first; :func:`list_cycles`,
+    :func:`list_events` and :func:`list_nodes` say it identically.
+
+    Raises:
+        ValueError: If ``limit`` is below 1.
+    """
+    if limit < 1:
+        raise ValueError(f"limit must be >= 1, got {limit}")
+
+
 def list_nodes(
     *,
     type: str | None = None,
@@ -1321,8 +1339,12 @@ def list_nodes(
         TypeNotFound: If ``type`` or ``space`` resolves to nothing the
             principal can read — an ungranted space and a nonexistent one
             answer identically (Q13 review S3).
-        ValueError: If ``state`` is not a known state.
+        ValueError: If ``state`` is not a known state, or ``limit`` is below 1
+            — :func:`subgraph`'s rule, said here for the same reason: SQLite
+            reads a negative ``LIMIT`` as *unbounded*, so ``--limit -3`` handed
+            back every node in scope.
     """
+    _require_positive_limit(limit)
     conn = _connect(path)
     try:
         store = Store(conn, principal)
@@ -2759,6 +2781,10 @@ def list_events(
         path: Explicit database path.
 
     Raises:
+        ValueError: If ``limit`` is below 1 — :func:`subgraph`'s rule, and
+            :func:`list_cycles`'. SQLite reads a negative ``LIMIT`` as
+            *unbounded*, so ``--limit -3`` answered with the whole log: a caller
+            asking for less got everything.
         GrantNotPermitted: If the principal is not a human.
         RecordNotFound: If ``cycle_id`` names no cycle. An empty list is what a
             **dry run** looks like — ``AGENTS.md`` leans on exactly that as the
@@ -2766,6 +2792,7 @@ def list_events(
             the id answering with the same empty list, and exit 0, would make
             that proof unreadable.
     """
+    _require_positive_limit(limit)
     conn = _connect(path)
     try:
         Store(conn, principal).require_human("read the event log")
@@ -3168,8 +3195,7 @@ def subgraph(
     """
     if depth < 0:
         raise ValueError(f"depth must be >= 0, got {depth}")
-    if limit < 1:
-        raise ValueError(f"limit must be >= 1, got {limit}")
+    _require_positive_limit(limit)
     # Clamped rather than refused: a caller asking for more than the server
     # will ever draw gets the ceiling plus an honest `truncated`.
     limit = min(limit, MAX_SUBGRAPH_LIMIT)
@@ -3520,7 +3546,11 @@ def set_human_password(
             (auth.hash_password(password), human_id),
         )
         if cursor.rowcount == 0:
-            raise RecordNotFound(f"no humans row with id: {human_id}")
+            # `no humans row with id` is this module's schema vocabulary reaching
+            # somebody who typed `nodum human passwd <id>` and has no reason to
+            # know the table. Every other lookup here says `<thing> not found:
+            # <id>`, and so does this one.
+            raise RecordNotFound(f"human not found: {human_id}")
         conn.execute("DELETE FROM sessions WHERE human_id = ?", (human_id,))
         _emit(conn, actor, "human.password", {"human_id": human_id})
         conn.commit()
@@ -3531,7 +3561,9 @@ def set_human_password(
 def _set_disabled(table: str, row_id: str, disabled: bool, *, conn: sqlite3.Connection) -> None:
     cursor = conn.execute(f"UPDATE {table} SET disabled = ? WHERE id = ?", (int(disabled), row_id))
     if cursor.rowcount == 0:
-        raise RecordNotFound(f"no {table} row with id: {row_id}")
+        # The table name is this module's schema vocabulary; the caller asked
+        # about an account, so it is an account the refusal names.
+        raise RecordNotFound(f"{table.rstrip('s')} not found: {row_id}")
 
 
 def disable_human(human_id: str, *, principal: Principal, path: str | Path | None = None) -> None:
@@ -3674,7 +3706,9 @@ def create_agent(
             owner_human_id is not None
             and not conn.execute("SELECT 1 FROM humans WHERE id = ?", (owner_human_id,)).fetchone()
         ):
-            raise RecordNotFound(f"no humans row with id: {owner_human_id}")
+            # Named as the human the caller typed, not as the row it is stored
+            # in — the convention `_get_cycle_row` states.
+            raise RecordNotFound(f"human not found: {owner_human_id}")
         template = {
             _resolve_space(conn, space, principal): level for space, level in template.items()
         }
@@ -3722,7 +3756,7 @@ def rotate_agent_token(
         actor = _admin_actor(conn, principal)
         row = conn.execute("SELECT kind FROM agents WHERE id = ?", (agent_id,)).fetchone()
         if row is None:
-            raise RecordNotFound(f"no agents row with id: {agent_id}")
+            raise RecordNotFound(f"agent not found: {agent_id}")
         if row["kind"] == "internal":
             raise ValueError(
                 f"agent {agent_id!r} is internal: it authenticates in-process and holds no token"
@@ -3732,7 +3766,7 @@ def rotate_agent_token(
             "UPDATE agents SET credential_hash = ? WHERE id = ?", (token_hash, agent_id)
         )
         if cursor.rowcount == 0:
-            raise RecordNotFound(f"no agents row with id: {agent_id}")
+            raise RecordNotFound(f"agent not found: {agent_id}")
         _emit(conn, actor, "agent.token_rotate", {"agent_id": agent_id})
         conn.commit()
         return token
@@ -3798,7 +3832,7 @@ def grant(
     try:
         actor = _admin_actor(conn, principal)
         if not conn.execute("SELECT 1 FROM agents WHERE id = ?", (agent_id,)).fetchone():
-            raise RecordNotFound(f"no agents row with id: {agent_id}")
+            raise RecordNotFound(f"agent not found: {agent_id}")
         # Human-only (`_admin_actor` above), so resolving an archived space by
         # name is not a leak — and refusing it by name beats the bare "unknown
         # space" the active-only resolver used to answer with.
@@ -4132,9 +4166,11 @@ def _cycle_authority_spaces(principal: Principal, scope_id: str | None) -> set[s
     agent with none gets the empty set and is refused. This is not a weaker rule
     than it looks: opening a cycle is authority to *group*, and every write made
     inside one is still gated space by space by the same store as any other
-    write. The gardener holds ``edit`` on ``meta`` and ``main`` by migration
-    ``0014``, which is exactly what lets it run the nightly cycle and nothing
-    outside those two spaces.
+    write. The gardener holds ``read`` on ``meta`` and ``edit`` on ``main`` by
+    migration ``0014``, so the set it brings here is ``{main}`` — which is
+    exactly what lets it run the nightly cycle and nothing outside ``main``.
+    ``read`` on ``meta`` resolves a type and never opens a cycle over the
+    vocabulary, which is the point: no job writes ``meta``.
     """
     if scope_id is not None:
         return {scope_id}
@@ -4391,8 +4427,7 @@ def list_cycles(
             :func:`subgraph`'s, said here for the same reason.
         GrantNotPermitted: If the principal is not a human.
     """
-    if limit < 1:
-        raise ValueError(f"limit must be >= 1, got {limit}")
+    _require_positive_limit(limit)
     conn = _connect(path)
     try:
         Store(conn, principal).require_human("read the consolidation journal")

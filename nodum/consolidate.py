@@ -103,9 +103,11 @@ class CycleInProgress(ValueError):
 
     A :class:`ValueError` so every adapter already reports it as one line and a
     status rather than a traceback: the CLI's ``_run`` catches it, and
-    ``http_api.EXCEPTION_STATUS`` maps ``ValueError`` to 400. It is closer to a
-    409 — the refusal is about current state, not about the request — and the
-    row that says so belongs in that table, not here.
+    ``http_api.EXCEPTION_STATUS`` would map a bare ``ValueError`` to 400. The
+    refusal is about current state rather than about the request, so that table
+    now carries its own **409** row for this class — the shape
+    ``RollbackConflict`` already had — and the row lives there, not here,
+    because a domain module does not know about statuses.
     """
 
 

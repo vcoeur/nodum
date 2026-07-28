@@ -241,7 +241,9 @@ commands on a saved node for exactly this reason.
   through `close_cycle` — one place leaves `running` — with a report naming who
   abandoned it; it refuses a cycle that is not `running`, because a cycle that
   has said how it ended is not abandoned and re-closing it would overwrite that
-  record. The stamp itself is `in_cycle`, a `ContextVar` that
+  record. It is reachable on both human surfaces — `nodum cycle-abandon <id>`
+  and `POST /api/cycles/{id}/abandon` — because a door nothing opens is not a
+  door; it stays off MCP with the rest of `HUMAN_ONLY_TOOLS`. The stamp itself is `in_cycle`, a `ContextVar` that
   `_emit` reads, so a cycle's writes go through the *ordinary* public functions
   and are stamped without any call site naming a cycle — a per-task variable
   rather than a module global, so the HTTP server handling a normal request
@@ -346,24 +348,50 @@ commands on a saved node for exactly this reason.
   replaced), and `update_node` is `destructiveHint=True` because under an
   `edit` grant it overwrites the node in place — MCP hosts auto-approve on
   that flag, so it must not lie. Every write tool's description says what an
-  `edit` grant changes rather than promising `proposed`. Auth is the agent token in `NODUM_AGENT_TOKEN` —
+  `edit` grant changes rather than promising `proposed`.
+  **Anything an agent must be able to say has to be in a tool's signature
+  here**, because the SDK discards a keyword this module does not declare
+  instead of refusing it: `create_node` had no `space` parameter while
+  `ingest_file`/`ingest_url`/`request_upload_url` did, so an agent asking for
+  `research` got a 200-shaped response describing a node in `main` — no way to
+  choose a space and no way to learn it had not got one. `create_node` now takes
+  `space` (a space id or name, `main` by default, narrowed by the grant set like
+  every other space reference, and refused in the non-oracle's identical words
+  when the agent holds nothing on it). Making the *extra key* an error instead
+  was the other option and is not reachable without mutating the SDK's
+  `ArgModelBase.model_config`, a third-party base class every generated tool
+  model inherits — and an agent that cannot name a space is not helped by being
+  told its spelling was wrong. Every write result carries the `space_id` it
+  actually landed in, which is the checkable half of the same rule.
+  Auth is the agent token in `NODUM_AGENT_TOKEN` —
   an `ndm_…` token minted by `nodum agent create` / `token-rotate`, shown
   once and stored hashed — carried in the environment, never a flag (a flag
   leaks into `ps` and shell history). At startup it is verified against the
   `agents` table (an unknown or disabled agent is a startup error), the
   verified agent's principal is loaded with its grant set, and every read
-  and write is confined to those grants. The review tools
-  (`accept`, `reject` — the §8.1 "write (human)" tier) and the
+  and write is confined to those grants. **Three tiers are never registered,
+  and each one is a named absence**: the review tools
+  (`accept`, `reject` — `REVIEW_TOOLS`, the §8.1 "write (human)" tier), the
   curative tools (`merge_nodes`, `retype`, `supersede_edge`, `bulk_relink`,
-  `consolidate` — §8.2) are **never registered**: structural enforcement, not
+  `consolidate` — `CURATIVE_TOOLS`, §8.2), and **reversal plus the journal that
+  records it** (`undo`, `rollback`, `abandon_cycle`, `get_cycle`, `list_cycles`
+  — `HUMAN_ONLY_TOOLS`). Structural enforcement, not
   a runtime check. Phase 5a built the whole curative tier and **left this
   exactly as it was** — that absence is now a decision about a surface that
   exists, not a description of code that does not. It stays a decision: an
   agent reaching this tier could merge two nodes or rewrite five hundred edges
   from one call, and the only thing that takes those back is a human's
-  rollback. `CURATIVE_TOOLS` and `REVIEW_TOOLS` name them so
-  `tests/test_mcp_server.py` can assert the registry stays disjoint from both;
-  adding a curative operation means adding it to `CURATIVE_TOOLS`, never to the
+  rollback. The third list is newer, and it closed a real hole: `rollback_cycle`
+  — the most destructive operation in the system, writing recorded payloads back
+  verbatim across spaces for a whole cycle at once — was in **no** absence list
+  at all, and neither were `undo`, `abandon_cycle` or the two journal reads, so
+  the disjointness assertions would have watched a future tool expose any of
+  them without a word. Reversal is human-only because no grant delegates writing
+  `state = 'active'` back; the journal is human-only because an entry says what
+  the gardener did across every space in the file, which is territory an agent
+  holds no grant on. `UNREGISTERED_TOOLS` is the union, and what
+  `tests/test_mcp_server.py` asserts the registry stays disjoint from; adding an
+  operation to any of those tiers means adding its name to a list, never to the
   registry. Launched by `nodum mcp serve`.
 - **`nodum.http_api`** — the HTTP adapter (design §9), the **human** surface
   and the exact inverse of the MCP server. `create_app(*, db_path,
@@ -406,20 +434,35 @@ commands on a saved node for exactly this reason.
   HTTP contract below) — binding loopback keeps other machines out, not other
   *origins*, and a browser reaches `127.0.0.1` from any page.
   Phase 5a adds the **dream journal** (`GET /api/cycles`, `POST /api/cycles`,
-  `GET /api/cycles/{id}`, `POST /api/cycles/{id}/rollback`) and the **nightly
+  `GET /api/cycles/{id}`, `POST /api/cycles/{id}/abandon`,
+  `POST /api/cycles/{id}/rollback`) and the **nightly
   scheduler**, owned by the app's lifespan and `None` unless configured — so an
-  ordinary `nodum serve` creates no background writer at all. Two error rows
+  ordinary `nodum serve` creates no background writer at all. Three error rows
   came with them. `RollbackConflict` is **409** with the conflicts in the error
   body — the graph moved on, which is a conflict with current state and not a
   bad request — and it is the one failure whose body says more than `type` and
   `message`, rendered by `_rollback_conflict_handler` while its status stays the
-  table's. `auth.UnknownPrincipal` is **404**: it is a `LookupError`, so it
+  table's. `consolidate.CycleInProgress` is **409** for the same reason and not
+  the 400 it inherited from `ValueError`: the request was fine and the graph was
+  busy, which is what a client retries on. `auth.UnknownPrincipal` is **404**: it
+  is a `LookupError`, so it
   inherited neither the `RecordNotFound` nor the `ValueError` row and escaped as
   a traceback and a generic 500 — a shape a cycle meets for real, since the
   runner re-mints whoever asked from stored state. The curative tier is
   **not** on this surface either: rollback is here because it is the human's
-  undo for a cycle, and `POST /api/cycles` is here because a schedule that is
-  off by default would otherwise leave the journal empty forever.
+  undo for a cycle, `abandon` is here because a cycle left `running` by a
+  `SIGKILL` or a shutdown mid-nightly-run makes its own writes irreversible
+  until somebody closes it, and `POST /api/cycles` is here because a schedule
+  that is off by default would otherwise leave the journal empty forever.
+  **`POST /api/cycles` is the one handler that does not call the service
+  inline** — it goes through `run_in_threadpool`. Every other handler here is a
+  read or a single-row write, where inline is right; a cycle is every job over
+  every node in scope (3.75 s measured on 450 nodes with no embeddings, minutes
+  with them) and the event loop is single-threaded, so inline it froze
+  `/healthz`, the SPA and every other tab for the length of the run —
+  `nodum.scheduler`'s own docstring had made exactly this argument for the
+  nightly half. What is handed to the thread is `_write`, so the principal is
+  still bound in the one place this module binds one.
 - **`nodum.consolidate`** — the consolidation runner (design §8.4/§8.5), and
   everything on the near side of the LLM line: four deterministic jobs and five
   coherence metrics, with no provider, no generation and no judgement anywhere
@@ -501,7 +544,20 @@ commands on a saved node for exactly this reason.
   against a single-writer database would be a lock fight at 3am nobody is awake
   to read. A **crash neither takes the server down nor stops the schedule**: the
   runner already closes a failing cycle `failed`, anything escaping it is logged
-  and the loop waits for tomorrow. It is **off unless configured** —
+  and the loop waits for tomorrow. **"One cycle a night" holds on the two nights
+  a year that are not 24 hours long**: `NODUM_CONSOLIDATE_AT` is a *wall clock*
+  time and a wall clock does not advance uniformly, so `seconds_until` does its
+  arithmetic in **aware local time** (`datetime.astimezone`, which reads a naive
+  value as local and attaches the offset in force at that instant). Subtracting
+  two naive datetimes measures the calendar rather than elapsed time: driven
+  over a real `Europe/Paris` timeline that ran the schedule **twice on the
+  autumn fall-back** (waking an hour early, then again at the hour it was asked
+  for) and **an hour late on the spring-forward**. Neither crashed and neither
+  overlapped — the loop is sequential — but the property is the property. The
+  two pathological wall-clock times are answered rather than special-cased: one
+  that occurs twice resolves to its first occurrence, one that does not occur at
+  all resolves an hour later, and each runs exactly once on the right date. It
+  is **off unless configured** —
   `NODUM_CONSOLIDATE_AT` (`HH:MM`, local wall clock) is unset by default and
   unset means no task is created at all, because a background process writing
   to the human's graph unasked is not something to enable by surprise; a value
@@ -1006,7 +1062,13 @@ Phase-1 decision log.
 - Errors are always one line on stderr with exit 1, never a traceback — that
   includes a missing file (`asset register /missing.png`), a database another
   writer holds (`database error: database is locked`), and an undo the graph
-  has grown past (a created node that now has children).
+  has grown past (a created node that now has children). **A command that reads
+  a file reads it *through* `_run`**, never beside it: a helper called in the
+  argument list of the command's own `_run(...)` is evaluated before `_run` is
+  entered, which is how `edge create-batch /missing.json` and `node
+  create|update --content-file /missing.md` printed a full Rich traceback while
+  `asset register` and `ingest file` did not. `_principal` was moved inside
+  `_run` for the identical reason; new file-reading options follow both.
 - `--set key=value` is repeatable; values are parsed as JSON with a raw-string
   fallback.
 - `--version` prints `nodum <version>` and exits 0; `schema-dump` prints the
@@ -1048,13 +1110,16 @@ Phase-1 decision log.
   the CLI's own trusted-local path),
   `agent create/list/token-rotate/disable/enable` (create and rotate print
   the show-once `ndm_…` token to stderr; only the hash is stored. Every account
-  created here is **external**: `service.create_agent` refuses
+  created here is **external and there is no flag for anything else**:
+  `service.create_agent` refuses
   `kind="internal"`, because `auth.internal_principal` selects the gardener by
   being the only row with that kind and refuses to choose between two — so a
   second one does not add a gardener, it takes the existing one away and every
   consolidation path dies. `disable_agent` is no cure (the count precedes the
   `disabled` check) and no surface deletes an agent, so the install would only
-  be recoverable by hand-editing the database),
+  be recoverable by hand-editing the database. `--kind` is therefore **gone**:
+  its one non-default value became a permanent refusal, which is not a choice,
+  and HTTP already hardcoded `external`),
   `grant <agent> <space> <level>` / `revoke <agent> <space>` / `grants [--agent]`
   (`read`/`suggest`/`edit`, event-logged; `revoke` reaches an **archived**
   space by id or name, since archiving makes a grant inert but leaves the row
@@ -1073,16 +1138,31 @@ Phase-1 decision log.
   `consolidate [--scope] [--job …] [--dry-run]` (the gardener's cycle: `--as`
   names who *asked*, and the writes are the gardener's because the gardener made
   them),
-  `cycle-list [--limit]` / `cycle-get <id>` (the dream journal, human-only for
+  `cycle-list [--limit]` / `cycle-get <id>` / `cycle-abandon <id>` (the dream
+  journal, human-only for
   the reason `events` is — a journal entry says what the gardener did across
   every space in the file, and an agent reading it would learn the shape of
-  territory it holds no grant on. `--limit` below 1 is an **error**, the rule
-  `subgraph` states: SQLite reads a negative `LIMIT` as unbounded, so
+  territory it holds no grant on. **`cycle-get` returns the cycle row and
+  nothing else** — what ran, who asked, over what, how it ended — and the
+  entry's *diff* is `events --cycle <id>`, deliberately a second command: the
+  row stores no diff, because a journal keeping its own copy could disagree with
+  the log. `GET /api/cycles/{id}` composes the two (plus the metrics and a
+  truncation flag) into one round trip because a browser paints one screen from
+  one request; the divergence between the two surfaces is intentional and this
+  is where it is written down. `--limit` below 1 is an **error**, the rule
+  `subgraph` states and `events` and `node list` now follow: SQLite reads a
+  negative `LIMIT` as unbounded, so
   `--limit -3` used to answer with the whole journal — a caller asking for less
   got everything. `events --cycle <id>` on an id naming no cycle is a **not
   found**, not an empty list: an empty list is what a *dry run* looks like, and
   this file leans on exactly that as the machine-checkable proof a rehearsal
-  changed nothing),
+  changed nothing. **`cycle-abandon` is the door out of an interrupted run**: a
+  cycle left `running` by a `SIGKILL`, a power cut or a server shutdown
+  cancelling a mid-nightly-run task makes its own writes irreversible on every
+  surface — `rollback` refuses a running cycle and `undo` refuses every
+  cycle-stamped event — so this closes it `failed`, with a report naming who
+  abandoned it, and `rollback` then works. It refuses a cycle that already said
+  how it ended, because re-closing it would overwrite that record),
   `rollback <cycle-id> [--dry-run]`,
   `merge-nodes <ids…> --into <id>`, `retype <ids…> --type <t>`,
   `supersede-edge <edge-id> [--src --dst --type --confidence --set]` (every
@@ -1102,7 +1182,12 @@ Phase-1 decision log.
   `NODUM_CONSOLIDATE_AT` (`HH:MM`, local wall clock) and by nothing else** —
   there is deliberately no `--consolidate-at` flag, because unset means off and
   a flag would put "start a background writer on the human's graph" one
-  keystroke from an ordinary `serve`.
+  keystroke from an ordinary `serve`. **A schedule that is on says so in the
+  banner**, beside the database path and the auth posture: an unparseable value
+  was announced and a *valid* one produced nothing at all, which is the wrong
+  way round for the one setting that starts a background writer on the human's
+  graph. The unparseable case is still announced exactly once, by `create_app`,
+  which is also what decides to start without a schedule.
 - **A `--dry-run` here answers "what would happen", and each one is precise
   about what it costs.** `consolidate --dry-run` still writes its journal entry,
   flagged, because the journal has to say which it was — and emits **no** event,
@@ -1148,7 +1233,12 @@ Phase-1 decision log.
   that. A limit below 1 is still an error rather than SQL's "unbounded". Every
   filter composes as one conjunction, and an edge whose far node is filtered
   out is dropped with it — the result never names an edge endpoint it does not
-  also return. The edge list is also *closed* over the node list: an edge
+  also return. **That last rule is now every capped read's**
+  (`service._require_positive_limit`): `subgraph` stated it, `list_cycles`
+  followed it, and `list_events` and `list_nodes` took the number straight to
+  SQL — so `events --limit -3` and `node list --limit -3` handed back the whole
+  log and the whole listing, which is the opposite of what was asked for. One
+  helper, one message, four callers. The edge list is also *closed* over the node list: an edge
   between two returned nodes comes back even when the walk never traversed it
   (the B–C edge of a triangle read at depth 1), which the uncapped `traverse`
   does not do.
@@ -1178,6 +1268,16 @@ Phase-1 decision log.
   "read stderr for what is missing", not "nothing happened". Re-running the
   same batch is safe: ingestion is idempotent per `(hash, space)`, so what
   already landed comes back with `created: false` instead of being duplicated.
+- **That is the rule for every batch verb, and `retype` follows it.** It used to
+  print its `failed[]` and exit **0**, so `nodum retype main --type note` —
+  which accomplishes nothing, opens a curative cycle and closes it `completed`
+  with zero events — reported success to the one thing a script reads. Now the
+  envelope is on stdout as before (the successes are the point of not aborting),
+  each skipped id is named on stderr as `  failed <id>: <reason>`, and the exit
+  code is 1 if any item was skipped. `bulk-relink` is deliberately **not** in
+  this rule: its `skipped[]` is a diff annotation carrying "nothing would change
+  on this edge" beside real refusals, so it is not a failure list and an exit
+  code derived from it would be wrong more often than right.
 - `ingest url` fetches `http`/`https` only, once, with a timeout and a size
   ceiling, and refuses a redirect that leaves those two schemes. It does *not*
   block loopback or private ranges — this is itself a loopback service — so
@@ -1348,10 +1448,13 @@ Phase-1 decision log.
   Agent creation over HTTP is external-kind and owned by the session's human;
   the show-once token comes back in the create and token-rotate response
   bodies, since HTTP has no stderr to print it to the way the CLI does.
-- **The dream journal is four routes, and the curative tier is none of them.**
-  `GET /api/cycles` (newest first), `POST /api/cycles` (run one now — `scope`
-  and `dry_run` are the runner's own parameters and this route invents
-  neither), `GET /api/cycles/{id}` (the row, its metrics, and
+- **The dream journal is five routes, and the curative tier is none of them.**
+  `GET /api/cycles` (newest first — byte-identical to `nodum cycle-list`, as
+  every list endpoint is to its command), `POST /api/cycles` (run one now —
+  `scope` and `dry_run` are the runner's own parameters and this route invents
+  neither), `POST /api/cycles/{id}/abandon` (close an interrupted run `failed`,
+  which is what makes its writes rollback-able at all; 400 on a cycle that is
+  not `running`), `GET /api/cycles/{id}` (the row, its metrics, and
   `list_events(cycle_id=…)` composed into one round trip, bounded by `?limit=`
   with `events_truncated` when it bit), and `POST /api/cycles/{id}/rollback`.
   `POST /api/cycles` exists because the schedule is off unless configured: a
@@ -1368,7 +1471,16 @@ Phase-1 decision log.
   **A rollback conflict is 409**, not 400 — the graph moved on, which is a
   conflict with current state — and it is the only failure on this surface whose
   body carries more than `type` and `message`: `_rollback_conflict_handler`
-  replaces the *rendering* while the status stays `EXCEPTION_STATUS`'s. Do not
+  replaces the *rendering* while the status stays `EXCEPTION_STATUS`'s.
+  **`consolidate.CycleInProgress` is 409 for the same reason**: it derives from
+  `ValueError` and so rendered as a clean 400 carrying the right sentence, but
+  the request was well-formed and the graph was busy, which is what a client
+  retries on and what 409 means. **And `POST /api/cycles` runs the cycle off the
+  event loop** (`run_in_threadpool`) — the one handler here that does not call
+  the service inline, because a cycle is minutes of work on a real graph and the
+  loop is single-threaded, so inline it stalled `/healthz`, the SPA and every
+  other request for the whole run. `_write` is what goes to the thread, so the
+  principal boundary is unchanged. Do not
   add `merge_nodes`, `retype`, `supersede_edge` or `bulk_relink` here: they are
   the curative tier and they belong to the CLI, and `PATCH /api/nodes/{id}`
   still cannot retype a node.

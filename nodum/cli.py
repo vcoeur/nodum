@@ -27,7 +27,7 @@ from nodum.assets import AssetNotFound, AssetSourceChanged, AssetTooLarge, Unsup
 from nodum.cli_schema import build_cli_schema
 from nodum.db import ENV_DB_VAR
 from nodum.envelope import envelope, list_envelope, render_json
-from nodum.models import RollbackOut
+from nodum.models import RollbackOut, TransitionFailure
 from nodum.principal import Principal
 from nodum.service import (
     EventNotFound,
@@ -114,6 +114,34 @@ def _emit_list(key: str, results: Sequence[BaseModel]) -> None:
     _print_json(list_envelope(key, results))
 
 
+def _emit_batch(result: BaseModel, failures: Sequence[TransitionFailure]) -> None:
+    """Print a batch result, name each per-item failure on stderr, exit 1 if any failed.
+
+    ``ingest file``'s rule, and it is the same rule for the same reason. A batch
+    never loses its successes, so the envelope is on stdout **before** the exit
+    code is decided; and a run where something did not happen must not report
+    success, so the exit code is 1 if any item failed. ``nodum retype main
+    --type note`` accomplished nothing, said so in ``failed[]``, opened a cycle
+    that closed ``completed`` with zero events — and exited 0, which is the one
+    thing a script reads.
+
+    The per-item reasons go to stderr as well as into the envelope, because an
+    exit code of 1 with nothing on stderr breaks the other half of the contract:
+    a failure is one readable line there.
+
+    Args:
+        result: The batch outcome to print as the command's one JSON object.
+        failures: Its per-item failures — the ``failed`` list, never a list of
+            benign skips (``bulk_relink``'s ``skipped`` carries "nothing would
+            change on this edge", which is a diff annotation and not a refusal).
+    """
+    _emit(result)
+    for failure in failures:
+        typer.echo(f"  failed {failure.id}: {failure.error}", err=True)
+    if failures:
+        raise typer.Exit(1)
+
+
 def _parse_set(pairs: list[str] | None) -> dict:
     """Parse repeatable ``--set key=value`` options into a props dict.
 
@@ -136,15 +164,24 @@ def _parse_set(pairs: list[str] | None) -> dict:
 
 
 def _read_content(content: str | None, content_file: str | None) -> str | None:
-    """Resolve node content from ``--content`` or ``--content-file`` (``-`` = stdin)."""
+    """Resolve node content from ``--content`` or ``--content-file`` (``-`` = stdin).
+
+    The file is read **through** :func:`_run`, not beside it, for the reason
+    :func:`_principal` is: this helper is evaluated inside the argument list of
+    the command's own ``_run(service.create_node, …)``, and Python builds that
+    list before ``_run`` is entered — so ``--content-file /missing.md`` raised
+    ``FileNotFoundError`` outside the error boundary and printed a full Rich
+    traceback, against a contract whose named example of what must never be one
+    is a missing file. Routing it here fixes ``node create`` and ``node update``
+    at once.
+    """
     if content is not None and content_file is not None:
         typer.echo("use either --content or --content-file, not both", err=True)
         raise typer.Exit(1)
     if content_file is not None:
         if content_file == "-":
             return sys.stdin.read()
-        with open(content_file) as handle:
-            return handle.read()
+        return _run(Path(content_file).read_text)
     return content
 
 
@@ -397,7 +434,10 @@ def edge_create_batch(
     as_human: str = AS_OPTION,
 ) -> None:
     """Propose a batch of edges; bad suggestions are reported, not fatal."""
-    raw = sys.stdin.read() if suggestions_file == "-" else Path(suggestions_file).read_text()
+    # Through `_run`, so a missing or unreadable file is the contract's one line
+    # on stderr rather than a Rich traceback — the same reason `_read_content`
+    # and `_principal` read through it.
+    raw = sys.stdin.read() if suggestions_file == "-" else _run(Path(suggestions_file).read_text)
     try:
         suggestions = json.loads(raw)
     except json.JSONDecodeError:
@@ -1051,7 +1091,7 @@ def serve(
     """
     import uvicorn
 
-    from nodum import http_api
+    from nodum import http_api, scheduler
 
     resolved_db = Path(db_path) if db_path is not None else db.db_path()
     loopback = http_api.bare_host(host) in http_api.LOOPBACK_BIND_ADDRESSES
@@ -1061,6 +1101,24 @@ def serve(
         "so every /api request still needs a human password (nodum human passwd).",
         err=True,
     )
+    try:
+        consolidate_at = scheduler.configured_time()
+    except ValueError:
+        # An unparseable value is announced by `create_app`, which is also what
+        # decides to start without a schedule. Saying it twice, in two voices,
+        # is worse than saying it once where the decision is made.
+        consolidate_at = None
+    if consolidate_at is not None:
+        # The *successful* configuration is the one that matters more, and it
+        # was the silent one: a typo got a warning while the setting that
+        # actually starts a background writer on the human's graph produced
+        # nothing at all on the console.
+        typer.echo(
+            f"nightly consolidation cycle: {consolidate_at.strftime('%H:%M')} local time "
+            f"(${scheduler.ENV_CONSOLIDATE_AT}) — the gardener will write to this graph "
+            "unasked; unset it to turn the schedule off.",
+            err=True,
+        )
     if not loopback:
         # uvicorn serves plain HTTP. The session cookie is marked Secure on a
         # non-loopback bind and so fails closed without TLS, but the login body
@@ -1258,16 +1316,25 @@ def human_enable(
 @agent_app.command("create")
 def agent_create(
     name: str = typer.Argument(..., help="Agent id (becomes agent:<name>)."),
-    kind: str = typer.Option("external", "--kind", help="'external' or 'internal'."),
-    owner: str = typer.Option("owner", "--owner", help="Owning human (external agents)."),
+    owner: str = typer.Option("owner", "--owner", help="Owning human."),
     as_human: str = AS_OPTION,
 ) -> None:
-    """Create an agent account and print its token — shown this once, only the hash is stored."""
+    """Create an agent account and print its token — shown this once, only the hash is stored.
+
+    Every account created here is **external**, and there is no flag for the
+    other kind. `service.create_agent` refuses `kind="internal"` outright:
+    `auth.internal_principal` selects the gardener by being the only row with
+    that kind and refuses to choose between two, so a second internal agent does
+    not add a gardener — it takes the existing one away and every consolidation
+    path dies. `disable_agent` is no cure (the count precedes the `disabled`
+    check) and no surface deletes an agent, so the install was recoverable only
+    by hand-editing the database. A flag whose one non-default value is a
+    permanent refusal is not a choice; HTTP already hardcodes `external`.
+    """
     created = _run(
         service.create_agent,
         name,
-        kind=kind,
-        owner_human_id=None if kind == "internal" else owner,
+        owner_human_id=owner,
         principal=_principal(as_human),
     )
     _emit(created)
@@ -1450,6 +1517,29 @@ def cycle_get(
     _emit(_run(service.get_cycle, cycle_id, principal=_principal(as_human)))
 
 
+@app.command(name="cycle-abandon")
+def cycle_abandon(
+    cycle_id: str = typer.Argument(..., help="The interrupted cycle to close as failed."),
+    as_human: str = AS_OPTION,
+) -> None:
+    """Close an interrupted cycle nobody is going to finish — the door out (human-only).
+
+    A cycle left `running` by a `SIGKILL`, a power cut, or a server shutdown
+    that cancelled the nightly task is not a cosmetic wart in the journal: it
+    makes its own writes **irreversible on every surface**. `rollback` refuses a
+    cycle that is still running, because its event set is not closed yet, and
+    `undo` refuses every event a cycle stamped by name. This is what closes it,
+    as `failed`, with a report saying who abandoned it — after which
+    `rollback <cycle-id>` works normally.
+
+    It is not a general "close this cycle": a cycle that already said how it
+    ended is refused, since re-closing it would overwrite that record. Nothing
+    the run already wrote is touched — those writes are real, and taking them
+    back is exactly what this unlocks.
+    """
+    _emit(_run(service.abandon_cycle, cycle_id, principal=_principal(as_human)))
+
+
 def _rollback(cycle_id: str, *, dry_run: bool, principal: Principal) -> RollbackOut:
     """Roll a cycle back, rendering a refusal as JSON rather than as a sentence.
 
@@ -1535,9 +1625,14 @@ def retype(
     curative operation rather than a field on `node update`. No props are
     transformed: what a property means after a retype is a judgement call, and
     this tier is the deterministic one. Per-item failures are reported rather
-    than fatal, exactly as a batch accept/reject reports them.
+    than fatal, exactly as a batch accept/reject reports them — in `failed`, on
+    stderr, and in the **exit code**, which is 1 if any node was skipped. That
+    is `ingest file`'s rule: a batch never loses its successes, so the envelope
+    is printed either way, but a run that accomplished nothing must not report
+    success to a script that only reads the code.
     """
-    _emit(_run(service.retype, ids, type, principal=_principal(as_human)))
+    retyped = _run(service.retype, ids, type, principal=_principal(as_human))
+    _emit_batch(retyped, retyped.failed)
 
 
 @app.command(name="supersede-edge")
