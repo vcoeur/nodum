@@ -20,6 +20,29 @@ import nodum
 #: Where minting is the module's whole job.
 MINTING_MODULES = {"auth.py", "principal.py"}
 
+#: Every ``nodum.auth`` function that hands back a ``Principal``. A new one that
+#: is not listed here would be invisible to the property below, so this list is
+#: the one thing to extend when ``auth`` grows a loader.
+MINTING_FUNCTIONS = {
+    "owner_principal",
+    "agent_principal",
+    "internal_principal",
+    "verify_agent_token",
+    "verify_login",
+    "principal_for_session",
+}
+
+#: Module → the identity sources it may use. One line per module that binds an
+#: identity at all; anything absent from a module's set is a bypass.
+IDENTITY_SOURCES = {
+    "cli.py": {"owner_principal"},  # trusted-local: --as names the human
+    "mcp_server.py": {"verify_agent_token"},  # the agent's token
+    "http_api.py": {"verify_login", "principal_for_session", "delete_session"},
+    # The consolidation runner (a later wave): the internal agent authenticates
+    # by being in-process and holds no credential to present.
+    "consolidate.py": {"internal_principal"},
+}
+
 
 def _modules() -> list[Path]:
     """Every source file in the package (the guard's input is the tree, not a list)."""
@@ -95,14 +118,18 @@ def test_every_adapter_binds_a_principal_it_was_given():
     The HTTP module's own guards pin it to the session; this states the
     weaker property the other two adapters must also satisfy — the identity
     enters through ``nodum.auth`` and nowhere else.
+
+    A module in the map that is not on disk yet is skipped rather than crashed
+    on: the map is written ahead of the module it constrains (``consolidate.py``
+    arrives with the consolidation runner), and a guard that fails because the
+    thing it guards does not exist teaches nothing. ``_the_identity_map_names_
+    at_least_one_module_on_disk`` below is what stops the whole property going
+    vacuous that way.
     """
-    sources = {
-        "cli.py": {"owner_principal"},  # trusted-local: --as names the human
-        "mcp_server.py": {"verify_agent_token"},  # the agent's token
-        "http_api.py": {"verify_login", "principal_for_session", "delete_session"},
-    }
-    for name, allowed in sources.items():
+    for name, allowed in IDENTITY_SOURCES.items():
         path = Path(nodum.__file__).parent / name
+        if not path.exists():
+            continue
         calls = {
             node.func.attr
             for node in ast.walk(_tree(path))
@@ -111,11 +138,16 @@ def test_every_adapter_binds_a_principal_it_was_given():
             and isinstance(node.func.value, ast.Name)
             and node.func.value.id == "auth"
         }
-        minting = calls & {
-            "owner_principal",
-            "agent_principal",
-            "verify_agent_token",
-            "verify_login",
-            "principal_for_session",
-        }
+        minting = calls & MINTING_FUNCTIONS
         assert minting <= allowed, f"{name} mints principals through {sorted(minting - allowed)}"
+
+
+def test_the_identity_map_names_modules_that_are_on_disk():
+    """The map skips absent modules, so it must be checked to still cover real ones.
+
+    Without this, deleting or renaming every module in
+    :data:`IDENTITY_SOURCES` would make the property above pass by skipping
+    everything.
+    """
+    present = {name for name in IDENTITY_SOURCES if (Path(nodum.__file__).parent / name).exists()}
+    assert {"cli.py", "mcp_server.py", "http_api.py"} <= present

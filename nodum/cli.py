@@ -32,6 +32,7 @@ from nodum.service import (
     GrantNotPermitted,
     InvalidTransition,
     RecordNotFound,
+    RollbackConflict,
     TypeNotFound,
     UndoNotPossible,
 )
@@ -174,6 +175,10 @@ def _run(func, *args, **kwargs):
         InvalidTransition,
         GrantNotPermitted,
         UndoNotPossible,
+        # A `UndoNotPossible` subclass, so already caught above; named because
+        # the surfaces wave has to see that a refused rollback is one readable
+        # line here and a 409 there, not a traceback.
+        RollbackConflict,
         ValueError,
     ) as exc:
         typer.echo(str(exc), err=True)

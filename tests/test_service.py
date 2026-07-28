@@ -6,6 +6,7 @@ import pytest
 from helpers import OWNER_ACTOR, agent, owner
 
 from nodum import service
+from nodum.migrations import GARDENER_AGENT_ID
 from nodum.service import (
     EdgeNotFound,
     InvalidTransition,
@@ -256,6 +257,7 @@ def test_the_lifecycle_refuses_a_node_that_is_not_a_space(fresh_db):
 
 def test_list_spaces_carries_live_node_counts_and_grant_holders(fresh_db):
     space = service.create_space("research", principal=owner())
+    service.create_space("sandbox", principal=owner())
     service.create_node(type="note", title="live", space="research", principal=owner())
     proposed = service.create_node(type="note", title="draft", space="research", principal=owner())
     service.transition(proposed.id, "archive", principal=owner())
@@ -270,8 +272,11 @@ def test_list_spaces_carries_live_node_counts_and_grant_holders(fresh_db):
     assert [(g.agent_id, g.level) for g in listed["research"].grants] == [
         (researcher.id, "suggest")
     ]
+    # The gardener's seeded grants (migration 0014) are ordinary rows and list
+    # here beside every other agent's — that is what makes them revocable.
+    assert [(g.agent_id, g.level) for g in listed["main"].grants] == [(GARDENER_AGENT_ID, "edit")]
     # A space nobody was granted reports an empty list rather than omitting the key.
-    assert listed["main"].grants == []
+    assert listed["sandbox"].grants == []
 
 
 def test_list_spaces_is_human_only(fresh_db):

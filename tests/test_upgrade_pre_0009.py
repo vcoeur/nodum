@@ -221,7 +221,11 @@ def test_every_agent_identity_is_seeded_once_under_its_bare_name(upgraded):
     the bare id, and minting a principal for it would attribute writes to
     `agent:agent:polconly`.
     """
-    assert sorted(_column(upgraded, "SELECT id FROM agents ORDER BY id")) == ["cook", "polconly"]
+    # Scoped to the external agents, which is what 0010 seeds from the log's
+    # actors; 0014's internal gardener is not one of them.
+    assert sorted(
+        _column(upgraded, "SELECT id FROM agents WHERE kind = 'external' ORDER BY id")
+    ) == ["cook", "polconly"]
     assert _column(upgraded, "SELECT id FROM agents WHERE id LIKE 'agent:%'") == []
     # A bare `agent:` actor names nobody and must seed nothing.
     assert _column(upgraded, "SELECT id FROM agents WHERE length(id) = 0") == []

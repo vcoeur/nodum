@@ -13,6 +13,7 @@ from typer.testing import CliRunner
 
 from nodum import db, extract, service
 from nodum.cli import app
+from nodum.migrations import GARDENER_AGENT_ID
 
 runner = CliRunner()
 
@@ -473,8 +474,10 @@ def test_human_and_agent_admin_over_the_cli(fresh_db):
     result = runner.invoke(app, ["agent", "create", "researcher", "--as", "owner"])
     assert result.exit_code == 0, result.output
     assert "ndm_" in result.stderr  # the token prints once, to stderr
-    agents = _run_json("agent", "list", "--as", "owner")
-    assert agents["agents"][0]["has_token"] is True
+    agents = {row["id"]: row for row in _run_json("agent", "list", "--as", "owner")["agents"]}
+    assert agents["researcher"]["has_token"] is True
+    # The gardener lists beside it, credential-less: it authenticates in-process.
+    assert agents[GARDENER_AGENT_ID]["has_token"] is False
 
     result = runner.invoke(app, ["agent", "token-rotate", "researcher", "--as", "owner"])
     assert result.exit_code == 0, result.output
@@ -489,7 +492,8 @@ def test_human_and_agent_admin_over_the_cli(fresh_db):
     assert [(g["space_id"], g["level"]) for g in remaining["grants"]] == [("meta", "read")]
 
     _run_json("agent", "disable", "researcher", "--as", "owner")
-    assert _run_json("agent", "list", "--as", "owner")["agents"][0]["disabled"] is True
+    disabled = {row["id"]: row for row in _run_json("agent", "list", "--as", "owner")["agents"]}
+    assert disabled["researcher"]["disabled"] is True
 
 
 def test_space_admin_over_the_cli(fresh_db):

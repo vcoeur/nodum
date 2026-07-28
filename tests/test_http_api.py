@@ -51,6 +51,7 @@ from starlette.requests import ClientDisconnect
 from typer.testing import CliRunner
 
 from nodum import assets, auth, cli, db, http_api, ingest, service, urls
+from nodum.migrations import GARDENER_AGENT_ID
 from nodum.principal import Principal
 
 AGENT = "agent:researcher"
@@ -509,6 +510,17 @@ WRITE_FUNCTIONS = {
     "create_space",
     "rename_space",
     "archive_space",
+    # The curative tier (design §8.2). No route reaches these yet, and listing
+    # them before one does is the point: they are the heaviest writes in the
+    # system — a merge rewrites a node's state and every edge incident to it —
+    # so the rail that says "route it through `_write` and never import it
+    # here" has to cover them from the moment they exist, not from the moment
+    # somebody adds the handler. `bulk_relink`'s `dry_run` is a read, but the
+    # function is a writer.
+    "merge_nodes",
+    "retype",
+    "supersede_edge",
+    "bulk_relink",
 }
 
 
@@ -2726,9 +2738,11 @@ def test_agents_create_list_rotate_disable_enable(client, fresh_db):
 
     # The shown token authenticates; it never reappears in a later body.
     assert auth.verify_agent_token(token).id == "researcher"
-    listed = _ok(client.get("/api/agents"))
-    assert listed["count"] == 1
-    assert "token" not in listed["agents"][0]
+    listed = {row["id"]: row for row in _ok(client.get("/api/agents"))["agents"]}
+    assert "token" not in listed["researcher"]
+    # The gardener (migration 0014) lists beside it and holds no credential.
+    assert listed[GARDENER_AGENT_ID]["kind"] == "internal"
+    assert listed[GARDENER_AGENT_ID]["has_token"] is False
 
     rotated = _ok(client.post("/api/agents/researcher/token-rotate"))
     new_token = rotated["token"]
@@ -2765,8 +2779,17 @@ def test_grants_grant_list_and_revoke(client, fresh_db):
     assert granted["space_id"] == "main"
     assert granted["level"] == "edit"
 
-    everything = _ok(client.get("/api/grants"))
-    assert everything["count"] == 2  # the creation-template meta read, plus this one
+    everything = {
+        (row["agent_id"], row["space_id"], row["level"])
+        for row in _ok(client.get("/api/grants"))["grants"]
+    }
+    # The creation-template meta read, plus this one …
+    assert {("researcher", "meta", "read"), ("researcher", "main", "edit")} <= everything
+    # … alongside the gardener's own seeded rows, which are ordinary grants.
+    assert {
+        (GARDENER_AGENT_ID, "meta", "edit"),
+        (GARDENER_AGENT_ID, "main", "edit"),
+    } <= everything
     filtered = _ok(client.get("/api/grants?agent=researcher"))
     assert filtered["count"] == 2
     assert _ok(client.get("/api/grants?agent=nobody")) == {"grants": [], "count": 0}
@@ -2982,6 +3005,7 @@ def test_spaces_carry_the_node_count_and_grant_holders(client, fresh_db):
     space = _ok(client.post("/api/spaces", json={"name": "research"}))
     assert (space["type"], space["space_id"]) == ("space", "meta")
 
+    _ok(client.post("/api/spaces", json={"name": "sandbox"}))
     _ok(client.post("/api/nodes", json={"type": "note", "title": "n", "space": "research"}))
     _ok(client.post("/api/agents", json={"name": "researcher"}))
     _ok(
@@ -2996,7 +3020,13 @@ def test_spaces_carry_the_node_count_and_grant_holders(client, fresh_db):
         ("researcher", "suggest")
     ]
     assert listed["main"]["node_count"] == 0
-    assert listed["main"]["grants"] == []
+    # The gardener's seeded grants (migration 0014) reach this screen like any
+    # other agent's — which is what makes them revocable from it.
+    assert [(g["agent_id"], g["level"]) for g in listed["main"]["grants"]] == [
+        (GARDENER_AGENT_ID, "edit")
+    ]
+    # A space nobody was granted still reports an empty list, not a missing key.
+    assert listed["sandbox"]["grants"] == []
 
 
 def test_the_space_lifecycle_round_trips_over_http(client, fresh_db):

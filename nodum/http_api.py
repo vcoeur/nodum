@@ -135,6 +135,7 @@ from nodum.service import (
     GrantNotPermitted,
     InvalidTransition,
     RecordNotFound,
+    RollbackConflict,
     SpaceNameTaken,
     TypeNotFound,
     UndoNotPossible,
@@ -441,6 +442,12 @@ EXCEPTION_STATUS: dict[type[Exception], int] = {
     # ValueError; the more specific entries win (Starlette walks the
     # exception's MRO).
     UndoNotPossible: 409,
+    # The cycle-sized version of the same 409: rows the cycle wrote have been
+    # changed since, so the rollback refused rather than clobbering them. Listed
+    # although it derives from `UndoNotPossible` and would inherit the status,
+    # because its `conflicts` are what a UI renders and the row is where a
+    # reader looks for the code that gets rendered under.
+    RollbackConflict: 409,
     AccountExists: 409,
     SpaceNameTaken: 409,
     # 413 — the body passed the ceiling this server is willing to read, whether

@@ -7,6 +7,7 @@ from helpers import OWNER_ACTOR, agent, owner
 
 from nodum import service
 from nodum.service import EventNotFound, NodeNotFound, UndoNotPossible
+from nodum.store import GrantNotPermitted
 
 
 def _events():
@@ -181,6 +182,69 @@ def test_undo_create_of_a_node_with_children_is_refused(fresh_db):
     service.undo(create_page_seq, principal=owner())
     with pytest.raises(NodeNotFound):
         service.get_node(page.id, principal=owner())
+
+
+def test_undo_refuses_an_event_that_belongs_to_a_consolidation_cycle(fresh_db):
+    """The guard that makes the curative tier safe to name under `node.`/`edge.`.
+
+    Curative ops *have* to live in those namespaces — `projectors` dispatches on
+    `op.startswith("node.")` to reproject FTS and embeddings, so an op outside
+    them desynchronises the search index silently. Which means undo's "undoable"
+    filter would otherwise happily reverse one row of a multi-row merge and
+    leave the other half standing.
+    """
+    cycle = service.open_cycle(trigger="manual", principal=owner())
+    with service.in_cycle(cycle.id):
+        node = service.create_node(type="note", title="merged", principal=owner())
+    seq = _events()[-1].seq
+
+    with pytest.raises(UndoNotPossible, match=f"consolidation cycle {cycle.id}"):
+        service.undo(seq, principal=owner())
+    # Nothing moved, and no `undo` event claims otherwise.
+    assert service.get_node(node.id, principal=owner()).title == "merged"
+    assert [event for event in _events() if event.op == "undo"] == []
+
+
+def test_undo_with_no_seq_skips_past_a_cycle_event_to_the_one_below(fresh_db):
+    """Same treatment as an event a previous undo already reversed.
+
+    Without the skip, `nodum undo` on a graph whose last write was a
+    consolidation would refuse rather than reach the human's own last edit —
+    and the refusal would be for something the human never did.
+    """
+    ordinary = service.create_node(type="note", title="mine", principal=owner())
+    cycle = service.open_cycle(trigger="scheduled", principal=owner())
+    with service.in_cycle(cycle.id):
+        gardened = service.create_node(type="note", title="gardened", principal=owner())
+
+    result = service.undo(principal=owner())
+
+    assert result.undone_op == "node.create"
+    assert result.deleted[-1]["row"]["id"] == ordinary.id
+    # The cycle's own write is untouched: it is taken back by rolling the cycle
+    # back, never by an undo that happened to walk past it.
+    assert service.get_node(gardened.id, principal=owner()).title == "gardened"
+    with pytest.raises(NodeNotFound):
+        service.get_node(ordinary.id, principal=owner())
+
+
+def test_list_events_narrows_to_one_cycle(fresh_db):
+    cycle = service.open_cycle(trigger="manual", principal=owner())
+    service.create_node(type="note", title="outside", principal=owner())
+    with service.in_cycle(cycle.id):
+        inside = service.create_node(type="note", title="inside", principal=owner())
+
+    narrowed = service.list_events(owner(), cycle_id=cycle.id)
+    assert [event.payload["after"]["id"] for event in narrowed] == [inside.id]
+    assert len(service.list_events(owner())) == 2
+    # An id no event carries is an empty list, not everything.
+    assert service.list_events(owner(), cycle_id="no-such-cycle") == []
+
+
+def test_the_cycle_filter_keeps_the_human_only_guard(fresh_db):
+    cycle = service.open_cycle(trigger="manual", principal=owner())
+    with pytest.raises(GrantNotPermitted, match="read the event log"):
+        service.list_events(agent("x"), cycle_id=cycle.id)
 
 
 def test_undo_create_of_a_space_that_now_holds_nodes_is_refused(fresh_db):

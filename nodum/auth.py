@@ -199,6 +199,59 @@ def agent_principal(agent_id: str, *, path: str | Path | None = None) -> Princip
         conn.close()
 
 
+def internal_principal(*, path: str | Path | None = None) -> Principal:
+    """Load the internal agent's principal — the in-process trusted path (§8.4).
+
+    The internal agent is the gardener, seeded by migration ``0014``. It is the
+    one principal that authenticates **by being in-process**: it holds no
+    credential at all (``agents.credential_hash`` is NULL, and
+    :func:`nodum.service.rotate_agent_token` refuses to mint one for an internal
+    agent), so there is nothing to present and nothing to steal. What makes it a
+    principal and not a bypass is that everything downstream is unchanged: it
+    carries an ordinary grant set loaded the same way
+    :func:`agent_principal` loads one — :func:`_grant_set`, archived spaces and
+    all — so archiving a space cuts the gardener off exactly as it cuts off any
+    other agent, and ``nodum revoke`` reaches its grants like any other agent's.
+
+    There is deliberately no ``agent_id`` argument: an internal identity that a
+    caller could name is an identity a caller could choose, and the design has
+    exactly one internal agent. A second one is a schema change, and it should
+    have to be.
+
+    Args:
+        path: Explicit database path.
+
+    Returns:
+        The internal agent's principal, with its grant set.
+
+    Raises:
+        UnknownPrincipal: If no internal agent exists (a database that predates
+            ``0014``, or one whose row was removed), or if more than one does.
+        PrincipalDisabled: If the internal agent is disabled — the supported way
+            to stop the gardener, and it must bite here rather than leave a
+            disabled account writing because nobody checked a token for it.
+    """
+    conn = _connect(path)
+    try:
+        rows = conn.execute("SELECT id, disabled FROM agents WHERE kind = 'internal'").fetchall()
+        if not rows:
+            raise UnknownPrincipal(
+                "no internal agent account exists: migration '0014_cycles_and_gardener' seeds it"
+            )
+        if len(rows) > 1:
+            raise UnknownPrincipal(
+                "more than one internal agent account exists "
+                f"({', '.join(sorted(row['id'] for row in rows))}): "
+                "the in-process path names none, so it cannot choose between them"
+            )
+        row = rows[0]
+        if row["disabled"]:
+            raise PrincipalDisabled(f"agent account is disabled: {row['id']}")
+        return Principal(kind="internal", id=row["id"], grants=_grant_set(conn, row["id"]))
+    finally:
+        conn.close()
+
+
 # ── Passwords (argon2id) ──────────────────────────────────────────────────────
 
 

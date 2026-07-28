@@ -8,8 +8,13 @@ from pathlib import Path
 import pytest
 from helpers import owner
 
-from nodum import assets, db, service
-from nodum.migrations import MIGRATIONS, SEED_EDGE_TYPES, SEED_NODE_TYPES
+from nodum import assets, auth, db, service
+from nodum.migrations import (
+    GARDENER_AGENT_ID,
+    MIGRATIONS,
+    SEED_EDGE_TYPES,
+    SEED_NODE_TYPES,
+)
 
 CORE_TABLES = {
     "nodes",
@@ -265,7 +270,11 @@ def test_0012_applies_to_a_populated_database_already_at_0011(tmp_path, monkeypa
     monkeypatch.setattr(db, "MIGRATIONS", MIGRATIONS)
     conn = db.connect()
     try:
-        assert db.init_db(conn) == ["0012_url_tokens", "0013_unique_space_titles"]
+        assert db.init_db(conn) == [
+            "0012_url_tokens",
+            "0013_unique_space_titles",
+            "0014_cycles_and_gardener",
+        ]
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
         conn.execute(
             "INSERT INTO url_tokens (id, token_hash, kind, asset_hash, created_by, expires_at)"
@@ -378,7 +387,7 @@ def test_0013_applies_to_a_populated_database_holding_duplicate_space_titles(tmp
     monkeypatch.setattr(db, "MIGRATIONS", MIGRATIONS)
     conn = db.connect()
     try:
-        assert db.init_db(conn) == ["0013_unique_space_titles"]
+        assert db.init_db(conn) == ["0013_unique_space_titles", "0014_cycles_and_gardener"]
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
         titles = dict(
             conn.execute("SELECT id, title FROM nodes WHERE id LIKE 'sp-%' ORDER BY id").fetchall()
@@ -449,7 +458,7 @@ def test_0013_finds_a_free_name_when_the_deduping_rename_would_itself_collide(
     monkeypatch.setattr(db, "MIGRATIONS", MIGRATIONS)
     conn = db.connect()
     try:
-        assert db.init_db(conn) == ["0013_unique_space_titles"]
+        assert db.init_db(conn) == ["0013_unique_space_titles", "0014_cycles_and_gardener"]
         titles = dict(
             conn.execute("SELECT id, title FROM nodes WHERE id LIKE 'sp-%' ORDER BY id").fetchall()
         )
@@ -494,7 +503,7 @@ def test_0013_deduplicates_a_title_that_is_another_spaces_id(tmp_path, monkeypat
     monkeypatch.setattr(db, "MIGRATIONS", MIGRATIONS)
     conn = db.connect()
     try:
-        assert db.init_db(conn) == ["0013_unique_space_titles"]
+        assert db.init_db(conn) == ["0013_unique_space_titles", "0014_cycles_and_gardener"]
         titles = dict(
             conn.execute("SELECT id, title FROM nodes WHERE id LIKE 'sp-%' ORDER BY id").fetchall()
         )
@@ -566,6 +575,151 @@ def test_0013_lets_a_space_change_state_without_touching_the_index(fresh_db):
             )
         conn.execute("UPDATE nodes SET state = 'active' WHERE id = 'sp-a'")
         conn.commit()
+    finally:
+        conn.close()
+
+
+# ── 0014: consolidation cycles and the gardener ──────────────────────────────
+
+
+def test_cycles_exists_on_a_database_built_from_scratch(fresh_db):
+    conn = db.connect()
+    try:
+        assert "0014_cycles_and_gardener" in db.applied_migrations(conn)
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(cycles)")}
+        assert columns == {
+            "id",
+            "trigger",
+            "triggered_by",
+            "scope",
+            "dry_run",
+            "status",
+            "report",
+            "started_at",
+            "finished_at",
+            "rolled_back_by",
+        }
+        indexes = {row["name"] for row in conn.execute("PRAGMA index_list(cycles)")}
+        assert "idx_cycles_started" in indexes
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    ("columns", "values"),
+    [
+        ("id, trigger, triggered_by, status", "'c', 'sideways', 'human:owner', 'running'"),
+        ("id, trigger, triggered_by, status", "'c', 'manual', 'human:owner', 'sideways'"),
+    ],
+    ids=["unknown trigger", "unknown status"],
+)
+def test_a_cycle_row_outside_the_vocabulary_is_refused(fresh_db, columns, values):
+    """The journal's two enums are the schema's, so no writer can invent a fifth."""
+    conn = db.connect()
+    try:
+        with pytest.raises(sqlite3.IntegrityError, match="CHECK"):
+            conn.execute(f"INSERT INTO cycles ({columns}) VALUES ({values})")
+    finally:
+        conn.close()
+
+
+def test_0014_seeds_the_gardener_with_edit_on_meta_and_main(fresh_db):
+    """D7 is auto-apply by default, and a gardener with no grant does nothing.
+
+    The grants are ordinary rows on purpose: they list beside every other
+    agent's on `/spaces` and `nodum revoke` takes them away. There is no
+    gardener-shaped exception in the grant model.
+    """
+    conn = db.connect()
+    try:
+        row = conn.execute("SELECT * FROM agents WHERE kind = 'internal'").fetchone()
+        assert row["id"] == GARDENER_AGENT_ID
+        assert row["name"] == GARDENER_AGENT_ID
+        assert row["owner_human_id"] is None
+        # An internal agent authenticates by being in-process; there is nothing
+        # to present and nothing to steal.
+        assert row["credential_hash"] is None
+        assert row["disabled"] == 0
+        levels = dict(
+            conn.execute(
+                "SELECT space_id, level FROM grants WHERE agent_id = ?", (GARDENER_AGENT_ID,)
+            ).fetchall()
+        )
+        assert levels == {"meta": "edit", "main": "edit"}
+    finally:
+        conn.close()
+
+
+def test_0014_applies_to_a_populated_database_already_at_0013(tmp_path, monkeypatch):
+    """The upgrade path, not just the fresh-file one: 0013 is where users are."""
+    monkeypatch.setenv("NODUM_DB", str(tmp_path / "at0013.db"))
+    monkeypatch.setattr(db, "MIGRATIONS", _prefix_through("0013_unique_space_titles"))
+    service.init()
+    node = service.create_node(type="note", title="before the upgrade", principal=owner())
+    space = service.create_space("research", principal=owner())
+
+    monkeypatch.setattr(db, "MIGRATIONS", MIGRATIONS)
+    conn = db.connect()
+    try:
+        assert db.init_db(conn) == ["0014_cycles_and_gardener"]
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+        conn.execute(
+            "INSERT INTO cycles (id, trigger, triggered_by, scope, status)"
+            " VALUES ('c1', 'scheduled', 'scheduler', ?, 'running')",
+            (space.id,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    # The graph it was applied over is untouched, and the gardener it seeded is
+    # a usable principal on it.
+    assert service.get_node(node.id, principal=owner()).title == "before the upgrade"
+    gardener = auth.internal_principal()
+    assert gardener.id == GARDENER_AGENT_ID
+
+
+def test_0014_refuses_to_upgrade_a_database_whose_reserved_id_is_taken(tmp_path, monkeypatch):
+    """Stealing the id, or renaming the impostor, would both corrupt an identity.
+
+    `create_agent` sets `agent_id = name` verbatim and only reserves the prefix
+    from this migration onward, so a database written before it can already hold
+    a user's agent called `builtin-gardener` — with `agent:builtin-gardener` in
+    `events.actor`, `versions.actor` and both `created_by` columns behind it.
+    Taking the id attributes that history to the gardener; renaming the account
+    detaches it from the history that names it, because actor strings are log
+    entries and not references anything follows. So the migration stops.
+    """
+    monkeypatch.setenv("NODUM_DB", str(tmp_path / "impostor.db"))
+    monkeypatch.setattr(db, "MIGRATIONS", _prefix_through("0013_unique_space_titles"))
+    service.init()
+    conn = db.connect()
+    try:
+        conn.execute(
+            "INSERT INTO agents (id, kind, name, owner_human_id)"
+            " VALUES ('builtin-gardener', 'external', 'builtin-gardener', 'owner')"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    monkeypatch.setattr(db, "MIGRATIONS", MIGRATIONS)
+    conn = db.connect()
+    try:
+        with pytest.raises(sqlite3.IntegrityError, match="is reserved"):
+            db.init_db(conn)
+        # Refused, not half-done: no cycles table, no migration row, and the
+        # impostor's own account is exactly as it was.
+        assert "0014_cycles_and_gardener" not in db.applied_migrations(conn)
+        assert (
+            conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'cycles'"
+            ).fetchone()
+            is None
+        )
+        assert (
+            conn.execute("SELECT kind FROM agents WHERE id = 'builtin-gardener'").fetchone()["kind"]
+            == "external"
+        )
     finally:
         conn.close()
 

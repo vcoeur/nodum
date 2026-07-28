@@ -721,6 +721,116 @@ WHERE type_id = 'space' AND title IS NOT NULL;
 """
 
 
+#: The internal agent seeded by ``0014`` — the gardener, the only principal that
+#: authenticates by being in-process (design §8.4). Its id is also the whole of
+#: the reserved prefix below, for now.
+GARDENER_AGENT_ID = "builtin-gardener"
+
+#: Reserved id prefix for agents the system seeds. ``Principal.actor_string``
+#: renders every agent as ``agent:<id>``, so an *external* agent free to take
+#: this id would write events indistinguishable from the gardener's — and the
+#: event log is this system's answer to "who is answerable for this write".
+#: Enforced for new accounts in :func:`nodum.service.create_agent` and, for
+#: databases written before that check existed, by ``0014`` refusing to upgrade.
+BUILTIN_AGENT_PREFIX = "builtin-"
+
+
+CYCLES_AND_GARDENER_DDL = """
+-- Consolidation cycles and the gardener that runs them (Phase 5, design §8.4).
+--
+-- A cycle groups a set of graph writes under one id so that a human can take
+-- the whole of it back in one action. `events.cycle_id` has been there since
+-- 0001 and no caller ever set it; this is the table it points at, and the
+-- dream journal's record: what ran, who asked for it, over what, and how it
+-- ended. The per-cycle *diff* is deliberately not stored here — that is
+-- `list_events` filtered by `cycle_id`, so the journal can never become a
+-- second, disagreeing record of what happened.
+--
+-- `triggered_by` is who **asked** — a human's `human:<id>`, or the literal
+-- `scheduler` when the clock did. It is deliberately not the same thing as the
+-- `actor` on the events the cycle contains, which is who **acted**: the
+-- gardener. A journal entry that carried only one of the two could not answer
+-- "I did not ask for this" or "who ran this at 04:00", and they are different
+-- questions.
+--
+-- `scope` carries a space id or NULL (the whole file), and takes **no foreign
+-- key** on purpose, for the reason `url_tokens` takes none: a cycle row is
+-- history, and a reference from history into the live graph would let an old
+-- journal entry block an ordinary graph write (an undo deleting a space node)
+-- long after anyone cared. `rolled_back_by` does point at `cycles(id)` — that
+-- is one journal entry naming another, which is structure, not history
+-- reaching forward.
+CREATE TABLE cycles (
+    id             TEXT PRIMARY KEY,   -- uuid4().hex, like every other generated id
+    trigger        TEXT NOT NULL CHECK (trigger IN ('manual','scheduled','curative','rollback')),
+    triggered_by   TEXT NOT NULL,      -- who asked: 'human:<id>', or 'scheduler'
+    scope          TEXT,               -- a space id, or NULL for the whole file
+    dry_run        INTEGER NOT NULL DEFAULT 0,
+    status         TEXT NOT NULL CHECK (status IN ('running','completed','failed','rolled_back')),
+    report         TEXT,               -- JSON; NULL while the cycle is running
+    started_at     TEXT NOT NULL DEFAULT (datetime('now')),
+    finished_at    TEXT,               -- NULL while the cycle is running
+    rolled_back_by TEXT REFERENCES cycles(id)   -- the rollback cycle that reversed this one
+);
+
+-- The journal is read newest-first and, later, by date range; nothing else here
+-- is looked up by anything but the primary key.
+CREATE INDEX idx_cycles_started ON cycles(started_at);
+
+-- The gardener's own account. D7 is "auto-apply by default", and a gardener
+-- with no grant does nothing at all — every write it makes goes through the
+-- same scope-bound store as an external agent's, so seeding the identity
+-- without seeding its authority would ship a phase that silently no-ops. The
+-- grants are **ordinary rows**: they show up in `nodum space-list` and on the
+-- `/spaces` screen beside every other agent's, and `nodum revoke
+-- builtin-gardener main` takes them away with the command that was already
+-- there. There is no gardener-shaped exception anywhere in the grant model,
+-- which is the point.
+--
+-- `internal` means it holds no credential: it authenticates by being
+-- in-process (`auth.internal_principal`), and `rotate_agent_token` already
+-- refuses to mint one for an internal agent.
+--
+-- **A collision on the id refuses the upgrade rather than resolving it.**
+-- `agents.id` is a PRIMARY KEY and `create_agent` sets `agent_id = name`
+-- verbatim, so a database written before this migration can already hold a
+-- user's agent called `builtin-gardener`. Neither way out of that is safe:
+-- taking the id would attribute that agent's whole history — every
+-- `agent:builtin-gardener` in `events.actor`, `versions.actor` and both
+-- `created_by` columns — to the gardener, and renaming the impostor would
+-- detach that same history from the account it names, since the actor strings
+-- are immutable log entries and not references anything can follow. Both
+-- corrupt the one question the event log exists to answer. So the migration
+-- stops and says so, and the operator renames or removes the account by hand
+-- and re-runs; the whole migration rolls back as one transaction, exactly as
+-- any other failing one does.
+--
+-- `RAISE()` is a trigger-only construct in SQLite, so the abort is a CHECK
+-- constraint whose **name** carries the message (SQLite reports it verbatim as
+-- `CHECK constraint failed: <name>`). The insert below produces a row only when
+-- the id is already taken.
+CREATE TABLE _reserved_agent_id (
+    taken TEXT,
+    CONSTRAINT "the agent id 'builtin-gardener' is reserved: rename that account, then re-run"
+    CHECK (taken IS NULL)
+);
+INSERT INTO _reserved_agent_id (taken)
+SELECT id FROM agents WHERE id = 'builtin-gardener';
+DROP TABLE _reserved_agent_id;
+
+INSERT INTO agents (id, kind, name, owner_human_id, credential_hash)
+VALUES ('builtin-gardener', 'internal', 'builtin-gardener', NULL, NULL);
+
+-- `edit` on meta and on main: meta because consolidation reads and writes the
+-- type vocabulary spaces are named from, main because that is where every write
+-- naming no space lands. Any other space is an explicit `nodum grant`, like it
+-- is for every other agent.
+INSERT INTO grants (agent_id, space_id, level) VALUES
+    ('builtin-gardener', 'meta', 'edit'),
+    ('builtin-gardener', 'main', 'edit');
+"""
+
+
 #: Ordered (name, SQL) migrations. Append-only — never edit a shipped entry.
 MIGRATIONS: list[tuple[str, str]] = [
     ("0001_core", CORE_DDL),
@@ -736,4 +846,5 @@ MIGRATIONS: list[tuple[str, str]] = [
     ("0011_actor_strings", ACTOR_STRINGS_DDL),
     ("0012_url_tokens", URL_TOKENS_DDL),
     ("0013_unique_space_titles", UNIQUE_SPACE_TITLES_DDL),
+    ("0014_cycles_and_gardener", CYCLES_AND_GARDENER_DDL),
 ]

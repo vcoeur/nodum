@@ -109,10 +109,18 @@ class Store:
         )
 
     def require_review(self, spaces: set[str | None], action: str) -> None:
-        """Gate accept/reject/archive: human, or ``edit`` on every space touched.
+        """Gate review and curative work: human, or ``edit`` on every space touched.
 
         Q13 note 03 Q1: an ``edit`` grant carries full in-space state-machine
         authority. Humans pass unconditionally.
+
+        Its callers are accept/reject/archive and the consolidation cycle
+        lifecycle (:func:`nodum.service.open_cycle` /
+        :func:`nodum.service.close_cycle`), which asks the identical question —
+        may this principal exercise state-machine authority over these spaces?
+        — and so must not grow a second copy of the answer. What a cycle passes
+        as ``spaces`` is where the two differ, and that decision lives at the
+        call site, in :func:`nodum.service._cycle_authority_spaces`.
         """
         if self.principal.is_human:
             return
