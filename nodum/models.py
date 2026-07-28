@@ -553,6 +553,20 @@ class MergeRedirectOut(BaseModel):
     created_at: str
 
 
+class RetiredEdgeOut(EdgeOut):
+    """An edge a merge archived instead of repointing, **with its reason**.
+
+    Every :class:`EdgeOut` field is here unchanged, so a client that only wants
+    the edge keeps reading it as one. ``reason`` is the sentence the merge
+    recorded in the event payload — the repointing would have produced a
+    self-loop, or a duplicate of an edge the survivor already carries — lifted
+    into the return value because a caller reading the result should not have to
+    go to the event log to learn why an edge left the live graph.
+    """
+
+    reason: str
+
+
 class MergeOut(BaseModel):
     """The outcome of a soft merge (design D9): reversible, nothing destroyed.
 
@@ -561,9 +575,11 @@ class MergeOut(BaseModel):
     the survivor, each carrying its original endpoints in
     ``props.merged_from``; ``retired`` are the incident edges that could not be
     repointed because the repointing would have produced a self-loop or a
-    duplicate of an edge the survivor already carries. Both lists are reported
-    rather than summarised: an edge that quietly vanished from the live graph is
-    the kind of thing a merge must never do without saying so.
+    duplicate of an edge the survivor already carries — each carrying the
+    ``reason`` it was retired. Both lists are reported rather than summarised: an
+    edge that quietly vanished from the live graph is the kind of thing a merge
+    must never do without saying so, and "without saying so" includes saying
+    *which* of the two rules bit.
 
     ``cycle_id`` is the consolidation cycle the whole merge was stamped with —
     its own one-op ``curative`` cycle when a human invoked it directly, or the
@@ -574,7 +590,7 @@ class MergeOut(BaseModel):
     tombstones: list[NodeOut]
     redirects: list[MergeRedirectOut]
     relinked: list[EdgeOut]
-    retired: list[EdgeOut]
+    retired: list[RetiredEdgeOut]
     cycle_id: str
 
 
@@ -670,6 +686,32 @@ class RollbackConflictOut(BaseModel):
     conflicting_cycle_id: str | None
 
 
+class RollbackBlockerOut(BaseModel):
+    """A row a rollback would have to delete but cannot — the guards, as data.
+
+    A conflict is the graph having *moved* a row the cycle wrote
+    (:class:`RollbackConflictOut`). A blocker is the other refusal shape: the
+    graph having *grown something onto* a row the cycle created, so the delete
+    that reverses that create would have to cascade past what the reversal was
+    asked to touch. Both stop a rollback; only one of them was visible to the
+    preflight before, which meant a dry run could report ``conflicts: []`` for a
+    rollback that then failed.
+
+    ``row_id`` is the row the cycle created, named by ``cycle_event_seq`` /
+    ``cycle_event_op``. ``dependants`` are the ids in the way — children of a
+    node, occupants of a space, nodes typed by a type node, agents granted on a
+    space, merge redirects naming a node — and ``reason`` is the guard's own
+    sentence, which is what the refusal says if the rollback is attempted.
+    """
+
+    kind: str
+    row_id: str
+    cycle_event_seq: int
+    cycle_event_op: str
+    dependants: list[str]
+    reason: str
+
+
 class RollbackOut(BaseModel):
     """The outcome — or, on a dry run, the verdict — of rolling a cycle back.
 
@@ -686,7 +728,10 @@ class RollbackOut(BaseModel):
     effect to reverse.
 
     ``conflicts`` is empty on a rollback that happened; on a dry run it is the
-    reason it would not.
+    reason it would not. ``blockers`` is the second half of that verdict — the
+    delete guards, which refuse for a different reason and used to be invisible
+    until the rollback was already running. Both lists are empty on a rollback
+    that happened, and a dry run reporting either is a rollback that would fail.
     """
 
     cycle_id: str
@@ -700,6 +745,7 @@ class RollbackOut(BaseModel):
     deleted_edges: list[str]
     redirects_removed: list[str]
     conflicts: list[RollbackConflictOut]
+    blockers: list[RollbackBlockerOut] = []
 
 
 class SpaceOut(NodeOut):

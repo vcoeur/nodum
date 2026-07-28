@@ -623,12 +623,22 @@ def test_a_cycle_row_outside_the_vocabulary_is_refused(fresh_db, columns, values
         conn.close()
 
 
-def test_0014_seeds_the_gardener_with_edit_on_meta_and_main(fresh_db):
+def test_0014_seeds_the_gardener_with_read_on_meta_and_edit_on_main(fresh_db):
     """D7 is auto-apply by default, and a gardener with no grant does nothing.
 
     The grants are ordinary rows on purpose: they list beside every other
     agent's on `/spaces` and `nodum revoke` takes them away. There is no
     gardener-shaped exception in the grant model.
+
+    **`read` on meta, not `edit`.** The first cut said `edit`, justified as
+    "consolidation reads and *writes* the type vocabulary"; it never writes it —
+    `consolidate._is_curatable` excludes the meta space and the structural types
+    from every job, so meta is only ever read, to resolve a type. `read` is
+    also exactly what every other curating agent in this suite holds. What the
+    extra level bought was authority no shipped job reaches: creating spaces,
+    renaming `main`, and archiving the `note` type, after which a human is
+    blocked from writing a note too. `tests/test_consolidate.py` pins the
+    behavioural half — a full cycle completes on `read`.
     """
     conn = db.connect()
     try:
@@ -645,7 +655,7 @@ def test_0014_seeds_the_gardener_with_edit_on_meta_and_main(fresh_db):
                 "SELECT space_id, level FROM grants WHERE agent_id = ?", (GARDENER_AGENT_ID,)
             ).fetchall()
         )
-        assert levels == {"meta": "edit", "main": "edit"}
+        assert levels == {"meta": "read", "main": "edit"}
     finally:
         conn.close()
 
@@ -705,7 +715,7 @@ def test_0014_refuses_to_upgrade_a_database_whose_reserved_id_is_taken(tmp_path,
     monkeypatch.setattr(db, "MIGRATIONS", MIGRATIONS)
     conn = db.connect()
     try:
-        with pytest.raises(sqlite3.IntegrityError, match="is reserved"):
+        with pytest.raises(sqlite3.IntegrityError, match="reserved"):
             db.init_db(conn)
         # Refused, not half-done: no cycles table, no migration row, and the
         # impostor's own account is exactly as it was.
@@ -720,6 +730,70 @@ def test_0014_refuses_to_upgrade_a_database_whose_reserved_id_is_taken(tmp_path,
             conn.execute("SELECT kind FROM agents WHERE id = 'builtin-gardener'").fetchone()["kind"]
             == "external"
         )
+    finally:
+        conn.close()
+
+
+def test_0014_refuses_any_pre_existing_id_under_the_reserved_prefix(tmp_path, monkeypatch):
+    """The reservation is the **prefix**, and the upgrade guard has to say so.
+
+    Checking the one id `builtin-gardener` let a database holding, say,
+    `builtin-librarian` upgrade cleanly — leaving a live, token-bearing
+    *external* agent under the prefix whose whole purpose is that
+    `agent:<id>` in the event log names exactly one principal. Nothing is
+    impersonated the day it upgrades; the day 5b seeds a second `builtin-*`
+    agent, the collision this guard exists to refuse is already installed.
+    """
+    monkeypatch.setenv("NODUM_DB", str(tmp_path / "librarian.db"))
+    monkeypatch.setattr(db, "MIGRATIONS", _prefix_through("0013_unique_space_titles"))
+    service.init()
+    conn = db.connect()
+    try:
+        conn.execute(
+            "INSERT INTO agents (id, kind, name, owner_human_id)"
+            " VALUES ('builtin-librarian', 'external', 'builtin-librarian', 'owner')"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    monkeypatch.setattr(db, "MIGRATIONS", MIGRATIONS)
+    conn = db.connect()
+    try:
+        with pytest.raises(sqlite3.IntegrityError, match="builtin-") as refusal:
+            db.init_db(conn)
+        assert "reserved" in str(refusal.value)
+        assert "0014_cycles_and_gardener" not in db.applied_migrations(conn)
+        assert (
+            conn.execute("SELECT kind FROM agents WHERE id = 'builtin-librarian'").fetchone()[
+                "kind"
+            ]
+            == "external"
+        )
+    finally:
+        conn.close()
+
+
+def test_0014_lets_an_ordinary_agent_id_through(tmp_path, monkeypatch):
+    """The widened guard must still be a prefix and not a substring match."""
+    monkeypatch.setenv("NODUM_DB", str(tmp_path / "ordinary.db"))
+    monkeypatch.setattr(db, "MIGRATIONS", _prefix_through("0013_unique_space_titles"))
+    service.init()
+    conn = db.connect()
+    try:
+        conn.execute(
+            "INSERT INTO agents (id, kind, name, owner_human_id) VALUES"
+            " ('librarian', 'external', 'librarian', 'owner'),"
+            " ('my-builtin-helper', 'external', 'my-builtin-helper', 'owner')"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    monkeypatch.setattr(db, "MIGRATIONS", MIGRATIONS)
+    conn = db.connect()
+    try:
+        assert db.init_db(conn) == ["0014_cycles_and_gardener"]
     finally:
         conn.close()
 

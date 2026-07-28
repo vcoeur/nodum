@@ -205,9 +205,17 @@ including every parameter.
   `--dry-run` prints the diff and writes nothing.
 
 The writes a cycle makes are the **gardener's** (`agent:builtin-gardener`), an
-internal agent seeded with `edit` on `meta` and `main` as ordinary grant rows —
+internal agent seeded with `read` on `meta` and `edit` on `main` as ordinary
+grant rows —
 they show up in `space-list` and `nodum revoke builtin-gardener main` takes them
-away. `--as` on `consolidate` names who *asked*, which the journal records as
+away. Every other space needs an explicit
+`nodum grant builtin-gardener <space> edit`; `consolidate --scope` on a space
+the gardener holds nothing on refuses with that command in the message rather
+than running. Two cycles never run at once in one process: a second caller is
+refused with *a consolidation cycle is already running* instead of queueing
+behind the first and proposing every candidate a second time. Ctrl-C closes the
+cycle `failed` on the way out, so an interrupted run is still one a
+`cycle-rollback` can take back. `--as` on `consolidate` names who *asked*, which the journal records as
 `triggered_by`, and that is deliberately not the same thing as who acted: an
 entry carrying only one of the two could answer "I did not ask for this" or
 "who ran this at 04:00", never both.

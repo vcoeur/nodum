@@ -47,7 +47,9 @@ from nodum.models import (
     ProposalOut,
     ProposeEdgesOut,
     RelinkDiff,
+    RetiredEdgeOut,
     RetypeOut,
+    RollbackBlockerOut,
     RollbackConflictOut,
     RollbackOut,
     SpaceOut,
@@ -2326,6 +2328,130 @@ def reject_matching(
 #: stored payload and is interpolated into SQL.
 REINSERT_ORDER = ("nodes", "versions", "edges", "merge_redirects")
 
+#: How many blocking row ids a refusal spells out before summarising the rest.
+#: A refusal naming none of them cannot be acted on; one naming four hundred is
+#: not a sentence.
+MAX_NAMED_DEPENDANTS = 5
+
+
+def _named_rows(ids: list[str]) -> str:
+    """The first few ids, then a count of what is left."""
+    shown = ", ".join(ids[:MAX_NAMED_DEPENDANTS])
+    rest = len(ids) - MAX_NAMED_DEPENDANTS
+    return f"{shown} and {rest} more" if rest > 0 else shown
+
+
+def _delete_blocker(
+    conn: sqlite3.Connection,
+    node_id: str,
+    *,
+    doomed_nodes: frozenset[str] = frozenset(),
+    doomed_redirects: frozenset[str] = frozenset(),
+) -> tuple[list[str], str] | None:
+    """What stands in the way of deleting a node row, if anything.
+
+    **Every foreign key into ``nodes(id)`` is here**, and that completeness is
+    the point rather than a list that grew: an unguarded one is not a refusal
+    the caller can read but a bare ``sqlite3.IntegrityError`` — a 500 over HTTP
+    and ``database error: FOREIGN KEY constraint failed`` on a CLI whose
+    contract promises to name "an undo the graph has grown past". The graph is
+    never corrupted by one (the transaction rolls back whole); what is lost is
+    the ability to act on the answer.
+
+    The five, in the order a caller most likely meets them: ``nodes.parent_id``
+    (children), ``nodes.space_id`` (a space's occupants), ``merge_redirects``
+    (a node merged away, or merged into), ``grants.space_id`` (agents granted on
+    a space) and ``nodes.type_id`` (nodes typed by a type node).
+
+    Args:
+        conn: The open connection.
+        node_id: The node whose deletion is in question.
+        doomed_nodes: Nodes the same reversal is going to delete anyway. A
+            rollback reverses newest first, so a child a cycle created *after*
+            its parent is gone by the time the parent's create is reversed —
+            counting it would refuse a rollback that in fact succeeds. Empty for
+            :func:`undo`, which reverses exactly one event.
+        doomed_redirects: Tombstone ids whose ``merge_redirects`` rows the same
+            reversal removes, for the same reason.
+
+    Returns:
+        ``(dependant ids, the refusal's sentence)``, or ``None`` if the row can
+        go.
+    """
+
+    def surviving(rows: list[sqlite3.Row], column: str, doomed: frozenset[str]) -> list[str]:
+        return sorted({str(row[column]) for row in rows} - doomed)
+
+    children = surviving(
+        conn.execute("SELECT id FROM nodes WHERE parent_id = ?", (node_id,)).fetchall(),
+        "id",
+        doomed_nodes,
+    )
+    if children:
+        # A child is a separate create this reversal never covered. Cascading
+        # would destroy work nobody named, so it refuses — and names the
+        # children, because "reparent them" was advice nobody could follow (no
+        # surface reparents a node) and "undo them" is wrong when the child was
+        # itself written inside a cycle, which `undo` refuses by design.
+        return children, (
+            f"node {node_id} still has {len(children)} child node(s) ({_named_rows(children)}) — "
+            "take those back first: undo their creation, or roll back the cycle that made them"
+        )
+    occupants = surviving(
+        conn.execute(
+            "SELECT id FROM nodes WHERE space_id = ? AND id != ?", (node_id, node_id)
+        ).fetchall(),
+        "id",
+        doomed_nodes,
+    )
+    if occupants:
+        return occupants, (
+            f"space {node_id} still holds {len(occupants)} node(s) ({_named_rows(occupants)}) — "
+            "take those back first: undo their creation, or roll back the cycle that made them"
+        )
+    redirects = surviving(
+        conn.execute(
+            "SELECT tombstone_id FROM merge_redirects WHERE tombstone_id = ? OR into_id = ?",
+            (node_id, node_id),
+        ).fetchall(),
+        "tombstone_id",
+        doomed_redirects,
+    )
+    if redirects:
+        return redirects, (
+            f"node {node_id} is named by {len(redirects)} merge redirect(s) "
+            f"({_named_rows(redirects)}) — roll back the consolidation cycle that merged it first"
+        )
+    granted = surviving(
+        conn.execute("SELECT agent_id FROM grants WHERE space_id = ?", (node_id,)).fetchall(),
+        "agent_id",
+        frozenset(),
+    )
+    if granted:
+        # `grants.space_id` references `nodes(id)`, so a space a cycle created
+        # and a human has since delegated cannot be deleted. Revoking is the
+        # follow-through, and it reaches a space in any state.
+        return granted, (
+            f"space {node_id} still carries {len(granted)} grant(s) ({_named_rows(granted)}) — "
+            "revoke them first"
+        )
+    typed = surviving(
+        conn.execute(
+            "SELECT id FROM nodes WHERE type_id = ? AND id != ?", (node_id, node_id)
+        ).fetchall(),
+        "id",
+        doomed_nodes,
+    )
+    if typed:
+        # `nodes.type_id` references `nodes(id)` since migration 0009 — a type
+        # is a node — so a type node that has since been used to type anything
+        # is held down by every node wearing it.
+        return typed, (
+            f"type {node_id} still types {len(typed)} node(s) ({_named_rows(typed)}) — "
+            "take those back first: undo their creation, or roll back the cycle that made them"
+        )
+    return None
+
 
 def _delete_created_row(
     conn: sqlite3.Connection,
@@ -2350,51 +2476,18 @@ def _delete_created_row(
 
     Raises:
         UndoNotPossible: If the graph has grown something onto the row that the
-            reversal was never asked to touch.
+            reversal was never asked to touch — every foreign key into
+            ``nodes(id)``, checked by :func:`_delete_blocker`, which
+            :func:`_rollback_plan` also reads so that the preflight and the run
+            agree about what will happen.
     """
     deleted: list[dict[str, Any]] = []
     if kind == "node":
-        # Children are separate creates this event never covered, and they hold
-        # an FK to the row being deleted. Cascading would destroy work the
-        # reversal was never asked to touch, so it refuses and says what is in
-        # the way.
-        children = conn.execute("SELECT id FROM nodes WHERE parent_id = ?", (row["id"],)).fetchall()
-        if children:
-            raise UndoNotPossible(
-                f"{context}: node {row['id']} still has {len(children)} child node(s) — "
-                "undo or reparent them first"
-            )
-        # `nodes.space_id` is the second foreign key into this row, and it is
-        # the one a space create grows: undoing the create of a space that has
-        # since been written into hit the FK and served a bare IntegrityError —
-        # a 500 on `/api/undo`, and `database error: FOREIGN KEY constraint
-        # failed` on the CLI, for the ordinary "the graph has grown past this"
-        # case the contract promises to name. `/spaces` put it one click away.
-        occupants = conn.execute(
-            "SELECT id FROM nodes WHERE space_id = ? AND id != ?",
-            (row["id"], row["id"]),
-        ).fetchall()
-        if occupants:
-            raise UndoNotPossible(
-                f"{context}: space {row['id']} still holds {len(occupants)} node(s) — "
-                "undo their creation first"
-            )
-        # `merge_redirects` is the third foreign key into this row, and the
-        # curative tier is its first writer. A node that has since been merged
-        # away — or merged *into* — is named by a redirect, so deleting it hit
-        # the FK and served the same bare IntegrityError the two guards above
-        # exist to prevent. A rollback deletes its own cycle's redirect rows
-        # before it reaches the creates (it reverses newest first), so what
-        # survives this guard is always another cycle's.
-        redirects = conn.execute(
-            "SELECT tombstone_id FROM merge_redirects WHERE tombstone_id = ? OR into_id = ?",
-            (row["id"], row["id"]),
-        ).fetchall()
-        if redirects:
-            raise UndoNotPossible(
-                f"{context}: node {row['id']} is named by {len(redirects)} merge redirect(s) — "
-                "roll back the consolidation cycle that merged it first"
-            )
+        # No `doomed_*`: this is the apply path, and a rollback deletes
+        # newest-first, so anything it will remove is already gone by now.
+        blocker = _delete_blocker(conn, row["id"])
+        if blocker is not None:
+            raise UndoNotPossible(f"{context}: {blocker[1]}")
         for edge in conn.execute(
             "SELECT * FROM edges WHERE src_id = ? OR dst_id = ?",
             (row["id"], row["id"]),
@@ -2510,9 +2603,12 @@ def undo(
     embeddings, so a curative op outside the namespace would desynchronise the
     search index silently. That means the "undoable" filter above would
     otherwise reverse *one row* of a multi-row merge and leave the other half
-    standing. So an explicit ``seq`` naming one is refused and points at
-    rollback, and the no-``seq`` search **skips** them exactly as it skips
-    events a previous undo already reversed.
+    standing. So a cycle-stamped event is refused and points at rollback — and
+    the no-``seq`` search **finds** them rather than stepping over them, so that
+    the refusal is what a bare ``undo`` after a curative operation gets. Only
+    events a previous ``undo`` already reversed are skipped there: those have a
+    reversal, while a cycle is simply the most recent thing that happened, and
+    reaching past it to an older event is never what the caller meant.
 
     Raises:
         GrantNotPermitted: If the principal is not a human.
@@ -2533,9 +2629,18 @@ def undo(
             json.loads(row["payload"])["reversed_seq"]
             for row in conn.execute("SELECT payload FROM events WHERE op = 'undo'").fetchall()
         }
-        # A cycle's events are `node.`/`edge.` like any other, so the prefix
-        # test alone would pick one out of a merge and reverse half of it.
-        undoable = "(op LIKE 'node.%' OR op LIKE 'edge.%') AND cycle_id IS NULL"
+        # Cycle-stamped events are **in** this search, and are refused below
+        # rather than stepped over. Skipping them looked like the safe reading —
+        # `undo` cannot reverse one row of a merge, so do not offer to — but the
+        # no-`seq` path answers "take back the last thing that happened", and
+        # reaching *past* a curative op to an older event is never what that
+        # meant: a human who merged two nodes and typed the reversal verb they
+        # know got an unrelated edit undone, silently, and the edge the merge
+        # had just relinked deleted with it. Worse, that undo then became a
+        # conflict standing between the merge and its rollback, so both reversal
+        # verbs were spent and the merge was permanently unrollbackable. A
+        # refusal naming the cycle costs one command; this cost the graph.
+        undoable = "(op LIKE 'node.%' OR op LIKE 'edge.%')"
         if seq is None:
             event = conn.execute(
                 f"SELECT * FROM events WHERE op != 'undo' AND {undoable} ORDER BY seq DESC LIMIT 1"
@@ -2562,7 +2667,7 @@ def undo(
                 f"cannot undo event {event['seq']} ({event['op']}): it belongs to consolidation "
                 f"cycle {event['cycle_id']}, and a cycle is taken back whole — one event of a "
                 "merge reversed on its own would leave the other half standing. Roll the cycle "
-                "back instead."
+                f"back instead. Run: nodum rollback {event['cycle_id']}"
             )
         if event["seq"] in reversed_seqs:
             raise ValueError(f"event {event['seq']} has already been undone")
@@ -2655,10 +2760,17 @@ def list_events(
 
     Raises:
         GrantNotPermitted: If the principal is not a human.
+        RecordNotFound: If ``cycle_id`` names no cycle. An empty list is what a
+            **dry run** looks like — ``AGENTS.md`` leans on exactly that as the
+            machine-checkable proof a rehearsal changed nothing — so a typo in
+            the id answering with the same empty list, and exit 0, would make
+            that proof unreadable.
     """
     conn = _connect(path)
     try:
         Store(conn, principal).require_human("read the event log")
+        if cycle_id is not None:
+            _get_cycle_row(conn, cycle_id)
         where = "" if cycle_id is None else " WHERE cycle_id = ?"
         params: tuple[Any, ...] = (limit,) if cycle_id is None else (cycle_id, limit)
         rows = conn.execute(
@@ -3505,9 +3617,22 @@ def create_agent(
     "who is answerable for this write", and an answer two different principals
     can produce is not one.
 
+    **An ``internal`` agent cannot be created here at all.** The design has
+    exactly one, seeded by migration ``0014``, and
+    :func:`nodum.auth.internal_principal` selects it by
+    ``WHERE kind = 'internal'`` and refuses to choose between two — so a second
+    one does not add a gardener, it **removes** the one that exists: every
+    consolidation path, every curative op the runner makes and the whole nightly
+    schedule die with "more than one internal agent account exists".
+    ``disable_agent`` is no cure (the count precedes the ``disabled`` check) and
+    no surface deletes an agent, so the install is only recoverable by editing
+    the database by hand. A second internal agent is a schema change, and it
+    should have to be.
+
     Raises:
-        ValueError: If ``kind`` is unknown, an external agent names no owner,
-            a grant level is unknown, or ``name`` takes a reserved prefix.
+        ValueError: If ``kind`` is unknown or ``internal``, an external agent
+            names no owner, a grant level is unknown, or ``name`` takes a
+            reserved prefix.
         AccountExists: If an agent already answers to ``name``.
         RecordNotFound: If ``owner_human_id`` names no human.
     """
@@ -3521,6 +3646,16 @@ def create_agent(
             "this system seeds itself: an agent's id is its name, and every agent writes to the "
             f"event log as 'agent:<id>', so an account called {name!r} would be indistinguishable "
             "there from the built-in one. Choose another name."
+        )
+    # The prefix check runs first on purpose: `builtin-anything` is refused for
+    # what it is *called*, whatever kind it asked to be.
+    if kind == "internal":
+        raise ValueError(
+            "an internal agent cannot be created: this system has exactly one, seeded by "
+            "migration 0014, and it is chosen by being the only row with kind 'internal'. A "
+            f"second one — {name!r} — would not add a gardener, it would take the existing one "
+            "away: every consolidation path would refuse to choose between them, and no surface "
+            "deletes an agent. A second internal agent is a schema change"
         )
     template = {"meta": "read"} if grants is None else grants
     for level in template.values():
@@ -3975,9 +4110,13 @@ def _cycle_out(row: sqlite3.Row) -> CycleOut:
 
 
 def _get_cycle_row(conn: sqlite3.Connection, cycle_id: str) -> sqlite3.Row:
+    # The message names the thing the caller asked for, not the table it lives
+    # in: `no cycles row with id` is this module's own vocabulary reaching a
+    # human who typed `nodum cycle-get <id>` and has no reason to know the
+    # schema. Every other lookup here says `<thing> not found: <id>`.
     row = conn.execute("SELECT * FROM cycles WHERE id = ?", (cycle_id,)).fetchone()
     if row is None:
-        raise RecordNotFound(f"no cycles row with id: {cycle_id}")
+        raise RecordNotFound(f"consolidation cycle not found: {cycle_id}")
     return row
 
 
@@ -4033,7 +4172,9 @@ def open_cycle(
         principal: Who is opening it. Recorded as ``triggered_by`` (who
             *asked*), which is deliberately not the ``actor`` on the events
             inside (who *acted*) — except for a ``scheduled`` cycle, where the
-            honest answer is :data:`SCHEDULER_ACTOR`.
+            honest answer is :data:`SCHEDULER_ACTOR`. A ``manual`` cycle is by
+            definition a human asking for one, and that is **enforced**: see
+            below.
         path: Explicit database path.
 
     Returns:
@@ -4042,7 +4183,8 @@ def open_cycle(
     Raises:
         ValueError: If ``trigger`` is not one of :data:`CYCLE_TRIGGERS`.
         TypeNotFound: If ``scope`` resolves to no space the principal can see.
-        GrantNotPermitted: If the principal may not open a cycle there.
+        GrantNotPermitted: If the principal may not open a cycle there, or is
+            not a human and asked for a ``manual`` cycle.
     """
     if trigger not in CYCLE_TRIGGERS:
         raise ValueError(f"trigger must be one of {CYCLE_TRIGGERS}, got {trigger!r}")
@@ -4053,6 +4195,25 @@ def open_cycle(
         store.require_review(
             _cycle_authority_spaces(principal, scope_id), "open a consolidation cycle"
         )
+        # `manual` means *a human asked for this run*, and the schema says so in
+        # as many words (`triggered_by` is "'human:<id>', or 'scheduler'"). It
+        # was only ever a convention: `nodum.consolidate.consolidate` takes
+        # `triggered_by` as a **string** and re-mints a principal from it, so
+        # nothing downstream had a `principal=` binding to check and a caller
+        # able to reach that function could put `agent:builtin-gardener` in the
+        # journal's "who asked" column — which is the one column that answers
+        # "I did not ask for this". Refused here rather than there, because this
+        # is where the value is written and every future caller passes through
+        # it. `scheduled` needs no check (it records the clock whatever it is
+        # handed) and `curative` genuinely records the principal running the
+        # operation, which may be an `edit`-granted agent by design (T1).
+        if trigger == "manual" and not principal.is_human:
+            raise GrantNotPermitted(
+                f"{principal.actor_string} may not open a 'manual' consolidation cycle: "
+                "'manual' records that a human asked for this run, and the journal's answer to "
+                "'who asked' is a human or the scheduler. A run nobody asked for is 'scheduled'; "
+                "a cycle carrying one curative operation is 'curative'"
+            )
         cycle_id = uuid.uuid4().hex
         triggered_by = SCHEDULER_ACTOR if trigger == "scheduled" else principal.actor_string
         conn.execute(
@@ -4124,6 +4285,81 @@ def close_cycle(
         conn.close()
 
 
+def abandon_cycle(
+    cycle_id: str, *, principal: Principal, path: str | Path | None = None
+) -> CycleOut:
+    """Close a ``running`` cycle nobody is going to finish, as ``failed`` (human-only).
+
+    The door out of an **interrupted** run. A cycle that never closed is not a
+    cosmetic wart in the journal: ``_rollback_plan`` refuses a ``running`` cycle
+    because its event set is not closed yet, and :func:`undo` refuses every
+    event it stamped — so the writes it made before it died are irreversible on
+    every surface until somebody closes it. The runner closes its own cycle even
+    on ``KeyboardInterrupt``, but a ``SIGKILL``, a power cut, or
+    :meth:`nodum.scheduler.ConsolidationScheduler.stop` cancelling a mid-cycle
+    task during a server shutdown all leave the row exactly there, and until now
+    nothing on any surface could move it.
+
+    It is deliberately **not** a general "close this cycle" verb — that is
+    :func:`close_cycle`, which the runner owns and which takes the outcome and
+    the report. This one takes neither: the outcome of an abandoned run is
+    ``failed`` (what the run itself would have recorded had it survived), and
+    the report says who abandoned it and that the run never finished, which is
+    the whole of what is known. Nothing about the writes it already made is
+    touched — they are real, and :func:`rollback_cycle` is what takes them back,
+    which is exactly what this unlocks.
+
+    Human-only. Declaring somebody else's run dead is a judgement about a
+    process the caller cannot see, and it is the step that makes a whole cycle's
+    writes reversible — an authority ``rollback_cycle`` itself does not delegate.
+
+    Args:
+        cycle_id: The cycle to abandon.
+        principal: Who is abandoning it; must be a human, and is recorded in the
+            report.
+        path: Explicit database path.
+
+    Returns:
+        The cycle, now ``failed``.
+
+    Raises:
+        GrantNotPermitted: If the principal is not a human.
+        RecordNotFound: If the cycle id does not resolve.
+        InvalidTransition: If the cycle is not ``running`` — a cycle that has
+            already said how it ended is not abandoned, and re-closing it would
+            overwrite the record of what actually happened.
+    """
+    conn = _connect(path)
+    try:
+        Store(conn, principal).require_human("abandon a consolidation cycle")
+        row = _get_cycle_row(conn, cycle_id)
+        if row["status"] != "running":
+            raise InvalidTransition(
+                f"cycle {cycle_id} is already {row['status']}, not running: abandoning is for a "
+                "run that was interrupted and left its journal entry open, and a cycle that has "
+                "said how it ended is not one"
+            )
+    finally:
+        conn.close()
+    # Through `close_cycle`, so a cycle leaves `running` in exactly one place —
+    # including the re-check under the write, which is what makes the read above
+    # a message rather than a race.
+    return close_cycle(
+        cycle_id,
+        status="failed",
+        report={
+            "op": "abandon_cycle",
+            "abandoned_by": principal.actor_string,
+            "error": (
+                "the run was interrupted and never closed itself; a human closed its journal "
+                "entry so that what it had already written could be rolled back"
+            ),
+        },
+        principal=principal,
+        path=path,
+    )
+
+
 def get_cycle(cycle_id: str, *, principal: Principal, path: str | Path | None = None) -> CycleOut:
     """Return one cycle's journal entry (human-only).
 
@@ -4149,8 +4385,14 @@ def list_cycles(
     """Return the most recent cycles, newest first (human-only).
 
     Raises:
+        ValueError: If ``limit`` is below 1. SQLite reads a negative ``LIMIT``
+            as *unbounded*, so ``--limit -3`` silently returned the whole
+            journal — the opposite of what the caller asked for. The rule is
+            :func:`subgraph`'s, said here for the same reason.
         GrantNotPermitted: If the principal is not a human.
     """
+    if limit < 1:
+        raise ValueError(f"limit must be >= 1, got {limit}")
     conn = _connect(path)
     try:
         Store(conn, principal).require_human("read the consolidation journal")
@@ -4326,11 +4568,13 @@ def merge_nodes(
     nothing the props field does not already carry.
 
     Two kinds of incident edge cannot be repointed and are **archived** instead,
-    each reported in ``retired`` with the reason in its event payload: one whose
-    repointing would produce a **self-loop** (both endpoints merged into the
-    same survivor — which is exactly what happens to the ``duplicate_of`` edge
-    that proposed the merge), and one that would **duplicate** an edge the
-    survivor already carries. Neither is dropped silently.
+    each reported in ``retired`` carrying its own ``reason`` — the same sentence
+    the event payload records: one whose repointing would produce a
+    **self-loop** (both endpoints merged into the same survivor — which is
+    exactly what happens to the ``duplicate_of`` edge that proposed the merge),
+    and one that would **duplicate** an edge the survivor already carries.
+    Neither is dropped silently, and neither is reported without saying which of
+    the two rules bit.
 
     What it refuses, and why each is a refusal rather than a silent skip: a node
     merged **into itself** (nothing to do, and a ``tombstones`` list that did
@@ -4439,7 +4683,7 @@ def merge_nodes(
                 ).fetchall()
             }
             relinked: list[EdgeOut] = []
-            retired: list[EdgeOut] = []
+            retired: list[RetiredEdgeOut] = []
             for row in incident:
                 before = _row_dict(row)
                 new_src = survivor["id"] if before["src_id"] in merged_ids else before["src_id"]
@@ -4457,9 +4701,18 @@ def merge_nodes(
                     # A pending edge leaves `proposed`, so its op is `reject`
                     # rather than `archive` — the state machine allows one.
                     action = "archive" if before["state"] == "active" else "reject"
+                    # The reason travels in the return value as well as in the
+                    # event payload: a caller reading `retired` should not have
+                    # to go to the event log to learn why an edge left the live
+                    # graph, and the two rules read very differently to a human.
                     retired.append(
-                        _edge_out(
-                            _set_edge_state(conn, before, "archived", action, actor, reason=reason)
+                        RetiredEdgeOut(
+                            **_edge_out(
+                                _set_edge_state(
+                                    conn, before, "archived", action, actor, reason=reason
+                                )
+                            ).model_dump(),
+                            reason=reason,
                         )
                     )
                     continue
@@ -5058,6 +5311,40 @@ class _RollbackPlan(NamedTuple):
     events: list[dict[str, Any]]
     skipped: list[int]
     conflicts: list[RollbackConflictOut]
+    blockers: list[RollbackBlockerOut]
+
+
+def _merged_into(row: dict[str, Any] | None) -> str | None:
+    """``props.merged_into`` on a recorded node row, if it carries one."""
+    if row is None:
+        return None
+    props = row.get("props")
+    if isinstance(props, str):
+        props = json.loads(props or "{}")
+    return props.get("merged_into") if isinstance(props, dict) else None
+
+
+def _applies_a_merge(
+    kind: str, before: dict[str, Any] | None, after: dict[str, Any] | None
+) -> bool:
+    """Did this event's payload put a node *into* a merged-away state?
+
+    The question a reversal has to ask before it deletes a ``merge_redirects``
+    row, and it is a question about the **payload**, not about the op's name.
+    Keying on ``op == 'node.merge'`` was right exactly twice: a rollback that
+    re-applies a merge writes the same before/after pair under the name
+    ``node.rollback``, so reversing *that* restored the tombstone and left the
+    redirect standing — after which the tombstone's create was permanently
+    un-undoable (``undo`` refuses a node a redirect names, and the merge that
+    made it is cycle-stamped) and merging the node again died on the
+    ``merge_redirects.tombstone_id`` primary key. The involution held for one
+    rollback and broke on the third.
+
+    Reading the payload covers both spellings and excludes the reversals that
+    *un*-merge (``after`` has no ``merged_into``): those put the redirect back
+    through the ordinary ``deleted`` re-insertion, which is where it belongs.
+    """
+    return kind == "node" and _merged_into(after) is not None and _merged_into(before) is None
 
 
 def _touched_rows(op: str, payload: dict[str, Any]) -> set[tuple[str, str]]:
@@ -5130,6 +5417,25 @@ def _rollback_plan(conn: sqlite3.Connection, cycle_id: str) -> _RollbackPlan:
     and "another gardener's cycle touched it" is exactly as much of a
     later modification as a human's edit.
 
+    **"Taken back" is a fixpoint, not a set.** A reversal can itself be
+    reversed — rolling a rollback back re-applies what it reversed — so an event
+    counted as "already taken back" the moment anything named it was wrong the
+    moment that reversal was undone. A cycle whose write had been rolled back
+    and then rolled back again is *live*, and was being skipped as reversed
+    while an older cycle's rollback wrote straight over it. So a seq is reversed
+    iff **some** reversal of it is not itself reversed, computed by recursion:
+    reversals strictly increase in seq, so it terminates.
+
+    **Blockers are the second refusal, and they belong here too** (finding S8).
+    A conflict is the graph having *moved* a row the cycle wrote; a blocker is
+    the graph having *grown something onto* a row the cycle created, which
+    :func:`_delete_blocker` refuses. Both stop a rollback, and modelling only
+    the first made the preflight disagree with the run — a dry run reported
+    ``conflicts: []`` for a rollback that then died on the guard, which is the
+    one answer a confirm dialog must not give. Rows the rollback itself removes
+    are excluded, since it reverses newest first and a child a cycle created
+    after its parent is gone before the parent's create is reached.
+
     Raises:
         RecordNotFound: If the cycle id does not resolve.
         InvalidTransition: If the cycle is still running, has already been
@@ -5196,11 +5502,27 @@ def _rollback_plan(conn: sqlite3.Connection, cycle_id: str) -> _RollbackPlan:
     payloads = {event["seq"]: json.loads(event["payload"]) for event in later}
     # Anything that reverses a candidate must itself come after it, so the
     # window above holds every reversal that can matter.
-    already_reversed: set[int] = set()
+    reversed_by: dict[int, list[int]] = {}
     for event in later:
         reversed_seq = _reverses(event["op"], payloads[event["seq"]])
         if reversed_seq is not None:
-            already_reversed.add(reversed_seq)
+            reversed_by.setdefault(reversed_seq, []).append(int(event["seq"]))
+
+    settled: dict[int, bool] = {}
+
+    def is_reversed(seq: int) -> bool:
+        """Is this event's effect currently undone? (a fixpoint, not a flag)."""
+        answer = settled.get(seq)
+        if answer is None:
+            # A reversal that has itself been reversed has been re-applied, so
+            # it stops counting. Recursion terminates because a reversal always
+            # comes after what it reverses.
+            settled[seq] = answer = any(
+                not is_reversed(reversal) for reversal in reversed_by.get(seq, ())
+            )
+        return answer
+
+    already_reversed = {seq for seq in reversed_by if is_reversed(seq)}
 
     conflicts: list[RollbackConflictOut] = []
     for event in later:
@@ -5226,7 +5548,62 @@ def _rollback_plan(conn: sqlite3.Connection, cycle_id: str) -> _RollbackPlan:
                     conflicting_cycle_id=event["cycle_id"],
                 )
             )
-    return _RollbackPlan(cycle=cycle, events=events, skipped=skipped, conflicts=conflicts)
+    return _RollbackPlan(
+        cycle=cycle,
+        events=events,
+        skipped=skipped,
+        conflicts=conflicts,
+        blockers=_rollback_blockers(conn, events),
+    )
+
+
+def _rollback_blockers(
+    conn: sqlite3.Connection, events: list[dict[str, Any]]
+) -> list[RollbackBlockerOut]:
+    """The delete guards a rollback of these events would hit, as data.
+
+    Runs the same check :func:`_delete_created_row` raises on, over exactly the
+    rows the reversal would have to delete — the ``node.`` events whose payload
+    has no ``before``, which is what "the cycle created this" looks like in the
+    log. Rows the reversal removes on its way are excluded: the pass goes newest
+    first, so anything the cycle created *after* the row in question is already
+    gone, as is any ``merge_redirects`` row the reversal of a merge takes with
+    it.
+    """
+    payloads = [(event, json.loads(event["payload"])) for event in events]
+    created = [
+        (event, payload["after"])
+        for event, payload in payloads
+        if event["op"].startswith("node.")
+        and payload.get("before") is None
+        and payload.get("after") is not None
+    ]
+    doomed_nodes = frozenset(after["id"] for _, after in created)
+    doomed_redirects = frozenset(
+        payload["after"]["id"]
+        for event, payload in payloads
+        if _applies_a_merge(
+            event["op"].split(".", 1)[0], payload.get("before"), payload.get("after")
+        )
+    )
+    blockers: list[RollbackBlockerOut] = []
+    for event, after in created:
+        blocker = _delete_blocker(
+            conn, after["id"], doomed_nodes=doomed_nodes, doomed_redirects=doomed_redirects
+        )
+        if blocker is not None:
+            dependants, reason = blocker
+            blockers.append(
+                RollbackBlockerOut(
+                    kind="node",
+                    row_id=after["id"],
+                    cycle_event_seq=int(event["seq"]),
+                    cycle_event_op=event["op"],
+                    dependants=dependants,
+                    reason=reason,
+                )
+            )
+    return blockers
 
 
 def _conflict_message(cycle_id: str, conflicts: list[RollbackConflictOut]) -> str:
@@ -5287,14 +5664,13 @@ def _apply_rollback(
             _reinsert_rows(conn, payload["deleted"])
 
         # `merge_redirects` is covered by no event of its own. It is derivable
-        # (the tombstone, the survivor and the seq are all in the `node.merge`
-        # payload) but it has to be removed explicitly, because the foreign key
-        # it holds into `nodes` otherwise makes the tombstone's original create
-        # permanently un-undoable.
-        if event["op"] == "node.merge" and after is not None:
+        # (the tombstone and the survivor are both in the payload) but it has to
+        # be removed explicitly, because the foreign key it holds into `nodes`
+        # otherwise makes the tombstone's original create permanently
+        # un-undoable.
+        if _applies_a_merge(kind, before, after):
             redirect = conn.execute(
-                "SELECT * FROM merge_redirects WHERE tombstone_id = ? AND event_seq = ?",
-                (after["id"], event["seq"]),
+                "SELECT * FROM merge_redirects WHERE tombstone_id = ?", (after["id"],)
             ).fetchone()
             if redirect is not None:
                 removed.append({"table": "merge_redirects", "row": _row_dict(redirect)})
@@ -5447,8 +5823,10 @@ def rollback_cycle(
         dry_run: Compute the plan and return it without writing anything — no
             rollback cycle is opened and no event is emitted. This is the "would
             this succeed?" a UI needs, so conflicts come back in ``conflicts``
-            rather than as an exception; every other refusal is raised on both
-            paths, because they are refusals to plan rather than results of one.
+            and the delete guards in ``blockers`` rather than as exceptions;
+            every other refusal is raised on both paths, because they are
+            refusals to plan rather than results of one. A dry run reporting
+            either list is a rollback that would fail.
         principal: Who is rolling it back. Must be a human.
         path: Explicit database path.
 
@@ -5484,6 +5862,7 @@ def rollback_cycle(
             deleted_edges=[],
             redirects_removed=[],
             conflicts=plan.conflicts,
+            blockers=plan.blockers,
         )
     if plan.conflicts:
         raise RollbackConflict(_conflict_message(cycle_id, plan.conflicts), plan.conflicts)

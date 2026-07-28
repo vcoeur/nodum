@@ -13,6 +13,7 @@ import pytest
 from helpers import agent, owner
 
 from nodum import auth, db, service
+from nodum.migrations import GARDENER_AGENT_ID
 from nodum.service import InvalidTransition, RecordNotFound, TypeNotFound
 from nodum.store import GrantNotPermitted
 
@@ -207,9 +208,52 @@ def test_a_read_only_grant_does_not_veto_an_unscoped_cycle_the_agent_may_run(fre
     every granted space: an agent with `edit` on `main` and `read` on `meta` —
     the ordinary shape, since resolving a type needs `read` on meta — would
     otherwise be refused by its own read grant.
+
+    The trigger is `curative` because that is the one an agent legitimately
+    opens for itself (`_curative_cycle`); `manual` means a *human* asked, and is
+    refused below.
     """
     writer = agent("writer", grants={"meta": "read", "main": "edit"})
-    assert service.open_cycle(trigger="manual", principal=writer).scope is None
+    assert service.open_cycle(trigger="curative", principal=writer).scope is None
+
+
+def test_only_a_human_may_open_a_manual_cycle(fresh_db):
+    """`triggered_by` answers "who asked", and it was a convention, not a rule.
+
+    The schema's own comment says the column holds `'human:<id>'` or
+    `'scheduler'`, but `open_cycle` wrote `principal.actor_string` unchecked —
+    and `consolidate.consolidate` takes `triggered_by` as a **string** and
+    re-mints a principal from it, so no `principal=` binding existed anywhere
+    downstream for a guard to check. A caller reaching that function could put
+    `agent:builtin-gardener` in the one column that answers "I did not ask for
+    this". The curative and scheduled triggers are untouched: one records the
+    operation's own principal by design, the other records the clock.
+    """
+    gardener = auth.internal_principal()
+    writer = agent("writer", grants={"meta": "read", "main": "edit"})
+
+    for principal in (gardener, writer):
+        with pytest.raises(GrantNotPermitted, match="may not open a 'manual'"):
+            service.open_cycle(trigger="manual", principal=principal)
+    assert service.list_cycles(principal=owner()) == []
+
+    # Neither trigger an agent may legitimately use is affected, and neither
+    # can name an agent as the asker.
+    assert _open(trigger="scheduled", principal=gardener).triggered_by == service.SCHEDULER_ACTOR
+    assert _open(trigger="curative", principal=writer).triggered_by == "agent:writer"
+
+
+def test_the_gardener_cannot_forge_who_asked_through_the_runners_string(fresh_db):
+    """The demonstrated route, closed where the value is written.
+
+    `consolidate(triggered_by=…)` resolves the string to a principal and hands
+    it to `open_cycle`, so the check has to live at the write and not at that
+    call site — every future caller passes through this one.
+    """
+    forged = auth.principal_from_actor(f"agent:{GARDENER_AGENT_ID}")
+    with pytest.raises(GrantNotPermitted, match="may not open a 'manual'"):
+        service.open_cycle(trigger="manual", principal=forged)
+    assert [entry.triggered_by for entry in service.list_cycles(principal=owner())] == []
 
 
 def test_closing_is_gated_the_same_way_opening_is(fresh_db):
@@ -274,8 +318,82 @@ def test_a_status_outside_the_closed_set_is_refused(fresh_db):
 
 
 def test_closing_an_unknown_cycle_is_a_not_found(fresh_db):
-    with pytest.raises(RecordNotFound, match="no cycles row"):
+    with pytest.raises(RecordNotFound, match="consolidation cycle not found"):
         service.close_cycle("nope", status="completed", report={}, principal=owner())
+
+
+def test_a_missing_cycle_is_named_without_naming_the_table_it_lives_in(fresh_db):
+    """`no cycles row with id` is schema vocabulary reaching a human at a prompt.
+
+    Every other lookup in the service says `<thing> not found: <id>`, and the
+    person who typed `nodum cycle-get <id>` has no reason to know the table is
+    called `cycles`.
+    """
+    for call in (
+        lambda: service.get_cycle("nope", principal=owner()),
+        lambda: service.rollback_cycle("nope", principal=owner()),
+        lambda: service.abandon_cycle("nope", principal=owner()),
+        lambda: service.close_cycle("nope", status="failed", report={}, principal=owner()),
+    ):
+        with pytest.raises(RecordNotFound) as missing:
+            call()
+        assert str(missing.value) == "consolidation cycle not found: nope"
+        assert "cycles row" not in str(missing.value)
+
+
+# ── Abandoning an interrupted cycle ───────────────────────────────────────────
+
+
+def test_an_interrupted_cycle_can_be_abandoned_and_only_then_rolled_back(fresh_db):
+    """The door out of a `running` row, which had none on any surface.
+
+    A cycle that never closed is not cosmetic: rollback refuses a `running`
+    cycle because its event set is not closed, and `undo` refuses every event it
+    stamped — so a run killed by `SIGKILL`, a power cut, or the scheduler
+    cancelling a mid-cycle task on shutdown left its writes irreversible
+    *everywhere*, behind advice ("close it first") that nothing could carry out.
+    """
+    cycle = _open()
+    with service.in_cycle(cycle.id):
+        node = service.create_node(type="claim", title="Half-written", principal=owner())
+    with pytest.raises(InvalidTransition, match="still running"):
+        service.rollback_cycle(cycle.id, principal=owner())
+
+    abandoned = service.abandon_cycle(cycle.id, principal=owner())
+
+    assert abandoned.status == "failed"
+    assert abandoned.finished_at is not None
+    # The journal says what happened and who declared it dead.
+    assert abandoned.report["op"] == "abandon_cycle"
+    assert abandoned.report["abandoned_by"] == "human:owner"
+    assert "interrupted" in abandoned.report["error"]
+    # And the writes it made are reachable again — which is the whole point.
+    service.rollback_cycle(cycle.id, principal=owner())
+    assert service.get_cycle(cycle.id, principal=owner()).status == "rolled_back"
+    from nodum.service import NodeNotFound
+
+    with pytest.raises(NodeNotFound):
+        service.get_node(node.id, principal=owner())
+
+
+def test_abandoning_a_cycle_that_already_said_how_it_ended_is_refused(fresh_db):
+    """Not a general "close this" verb: re-closing would overwrite the record."""
+    cycle = _open()
+    service.close_cycle(cycle.id, status="completed", report={"jobs": 4}, principal=owner())
+
+    with pytest.raises(InvalidTransition, match="already completed, not running"):
+        service.abandon_cycle(cycle.id, principal=owner())
+
+    assert service.get_cycle(cycle.id, principal=owner()).report == {"jobs": 4}
+
+
+def test_abandon_is_human_only(fresh_db):
+    """It makes a whole cycle's writes reversible, which `rollback` does not delegate."""
+    cycle = _open()
+    for principal in (agent("bot", grants={"main": "edit"}), auth.internal_principal()):
+        with pytest.raises(GrantNotPermitted, match="abandon a consolidation cycle"):
+            service.abandon_cycle(cycle.id, principal=principal)
+    assert service.get_cycle(cycle.id, principal=owner()).status == "running"
 
 
 # ── Reading the journal ───────────────────────────────────────────────────────
@@ -294,7 +412,7 @@ def test_get_and_list_cycles_are_human_only(fresh_db):
 
 
 def test_get_cycle_on_an_unknown_id_is_a_not_found(fresh_db):
-    with pytest.raises(RecordNotFound, match="no cycles row"):
+    with pytest.raises(RecordNotFound, match="consolidation cycle not found"):
         service.get_cycle("nope", principal=owner())
 
 
@@ -309,6 +427,19 @@ def test_list_cycles_is_newest_first_and_capped(fresh_db):
         third.id,
         second.id,
     ]
+
+
+def test_a_limit_below_one_is_an_error_and_not_the_whole_journal(fresh_db):
+    """SQLite reads a negative LIMIT as *unbounded*, which is the opposite answer.
+
+    `cycle-list --limit -3` returned every row in the journal — a caller asking
+    for less got everything, silently. `subgraph` states the rule this follows.
+    """
+    _open(), _open()
+    for limit in (0, -3):
+        with pytest.raises(ValueError, match="limit must be >= 1"):
+            service.list_cycles(limit=limit, principal=owner())
+    assert len(service.list_cycles(limit=1, principal=owner())) == 1
 
 
 def test_the_journals_diff_is_the_event_log_and_not_a_second_record(fresh_db):

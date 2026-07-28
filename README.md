@@ -266,10 +266,13 @@ degrades to BM25 + graph expansion. `NODUM_EMBED_MODEL` switches the model
   that space. There is deliberately no auto-accept machinery: an agent earns
   `edit`, or it waits.
 - **The gardener is an agent, not an exception.** `nodum consolidate` runs the
-  internal agent `builtin-gardener` — seeded with `edit` on `meta` and `main` as
+  internal agent `builtin-gardener` — seeded with `read` on `meta` and `edit` on
+  `main` as
   ordinary grant rows, which show up in `nodum space-list` and on the `/spaces`
   screen beside every other agent's, and which `nodum revoke builtin-gardener
-  main` takes away with the command that was already there. It holds no
+  main` takes away with the command that was already there. Consolidating any
+  *other* space is an explicit `nodum grant builtin-gardener <space> edit`, and
+  a cycle scoped to a space it holds no grant on says exactly that. It holds no
   credential at all: it authenticates by being in-process, so there is nothing
   to present and nothing to steal, and the supported way to stop it is
   `nodum agent disable builtin-gardener`. Its four jobs are arithmetic over data
@@ -288,8 +291,13 @@ degrades to BM25 + graph expansion. `NODUM_EMBED_MODEL` switches the model
   whole of it inside one transaction — all of it, or none of it. It **refuses
   rather than clobbers**: if anything outside the cycle has touched a row the
   cycle touched, nothing is written and the refusal names both ends of each
-  collision, so you can go and look. A rollback is itself a cycle, so rolling
-  *that* back re-applies the original. `nodum cycle-list` and `nodum cycle-get`
+  collision, so you can go and look. `--dry-run` answers the same question
+  without writing: `conflicts` for rows that moved, `blockers` for rows the
+  graph has grown something onto (a created node that now has a child, a created
+  space that now carries a grant) — both empty is the only clean verdict.
+  A rollback is itself a cycle, so rolling
+  *that* back re-applies the original, at any depth. `nodum cycle-list` and
+  `nodum cycle-get`
   are the journal — what ran, who asked, what it measured, how it ended — and
   what a cycle *changed* is `nodum events --cycle <id>`, read off the same
   append-only log as everything else, so the journal can never become a second
@@ -305,7 +313,10 @@ degrades to BM25 + graph expansion. `NODUM_EMBED_MODEL` switches the model
   MCP — and all four run **inside a cycle**, even when you invoke one directly.
   That is why `undo` refuses a cycle-stamped event and points at `rollback`
   instead: a merge is several rows from one decision, and undoing one of them
-  would leave the other half standing.
+  would leave the other half standing. A bare `nodum undo` right after a
+  curative operation gets that same refusal, naming the cycle — it does not walk
+  past the cycle to an older event, because "take back the last thing that
+  happened" never meant something you did not name.
 - **A schedule, if you ask for one.** Set `NODUM_CONSOLIDATE_AT=03:30` and
   `nodum serve` runs one cycle a night, in the process that is already running —
   no cron, no second process, no new dependency. Unset means off, which is the

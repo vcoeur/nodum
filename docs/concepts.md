@@ -182,11 +182,22 @@ names both ends of every collision. A rollback is itself a cycle, so rolling
 The **gardener** (`builtin-gardener`) is the agent that runs the cycle. It is an
 internal account: it holds no credential at all and authenticates by being
 in-process, so there is nothing to present and nothing to steal. Everything else
-about it is unremarkable on purpose — it has `edit` on `meta` and `main` as two
+about it is unremarkable on purpose — it has `read` on `meta` and `edit` on
+`main` as two
 ordinary grant rows, they appear in `nodum space-list` beside every other
 agent's, and `nodum revoke builtin-gardener main` takes them away with the
 command that was already there. There is no gardener-shaped exception anywhere
-in the grant model, which is the point.
+in the grant model, which is the point. `read` on meta is what resolving a type
+costs; consolidation never writes the vocabulary, so it is never granted to.
+Any other space is an explicit `nodum grant builtin-gardener <space> edit`, and
+a cycle scoped to a space the gardener holds nothing on says so and names that
+command — rather than reporting that the space does not exist, which is true of
+neither the space nor the person reading it.
+
+A revoked grant takes effect from the **next** cycle: the gardener's principal
+is minted once when a run starts, so a cycle already in flight finishes under
+the grants it began with. A cycle is minutes at most, and rolling it back takes
+back whatever it wrote in the meantime.
 
 Its four jobs are arithmetic over data the file already holds — no model is
 involved, and a cycle runs fine on a machine that has none:

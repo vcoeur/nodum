@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 from helpers import OWNER_ACTOR, agent, owner
 
-from nodum import service
+from nodum import auth, service
 from nodum.migrations import GARDENER_AGENT_ID
 from nodum.service import (
     EdgeNotFound,
@@ -395,3 +395,33 @@ def test_list_spaces_is_human_only(fresh_db):
 
     with pytest.raises(GrantNotPermitted):
         service.list_spaces(principal=agent("researcher"))
+
+
+# ── Account administration: the one kind that cannot be created ───────────────
+
+
+def test_create_agent_refuses_an_internal_kind(fresh_db):
+    """A second internal agent does not add a gardener — it removes the one there is.
+
+    `auth.internal_principal` selects by `WHERE kind = 'internal'` and refuses
+    to choose between two, so `nodum agent create mygardener --kind internal`
+    used to succeed and take every consolidation path down with "more than one
+    internal agent account exists". `disable_agent` is no cure (the count
+    precedes the `disabled` check) and no surface deletes an agent, so the
+    install was only recoverable by hand-editing the database.
+    """
+    with pytest.raises(ValueError, match="internal agent cannot be created"):
+        service.create_agent("mygardener", kind="internal", grants={}, principal=owner())
+
+    # Nothing was written on the way to the refusal, so the gardener is still
+    # the only internal account and still mintable.
+    assert [row.id for row in service.list_agents(principal=owner())] == [GARDENER_AGENT_ID]
+    assert auth.internal_principal().id == GARDENER_AGENT_ID
+    # And an ordinary external agent is unaffected.
+    assert service.create_agent("bot", owner_human_id="owner", principal=owner()).agent.id == "bot"
+
+
+def test_the_reserved_prefix_is_still_answered_first(fresh_db):
+    """A `builtin-` name is refused for what it is *called*, whatever kind it asked to be."""
+    with pytest.raises(ValueError, match="reserved"):
+        service.create_agent("builtin-anything", kind="internal", grants={}, principal=owner())

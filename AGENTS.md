@@ -66,13 +66,23 @@ Phase 5a (the gardener's spine) has landed — the deterministic half of design
 §8.4/§8.5, cut at the LLM line: **consolidation cycles** (migration
 `0014_cycles_and_gardener` gives `events.cycle_id` the table it has pointed at
 since `0001` with nothing on the other end), the **internal agent**
-(`builtin-gardener`, seeded by that migration with `edit` on `meta` and `main`
+(`builtin-gardener`, seeded by that migration with `read` on `meta` and `edit`
+on `main`
 as ordinary grant rows, minted in-process by `auth.internal_principal` with no
-credential to present and none to steal — and the `builtin-` id prefix is
+credential to present and none to steal — `read` on meta because resolving a
+type is a read and no job ever writes the vocabulary (`_is_curatable` excludes
+the meta space and the structural types outright), where `edit` bought latent
+authority nothing shipped reaches: creating spaces, renaming `main`, and
+archiving the `note` type, after which a **human** is blocked from writing a
+note too — and the `builtin-` id **prefix** is
 **reserved**, because `Principal.actor_string` renders every agent as
 `agent:<id>`, so an external agent free to take that id would write events
 indistinguishable from the gardener's, and the event log is this system's
-answer to *who is answerable for this write*), the **curative tier**
+answer to *who is answerable for this write*; `0014`'s upgrade guard therefore
+refuses on `id LIKE 'builtin-%'` rather than on the one id, since `0010`
+back-fills an `agents` row from every actor string in the log and a pre-0010
+file merely *mentioning* `agent:builtin-librarian` would otherwise upgrade into
+a live token-bearing account under the prefix), the **curative tier**
 (`merge_nodes`, `retype`, `supersede_edge`, `bulk_relink` — §8.2), **cycle
 rollback** (`service.rollback_cycle`, human-only and atomic), the **landing
 seam** (`store.cap_landing` plus a keyword-only `landing=` on `create_edge` /
@@ -204,7 +214,8 @@ commands on a saved node for exactly this reason.
   exactly the delegation that was there. Inert, not destroyed. `grant` on an
   archived space is refused and says why.
   **Consolidation cycles, the curative tier and rollback are here too** (design
-  §8.2/§8.4). `open_cycle` / `close_cycle` / `get_cycle` / `list_cycles` own the
+  §8.2/§8.4). `open_cycle` / `close_cycle` / `abandon_cycle` / `get_cycle` /
+  `list_cycles` own the
   `cycles` row — the dream journal's record of what ran, who asked, over what,
   and how it ended — and store **no diff**, because the diff is
   `list_events(cycle_id=…)` and a journal that kept its own copy could disagree
@@ -212,7 +223,25 @@ commands on a saved node for exactly this reason.
   `scheduler`) is deliberately not the `actor` on the events inside (who
   *acted*: the gardener); an entry carrying only one of the two could not answer
   "I did not ask for this" **or** "who ran this at 04:00", and those are
-  different questions. The stamp itself is `in_cycle`, a `ContextVar` that
+  different questions. **"Who asked" is structurally one of those two**:
+  `open_cycle` refuses a non-human principal on `trigger='manual'`, because that
+  trigger *means* a human asked and it was previously only a convention —
+  `consolidate.consolidate` takes `triggered_by` as a plain **string** and
+  re-mints a principal from it, so nothing downstream had a `principal=` binding
+  to check and a caller reaching it could write `agent:builtin-gardener` into
+  the one column that answers "I did not ask for this". `scheduled` needs no
+  check (it records the clock whatever it is handed) and `curative` genuinely
+  records the principal running the operation, which may be an `edit`-granted
+  agent by design. **`abandon_cycle` is the door out of an interrupted run**
+  (human-only): a cycle that never closed cannot be rolled back (`_rollback_plan`
+  refuses a `running` one) and `undo` refuses every event it stamped, so a run
+  killed by `SIGKILL`, a power cut or `ConsolidationScheduler.stop()` cancelling
+  a mid-cycle task left its writes irreversible on every surface, behind advice
+  ("close it first") that nothing could carry out. It closes the row `failed`
+  through `close_cycle` — one place leaves `running` — with a report naming who
+  abandoned it; it refuses a cycle that is not `running`, because a cycle that
+  has said how it ended is not abandoned and re-closing it would overwrite that
+  record. The stamp itself is `in_cycle`, a `ContextVar` that
   `_emit` reads, so a cycle's writes go through the *ordinary* public functions
   and are stamped without any call site naming a cycle — a per-task variable
   rather than a module global, so the HTTP server handling a normal request
@@ -226,7 +255,10 @@ commands on a saved node for exactly this reason.
   operations are `merge_nodes` (soft, D9: tombstones keep `props.merged_into`,
   a `merge_redirects` row records where each went, incident edges are repointed
   keeping `props.merged_from` — or archived when repointing would self-loop or
-  duplicate, each reported with its reason; the read path is deliberately
+  duplicate, each reported in `retired[]` carrying its own `reason` field and
+  not only in the event payload, since the two rules read very differently and a
+  list of bare edges says only that something disappeared; the read path is
+  deliberately
   unchanged, since a redirect on the hottest read in the system buys nothing
   the props field does not already carry), `retype` (the one sanctioned
   exception to an immutable field; **no props are transformed**, because what a
@@ -252,10 +284,33 @@ commands on a saved node for exactly this reason.
   `state = 'active'` included, across spaces, for a whole cycle at once), is
   atomic, and **refuses rather than clobbers**: if anything outside the cycle
   has touched a row the cycle touched, nothing is written and `RollbackConflict`
-  names the rows and both ends of each collision. A rollback is itself a cycle,
+  names the rows and both ends of each collision. "Touched" is a **fixpoint,
+  not a set**: a reversal can itself be reversed (rolling a rollback back
+  re-applies the original), so a cycle whose write was rolled back and then
+  rolled back again is *live*, and counting its event as "already reversed" the
+  moment anything named it let an older cycle's rollback write straight over it
+  — reporting `conflicts: []` on the dry run first. A seq is reversed iff some
+  reversal of it is not itself reversed, resolved by recursion (reversals
+  strictly increase in seq, so it terminates). The **delete guards are modelled
+  in the plan too**, as a second list: a conflict is the graph having *moved* a
+  row the cycle wrote, a `blockers[]` entry is the graph having *grown something
+  onto* a row the cycle created, and modelling only the first made the preflight
+  a UI's confirm dialog calls disagree with the run. Every foreign key into
+  `nodes(id)` is guarded — `nodes.parent_id`, `nodes.space_id`,
+  `merge_redirects`, `grants.space_id` and `nodes.type_id` — because an
+  unguarded one is a bare `IntegrityError`: a 500 over HTTP, and
+  `database error: FOREIGN KEY constraint failed` on a CLI that promises to name
+  what the graph has grown. A rollback is itself a cycle,
   so rolling *it* back re-applies the original — the reversal is an involution,
-  and that is how a rollback's own writes are reversed given `undo` will not
-  touch them. Finally, the **landing seam**: `Store.cap_landing` and a
+  and it holds at **every** depth, which is not free: the `merge_redirects`
+  removal keys on what the payload *says happened* (`after.props` gained
+  `merged_into` and `before` did not), never on the op name. Keying on
+  `op == 'node.merge'` was right for the first two rollbacks and wrong from the
+  third, because a rollback that re-applies a merge writes that same before/after
+  pair under the name `node.rollback` — so reversing it restored the node and
+  stranded the redirect, after which the tombstone's create was un-undoable
+  for good and merging it again died on the redirect's primary key. Finally,
+  the **landing seam**: `Store.cap_landing` and a
   keyword-only `landing=` on `create_edge`/`propose_edges` let a writer file
   below its own grant (§8.3 — a grant is a **ceiling, not a mandate**). It only
   ever lowers; asking to land *above* the grant is refused rather than quietly
@@ -403,6 +458,41 @@ commands on a saved node for exactly this reason.
   computed, and the cycle closes `failed` with all of it. Determinism is a
   rule here: no randomness, one clock captured when the cycle opens, and every
   pair, group and list ordered before it is written.
+  Three rules guard the run itself. **One cycle at a time, per process**: a
+  module-level lock is held for the length of `consolidate()` and a second
+  caller is **refused** (`CycleInProgress`, a `ValueError`) rather than queued —
+  the scheduler's no-overlap property only ever guarded the nightly task against
+  itself, nothing serialised it against `POST /api/cycles` or `nodum
+  consolidate`, and every job's "leave what is already there alone" is a
+  read-then-write with no transaction spanning it, so two concurrent runs
+  proposed every duplicate pair twice. Refusing rather than waiting is the point:
+  a blocking wait would hang a request thread for the length of a cycle and then
+  run a second cycle over a graph the first had just changed, which is two
+  journal entries for one human intention. A `nodum consolidate` in a *separate*
+  process is outside a process lock, and that is stated rather than claimed
+  otherwise. **A scoped cycle checks the gardener's own grant** right after
+  `open_cycle` and raises `GrantNotPermitted` naming `nodum grant
+  builtin-gardener <space> edit` — every space created after `0014` is invisible
+  to the gardener, so the first click on the UI's scope picker used to reach
+  `list_nodes(space=…, principal=gardener)` and fail with the Q13 non-oracle
+  `unknown space: <32-hex id>`: the right sentence for a caller who lacks the
+  grant, and the wrong one when the caller can see the space in a picker and it
+  is the *gardener* that cannot — and it landed in a permanent journal row the
+  dream journal splices into an entry's headline. The check runs **after**
+  `open_cycle` on purpose, so a scope the *caller* cannot see is still refused
+  by the non-oracle rule first, and the message echoes the reference the caller
+  supplied so a name is never answered with a raw id. **The guard catches
+  `BaseException`**: Ctrl-C during `nodum consolidate` raises
+  `KeyboardInterrupt`, which is not an `Exception` and used to escape with the
+  cycle row still `running` — and a `running` cycle cannot be rolled back while
+  `undo` refuses every event it stamped, so its writes were irreversible on
+  every surface. The per-job handler stays `Exception` deliberately: one job
+  falling over must not lose the others, but an interrupt is a request to stop
+  the run. Finally, the gardener's principal is minted **once per run**, so **a
+  revoked grant bites at the next cycle, not mid-flight** — the same window
+  `disable_agent` documents for the MCP server's process-lifetime principal,
+  stated in the module docstring because the archive dialog promises an agent
+  can do nothing the moment a space is archived.
 - **`nodum.scheduler`** — the nightly schedule (decision J1): one asyncio task
   in `nodum serve`'s lifespan, no `cron` file this repo does not ship, no second
   process, no new dependency. Four properties, each a decision. It **cannot
@@ -750,18 +840,30 @@ commands on a saved node for exactly this reason.
   later migration replaces: introduce a table where its bytes already belong
   (this is why asset bytes are part of `0007` and there is no `path` column
   anywhere). `0014` adds the `cycles` table, seeds the `builtin-gardener`
-  internal agent with its two ordinary grant rows, and **refuses the upgrade**
-  on a database that already holds an agent by that id rather than resolving
+  internal agent with its two ordinary grant rows (`read` on `meta`, `edit` on
+  `main`), and **refuses the upgrade**
+  on a database that already holds an agent id under the reserved `builtin-`
+  prefix rather than resolving
   the collision: taking the id would attribute that agent's whole history —
   every `agent:builtin-gardener` in `events.actor`, `versions.actor` and both
   `created_by` columns — to the gardener, and renaming the impostor would
   detach that same history from the account it names, since actor strings are
   immutable log entries and not references anything can follow. Both corrupt
   the one question the event log exists to answer, so the operator renames or
-  removes the account by hand and re-runs. `RAISE()` is trigger-only in SQLite,
+  removes the account by hand and re-runs. The guard is `id LIKE 'builtin-%'`
+  and not the single id: `0010` back-fills an `agents` row from every actor
+  string in the log, so a pre-0010 file whose events merely *mention*
+  `agent:builtin-librarian` upgraded clean and left a live, token-bearing
+  external account under the prefix — the collision this guard exists to refuse,
+  pre-installed for the day 5b seeds a second `builtin-*` agent.
+  `RAISE()` is trigger-only in SQLite,
   so the abort is a `CHECK` constraint whose **name** carries the message —
   SQLite reports it verbatim — over a scratch table that gets a row only when
-  the id is taken.
+  something under the prefix exists. The name cannot name the offenders: SQLite
+  takes an expression as `RAISE()`'s second argument only from 3.47.1, newer
+  than most distributions ship, and a migration that fails to *parse* is a worse
+  failure than one whose message carries the `LIKE` pattern to look them up
+  with.
 - **`nodum.models`** — the pydantic I/O schema shared by every surface.
 - **`nodum.cli`** (Typer) — each command calls one service function and prints
   the result as a single JSON object on stdout; human/error messages go to
@@ -887,12 +989,20 @@ Phase-1 decision log.
 - **`undo` and `rollback` split on one line: does the event carry a `cycle_id`?**
   An event with none is reversed by `undo`; an event with one is reversed by
   `rollback <cycle-id>`, and `undo` refuses it by name rather than reversing one
-  row of a multi-row decision and leaving the other half standing. The no-`seq`
-  search **skips** cycle-stamped events exactly as it skips ones a previous undo
-  already reversed, so `nodum undo` with no argument never silently walks into a
-  merge. This is not a gap in `undo`: a curative operation always writes several
-  rows from one decision, and a merge's tombstone, its redirect row and its
-  repointed edges are one act.
+  row of a multi-row decision and leaving the other half standing. This is not a
+  gap in `undo`: a curative operation always writes several rows from one
+  decision, and a merge's tombstone, its redirect row and its repointed edges
+  are one act. The no-`seq` search **finds** cycle-stamped events and gets that
+  same refusal, naming `nodum rollback <cycle-id>`; it does **not** step over
+  them. It used to, and the reading was backwards: `nodum undo` means *take back
+  the last thing that happened*, so right after a merge it reversed an unrelated
+  older event instead — deleting the edge the merge had just relinked, which
+  nobody had named — and that undo then counted as work outside the cycle
+  touching a row the cycle owned, so `rollback <merge cycle>` was refused as a
+  conflict. Both reversal verbs spent, an edge gone, the merge permanently
+  unrollbackable. The only thing still skipped there is an event a previous
+  `undo` already reversed: that one has a reversal, while a cycle is simply the
+  most recent thing that happened.
 - Errors are always one line on stderr with exit 1, never a traceback — that
   includes a missing file (`asset register /missing.png`), a database another
   writer holds (`database error: database is locked`), and an undo the graph
@@ -937,7 +1047,14 @@ Phase-1 decision log.
   be disabled — no enabled human means no principal on any surface, including
   the CLI's own trusted-local path),
   `agent create/list/token-rotate/disable/enable` (create and rotate print
-  the show-once `ndm_…` token to stderr; only the hash is stored),
+  the show-once `ndm_…` token to stderr; only the hash is stored. Every account
+  created here is **external**: `service.create_agent` refuses
+  `kind="internal"`, because `auth.internal_principal` selects the gardener by
+  being the only row with that kind and refuses to choose between two — so a
+  second one does not add a gardener, it takes the existing one away and every
+  consolidation path dies. `disable_agent` is no cure (the count precedes the
+  `disabled` check) and no surface deletes an agent, so the install would only
+  be recoverable by hand-editing the database),
   `grant <agent> <space> <level>` / `revoke <agent> <space>` / `grants [--agent]`
   (`read`/`suggest`/`edit`, event-logged; `revoke` reaches an **archived**
   space by id or name, since archiving makes a grant inert but leaves the row
@@ -959,7 +1076,13 @@ Phase-1 decision log.
   `cycle-list [--limit]` / `cycle-get <id>` (the dream journal, human-only for
   the reason `events` is — a journal entry says what the gardener did across
   every space in the file, and an agent reading it would learn the shape of
-  territory it holds no grant on),
+  territory it holds no grant on. `--limit` below 1 is an **error**, the rule
+  `subgraph` states: SQLite reads a negative `LIMIT` as unbounded, so
+  `--limit -3` used to answer with the whole journal — a caller asking for less
+  got everything. `events --cycle <id>` on an id naming no cycle is a **not
+  found**, not an empty list: an empty list is what a *dry run* looks like, and
+  this file leans on exactly that as the machine-checkable proof a rehearsal
+  changed nothing),
   `rollback <cycle-id> [--dry-run]`,
   `merge-nodes <ids…> --into <id>`, `retype <ids…> --type <t>`,
   `supersede-edge <edge-id> [--src --dst --type --confidence --set]` (every
@@ -986,8 +1109,14 @@ Phase-1 decision log.
   so `events --cycle <id>` on it is empty. `bulk-relink --dry-run` writes
   nothing at all, not even a cycle, because it is a diff a human is reading
   right now. `rollback --dry-run` opens no cycle and returns the conflicts in
-  `conflicts` instead of raising, which is the "would this succeed?" a confirm
-  dialog needs.
+  `conflicts` **and the delete guards in `blockers`** instead of raising, which
+  is the "would this succeed?" a confirm dialog needs — and it needs both,
+  because a rollback fails for either reason and a preflight modelling only
+  `conflicts` answered "clean" for a created node that has since gained a child
+  or a created space that has since been granted on. Each `blockers[]` entry
+  names the cycle's own create event, the row it made, the `dependants` in the
+  way and the `reason` the run would refuse with. A dry run reporting either
+  list is a rollback that would fail; both empty is the only clean verdict.
 - **A refused `rollback` is this CLI's one structured error.** Every other
   failure is one line on stderr because one line is all there is to say; a
   rollback conflict is a *list* — for each row in the way, which event of the
@@ -1530,7 +1659,15 @@ Phase-1 decision log.
   and each conflict names *both* ends of a collision — the cycle's event and the
   later one that moved the row. Render both. A count, or the server's message
   alone, tells a human that something is in the way without telling them what,
-  and the only action available to them is to go and look.
+  and the only action available to them is to go and look. The preflight now
+  answers with a second list, **`blockers`**, and a confirm that renders only
+  `conflicts` still says "clean" for a rollback that will fail: a blocker is the
+  graph having *grown something onto* a row the cycle created (a child node,
+  an occupant, a grant, a type in use, a merge redirect) rather than having
+  moved it. Each entry carries `row_id`, `cycle_event_seq`/`cycle_event_op`, the
+  `dependants` in the way and the `reason` the run refuses with — render the
+  reason and the dependants. A verdict is clean only when **both** lists are
+  empty.
 - **The design system has two colour axes and both are taken**: the brass accent
   means "you can act on this", the state ramp means the service-layer state
   machine (`proposed` violet, `active` sea-green, `archived` lowest-contrast).

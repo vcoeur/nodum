@@ -537,8 +537,12 @@ WRITE_FUNCTIONS = {
     # here for the reason the curative tier was listed before it had a route:
     # they write the journal row, and a handler that opened a cycle of its own
     # would be inventing a second lifecycle beside the runner's.
+    # `abandon_cycle` is listed here before its route for the same reason: it
+    # closes somebody else's interrupted run and is what makes that run's whole
+    # set of writes reversible, so it is a journal write and human-only.
     "open_cycle",
     "close_cycle",
+    "abandon_cycle",
     "rollback_cycle",
 }
 
@@ -3051,9 +3055,10 @@ def test_grants_grant_list_and_revoke(client, fresh_db):
     }
     # The creation-template meta read, plus this one …
     assert {("researcher", "meta", "read"), ("researcher", "main", "edit")} <= everything
-    # … alongside the gardener's own seeded rows, which are ordinary grants.
+    # … alongside the gardener's own seeded rows, which are ordinary grants —
+    # and the same `meta` read every other curating agent holds.
     assert {
-        (GARDENER_AGENT_ID, "meta", "edit"),
+        (GARDENER_AGENT_ID, "meta", "read"),
         (GARDENER_AGENT_ID, "main", "edit"),
     } <= everything
     filtered = _ok(client.get("/api/grants?agent=researcher"))

@@ -134,11 +134,40 @@ def test_undo_refuses_a_curative_event_and_points_at_rollback(fresh_db):
 
     with pytest.raises(UndoNotPossible, match="Roll the cycle back instead"):
         service.undo(merge_event.seq, principal=owner())
-    # And the no-seq search skips it rather than reaching for it: the newest
-    # undoable event is the ordinary write that followed the merge.
+    # An ordinary write landed *after* the merge, so it is the newest event and
+    # the no-seq search reaches it without going anywhere near the cycle.
     undone = service.undo(principal=owner())
     assert undone.undone_op == "node.create"
     assert undone.deleted[-1]["row"]["id"] == later.id
+
+
+def test_a_bare_undo_right_after_a_merge_names_the_cycle_rather_than_reaching_past_it(fresh_db):
+    """The reversal verb a human knows, typed at the moment they want the merge back.
+
+    The no-`seq` path used to filter cycle-stamped events out of the search
+    entirely, so `nodum undo` here reversed an unrelated older event: the
+    *create* of the edge the merge had just relinked, deleting it. Nobody named
+    that edge. And the loss compounded — that undo then counted as work outside
+    the cycle touching a row the cycle owned, so `rollback <merge cycle>` was
+    refused as a conflict. The human asked to take the merge back, silently lost
+    an edge, and both reversal verbs were spent: the merge was permanently
+    unrollbackable.
+    """
+    survivor, duplicate, other = _node("Alpha"), _node("Alpha (dup)"), _node("Gamma")
+    edge = service.create_edge(other.id, duplicate.id, "supports", principal=owner())
+    merge = service.merge_nodes([duplicate.id], into=survivor.id, principal=owner())
+    assert _edge(edge.id)["dst_id"] == survivor.id
+
+    with pytest.raises(UndoNotPossible, match=f"consolidation cycle {merge.cycle_id}"):
+        service.undo(principal=owner())
+
+    # The edge the merge relinked is untouched, and so is everything else.
+    assert _edge(edge.id)["dst_id"] == survivor.id
+    assert [event for event in _events() if event.op == "undo"] == []
+    # And the verb the refusal names still works — which is what was lost.
+    service.rollback_cycle(merge.cycle_id, principal=owner())
+    assert _edge(edge.id)["dst_id"] == duplicate.id
+    assert service.get_node(duplicate.id, principal=owner()).state == "active"
 
 
 def test_undoing_the_create_of_a_merged_node_is_refused_by_name(fresh_db):
@@ -363,6 +392,11 @@ def test_an_edge_that_would_become_a_self_loop_is_retired_with_its_reason(fresh_
     )
     archive_event = next(event for event in _events() if event.op == "edge.archive")
     assert "self-loop" in archive_event.payload["reason"]
+    # And in the return value, not only in the log: `AGENTS.md` says each
+    # retired edge is "reported with its reason", and a caller holding the
+    # result should not have to go to the event log to learn which rule bit.
+    assert "self-loop" in result.retired[0].reason
+    assert result.retired[0].reason == archive_event.payload["reason"]
 
 
 def test_a_repointed_edge_that_would_duplicate_one_the_survivor_has_is_retired(fresh_db):
@@ -377,6 +411,31 @@ def test_a_repointed_edge_that_would_duplicate_one_the_survivor_has_is_retired(f
     assert _edge(kept.id)["state"] == "active"
     archive_event = next(event for event in _events() if event.op == "edge.archive")
     assert "already carries an identical edge" in archive_event.payload["reason"]
+    assert result.retired[0].reason == archive_event.payload["reason"]
+
+
+def test_the_two_retirement_rules_are_told_apart_in_the_return_value(fresh_db):
+    """One merge, both rules — and `retired` has to say which is which.
+
+    The two reasons read very differently to a human ("both endpoints are being
+    merged into it" against "the survivor already carries an identical edge"),
+    and a list of bare edges says only that something disappeared. The reason
+    was in the event payload all along; this is it reaching the caller.
+    """
+    survivor, duplicate, other = _node("Alpha"), _node("Alpha (dup)"), _node("Gamma")
+    loop = service.create_edge(duplicate.id, survivor.id, "duplicate_of", principal=owner())
+    service.create_edge(survivor.id, other.id, "supports", principal=owner())
+    twin = service.create_edge(duplicate.id, other.id, "supports", principal=owner())
+
+    result = service.merge_nodes([duplicate.id], into=survivor.id, principal=owner())
+
+    reasons = {edge.id: edge.reason for edge in result.retired}
+    assert set(reasons) == {loop.id, twin.id}
+    assert "self-loop" in reasons[loop.id]
+    assert "already carries an identical edge" in reasons[twin.id]
+    # Every other edge field is still there: a retired edge is an edge.
+    assert {edge.state for edge in result.retired} == {"archived"}
+    assert reasons[loop.id] != reasons[twin.id]
 
 
 def test_two_merged_nodes_carrying_the_same_edge_leave_only_one(fresh_db):

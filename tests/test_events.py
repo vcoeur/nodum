@@ -6,7 +6,7 @@ import pytest
 from helpers import OWNER_ACTOR, agent, owner
 
 from nodum import service
-from nodum.service import EventNotFound, NodeNotFound, UndoNotPossible
+from nodum.service import EventNotFound, NodeNotFound, RecordNotFound, UndoNotPossible
 from nodum.store import GrantNotPermitted
 
 
@@ -205,27 +205,45 @@ def test_undo_refuses_an_event_that_belongs_to_a_consolidation_cycle(fresh_db):
     assert [event for event in _events() if event.op == "undo"] == []
 
 
-def test_undo_with_no_seq_skips_past_a_cycle_event_to_the_one_below(fresh_db):
-    """Same treatment as an event a previous undo already reversed.
+def test_undo_with_no_seq_names_the_cycle_instead_of_reaching_past_it(fresh_db):
+    """A cycle is the most recent thing that happened; reaching past it is never meant.
 
-    Without the skip, `nodum undo` on a graph whose last write was a
-    consolidation would refuse rather than reach the human's own last edit —
-    and the refusal would be for something the human never did.
+    The no-`seq` path used to filter cycle-stamped events out of the search
+    entirely, on the reading that undo cannot reverse one row of a merge so it
+    should not offer to. But `nodum undo` means *take back the last thing that
+    happened*, and stepping over a consolidation to an older event silently
+    reversed something the human never named — see the curative repro in
+    `test_curative.py`, where it cost an edge and then left the merge itself
+    permanently unrollbackable. The refusal names the cycle instead.
     """
     ordinary = service.create_node(type="note", title="mine", principal=owner())
     cycle = service.open_cycle(trigger="scheduled", principal=owner())
     with service.in_cycle(cycle.id):
         gardened = service.create_node(type="note", title="gardened", principal=owner())
 
-    result = service.undo(principal=owner())
+    with pytest.raises(UndoNotPossible, match=f"consolidation cycle {cycle.id}"):
+        service.undo(principal=owner())
 
-    assert result.undone_op == "node.create"
-    assert result.deleted[-1]["row"]["id"] == ordinary.id
-    # The cycle's own write is untouched: it is taken back by rolling the cycle
-    # back, never by an undo that happened to walk past it.
+    # Neither write moved, and no `undo` event claims otherwise.
     assert service.get_node(gardened.id, principal=owner()).title == "gardened"
+    assert service.get_node(ordinary.id, principal=owner()).title == "mine"
+    assert [event for event in _events() if event.op == "undo"] == []
+    # And the refusal is followable: it names the command that does work.
+    with pytest.raises(UndoNotPossible, match=f"nodum rollback {cycle.id}"):
+        service.undo(principal=owner())
+
+
+def test_a_bare_undo_still_skips_what_a_previous_undo_reversed(fresh_db):
+    """The one skip that stays: a reversed event has a reversal, a cycle has none."""
+    first = service.create_node(type="note", title="one", principal=owner())
+    second = service.create_node(type="note", title="two", principal=owner())
+
+    service.undo(principal=owner())  # takes `second` back
+    result = service.undo(principal=owner())  # walks past it to `first`
+
+    assert result.deleted[-1]["row"]["id"] == first.id
     with pytest.raises(NodeNotFound):
-        service.get_node(ordinary.id, principal=owner())
+        service.get_node(second.id, principal=owner())
 
 
 def test_list_events_narrows_to_one_cycle(fresh_db):
@@ -237,8 +255,24 @@ def test_list_events_narrows_to_one_cycle(fresh_db):
     narrowed = service.list_events(owner(), cycle_id=cycle.id)
     assert [event.payload["after"]["id"] for event in narrowed] == [inside.id]
     assert len(service.list_events(owner())) == 2
-    # An id no event carries is an empty list, not everything.
-    assert service.list_events(owner(), cycle_id="no-such-cycle") == []
+
+
+def test_an_unknown_cycle_id_is_a_not_found_and_not_an_empty_diff(fresh_db):
+    """An empty list here is what a *dry run* looks like, so a typo must not fake one.
+
+    `AGENTS.md` leans on `events --cycle <id>` coming back empty as the
+    machine-checkable proof that a `consolidate --dry-run` changed nothing. An
+    id naming no cycle answering with the same empty list — and exit 0 — makes
+    that proof unreadable: the caller cannot tell "the rehearsal wrote nothing"
+    from "you mistyped the id".
+    """
+    with pytest.raises(RecordNotFound, match="consolidation cycle not found"):
+        service.list_events(owner(), cycle_id="no-such-cycle")
+
+    # A real dry run still answers with the empty list the claim rests on.
+    rehearsal = service.open_cycle(trigger="manual", dry_run=True, principal=owner())
+    service.close_cycle(rehearsal.id, status="completed", report={}, principal=owner())
+    assert service.list_events(owner(), cycle_id=rehearsal.id) == []
 
 
 def test_the_cycle_filter_keeps_the_human_only_guard(fresh_db):
@@ -275,3 +309,61 @@ def test_undo_create_of_a_space_that_now_holds_nodes_is_refused(fresh_db):
     service.undo(create_space_seq, principal=owner())
     with pytest.raises(NodeNotFound):
         service.get_node(space.id, principal=owner())
+
+
+def test_undo_create_of_a_space_an_agent_is_granted_on_is_refused(fresh_db):
+    """`grants.space_id` is a foreign key into `nodes` too, and nothing guarded it.
+
+    Three guards existed for exactly this shape — a bare `IntegrityError` is a
+    500 over HTTP and `database error: FOREIGN KEY constraint failed` on a CLI
+    whose contract promises to name what the graph has grown. This one is
+    reachable in two commands: create a space, grant an agent on it. The graph
+    is never corrupted (the transaction rolls back whole); what was lost was the
+    ability to read the answer, and the fix is a sentence naming the grant.
+    """
+    agent("reader-bot", grants={"meta": "read"})
+    space = service.create_space("delegated", principal=owner())
+    create_space_seq = _events()[0].seq
+    service.grant("reader-bot", space.id, "read", principal=owner())
+
+    with pytest.raises(UndoNotPossible, match="still carries 1 grant"):
+        service.undo(create_space_seq, principal=owner())
+
+    assert "reader-bot" in str(
+        pytest.raises(UndoNotPossible, service.undo, create_space_seq, principal=owner()).value
+    )
+    assert service.get_node(space.id, principal=owner()).state == "active"
+    assert [event for event in _events() if event.op == "undo"] == []
+
+    # Revoking is the follow-through the message names, and it clears the way.
+    service.revoke("reader-bot", space.id, principal=owner())
+    service.undo(create_space_seq, principal=owner())
+    with pytest.raises(NodeNotFound):
+        service.get_node(space.id, principal=owner())
+
+
+def test_undo_create_of_a_type_node_something_is_typed_by_is_refused(fresh_db):
+    """`nodes.type_id` became a foreign key into `nodes` at 0009 — a type is a node.
+
+    So a type node that has since been used to type anything is held down by
+    every node wearing it, and the delete served the same bare `IntegrityError`
+    the other guards exist to prevent.
+    """
+    widget = service.create_node(
+        type="type", title="widget", space="meta", props={"type_kind": "node"}, principal=owner()
+    )
+    create_type_seq = _events()[0].seq
+    typed = service.create_node(type="widget", title="a widget", principal=owner())
+
+    with pytest.raises(UndoNotPossible, match="still types 1 node"):
+        service.undo(create_type_seq, principal=owner())
+
+    assert service.get_node(widget.id, principal=owner()).state == "active"
+    assert service.get_node(typed.id, principal=owner()).type == widget.id
+    assert [event for event in _events() if event.op == "undo"] == []
+
+    # Taking the typed node back first clears the way.
+    service.undo(principal=owner())
+    service.undo(create_type_seq, principal=owner())
+    with pytest.raises(NodeNotFound):
+        service.get_node(widget.id, principal=owner())

@@ -44,6 +44,33 @@ the cycle *changed* is ``service.list_events(cycle_id=…)`` — the same append
 log everything else reads — so the dream journal can never drift from what
 actually happened.
 
+**One cycle at a time, per process.** :func:`consolidate` holds
+:data:`_RUNNER_LOCK` for its whole length and a second caller is **refused**
+(:class:`CycleInProgress`) rather than queued. The scheduler's no-overlap
+property only ever guarded the nightly task against itself; nothing serialised
+it against ``POST /api/cycles`` or ``nodum consolidate``, and every job's "leave
+what is already there alone" is a read followed by a write with no transaction
+spanning it — so two concurrent runs proposed every duplicate pair twice, and
+rolling one cycle back left the other's copies standing. The refusal is
+immediate and says so: a blocking wait would hang a request thread for the
+length of a cycle and then run a second cycle over a graph the first had just
+changed, which is two journal entries for one human intention. The lock is
+**process-wide**, which covers the surfaces that share one: the HTTP route, the
+nightly task and an in-process caller. A ``nodum consolidate`` in a *separate*
+process is not covered by it and is not claimed to be.
+
+**Revocation bites at the next cycle, not mid-flight.** The gardener's principal
+— and with it its grant set — is minted once, when the run starts, so a grant
+revoked or a space archived while a cycle is in progress does not stop the cycle
+that is already running: its remaining writes land under the grants it started
+with, and the change takes effect from the next cycle. This is the same window
+:func:`nodum.service.disable_agent` documents for the MCP server, whose
+principal is held for the life of the process, and it is stated here for the
+same reason — the archive dialog promises an agent can do nothing the moment a
+space is archived, and one cycle is how long that promise takes to become true.
+A cycle is minutes at most, and :func:`nodum.service.rollback_cycle` takes back
+whatever it wrote in the meantime.
+
 **Determinism.** No randomness, and one clock per run: every age is measured
 against :func:`_utcnow`, captured once when the cycle opens, so a test pins the
 whole run by patching one function. Every pair, group and list is ordered before
@@ -55,6 +82,7 @@ from __future__ import annotations
 import difflib
 import itertools
 import math
+import threading
 import unicodedata
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -64,10 +92,26 @@ from typing import Any
 from pydantic import BaseModel
 
 from nodum import auth, embeddings, projectors, service
-from nodum.migrations import META_SPACE_ID
+from nodum.migrations import GARDENER_AGENT_ID, META_SPACE_ID
 from nodum.models import CycleOut, EdgeOut, NodeOut
 from nodum.principal import Principal
 from nodum.store import GrantNotPermitted
+
+
+class CycleInProgress(ValueError):
+    """Raised when a consolidation cycle is asked for while one is running.
+
+    A :class:`ValueError` so every adapter already reports it as one line and a
+    status rather than a traceback: the CLI's ``_run`` catches it, and
+    ``http_api.EXCEPTION_STATUS`` maps ``ValueError`` to 400. It is closer to a
+    409 — the refusal is about current state, not about the request — and the
+    row that says so belongs in that table, not here.
+    """
+
+
+#: Serialises the whole runner within one process. See the module docstring for
+#: why a second caller is refused rather than made to wait.
+_RUNNER_LOCK = threading.Lock()
 
 # ── Job names (the `jobs=` selector's vocabulary) ─────────────────────────────
 
@@ -837,7 +881,8 @@ def _write_edges(context: _Context, outcome: JobOutcome, suggestions: list[dict[
     gardener may not write costs one ``skipped`` line and not the job.
 
     **The landing state is chosen, not inherited.** Migration ``0014`` grants
-    the gardener ``edit`` on ``meta`` and ``main``, and a write lands at the
+    the gardener ``edit`` on ``main`` (and ``read`` on ``meta``, which is all
+    resolving a type needs), and a write lands at the
     writer's grant level by default — so without this these suggestions would
     land ``active`` and become asserted fact instead of reaching the review
     queue, which is exactly what job 1's D9 argument rests on. Design §8.3 has
@@ -954,6 +999,55 @@ def _opener(
     return "manual", auth.principal_from_actor(triggered_by, path=path)
 
 
+def _require_gardener_scope(
+    scope: str | None, cycle: CycleOut, gardener: Principal, path: str | Path | None
+) -> None:
+    """Refuse a scope the gardener holds no grant on, and name the fix.
+
+    Migration ``0014`` grants the gardener ``main`` and ``meta`` and nothing
+    else, so **every space created after it is invisible to the gardener** until
+    somebody grants it — including the spaces the human UI's own scope picker
+    offers on a default install. Without this check the run reached
+    ``list_nodes(space=…, principal=gardener)`` inside the first metrics
+    snapshot and failed there with :class:`nodum.service.TypeNotFound`
+    ``unknown space: <id>``: the Q13 non-oracle refusal, which is the honest
+    answer to a *caller* who lacks the grant and the wrong answer here, where the
+    caller is a human looking at the space in a picker and it is the gardener
+    that lacks it. It also became a permanent journal row, and the dream journal
+    splices a cycle's failure message into the entry's headline — so the one
+    sentence no user-facing surface may say ended up on screen, with a bare
+    32-hex id in it.
+
+    The check runs **after** :func:`nodum.service.open_cycle`, which is what
+    keeps the non-oracle rule intact: a scope the *caller* cannot see is still
+    refused there, identically for a space that does not exist and one they hold
+    no grant on. Only once the caller has been shown to see it does this ask
+    whether the gardener does.
+
+    Args:
+        scope: The reference the caller supplied — echoed in the message, so a
+            caller who named a space is never shown an id they did not type.
+        cycle: The open cycle, carrying the resolved ``scope`` id.
+        gardener: The internal principal the jobs will run as.
+        path: Explicit database path.
+
+    Raises:
+        GrantNotPermitted: If the gardener cannot resolve the cycle's scope.
+    """
+    if cycle.scope is None:
+        return
+    reference = scope if scope is not None else cycle.scope
+    try:
+        service.resolve_space_id(cycle.scope, principal=gardener, path=path)
+    except service.TypeNotFound:
+        raise GrantNotPermitted(
+            f"the gardener holds no grant on space {reference!r}, so it cannot consolidate it: "
+            f"migration 0014 seeds {GARDENER_AGENT_ID} with 'main' and 'meta' only, and every "
+            f"other space is an explicit grant. Run: "
+            f"nodum grant {GARDENER_AGENT_ID} {reference} edit"
+        ) from None
+
+
 def consolidate(
     *,
     scope: str | None = None,
@@ -969,6 +1063,11 @@ def consolidate(
     closes it with the report. Writes are the gardener's;
     ``cycles.triggered_by`` is whoever asked.
 
+    **One cycle at a time.** The runner is serialised by a process-wide lock and
+    a second caller is refused with :class:`CycleInProgress` rather than made to
+    wait — see the module docstring for the argument, and for what a lock in one
+    process does and does not cover.
+
     A job that raises does not lose the run: its own outcome carries the error,
     the other jobs still run and still report, the after-metrics are still
     computed, and the cycle closes ``failed`` with all of it. The events the
@@ -977,10 +1076,19 @@ def consolidate(
     grant on, for instance) closes the cycle ``failed`` and re-raises: that is
     not a job result, it is a caller error.
 
+    **``BaseException``, not ``Exception``.** Ctrl-C during ``nodum consolidate``
+    raises :class:`KeyboardInterrupt`, which is not an ``Exception`` and used to
+    escape this guard with the cycle row still ``running`` — and a ``running``
+    cycle cannot be rolled back while ``undo`` refuses every event it stamped,
+    so the writes it had already made were irreversible on every surface. The
+    cycle is closed ``failed`` and the interrupt re-raised, so the operator's
+    Ctrl-C still means what they pressed it for.
+
     Args:
         scope: A space id or name to confine the cycle to, or ``None`` for the
             whole file. Resolved by :func:`nodum.service.open_cycle` through the
-            ordinary space rule.
+            ordinary space rule, then checked against the gardener's own grants
+            by :func:`_require_gardener_scope`.
         dry_run: Compute everything and write nothing to the graph. The cycle
             row is still written, flagged ``dry_run``, and carries the report —
             the journal has to say which it was — but the cycle's event list is
@@ -996,12 +1104,39 @@ def consolidate(
 
     Raises:
         ValueError: If a job name is not registered.
+        CycleInProgress: If this process is already running a cycle.
         UnknownPrincipal: If ``triggered_by`` names no account.
         PrincipalDisabled: If it names a disabled one, or if the gardener is
             disabled — the supported way to stop it.
-        GrantNotPermitted: If the trigger may not open a cycle over ``scope``.
+        GrantNotPermitted: If the trigger may not open a cycle over ``scope``,
+            or if the gardener holds no grant on it.
     """
+    # Job names are resolved before the lock so a typo is still reported as a
+    # typo while another cycle is running, rather than as "already running".
     selected = _resolve_jobs(jobs)
+    if not _RUNNER_LOCK.acquire(blocking=False):
+        raise CycleInProgress(
+            "a consolidation cycle is already running: cycles are serialised so two runs "
+            "cannot propose the same candidate twice, and this one was refused rather than "
+            "queued behind it. Try again when it has finished."
+        )
+    try:
+        return _consolidate_locked(
+            scope=scope, dry_run=dry_run, selected=selected, triggered_by=triggered_by, path=path
+        )
+    finally:
+        _RUNNER_LOCK.release()
+
+
+def _consolidate_locked(
+    *,
+    scope: str | None,
+    dry_run: bool,
+    selected: list[str],
+    triggered_by: str,
+    path: str | Path | None,
+) -> ConsolidationOut:
+    """The body of :func:`consolidate`, run with :data:`_RUNNER_LOCK` held."""
     gardener = auth.internal_principal(path=path)
     trigger, opener = _opener(triggered_by, gardener, path)
     cycle = service.open_cycle(
@@ -1011,12 +1146,13 @@ def consolidate(
         principal=gardener, scope=cycle.scope, dry_run=dry_run, path=path, now=_utcnow()
     )
     try:
+        _require_gardener_scope(scope, cycle, gardener, path)
         # The block wraps the dry run too: a job that wrote when it should not
         # have would at least land inside the cycle a rollback can reach,
         # instead of as an unattributable loose write.
         with service.in_cycle(cycle.id):
             report = _run_jobs(context, cycle, selected)
-    except Exception as failure:
+    except BaseException as failure:
         service.close_cycle(
             cycle.id,
             status="failed",
@@ -1049,7 +1185,10 @@ def _run_jobs(context: _Context, cycle: CycleOut, selected: list[str]) -> Consol
     for name in selected:
         try:
             outcomes.append(JOBS[name](context))
-        except Exception as failure:  # one job's failure must not lose the others
+        # `Exception` and not `BaseException`, deliberately unlike the guard in
+        # `_consolidate_locked`: one job falling over must not lose the others,
+        # but an interrupt is a request to stop the *run*, not a job result.
+        except Exception as failure:
             message = f"{type(failure).__name__}: {failure}"
             outcomes.append(JobOutcome(name=name, error=message))
             failed.append(JobFailure(job=name, error=message))

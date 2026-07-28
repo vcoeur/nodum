@@ -248,6 +248,44 @@ def test_parity_grants_preserve_every_agents_reach(upgraded):
         assert grants == {"meta": "read", "main": "suggest"}
 
 
+def test_an_actor_string_under_the_reserved_prefix_stops_the_upgrade(tmp_path, monkeypatch):
+    """0010 invents accounts from the log, and 0014's guard has to see them.
+
+    Nothing before 0014 reserved the `builtin-` prefix, so an old log naming
+    `agent:builtin-librarian` back-fills a live external agent under it — one
+    `nodum agent token-rotate` gives a working token. Checking only the single
+    id `builtin-gardener` let that database upgrade clean; the prefix check is
+    what closes the route, and this is the route it was found on.
+    """
+    path = tmp_path / "reserved-actor.db"
+    monkeypatch.setenv("NODUM_DB", str(path))
+    names = [name for name, _ in MIGRATIONS]
+    monkeypatch.setattr(db, "MIGRATIONS", MIGRATIONS[: names.index(PRE_0009_THROUGH) + 1])
+    conn = db.connect(path)
+    try:
+        db.init_db(conn)
+        conn.execute(
+            "INSERT INTO events (actor, op, payload)"
+            " VALUES ('agent:builtin-librarian', 'node.propose', '{}')"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    monkeypatch.setattr(db, "MIGRATIONS", MIGRATIONS)
+    conn = db.connect(path)
+    try:
+        with pytest.raises(Exception, match="builtin-") as refusal:
+            db.init_db(conn)
+        assert "reserved" in str(refusal.value)
+        applied = db.applied_migrations(conn)
+        # 0010 still ran — it is what created the row — and 0014 is what stopped.
+        assert "0010_principals" in applied
+        assert "0014_cycles_and_gardener" not in applied
+    finally:
+        conn.close()
+
+
 def test_the_first_human_is_seeded_passwordless_and_policies_are_gone(upgraded):
     human = _one(upgraded, "SELECT * FROM humans WHERE id = 'owner'")
     assert human["name"] == "owner"

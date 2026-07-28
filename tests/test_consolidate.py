@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import ast
 import math
+import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -22,6 +23,7 @@ import pytest
 from helpers import agent, owner
 
 from nodum import auth, consolidate, db, embeddings, service
+from nodum.store import GrantNotPermitted
 
 # ── Fixtures and helpers ──────────────────────────────────────────────────────
 
@@ -394,6 +396,29 @@ def test_the_job_degrades_to_titles_when_no_model_is_present(fresh_db):
     assert any("no embedding provider" in note for note in outcome.notes)
 
 
+def test_every_job_that_degrades_says_so_in_the_same_run(fresh_db):
+    """The commonest install has no model, and a live pass proved it runs degraded.
+
+    All three embedding-dependent halves — the duplicate cosine, `relates_to`
+    from proximity, and the `vec` projector's catch-up — must report their own
+    absence in the report a human reads, not just the first one to notice it.
+    """
+    _node("Alpha")
+    _node("Alpha")
+
+    report = _run().report
+
+    degraded = {
+        job.name for job in report.jobs if any("no embedding provider" in n for n in job.notes)
+    }
+    assert degraded == {
+        consolidate.JOB_DUPLICATES,
+        consolidate.JOB_LINKS,
+        consolidate.JOB_HOUSEKEEPING,
+    }
+    assert report.failed == []
+
+
 def test_with_a_provider_the_job_never_claims_it_degraded(fresh_db):
     _place(Alpha=0.0)
     _node("Alpha")
@@ -471,6 +496,72 @@ def test_consolidation_never_proposes_a_merge(fresh_db):
     _run()
 
     assert [event.op for event in _events() if event.op == "node.merge"] == []
+
+
+# ── What the gardener's grant has to be ──────────────────────────────────────
+
+
+def test_a_full_cycle_completes_on_read_over_meta(fresh_db):
+    """`0014` seeds `read` on meta because that is what consolidation needs.
+
+    The migration's first cut said `edit`, justified as "consolidation reads and
+    **writes** the type vocabulary". It never writes it: `_is_curatable` excludes
+    the meta space and the structural types from every job, so the only thing
+    meta is used for is resolving a type — which is a READ. What the extra level
+    bought was latent authority no job reaches: creating spaces, renaming `main`,
+    and archiving the `note` type, after which a *human* is blocked too.
+    """
+    assert auth.internal_principal().grants == {"meta": "read", "main": "edit"}
+    _node("Alpha")
+    _node("Alpha")
+    first, second = _node("First"), _node("Second")
+    _edge(first.id, second.id)
+    _edge(first.id, second.id)
+
+    result = _run()
+
+    assert result.cycle.status == "completed"
+    assert result.report.failed == []
+    assert [job.error for job in result.report.jobs] == [None] * len(consolidate.JOBS)
+    # Both halves still work: a proposal was filed and a duplicate edge pruned.
+    assert _outcome(result.report, consolidate.JOB_DUPLICATES).proposed
+    assert _outcome(result.report, consolidate.JOB_LINKS).applied
+
+
+def test_no_meta_grant_at_all_is_what_actually_breaks_a_cycle(fresh_db):
+    """The lower bound under the test above: `read` is not decoration.
+
+    With the grant gone the edge type stops resolving before the first job even
+    runs, which is the failure the level exists to prevent — so `read` is the
+    smallest grant that works, not merely one that happens to.
+    """
+    service.revoke("builtin-gardener", "meta", principal=owner())
+    _node("Alpha")
+    _node("Alpha")
+
+    with pytest.raises(service.TypeNotFound, match="unknown edge type: duplicate_of"):
+        _run()
+
+    (cycle,) = service.list_cycles(principal=owner())
+    assert cycle.status == "failed"
+    assert _duplicates() == []
+
+
+def test_the_gardener_cannot_rewrite_the_type_vocabulary_it_reads(fresh_db):
+    """The authority `edit` on meta bought, and no shipped job ever reached.
+
+    Archiving the `note` type blocks every human write of that type too, so this
+    is not a theoretical over-grant — and it is what a 5b job would inherit by
+    default.
+    """
+    gardener = auth.internal_principal()
+
+    with pytest.raises(GrantNotPermitted):
+        service.transition("note", "archive", principal=gardener)
+    with pytest.raises(GrantNotPermitted):
+        service.rename_space("main", "renamed by the gardener", principal=gardener)
+    with pytest.raises(GrantNotPermitted):
+        service.create_space("invented", principal=gardener)
 
 
 # ── Job 2: link inference and pruning ─────────────────────────────────────────
@@ -848,6 +939,119 @@ def test_a_failure_outside_a_job_closes_the_cycle_and_re_raises(fresh_db, monkey
     assert cycle.report["failed"][0]["error"] == "RuntimeError: no scope"
 
 
+def test_ctrl_c_closes_the_cycle_instead_of_leaving_it_running(fresh_db, monkeypatch):
+    """`KeyboardInterrupt` is a `BaseException`, and it used to escape the guard.
+
+    A cycle left `running` cannot be rolled back and `undo` refuses every event
+    it stamped, so the writes it managed to make before the interrupt were
+    irreversible on every surface. Ctrl-C during `nodum consolidate` is the
+    ordinary way to meet it.
+    """
+
+    def _interrupt(context):
+        raise KeyboardInterrupt
+
+    monkeypatch.setitem(consolidate.JOBS, consolidate.JOB_LINKS, _interrupt)
+    _node("Alpha")
+    _node("Alpha")
+
+    with pytest.raises(KeyboardInterrupt):
+        _run()
+
+    (cycle,) = service.list_cycles(principal=owner())
+    assert cycle.status == "failed"
+    assert "KeyboardInterrupt" in cycle.report["failed"][0]["error"]
+    # The writes it did make are inside a closed cycle, so rollback reaches them —
+    # which a `running` cycle refuses outright.
+    rollback = service.rollback_cycle(cycle.id, principal=owner())
+    assert rollback.rollback_cycle_id is not None
+    assert service.get_cycle(cycle.id, principal=owner()).status == "rolled_back"
+
+
+# ── One cycle at a time ───────────────────────────────────────────────────────
+
+
+def _run_in_thread(results, **kwargs):
+    def _target():
+        try:
+            results.append(_run(**kwargs))
+        except BaseException as failure:
+            # Reported, not swallowed: the caller asserts on what came out.
+            results.append(failure)
+
+    thread = threading.Thread(target=_target)
+    thread.start()
+    return thread
+
+
+def test_a_second_cycle_is_refused_while_one_is_running(fresh_db, monkeypatch):
+    """The scheduler's no-overlap property guarded it against *itself* only.
+
+    Nothing serialised the nightly task against `POST /api/cycles` or `nodum
+    consolidate`, and the duplicate job's "a pair already carrying a
+    `duplicate_of` edge is left alone" is a read-then-write with no transaction
+    spanning it — so two concurrent runs proposed every pair twice and the human
+    got a review queue of the same size as the graph.
+    """
+    inside = threading.Event()
+    release = threading.Event()
+
+    def _hold(context):
+        inside.set()
+        assert release.wait(10), "the second caller never returned"
+        return consolidate.JobOutcome(name=consolidate.JOB_NEGLECT)
+
+    monkeypatch.setitem(consolidate.JOBS, consolidate.JOB_NEGLECT, _hold)
+    _node("Alpha")
+    _node("Alpha")
+    results: list = []
+    first = _run_in_thread(results, jobs=[consolidate.JOB_NEGLECT])
+    try:
+        assert inside.wait(10), "the first cycle never started"
+        with pytest.raises(consolidate.CycleInProgress, match="already running"):
+            _run(jobs=[consolidate.JOB_NEGLECT])
+    finally:
+        release.set()
+        first.join(10)
+
+    assert [type(result) for result in results] == [consolidate.ConsolidationOut]
+    # The refused caller opened no cycle, so the journal records one run.
+    assert len(service.list_cycles(principal=owner())) == 1
+
+
+def test_the_lock_is_released_when_a_cycle_fails(fresh_db, monkeypatch):
+    """A refusal that outlived one crash would be a nightly job nobody can restart."""
+    original = consolidate.JOBS[consolidate.JOB_NEGLECT]
+
+    def _explode(context):
+        raise RuntimeError("boom")
+
+    monkeypatch.setitem(consolidate.JOBS, consolidate.JOB_NEGLECT, _explode)
+    assert _run(jobs=[consolidate.JOB_NEGLECT]).cycle.status == "failed"
+
+    monkeypatch.setitem(consolidate.JOBS, consolidate.JOB_NEGLECT, original)
+    assert _run(jobs=[consolidate.JOB_NEGLECT]).cycle.status == "completed"
+
+
+def test_the_lock_is_released_when_a_cycle_is_interrupted(fresh_db, monkeypatch):
+    original = consolidate.JOBS[consolidate.JOB_NEGLECT]
+
+    def _interrupt(context):
+        raise KeyboardInterrupt
+
+    monkeypatch.setitem(consolidate.JOBS, consolidate.JOB_NEGLECT, _interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        _run(jobs=[consolidate.JOB_NEGLECT])
+
+    monkeypatch.setitem(consolidate.JOBS, consolidate.JOB_NEGLECT, original)
+    assert _run(jobs=[consolidate.JOB_NEGLECT]).cycle.status == "completed"
+
+
+def test_a_refused_second_cycle_is_a_clean_message_and_not_a_traceback(fresh_db):
+    """It reaches a human through the CLI and the journal's run button alike."""
+    assert issubclass(consolidate.CycleInProgress, ValueError)
+
+
 # ── Attribution and the cycle stamp ───────────────────────────────────────────
 
 
@@ -937,6 +1141,72 @@ def test_a_scope_confines_the_run_to_one_space(fresh_db):
     assert result.cycle.scope == space.id
     (edge,) = _duplicates()
     assert service.get_node(edge.src_id, principal=owner()).space_id == space.id
+
+
+def test_a_scope_the_gardener_holds_no_grant_on_names_the_grant_command(fresh_db):
+    """The one message a human must never be shown is "that space does not exist".
+
+    Every space created after `0014` is invisible to the gardener until somebody
+    grants it, and the scope picker offers those spaces on the first click. The
+    read that used to fail was `list_nodes(space=…, principal=gardener)`, deep
+    inside the metrics, and it failed with the Q13 non-oracle refusal — which is
+    the right sentence for a caller who lacks the grant and the wrong one here,
+    where the caller can see the space and it is the *gardener* that cannot. It
+    also landed in a permanent journal row the dream journal splices into an
+    entry's headline, complete with a bare 32-hex id.
+    """
+    space = service.create_space("research", principal=owner())
+
+    with pytest.raises(GrantNotPermitted) as refusal:
+        _run(scope="research")
+
+    message = str(refusal.value)
+    assert "builtin-gardener" in message
+    assert "nodum grant builtin-gardener research edit" in message
+    # The caller supplied a name, so the refusal quotes a name.
+    assert space.id not in message
+    assert "unknown space" not in message
+    # And the journal entry a human actually reads says the same thing.
+    (cycle,) = service.list_cycles(principal=owner())
+    assert cycle.status == "failed"
+    journal = cycle.report["failed"][0]["error"]
+    assert "nodum grant builtin-gardener research edit" in journal
+    assert "unknown space" not in journal
+    assert space.id not in journal
+
+
+def test_a_scope_the_gardener_can_only_read_still_runs(fresh_db):
+    """`read` resolves the space, which is all the metrics and the reads need.
+
+    The refusal above is about a scope the gardener cannot see at all. A grant
+    below `edit` is a narrower posture, not a broken one: the reads work, the
+    writes are refused one suggestion at a time and reported, and the cycle
+    still closes.
+    """
+    service.create_space("research", principal=owner())
+    service.grant("builtin-gardener", "research", "read", principal=owner())
+    service.create_node(type="claim", title="Beta", space="research", principal=owner())
+    service.create_node(type="claim", title="Beta", space="research", principal=owner())
+
+    result = _run(scope="research")
+
+    assert result.cycle.status == "completed"
+    outcome = _outcome(result.report, consolidate.JOB_DUPLICATES)
+    assert outcome.error is None
+    # The candidate was found and the write refused — reported, not raised.
+    assert outcome.detail["matched"] == 1
+    assert outcome.proposed == []
+    assert len(outcome.skipped) == 1
+    assert _duplicates() == []
+
+
+def test_an_unscoped_run_needs_no_new_grant(fresh_db):
+    """The nightly default must not start asking for one."""
+    service.create_space("research", principal=owner())
+    _node("Alpha")
+    _node("Alpha")
+
+    assert _run().cycle.status == "completed"
 
 
 def test_a_subset_of_jobs_runs_and_the_rest_do_not(fresh_db):
@@ -1081,3 +1351,28 @@ def test_every_write_the_module_makes_names_the_gardener():
     assert rendered <= {"context.principal", "self.principal", "opener", "gardener"}, (
         f"unreviewed principal binding: {sorted(rendered)}"
     )
+
+
+def test_the_module_documents_when_a_revoked_grant_bites(fresh_db):
+    """The grant set is minted once per run, so a revocation lands next cycle.
+
+    `disable_agent` already carries this note for the MCP server's
+    process-lifetime principal, and the archive dialog's copy promises an agent
+    "can read, write, propose and review nothing" from the moment a space is
+    archived. The window is one cycle, and an undocumented window is the part
+    that is wrong.
+    """
+    documentation = consolidate.__doc__ or ""
+
+    assert "revocation" in documentation.lower()
+    assert "next cycle" in documentation
+
+    # And the behaviour the sentence describes: the run holds the grants it
+    # started with.
+    space = service.create_space("research", principal=owner())
+    service.grant("builtin-gardener", space.id, "edit", principal=owner())
+    minted = auth.internal_principal()
+    service.revoke("builtin-gardener", space.id, principal=owner())
+
+    assert space.id in minted.grants
+    assert space.id not in auth.internal_principal().grants

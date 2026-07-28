@@ -221,7 +221,11 @@ def test_internal_principal_loads_the_gardener_with_its_grants(fresh_db):
     principal = auth.internal_principal()
     assert principal.kind == "internal"
     assert principal.actor_string == f"agent:{GARDENER_AGENT_ID}"
-    assert principal.grants == {"meta": "edit", "main": "edit"}
+    # `read` on meta, `edit` on main — the shape every curating agent in this
+    # suite holds. Consolidation only ever *reads* the type vocabulary; what
+    # `edit` on meta bought was authority no job reaches (see
+    # `tests/test_migrations.py`).
+    assert principal.grants == {"meta": "read", "main": "edit"}
 
 
 def test_internal_principal_reads_grants_through_the_same_archived_space_filter(fresh_db):

@@ -791,12 +791,12 @@ CREATE INDEX idx_cycles_started ON cycles(started_at);
 -- in-process (`auth.internal_principal`), and `rotate_agent_token` already
 -- refuses to mint one for an internal agent.
 --
--- **A collision on the id refuses the upgrade rather than resolving it.**
--- `agents.id` is a PRIMARY KEY and `create_agent` sets `agent_id = name`
--- verbatim, so a database written before this migration can already hold a
--- user's agent called `builtin-gardener`. Neither way out of that is safe:
--- taking the id would attribute that agent's whole history — every
--- `agent:builtin-gardener` in `events.actor`, `versions.actor` and both
+-- **A collision under the reserved prefix refuses the upgrade rather than
+-- resolving it.** `agents.id` is a PRIMARY KEY and `create_agent` sets
+-- `agent_id = name` verbatim, so a database written before this migration can
+-- already hold a user's agent called `builtin-gardener`. Neither way out of
+-- that is safe: taking the id would attribute that agent's whole history —
+-- every `agent:builtin-gardener` in `events.actor`, `versions.actor` and both
 -- `created_by` columns — to the gardener, and renaming the impostor would
 -- detach that same history from the account it names, since the actor strings
 -- are immutable log entries and not references anything can follow. Both
@@ -805,28 +805,57 @@ CREATE INDEX idx_cycles_started ON cycles(started_at);
 -- and re-runs; the whole migration rolls back as one transaction, exactly as
 -- any other failing one does.
 --
+-- **The check is the whole prefix, not the one id.** What is reserved is
+-- `builtin-` (`BUILTIN_AGENT_PREFIX`), because `Principal.actor_string` renders
+-- every agent as `agent:<id>` and the reservation is what keeps one such string
+-- naming one principal. Checking `builtin-gardener` alone let a pre-0010
+-- database whose log merely *mentions* `agent:builtin-librarian` upgrade
+-- clean — 0010 back-fills an `agents` row from every actor string it finds, so
+-- the upgrade installs a live, token-bearing external agent under the reserved
+-- prefix, and the collision this guard exists to refuse arrives pre-installed
+-- the day a second `builtin-*` agent is seeded. `LIKE 'builtin-%'` closes that,
+-- and it still catches the original single-id case.
+--
 -- `RAISE()` is a trigger-only construct in SQLite, so the abort is a CHECK
 -- constraint whose **name** carries the message (SQLite reports it verbatim as
--- `CHECK constraint failed: <name>`). The insert below produces a row only when
--- the id is already taken.
+-- `CHECK constraint failed: <name>`). The name is static SQL and **cannot
+-- interpolate the ids it found**: SQLite accepts an expression as `RAISE()`'s
+-- second argument only from 3.47.1 (2024-11-25), newer than the library most
+-- distributions ship, and a migration that fails to *parse* on an ordinary
+-- machine is a far worse failure than one whose message has to be looked up. So
+-- the message carries the LIKE pattern instead — `nodum agent list`, or one
+-- `SELECT id FROM agents WHERE id LIKE 'builtin-%'`, names them. The insert
+-- below produces a row only when something under the prefix exists.
 CREATE TABLE _reserved_agent_id (
     taken TEXT,
-    CONSTRAINT "the agent id 'builtin-gardener' is reserved: rename that account, then re-run"
+    CONSTRAINT
+"agent ids matching 'builtin-%' are reserved: rename or remove them, then re-run"
     CHECK (taken IS NULL)
 );
 INSERT INTO _reserved_agent_id (taken)
-SELECT id FROM agents WHERE id = 'builtin-gardener';
+SELECT id FROM agents WHERE id LIKE 'builtin-%';
 DROP TABLE _reserved_agent_id;
 
 INSERT INTO agents (id, kind, name, owner_human_id, credential_hash)
 VALUES ('builtin-gardener', 'internal', 'builtin-gardener', NULL, NULL);
 
--- `edit` on meta and on main: meta because consolidation reads and writes the
--- type vocabulary spaces are named from, main because that is where every write
--- naming no space lands. Any other space is an explicit `nodum grant`, like it
--- is for every other agent.
+-- `read` on meta and `edit` on main — the shape every other curating agent in
+-- this system holds. Meta because resolving a node or edge type is a READ of
+-- the type vocabulary, and consolidation never writes it: every job filters
+-- through `consolidate._is_curatable`, which excludes the meta space and the
+-- structural types outright. `edit` on meta was the first cut, justified as
+-- "reads and writes the vocabulary", and the write half was never true — what
+-- the level actually bought was authority no shipped job reaches: creating
+-- spaces, renaming `main`, retitling the `concept` type, and archiving the
+-- `note` type, after which a *human* can no longer write a note either. A grant
+-- is a ceiling, and this one is now set at what the jobs need.
+--
+-- Main because that is where every write naming no space lands. Any other space
+-- is an explicit `nodum grant builtin-gardener <space> edit`, like it is for
+-- every other agent — which is also what a scoped cycle over a space created
+-- after this migration asks for by name.
 INSERT INTO grants (agent_id, space_id, level) VALUES
-    ('builtin-gardener', 'meta', 'edit'),
+    ('builtin-gardener', 'meta', 'read'),
     ('builtin-gardener', 'main', 'edit');
 """
 

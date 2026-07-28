@@ -1294,17 +1294,26 @@ def test_consolidate_is_refused_on_a_scope_the_gardener_holds_nothing_on(fresh_d
     A human passes `require_review` unconditionally, so no curative verb on this
     surface can be refused for want of the *caller's* grant. The gardener's is
     the one that bites: migration `0014` gives it `main` and `meta` and nothing
-    else, and a space it holds nothing on reads exactly like one that does not
-    exist — a cycle is not an existence oracle either.
+    else, so every space made since needs an explicit grant.
+
+    The refusal names that grant. It used to be the Q13 non-oracle "unknown
+    space: <id>", which is the honest answer when the *caller* holds nothing and
+    a false one here — the caller just created the space and can see it in every
+    picker; it is the gardener that cannot. That sentence also outlived the
+    command, in a `failed` journal row whose message the dream journal splices
+    into the entry's headline.
     """
     _run_json("space-create", "research")
 
     result = runner.invoke(app, ["consolidate", "--scope", "research", "--as", "owner"])
 
     assert result.exit_code == 1
-    assert "unknown space" in result.stderr
+    assert "nodum grant builtin-gardener research edit" in result.stderr
+    assert "unknown space" not in result.stderr
     assert "Traceback" not in result.output
-    assert _run_json("cycle-list")["cycles"][0]["status"] == "failed"
+    journal = _run_json("cycle-list")["cycles"][0]
+    assert journal["status"] == "failed"
+    assert "unknown space" not in journal["report"]["failed"][0]["error"]
 
 
 def test_consolidate_stops_when_the_gardener_is_disabled(fresh_db):
@@ -1328,8 +1337,8 @@ def test_every_curative_refusal_is_one_line_and_never_a_traceback(fresh_db):
         (["supersede-edge", proposed.id], "cannot supersede an edge in state 'proposed'"),
         (["bulk-relink", "--to-type", "supports"], "needs a selector"),
         (["bulk-relink", "--src", node["id"]], "needs changes"),
-        (["cycle-get", "missing"], "no cycles row with id"),
-        (["rollback", "missing"], "no cycles row with id"),
+        (["cycle-get", "missing"], "consolidation cycle not found"),
+        (["rollback", "missing"], "consolidation cycle not found"),
         (["consolidate", "--job", "nope"], "unknown consolidation job"),
     ):
         result = runner.invoke(app, [*command, "--as", "owner"])

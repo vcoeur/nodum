@@ -324,6 +324,49 @@ def test_a_later_change_that_has_itself_been_undone_is_not_a_conflict(fresh_db):
     assert service.get_node(node.id, principal=owner()).type == "claim"
 
 
+def test_a_reversal_that_was_itself_reversed_stops_counting_as_one(fresh_db):
+    """ "Reversed" is a fixpoint, and treating it as a flat set let a rollback clobber.
+
+    C2's write was rolled back and then rolled back again, so it is **live**:
+    the node reads `source`, and C2's journal entry says `completed`. The old
+    code added every seq anything named to one set, so C2's own event counted as
+    "already reversed" and C1's rollback sailed straight over it — reporting no
+    conflicts on the dry run and then silently destroying a live write.
+    """
+    node = _node("Alpha")
+    first = service.retype([node.id], "note", principal=owner())
+    second = service.retype([node.id], "source", principal=owner())
+
+    reversal = service.rollback_cycle(second.cycle_id, principal=owner())
+    assert service.get_node(node.id, principal=owner()).type == "note"
+    service.rollback_cycle(reversal.rollback_cycle_id, principal=owner())
+    assert service.get_node(node.id, principal=owner()).type == "source"
+    assert service.get_cycle(second.cycle_id, principal=owner()).status == "completed"
+
+    plan = service.rollback_cycle(first.cycle_id, dry_run=True, principal=owner())
+    assert [conflict.row_id for conflict in plan.conflicts] == [node.id]
+    assert [conflict.conflicting_cycle_id for conflict in plan.conflicts] == [second.cycle_id]
+    with pytest.raises(RollbackConflict):
+        service.rollback_cycle(first.cycle_id, principal=owner())
+    assert service.get_node(node.id, principal=owner()).type == "source"
+
+
+def test_a_reversal_that_is_still_standing_still_clears_the_way(fresh_db):
+    """The other half of the fixpoint: one reversal deep is still reversed.
+
+    Rolled back *once*, C2's write is genuinely gone, so C1's rollback proceeds
+    — the fix must not turn every reversal into a permanent conflict.
+    """
+    node = _node("Alpha")
+    first = service.retype([node.id], "note", principal=owner())
+    second = service.retype([node.id], "source", principal=owner())
+    service.rollback_cycle(second.cycle_id, principal=owner())
+
+    service.rollback_cycle(first.cycle_id, principal=owner())
+
+    assert service.get_node(node.id, principal=owner()).type == "claim"
+
+
 def test_a_write_to_another_row_is_not_a_conflict(fresh_db):
     """Neither over- nor under-sensitive: the graph moving on elsewhere is fine."""
     node, bystander = _node("Alpha"), _node("Bystander")
@@ -422,6 +465,66 @@ def test_rolling_a_rollback_back_puts_a_deleted_node_back_with_its_versions(fres
     assert [version.id for version in restored][: len(before_versions)] == [
         version.id for version in before_versions
     ]
+
+
+def test_the_involution_holds_past_the_second_rollback(fresh_db):
+    """Roll a merge back and forward five times; every state must be bit-identical.
+
+    Depths 1 and 2 were correct and depth 3 was not, because the redirect
+    removal was keyed on the **op name** `node.merge` (and on the merge's own
+    `event_seq`). A rollback that *re-applies* a merge emits `node.rollback`
+    carrying the same before/after pair, so reversing that restored the node and
+    left the `merge_redirects` row behind — a divergence invisible in `nodes`
+    and `edges`, which is exactly why `GRAPH_TABLES` includes the third table.
+
+    Two rollbacks were never enough to catch it: the involution has to be
+    exercised past the point where a rollback is reversing another rollback's
+    reversal.
+    """
+    survivor, duplicate, other = _node("Alpha"), _node("Alpha (dup)"), _node("Gamma")
+    service.create_edge(other.id, duplicate.id, "supports", principal=owner())
+    merge = service.merge_nodes([duplicate.id], into=survivor.id, principal=owner())
+    merged = _graph()
+
+    first = service.rollback_cycle(merge.cycle_id, principal=owner())
+    unmerged = _graph()
+    assert unmerged != merged
+
+    next_cycle = first.rollback_cycle_id
+    for depth in range(2, 6):
+        result = service.rollback_cycle(next_cycle, principal=owner())
+        next_cycle = result.rollback_cycle_id
+        expected = merged if depth % 2 == 0 else unmerged
+        assert _graph() == expected, f"rollback #{depth} diverged from the state it must reproduce"
+
+
+def test_a_thrice_rolled_back_merge_leaves_the_node_mergeable_again(fresh_db):
+    """The consequence, stated as the two things a human actually hits.
+
+    A stranded `merge_redirects` row makes the tombstone's *creating* cycle
+    permanently unrollbackable — the guard names the redirect and tells you to
+    roll back the cycle that merged it, which reads `rolled_back` and refuses —
+    and merging the node again dies on the primary key with a bare
+    `sqlite3.IntegrityError`: a 500 over HTTP, and precisely the shape the three
+    guards in `_delete_created_row` exist to prevent.
+    """
+    survivor, duplicate = _node("Alpha"), _node("Alpha (dup)")
+    merge = service.merge_nodes([duplicate.id], into=survivor.id, principal=owner())
+
+    cycle = merge.cycle_id
+    for _ in range(3):
+        cycle = service.rollback_cycle(cycle, principal=owner()).rollback_cycle_id
+
+    # Three rollbacks from a merge is an un-merged graph, so no redirect stands.
+    assert _rows("merge_redirects", "tombstone_id") == []
+    assert service.get_node(duplicate.id, principal=owner()).state == "active"
+    # Which means the node can be merged again — and its create can be reversed.
+    again = service.merge_nodes([duplicate.id], into=survivor.id, principal=owner())
+    assert [row.tombstone_id for row in again.redirects] == [duplicate.id]
+    service.rollback_cycle(again.cycle_id, principal=owner())
+    service.undo(_seq_of("node.create", row_id=duplicate.id), principal=owner())
+    with pytest.raises(NodeNotFound):
+        service.get_node(duplicate.id, principal=owner())
 
 
 def test_a_cycle_is_rolled_back_once(fresh_db):
@@ -613,7 +716,7 @@ def test_a_cycle_that_wrote_nothing_is_refused_and_a_dry_run_says_why(fresh_db):
 
 
 def test_rolling_back_an_unknown_cycle_is_a_not_found(fresh_db):
-    with pytest.raises(RecordNotFound, match="no cycles row"):
+    with pytest.raises(RecordNotFound, match="consolidation cycle not found"):
         service.rollback_cycle("nope", principal=owner())
 
 
@@ -669,6 +772,65 @@ def test_a_dry_run_reports_the_conflicts_instead_of_raising_them(fresh_db):
     assert [conflict.row_id for conflict in plan.conflicts] == [node.id]
     with pytest.raises(RollbackConflict):
         service.rollback_cycle(result.cycle_id, principal=owner())
+
+
+def test_a_dry_run_reports_the_delete_guards_it_used_to_call_clean(fresh_db):
+    """The preflight and the run have to agree, and on these two they did not.
+
+    A conflict is the graph having *moved* a row the cycle wrote; a blocker is
+    the graph having *grown something onto* a row the cycle created. The plan
+    modelled only the first, so a created node that has since gained a child —
+    and a created space that has since been granted on — both answered
+    `conflicts: []` and then died on the guard mid-rollback. A confirm dialog
+    that says "clean" and then fails is worse than one that says nothing.
+    """
+    cycle = service.open_cycle(trigger="manual", principal=owner())
+    with service.in_cycle(cycle.id):
+        page = service.create_node(type="page", title="P", principal=owner())
+        space = service.create_space("delegated", principal=owner())
+    service.close_cycle(cycle.id, status="completed", report={}, principal=owner())
+    child = service.create_node(type="block", content="b", parent_id=page.id, principal=owner())
+    agent("reader-bot", grants={"meta": "read"})
+    service.grant("reader-bot", space.id, "read", principal=owner())
+
+    plan = service.rollback_cycle(cycle.id, dry_run=True, principal=owner())
+
+    assert plan.conflicts == []
+    blocked = {blocker.row_id: blocker for blocker in plan.blockers}
+    assert set(blocked) == {page.id, space.id}
+    assert blocked[page.id].dependants == [child.id]
+    assert "child node" in blocked[page.id].reason
+    assert blocked[space.id].dependants == ["reader-bot"]
+    assert "grant" in blocked[space.id].reason
+    assert blocked[page.id].cycle_event_op == "node.create"
+    # And the verdict is honest: the real run refuses on one of the two guards
+    # the plan named — the space's, since a rollback reverses newest first.
+    with pytest.raises(UndoNotPossible) as refused:
+        service.rollback_cycle(cycle.id, principal=owner())
+    assert str(refused.value).endswith(blocked[space.id].reason)
+
+
+def test_a_dry_run_does_not_call_the_cycles_own_rows_blockers(fresh_db):
+    """A rollback reverses newest first, so what it deletes cannot block it.
+
+    A cycle that creates a page and then a block child of it rolls back
+    perfectly — the child is gone before the parent's create is reached — and a
+    preflight that counted the child would refuse a rollback that in fact works.
+    """
+    cycle = service.open_cycle(trigger="manual", principal=owner())
+    with service.in_cycle(cycle.id):
+        page = service.create_node(type="page", title="P", principal=owner())
+        service.create_node(type="block", content="b", parent_id=page.id, principal=owner())
+    service.close_cycle(cycle.id, status="completed", report={}, principal=owner())
+    before = _graph()
+
+    plan = service.rollback_cycle(cycle.id, dry_run=True, principal=owner())
+    assert plan.blockers == []
+    assert _graph() == before
+
+    service.rollback_cycle(cycle.id, principal=owner())
+    with pytest.raises(NodeNotFound):
+        service.get_node(page.id, principal=owner())
 
 
 def test_a_dry_run_still_refuses_what_cannot_be_planned(fresh_db):
