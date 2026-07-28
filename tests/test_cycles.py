@@ -476,9 +476,12 @@ def test_an_abandoned_cycle_does_not_read_as_a_failed_curative_operation(fresh_d
     cycle ran, and the abandon did not fail. The cycle's own `trigger` says what
     it was; the report says only what is known about how it ended.
 
-    `abandoned` is the discriminator a reader branches on. The shape had none,
-    which is what forced the journal view to match `op` against a magic name;
-    `op` is still carried for that view and is the weaker of the two answers.
+    `abandoned` is the discriminator a reader branches on, and it is the **only**
+    one: there is no `op` here, because an abandon is not an operation the cycle
+    ran and naming one is that same misreading in field form. It carried
+    `op: "abandon_cycle"` for exactly one round — the journal view's reader
+    returned nothing for a report without that key, so a value on the server was
+    being kept alive by a client, which now keys on `abandoned`.
     """
     cycle = _open(trigger="scheduled")
     with service.in_cycle(cycle.id):
@@ -487,6 +490,7 @@ def test_an_abandoned_cycle_does_not_read_as_a_failed_curative_operation(fresh_d
     report = service.abandon_cycle(cycle.id, principal=owner()).report
 
     assert report["abandoned"] is True, "an abandon must be tellable without matching a name"
+    assert "op" not in report, "an abandon is not an operation the cycle ran"
     assert "error" not in report, "the abandon succeeded — it is the run that failed"
     assert "failed" not in str(report), "nothing in the report may say the abandon failed"
     assert report["abandoned_by"] == "human:owner"

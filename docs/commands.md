@@ -236,9 +236,12 @@ including every parameter.
   things that used to share a list: `unchanged` is bare edge ids the change
   would not alter (a fact about the diff — you asked for something already
   true), while `skipped` is the refusals with their reasons — a self-loop, a
-  duplicate the graph already carries, or a space you may not edit. Unlike
-  `retype`, this command exits **0** either way, so check `skipped` rather than
-  the exit code.
+  duplicate the graph already carries, or a space you may not edit. Because
+  `skipped` is now the failures and nothing else, the exit code is derived from
+  it exactly as `retype`'s is: **1 if anything was refused**, with each one named
+  on stderr. `unchanged` never affects it. **A `--dry-run` exits 0 whatever it
+  predicts** — every check a real run makes runs on the rehearsal, so its
+  `skipped` is accurate, but nothing was attempted there and nothing was lost.
 
 The writes a cycle makes are the **gardener's** (`agent:builtin-gardener`), an
 internal agent seeded with `read` on `meta` and `edit` on `main` as ordinary

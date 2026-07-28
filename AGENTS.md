@@ -1410,24 +1410,31 @@ Phase-1 decision log.
   with zero events — reported success to the one thing a script reads. Now the
   envelope is on stdout as before (the successes are the point of not aborting),
   each skipped id is named on stderr as `  failed <id>: <reason>`, and the exit
-  code is 1 if any item was skipped. **`bulk-relink` is the exception, and its
-  exemption no longer rests on what it used to rest on.** The original reason
-  was that its `skipped[]` mixed two things: "nothing would change on this edge"
-  sat beside real refusals under one field called `error`, so a script could
-  tell them apart only by matching the sentence and an exit code derived from
-  the list would have been wrong more often than right. That mixture is
-  **gone** — `BulkRelinkOut` now reports `unchanged` (bare edge ids the change
-  would not alter: a diff annotation) apart from `skipped` (the refusals, each
-  with a reason: a self-loop, a duplicate the graph already carries, or a space
-  the caller may not edit). So `skipped` *is* a failure list now, and
-  `bulk-relink` still exits **0** whatever is in it. **That is a live
-  inconsistency, recorded here rather than papered over**: a run that could not
-  relink three edges because the caller lacks `edit` on their space reports
-  success to the one thing a script reads, which is precisely the `retype` bug
-  above. Whoever picks this up should note that the dry run is the wrinkle — its
-  `skipped[]` is a *prediction*, nothing was attempted and nothing was lost, so
-  a rule here has to be "non-empty `skipped` **and** not a dry run" rather than
-  the flat one every other batch verb uses.
+  code is 1 if any item was skipped. **`bulk-relink` follows it too now, and it
+  took a shape change to get there.** Its exemption rested on `skipped[]` mixing
+  two things: "nothing would change on this edge" sat beside real refusals under
+  one field called `error`, so a script could tell them apart only by matching
+  the sentence and an exit code derived from the list would have been wrong more
+  often than right. That mixture is **gone** — `BulkRelinkOut` reports
+  `unchanged` (bare edge ids the change would not alter: a diff annotation)
+  apart from `skipped` (the refusals, each with a reason: a self-loop, a
+  duplicate the graph already carries, or a space the caller may not edit) — so
+  `skipped` *is* a failure list, and the exit code is derived from it. Without
+  that, a run which could not relink three edges for want of `edit` on their
+  space reported success to the one thing a script reads, which is precisely the
+  `retype` bug above.
+- **The rule `bulk-relink` follows is "non-empty `skipped` *and* not a dry run",
+  and the second clause is not a courtesy.** Every check a real run makes runs
+  on the rehearsal too — that is what makes the diff worth reading — so
+  `--dry-run` predicts its refusals accurately and reports them in the same
+  field. But nothing was attempted there and nothing was lost, so exit 1 would
+  announce a failure that has not happened, on the one command whose entire job
+  is to be read before it is run. A rehearsal names nothing on stderr either:
+  `  failed <id>` says an attempt was made. The CLI reads `result.dry_run` off
+  the answer rather than its own flag, because the service decides which posture
+  the run had. This is the only place a batch verb departs from the flat rule,
+  and it departs because a dry run is the only batch that never touched
+  anything.
 - `ingest url` fetches `http`/`https` only, once, with a timeout and a size
   ceiling, and refuses a redirect that leaves those two schemes. It does *not*
   block loopback or private ranges — this is itself a loopback service — so

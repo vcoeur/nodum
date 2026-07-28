@@ -131,12 +131,14 @@ def _emit_batch(result: BaseModel, failures: Sequence[TransitionFailure]) -> Non
 
     Args:
         result: The batch outcome to print as the command's one JSON object.
-        failures: Its per-item failures — the ``failed`` list. ``bulk_relink``
-            does not use this helper: its diff annotation ("nothing would change
-            on this edge") is reported apart from its refusals now, in
-            ``unchanged``, but its exit code stays 0 either way because a relink
-            that matched an edge already saying what was asked for is a diff a
-            human is reading, not a batch that lost an item.
+        failures: Its per-item failures — the ``failed`` list, or ``bulk_relink``'s
+            ``skipped``. That list *is* the refusals now (a self-loop, a
+            duplicate, a space the caller may not edit): its diff annotation
+            ("nothing would change on this edge") moved to ``unchanged``, which
+            is what let ``bulk-relink`` join this rule at all. Its **dry run**
+            passes nothing here on purpose — a rehearsal's ``skipped`` is a
+            prediction, nothing was attempted and nothing was lost, so exit 1
+            would report a failure that has not happened.
     """
     _emit(result)
     for failure in failures:
@@ -1706,6 +1708,13 @@ def bulk_relink(
     `--dry-run` opens no cycle and emits no event: it is the diff §8.5 asks for
     on a large refactor. The reversal of a run that did happen is
     `rollback <cycle-id>`.
+
+    The batch rule applies, with one departure. `skipped[]` is the refusals — a
+    self-loop, a duplicate, a space you may not edit — so a real run that
+    refused an edge exits **1** and names each one on stderr, exactly as
+    `retype` does; `unchanged[]` is the diff annotation and never affects the
+    code. A `--dry-run` exits **0** whatever it predicts: nothing was attempted
+    there, so nothing failed.
     """
     selector: dict = {}
     if src is not None:
@@ -1721,12 +1730,14 @@ def bulk_relink(
         changes["type"] = to_type
     if to_dst is not None:
         changes["dst_id"] = to_dst
-    _emit(
-        _run(
-            service.bulk_relink,
-            selector,
-            changes,
-            dry_run=dry_run,
-            principal=_principal(as_human),
-        )
+    result = _run(
+        service.bulk_relink,
+        selector,
+        changes,
+        dry_run=dry_run,
+        principal=_principal(as_human),
     )
+    # The dry run's refusals are a prediction, not a loss, so they buy no exit
+    # code — read off the result rather than the flag, since the service is what
+    # decides which posture the run had.
+    _emit_batch(result, [] if result.dry_run else result.skipped)

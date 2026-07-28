@@ -649,10 +649,16 @@ class BulkRelinkOut(BaseModel):
 
     They used to share one list under a field named ``error``, so "nothing would
     change on this edge" and "you may not edit that space" were distinguishable
-    only by matching the sentence — which is exactly why ``bulk-relink`` is the
-    one batch verb whose exit code is *not* derived from its failure list. A
-    script can now derive it: ``skipped`` is the failures, and ``unchanged`` is
-    not one.
+    only by matching the sentence — which is why ``bulk-relink`` was for one
+    round the only batch verb whose exit code was not derived from its failure
+    list. It is derived from it now: ``skipped`` is the failures, ``unchanged``
+    is not one, and ``nodum bulk-relink`` exits 1 when ``skipped`` is non-empty
+    on a run that actually happened.
+
+    **A dry run is the exception, and it is the only one.** Every check a real
+    run makes runs on the rehearsal too, so ``skipped`` there is an accurate
+    *prediction* — but nothing was attempted and nothing was lost, so it costs
+    no exit code. Read ``dry_run`` before reading ``skipped`` as a failure.
 
     ``truncated`` is true when the server-side ceiling stopped the selection
     short of the whole match — never a silent truncation.

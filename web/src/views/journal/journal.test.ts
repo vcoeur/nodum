@@ -72,6 +72,7 @@ import {
   nameIdsIn,
   noMetricsNote,
   readConsolidationReport,
+  readOperationReport,
   referencedNodeIds,
   rollbackAvailability,
   rollbackOutcome,
@@ -349,6 +350,36 @@ describe("readConsolidationReport", () => {
   });
 });
 
+describe("readOperationReport", () => {
+  it("reads a one-op report by its name", () => {
+    const parsed = readOperationReport({ op: "rollback_cycle", rolled_back: "abc", reversed: 3 });
+    expect(parsed).toMatchObject({ op: "rollback_cycle", rolledBack: "abc", reversed: 3 });
+    expect(parsed?.abandoned).toBe(false);
+  });
+
+  it("reads an abandoned run by its own discriminator, with no op to match", () => {
+    // The finding. `abandon_cycle`'s report carried `op: "abandon_cycle"` for
+    // one round *only* because this reader returned null without an `op` key and
+    // five readings below matched that string — a key on the server kept alive
+    // by a client, over a report whose own comment says to branch on
+    // `abandoned`. Dropping it must not make an abandoned cycle read as no
+    // report at all.
+    const parsed = readOperationReport(ABANDON_REPORT);
+    expect(parsed).not.toBeNull();
+    expect(parsed?.abandoned).toBe(true);
+    expect(parsed?.op).toBeNull();
+    expect(parsed?.abandonedBy).toBe("human:owner");
+    // And the abandon did not fail, so nothing reads as an error.
+    expect(parsed?.error).toBeNull();
+  });
+
+  it("is null for a report that is neither", () => {
+    expect(readOperationReport(report(A_NIGHT))).toBeNull();
+    expect(readOperationReport({ abandoned: false })).toBeNull();
+    expect(readOperationReport(null)).toBeNull();
+  });
+});
+
 describe("cycleWork", () => {
   it("reads a night's work as a sentence rather than a row of ids", () => {
     // The scenario the view exists for: "merged 3 duplicates, added 14 links,
@@ -531,16 +562,20 @@ const RECORDED_SCOPE_REFUSAL = `TypeNotFound: unknown space: ${RESEARCH_ID}`;
 /**
  * The report an **abandoned** cycle wears, verbatim from `service.abandon_cycle`.
  *
- * Verified against a live `POST /api/cycles/{id}/abandon`. It matters that this
- * is an *operation* report: `close_cycle` replaces whatever the interrupted run
- * had written, so an abandoned consolidation run reads as `{"op": …}` rather
- * than as a job list — and read as an ordinary one-op report it came out as
- * *"One curative operation: abandon_cycle. It failed."*
+ * `abandoned` is the whole discriminator, and it carries **no `op`**. It used to
+ * carry `{"op": "abandon_cycle"}`, which is what forced this view to match a
+ * magic string — a key the server kept for one round solely because this file's
+ * readings needed it, over a report whose own comment said to branch on
+ * `abandoned` instead. `close_cycle` still replaces whatever the interrupted run
+ * had written, so this is what an abandoned *consolidation* run reads back as:
+ * not a job list, and not a curative operation either.
  */
 const ABANDON_REPORT: JsonObject = {
-  op: "abandon_cycle",
+  abandoned: true,
   abandoned_by: "human:owner",
-  error:
+  // **Not `error`.** The abandon succeeded; the run is what failed, which
+  // `status` already says.
+  detail:
     "the run was interrupted and never closed itself; a human closed its journal entry so that " +
     "what it had already written could be rolled back",
 };
@@ -605,12 +640,12 @@ const EVERY_BRANCH: CycleOut[] = [
   // the one way a server string could otherwise reach the headline unshortened.
   cycle({ trigger: "rollback", report: { op: "rollback_cycle", rolled_back: "not found" } }),
   cycle({ trigger: "rollback", report: { op: "rollback_cycle", rolled_back: HOSTILE } }),
-  // An abandoned run: an operation report on a consolidation cycle.
+  // An abandoned run: a report with no `op` at all, on a consolidation cycle.
   cycle({ trigger: "manual", status: "failed", report: ABANDON_REPORT }),
   cycle({
     trigger: "manual",
     status: "failed",
-    report: { op: "abandon_cycle", abandoned_by: HOSTILE, error: HOSTILE },
+    report: { abandoned: true, abandoned_by: HOSTILE, detail: HOSTILE },
   }),
   // No report at all, and one still being written.
   cycle({ report: null }),

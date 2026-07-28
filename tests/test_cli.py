@@ -1327,6 +1327,77 @@ def test_bulk_relink_previews_before_it_writes(fresh_db):
     assert _run_json("edge", "list", "--node", third["id"])["count"] == 1
 
 
+def test_a_bulk_relink_that_refused_an_edge_does_not_exit_zero(fresh_db):
+    """The batch rule, now that `skipped[]` is a failure list and nothing else.
+
+    `retype`'s defect, one command along. The exemption `bulk-relink` held was
+    that its `skipped[]` mixed a diff annotation ("nothing would change on this
+    edge") with real refusals under one field called `error`, so an exit code
+    derived from it would have been wrong more often than right. `unchanged`
+    took the annotation, `skipped` kept the refusals — and until this, a run
+    that could not relink an edge still reported success to the one thing a
+    script reads.
+    """
+    first, second, third = _claim("A"), _claim("B"), _claim("C")
+    moving = _run_json("edge", "create", first["id"], second["id"], "--type", "supports")
+    # Already saying what the relink asks for, so repointing `moving` onto it is
+    # the duplicate refusal — and this edge itself is an `unchanged` entry.
+    _run_json("edge", "create", first["id"], third["id"], "--type", "supports")
+
+    result = runner.invoke(
+        app, ["bulk-relink", "--src", first["id"], "--to-dst", third["id"], "--as", "owner"]
+    )
+
+    assert result.exit_code == 1
+    relinked = json.loads(result.stdout)
+    # The envelope is still on stdout, printed before the exit code was decided.
+    assert relinked["changes"] == []
+    assert [failure["id"] for failure in relinked["skipped"]] == [moving["id"]]
+    assert f"failed {moving['id']}:" in result.stderr
+    assert "Traceback" not in result.output
+
+    # And the annotation is not a failure: a run whose only non-change is
+    # `unchanged` accomplished exactly what was asked and exits 0.
+    unchanged = _run_json("bulk-relink", "--src", first["id"], "--to-type", "supports")
+    assert unchanged["skipped"] == []
+    assert len(unchanged["unchanged"]) == 2
+
+
+def test_a_bulk_relink_dry_run_exits_zero_even_when_it_would_refuse(fresh_db):
+    """A rehearsal's `skipped[]` is a prediction: nothing was attempted, nothing lost.
+
+    The one place this command departs from the flat batch rule. Every check a
+    real run makes runs on the dry run too, so the diff tells the truth about
+    what *would* be refused — but exit 1 there would report a failure that has
+    not happened, on a command whose whole job is to be read before it is run.
+    """
+    first, second, third = _claim("A"), _claim("B"), _claim("C")
+    _run_json("edge", "create", first["id"], second["id"], "--type", "supports")
+    _run_json("edge", "create", first["id"], third["id"], "--type", "supports")
+
+    result = runner.invoke(
+        app,
+        [
+            "bulk-relink",
+            "--src",
+            first["id"],
+            "--to-dst",
+            third["id"],
+            "--dry-run",
+            "--as",
+            "owner",
+        ],
+    )
+
+    assert result.exit_code == 0
+    preview = json.loads(result.stdout)
+    assert preview["dry_run"] is True
+    assert len(preview["skipped"]) == 1
+    # Nothing "failed": naming a prediction on stderr under that word would say
+    # an attempt was made and lost.
+    assert "failed" not in result.stderr
+
+
 def test_rollback_takes_a_curative_cycle_back_whole(fresh_db):
     survivor, duplicate = _claim("Alpha"), _claim("Alpha (dup)")
     merged = _run_json("merge-nodes", duplicate["id"], "--into", survivor["id"])

@@ -4559,11 +4559,13 @@ def abandon_cycle(
             # (`op` + `error`), so an abandoned nightly sweep read back as "One
             # curative operation: abandon_cycle. It failed." — a consolidation
             # described as a curative op, and a failure that was the *run's*.
-            # Anything reading this report should branch on `abandoned` rather
-            # than match `op` against a name; `op` stays because the journal view
-            # keys on it today, and it is the weaker of the two answers.
+            # **And there is no `op` here**, deliberately: an abandon is not an
+            # operation the cycle ran, so naming one is the misreading in field
+            # form. It carried `op: "abandon_cycle"` for exactly one round,
+            # because the journal view's reader returned nothing without that key
+            # — a value on the server kept alive by a client, and the client
+            # keys on `abandoned` now.
             "abandoned": True,
-            "op": "abandon_cycle",
             "abandoned_by": principal.actor_string,
             # **Not `error`.** The abandon succeeded — it is the run that failed,
             # which `status = 'failed'` already says. A sentence explaining the

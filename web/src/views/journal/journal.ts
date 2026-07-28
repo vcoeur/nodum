@@ -230,29 +230,35 @@ export interface ConsolidationReport {
   failed: JobFailureReport[];
 }
 
-/**
- * The op name `service.abandon_cycle` writes into the report it closes with.
- *
- * An abandoned cycle wears an **operation** report — `{"op": "abandon_cycle",
- * "abandoned_by": …, "error": …}` — because `close_cycle` replaces whatever the
- * run had written. Read as an ordinary one-op report it comes out as *"One
- * curative operation: abandon_cycle. It failed."*, which is wrong three ways:
- * abandoning is not a curative operation, the operation did not fail (the run
- * did), and the entry is a consolidation run rather than a single-row write. So
- * every reading below branches on it.
- */
-const ABANDON_OP = "abandon_cycle";
-
 /** A cycle whose report is a single operation's — a rollback, an abandon, or a curative op. */
 export interface OperationReport {
-  /** The operation's name, e.g. `rollback_cycle`, `abandon_cycle`, `merge_nodes`. */
-  op: string;
+  /**
+   * The operation's name, e.g. `rollback_cycle`, `merge_nodes` — `null` for an
+   * abandon, which has no operation name and does not want one.
+   */
+  op: string | null;
+  /**
+   * Whether this entry was closed by hand rather than by whatever it was doing.
+   *
+   * `service.abandon_cycle`'s own discriminator, and the reason every reading
+   * below branches before it says the word *operation*. `close_cycle` replaces
+   * whatever the interrupted run had written, so an abandoned **consolidation**
+   * run arrives here wearing a one-op report's shape; read as one it came out as
+   * *"One curative operation: abandon_cycle. It failed."* — wrong three ways:
+   * abandoning is not a curative operation, the operation did not fail (the run
+   * did), and the entry is a night's sweep rather than a single-row write.
+   *
+   * This used to be `op === "abandon_cycle"`, a magic string the server carried
+   * **for this file alone**: the report already said `abandoned: true`, and the
+   * `op` key stayed only because this reader returned null without one.
+   */
+  abandoned: boolean;
   /** The cycle this one took back, for `rollback_cycle`. */
   rolledBack: string | null;
   /** How many events it reversed, when the report recorded it. */
   reversed: number | null;
   /**
-   * Who closed an interrupted run's entry, for `abandon_cycle`.
+   * Who closed an interrupted run's entry, for an abandon.
    *
    * An actor string, named through {@link actorLabel} like every other one on
    * this screen rather than spelt.
@@ -318,6 +324,13 @@ export function readConsolidationReport(
  * Both write `{"op": …}` rather than a job list, which is exactly why
  * `CycleDetailOut.metrics` is `{}` for them.
  *
+ * **Two discriminators, because there are two shapes.** An abandon writes
+ * `{"abandoned": true, …}` and **no** `op`: it is not an operation the cycle ran
+ * and has no name to give. Keying only on `op` would read that report as no
+ * report at all — an abandoned run rendered as *"No report was recorded for this
+ * cycle"*, which is worse than the curative-op misreading `abandoned` was
+ * introduced to fix.
+ *
  * @param report `CycleOut.report`.
  */
 export function readOperationReport(
@@ -325,9 +338,11 @@ export function readOperationReport(
 ): OperationReport | null {
   if (!report || typeof report !== "object") return null;
   const op = stringAt(report, "op");
-  if (op === null) return null;
+  const abandoned = report.abandoned === true;
+  if (op === null && !abandoned) return null;
   return {
     op,
+    abandoned,
     rolledBack: stringAt(report, "rolled_back"),
     reversed: numberAt(report, "reversed"),
     abandonedBy: stringAt(report, "abandoned_by"),
@@ -466,7 +481,7 @@ export function cycleWork(cycle: CycleOut): string {
     // An abandoned run is not an operation the way a merge is: the report says
     // how the *entry* was closed, not what the cycle did. Its own writes are the
     // event list below, which is why the sentence points at them.
-    if (operation.op === ABANDON_OP) {
+    if (operation.abandoned) {
       return (
         "Interrupted, and never finished. Its entry was closed by hand so that what it had " +
         "already written could be rolled back."
@@ -481,7 +496,8 @@ export function cycleWork(cycle: CycleOut): string {
         operation.reversed === null ? "" : ` — ${plural(operation.reversed, "event")} reversed`;
       return `Took ${target} back${count}.${failure}`;
     }
-    return `One curative operation: ${registeredName(operation.op, "unnamed")}.${failure}`;
+    // `op` is null only for an abandon, which returned above.
+    return `One curative operation: ${registeredName(operation.op ?? "", "unnamed")}.${failure}`;
   }
 
   if (cycle.status === "running") return "Running now — the report lands when it closes.";
@@ -516,7 +532,7 @@ export function cycleFailures(cycle: CycleOut, scope: SpaceName | null = null): 
     );
   }
   const operation = readOperationReport(cycle.report);
-  if (operation !== null && operation.op === ABANDON_OP) {
+  if (operation !== null && operation.abandoned) {
     // The server's own sentence says the same thing, under a prefix that is
     // false — *"The operation abandon_cycle failed"*. The operation succeeded;
     // the run it closed is what never finished.
@@ -529,7 +545,10 @@ export function cycleFailures(cycle: CycleOut, scope: SpaceName | null = null): 
         "rolling the cycle back is what takes those writes back.",
     ];
   }
-  if (operation !== null && operation.error !== null) {
+  // A *named* operation that failed. `op` is null only for an abandon, which
+  // returned above with its own line — and narrowing here is what keeps a bare
+  // `null` out of a sentence rather than trusting that it did.
+  if (operation !== null && operation.op !== null && operation.error !== null) {
     return [`The operation ${operation.op} failed: ${describeRecordedFailure(operation.error, scope)}`];
   }
   return [];
@@ -774,7 +793,7 @@ export function rollbackAvailability(
     const because =
       operation === null
         ? ""
-        : operation.op === ABANDON_OP
+        : operation.abandoned
           ? " — it was interrupted before it wrote anything"
           : " — a curative operation that matched nothing writes none";
     return {
@@ -1198,7 +1217,7 @@ export function noMetricsNote(cycle: CycleOut): string {
       : "This cycle recorded no coherence metrics, and its report does not say why.";
   }
   const operation = readOperationReport(cycle.report);
-  if (operation !== null && operation.op === ABANDON_OP) {
+  if (operation !== null && operation.abandoned) {
     // `close_cycle` replaces the report wholesale, so an abandoned run's metrics
     // are gone whether or not it had measured anything. Saying "a rollback and a
     // one-op curative cycle do not compute them" describes two things this is
@@ -1658,7 +1677,7 @@ export function emptyEventsNote(cycle: CycleOut): string {
           "to change.";
   }
   const operation = readOperationReport(cycle.report);
-  if (operation !== null && operation.op === ABANDON_OP) {
+  if (operation !== null && operation.abandoned) {
     // An abandoned run usually *did* write — that is why closing its entry
     // matters — so an empty list here means it died before it got that far.
     return (
