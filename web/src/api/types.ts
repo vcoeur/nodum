@@ -584,6 +584,32 @@ export interface RollbackConflictOut {
 }
 
 /**
+ * One row a rollback would have to delete but cannot — a delete guard, as data.
+ *
+ * The *other* refusal shape, and it is not a conflict: a conflict is the graph
+ * having **moved** a row the cycle wrote, a blocker is the graph having **grown
+ * something onto** a row the cycle created, so the delete that reverses that
+ * create would cascade past what the reversal was asked to touch. Both stop a
+ * rollback; only conflicts were modelled before, which is why a dry run could
+ * answer `conflicts: []` for a rollback that then failed at apply time.
+ *
+ * `row_id` is the row the cycle created, named by `cycle_event_seq` /
+ * `cycle_event_op`. `dependants` are the ids in the way — children of a node,
+ * occupants of a space, nodes typed by a type node, agents granted on a space,
+ * merge redirects naming a node — and it is the **whole** list, not the capped
+ * handful `reason` spells out. `reason` is the guard's own sentence, which is
+ * what the run refuses with if the rollback is attempted anyway.
+ */
+export interface RollbackBlockerOut {
+  kind: string;
+  row_id: string;
+  cycle_event_seq: number;
+  cycle_event_op: string;
+  dependants: string[];
+  reason: string;
+}
+
+/**
  * `POST /api/cycles/{id}/rollback` — the outcome, or on a dry run the verdict.
  *
  * `rollback_cycle_id` names the new `trigger='rollback'` cycle every reversal
@@ -591,9 +617,14 @@ export interface RollbackConflictOut {
  * writes nothing. `skipped_events` are the cycle's non-graph events — audit
  * records with no graph effect to reverse.
  *
- * `conflicts` is empty on a rollback that happened; on a dry run it is the
- * reason it would not. A **real** rollback that meets one refuses with 409 and
- * the same list in the error body — see `RollbackConflictError`.
+ * The verdict is **two** lists and it is clean only when both are empty.
+ * `conflicts` is the graph having moved on; `blockers` is the delete guards,
+ * which refuse for a different reason and used to be invisible until the
+ * rollback was already running. Both are empty on a rollback that happened; on
+ * a dry run either one is a rollback that would fail. A **real** rollback that
+ * meets a conflict refuses with 409 and the same `conflicts` list in the error
+ * body (see `RollbackConflictError`); one that meets a blocker refuses with
+ * `UndoNotPossible`, whose body carries the guard's sentence and no list.
  */
 export interface RollbackOut {
   cycle_id: string;
@@ -607,6 +638,7 @@ export interface RollbackOut {
   deleted_edges: string[];
   redirects_removed: string[];
   conflicts: RollbackConflictOut[];
+  blockers: RollbackBlockerOut[];
 }
 
 /** `POST /api/cycles/{id}/rollback` body. */

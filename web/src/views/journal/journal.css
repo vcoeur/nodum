@@ -448,10 +448,37 @@
   margin-bottom: var(--nd-space-3);
 }
 
+/* The two things that can stand in the way of a rollback are shown apart: a
+   conflict is the graph having moved a row the cycle wrote, a blocker is the
+   graph having grown onto a row it created, and they have different answers.
+   The distinction is carried by the heading and the note rather than by a
+   colour — neither is an affordance nor a service-layer state, so neither is
+   entitled to one of the two colour axes. */
+.nd-jn-standoff {
+  display: flex;
+  flex-direction: column;
+  gap: var(--nd-space-3);
+}
+
+.nd-jn-standoff__title {
+  font-size: var(--nd-text-md);
+}
+
+.nd-jn-standoff__note {
+  max-width: 80ch;
+}
+
 .nd-jn-conflicts {
   display: flex;
   flex-direction: column;
   gap: var(--nd-space-6);
+  list-style: none;
+}
+
+.nd-jn-dependants {
+  display: flex;
+  flex-direction: column;
+  gap: var(--nd-space-1);
   list-style: none;
 }
 

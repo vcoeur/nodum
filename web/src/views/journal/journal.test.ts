@@ -43,6 +43,7 @@ import type {
   EventOut,
   JsonObject,
   NodeOut,
+  RollbackBlockerOut,
   RollbackConflictOut,
   RollbackOut,
 } from "../../api/types";
@@ -54,6 +55,7 @@ import {
   cycleScopeIds,
   cycleScopeSpaces,
   cycleWork,
+  describeBlocker,
   describeConflict,
   describeEvent,
   describeRecordedFailure,
@@ -62,6 +64,7 @@ import {
   endpointLabel,
   eventWindow,
   eventWindowNote,
+  MAX_NAMED_DEPENDANTS,
   metricRows,
   noMetricsNote,
   readConsolidationReport,
@@ -204,7 +207,7 @@ function nodeRow(overrides: JsonObject = {}): JsonObject {
   };
 }
 
-/** A rollback response, clean unless conflicts are given. */
+/** A rollback response, clean unless conflicts or blockers are given. */
 function rollback(overrides: Partial<RollbackOut> = {}): RollbackOut {
   return {
     cycle_id: CYCLE_ID,
@@ -218,6 +221,7 @@ function rollback(overrides: Partial<RollbackOut> = {}): RollbackOut {
     deleted_edges: [],
     redirects_removed: [],
     conflicts: [],
+    blockers: [],
     ...overrides,
   };
 }
@@ -234,6 +238,51 @@ function conflict(overrides: Partial<RollbackConflictOut> = {}): RollbackConflic
     conflicting_actor: "human:alice",
     conflicting_cycle_id: null,
     ...overrides,
+  };
+}
+
+/**
+ * `count` distinct 32-hex ids, for a dependant list whose length is the point.
+ *
+ * Real id shapes rather than `dep-0`, because what these fixtures exercise is
+ * the shortening and the rule against putting 32 hex characters on a screen,
+ * and a short fake id would assert neither of them.
+ */
+function hexIds(count: number): string[] {
+  return Array.from(
+    { length: count },
+    (_unused, index) => `c${index}a2b3c4d5e6f708192a3b4c5d6e7f8${index}`,
+  );
+}
+
+/** `service._named_rows`: the first five ids, then a count of what is left. */
+function namedRows(rowIds: readonly string[]): string {
+  const shown = rowIds.slice(0, 5).join(", ");
+  const rest = rowIds.length - 5;
+  return rest > 0 ? `${shown} and ${rest} more` : shown;
+}
+
+/**
+ * One blocker row out of a dry run: a node the cycle created that is now a
+ * parent, which is `service._delete_blocker`'s first branch.
+ *
+ * `reason` is built the way the service builds it — the guard's own sentence,
+ * bare ids and all — because the whole question this module answers is what a
+ * dialog may do with a string the server wrote.
+ */
+function blocker(overrides: Partial<RollbackBlockerOut> = {}): RollbackBlockerOut {
+  const dependants = overrides.dependants ?? hexIds(2);
+  const rowId = overrides.row_id ?? NODE_ID;
+  return {
+    kind: "node",
+    cycle_event_seq: 43,
+    cycle_event_op: "node.create",
+    reason:
+      `node ${rowId} still has ${dependants.length} child node(s) (${namedRows(dependants)}) — ` +
+      "take those back first: undo their creation, or roll back the cycle that made them",
+    ...overrides,
+    row_id: rowId,
+    dependants,
   };
 }
 
@@ -1297,12 +1346,90 @@ describe("describeConflict", () => {
   });
 });
 
+describe("describeBlocker", () => {
+  it("names the row, the create that made it, what depends on it and the refusal", () => {
+    // The same argument as a conflict, one refusal along: a human told which
+    // rows are held down and by what can go and take those back; one told
+    // "rollback failed" can only go and look.
+    const line = describeBlocker(blocker());
+    expect(line.kind).toBe("node");
+    expect(line.rowId).toBe(NODE_ID);
+    expect(line.cycleDid).toBe("event #43 (node.create)");
+    expect(line.dependants).toHaveLength(2);
+    expect(line.dependantCount).toBe(2);
+    expect(line.reason).toContain("take those back first");
+  });
+
+  it("calls the row what the page's own event list calls it", () => {
+    // A blocker's row is always one the cycle *created*, so its event is on the
+    // page behind the dialog and that payload carries the title.
+    const names = new Map([[NODE_ID, "note: Kafka Streams"]]);
+    const line = describeBlocker(blocker(), (rowId) => names.get(rowId) ?? null);
+    expect(line.name).toBe("note: Kafka Streams");
+    expect(line.sentence).toContain("the node note: Kafka Streams");
+    // A dependant is a row outside the cycle, so the page usually cannot name
+    // one — but the sentence must never carry 32 hex characters either way.
+    expect(line.sentence).not.toMatch(BARE_ID);
+  });
+
+  it("falls back to the shortened id when nothing on the page named the row", () => {
+    const line = describeBlocker(blocker());
+    expect(line.name).toBeNull();
+    expect(line.sentence).toContain("a1a2b3c4…");
+    expect(line.sentence).not.toMatch(BARE_ID);
+  });
+
+  it("names the first few dependants and counts the rest", () => {
+    // A refusal naming none of them cannot be acted on; one naming four hundred
+    // is not a sentence. The count is stated, so the cap hides nothing.
+    const line = describeBlocker(blocker({ dependants: hexIds(8) }));
+    expect(line.dependants).toHaveLength(MAX_NAMED_DEPENDANTS);
+    expect(line.dependantCount).toBe(8);
+    expect(line.sentence).toContain("8 rows depend on it now");
+    expect(line.sentence).toContain("and 3 others");
+    expect(line.sentence).not.toMatch(BARE_ID);
+  });
+
+  it("agrees with itself about a single dependant", () => {
+    const line = describeBlocker(blocker({ dependants: hexIds(1) }));
+    expect(line.sentence).toContain("1 row depends on it now");
+  });
+
+  it("keeps the guard's own sentence verbatim, since it is what the run will say", () => {
+    // The reason is the line the rollback actually refuses with, so it is shown
+    // as written rather than paraphrased — the same bargain
+    // `describeRecordedFailure` strikes for everything but a refused space.
+    expect(describeBlocker(blocker()).reason).toBe(blocker().reason);
+  });
+
+  it("reads as a dependency rather than as a later write", () => {
+    // A conflict is *the graph moved on*; a blocker is *something now depends on
+    // what this rollback would remove*. Wording that let the two read alike
+    // would tell a human the same thing had happened twice, and the two have
+    // different answers: go and look at the later work, versus take the
+    // dependants back first.
+    const held = describeBlocker(blocker()).sentence;
+    const moved = describeConflict(conflict()).sentence;
+    expect(held).toContain("depend on it now");
+    expect(held).toContain("taken back first");
+    expect(held).not.toContain("has changed it since");
+    expect(held).not.toContain("would overwrite");
+    expect(moved).toContain("would overwrite");
+    expect(moved).not.toContain("depend on it now");
+  });
+});
+
 describe("rollbackPlan", () => {
   it("clears a rollback nothing stands in the way of, and counts it", () => {
     const plan = rollbackPlan(rollback({ reversed_events: [44, 43, 42] }));
     expect(plan.blocked).toBe(false);
     expect(plan.headline).toBe("Reversing 3 events.");
     expect(plan.conflicts).toEqual([]);
+    expect(plan.blockers).toEqual([]);
+  });
+
+  it("says a clean verdict covers both refusals, not just the conflicts", () => {
+    expect(rollbackPlan(rollback()).detail).toContain("nothing has been built on");
   });
 
   it("says which events will be skipped and why", () => {
@@ -1329,6 +1456,58 @@ describe("rollbackPlan", () => {
     const plan = rollbackPlan(rollback({ conflicts: [conflict()] }), () => "note: Meeting");
     expect(plan.conflicts[0]?.name).toBe("note: Meeting");
   });
+
+  it("blocks on blockers alone, with the conflicts list empty", () => {
+    // The defect this closes. A delete guard refuses a rollback exactly as
+    // firmly as a conflict does, and a preflight modelling only conflicts
+    // answered `conflicts: []` for a rollback that then died at apply time —
+    // which is the one answer a confirm dialog must not give.
+    const plan = rollbackPlan(rollback({ blockers: [blocker()] }));
+    expect(plan.blocked).toBe(true);
+    expect(plan.conflicts).toEqual([]);
+    expect(plan.blockers).toHaveLength(1);
+    expect(plan.headline).toBe("Something now depends on 1 row this cycle created.");
+    expect(plan.detail).toContain("all of it or none of it");
+    expect(plan.detail).toContain("taken back first");
+  });
+
+  it("does not read as clean when blockers stand and nothing has moved", () => {
+    // The regression, asserted the way the dialog reads it: `blocked` is what
+    // disables the confirm button, and none of the clean copy may survive.
+    const clean = rollbackPlan(rollback({ reversed_events: [42] }));
+    const held = rollbackPlan(rollback({ reversed_events: [42], blockers: [blocker()] }));
+    expect(clean.blocked).toBe(false);
+    expect(held.blocked).toBe(true);
+    expect(held.headline).not.toBe(clean.headline);
+    expect(held.headline).not.toContain("Reversing");
+    expect(held.detail).not.toContain("the whole of it can be taken back");
+    expect(held.detail).not.toContain("rolled back in turn");
+  });
+
+  it("names both when the graph has moved and grown", () => {
+    // They compose, and the headline says so rather than adding them up: a
+    // reader told "3 rows are in the way" has one number for two problems with
+    // two different answers.
+    const plan = rollbackPlan(
+      rollback({
+        conflicts: [conflict()],
+        blockers: [blocker(), blocker({ row_id: SRC_ID })],
+      }),
+    );
+    expect(plan.blocked).toBe(true);
+    expect(plan.headline).toBe(
+      "1 row moved since this cycle ran, and something now depends on 2 rows it created.",
+    );
+    expect(plan.detail).toContain("overwrite the later work");
+    expect(plan.detail).toContain("cascade");
+    expect(plan.conflicts).toHaveLength(1);
+    expect(plan.blockers).toHaveLength(2);
+  });
+
+  it("passes the page's row names down to every blocker", () => {
+    const plan = rollbackPlan(rollback({ blockers: [blocker()] }), () => "note: Kafka Streams");
+    expect(plan.blockers[0]?.name).toBe("note: Kafka Streams");
+  });
 });
 
 describe("rollbackRefusal", () => {
@@ -1347,6 +1526,13 @@ describe("rollbackRefusal", () => {
   it("names the rows the same way the preflight did", () => {
     const plan = rollbackRefusal([conflict()], () => "note: Meeting");
     expect(plan.conflicts[0]?.name).toBe("note: Meeting");
+  });
+
+  it("carries no blockers, because the 409 body has none to carry", () => {
+    // Not an omission: only `RollbackConflict` renders a list into its error
+    // body. A guard met mid-commit refuses as `UndoNotPossible` — one sentence,
+    // no list — and reaches the dialog as an ordinary error toast.
+    expect(rollbackRefusal([conflict()]).blockers).toEqual([]);
   });
 });
 

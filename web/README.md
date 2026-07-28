@@ -244,7 +244,7 @@ type-checking it and driving it in a browser.
 | `src/views/editor/` | CodeMirror-6 Markdown source editor, slash commands, `[[` autocomplete, live Mermaid preview, autosave, the write-target picker and the landing/refusal copy (`createOutcome.ts`) |
 | `src/views/search/` | query box, ranked hits, per-signal breakdown, signal grouping, the space filter + show-meta toggle in the URL (`searchState.ts`), refused-filter copy (`spaceFailure.ts`), when a row names its space (`resultSpace.ts`) |
 | `src/views/review/` | proposal queue grouped space → agent, per-kind cards, proposed-version diffs, self-governing space sections, cross-space edge marking (`grouping.edgeCrossing`) |
-| `src/views/journal/` | the dream journal: cycles as sentences, one entry with its job report, the five coherence metrics before/after, the events it wrote as a paged diff, the run-now control, and the dry-run-then-confirm rollback (`journal.ts` owns every sentence and every reading of the untyped `report` blob; `useNodeTitles.ts` names the nodes an edge event points at) |
+| `src/views/journal/` | the dream journal: cycles as sentences, one entry with its job report, the five coherence metrics before/after, the events it wrote as a paged diff, the run-now control, and the dry-run-then-confirm rollback — whose verdict is **two** lists, `conflicts` and `blockers`, and is clean only when both are empty (`journal.ts` owns every sentence and every reading of the untyped `report` blob; `useNodeTitles.ts` names the nodes an edge event points at) |
 | `src/views/graph/` | Cytoscape subgraph render, filters, cross-space edge styling and far-endpoint dimming, path panel |
 | `src/views/assets/` | rendition grid, lightbox, the ingesting drop-zone with its queue readout (`uploadOutcome.ts`) and its bookkeeping (`uploadQueue.ts` — batches, status labels, the refused second drop, the per-batch announcement), thin JSON export |
 | `src/views/login/` | password login against `POST /api/login` |
@@ -402,7 +402,13 @@ What it handles for you:
   a message the caller already has. In practice a view rarely sees one — the
   confirm dialog calls the same route with `dry_run: true` first, which answers
   the same list under a 200 — so a 409 means the graph moved between the check
-  and the commit;
+  and the commit. **The dry run answers a second list too, `blockers`**: the
+  delete guards, which refuse a rollback for a different reason (something now
+  depends on a row the cycle created, so the delete that reverses that create
+  would have to cascade). A verdict is clean only when both lists are empty, and
+  a caller reading one of them offers a confirm button for a rollback that will
+  fail. Only `conflicts` has a 409 body to come back in — a guard met for real
+  raises `UndoNotPossible`, one sentence and no list;
 - raises `UnknownSpaceError` (test it with `isUnknownSpace`) whenever a call
   that named a space could not resolve it. The wire is inconsistent here by
   accretion — the node listing refuses with a **404** (the service's

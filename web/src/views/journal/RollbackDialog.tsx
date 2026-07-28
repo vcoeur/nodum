@@ -2,17 +2,30 @@
  * The confirm in front of rolling a whole cycle back.
  *
  * **It calls the API before it asks.** `POST /api/cycles/{id}/rollback` with
- * `dry_run: true` opens no cycle, writes nothing, and answers the conflicts
- * under a **200** rather than raising — which is the "would this succeed?" a
- * confirm dialog exists for. So this dialog runs the rehearsal the moment it
- * opens and shows its verdict: how many events would be reversed, or which rows
- * stand in the way. A human meeting a conflict here has lost nothing; a human
- * meeting it as a 409 afterwards has already decided.
+ * `dry_run: true` opens no cycle, writes nothing, and answers under a **200**
+ * rather than raising — which is the "would this succeed?" a confirm dialog
+ * exists for. So this dialog runs the rehearsal the moment it opens and shows
+ * its verdict: how many events would be reversed, or what stands in the way. A
+ * human meeting a refusal here has lost nothing; a human meeting it after
+ * pressing the button has already decided.
+ *
+ * **Two things can stand in the way, and they are shown apart.** A *conflict* is
+ * the graph having moved on — a later write changed a row this cycle wrote, so
+ * reversing would overwrite that work. A *blocker* is the graph having grown
+ * onto a row this cycle created — a child, an occupant, a grant, a type in use —
+ * so the delete that reverses the create would cascade past what the reversal
+ * was asked to touch. They have different answers (go and look at the later
+ * work, versus take the dependants back first), so a single merged list would
+ * tell the reader that one thing had happened twice. The verdict is clean only
+ * when **both** lists are empty: a confirm that checked conflicts alone offered
+ * this button for a rollback that then failed at apply time.
  *
  * A real 409 is still handled, because it is a real race: the preflight and the
  * commit are two requests, and the graph can move between them. Its conflicts
  * come back in the error body verbatim and are rendered exactly as the
- * preflight's are, under wording that says which of the two happened.
+ * preflight's are, under wording that says which of the two happened. The 409
+ * body carries conflicts only — a guard met mid-commit refuses as
+ * `UndoNotPossible`, one sentence and no list, and reaches the error toast.
  *
  * Modelled on `views/spaces/ArchiveDialog.tsx` — busy state on the affirmative
  * button, the dialog left standing on failure, Escape and the backdrop
@@ -157,44 +170,101 @@ export function RollbackDialog({ cycle, nameRow, onRolledBack, onClose }: Rollba
             <p>{plan.detail}</p>
           </div>
 
-          {plan.conflicts.length === 0 ? (
+          {plan.conflicts.length === 0 && plan.blockers.length === 0 ? (
             <p className="nd-meta">
               Rolling back writes the recorded payloads back verbatim, across every space the cycle
               touched. It is not undone by undo — a rollback is itself a cycle, and rolling{" "}
               <em>that</em> back re-applies this one.
             </p>
-          ) : (
-            <ul className="nd-jn-conflicts">
-              {plan.conflicts.map((conflict) => (
-                <li key={`${conflict.rowId}:${conflict.sinceDid}`} className="nd-jn-conflict">
-                  <p className="nd-jn-conflict__row">
-                    <span className="nd-badge nd-badge--type">{conflict.kind}</span>
-                    {conflict.name === null ? null : (
-                      <span className="nd-jn-conflict__name">{conflict.name}</span>
-                    )}
-                    <span className="nd-mono nd-truncate" title={conflict.rowId}>
-                      {conflict.name === null ? conflict.rowId : shortId(conflict.rowId, 12)}
-                    </span>
-                  </p>
-                  <dl className="nd-jn-conflict__facts">
-                    <dt>This cycle</dt>
-                    <dd>{conflict.cycleDid}</dd>
-                    <dt>Changed since by</dt>
-                    <dd>
-                      {conflict.sinceDid} — {conflict.who}
-                      {conflict.inCycle === null
-                        ? ", outside any cycle"
-                        : `, in cycle ${shortId(conflict.inCycle)}`}
-                    </dd>
-                  </dl>
-                  {conflict.inCycle === null ? null : (
-                    <p className="nd-meta">
-                      Rolling that cycle back may clear this one out of the way.
+          ) : null}
+
+          {plan.conflicts.length === 0 ? null : (
+            <section className="nd-jn-standoff">
+              <h3 className="nd-jn-standoff__title">Moved since this cycle ran</h3>
+              <p className="nd-meta nd-jn-standoff__note">
+                Something outside this cycle has written to a row it wrote. Reversing would put the
+                cycle&rsquo;s own payload back over that work — go and look at it first.
+              </p>
+              <ul className="nd-jn-conflicts">
+                {plan.conflicts.map((conflict) => (
+                  <li key={`${conflict.rowId}:${conflict.sinceDid}`} className="nd-jn-conflict">
+                    <p className="nd-jn-conflict__row">
+                      <span className="nd-badge nd-badge--type">{conflict.kind}</span>
+                      {conflict.name === null ? null : (
+                        <span className="nd-jn-conflict__name">{conflict.name}</span>
+                      )}
+                      <span className="nd-mono nd-truncate" title={conflict.rowId}>
+                        {conflict.name === null ? conflict.rowId : shortId(conflict.rowId, 12)}
+                      </span>
                     </p>
-                  )}
-                </li>
-              ))}
-            </ul>
+                    <dl className="nd-jn-conflict__facts">
+                      <dt>This cycle</dt>
+                      <dd>{conflict.cycleDid}</dd>
+                      <dt>Changed since by</dt>
+                      <dd>
+                        {conflict.sinceDid} — {conflict.who}
+                        {conflict.inCycle === null
+                          ? ", outside any cycle"
+                          : `, in cycle ${shortId(conflict.inCycle)}`}
+                      </dd>
+                    </dl>
+                    {conflict.inCycle === null ? null : (
+                      <p className="nd-meta">
+                        Rolling that cycle back may clear this one out of the way.
+                      </p>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            </section>
+          )}
+
+          {plan.blockers.length === 0 ? null : (
+            <section className="nd-jn-standoff">
+              <h3 className="nd-jn-standoff__title">Depended on since this cycle ran</h3>
+              <p className="nd-meta nd-jn-standoff__note">
+                This cycle created these rows and something outside it points at them now. Reversing
+                a create deletes the row, and the deletion will not cascade onto rows this cycle
+                never wrote — so take the dependants back first, then roll this cycle back.
+              </p>
+              <ul className="nd-jn-conflicts">
+                {plan.blockers.map((blocker) => (
+                  <li key={`${blocker.rowId}:${blocker.cycleDid}`} className="nd-jn-conflict">
+                    <p className="nd-jn-conflict__row">
+                      <span className="nd-badge nd-badge--type">{blocker.kind}</span>
+                      {blocker.name === null ? null : (
+                        <span className="nd-jn-conflict__name">{blocker.name}</span>
+                      )}
+                      <span className="nd-mono nd-truncate" title={blocker.rowId}>
+                        {blocker.name === null ? blocker.rowId : shortId(blocker.rowId, 12)}
+                      </span>
+                    </p>
+                    <dl className="nd-jn-conflict__facts">
+                      <dt>This cycle</dt>
+                      <dd>{blocker.cycleDid} — it created this row</dd>
+                      <dt>Depended on by</dt>
+                      <dd>
+                        <ul className="nd-jn-dependants">
+                          {blocker.dependants.map((dependant) => (
+                            <li key={dependant.id} className="nd-truncate" title={dependant.id}>
+                              {dependant.label}
+                            </li>
+                          ))}
+                        </ul>
+                        {blocker.dependantCount > blocker.dependants.length ? (
+                          <p className="nd-meta">
+                            …and {blocker.dependantCount - blocker.dependants.length} more,{" "}
+                            {blocker.dependantCount} in all.
+                          </p>
+                        ) : null}
+                      </dd>
+                      <dt>The run refuses with</dt>
+                      <dd>{blocker.reason}</dd>
+                    </dl>
+                  </li>
+                ))}
+              </ul>
+            </section>
           )}
         </>
       )}

@@ -49,6 +49,7 @@ import type {
   EventOut,
   JsonObject,
   NodeOut,
+  RollbackBlockerOut,
   RollbackConflictOut,
   RollbackOut,
 } from "../../api/types";
@@ -1369,11 +1370,25 @@ export function emptyEventsNote(cycle: CycleOut): string {
 }
 
 /* ------------------------------------------------------------------ */
-/* Rollback: the preflight verdict and the conflicts                    */
+/* Rollback: the preflight verdict, the conflicts and the blockers      */
 /* ------------------------------------------------------------------ */
 
 /** Names a row this cycle touched, for a surface holding only its id. */
 export type RowNamer = (rowId: string) => string | null;
+
+/**
+ * What to call a row on screen: the page's own name for it, or its shortened id.
+ *
+ * The one rule shared by both refusal shapes, so neither can drift into printing
+ * 32 hex characters where the other prints a title.
+ *
+ * @param rowId The row's id.
+ * @param nameRow Names a row this cycle touched — {@link rowHeadlines}.
+ * @param keep How much of an unnamed id to show; see {@link shortId}.
+ */
+function rowLabel(rowId: string, nameRow: RowNamer, keep?: number): string {
+  return nameRow(rowId) ?? shortId(rowId, keep);
+}
 
 /** One conflict, in the four facts a human needs to act on it. */
 export interface ConflictLine {
@@ -1431,7 +1446,7 @@ export function describeConflict(
   const sinceDid = `event #${conflict.conflicting_seq} (${conflict.conflicting_op})`;
   const inCycle = conflict.conflicting_cycle_id;
   const name = nameRow(conflict.row_id);
-  const called = name === null ? shortId(conflict.row_id) : name;
+  const called = rowLabel(conflict.row_id, nameRow);
   const provenance =
     inCycle === null
       ? ""
@@ -1451,36 +1466,202 @@ export function describeConflict(
   };
 }
 
-/** The dry run's verdict, as the confirm dialog reads it. */
+/**
+ * How many dependants a blocker line names before it counts the rest.
+ *
+ * The same bargain `service._named_rows` strikes on the server, made again here
+ * because this list is the **whole** one rather than the capped handful the
+ * `reason` sentence spells out: a refusal naming none of them cannot be acted
+ * on, and one naming four hundred is not a sentence. The count is always stated,
+ * so nothing is hidden by the cap.
+ */
+export const MAX_NAMED_DEPENDANTS = 5;
+
+/** One row standing on a blocker, named where the page can name it. */
+export interface DependantLine {
+  /** The dependant's id — a node id, or an agent id for a grant. */
+  id: string;
+  /** What the page calls it, or the shortened id when nothing does. */
+  label: string;
+}
+
+/**
+ * One blocker: a row this cycle created that the graph has since grown onto.
+ *
+ * Deliberately **not** a {@link ConflictLine}, because it is not the same event
+ * and does not have the same answer. A conflict is *the graph moved on* — a
+ * later write changed a row this cycle wrote, and reversing would overwrite that
+ * work. A blocker is *something now depends on what this rollback would remove*
+ * — the cycle created a row, something outside the cycle has since pointed at
+ * it, and the delete that reverses the create refuses to cascade onto rows the
+ * reversal was never asked to touch. Rendering the two as one list would tell a
+ * human that the same thing had happened twice.
+ */
+export interface BlockerLine {
+  /** `node` — the only kind the delete guards cover. */
+  kind: string;
+  /** The row the cycle created and the rollback would have to delete. */
+  rowId: string;
+  /**
+   * What this cycle's own events call that row, or null when nothing does.
+   *
+   * A blocker's row is *always* one the cycle created, so its create is in the
+   * event list behind the dialog and that payload carries the title — the same
+   * lookup {@link describeConflict} does, and a stronger guarantee than the
+   * conflict case, where the row merely has to have been touched.
+   */
+  name: string | null;
+  /** The create this rollback would reverse: `event #42 (node.create)`. */
+  cycleDid: string;
+  /** What now depends on it, in the order the server listed them. */
+  dependants: DependantLine[];
+  /** How many there are in total — `dependants` is capped for reading, this is not. */
+  dependantCount: number;
+  /**
+   * The guard's own refusal, as the server wrote it.
+   *
+   * Shown verbatim, which is the same bargain {@link describeRecordedFailure}
+   * strikes: what this module owns is the sentence *about* the refusal, not
+   * every message the service can produce. It is also the one line that says
+   * what the run will actually fail with if it is attempted anyway.
+   */
+  reason: string;
+  /** The whole of it as one sentence, for a screen reader and a copy-paste. */
+  sentence: string;
+}
+
+/**
+ * Render one blocker legibly: which row, what the cycle did, what depends on it.
+ *
+ * Same argument as {@link describeConflict}, one refusal along: a human told
+ * *which* rows are held down and by what can go and take those back, and one
+ * told "rollback failed" can only go and look. So every field the server sends
+ * is used, and the ids are named through the page's own event list rather than
+ * printed.
+ *
+ * The sentence names the row and its dependants and stops there — the `reason`
+ * carries the server's own wording, ids and all, and is rendered beside the
+ * sentence rather than spliced into it, so a page that could name every row does
+ * not put 32 hex characters into the line a screen reader announces.
+ *
+ * @param blocker One row out of `RollbackOut.blockers`.
+ * @param nameRow Names a row this cycle touched — {@link rowHeadlines} over the
+ *   page's own event list. Omitted, the line falls back to shortened ids.
+ */
+export function describeBlocker(
+  blocker: RollbackBlockerOut,
+  nameRow: RowNamer = () => null,
+): BlockerLine {
+  const cycleDid = `event #${blocker.cycle_event_seq} (${blocker.cycle_event_op})`;
+  const name = nameRow(blocker.row_id);
+  const called = rowLabel(blocker.row_id, nameRow);
+  // A dependant is by definition a row this cycle did *not* write, so the page's
+  // event list usually cannot name it — the shortened id is the honest answer,
+  // and it is still not the 32 hex characters the server sent.
+  const dependants = blocker.dependants
+    .slice(0, MAX_NAMED_DEPENDANTS)
+    .map((id) => ({ id, label: rowLabel(id, nameRow, 12) }));
+  const total = blocker.dependants.length;
+  const rest = total - dependants.length;
+  const listed = dependants.map((dependant) => dependant.label);
+  // Capped, the tail is a count rather than a final "and" — the same shape
+  // `service._named_rows` writes, so the two readings of one list agree.
+  const named = rest > 0 ? `${listed.join(", ")} and ${plural(rest, "other")}` : joined(listed);
+  const depend = total === 1 ? "depends" : "depend";
+  return {
+    kind: blocker.kind,
+    rowId: blocker.row_id,
+    name,
+    cycleDid,
+    dependants,
+    dependantCount: total,
+    reason: blocker.reason,
+    sentence:
+      `This cycle's ${cycleDid} created the ${blocker.kind} ${called}, and ` +
+      `${plural(total, "row")} ${depend} on it now (${named}). Reversing a create deletes the ` +
+      "row, and the deletion will not cascade onto rows this cycle never made — so those have " +
+      "to be taken back first.",
+  };
+}
+
+/**
+ * The dry run's verdict, as the confirm dialog reads it.
+ *
+ * Two lists, and **`blocked` is true when either is non-empty**. They are not
+ * interchangeable and neither implies the other: a rollback can be perfectly
+ * free of conflicts and still fail on a guard, which is precisely the shape that
+ * made the preflight disagree with the run.
+ */
 export interface RollbackPlan {
-  /** True when conflicts stand between the cycle and its reversal. */
+  /** True when anything at all stands between the cycle and its reversal. */
   blocked: boolean;
   headline: string;
   detail: string;
+  /** Rows the graph has *moved* since the cycle wrote them. */
   conflicts: ConflictLine[];
+  /** Rows the cycle *created* that something outside it now depends on. */
+  blockers: BlockerLine[];
+}
+
+/**
+ * The headline over a refused verdict, naming which of the two shapes bit.
+ *
+ * They compose, so all three cases are written out rather than concatenated
+ * from a clause each: a reader told "5 rows are in the way" about two conflicts
+ * and three blockers has been told one number about two different problems with
+ * two different answers.
+ */
+function blockedHeadline(conflicts: number, blockers: number): string {
+  if (blockers === 0) return `${plural(conflicts, "row")} moved since this cycle ran.`;
+  if (conflicts === 0) {
+    return `Something now depends on ${plural(blockers, "row")} this cycle created.`;
+  }
+  return (
+    `${plural(conflicts, "row")} moved since this cycle ran, and something now depends on ` +
+    `${plural(blockers, "row")} it created.`
+  );
+}
+
+/** What to do about it, per shape, under {@link blockedHeadline}. */
+function blockedDetail(conflicts: number, blockers: number): string {
+  const opener =
+    "A rollback is all of it or none of it, so nothing can be reversed while these stand.";
+  const moved = "Rolling back would overwrite the later work listed below.";
+  const grown =
+    "Reversing a create deletes the row it made, and that deletion refuses to cascade onto " +
+    "rows this cycle never wrote — so each dependant below has to be taken back first.";
+  if (blockers === 0) return `${opener} ${moved}`;
+  if (conflicts === 0) return `${opener} ${grown}`;
+  return `${opener} ${moved} ${grown}`;
 }
 
 /**
  * Turn a dry-run rollback into the verdict a confirm dialog shows.
  *
  * The dry run is the whole reason the confirm calls the API before the human
- * commits: it opens no cycle, writes nothing, and answers the conflicts under a
- * **200**, so a blocked rollback is something the reader meets *before* acting
- * rather than as a 409 afterwards.
+ * commits: it opens no cycle, writes nothing, and answers under a **200**, so a
+ * blocked rollback is something the reader meets *before* acting rather than as
+ * a failure afterwards.
+ *
+ * **The verdict is clean only when `conflicts` and `blockers` are both empty.**
+ * Reading one of them was the defect this closes: the guards refuse a rollback
+ * exactly as firmly as a conflict does, so a dialog checking conflicts alone
+ * said "clean" and offered the button for a rollback that then died at apply
+ * time — the one answer a preflight must not give.
  *
  * @param result The `dry_run: true` response.
  * @param nameRow Names a row this cycle touched; see {@link describeConflict}.
  */
 export function rollbackPlan(result: RollbackOut, nameRow?: RowNamer): RollbackPlan {
   const conflicts = result.conflicts.map((conflict) => describeConflict(conflict, nameRow));
-  if (conflicts.length > 0) {
+  const blockers = result.blockers.map((blocker) => describeBlocker(blocker, nameRow));
+  if (conflicts.length > 0 || blockers.length > 0) {
     return {
       blocked: true,
-      headline: `${plural(conflicts.length, "row")} moved since this cycle ran.`,
-      detail:
-        "A rollback is all of it or none of it, so nothing can be reversed while these stand. " +
-        "Rolling back would overwrite the later work listed below.",
+      headline: blockedHeadline(conflicts.length, blockers.length),
+      detail: blockedDetail(conflicts.length, blockers.length),
       conflicts,
+      blockers,
     };
   }
   const skipped =
@@ -1492,10 +1673,11 @@ export function rollbackPlan(result: RollbackOut, nameRow?: RowNamer): RollbackP
     blocked: false,
     headline: `${sentence(`reversing ${plural(result.reversed_events.length, "event")}`)}`,
     detail:
-      `Nothing outside this cycle has touched the rows it wrote, so the whole of it can be ` +
-      `taken back.${skipped} The reversal is recorded as a new cycle of its own, which can be ` +
-      "rolled back in turn to re-apply this one.",
+      `Nothing outside this cycle has touched the rows it wrote, and nothing has been built on ` +
+      `the rows it created, so the whole of it can be taken back.${skipped} The reversal is ` +
+      "recorded as a new cycle of its own, which can be rolled back in turn to re-apply this one.",
     conflicts,
+    blockers,
   };
 }
 
@@ -1507,6 +1689,11 @@ export function rollbackPlan(result: RollbackOut, nameRow?: RowNamer): RollbackP
  * before the human pressed the button. Worth its own wording, because "3 rows
  * moved since this cycle ran" would be a confusing thing to read directly under
  * a check that had just said none had.
+ *
+ * `blockers` is empty here and that is the wire's shape rather than an omission:
+ * the 409 body carries a `conflicts` list and nothing else, because a rollback
+ * that meets a *guard* mid-commit refuses as `UndoNotPossible` — one sentence,
+ * no list — and reaches the dialog as an ordinary error toast.
  *
  * @param conflicts The `conflicts` list out of the 409 error body.
  * @param nameRow Names a row this cycle touched; see {@link describeConflict}.
@@ -1522,6 +1709,7 @@ export function rollbackRefusal(
       "The check above passed, and then something wrote to a row this cycle had touched. " +
       "Nothing was rolled back — a rollback is all of it or none of it.",
     conflicts: conflicts.map((conflict) => describeConflict(conflict, nameRow)),
+    blockers: [],
   };
 }
 

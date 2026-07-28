@@ -1284,11 +1284,17 @@ export async function runCycle(
  * `POST /api/cycles/{id}/rollback` — take a whole cycle back (design D7).
  *
  * **Call it with `dryRun` first.** A dry run opens no cycle, writes nothing, and
- * returns any conflicts in `conflicts` under a **200** — which is the "would
- * this succeed?" a confirm dialog needs, so the human meets a conflict *before*
- * committing rather than after. A real rollback that meets one refuses with 409
- * and the same list, raised as {@link RollbackConflictError}; that path is the
- * race where the graph moved between the two calls, not the ordinary one.
+ * returns its verdict under a **200** — which is the "would this succeed?" a
+ * confirm dialog needs, so the human meets a refusal *before* committing rather
+ * than after. A real rollback that meets a conflict refuses with 409 and the
+ * same list, raised as {@link RollbackConflictError}; that path is the race
+ * where the graph moved between the two calls, not the ordinary one.
+ *
+ * The verdict is **two** lists, `conflicts` and `blockers`, and it is clean only
+ * when both are empty — a caller reading one of them offers a confirm button for
+ * a rollback that will fail. Only `conflicts` has a 409 body to come back in:
+ * a blocker met for real raises `UndoNotPossible` carrying the guard's sentence
+ * and no list, which is an ordinary {@link ApiError}.
  *
  * @param id The cycle to take back.
  * @param options `dryRun` rehearses the reversal.
