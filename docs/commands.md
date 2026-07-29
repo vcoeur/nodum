@@ -119,8 +119,14 @@ including every parameter.
 - `diff <a> <b>` — Unified diff between two versions of one node.
 - `undo [seq]` — Reverse an event, restoring the prior state from its payload.
   An event carrying a `cycle_id` is **not** undoable here — `rollback` takes
-  the whole cycle instead — and the no-argument search skips those rather than
-  stopping on one.
+  the whole cycle instead — and the no-argument search *finds* those rather than
+  stepping over them, so a bare `undo` after a consolidation is answered by a
+  refusal naming the cycle instead of by silently reversing an older write.
+  **A version review comes back whole on both halves.** Undoing an `accept`
+  restores the node *and* puts the proposal back to `proposed` (reported as
+  `restored_version`), so it is a queue item again rather than a row stuck on
+  `applied` over content that has gone back; a `reject` is itself reversible, so
+  a rejection made by mistake is one command away from being reviewable again.
 - `accept <id>` — Accept a proposed node, edge, or update (proposed → active). Human only.
 - `reject <id> --reason` — Reject a proposed node, edge, or update (proposed → archived). Human only.
 - `archive <id>` — Archive an active node or edge (active → archived).
@@ -219,7 +225,9 @@ including every parameter.
   rather than only the ones in the same process.
 - `rollback <cycle-id>` — Take a whole cycle back, all of it or none of it.
   `--dry-run` reports what would be reversed and what stands in the way.
-  Human-only.
+  Human-only. A review the cycle performed is part of "the whole of it":
+  `restored_versions` names the proposals put back to `proposed`, and a cycle
+  that did nothing but reject is a cycle with something to take back.
 - `merge-nodes <ids…> --into <id>` — Merge nodes into a survivor. Soft and
   reversible: nothing is destroyed.
 - `retype <ids…> --type <t>` — Change nodes' type. The one sanctioned exception

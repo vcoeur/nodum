@@ -7,7 +7,7 @@ import math
 
 import pytest
 
-from nodum import db, embeddings, service
+from nodum import db, embeddings, llm, service
 
 
 @pytest.fixture(autouse=True)
@@ -85,3 +85,20 @@ def fake_embedder():
     provider = HashEmbedder()
     embeddings.set_provider(provider)
     return provider
+
+
+@pytest.fixture(autouse=True)
+def _no_llm_provider():
+    """Force the LLM provider unavailable unless a test opts in.
+
+    The same posture ``_no_embedding_provider`` holds, for a sharper reason: an
+    embedding provider would only download a model, while an LLM provider would
+    send the suite's prompts to whatever ``NODUM_LLM_BASE_URL`` points at — a
+    developer's local ollama, or a paid API. The default here is the
+    graceful-degradation path; a test that needs a completion injects a fake
+    through ``llm.set_provider``, and no test ever asserts on real model output
+    (temperature-0 determinism is a property of one backend, not a contract).
+    """
+    llm.set_provider(None, reason="test default: no LLM provider")
+    yield
+    llm.reset_provider()

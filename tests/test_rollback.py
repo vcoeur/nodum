@@ -14,7 +14,9 @@ which re-applies the original.
 
 from __future__ import annotations
 
+import inspect
 import json
+import re
 
 import pytest
 from helpers import agent, owner
@@ -814,6 +816,278 @@ def test_a_rollback_adds_to_a_nodes_history_rather_than_erasing_it(fresh_db):
     ]
     assert len(history) == len(after_retype) + 1
     assert history[-1].event_seq == _seq_of("node.rollback", row_id=node.id)
+
+
+# ── A version review comes back too (decisions V1/V2) ────────────────────────
+#
+# A review moves two rows from one decision and only one of them is a graph
+# record, which is how both halves ended up outside the reversal by two
+# different mechanisms: an accept's flip of `versions.state` to `applied` rode
+# on no event at all, and a reject's `version.reject` — which does carry the
+# rows — was skipped as an audit record. The tests below compare **every table
+# in the file**, because the shape being tested is a row nobody thought to look
+# at.
+
+#: Tables a rollback appends to by construction, so no two moments of them
+#: compare whole: the append-only log, the journal (a rollback is a cycle of its
+#: own), and `versions` — history, which a reversal adds a snapshot to rather
+#: than rewriting (see the section above).
+_APPENDED_TO = {"events", "cycles", "versions"}
+
+
+def _every_table():
+    """Every row of every ordinary table, enumerated from `sqlite_master`.
+
+    Not from a list of table names. `GRAPH_TABLES` names three, and a version
+    row is exactly the kind of thing a named list leaves out — which is how the
+    hole these tests close survived a suite that already compared "the graph"
+    before and after a rollback. Derived indexes (`node_fts*`, `node_vec*`) are
+    out because they are a projector's business and are rebuilt from the log,
+    and `sqlite_*` is SQLite's own bookkeeping.
+    """
+    conn = db.connect()
+    try:
+        names = [
+            row["name"]
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+            if not row["name"].startswith(("node_fts", "node_vec", "sqlite_"))
+        ]
+        return {
+            name: sorted(
+                (dict(row) for row in conn.execute(f"SELECT * FROM {name}")),
+                key=lambda row: json.dumps(row, sort_keys=True, default=str),
+            )
+            for name in sorted(names)
+        }
+    finally:
+        conn.close()
+
+
+def _assert_every_row_came_back(before, after):
+    """Every table identical, and every history row that existed still exact.
+
+    The two guards are the point of the helper as much as the comparison is: a
+    "compares every table" that enumerated nothing, or a history loop over an
+    empty list, would pass on any graph at all. Both are the shape this project
+    has shipped four times — an assertion about a universal it does not check.
+    """
+    assert {"nodes", "edges", "versions", "merge_redirects", "grants", "agents"} <= set(before), (
+        "the comparison is not reading the tables it claims to"
+    )
+    assert before["versions"], "no version rows to check: the fixture staged nothing"
+    assert set(before) == set(after), "a table appeared or vanished"
+    for table in sorted(before):
+        if table not in _APPENDED_TO:
+            assert after[table] == before[table], f"{table} did not come back"
+    for row in before["versions"]:
+        assert row in after["versions"], f"versions row {row['id']} did not come back: {row}"
+
+
+def _proposal(node_id, *, content="a second thought"):
+    """An agent's proposed update to a node, as the pending `versions` row."""
+    service.update_node(node_id, content=content, principal=agent("proposer"))
+    return next(
+        version
+        for version in service.history(node_id, principal=owner())
+        if version.state == "proposed"
+    )
+
+
+def _version_state(version_id):
+    """One version row's state, read past every filter."""
+    conn = db.connect()
+    try:
+        row = conn.execute("SELECT state FROM versions WHERE id = ?", (version_id,)).fetchone()
+        return None if row is None else row["state"]
+    finally:
+        conn.close()
+
+
+def _reviewed_in_a_cycle(version_id, action):
+    """Review one proposal inside a closed cycle, as the gardener; return the id."""
+    cycle = service.open_cycle(trigger="manual", principal=owner())
+    with service.in_cycle(cycle.id):
+        service.transition(str(version_id), action, principal=auth.internal_principal())
+    service.close_cycle(cycle.id, status="completed", report={}, principal=owner())
+    return cycle.id
+
+
+def test_rolling_back_an_accepted_proposal_puts_the_proposal_back(fresh_db):
+    """The half note 03 recorded: state changed outside the log, again.
+
+    Accepting emits an ordinary `node.update`, which reverses correctly — and
+    flips `versions.state` to `applied` through no event of its own, so the
+    version's own state used to survive the rollback of the node change it
+    caused. That is not a cosmetic leftover: a version leaves `proposed` exactly
+    once, so a proposal left `applied` over a node whose content came back can
+    never be accepted or rejected again.
+    """
+    node = _node("Alpha", content="first")
+    version = _proposal(node.id)
+    before = _every_table()
+
+    cycle_id = _reviewed_in_a_cycle(version.id, "accept")
+    assert service.get_node(node.id, principal=owner()).content == "a second thought"
+    assert _version_state(version.id) == "applied"
+
+    result = service.rollback_cycle(cycle_id, principal=owner())
+
+    assert service.get_node(node.id, principal=owner()).content == "first"
+    assert _version_state(version.id) == "proposed"
+    assert result.restored_versions == [version.id]
+    _assert_every_row_came_back(before, _every_table())
+    # And the proposal is a proposal again rather than a row wearing the word:
+    # it is back in the queue, and accepting it a second time works.
+    queued = service.list_proposals(kind="update", principal=owner())
+    assert [item.version.id for item in queued] == [version.id]
+    service.transition(str(version.id), "accept", principal=owner())
+    assert service.get_node(node.id, principal=owner()).content == "a second thought"
+
+
+def test_rolling_back_a_rejected_proposal_puts_the_proposal_back(fresh_db):
+    """The half note 03 missed: an event nothing was reading.
+
+    `version.reject` carries the version rows as `before`/`after` — a proper
+    event — but `version.` was in neither reversal verb's set, so the rollback
+    plan filed it with `asset.download` as an audit record with no row behind
+    it. A cycle that did nothing but reject was therefore a cycle that "wrote no
+    graph events", and the refusal said so.
+    """
+    node = _node("Alpha", content="first")
+    version = _proposal(node.id)
+    before = _every_table()
+
+    cycle_id = _reviewed_in_a_cycle(version.id, "reject")
+    assert _version_state(version.id) == "archived"
+
+    result = service.rollback_cycle(cycle_id, principal=owner())
+
+    assert _version_state(version.id) == "proposed"
+    assert result.restored_versions == [version.id]
+    assert result.skipped_events == [], "the reject is still being read as an audit record"
+    _assert_every_row_came_back(before, _every_table())
+    queued = service.list_proposals(kind="update", principal=owner())
+    assert [item.version.id for item in queued] == [version.id]
+
+
+def test_a_version_review_is_re_applied_by_rolling_its_rollback_back(fresh_db):
+    """The involution, at the depth this file has already been wrong at twice.
+
+    The version's move is recorded on the reversal too, mirrored, so each hop
+    flips it. Clearing it one way only would be right at depth 1 and wrong from
+    depth 2 — which is exactly the shape of the `merge_redirects` and
+    `rolled_back` bugs this suite already carries tests for.
+    """
+    node = _node("Alpha", content="first")
+    version = _proposal(node.id)
+    accepted_cycle = _reviewed_in_a_cycle(version.id, "accept")
+    accepted = _every_table()
+
+    first = service.rollback_cycle(accepted_cycle, principal=owner())
+    assert _version_state(version.id) == "proposed"
+
+    second = service.rollback_cycle(first.rollback_cycle_id, principal=owner())
+    assert _version_state(version.id) == "applied", "the accept was not re-applied"
+    assert service.get_node(node.id, principal=owner()).content == "a second thought"
+    _assert_every_row_came_back(accepted, _every_table())
+
+    third = service.rollback_cycle(second.rollback_cycle_id, principal=owner())
+    assert _version_state(version.id) == "proposed"
+    assert third.restored_versions == [version.id]
+    assert service.get_node(node.id, principal=owner()).content == "first"
+
+
+def test_a_proposal_staged_and_reviewed_inside_one_cycle_comes_back(fresh_db):
+    """The node's create and the review of a proposal on it, in one reversal.
+
+    The interaction the two tests above do not reach: the version row is deleted
+    by the create's reversal (a foreign key forces it) *after* the accept's
+    reversal has already put it back to `proposed`, and rolling the rollback
+    back has to re-insert it and then move it to `applied` again. It is also the
+    fixture that caught a prefix match: `version.propose` lives in the same
+    namespace as `version.reject` and records the *creation* of a version rather
+    than a move of one, so sweeping the namespace into the plan died here on
+    `KeyError: 'after'`.
+    """
+    cycle = service.open_cycle(trigger="manual", principal=owner())
+    with service.in_cycle(cycle.id):
+        node = service.create_node(type="claim", title="Made", content="first", principal=owner())
+        version = _proposal(node.id)
+        service.transition(str(version.id), "accept", principal=auth.internal_principal())
+    service.close_cycle(cycle.id, status="completed", report={}, principal=owner())
+    reviewed = _every_table()
+    assert service.get_node(node.id, principal=owner()).content == "a second thought"
+
+    first = service.rollback_cycle(cycle.id, principal=owner())
+
+    assert first.deleted_nodes == [node.id]
+    assert first.restored_versions == [version.id]
+    assert _version_state(version.id) is None, "the node's versions went with it"
+    with pytest.raises(NodeNotFound):
+        service.get_node(node.id, principal=owner())
+
+    service.rollback_cycle(first.rollback_cycle_id, principal=owner())
+
+    assert service.get_node(node.id, principal=owner()).content == "a second thought"
+    assert _version_state(version.id) == "applied"
+    _assert_every_row_came_back(reviewed, _every_table())
+
+
+def test_a_proposals_own_event_is_not_swept_into_a_reversal_by_its_namespace(fresh_db):
+    """`version.` is three ops with three payload shapes, so it is not a filter.
+
+    `version.propose` records the *creation* of a version row: its `before` is
+    the **node** row, it carries no `after` at all, and it does not name the
+    version it made (the event is emitted before the insert so the row can point
+    back at it). Matching the namespace instead of naming the ops put it in both
+    reversal verbs. The enumeration is read out of the module so a fourth
+    `version.` op is a decision somebody has to make rather than one a prefix
+    makes for them.
+    """
+    emitted = set(re.findall(r'"(version\.[a-z_]+)"', inspect.getsource(service)))
+    assert emitted == {"version.propose", "version.reject", "version.rollback"}, (
+        "a new `version.` op: decide whether a reversal can read its payload"
+    )
+    assert {op for op in emitted if service._is_reversible(op)} == set(
+        service._REVERSIBLE_VERSION_OPS
+    )
+
+    # And the behaviour under it. A proposal is stepped over by the bare search
+    # and refused when named, both exactly as before this change — reversing a
+    # proposal is a different operation with a different payload, and rejecting
+    # it is the one that exists.
+    node = _node("Alpha", content="first")
+    _proposal(node.id)
+    with pytest.raises(ValueError, match="not a graph event"):
+        service.undo(_seq_of("version.propose"), principal=owner())
+    assert service.undo(principal=owner()).undone_op == "node.create"
+
+
+def test_a_rejects_reversal_is_outside_the_projector_namespaces_on_purpose(fresh_db):
+    """`version.rollback` changes no node text, so no projector should read it.
+
+    The mirror of the rule `ROLLBACK_OPS` states for the other two kinds: a
+    curative op that changes a node has to be `node.*` or the search index
+    desynchronises, and an op that changes *only* a `versions` row has to stay
+    out of it or the index reprojects a node nothing touched.
+    """
+    node = _node("Alpha", content="first")
+    version = _proposal(node.id)
+    cycle_id = _reviewed_in_a_cycle(version.id, "reject")
+    projectors.run_projectors()
+    indexed = _fts_rows()
+    assert indexed, "nothing is indexed, so an unchanged index would prove nothing"
+
+    result = service.rollback_cycle(cycle_id, principal=owner())
+
+    ops = {event.op for event in _events(cycle_id=result.rollback_cycle_id)}
+    assert ops == {"version.rollback", "cycle.rollback"}
+    assert not any(op.startswith(("node.", "edge.")) for op in ops)
+    # The claim, not just the op name: replaying the reversal changes no index
+    # row, because no node's text moved.
+    projectors.run_projectors()
+    assert _fts_rows() == indexed
+    assert service.get_node(node.id, principal=owner()).content == "first"
 
 
 # ── The projectors follow a rollback (the highest-risk detail) ────────────────

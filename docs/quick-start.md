@@ -77,6 +77,14 @@ Hybrid search fuses BM25 and vector results by reciprocal rank fusion, then
 re-ranks by graph expansion. Without the `embeddings` extra installed this
 degrades to BM25 alone rather than failing.
 
+You can ask a question rather than name keywords — `nodum search "how does
+compaction let a topic work as a state store?"`. The keyword half does not
+require every word: a node is kept when the query terms it carries are worth
+at least half the query's weight, where a rare word counts for more than a
+common one and a word the graph has never seen counts for nothing. So a
+question's *"how does … work as a"* costs nothing, and a typo does not empty
+the result.
+
 Check what the derived indexes know:
 
 ```sh

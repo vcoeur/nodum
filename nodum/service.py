@@ -1762,6 +1762,13 @@ def _transition_version(
     reviewer owns every state change the accept causes (new ``mentions`` edges
     go live, dropped ones are archived), not the agent that proposed the text.
     Rejecting flips it to ``archived`` and emits ``version.reject``.
+
+    **Both spellings record the version row's own move**, because a review
+    changes two rows and only one of them is a graph record. The accept carries
+    it as :data:`VERSION_STATE_KEY` inside the ``node.update`` payload (the
+    ``merge_redirects`` shape: state no event of its own covers rides on the
+    event that caused it), and the reject's own before/after *is* that move. A
+    reversal reads both — see :func:`_restore_version_state`.
     """
     version_id = before["id"]
     if action == "accept":
@@ -1792,6 +1799,10 @@ def _transition_version(
                 "applied_version_id": version_id,
                 "applied_fields": fields,
                 "proposed_event_seq": before["event_seq"],
+                VERSION_STATE_KEY: {
+                    "before": before,
+                    "after": _row_dict(_get_version_row(conn, version_id)),
+                },
             },
         )
         if "content" in fields:
@@ -2619,6 +2630,82 @@ def _restore_row(
     return before
 
 
+#: Payload key carrying the **version row's own** before/after on the event
+#: that moved it. A review changes two rows from one decision: the node, which
+#: is a graph record with an event of its own, and the ``versions`` row's
+#: ``state``, which is not. Accepting therefore hangs the second off the first,
+#: exactly as a merge hangs its ``merge_redirects`` row off the tombstone's
+#: ``node.merge`` — *state changed outside the event log is state a reversal
+#: cannot see*, and this is the fourth row in this file to learn it.
+VERSION_STATE_KEY = "version_state"
+
+#: Kinds a reversal can put a row back for, and the table each lives in.
+#: ``version`` is here and deliberately **not** in :data:`_TABLE_KIND`: a
+#: version row is reversible but carries no conflict of its own, because
+#: :func:`_transition_row` is the only writer of ``versions.state`` and it moves
+#: a row out of ``proposed`` exactly once — there is no second write for a
+#: rollback to collide with.
+_REVERSIBLE_TABLES = {"node": "nodes", "edge": "edges", "version": "versions"}
+
+#: The ``version.`` ops a reversal can read, named rather than matched by
+#: prefix. **The namespace is not the predicate; the payload shape is.**
+#: ``version.propose`` is in the same namespace and is not here: it records the
+#: *creation* of a version row rather than a move of one, its ``before`` is the
+#: **node** row, it carries no ``after`` at all, and it does not name the
+#: version it made — the event is emitted before the insert so the row can point
+#: back at it. A prefix match over the namespace swept it into both reversal
+#: verbs, where a cycle that staged a proposal and reviewed it in the same run
+#: died on ``KeyError: 'after'``. Reversing a *proposal* would be a different
+#: operation with a different payload; rejecting it is the one that exists.
+_REVERSIBLE_VERSION_OPS = ("version.reject", "version.rollback")
+
+
+def _is_reversible(op: str) -> bool:
+    """Does this event record a row move a reversal can write back?
+
+    The one question :func:`undo` and :func:`_rollback_plan` both have to answer
+    the same way, so they ask it here rather than each spelling out a filter.
+    """
+    kind = op.split(".", 1)[0]
+    if kind == "version":
+        return op in _REVERSIBLE_VERSION_OPS
+    return kind in _REVERSIBLE_TABLES
+
+
+def _restore_version_state(
+    conn: sqlite3.Connection,
+    payload: dict[str, Any],
+    principal: Principal,
+    context: str,
+) -> dict[str, Any] | None:
+    """Put a version row back to where a payload's :data:`VERSION_STATE_KEY` says it was.
+
+    The accept half of the version-review reversal. Reversing the
+    ``node.update`` an accept emits restores the node and would leave the
+    proposal marked ``applied`` — permanently, since a version only ever leaves
+    ``proposed`` once, so nothing could accept or reject it again.
+
+    Args:
+        conn: The open connection (the caller commits).
+        payload: The event payload being reversed. An event that moved no
+            version simply lacks the key.
+        principal: Passed through to :func:`_restore_row`.
+        context: The refusal's leading phrase.
+
+    Returns:
+        The **mirrored** record for the reversal's own payload (``before`` and
+        ``after`` swapped), or ``None`` when the event moved no version. The
+        mirror is what makes reversing a reversal re-apply the accept, at every
+        depth, without a second inverse code path — the rule the rest of this
+        module already holds for node and edge rows.
+    """
+    recorded = payload.get(VERSION_STATE_KEY)
+    if recorded is None:
+        return None
+    _restore_row(conn, "version", "versions", recorded["before"], principal, context)
+    return {"before": recorded["after"], "after": recorded["before"]}
+
+
 def _reinsert_rows(conn: sqlite3.Connection, rows: list[dict[str, Any]]) -> None:
     """Put back rows a reversal removed, in foreign-key order.
 
@@ -2646,8 +2733,18 @@ def _reinsert_rows(conn: sqlite3.Connection, rows: list[dict[str, Any]]) -> None
         )
 
 
-#: What :func:`undo` can reverse: a graph write, and not its own reversal.
-_UNDOABLE_OPS = "op != 'undo' AND (op LIKE 'node.%' OR op LIKE 'edge.%')"
+#: What :func:`undo` can reverse, as SQL — :func:`_is_reversible`'s predicate in
+#: the form the newest-first search needs, and not its own reversal. The version
+#: ops are **listed**, never `LIKE 'version.%'`: `version.propose` is in that
+#: namespace and reverses nothing (see :data:`_REVERSIBLE_VERSION_OPS`), so a
+#: prefix here would make a bare ``undo`` after an agent's proposal stop on an
+#: event it then cannot reverse. The names are module constants, interpolated
+#: the way the table names in :func:`_reinsert_rows` are.
+_UNDOABLE_OPS = (
+    "op != 'undo' AND (op LIKE 'node.%' OR op LIKE 'edge.%' OR op IN ("
+    + ", ".join(f"'{op}'" for op in _REVERSIBLE_VERSION_OPS)
+    + "))"
+)
 
 
 def _latest_undoable(conn: sqlite3.Connection, reversed_seqs: set[int]) -> sqlite3.Row | None:
@@ -2718,9 +2815,18 @@ def undo(
     by writing the ``before`` state back. Undoing a node restore re-runs
     wikilink materialisation so the graph stays consistent with the restored
     content. The reversal itself is appended as an ``undo`` event; undo
-    events cannot themselves be undone. Only graph events (``node.*`` /
-    ``edge.*``) are reversible — audited non-graph events
-    are skipped by default and refused when named explicitly.
+    events cannot themselves be undone. Only events naming a row a reversal can
+    put back (``node.*``, ``edge.*``, ``version.*`` — :data:`_REVERSIBLE_TABLES`)
+    are reversible; audited non-graph events are skipped by default and refused
+    when named explicitly.
+
+    **A version review is reversible on both halves.** Undoing the
+    ``node.update`` an accept emits also puts the proposal back to ``proposed``
+    (:func:`_restore_version_state`), and a ``version.reject`` is reversed the
+    way any other recorded row move is. Without the first, an undo restored the
+    node and left the proposal marked ``applied`` with no way to accept or
+    reject it again; without the second, the rejection was the one review
+    outcome no verb in this file could take back.
 
     Undo is the **human tier**: restoring an event's payload writes arbitrary
     prior state back, ``state = 'active'`` included, so an agent allowed to
@@ -2791,7 +2897,7 @@ def undo(
         if event["op"] == "undo":
             raise ValueError(f"event {event['seq']} is an undo event and cannot be undone")
         kind = event["op"].split(".", 1)[0]
-        if kind not in ("node", "edge"):
+        if not _is_reversible(event["op"]):
             raise ValueError(
                 f"event {event['seq']} ({event['op']}) is not a graph event and cannot be undone"
             )
@@ -2801,7 +2907,7 @@ def undo(
             raise ValueError(f"event {event['seq']} has already been undone")
 
         payload = json.loads(event["payload"])
-        table = "nodes" if kind == "node" else "edges"
+        table = _REVERSIBLE_TABLES[kind]
         before, after = payload["before"], payload["after"]
         context = f"cannot undo event {event['seq']} ({event['op']})"
         deleted: list[dict[str, Any]] = []
@@ -2813,17 +2919,17 @@ def undo(
             restored = None
         else:
             restored = _restore_row(conn, kind, table, before, principal, context)
-        undo_seq = _emit(
-            conn,
-            actor,
-            "undo",
-            {
-                "reversed_seq": event["seq"],
-                "reversed_op": event["op"],
-                "restored": restored,
-                "deleted": deleted,
-            },
-        )
+        # An accept moved a version row too, recorded on this same event.
+        version_state = _restore_version_state(conn, payload, principal, context)
+        undo_payload: dict[str, Any] = {
+            "reversed_seq": event["seq"],
+            "reversed_op": event["op"],
+            "restored": restored,
+            "deleted": deleted,
+        }
+        if version_state is not None:
+            undo_payload[VERSION_STATE_KEY] = version_state
+        undo_seq = _emit(conn, actor, "undo", undo_payload)
         if restored is not None and kind == "node":
             _write_version(conn, restored, actor, undo_seq)
             _materialize_mentions(conn, restored, actor, store)
@@ -2833,6 +2939,7 @@ def undo(
             undone_op=event["op"],
             restored=restored,
             deleted=deleted,
+            restored_version=None if version_state is None else version_state["after"],
             undo_event_seq=undo_seq,
         )
     finally:
@@ -5501,21 +5608,32 @@ def _relink(
 # refuses cycle-stamped events, no new guard is needed to keep `undo` out of a
 # rollback's own writes.
 
-#: The op a rollback emits per row it reverses, by kind. They stay inside the
-#: `node.`/`edge.` namespaces for the same reason the curative ops do:
-#: :mod:`nodum.projectors` dispatches on ``op.startswith("node.")`` to reproject
-#: FTS and the embeddings, and an op outside it would leave the search index
-#: quietly describing a graph that no longer exists.
-ROLLBACK_OPS = {"node": "node.rollback", "edge": "edge.rollback"}
+#: The op a rollback emits per row it reverses, by kind. The first two stay
+#: inside the `node.`/`edge.` namespaces for the same reason the curative ops
+#: do: :mod:`nodum.projectors` dispatches on ``op.startswith("node.")`` to
+#: reproject FTS and the embeddings, and an op outside it would leave the search
+#: index quietly describing a graph that no longer exists. ``version.rollback``
+#: is outside it for the mirror of that reason — reversing a review decision
+#: moves a ``versions`` row and no node text, so a projector reading it would
+#: reindex a node nothing changed.
+ROLLBACK_OPS = {
+    "node": "node.rollback",
+    "edge": "edge.rollback",
+    "version": "version.rollback",
+}
 
 #: The rollback's own summary event. Deliberately *outside* the graph
 #: namespaces: it changes no row, so a projector reading it as one would index
 #: nothing, and :func:`undo` refuses it as the audit record it is.
 ROLLBACK_SUMMARY_OP = "cycle.rollback"
 
-#: Payload table names mapped to the kind of graph record they hold. Used to
-#: read an ``undo``'s reach out of its ``deleted`` list — `versions` rows are
-#: not graph records and carry no conflict of their own.
+#: Payload table names mapped to the kind of graph record they hold. This is the
+#: **conflict** map, not the reversal map (:data:`_REVERSIBLE_TABLES`): it is
+#: what reads an ``undo``'s reach out of its ``deleted`` list, and `versions`
+#: rows are absent because they carry no conflict of their own —
+#: :func:`_transition_row` is the only writer of ``versions.state`` and it moves
+#: a row out of ``proposed`` exactly once, so there is no later write for a
+#: rollback to collide with.
 _TABLE_KIND = {"nodes": "node", "edges": "edge"}
 
 #: How many conflicts a refusal spells out before summarising the rest. The
@@ -5682,16 +5800,15 @@ def _rollback_plan(conn: sqlite3.Connection, cycle_id: str) -> _RollbackPlan:
     ).fetchall():
         # Non-graph events a cycle happens to contain are audit records — an
         # `asset.download` says a URL was redeemed, and there is no row behind
-        # it to put back. The one shape this leaves uncovered is a **version
-        # review inside a cycle**: accepting a proposed version emits an
-        # ordinary `node.update` (reversed here like any other) but also flips
-        # `versions.state` to `applied` through no event of its own, and a
-        # `version.reject` is skipped here as the audit record it looks like —
-        # so the version's own state would survive the rollback of the node
-        # change it caused. Nothing in the curative tier reviews versions, so
-        # nothing reaches it today; a runner that starts accepting proposals
-        # inside a cycle has to close this first.
-        if row["op"].split(".", 1)[0] in _TABLE_KIND.values():
+        # it to put back. A **version review inside a cycle** is not one of
+        # them, and used to be read as one on both halves: the accept's
+        # `node.update` came through here like any other event while the
+        # `versions.state` flip it also made rode on no event at all, and the
+        # reject's `version.reject` — which does carry the version rows — was
+        # skipped as the audit record it looks like. Both are covered now: the
+        # accept records the move in its own payload (:data:`VERSION_STATE_KEY`)
+        # and `version.` joins the reversible kinds here.
+        if _is_reversible(row["op"]):
             events.append(_row_dict(row))
         else:
             skipped.append(int(row["seq"]))
@@ -5980,12 +6097,22 @@ def _apply_rollback(
     The reversal payloads are the mirror image of the events they reverse
     (``before`` and ``after`` swapped), which is what makes rolling a rollback
     back re-apply the original rather than needing a second, inverse code path.
+    That holds for the ``versions`` row a review moves too: an accept's move
+    rides on the ``node.update`` it caused (:data:`VERSION_STATE_KEY`) and is
+    mirrored onto the ``node.rollback``, while a reject is a ``version.reject``
+    reversed like any other recorded row move.
     """
     actor = principal.actor_string
     cycle_id = plan.cycle["id"]
     reversed_events: list[int] = []
     restored_nodes: list[str] = []
     restored_edges: list[str] = []
+    restored_versions: list[int] = []
+    restored_by_kind: dict[str, list[Any]] = {
+        "node": restored_nodes,
+        "edge": restored_edges,
+        "version": restored_versions,
+    }
     deleted_nodes: list[str] = []
     deleted_edges: list[str] = []
     redirects_removed: list[str] = []
@@ -5993,7 +6120,7 @@ def _apply_rollback(
     for event in reversed(plan.events):
         payload = json.loads(event["payload"])
         kind = event["op"].split(".", 1)[0]
-        table = "nodes" if kind == "node" else "edges"
+        table = _REVERSIBLE_TABLES[kind]
         context = f"cannot roll back event {event['seq']} ({event['op']})"
         before, after = payload["before"], payload["after"]
         removed: list[dict[str, Any]] = []
@@ -6037,12 +6164,20 @@ def _apply_rollback(
             if not payload.get("deleted"):
                 _reinsert_rows(conn, [{"table": table, "row": before}])
             reversal = {"before": None, "after": before}
-            (restored_nodes if kind == "node" else restored_edges).append(before["id"])
+            restored_by_kind[kind].append(before["id"])
             restored = before
         else:
             restored = _restore_row(conn, kind, table, before, principal, context)
             reversal = {"before": after, "after": before}
-            (restored_nodes if kind == "node" else restored_edges).append(before["id"])
+            restored_by_kind[kind].append(before["id"])
+
+        # An accept moved a version row on top of the node it rewrote, recorded
+        # on this same event. The mirror goes on the reversal so that rolling
+        # *this* back re-applies the accept — the involution the rest of these
+        # payloads already hold, at every depth.
+        version_state = _restore_version_state(conn, payload, principal, context)
+        if version_state is not None:
+            restored_versions.append(int(version_state["after"]["id"]))
 
         reversal.update(
             {
@@ -6051,6 +6186,8 @@ def _apply_rollback(
                 "rolled_back_cycle": cycle_id,
             }
         )
+        if version_state is not None:
+            reversal[VERSION_STATE_KEY] = version_state
         if removed:
             reversal["deleted"] = removed
         seq = _emit(conn, actor, ROLLBACK_OPS[kind], reversal, cycle_id=rollback_cycle_id)
@@ -6103,6 +6240,7 @@ def _apply_rollback(
         skipped_events=plan.skipped,
         restored_nodes=restored_nodes,
         restored_edges=restored_edges,
+        restored_versions=restored_versions,
         deleted_nodes=deleted_nodes,
         deleted_edges=deleted_edges,
         redirects_removed=redirects_removed,

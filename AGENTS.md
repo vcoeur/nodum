@@ -104,12 +104,18 @@ proposals**, which moved to Phase 5b deliberately rather than being forgotten �
 deciding that a sentence *is* a claim is a judgement call and belongs to the
 research agent in design §3, and splitting prose into sentences would fill the
 review queue with noise instead of knowledge, so ingestion proposes sources and
-structure and stops; the **LLM half of the gardener** (Phase 5b) — props
-migration on a retype, deciding that an untouched claim has gone *stale*
-rather than merely old, the abstraction job, and the two Q12 metrics that need
-it — design Constraint 4 keeps the model out of validation, the state machine
-and the projectors, and every line of `nodum.consolidate` runs on a machine
-with no model present; **Markdown Mirror** and any whole-graph export (the only
+structure and stops; the **LLM *jobs* of the gardener** — props migration on a
+retype, deciding that an untouched claim has gone *stale* rather than merely
+old, the abstraction job, learned queue curation, and the two Q12 metrics that
+need it — which Phase 5b-ii lands on top of 5b-i's runtime (`nodum.llm` +
+`nodum.agent`, below): the provider, the accounting, the budgets and the kill
+switch ship first, so the thing being observed arrives after the observability
+and can be judged rather than trusted. Design Constraint 4 is unchanged and now
+structurally enforced — the model stays out of validation, the state machine
+and the projectors (`tests/test_llm.py` proves those modules cannot reach
+`nodum.llm` at all), and every line of `nodum.consolidate` still runs on a
+machine with no model present. Also not built: **Markdown Mirror** and any
+whole-graph export (the only
 export that exists is the thin per-node snapshot,
 `GET /api/export/node/{id}?depth=`, which is `get_neighborhood` with a
 `content-disposition` header — not a format, not a backup). Each lands as its
@@ -347,6 +353,54 @@ commands on a saved node for exactly this reason.
   an event; and carrying `previous_status` as well, which `rolled_back_by`
   cannot — a `failed` cycle put back into force is `failed` again, and a
   fallback that only knew *which* cycle would have had to guess `completed`.
+  **A version review is the fourth instance of the same class, and it was
+  two-sided.** A review changes two rows from one decision and only one of them
+  is a graph record, so both halves sat outside both reversal verbs by two
+  different mechanisms. Accepting emitted an ordinary `node.update`, which
+  reversed correctly, and *also* flipped `versions.state` to `applied` through
+  no event of its own — the `merge_redirects` shape exactly. Rejecting did emit
+  `version.reject` carrying the version rows, and that event was skipped by
+  `_rollback_plan` (its op prefix was not in `_TABLE_KIND`) and excluded from
+  `undo` (`_UNDOABLE_OPS` matched `node.%`/`edge.%` only) — so the one review
+  outcome that *had* recorded itself properly was the one nothing could read.
+  Neither was hypothetical: `_transition_row` gates a version through
+  `store.require_review`, which passes for an `edit`-granted agent, and `0014`
+  gives the gardener `edit` on `main` — the authority is live in the shipped
+  release and only the call site is missing. And the accept half needed no agent
+  at all: a human accepting their own queue item and pressing `undo` reached it,
+  leaving the proposal marked `applied` over content that had gone back, which
+  strands it for good because a version leaves `proposed` exactly once. The fix
+  is the one `merge_redirects` already established rather than a fifth
+  mechanism: the accept's `node.update` payload carries the version row's own
+  before/after under `VERSION_STATE_KEY`, and `_restore_version_state` writes
+  the recorded row back and returns the **mirrored** record for the reversal's
+  own payload — so rolling a rollback back re-applies the accept, at every
+  depth, with no inverse code path. The reject needed no new payload: `version.`
+  simply joins the reversible kinds (`_REVERSIBLE_TABLES`, which is *not*
+  `_TABLE_KIND` — a version row is reversible but carries no conflict, since
+  `_transition_row` is its only writer and moves it out of `proposed` once), so
+  the rollback plan reverses it and emits `version.rollback`. That op is
+  deliberately **outside** the `node.`/`edge.` namespaces the projectors
+  dispatch on — the mirror of the rule the curative ops follow: an op that
+  changes node text must be `node.*` or the index desynchronises, and an op that
+  changes *only* a `versions` row must stay out of it or the index reprojects a
+  node nothing touched. `undo` reaches both halves too, and `version.%` in
+  `_UNDOABLE_OPS` fixed a second thing on the way: a bare `nodum undo` after a
+  rejection used to reach *past* it to the node's own create — a proposal emits
+  `version.propose`, so the create was the last `node.` event — and delete the
+  node, taking the rejected proposal's row with it. `RollbackOut.restored_versions`
+  and `UndoResult.restored_version` are the reported half; a reversal that moved
+  a row its own result did not mention is the smell this whole class is made of.
+  Both are additive with defaults, so no adapter had to change — and the web
+  journal's rollback toast (`rollbackOutcome`) still counts nodes and edges
+  only, which understates a review-only rollback rather than misstating it: it
+  leads with "N events reversed", which stays true. Itemising versions there is
+  the follow-up, and it is a `web/` change rather than a service one.
+  **Events written before this fix are not covered**, deliberately: the recorded
+  move is what the reversal reads, an accept that predates the key recorded
+  none, and a branch inferring one from `applied_version_id` would be a second
+  path no test can reach honestly. A pre-fix accept-then-reverse leaves its
+  version on `applied`; putting it back is a `versions` UPDATE, not a mechanism.
   Finally, the **landing seam**: `Store.cap_landing` and a
   keyword-only `landing=` on `create_edge`/`propose_edges` let a writer file
   below its own grant (§8.3 — a grant is a **ceiling, not a mandate**). It only
@@ -784,6 +838,117 @@ commands on a saved node for exactly this reason.
   `NODUM_EMBED_MODEL` overrides the model name (a different dimensionality
   needs a new migration — the vec0 table is fixed at 384). Tests inject a
   deterministic hashing fake via `embeddings.set_provider`.
+- **`nodum.llm`** — the LLM provider seam (Phase 5b, design P1), shaped
+  deliberately like `nodum.embeddings`: a `Protocol`, a cached
+  `get_provider()` → provider or `None`, an `unavailable_reason()`, and a
+  `set_provider()` test seam — because that is the seam every adapter here
+  already knows how to be absent through, and a second shape would mean two
+  ways to be offline. **One class covers both halves**
+  (`OpenAICompatProvider`): ollama serves an OpenAI-compatible
+  `/v1/chat/completions` that honours `response_format: {type: json_schema}`
+  and returns `usage` plus `finish_reason` — verified by driving it — so the
+  local default (`http://localhost:11434/v1`, no key) and a remote API are the
+  same wire. ollama's richer native `/api/chat` was rejected as a second code
+  path only the local half can exercise. It deliberately abstracts over
+  **nothing else**: no streaming, no tool calling, no embeddings, no retries
+  (the retry policy belongs where the budget is), no prompt templates (a
+  prompt change would become a provider change), and no sampling —
+  `TEMPERATURE` is pinned at 0, and *nothing may depend on the determinism
+  that produced locally*, which is a property of one backend. **There is no
+  module-level `chat`**: every provider call goes through `nodum.agent` (P3),
+  and a second door would be a second place with its own accounting.
+  Configuration is `NODUM_LLM_MODEL` (**unset means no provider** — there is no
+  guessed default), `NODUM_LLM_BASE_URL`, `NODUM_LLM_API_KEY`,
+  `NODUM_LLM_CONTEXT_TOKENS` (4096 by default, the measured local window).
+  **An over-long prompt is refused before the call, and that is the whole
+  point.** Measured: 16 000 characters report 2 932 prompt tokens while 64 000
+  and 70 000 both report **4 096** — the window filled, the rest was dropped,
+  and nothing in the response says so. `finish_reason` describes the *output*
+  only, so it reads `stop` on a prompt truncated from 70 000 characters; the
+  sole signal is `prompt_tokens` at the ceiling, and it arrives after the call
+  is paid for. So `chat` counts first and raises `PromptTooLong` without
+  sending, and `Completion.context_filled` is the second line of defence for a
+  window an operator configured too high. **The estimate is UTF-8 bytes**,
+  because a byte-level BPE token decodes to at least one byte and that makes it
+  a *bound* rather than a heuristic; a `chars/4` estimate under-counts emoji by
+  twelve times and a run of accented Latin by four, and an under-count is the
+  one failure this may not have. The price is refusing about four times too
+  eagerly on English prose, which is the trade an over-refusal (visible,
+  itemisable) versus an under-refusal (an answer nobody can tell from a good
+  one) forces. **A token ceiling gives unparseable JSON, not a short object** —
+  measured `'{\n  "title": "Kafka'` at `finish_reason: "length"` — so a
+  `length` finish is no result. **A JSON schema fixes the envelope and nothing
+  else**: asked a question its context could not answer, under a schema, the
+  model returned `{"answer": "n0", "cited_ids": ["n0"], "answered": false}`.
+  Never read a schema-valid object as a true one; validating what the model
+  said against what was actually retrieved is the caller's job. Resolution
+  reads configuration and makes **no network call** — unlike the embedding
+  seam, whose construction loads a model — because "configured" and
+  "reachable" are different facts and a probe would cache one instant's answer
+  for the process. Design Constraint 4 is held structurally:
+  `tests/test_llm.py` walks the package's own import graph and asserts that
+  `nodum.service`, `nodum.projectors`, `nodum.store` and `nodum.migrations`
+  cannot reach this module **under any spelling** (aliased, relative,
+  `importlib.import_module`, an attribute chain) **or any number of hops**, and
+  that `nodum.agent` is the only module that imports it at all.
+- **`nodum.agent`** — the internal agent's runtime and the **one door to the
+  model** (design P3, A1–A3, B1–B4, K1–K3). `AgentRun.chat` takes a principal,
+  a job budget and a prompt version, and returns the text with the provenance a
+  write must record. **A peer client, like the runner**: it opens no
+  connection, imports no service private, and mints no principal — it receives
+  one. *Accounting* (A1): `GeneratedBy` = `{provider, model_id,
+  prompt_version}` goes on the **event**, because the log is already this
+  system's answer to who is answerable for a write; `actor` stays
+  `agent:builtin-gardener` (the gardener made the write, the model is *how* —
+  `agent:llama3.2:1b` would be an actor with no account and nothing to revoke);
+  cost goes on the **cycle report** under `report["llm"]`, because cost is a
+  property of the run. This is **not** `chunks.model_id`'s mechanism (A3):
+  embeddings are derived and a model change is `projector rebuild vec`, while
+  generated text cannot be regenerated by replaying the log — so do not later
+  "unify" them into a `model_id` column on `nodes`. `prompt_version` (A2) is a
+  short hash of the prompt template, because two cycles a month apart can name
+  the same model and differ only in the prompt. *Budgets* (B1/B2): **per-call ⊂
+  per-job ⊂ per-cycle**, the unit is tokens metered from `usage`, and an
+  **independent wall-clock ceiling** sits beside it because tokens do not bound
+  a night — 2 395 prompt tokens cost 47 s locally. Charging a job charges the
+  cycle and the remainder is the minimum down the chain; a job budget shares
+  the run's clock, so no ceiling is ever infinite (`cycles.report` is
+  `json.dumps`, which writes a bare `Infinity` that is not JSON).
+  `NODUM_LLM_CYCLE_BUDGET` is **0 by default — the LLM jobs do not run** (K2
+  level 1); `NODUM_LLM_REQUEST_BUDGET` defaults to *on*, because "off by
+  default" exists to stop an unattended process spending the human's night and
+  a human pressing a button is not that. *At a ceiling* (B3): **refuse and
+  itemise, never truncate** — the call's worst case (the over-counted estimate
+  plus the whole output reservation) is measured before anything is sent, and a
+  refusal names the item it skipped. **Exhaustion is deliberately a different
+  report shape from 5a's degraded path**: a provider absence is `available:
+  false` + `unavailable_reason` (a stable fact about this install, and 5a's
+  `notes` vocabulary), exhaustion is `exhausted: true` + an itemised `skipped`
+  (a fact about *this* run, false again tomorrow) — `LLMReport` has no `notes`
+  field at all, and a test pins that. `exhausted` means *a spending ceiling
+  stopped work*, not that a counter reached zero: a budget with 10 tokens left
+  can afford nothing, and a flag read off the counter would report a truncated
+  night as a complete one. A budget that was never turned on is refused as
+  `kind="off"` and is **not** reported exhausted. A failed call — `length`
+  finish or filled context — is charged, because the tokens were really spent;
+  a `PromptTooLong` costs nothing, because nothing was sent. *The kill switch*
+  (K1–K3): a `cycles.stop_requested` row, **not** a reuse of `abandon_cycle`
+  (that verb is a *repair* — a human declaring somebody else's dead process
+  dead — while a stop is an instruction a live run obeys, and a journal that
+  could not tell them apart would fail the human reading a `failed` cycle at
+  09:00), checked immediately before every provider call here and between jobs
+  and items by the runner, read fresh every time because a cached answer is a
+  switch that cannot be hit after the run starts. **The column and its service
+  read are migration `0015`'s, not this wave's**: `cycle_stop_check` gates on
+  `service.stop_requested` existing, and until it does `stop_switch_available()`
+  is false and the report says `stop_switch: "pending…"` — because "no stop was
+  requested" and "no stop *could* be requested" are different facts. See
+  `agent.cycle_stop_check`'s docstring for the exact four things `0015` must
+  add. Configuration: `NODUM_LLM_CYCLE_BUDGET`, `NODUM_LLM_CYCLE_SECONDS`,
+  `NODUM_LLM_REQUEST_BUDGET`, `NODUM_LLM_REQUEST_SECONDS`,
+  `NODUM_LLM_CALL_TIMEOUT`, `NODUM_LLM_MAX_OUTPUT_TOKENS` — each unparseable
+  value falls back to its default rather than refusing to boot (the scheduler's
+  precedent), and the cycle fallback is 0, so a typo cannot authorise spending.
 - **`nodum.assets`** — content-addressed binaries and their derived
   renditions (design §5.5/§5.7). Reads take a principal, and **an asset is as
   reachable as its describing nodes**: a principal may read an asset iff it can
@@ -1021,6 +1186,65 @@ commands on a saved node for exactly this reason.
   builds its own `SearchHit`); adding a fourth means carrying it there too.
   With no embedding provider the vector signal is skipped —
   search silently degrades to BM25 + graph.
+  **The keyword half matches on a quorum, not a conjunction** (`_compile_match`,
+  Phase 5b): a node is a candidate when the query terms it carries are worth at
+  least **half** the query's total inverse-document-frequency weight. Weighting
+  by IDF is the whole of why the rule works rather than being a knob — a term
+  discriminates in proportion to its rarity, so a document qualifies by carrying
+  enough of the query's *discriminating power* rather than enough of its
+  *words*, and the eight function words of a twelve-word question cost it
+  nothing. Two kinds of term are dropped before the quorum is computed, both
+  because they separate nothing: one the index has **never seen** (`df = 0` —
+  BM25 already scores it zero, and requiring it is exactly how a hallucinated
+  term used to empty a result set) and one in **more than half the indexed
+  rows** — that second is a *cost* rule and not a relevance one, since such a
+  term's weight is near zero either way but leaving it in the expression makes
+  FTS5 walk a doclist the size of the graph. Measured on 312 nodes, a
+  question-shaped query costs **32 ms without the drop and 14 ms with it**, for
+  0.03 of recall and no measurable precision (0.766/0.622 against 0.737/0.632) —
+  a cost rule that is very nearly free, not a free one. A query left with one
+  term compiles **no quorum at all**, so a
+  one-word search runs the statement it always ran. The restriction is a CTE in
+  the `WHERE`, never a filter over the ranked rows — ranking first and filtering
+  after would drop good rows off the end of `LIMIT k` before anything looked at
+  them — and it changes *which rows are candidates* and nothing else: the BM25
+  weights, the `k` cap, RRF's rank arithmetic and the post-fusion graph
+  expansion are all untouched. **The conjunctive rule it replaces was Phase 2's
+  carried "BM25 goes silent" finding**, and the numbers are the argument: on a
+  312-node corpus with 40 question-shaped queries, **85 % returned no hits at
+  all** (recall 0.06, precision-over-returned 0.15) against 3 % after (recall
+  0.74, precision 0.63); on 16 short keyword queries recall 0.79 → 0.92 with
+  precision 1.00 → 0.72; and on those same keyword queries plus **one invented
+  term**, recall 0.00 → 0.92 — which is the E3 prerequisite, since a query
+  rewrite laid over a conjunctive index can be zeroed by a single hallucinated
+  token. A **bare OR** was measured as the third arm and rejected on precision:
+  recall 0.94 on questions but precision-over-returned 0.24, and 1.00 → 0.32 on
+  keyword queries. `0.5` itself is measured rather than picked: 0.6 scores
+  better on the 312-node corpus and buys **no keyword recall at all** on 26- and
+  78-node ones, and a graph is small before it is large.
+  **Phase 2's other carried finding — "source nodes outrank claim nodes" —
+  does not reproduce as recorded, and the mechanism it names is wrong.** The
+  note blamed BM25 length normalisation for not offsetting a `source` node
+  carrying a whole document's text. Normalisation offsets it and then some: with
+  term coverage held fixed and only length varying, the same sentence scores
+  −14.6 at 112 characters and −0.5 at 60 KB (more negative is better) — a 28×
+  penalty for length alone — and a one-sentence `claim` beats a 20 KB `source`
+  carrying that same sentence under the same title.
+  `asset_ref` text in the `extracted_text` column — the design pass's named
+  suspect if it *had* reproduced — does not change that either. What is real is
+  the observation, and its cause is the **conjunction**: a whole-document node
+  is the only node in a graph that contains every word of a question, so under
+  the AND rule it was the only node that could match one. Measured on the
+  312-node corpus: of the six question-shaped queries the conjunctive matcher
+  answered at all, **all six put a `source` node first**; after the quorum,
+  `source` holds 7 of 40 first places and `claim` 15. The two carried findings
+  were one defect seen from two sides, and fixing the first closes the second —
+  which is why **no ranking weight was touched**. Where a source still outranks
+  a claim (11 of 37 comparable queries), it does so having matched strictly more
+  of the query's terms in *every* case, which is BM25 being right. Do not retune
+  `_BM25_WEIGHTS` against this finding; `tests/test_search.py` pins the
+  normalisation property so a later change cannot quietly make the old
+  explanation true.
 - **`nodum.db`** — connection management (WAL, foreign keys), `NODUM_DB`
   resolution, the migration runner. Each migration's script and its
   `schema_migrations` row are one transaction (`apply_migration`), so an

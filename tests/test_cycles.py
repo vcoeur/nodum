@@ -300,6 +300,55 @@ def test_the_gardener_may_open_a_cycle_on_the_spaces_it_holds_edit_on(fresh_db):
     assert service.open_cycle(trigger="scheduled", principal=gardener).scope is None
 
 
+def test_the_gardener_can_review_a_proposed_version_today(fresh_db):
+    """The authority is live in the shipped release; only the caller is missing.
+
+    `_transition_row` gates a version through `Store.require_review`, which
+    passes for a human *or* an agent holding `edit` on the node's space — and
+    `0014` seeds the gardener with `edit` on `main`. So "nothing reaches the
+    version-review hole today" is true of the shipped *callers* and false of the
+    shipped *authority*: writing the call is all it takes, which is why the
+    reversal of a review had to be closed before anything is written that makes
+    it. `suggest` is here as the control — without it this test would pass on a
+    check that let everyone through.
+    """
+    gardener = auth.internal_principal()
+    assert not gardener.is_human
+    assert gardener.grants["main"] == "edit"
+
+    proposer = agent("proposer", grants={"meta": "read", "main": "suggest"})
+
+    def staged(title):
+        node = service.create_node(type="claim", title=title, content="first", principal=owner())
+        service.update_node(node.id, content="a second thought", principal=proposer)
+        version = next(
+            entry
+            for entry in service.history(node.id, principal=owner())
+            if entry.state == "proposed"
+        )
+        return node, version
+
+    accepted_node, to_accept = staged("Alpha")
+    _, to_reject = staged("Beta")
+    with pytest.raises(GrantNotPermitted):
+        service.transition(str(to_accept.id), "accept", principal=proposer)
+
+    cycle = _open()
+    with service.in_cycle(cycle.id):
+        assert (
+            service.transition(str(to_accept.id), "accept", principal=gardener).state == "applied"
+        )
+        assert (
+            service.transition(str(to_reject.id), "reject", principal=gardener).state == "archived"
+        )
+    service.close_cycle(cycle.id, status="completed", report={}, principal=owner())
+
+    assert service.get_node(accepted_node.id, principal=owner()).content == "a second thought"
+    reviews = [event for event in _events() if event.cycle_id == cycle.id]
+    assert {event.actor for event in reviews} == {f"agent:{GARDENER_AGENT_ID}"}
+    assert {event.op for event in reviews} == {"node.update", "version.reject"}
+
+
 def test_an_agent_with_edit_nowhere_cannot_open_an_unscoped_cycle(fresh_db):
     """An unscoped cycle covers the whole file, which no grant confers."""
     reader = agent("reader", grants={"meta": "read"})

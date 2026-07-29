@@ -14,14 +14,22 @@ contributes ``1 / (RRF_K + rank)`` per hit, the fused ``score`` is the sum,
 and ``signals`` carries each contribution, so the breakdown explains the
 score exactly. Graph expansion runs on the fused list (post-fusion).
 
+The keyword signal matches on a **quorum of the query's discriminating
+weight**, not on every term: see :func:`_compile_match`. A conjunctive matcher
+returns nothing as soon as one term of a question is absent, which on an
+install with no embedding provider — the default — makes a question-shaped
+query answer with silence.
+
 Both projectors are caught up before querying, so search always reflects the
 latest committed events without a manual projector run.
 """
 
 from __future__ import annotations
 
+import math
 import sqlite3
 from pathlib import Path
+from typing import NamedTuple
 
 import sqlite_vec
 
@@ -52,6 +60,19 @@ _EXPANSION_TYPE_WEIGHTS = {"supports": 1.0, "relates_to": 0.5}
 _SNIPPET_PRE = "**"
 _SNIPPET_POST = "**"
 
+#: The quorum: a node is a keyword candidate when the query terms it carries
+#: are worth at least this fraction of the query's total term weight. Half —
+#: measured, not chosen: below it the result list fills with nodes that share
+#: one word with the question, and above it the rule stops doing anything at
+#: all on a small graph, which is the size every graph starts at.
+_QUORUM_WEIGHT_FRACTION = 0.5
+
+#: A term in more than this fraction of the indexed rows is dropped from the
+#: query before the quorum is computed. It is a *cost* rule, not a relevance
+#: one: such a term's weight is near zero either way, but leaving it in the
+#: match expression makes FTS5 walk a doclist the size of the graph.
+_COMMON_TERM_DF_FRACTION = 0.5
+
 
 def _connect(path: str | Path | None) -> sqlite3.Connection:
     """Open a connection and apply any pending migrations (idempotent)."""
@@ -60,17 +81,124 @@ def _connect(path: str | Path | None) -> sqlite3.Connection:
     return conn
 
 
-def _match_query(query: str) -> str:
-    """Compile a free-text query into a safe FTS5 MATCH expression.
+def _query_terms(query: str) -> list[str]:
+    """Split a free-text query into safe FTS5 terms, in order, without repeats.
 
-    Each whitespace-separated token becomes one double-quoted term, ANDed
-    together — FTS5 operators and punctuation in the raw input can never break
-    (or hijack) the expression.
+    Each whitespace-separated token becomes one double-quoted term, so FTS5
+    operators and punctuation in the raw input can never break (or hijack) the
+    expression: ``OR`` is the word "or", ``c++`` is a term rather than a syntax
+    error, and an embedded quote is doubled rather than closing the string.
+    Nothing else in this module builds a MATCH expression, so this is the one
+    place a user string becomes FTS5 syntax.
+
+    Repeats are dropped case-insensitively because the quorum weighs terms:
+    typing a word twice would otherwise count its weight twice, both in what a
+    document must reach and in what it can collect.
     """
-    terms = ['"' + token.replace('"', '""') + '"' for token in query.split() if token.strip()]
-    if not terms:
+    seen: dict[str, str] = {}
+    for token in query.split():
+        if token.strip():
+            seen.setdefault(token.casefold(), '"' + token.replace('"', '""') + '"')
+    if not seen:
         raise ValueError("query must contain at least one term")
-    return " AND ".join(terms)
+    return list(seen.values())
+
+
+class _MatchPlan(NamedTuple):
+    """A compiled query: the FTS5 expression plus the quorum restriction.
+
+    ``cte`` is a ``WITH`` prefix and ``clause`` a WHERE fragment naming it;
+    both are empty when the quorum cannot exclude anything, in which case the
+    query is the bare expression and costs exactly what it did before.
+    """
+
+    match: str
+    cte: str
+    cte_params: list
+    clause: str
+
+
+def _compile_match(conn: sqlite3.Connection, terms: list[str]) -> _MatchPlan:
+    """Compile terms into an ORed expression plus a quorum over their weight.
+
+    The shipped rule was ``AND``, and it is the reason a question-shaped query
+    answered with silence: FTS5 requires every term, so one word the graph does
+    not happen to hold — *"how"*, *"my"*, or a term a model invented while
+    rewriting the query — empties the result set. A bare ``OR`` fixes that and
+    breaks precision instead, since every document holding one common word
+    becomes a hit.
+
+    So: **OR the terms, then require a quorum of their weight.** A term's
+    weight is its BM25 inverse document frequency, which is a measure of how
+    much it discriminates — so a rare term counts for more than a common one,
+    and a document qualifies by carrying enough of the query's *discriminating
+    power* rather than enough of its *words*. That distinction is what makes
+    the rule work on a question: eight of a question's twelve words are
+    function words the graph holds everywhere, they are worth almost nothing,
+    and the four words that mean something decide the outcome.
+
+    Two kinds of term are dropped before any of that, both for the same reason
+    — they separate nothing:
+
+    * **absent** (``df = 0``): BM25 already scores it zero, and keeping it
+      would put weight in the denominator that no document could ever reach.
+      This is the whole of why a hallucinated term stops mattering.
+    * **everywhere** (``df`` above :data:`_COMMON_TERM_DF_FRACTION`): its
+      weight is near zero anyway, but leaving it in the match expression makes
+      FTS5 walk a doclist the size of the graph to rank on it.
+
+    A query left with one term needs no quorum — matching it *is* the quorum —
+    so a one-word search runs exactly the statement it ran before.
+
+    The cost is one index probe per term plus one row count, all of which scale
+    with the *number* of indexed nodes rather than their text (measured: the
+    count is 0.14 ms over 312 rows holding 6.6 MB and 0.17 ms over 456 rows
+    holding 5.1 MB). At the scale this system is for that is well under a
+    millisecond; it is linear, so a graph two orders of magnitude larger would
+    want the total cached rather than counted.
+    """
+    total_rows = conn.execute("SELECT count(*) AS n FROM node_fts").fetchone()["n"]
+    plain = _MatchPlan(match=" OR ".join(terms), cte="", cte_params=[], clause="")
+    if total_rows == 0 or len(terms) == 1:
+        return plain
+    frequencies = [
+        (
+            term,
+            conn.execute(
+                "SELECT count(*) AS n FROM node_fts WHERE node_fts MATCH ?", (term,)
+            ).fetchone()["n"],
+        )
+        for term in terms
+    ]
+    ceiling = max(1, int(total_rows * _COMMON_TERM_DF_FRACTION))
+    kept = [(term, df) for term, df in frequencies if 0 < df <= ceiling]
+    if not kept:
+        # Every term is either absent or ubiquitous. On a small or single-topic
+        # graph the second is ordinary — every node really does say "kafka" —
+        # so fall back to the terms the graph knows rather than to nothing.
+        kept = [(term, df) for term, df in frequencies if df > 0]
+    if not kept:
+        return plain
+    weights = [(term, math.log(1 + (total_rows - df + 0.5) / (df + 0.5))) for term, df in kept]
+    match = " OR ".join(term for term, _ in weights)
+    if len(weights) == 1:
+        return _MatchPlan(match=match, cte="", cte_params=[], clause="")
+    branches = " UNION ALL ".join(
+        "SELECT node_id, ? AS weight FROM node_fts WHERE node_fts MATCH ?" for _ in weights
+    )
+    params: list = []
+    for term, weight in weights:
+        params.extend((weight, term))
+    params.append(_QUORUM_WEIGHT_FRACTION * sum(weight for _, weight in weights))
+    return _MatchPlan(
+        match=match,
+        cte=(
+            f"WITH matched(node_id, weight) AS ({branches}), quorum(node_id) AS ("
+            " SELECT node_id FROM matched GROUP BY node_id HAVING SUM(weight) >= ?)"
+        ),
+        cte_params=params,
+        clause="node_fts.node_id IN (SELECT node_id FROM quorum)",
+    )
 
 
 def _resolve_space(conn: sqlite3.Connection, space_ref: str, principal: Principal) -> str:
@@ -169,7 +297,7 @@ class _RankedRow:
 
 def _search_bm25(
     conn: sqlite3.Connection,
-    match: str,
+    terms: list[str],
     *,
     k: int,
     state: str | None,
@@ -181,14 +309,26 @@ def _search_bm25(
     space_id: str | None,
     principal: Principal | None,
 ) -> list[_RankedRow]:
-    """Run the BM25-ranked FTS query, best (most-negative bm25) first."""
+    """Run the BM25-ranked FTS query, best (most-negative bm25) first.
+
+    The quorum restricts *which rows are candidates* and nothing else: ranking
+    is still ``bm25()`` with the same weights over the same index, and the
+    ``LIMIT`` is still ``k``. That is what keeps the change local — the list
+    handed to fusion is the same shape and the same length it always was, so
+    RRF's rank arithmetic and the post-fusion graph expansion are untouched.
+    The quorum has to sit in the ``WHERE`` rather than filter the result:
+    ranking first and filtering after would drop good rows off the end of
+    ``LIMIT k`` before anything looked at them.
+    """
+    plan = _compile_match(conn, terms)
     filters, params = _node_filters(
         state, type_id, created_by, created_after, created_before, include_meta, space_id, principal
     )
-    clauses = ["node_fts MATCH ?", *filters]
+    clauses = ["node_fts MATCH ?", *([plan.clause] if plan.clause else []), *filters]
     weights = ", ".join(str(w) for w in _BM25_WEIGHTS)
     rows = conn.execute(
         f"""
+        {plan.cte}
         SELECT n.id, n.space_id, n.type_id, n.title,
                snippet(node_fts, 2, ?, ?, '…', 40) AS snippet
         FROM node_fts
@@ -197,7 +337,7 @@ def _search_bm25(
         ORDER BY bm25(node_fts, {weights})
         LIMIT ?
         """,
-        (_SNIPPET_PRE, _SNIPPET_POST, match, *params, k),
+        (*plan.cte_params, _SNIPPET_PRE, _SNIPPET_POST, plan.match, *params, k),
     ).fetchall()
     return [
         _RankedRow(
@@ -412,8 +552,11 @@ def search(
     to BM25 (+ graph expansion) without failing.
 
     Args:
-        query: Free-text query; whitespace-separated terms are ANDed for
-            BM25 and embedded whole for the vector signal.
+        query: Free-text query. The keyword signal keeps a node when the query
+            terms it carries are worth at least half the query's total
+            inverse-document-frequency weight (:func:`_compile_match`), so a
+            question keeps working when the graph does not hold every one of
+            its words; the vector signal embeds the query whole.
         k: Maximum hits.
         state: Node-state filter (default ``active``); ``None`` searches all
             states.
@@ -448,7 +591,9 @@ def search(
             and answered with everything the index held.
     """
     require_positive_limit(k, "k")
-    match = _match_query(query)
+    # Term-splitting is the one validation that can fail before any work: an
+    # empty query must not cost a projector run.
+    terms = _query_terms(query)
     # Derived indexes first: the projectors are incremental, so this is cheap.
     projectors.run_projectors(names=["fts", "vec"], path=path)
     conn = _connect(path)
@@ -468,7 +613,7 @@ def search(
         space_id = _resolve_space(conn, space, principal) if space is not None else None
         bm25_rows = _search_bm25(
             conn,
-            match,
+            terms,
             k=k,
             state=state,
             type_id=type_id,

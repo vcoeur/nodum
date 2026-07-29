@@ -93,6 +93,17 @@ a `proposed` **version** that records *which fields it named*. Accepting applies
 only those fields to the node as it stands at that moment, so a human edit made
 while the proposal waited survives.
 
+**A review is reversible, on both halves.** A version leaves `proposed` exactly
+once, so a reversal that put the node back and left the proposal marked
+`applied` would strand it: neither acceptable nor rejectable, over content that
+had gone back. Both `undo` and `rollback` therefore move the version row with
+the node — an accept records that move on the `node.update` it emits, a reject
+is an event in its own right — and a rejection is as reversible as an
+acceptance. This matters more than it looks: the gardener holds `edit` on
+`main`, which is authority to *review*, so a proposal accepted inside a
+consolidation cycle is taken back by `nodum rollback <cycle-id>` like every
+other write the cycle made.
+
 ### Grants
 
 A grant is one row per (agent, space). It is set with
@@ -272,7 +283,11 @@ nodum projector rebuild vec     # e.g. after an embedding-model change
 
 Two ship today:
 
-- **`fts`** — a SQLite FTS5 full-text index, giving BM25 keyword ranking. An
+- **`fts`** — a SQLite FTS5 full-text index, giving BM25 keyword ranking. A
+  query's terms are not all required: a node is kept when the ones it carries
+  are worth at least half the query's weight, rare words counting for more than
+  common ones and unknown words for nothing, so a question-shaped query works
+  and one absent term does not empty the result. An
   ingested document's full extracted text is joined onto the `asset_ref` node
   that stands for its bytes — and onto that node only, so a word on page 3 does
   not match every other page of the document just as strongly.

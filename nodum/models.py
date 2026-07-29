@@ -114,12 +114,19 @@ class UndoResult(BaseModel):
     deleted a created row); ``deleted`` lists rows removed by a create
     reversal (the created row plus, for nodes, its versions and incident
     edges).
+
+    ``restored_version`` is the second row a reversal can move: accepting a
+    proposed update rewrites the node *and* flips the ``versions`` row to
+    ``applied``, so undoing it puts the proposal back to ``proposed`` and says
+    so here. It is ``None`` on every reversal that moved no version — and on
+    undoing a *rejection*, where the version row is the one under ``restored``.
     """
 
     undone_seq: int
     undone_op: str
     restored: dict[str, Any] | None
     deleted: list[dict[str, Any]]
+    restored_version: dict[str, Any] | None = None
     undo_event_seq: int
 
 
@@ -745,6 +752,13 @@ class RollbackOut(BaseModel):
     non-graph events — audit records like ``asset.download`` that have no graph
     effect to reverse.
 
+    ``restored_versions`` names the ``versions`` rows the reversal put back —
+    the review decisions inside the cycle, by version id. A review moves two
+    rows from one decision and only the node is a graph record, so an accept's
+    version move rides on the ``node.update`` it caused and a reject is a
+    ``version.reject`` of its own; both are reversed, and both are counted here
+    rather than in ``restored_nodes``.
+
     ``conflicts`` is empty on a rollback that happened; on a dry run it is the
     reason it would not. ``blockers`` is the second half of that verdict — the
     delete guards, which refuse for a different reason and used to be invisible
@@ -759,6 +773,7 @@ class RollbackOut(BaseModel):
     skipped_events: list[int]
     restored_nodes: list[str]
     restored_edges: list[str]
+    restored_versions: list[int] = []
     deleted_nodes: list[str]
     deleted_edges: list[str]
     redirects_removed: list[str]
