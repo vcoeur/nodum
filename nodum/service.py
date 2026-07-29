@@ -4697,6 +4697,16 @@ def request_stop(
     latency is therefore one provider call, and honestly so: cancelling mid-call
     would buy seconds and cost a torn transaction.
 
+    **What checks it today is one of those three points**: :meth:`nodum.agent.
+    AgentRun.chat`, immediately before a provider call. The four deterministic
+    jobs in :mod:`nodum.consolidate` make no provider call and read this switch
+    nowhere, so a stop recorded against one of those runs is kept on the row and
+    the run finishes — the between-jobs and between-items checks belong to the
+    LLM jobs 5b-ii lands on that runtime. Every human surface says so rather than
+    promising a wind-down that would not arrive, and
+    ``test_the_deterministic_runner_consults_no_stop_switch_and_the_copy_says_so``
+    is what makes that copy fail when it stops being true.
+
     **Deliberately not** :func:`abandon_cycle`, and not a thin wrapper over it.
     That verb is a *repair* — a human declaring somebody else's dead process
     dead, closing the row from outside so its writes become rollback-able. This

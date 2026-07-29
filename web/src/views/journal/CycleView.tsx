@@ -32,6 +32,7 @@ import { CycleBadges } from "./CycleBadges";
 import { EventDiff } from "./EventDiff";
 import { MetricTable } from "./MetricTable";
 import { RollbackDialog } from "./RollbackDialog";
+import { StopDialog } from "./StopDialog";
 import {
   ABANDON_ACTION_LABEL,
   abandonAvailability,
@@ -48,6 +49,11 @@ import {
   readConsolidationReport,
   rollbackAvailability,
   rollbackOutcome,
+  RUNNING_ACTIONS_HINT,
+  STOP_ACTION_LABEL,
+  stopAvailability,
+  stopOutcome,
+  stopRecord,
 } from "./journal";
 import type { ConsolidationReport } from "./journal";
 import "./journal.css";
@@ -65,6 +71,7 @@ export default function CycleView() {
   const [load, setLoad] = useState<LoadState>({ status: "loading" });
   const [confirming, setConfirming] = useState(false);
   const [abandoning, setAbandoning] = useState(false);
+  const [stopping, setStopping] = useState(false);
   const [attempt, setAttempt] = useState(0);
   /**
    * Where the keyboard goes once the rollback has happened.
@@ -109,6 +116,19 @@ export default function CycleView() {
   const onAbandoned = useCallback(
     (closed: CycleOut) => {
       toast.show("info", "Cycle abandoned", abandonOutcome(closed));
+      heading.current?.focus();
+      reload();
+    },
+    [reload, toast],
+  );
+
+  // The same landing again, for the same reason: the stop button gives way to
+  // the record once a stop is on the entry, so the control that opened the
+  // dialog is gone by the time it closes. The toast reports the *instruction*
+  // and never an outcome — the row comes back still `running`.
+  const onStopRequested = useCallback(
+    (stopped: CycleOut) => {
+      toast.show("info", "Stop requested", stopOutcome(stopped));
       heading.current?.focus();
       reload();
     },
@@ -214,6 +234,14 @@ export default function CycleView() {
   // cycle a crash left `running` had its writes irreversible on every surface —
   // on the one screen that displays the stuck entry.
   const abandon = abandonAvailability(cycle);
+  // The kill switch. `service.request_stop` and migration `0015` shipped with no
+  // CLI verb, no route and no button — and this is the screen that displays the
+  // running cycle a human would want to stop. The record beside it is the other
+  // half: `status` says `failed` for a run the operator stopped and for one
+  // whose process died, so who asked and when is the only thing that tells the
+  // two apart the next morning.
+  const stop = stopAvailability(cycle);
+  const stopped = stopRecord(cycle);
 
   return (
     <div className="nd-view nd-jn">
@@ -240,9 +268,32 @@ export default function CycleView() {
             )}
             .
           </p>
+          {stopped === null ? null : (
+            <p className="nd-meta">
+              {stopped.by} asked this run to stop{" "}
+              <span title={formatTimestampLong(stopped.at)}>{formatTimestamp(stopped.at)}</span>.
+              Nothing about a stop reverses what it had already written.
+            </p>
+          )}
           <CycleBadges cycle={cycle} />
         </div>
         <div className="nd-jn-detail__actions">
+          {/* Offered only while it is possible, rather than always and mostly
+              disabled — the rule the abandon control below follows too. A stop
+              is for a run that is still alive; once one is recorded the control
+              gives way to the record above, because a second press is a no-op in
+              the service and a button that provably changes nothing is the
+              screen's own version of the ambiguity that no-op exists to avoid. */}
+          {stop.available ? (
+            <button
+              type="button"
+              className="nd-button nd-button--danger"
+              onClick={() => setStopping(true)}
+              title="Ask this run to wind down and close its own entry"
+            >
+              {STOP_ACTION_LABEL}
+            </button>
+          ) : null}
           {/* Offered only while it is possible, rather than always and mostly
               disabled: abandoning is for one situation — a run nothing is going
               to finish — and a permanently greyed control beside the rollback
@@ -256,6 +307,23 @@ export default function CycleView() {
             >
               {ABANDON_ACTION_LABEL}
             </button>
+          ) : null}
+          {/* Only while *both* buttons are on screen: the sentence names each
+              one by its own label, so showing it beside a control that is no
+              longer offered would point a reader at nothing. Nothing here can
+              tell them which of the two they want — whether the process behind a
+              `running` row is alive is not a fact the server has — so the screen
+              states both situations rather than implying a preference by
+              ordering or styling. */}
+          {stop.available && abandon.available ? (
+            <p className="nd-meta nd-jn-detail__reason">{RUNNING_ACTIONS_HINT}</p>
+          ) : null}
+          {/* The one refusal that is not already said by the caveats or the
+              record: a running entry whose stop is in. It is rendered exactly
+              where the button it replaced was, because "why is that control
+              gone" is the question a reader has here and nowhere else. */}
+          {abandon.available && !stop.available ? (
+            <p className="nd-meta nd-jn-detail__reason">{stop.reason}</p>
           ) : null}
           <button
             type="button"
@@ -313,6 +381,14 @@ export default function CycleView() {
           cycle={cycle}
           onAbandoned={onAbandoned}
           onClose={() => setAbandoning(false)}
+        />
+      ) : null}
+
+      {stopping ? (
+        <StopDialog
+          cycle={cycle}
+          onStopRequested={onStopRequested}
+          onClose={() => setStopping(false)}
         />
       ) : null}
     </div>

@@ -346,11 +346,14 @@ def _cycle_stop_problems(conn: sqlite3.Connection) -> list[str]:
 
     The route in is 0014's, not a hypothetical: ``init_db`` skips a migration
     whose name it already holds, so a database built from an earlier cut of
-    ``0015`` — the three-column shape ``cycle_stop_check``'s docstring proposes,
-    say — carries the recorded name and not the columns, and nothing else would
-    ever notice. ``stop_switch_available()`` gates on the *service function*
-    existing, which it does on any install carrying this code, so it would read
-    ``armed`` on a database that cannot store a stop.
+    ``0015`` — the three-column shape ``cycle_stop_check``'s docstring used to
+    propose, say — carries the recorded name and not the columns, and nothing
+    else would ever notice. **Nothing in the runtime can notice it either**, and
+    that is the point of asking here: ``LLMReport.stop_switch`` reports which
+    posture a *run* had, not what a file can store, so a cycle over this database
+    would say ``armed`` right up until the write failed. Whether a stop has
+    somewhere to go is a question about the schema, so it is asked at ``init_db``
+    — where the answer comes with the two statements that repair it.
     """
     columns = _columns(conn, "cycles")
     return [

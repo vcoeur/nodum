@@ -149,6 +149,16 @@ nodum cycle-get <cycle-id> --as owner  # what ran, and what it measured
 nodum events --cycle <cycle-id> --as owner   # what it actually changed
 ```
 
+A cycle that is still going can be asked to stop, which records who asked and
+when and leaves everything it has written alone — the run closes its own entry
+at its next check. It is not the same verb as `cycle-abandon`, which closes the
+entry of a run nothing is going to finish, and neither of them reverses a write:
+
+```sh
+nodum cycle-stop <cycle-id> --as owner    # a run that is going right now
+nodum cycle-abandon <cycle-id> --as owner # a run a SIGKILL left open
+```
+
 If a cycle did something you did not want, take the whole of it back. It is all
 or nothing, and it refuses rather than clobbering when the graph has moved on:
 

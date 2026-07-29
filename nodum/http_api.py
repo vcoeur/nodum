@@ -2473,6 +2473,33 @@ def create_app(
         cycle = _write(request, service.abandon_cycle, request.path_params["id"], path=db_path)
         return EnvelopeResponse(envelope(cycle))
 
+    async def stop_cycle(request: Request) -> Response:
+        """Ask a ``running`` cycle to stop, and record who asked (design K1–K3).
+
+        The kill switch, and the one write on this surface that closes nothing:
+        it stamps ``stop_requested_by``/``stop_requested_at`` and returns the row
+        still ``running``. The run notices at its next check and closes its own
+        entry ``failed``, so the journal says the operator stopped that night.
+
+        **Deliberately not ``/abandon``, and not built on it.** Abandoning is a
+        repair — a human closing a dead process's entry from outside so its
+        writes become reversible — while a stop is an instruction to a live run.
+        A human reading a ``failed`` cycle at 09:00 needs to know which happened,
+        and one route serving both would erase exactly that.
+
+        It reverses nothing either: what the run already wrote stays, stamped
+        with the cycle, and ``POST /api/cycles/{id}/rollback`` is what takes it
+        back once the entry has closed. Human-only in the service, which sessions
+        satisfy by construction here.
+
+        It refuses a cycle that is not ``running`` (400) — nothing is left to obey
+        it — and answers **200** to a second stop rather than refusing, keeping
+        the first asker: a switch that raised on the second press would make a
+        human doubt whether the first one worked.
+        """
+        cycle = _write(request, service.request_stop, request.path_params["id"], path=db_path)
+        return EnvelopeResponse(envelope(cycle))
+
     async def roll_cycle_back(request: Request) -> Response:
         """Take a whole cycle back — all of it, or none of it (design D7).
 
@@ -2766,6 +2793,7 @@ def create_app(
         Route("/api/cycles", run_cycle, methods=["POST"]),
         Route("/api/cycles/{id}", get_cycle),
         Route("/api/cycles/{id}/abandon", abandon_cycle, methods=["POST"]),
+        Route("/api/cycles/{id}/stop", stop_cycle, methods=["POST"]),
         Route("/api/cycles/{id}/rollback", roll_cycle_back, methods=["POST"]),
         Route("/api/me", get_me),
         Route("/api/humans", list_humans),

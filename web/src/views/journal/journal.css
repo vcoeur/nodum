@@ -161,6 +161,18 @@
   color: var(--nd-warn);
 }
 
+/* "stop asked" shares the caution hue with the rehearsal pill deliberately. The
+   design system's two colour axes are both taken — brass means "you can act on
+   this", the state ramp means the service-layer state machine — and these two
+   pills do the same job on the same row: they qualify how the entry beside them
+   should be read, being neither an affordance nor a lifecycle state. A third
+   hue would be a third axis for a distinction the label already carries. */
+.nd-jn-badge--stopped {
+  background: var(--nd-warn-wash);
+  border-color: rgb(208 154 74 / 35%);
+  color: var(--nd-warn);
+}
+
 /* --- One entry in full ------------------------------------------------ */
 
 .nd-jn-detail__heading {

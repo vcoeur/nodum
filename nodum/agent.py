@@ -100,11 +100,11 @@ module does not know about dry runs — the runner still calls
 Three levels, and only the third is new. **Off** is
 :data:`ENV_CYCLE_BUDGET` unset or 0. **Stop the gardener entirely** is ``nodum
 agent disable builtin-gardener``, which already exists. **Stop this run now**
-is a ``cycles.stop_requested`` row, checked here at the last of K3's three
-points — immediately before every provider call — and by the runner at the
-other two, between jobs and between items. Worst-case latency is one provider
-call, bounded above by the per-call timeout; cancelling mid-call would buy
-seconds and cost a torn transaction.
+is a stop recorded on the ``cycles`` row, checked here at the last of K3's three
+points — immediately before every provider call — and by an LLM job at the other
+two, between jobs and between items (:meth:`AgentRun.check_stop`). Worst-case
+latency is one provider call, bounded above by the per-call timeout; cancelling
+mid-call would buy seconds and cost a torn transaction.
 
 It is deliberately **not** ``abandon_cycle``. That verb is a *repair* — a human
 declaring somebody else's dead process dead — and the kill switch is an
@@ -115,12 +115,25 @@ flag is a **row rather than a process signal** for the reason 5a's cycle
 serialisation is a row: ``nodum cycle-stop`` typed at a terminal must stop a
 cycle running inside ``nodum serve``, and those are two interpreters.
 
-**The column is not this wave's to add.** Migration ``0015`` adds
-``cycles.stop_requested`` and the service read that exposes it; until it lands,
-:func:`cycle_stop_check` resolves to a check that always answers "keep going"
-and :func:`stop_switch_available` is false, which the report carries as
-:attr:`LLMReport.stop_switch` so a journal entry never implies a switch that
-was not wired. See that function for exactly what the migration must add.
+**The row is migration ``0015``'s** — ``cycles.stop_requested_at`` and
+``cycles.stop_requested_by`` — and :func:`cycle_stop_check` reads it through
+:func:`nodum.service.stop_requested`. A human hits the switch with ``nodum
+cycle-stop <id>`` or ``POST /api/cycles/{id}/stop``; both go through
+:func:`nodum.service.request_stop`, which is human-only, refuses a cycle that is
+not ``running``, and stamps the row without closing it. :attr:`LLMReport.
+stop_switch` says which posture a run had, because a journal entry must never
+imply a switch that was not there: a cycle has a row anybody can stamp
+(:data:`STOP_SWITCH_ARMED`), and a human's request has none
+(:data:`STOP_SWITCH_NONE`) — it is bounded by its own ceilings and by the human
+who can close the tab.
+
+**What obeys it, today.** Every provider call goes through :meth:`AgentRun.chat`,
+which checks first, so any run that reaches a model is stoppable. The four
+*deterministic* consolidation jobs in :mod:`nodum.consolidate` make no provider
+call and no stop check, so a stop recorded against one of those runs is kept in
+the journal and that run finishes on its own — the LLM jobs that check between
+jobs and between items are 5b-ii's, landing on this runtime. The human surfaces
+say so rather than promising a stop that would not arrive.
 """
 
 from __future__ import annotations
@@ -170,7 +183,6 @@ __all__ = [
     "for_cycle",
     "for_request",
     "prompt_version",
-    "stop_switch_available",
 ]
 
 #: The key :class:`LLMReport` is filed under inside ``cycles.report`` (A1).
@@ -215,19 +227,25 @@ DEFAULT_REQUEST_SECONDS = 180.0
 DEFAULT_CALL_TIMEOUT = 120.0
 DEFAULT_MAX_OUTPUT_TOKENS = 512
 
-#: The public :mod:`nodum.service` read that answers "has this cycle been told
-#: to stop?". It does not exist yet — migration ``0015`` and its wave own it —
-#: and :func:`cycle_stop_check` gates on its presence rather than importing a
-#: name that would be an ``AttributeError`` on every install today.
-SERVICE_STOP_READ = "stop_requested"
-
-#: What :attr:`LLMReport.stop_switch` says when the column and its read exist.
+#: What :attr:`LLMReport.stop_switch` says for a run wired to a cycle's row:
+#: this run reads ``0015``'s stamps and obeys them.
 STOP_SWITCH_ARMED = "armed"
 
-#: What it says when they do not. A journal entry must never imply a switch
-#: that was not wired, and "no stop was requested" and "no stop *could* be
-#: requested" are different facts.
-STOP_SWITCH_PENDING = "pending: cycles.stop_requested is not in this database's schema yet"
+#: What it says for a run that has no cycle — :func:`for_request`'s posture.
+#: A journal entry must never imply a switch that was not there, and "no stop
+#: was requested" and "there was no stop to request" are different facts: a
+#: human-initiated request has no ``cycles`` row for anybody to stamp, and is
+#: bounded instead by its own ceilings and by the human who can close the tab.
+#:
+#: It replaces a third value, ``STOP_SWITCH_PENDING`` ("cycles.stop_requested is
+#: not in this database's schema yet"), which was stale in three ways at once by
+#: the time ``0015`` landed: the column is ``stop_requested_at``, the gate under
+#: it keyed on the *service function* rather than on the column, and no build
+#: carrying this module can reach the branch that produced it. Whether a
+#: *database* can store a stop is a real question with two answers and it is
+#: :func:`nodum.db._cycle_stop_problems`'s, asked at ``init_db`` where it can be
+#: repaired — never a string in a report written after the write already failed.
+STOP_SWITCH_NONE = "none: this run is not a cycle and has no stop row"
 
 
 class BudgetExhausted(RuntimeError):
@@ -522,16 +540,6 @@ def prompt_version(template: str) -> str:
     return hashlib.sha256(template.encode("utf-8")).hexdigest()[:12]
 
 
-def stop_switch_available() -> bool:
-    """Is the kill switch's row read present in this build? (K3)
-
-    False until migration ``0015``'s wave lands. Reported rather than assumed,
-    because "no stop was requested" and "no stop could be requested" are
-    different facts and a journal entry must not print the second as the first.
-    """
-    return callable(getattr(service, SERVICE_STOP_READ, None))
-
-
 def cycle_stop_check(
     cycle_id: str, *, principal: Principal, path: str | Path | None = None
 ) -> StopCheck:
@@ -544,28 +552,17 @@ def cycle_stop_check(
     be a kill switch that cannot be hit after the run starts, which is the only
     time anyone hits one.
 
-    **What migration ``0015`` and its wave must add for this to do anything:**
+    The read is :func:`nodum.service.stop_requested`, called on every check.
+    That function is deliberately **not** human-only, unlike ``get_cycle`` and
+    ``list_cycles``: it is one boolean about the caller's own run, disclosing no
+    node, space or count, and a runner that cannot ask whether it was told to
+    stop cannot obey. What bounds it instead is the authority to *close* this
+    cycle — obeying a stop is closing it — so a principal that could not have
+    opened the run gets ``GrantNotPermitted`` rather than an answer.
 
-    1. ``ALTER TABLE cycles ADD COLUMN stop_requested INTEGER NOT NULL DEFAULT 0``
-       — plus, if the journal is to say *who* asked and *when*,
-       ``stop_requested_by TEXT`` and ``stop_requested_at TEXT``.
-    2. ``service.stop_requested(cycle_id, *, principal, path=None) -> bool`` —
-       readable by the principal **running** the cycle, not human-only like
-       ``get_cycle`` and ``list_cycles``. Those are human-only because a
-       journal entry says what the gardener did across every space in the file;
-       this read is one boolean about the caller's own run and discloses no
-       territory, and a runner that could not ask whether it had been told to
-       stop could not obey.
-    3. ``service.request_stop(cycle_id, *, principal, path=None)`` — human-only,
-       refusing a cycle that is not ``running``, and **not** a reuse of
-       ``abandon_cycle``: stopping cleanly and crashing are different facts the
-       journal has to keep apart (K1).
-    4. ``CycleOut.stop_requested`` so both human surfaces can render it.
-
-    Until then this returns a check that always answers "keep going", and
-    :func:`stop_switch_available` says so. Gated on the function's presence
-    rather than importing a name that would be an ``AttributeError`` on every
-    install today.
+    This raises nothing itself; :meth:`AgentRun.check_stop` is what turns a
+    ``True`` into :class:`CycleStopped`, and :meth:`AgentRun.chat` calls it
+    before every provider call.
 
     Args:
         cycle_id: The cycle to watch.
@@ -573,14 +570,11 @@ def cycle_stop_check(
         path: Explicit database path.
 
     Returns:
-        A callable answering ``True`` when a stop has been requested.
+        A callable answering ``True`` once a stop has been recorded.
     """
 
     def check() -> bool:
-        reader = getattr(service, SERVICE_STOP_READ, None)
-        if reader is None:
-            return False
-        return bool(reader(cycle_id, principal=principal, path=path))
+        return bool(service.stop_requested(cycle_id, principal=principal, path=path))
 
     return check
 
@@ -633,7 +627,7 @@ class AgentRun:
         purpose: str,
         budget: Budget,
         stop: StopCheck | None = None,
-        stop_switch: str = STOP_SWITCH_PENDING,
+        stop_switch: str = STOP_SWITCH_NONE,
         max_output_tokens: int | None = None,
         call_timeout: float | None = None,
     ) -> None:
@@ -1013,7 +1007,7 @@ def for_cycle(
             seconds=_positive_float(ENV_CYCLE_SECONDS, DEFAULT_CYCLE_SECONDS),
         ),
         stop=cycle_stop_check(cycle_id, principal=principal, path=path),
-        stop_switch=STOP_SWITCH_ARMED if stop_switch_available() else STOP_SWITCH_PENDING,
+        stop_switch=STOP_SWITCH_ARMED,
     )
 
 

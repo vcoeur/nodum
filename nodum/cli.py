@@ -1654,6 +1654,44 @@ def cycle_abandon(
     _emit(_run(service.abandon_cycle, cycle_id, principal=_principal(as_human)))
 
 
+@app.command(name="cycle-stop")
+def cycle_stop(
+    cycle_id: str = typer.Argument(..., help="The running cycle to ask to stop."),
+    as_human: str = AS_OPTION,
+) -> None:
+    """Ask a running cycle to stop, and record who asked — the kill switch (human-only).
+
+    It stamps the cycle with who asked and when, and does nothing else: the entry
+    stays `running`, no event is emitted, and nothing the run already wrote is
+    touched. The run notices at its next check — between jobs, between items, or
+    immediately before a model call — and closes its own entry `failed`, so the
+    journal says the operator stopped that night rather than that a process died.
+
+    **Not `cycle-abandon`.** That is a repair: a human closing a dead process's
+    entry from *outside*, which is what makes its writes reversible. This is an
+    instruction to a run that is still alive and expected to obey it. A `failed`
+    entry read the next morning has to say which of the two happened, so the two
+    verbs stay apart.
+
+    **Not `rollback` either.** Stopping reverses nothing: every write the run made
+    stays in the graph, stamped with the cycle, and `rollback <cycle-id>` is what
+    takes those back once the entry has closed. Stopping and undoing are two
+    decisions, and a switch that also reverted would make "stop, look at what it
+    did, then decide" impossible — which is the reason a human hits one.
+
+    Asking twice is a no-op that keeps the first asker. A cycle that has already
+    said how it ended is refused: there is nothing left to obey the instruction,
+    and the stamp would name a run that never saw it.
+
+    **What obeys it today** is the model-calling runtime (`nodum.agent`), which
+    checks the switch before every provider call. The four deterministic
+    consolidation jobs make no model call and no such check, so a stop recorded
+    against one is kept in the journal and that run finishes on its own —
+    `cycle-abandon` is the verb for a run that will never finish at all.
+    """
+    _emit(_run(service.request_stop, cycle_id, principal=_principal(as_human)))
+
+
 def _rollback(cycle_id: str, *, dry_run: bool, principal: Principal) -> RollbackOut:
     """Roll a cycle back, rendering a refusal as JSON rather than as a sentence.
 

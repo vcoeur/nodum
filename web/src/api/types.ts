@@ -497,6 +497,16 @@ export type CycleStatus = "running" | "completed" | "failed" | "rolled_back";
  * `finished_at` is, and `rolled_back_by` names the rollback cycle that reversed
  * this one.
  *
+ * `stop_requested_by` and `stop_requested_at` are the kill switch's record: who
+ * told this run to stop, and when. They outlive the run, because an entry has to
+ * go on saying that this night was stopped and by whom. `stop_requested` is the
+ * boolean to render and is **derived** server-side (`stop_requested_at is not
+ * None`) rather than stored, so it cannot disagree with the stamps beside it — do
+ * not re-derive it here either. A stop is not an abandon: these columns say the
+ * operator stopped a live run, while `report.abandoned` says a human closed a
+ * dead process's entry from outside, and a `failed` cycle reads differently
+ * depending on which.
+ *
  * `trigger` and `status` are typed as plain strings for the same reason every
  * other enum-shaped field here is: the server may add a value, and a union that
  * silently excludes it would make a real row unrepresentable.
@@ -512,6 +522,9 @@ export interface CycleOut {
   started_at: string;
   finished_at: string | null;
   rolled_back_by: string | null;
+  stop_requested: boolean;
+  stop_requested_by: string | null;
+  stop_requested_at: string | null;
 }
 
 /**

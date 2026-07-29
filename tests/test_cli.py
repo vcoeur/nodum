@@ -1224,6 +1224,73 @@ def test_cycle_abandon_refuses_a_cycle_that_already_ended(fresh_db):
     assert _run_json("cycle-get", finished["id"])["status"] == "completed"
 
 
+def test_cycle_stop_records_the_instruction_and_closes_nothing(fresh_db):
+    """The kill switch's verb — and it is neither `cycle-abandon` nor `rollback`.
+
+    `service.request_stop` shipped with migration `0015` and no surface reached
+    it, which is the defect this repo keeps re-committing: a door nothing opens.
+
+    What it must *not* do is as load-bearing as what it does. The entry stays
+    `running` (the run is expected to notice and close its own), and every write
+    the run already made stands — a switch that also reverted would make "stop,
+    look at what it did, then decide" impossible.
+    """
+    cycle = service.open_cycle(trigger="manual", principal=owner())
+    with service.in_cycle(cycle.id):
+        node = service.create_node(type="claim", title="Half-written", principal=owner())
+
+    stopped = _run_json("cycle-stop", cycle.id)
+
+    assert stopped["status"] == "running", "a stop is an instruction, not a close"
+    assert stopped["stop_requested"] is True
+    assert stopped["stop_requested_by"] == "human:owner"
+    assert stopped["stop_requested_at"] is not None
+    # Nothing was reversed, and the journal keeps the stamp where a reader finds it.
+    assert _run_json("node", "get", node.id)["state"] == "active"
+    assert _run_json("cycle-get", cycle.id)["stop_requested_by"] == "human:owner"
+    # And a stop is not an abandon: no report claims a human closed this entry.
+    assert _run_json("cycle-get", cycle.id)["report"] is None
+
+
+def test_cycle_stop_twice_keeps_the_first_asker_and_is_not_an_error(fresh_db):
+    """A switch that raised on the second press would make a human doubt the first.
+
+    That is the one moment which must not be ambiguous, so the second call is a
+    no-op — exit 0, the same row back — and the journal keeps whoever actually
+    stopped the night.
+    """
+    second = service.create_human("second", principal=owner())
+    cycle = service.open_cycle(trigger="manual", principal=owner())
+
+    first = _run_json("cycle-stop", cycle.id)
+    again = runner.invoke(app, ["cycle-stop", cycle.id, "--as", second.id])
+
+    assert again.exit_code == 0
+    assert json.loads(again.stdout)["stop_requested_by"] == "human:owner"
+    assert json.loads(again.stdout)["stop_requested_at"] == first["stop_requested_at"]
+
+
+def test_cycle_stop_refuses_a_cycle_that_already_ended(fresh_db):
+    """Nothing is left to obey it, and the stamp would name a run that never saw it.
+
+    The refusal is asserted by its *own* sentence rather than by the shared
+    "already completed, not running" prefix: `cycle-abandon` refuses the same row
+    with the same prefix, so a `cycle-stop` mis-wired to `abandon_cycle` would
+    pass a test that read only that much.
+    """
+    finished = _run_json("consolidate")["cycle"]
+
+    result = runner.invoke(app, ["cycle-stop", finished["id"], "--as", "owner"])
+
+    assert result.exit_code == 1
+    assert "already completed, not running" in result.stderr
+    assert "a stop is an instruction to a live run" in result.stderr
+    assert "Traceback" not in result.output
+    assert _run_json("cycle-get", finished["id"])["stop_requested"] is False
+    # And the refused stop closed nothing: the row still says how it really ended.
+    assert _run_json("cycle-get", finished["id"])["report"]["jobs"] != []
+
+
 def test_merge_nodes_over_the_cli(fresh_db):
     survivor, duplicate, citer = _claim("Alpha"), _claim("Alpha (dup)"), _claim("Cites")
     edge = _run_json("edge", "create", citer["id"], duplicate["id"], "--type", "supports")

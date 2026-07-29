@@ -1375,6 +1375,59 @@ def test_the_runner_imports_only_the_modules_it_is_allowed_to():
     )
 
 
+def test_the_deterministic_runner_consults_no_stop_switch_and_the_copy_says_so(
+    fresh_db, monkeypatch
+):
+    """The kill switch's surfaces promise a latency, and this is what bounds it.
+
+    ``nodum cycle-stop`` and ``POST /api/cycles/{id}/stop`` record an instruction
+    the *run* is supposed to notice, and the only thing that notices one today is
+    :meth:`nodum.agent.AgentRun.chat`, before a provider call. These four jobs
+    make no provider call and no stop check — the jobs that check between jobs
+    and between items are 5b-ii's — so a stop asked for during a deterministic
+    cycle is recorded and that run finishes. Every surface says exactly that, and
+    this is what keeps the sentence honest: when 5b-ii wires a check in here, this
+    test fails and the copy it names has to be rewritten rather than quietly
+    becoming an understatement.
+
+    Both halves are asserted, because neither alone is the claim. The AST half
+    catches a check added anywhere in the module; the behavioural half proves the
+    run really does complete, since a check could be added through a helper this
+    file does not name.
+    """
+    reached = {
+        node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", "")
+        for node in ast.walk(_module_ast())
+        if isinstance(node, ast.Call)
+    }
+    assert "stop_requested" not in reached
+    assert "cycle_stop_check" not in reached
+    assert "check_stop" not in reached
+    assert "nodum.agent" not in _imported_modules()
+
+    # And in the run itself. The switch is hit from *inside* the cycle — the
+    # only moment anybody hits one — by a job standing where the real first job
+    # stands, and every job after it still runs to completion.
+    human = owner()
+
+    def stopper(context):
+        (running,) = [
+            entry for entry in service.list_cycles(principal=human) if entry.status == "running"
+        ]
+        service.request_stop(running.id, principal=human)
+        return consolidate.JobOutcome(name="stopper")
+
+    monkeypatch.setitem(consolidate.JOBS, "stopper", stopper)
+    ran = ["stopper", *[name for name in consolidate.JOBS if name != "stopper"]]
+
+    outcome = consolidate.consolidate(jobs=ran, triggered_by=human.actor_string)
+
+    assert outcome.cycle.stop_requested is True, "the stop was recorded mid-run"
+    assert outcome.cycle.status == "completed", "and the run finished anyway"
+    assert [job.name for job in outcome.report.jobs] == ran
+    assert outcome.report.failed == []
+
+
 def test_every_write_the_module_makes_names_the_gardener():
     """The only ``principal=`` a job may bind is the run context's.
 

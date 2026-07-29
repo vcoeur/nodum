@@ -284,6 +284,18 @@ commands on a saved node for exactly this reason.
   a switch that cannot be hit after the run starts, which is the only time
   anyone hits one. The stamps outlive the run, so the journal goes on saying who
   stopped that night. Neither verb is on MCP (`HUMAN_ONLY_TOOLS`).
+  **`request_stop` is reachable on both human surfaces** — `nodum cycle-stop
+  <id>`, `POST /api/cycles/{id}/stop`, and a confirm on the journal entry, which
+  also renders who asked and when — for the reason `cycle-abandon` is: a door
+  nothing opens is not a door, and this one shipped with its schema, its runtime
+  and no surface at all. The three verbs a `running` entry can meet are stop,
+  abandon and rollback, and every surface states the difference rather than
+  leaving a human to infer it from three similar buttons. What *obeys* a stop
+  today is `agent.AgentRun.chat`, immediately before a provider call; the four
+  deterministic jobs in `nodum.consolidate` make none and read the switch
+  nowhere, so a stop recorded against one of those runs is kept and the run
+  finishes — which every surface says, rather than promising a wind-down that
+  would not arrive.
   The stamp itself is `in_cycle`, a `ContextVar` that
   `_emit` reads, so a cycle's writes go through the *ordinary* public functions
   and are stamped without any call site naming a cycle — a per-task variable
@@ -793,7 +805,10 @@ commands on a saved node for exactly this reason.
   dry run beside it), the **abandon** confirm
   (`POST /api/cycles/{id}/abandon`, offered only on a `running` entry — the
   browser half of "a door nothing opens is not a door", and the thing that turns
-  the rollback button's refusal from a dead end into a route) and the rollback
+  the rollback button's refusal from a dead end into a route), the **stop**
+  confirm (`POST /api/cycles/{id}/stop`, the same rule one verb along: offered
+  only on a `running` entry nobody has stopped yet, and giving way to the record
+  of who asked and when once one is on the row) and the rollback
   confirm — which is the only place a human
   meets a 409 with a `conflicts` list, so it has to render *both* ends of each
   collision rather than a count. It reads the journal; it does not summarise
@@ -968,15 +983,32 @@ commands on a saved node for exactly this reason.
   09:00), checked immediately before every provider call here and between jobs
   and items by the runner, read fresh every time because a cached answer is a
   switch that cannot be hit after the run starts. **The row and its service read
-  landed in migration `0015`**, so the gate is closed: `cycle_stop_check`
-  resolves to `service.stop_requested`, `stop_switch_available()` is true, and
-  the report says `stop_switch: "armed"`. The gated branch stays and stays
-  correct — on a build without the read it answers "keep going" and the report
-  says `pending…`, because "no stop was requested" and "no stop *could* be
-  requested" are different facts and a journal entry must never print the second
-  as the first. What `0015` actually added deviates from the four things that
-  docstring asks for in one place: **two columns, not three** — the boolean is
-  derived (see `nodum.migrations`). Configuration: `NODUM_LLM_CYCLE_BUDGET`, `NODUM_LLM_CYCLE_SECONDS`,
+  landed in migration `0015`**, so `cycle_stop_check` calls
+  `service.stop_requested` directly and a cycle's report says
+  `stop_switch: "armed"`. What `0015` actually added deviates from the four
+  things that docstring asked for in one place: **two columns, not three** — the
+  boolean is derived (see `nodum.migrations`). **The gate under it is gone, and
+  so is `STOP_SWITCH_PENDING`.** That branch was the only way to reach the armed
+  path before `0015`, and afterwards it was three kinds of stale at once: the
+  string named a column (`cycles.stop_requested`) the migration never created,
+  the gate keyed on the *service function* rather than on the column, and no
+  build carrying this module could reach it. The field still has two values,
+  because the distinction it exists for is still real — a cycle has a row
+  anybody can stamp (`STOP_SWITCH_ARMED`), and a human's request has none
+  (`STOP_SWITCH_NONE`, `for_request`'s posture, previously reported as a
+  migration that had already landed). Whether a *database* can store a stop is
+  the question with two live answers, and it belongs to `db._cycle_stop_problems`
+  at `init_db` where the answer comes with the statements that repair it —
+  never to a string in a report written after the write already failed.
+  **The human end is `nodum cycle-stop <id>`, `POST /api/cycles/{id}/stop`, and
+  a confirm on the journal entry** — all three through `service.request_stop`.
+  What obeys a stop today is `AgentRun.chat`, before a provider call; the four
+  deterministic jobs in `nodum.consolidate` make none and check nothing, so a
+  run of those finishes with the stop recorded on it. **Every surface says that
+  rather than promising a wind-down that would not arrive**, and
+  `test_the_deterministic_runner_consults_no_stop_switch_and_the_copy_says_so`
+  fails the day 5b-ii wires a check in, so the copy is rewritten rather than
+  quietly becoming an understatement. Configuration: `NODUM_LLM_CYCLE_BUDGET`, `NODUM_LLM_CYCLE_SECONDS`,
   `NODUM_LLM_REQUEST_BUDGET`, `NODUM_LLM_REQUEST_SECONDS`,
   `NODUM_LLM_CALL_TIMEOUT`, `NODUM_LLM_MAX_OUTPUT_TOKENS` — each unparseable
   value falls back to its default rather than refusing to boot (the scheduler's
@@ -1406,9 +1438,10 @@ commands on a saved node for exactly this reason.
   them is a cycle nobody asked to stop, which is what two NULLs say.
   `db._cycle_stop_problems` asserts both exist on any file recording `0015`, for
   the reason `_cycles_problems` asserts 0014's index — `init_db` skips a
-  migration whose name it already holds, and `stop_switch_available()` gates on
-  the *service function* existing, so it would read `armed` over a database that
-  cannot store a stop. Its remedy is `0014`'s kind, not the first four's: the
+  migration whose name it already holds, and nothing in the runtime catches the
+  drift first: `LLMReport.stop_switch` reports the posture a *run* had rather
+  than what the file can store, so a cycle over such a database reads `armed`
+  right up to the failed write. Its remedy is `0014`'s kind, not the first four's: the
   refusal prints the `ALTER TABLE` for each column it **found missing**, in
   dependency order, because `ADD COLUMN` has no `IF NOT EXISTS` and a remedy
   that always printed both would die on `duplicate column name`.
@@ -1688,7 +1721,23 @@ Phase-1 decision log.
   surface — `rollback` refuses a running cycle and `undo` refuses every
   cycle-stamped event — so this closes it `failed`, with a report naming who
   abandoned it, and `rollback` then works. It refuses a cycle that already said
-  how it ended, because re-closing it would overwrite that record),
+  how it ended, because re-closing it would overwrite that record.
+  **`cycle-stop` is the kill switch and is the third verb of three, not a
+  softer `cycle-abandon`**: it stamps who asked and when on a `running` cycle and
+  changes nothing else — the entry stays `running`, no event is emitted, no
+  write is touched — and the run notices at its next check and closes its *own*
+  entry. Abandoning is a repair performed on somebody else's dead process from
+  outside; a stop is an instruction a live run obeys. Both end `failed`, so the
+  stamps rather than the status are what answer "did the operator stop this or
+  did the process die?", which is the question the journal exists for. Neither
+  reverses anything: `rollback` is still the only verb that does, and it runs
+  *after* the entry closes. Asking twice is a no-op that keeps the first asker —
+  a switch that raised on the second press would make a human doubt the first —
+  and a cycle that has said how it ended is refused, since nothing is left to
+  obey it. **What obeys a stop today is `AgentRun.chat`, before a provider
+  call**; the four deterministic jobs make none, so a run of those finishes with
+  the stop recorded on it, and the help text, the docs and the browser confirm
+  all say so rather than promising a wind-down that would not arrive),
   `rollback <cycle-id> [--dry-run]`,
   `merge-nodes <ids…> --into <id>`, `retype <ids…> --type <t>`,
   `supersede-edge <edge-id> [--src --dst --type --confidence --set]` (every
@@ -2055,13 +2104,20 @@ Phase-1 decision log.
   about its own bug hides the bug. `/summarize` reads the subgraph **before**
   looking at the provider for exactly that reason: a node that does not exist is
   a 404 whether or not a model is configured.
-- **The dream journal is five routes, and the curative tier is none of them.**
+- **The dream journal is six routes, and the curative tier is none of them.**
   `GET /api/cycles` (newest first — byte-identical to `nodum cycle-list`, as
   every list endpoint is to its command), `POST /api/cycles` (run one now —
   `scope` and `dry_run` are the runner's own parameters and this route invents
   neither), `POST /api/cycles/{id}/abandon` (close an interrupted run `failed`,
   which is what makes its writes rollback-able at all; 400 on a cycle that is
-  not `running`), `GET /api/cycles/{id}` (the row, its metrics, and
+  not `running`), **`POST /api/cycles/{id}/stop`** (the kill switch: stamp who
+  asked and when on a `running` cycle and close nothing — the row comes back
+  still `running`, the run closes its own entry when it notices; 400 on a cycle
+  that is not `running`, and **200 on a second stop**, keeping the first asker,
+  because a switch that refused the second press would make a human doubt the
+  first. It takes the `/abandon` shape and is deliberately not that route: a
+  repair closes a dead process's entry from outside, an instruction is obeyed by
+  a live run, and both end `failed`), `GET /api/cycles/{id}` (the row, its metrics, and
   `list_events(cycle_id=…)` composed into one round trip, bounded by `?limit=`
   with `events_truncated` when it bit), and `POST /api/cycles/{id}/rollback`.
   `POST /api/cycles` exists because the schedule is off unless configured: a
@@ -2379,6 +2435,31 @@ Phase-1 decision log.
   the other. A **dry-run** entry has a report and no events at all, and that is
   the point rather than an empty state to hide: it is the checkable form of "it
   changed nothing", and copy that says "no changes recorded" reads as a failure.
+  **Three actions, three situations, and the copy is what keeps them apart.**
+  `stop` asks a live run to wind down (the entry stays `running`; who asked and
+  when is rendered on it), `abandon` closes the entry of a run nothing is going
+  to finish, and `rollback` is the only one of the three that reverses a write —
+  and it only works once the entry has closed. A stopped run and a crashed one
+  both close `failed`, so the *record* rather than the status is what a reader
+  has to be given. Each action names itself in **one exported constant**
+  (`STOP_ACTION_LABEL`, `ABANDON_ACTION_LABEL`) used by both the button and any
+  copy that sends a reader to look for it, since a control named by an
+  unattached string goes stale the first time somebody rewords the button —
+  which is also why `RUNNING_ACTIONS_HINT`, the line that gives each of the two
+  its situation, is rendered **only while both buttons are on screen**: it names
+  each by its own label, and beside a control that is no longer offered it would
+  point at nothing. Each
+  confirm's copy is an exported array (`STOP_CONFIRM`, `ABANDON_CONFIRM`) rather
+  than JSX, because the harness renders no components and a claim made inside
+  one is a claim nothing checks. **Every line of that copy has to be something
+  the system delivers**, including the awkward one: what checks the kill switch
+  today is a provider call, the deterministic jobs make none, so a run of those
+  finishes even after a stop — the confirm says so, and
+  `tests/test_consolidate.py` fails when that stops being true. Neither stop nor
+  abandon is offered on an entry it cannot act on, and a stop already recorded
+  gives way to the record: the service makes a second stop a *no-op* so a human
+  pressing twice never doubts the first press, and a button that provably
+  changes nothing would put that doubt back on the screen.
   A **rollback confirm** has one hard rule: a 409 carries a `conflicts` list,
   and each conflict names *both* ends of a collision — the cycle's event and the
   later one that moved the row. Render both. A count, or the server's message

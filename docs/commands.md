@@ -262,6 +262,13 @@ does not resolve). With no provider configured the refusal names
   with the id already filled in — the `rollback` refusal, and the "a
   consolidation cycle is already running" that now blocks *every* later run
   rather than only the ones in the same process.
+- `cycle-stop <id>` — Ask a **running** cycle to stop: the kill switch.
+  Human-only. It records who asked and when, and changes nothing else — the
+  entry stays `running`, and the run closes its own entry `failed` when it
+  next checks. Asking twice keeps the first asker rather than raising, so
+  pressing it again is never ambiguous; a cycle that has said how it ended is
+  refused, since nothing is left to obey it. See *stop, abandon, rollback*
+  below for which of the three you want.
 - `rollback <cycle-id>` — Take a whole cycle back, all of it or none of it.
   `--dry-run` reports what would be reversed and what stands in the way.
   Human-only. A review the cycle performed is part of "the whole of it":
@@ -289,6 +296,29 @@ does not resolve). With no provider configured the refusal names
   on stderr. `unchanged` never affects it. **A `--dry-run` exits 0 whatever it
   predicts** — every check a real run makes runs on the rehearsal, so its
   `skipped` is accurate, but nothing was attempted there and nothing was lost.
+
+**Stop, abandon, rollback — three verbs, three different situations.** They all
+end up near a `failed` journal entry, which is exactly why they are worth
+keeping straight.
+
+| You want to | Run | What it does | What it does *not* do |
+|---|---|---|---|
+| Wind down a run that is going right now | `cycle-stop <id>` | Records who asked and when. The entry stays `running`; the run closes its own entry `failed` when it next checks. | Close the entry. Reverse anything. |
+| Close the entry of a run that is never going to finish | `cycle-abandon <id>` | Closes it `failed` from outside, with a report naming who closed it — which is what makes its writes reversible at all. | Stop a process. Reverse anything. |
+| Take back what a closed cycle wrote | `rollback <cycle-id>` | Reverses every event the cycle wrote, all of it or none of it. | Work on a cycle that has not closed. |
+
+The order is the order: a run you stopped closes itself, and then you can roll it
+back. A run a `SIGKILL` ended never closes itself, so you abandon it first and
+roll it back after. **Neither stop nor abandon reverses a single write** —
+stopping and undoing are two decisions, and a switch that did both would make
+"stop, look at what it did, then decide" impossible.
+
+`cycle-stop` records an instruction; what obeys it is the run. Today the only
+check is the one immediately before a model call, so a run of the **four
+deterministic jobs** — which make none — finishes even after you stop it, with
+the stop kept on the entry. The switch is worth having now because it is the
+model-spending half it was built to bound, and the entry says who asked and when
+whichever way the run ended.
 
 The writes a cycle makes are the **gardener's** (`agent:builtin-gardener`), an
 internal agent seeded with `read` on `meta` and `edit` on `main` as ordinary

@@ -248,7 +248,7 @@ type-checking it and driving it in a browser.
 | `src/views/editor/` | CodeMirror-6 Markdown source editor, slash commands, `[[` autocomplete, live Mermaid preview, autosave, the write-target picker and the landing/refusal copy (`createOutcome.ts`) |
 | `src/views/search/` | query box, ranked hits, per-signal breakdown, signal grouping, the space filter + show-meta toggle in the URL (`searchState.ts`), refused-filter copy (`spaceFailure.ts`), when a row names its space (`resultSpace.ts`) |
 | `src/views/review/` | proposal queue grouped space → agent, per-kind cards, proposed-version diffs, self-governing space sections, cross-space edge marking (`grouping.edgeCrossing`), and the pager over it (`grouping.sectionOrder` / `restrictToPage`, over `lib/pageWindow`) with the honest count above it (`grouping.queueCount`) |
-| `src/views/journal/` | the dream journal: cycles as sentences, one entry with its job report, the five coherence metrics before/after, the events it wrote as a paged diff, the run-now control, the abandon confirm for a cycle a crash left `running`, and the dry-run-then-confirm rollback — whose verdict is **two** lists, `conflicts` and `blockers`, and is clean only when both are empty (`journal.ts` owns every sentence and every reading of the untyped `report` blob; `useNodeTitles.ts` names the nodes an edge event points at) |
+| `src/views/journal/` | the dream journal: cycles as sentences, one entry with its job report, the five coherence metrics before/after, the events it wrote as a paged diff, the run-now control, the **stop** confirm for a run that is still going and the **abandon** confirm for one a crash left `running` (three verbs, three situations: a stop is an instruction a live run obeys, an abandon closes a dead run's entry from outside, and only the rollback reverses a write — a stopped run and a crashed one both close `failed`, so the entry renders who asked for the stop and when), and the dry-run-then-confirm rollback — whose verdict is **two** lists, `conflicts` and `blockers`, and is clean only when both are empty (`journal.ts` owns every sentence and every reading of the untyped `report` blob; `useNodeTitles.ts` names the nodes an edge event points at) |
 | `src/views/graph/` | Cytoscape subgraph render, filters, cross-space edge styling and far-endpoint dimming, path panel |
 | `src/views/assets/` | rendition grid, lightbox, the ingesting drop-zone with its queue readout (`uploadOutcome.ts`) and its bookkeeping (`uploadQueue.ts` — batches, status labels, the refused second drop, the per-batch announcement), thin JSON export |
 | `src/views/login/` | password login against `POST /api/login` |
@@ -415,17 +415,20 @@ Conventions that hold across the tree:
 ## The API client
 
 `src/api/client.ts` is the only place that calls `fetch`. It covers the whole
-Phase-3 endpoint surface plus the five consolidation-cycle routes, typed, and
+Phase-3 endpoint surface plus the six consolidation-cycle routes, typed, and
 every route it names is served by `nodum.http_api`.
 
 What it handles for you:
 
-- covers the **five** consolidation-cycle routes, `POST /api/cycles/{id}/abandon`
+- covers the **six** consolidation-cycle routes, `POST /api/cycles/{id}/abandon`
   included — the door out of a cycle a crash left `running`, and the
   precondition for the rollback route rather than a tidier journal: rollback
   refuses a cycle that has not closed and `undo` refuses every event a cycle
   stamped, so until the row is closed the run's writes are irreversible on every
-  surface;
+  surface — and `POST /api/cycles/{id}/stop`, which takes that route's shape and
+  is deliberately not it: a stop leaves the row `running` and stamps who asked
+  and when, because a repair performed on a dead process and an instruction
+  obeyed by a live run are two facts the journal has to keep apart;
 - prefixes `/api` (`getHealth` is the one exception — `/healthz` sits outside);
 - unwraps the `{"<plural>": [...], "count": n}` list envelope, so list calls
   return a plain array;

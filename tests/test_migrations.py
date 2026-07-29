@@ -1088,9 +1088,9 @@ def test_a_database_recorded_at_0015_without_the_columns_is_refused(tmp_path, mo
     `0015`'s is as checkable as they come — two columns, or the switch has
     nowhere to write. Without the entry the drift would surface where the four
     earlier ones used to: deep inside a write, as `no such column` raised by the
-    very call a human made to stop a run. `stop_switch_available()` gates on the
-    *service function* existing, which it does on any install carrying this
-    code, so it would read `armed` over a database that cannot store a stop.
+    very call a human made to stop a run. Nothing in the runtime catches it
+    first: `LLMReport.stop_switch` reports the posture a *run* had, so a cycle
+    over such a database reads `armed` right up to the failed write.
     """
     _at_0014(tmp_path, monkeypatch, "stale.db")
     conn = db.connect()

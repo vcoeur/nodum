@@ -814,20 +814,20 @@ def test_a_space_archived_mid_run_does_not_make_its_cycle_unstoppable(fresh_db):
 
 
 def test_the_stop_switch_is_armed_and_the_runtime_reads_the_real_service(fresh_db):
-    """The gate's other branch, driven against the shipped service rather than a fake.
+    """The runtime driven against the shipped service rather than against a fake.
 
     `nodum.agent.cycle_stop_check` was written blind against this interface and
     resolved to "keep going" while `service.stop_requested` did not exist;
-    `tests/test_agent.py` covers that branch by installing a fake under
-    `SERVICE_STOP_READ`, because the tree it was written in could not express
+    `tests/test_agent.py` reached the armed branch by installing a fake over a
+    name that was not there, because the tree it was written in could not express
     the real one. This is the real one: no fake, no monkeypatch, one row, and
     the check re-read after the switch is hit — a check that answered from a
     value taken at the top of the run would be a kill switch that cannot be hit
-    after the run starts, which is the only time anyone hits one.
+    after the run starts, which is the only time anyone hits one. What is left to
+    a fake over there is the call shape, and it now goes over the real function.
     """
     gardener = auth.internal_principal()
     cycle = _running(gardener)
-    assert agent_runtime.stop_switch_available() is True
 
     check = agent_runtime.cycle_stop_check(cycle.id, principal=gardener)
     assert check() is False

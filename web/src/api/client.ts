@@ -1353,6 +1353,37 @@ export function abandonCycle(id: string, signal?: AbortSignal): Promise<CycleOut
 }
 
 /**
+ * `POST /api/cycles/{id}/stop` — ask a running cycle to stop (the kill switch).
+ *
+ * **Not {@link abandonCycle}, and not a softer version of it.** Abandoning is a
+ * repair: a human closing a dead process's entry from *outside*, which is what
+ * makes its writes reversible. This is an instruction to a run that is still
+ * alive — the row comes back still `running`, with `stop_requested_by` and
+ * `stop_requested_at` stamped on it, and the run closes its own entry when it
+ * notices. The journal keeps the two apart because a `failed` cycle read the
+ * next morning has to say whether the operator stopped it or the process died.
+ *
+ * It reverses nothing: every write the run already made stays in the graph,
+ * stamped with the cycle, and {@link rollbackCycle} is what takes those back
+ * once the entry has closed.
+ *
+ * Takes no body. It refuses a cycle that is not `running` with
+ * `InvalidTransition` (**400**) — nothing is left to obey it — and an unknown id
+ * with `RecordNotFound` (**404**). A **second** stop is a **200** that keeps the
+ * first asker rather than a refusal, so a human who presses twice is never left
+ * wondering whether the first press worked.
+ *
+ * @param id The cycle to stop.
+ * @returns The cycle row, still `running`, now carrying the stop.
+ */
+export function requestCycleStop(id: string, signal?: AbortSignal): Promise<CycleOut> {
+  return request<CycleOut>(`/cycles/${encodeURIComponent(id)}/stop`, {
+    method: "POST",
+    ...(signal ? { signal } : {}),
+  });
+}
+
+/**
  * `POST /api/cycles/{id}/rollback` — take a whole cycle back (design D7).
  *
  * **Call it with `dryRun` first.** A dry run opens no cycle, writes nothing, and
@@ -1474,6 +1505,7 @@ export const api = {
   getCycle,
   runCycle,
   abandonCycle,
+  requestCycleStop,
   rollbackCycle,
   listEvents,
   undo,

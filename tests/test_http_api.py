@@ -3205,6 +3205,46 @@ def test_an_interrupted_cycle_is_abandoned_over_http_and_only_then_rolled_back(c
     assert client.post("/api/cycles/nope/abandon", json={}).status_code == 404
 
 
+def test_the_kill_switch_is_a_route_and_it_is_not_the_abandon_route(client, fresh_db):
+    """``POST /api/cycles/{id}/stop`` — the browser half of the kill switch (K1).
+
+    ``service.request_stop`` shipped with migration ``0015`` and no route reached
+    it, on the one surface that displays a running cycle. It takes the shape of
+    ``/abandon`` — bodyless verb-POST, the cycle row back, 400 on a cycle that is
+    not ``running``, 404 on an unknown id — and behaves like nothing else on it:
+    the entry stays **running** and the run's writes are untouched. A stop that
+    closed the row would be an abandon under another name, and the journal exists
+    to keep "the operator stopped this" apart from "this process died".
+    """
+    cycle = service.open_cycle(trigger="manual", principal=owner())
+    with service.in_cycle(cycle.id):
+        node = service.create_node(type="claim", title="Half-written", principal=owner())
+
+    stopped = _ok(client.post(f"/api/cycles/{cycle.id}/stop", json={}))
+
+    assert stopped["status"] == "running"
+    assert stopped["stop_requested"] is True
+    assert stopped["stop_requested_by"] == OWNER_ACTOR
+    assert stopped["stop_requested_at"] is not None
+    # Nothing was reversed and nothing was closed — the two things it must not do.
+    assert stopped["report"] is None
+    assert client.get(f"/api/nodes/{node.id}").status_code == 200
+    assert _ok(client.get(f"/api/cycles/{cycle.id}"))["cycle"]["stop_requested"] is True
+
+    # Asking twice keeps the first asker, and answers 200 rather than refusing:
+    # a switch that raised on the second press would make a human doubt the first.
+    again = _ok(client.post(f"/api/cycles/{cycle.id}/stop", json={}))
+    assert again["stop_requested_at"] == stopped["stop_requested_at"]
+
+    # And the two verbs stay apart on the wire: a cycle that has said how it
+    # ended has nothing left to obey a stop.
+    _ok(client.post(f"/api/cycles/{cycle.id}/abandon", json={}))
+    refused = client.post(f"/api/cycles/{cycle.id}/stop", json={})
+    assert refused.status_code == 400
+    assert "not running" in refused.json()["error"]["message"]
+    assert client.post("/api/cycles/nope/stop", json={}).status_code == 404
+
+
 def test_a_refused_rollback_is_a_409_that_names_the_rows(client, fresh_db):
     """Decision C4 over the wire: it refuses rather than clobbers, and says what.
 

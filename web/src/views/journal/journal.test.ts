@@ -80,8 +80,14 @@ import {
   rollbackPlan,
   rollbackRefusal,
   rowHeadlines,
+  RUNNING_ACTIONS_HINT,
   SCOPE_CONTROL_HINT,
   shortId,
+  STOP_ACTION_LABEL,
+  STOP_CONFIRM,
+  stopAvailability,
+  stopOutcome,
+  stopRecord,
   verdictNodeIds,
 } from "./journal";
 
@@ -122,9 +128,15 @@ function cycle(overrides: Partial<CycleOut> = {}): CycleOut {
     started_at: "2026-07-27 02:00:00",
     finished_at: "2026-07-27 02:00:12",
     rolled_back_by: null,
+    stop_requested: false,
+    stop_requested_by: null,
+    stop_requested_at: null,
     ...overrides,
   };
 }
+
+/** What `cycles.stop_requested_at` looks like: SQLite's UTC, with no zone marker. */
+const STOPPED_AT = "2026-07-27 02:00:07";
 
 /** One job outcome as the runner dumps it into `report.jobs`. */
 function job(name: string, overrides: JsonObject = {}): JsonObject {
@@ -998,6 +1010,64 @@ describe("cycleCaveats", () => {
     expect(lines).toContain("rollback");
   });
 
+  it("tells a stopped run apart from a run that fell over, in the one status they share", () => {
+    // The question the kill switch exists to keep answerable: a human reading a
+    // `failed` cycle at 09:00 has to know whether the operator stopped that run
+    // or the process died. A stopped run closes itself `failed`, so the status
+    // cannot answer it — read without the stop this caveat called an obeyed
+    // instruction a fault.
+    const stopped = cycleCaveats(
+      cycle({
+        status: "failed",
+        report: report(A_NIGHT),
+        stop_requested: true,
+        stop_requested_by: "human:owner",
+        stop_requested_at: STOPPED_AT,
+      }),
+    ).join(" ");
+    expect(stopped).toContain("a stop was asked for on it");
+    expect(stopped).toContain("rather than a fault");
+    expect(stopped).toContain("is real and stays");
+    // And a cycle that really did fall over is still described as one.
+    const failed = cycleCaveats(cycle({ status: "failed", report: report(A_NIGHT) })).join(" ");
+    expect(failed).not.toContain("rather than a fault");
+    expect(failed).toContain("before the failure");
+  });
+
+  it("says a stop on a running entry has reversed nothing and closed nothing", () => {
+    const said = cycleCaveats(
+      cycle({
+        status: "running",
+        finished_at: null,
+        report: null,
+        stop_requested: true,
+        stop_requested_by: "human:owner",
+        stop_requested_at: STOPPED_AT,
+      }),
+    ).join(" ");
+    expect(said).toContain("Still running");
+    expect(said).toContain("A stop has been asked for");
+    expect(said).toContain("reverses anything");
+  });
+
+  it("does not read a completed run that was stopped as a failure", () => {
+    // Reachable today and not an edge case: the deterministic jobs make no
+    // provider call and so no stop check, so a cycle stopped mid-run finishes
+    // and closes `completed` carrying the stamp. A caveat that read alarm into
+    // that would be describing the opposite of what happened.
+    const said = cycleCaveats(
+      cycle({
+        report: report(A_NIGHT),
+        stop_requested: true,
+        stop_requested_by: "human:owner",
+        stop_requested_at: STOPPED_AT,
+      }),
+    ).join(" ");
+    expect(said).toContain("completed anyway");
+    expect(said).toContain("noticed at the next check");
+    expect(said).not.toContain("failed");
+  });
+
   it("composes, because a failed rehearsal is both", () => {
     expect(
       cycleCaveats(
@@ -1101,6 +1171,152 @@ describe("abandonOutcome", () => {
     expect(said).toContain("closed as failed");
     expect(said).toContain("Nothing it wrote has changed");
     expect(said).toContain("rolled back now");
+    expect(said).not.toMatch(BARE_ID);
+  });
+});
+
+describe("stopAvailability", () => {
+  it("offers the kill switch on a running cycle nobody has stopped yet", () => {
+    // `service.request_stop` and migration `0015` both shipped and no surface
+    // reached either — the door-nothing-opens defect, on the one screen that
+    // displays a running cycle.
+    expect(stopAvailability(cycle({ status: "running", finished_at: null }))).toEqual({
+      available: true,
+      reason: null,
+    });
+  });
+
+  it("refuses a cycle that has already said how it ended, and says a stop needs a live run", () => {
+    for (const status of ["completed", "failed", "rolled_back"]) {
+      const verdict = stopAvailability(cycle({ status }));
+      expect(verdict.available).toBe(false);
+      expect(verdict.reason).toContain(`closed ${status}`);
+      expect(verdict.reason).toContain("instruction to a live run");
+    }
+  });
+
+  it("gives way to the record once a stop is already on the entry", () => {
+    // The service makes a second stop a *no-op* rather than an error, so that a
+    // human pressing twice never doubts the first press. Re-offering the button
+    // would re-create that doubt on the screen: it would change nothing and say
+    // nothing. What replaces it is who asked, which is more than a second press
+    // would have told anybody.
+    const verdict = stopAvailability(
+      cycle({
+        status: "running",
+        finished_at: null,
+        stop_requested: true,
+        stop_requested_by: "human:owner",
+        stop_requested_at: STOPPED_AT,
+      }),
+    );
+    expect(verdict.available).toBe(false);
+    expect(verdict.reason).toContain("already been asked for");
+    expect(verdict.reason).toContain("first asker");
+  });
+});
+
+describe("RUNNING_ACTIONS_HINT", () => {
+  it("names both controls by the strings the controls render", () => {
+    // A `running` entry offers two irreversible verbs that look alike, and
+    // nothing on the page can tell a human which one they want — whether the
+    // process behind the row is alive is not a fact the server has. So the copy
+    // states both situations, and it names each control through its own exported
+    // label so a reworded button cannot leave this sentence pointing at nothing.
+    expect(RUNNING_ACTIONS_HINT).toContain(STOP_ACTION_LABEL);
+    expect(RUNNING_ACTIONS_HINT).toContain(ABANDON_ACTION_LABEL);
+  });
+
+  it("gives each verb its situation, and says what neither of them does", () => {
+    expect(RUNNING_ACTIONS_HINT).toContain("going right now");
+    expect(RUNNING_ACTIONS_HINT).toContain("never going to finish");
+    expect(RUNNING_ACTIONS_HINT).toContain("Neither reverses anything");
+    expect(RUNNING_ACTIONS_HINT).toContain("rolling the cycle back");
+  });
+});
+
+describe("stopRecord", () => {
+  it("names who asked without spelling their actor string, and hands the time back raw", () => {
+    // The *when* stays the server's string on purpose: SQLite writes
+    // `datetime('now')` with no zone marker, so it goes through `lib/time` in
+    // the view and must never meet `new Date()` here.
+    const record = stopRecord(
+      cycle({
+        status: "running",
+        finished_at: null,
+        stop_requested: true,
+        stop_requested_by: "human:owner",
+        stop_requested_at: STOPPED_AT,
+      }),
+    );
+    expect(record).toEqual({ by: "owner", at: STOPPED_AT });
+  });
+
+  it("is null for a run nobody asked to stop", () => {
+    expect(stopRecord(cycle())).toBeNull();
+  });
+
+  it("still names somebody if a stamp ever arrives without a requester", () => {
+    // The server's CHECK constraint makes this unstorable, and the branch exists
+    // anyway: every read of this wire is defensive, and "null asked this run to
+    // stop" is the sentence that would otherwise reach a screen.
+    const record = stopRecord(
+      cycle({ stop_requested: true, stop_requested_by: null, stop_requested_at: STOPPED_AT }),
+    );
+    expect(record?.by).toBe("Somebody");
+  });
+});
+
+describe("STOP_CONFIRM", () => {
+  it("says outright that it reverses nothing", () => {
+    const said = STOP_CONFIRM.join(" ");
+    expect(said).toContain("does not reverse anything");
+    expect(said).toContain("stays in the graph");
+    expect(said).toContain("Rolling the cycle back afterwards");
+  });
+
+  it("says it is not an abandon, and names the control that is", () => {
+    // The two misreadings this button sits between. A reader who takes a stop
+    // for a gentler abandon will use it on a run nothing is going to finish,
+    // where it does nothing at all — so the confirm points at the other control
+    // by the same string that control renders.
+    const said = STOP_CONFIRM.join(" ");
+    expect(said).toContain("not abandoning");
+    expect(said).toContain("a live run obeys");
+    expect(said).toContain(ABANDON_ACTION_LABEL);
+  });
+
+  it("admits the deterministic jobs will not notice it", () => {
+    // The line that costs something and is said anyway. `AgentRun.chat` checks
+    // the switch before a provider call and that is the only check there is, so
+    // a stop asked for during a deterministic cycle is recorded and that run
+    // finishes. Promising a wind-down that would not arrive is the copy defect
+    // this module exists to prevent — and
+    // `test_the_deterministic_runner_consults_no_stop_switch_and_the_copy_says_so`
+    // is what keeps this sentence answerable to the runner.
+    const said = STOP_CONFIRM.join(" ");
+    expect(said).toContain("deterministic jobs make none");
+    expect(said).toContain("finishes even after you stop it");
+  });
+
+  it("names no id and never says a space does not exist", () => {
+    const said = STOP_CONFIRM.join(" ").toLowerCase();
+    for (const phrase of FORBIDDEN) expect(said).not.toContain(phrase);
+    expect(STOP_CONFIRM.join(" ")).not.toMatch(BARE_ID);
+  });
+});
+
+describe("stopOutcome", () => {
+  it("reports the instruction and never the outcome", () => {
+    // The row comes back still `running`. A toast saying "stopped" would claim
+    // something about a run that is still writing, which is the one thing this
+    // screen cannot make good on.
+    const said = stopOutcome(
+      cycle({ status: "running", finished_at: null, stop_requested: true }),
+    );
+    expect(said).toContain("has been asked to stop");
+    expect(said).toContain("still running");
+    expect(said).toContain("nothing it wrote has changed");
     expect(said).not.toMatch(BARE_ID);
   });
 });

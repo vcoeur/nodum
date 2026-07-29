@@ -450,27 +450,44 @@ def test_a_run_with_no_stop_check_never_stops():
     assert run.report().stopped is False
 
 
-def test_the_stop_switch_is_not_wired_until_the_migration_lands():
-    """The runtime half is written; the column and its read are a later wave's.
+def test_a_run_reports_a_switch_it_has_and_says_so_when_it_has_none():
+    """:attr:`LLMReport.stop_switch`'s two postures, both reachable.
 
-    A journal entry must not imply a switch that was not wired: "no stop was
-    requested" and "no stop *could* be requested" are different facts.
+    The field exists so a journal entry never implies a switch that was not
+    wired. It used to hold a third value — ``STOP_SWITCH_PENDING``, "the column
+    is not in this database's schema yet" — which named a column that was never
+    called that (``stop_requested_at``), described a gate that keyed on the
+    service function rather than the column, and became unreachable the moment
+    migration ``0015`` landed. What is left is the distinction that is real: a
+    cycle has a row anyone can stamp, and a human's request has none.
     """
-    check = agent.cycle_stop_check("cycle-1", principal=GARDENER)
-    if agent.stop_switch_available():
-        pytest.skip("migration 0015 has landed; the gated branch no longer exists")
-    assert check() is False
-    run = agent.for_cycle(cycle_id="cycle-1", principal=GARDENER)
-    assert run.report().stop_switch == agent.STOP_SWITCH_PENDING
+    cycle_run = agent.for_cycle(cycle_id="cycle-1", principal=GARDENER)
+    assert cycle_run.stop is not None
+    assert cycle_run.report().stop_switch == agent.STOP_SWITCH_ARMED
+
+    request_run = agent.for_request(purpose="ask", principal=HUMAN)
+    assert request_run.stop is None, "there is no cycle row to stamp for a request"
+    assert request_run.report().stop_switch == agent.STOP_SWITCH_NONE
+    assert request_run.report().stopped is False
 
 
-def test_the_stop_check_reads_the_service_the_moment_that_read_exists(monkeypatch):
-    """The gate's other branch, which the shipped tree cannot reach today.
+def test_the_stop_check_forwards_what_it_was_given_and_re_reads_every_time(monkeypatch):
+    """:func:`cycle_stop_check`'s own contract: the call shape, and no caching.
 
-    A fixture that cannot express the behaviour is not coverage of it — so the
-    service read is installed here under the name :data:`nodum.agent.
-    SERVICE_STOP_READ` and the check is driven through it, which is exactly
-    what migration ``0015``'s wave will make real.
+    This fake used to be installed with ``raising=False`` over a name that did
+    **not exist** — the only way to reach the armed branch before migration
+    ``0015``. That made it a fixture standing in for the real thing rather than
+    a check on it, and it stayed that way after the real function landed, so the
+    test no longer covered what it was written for.
+
+    The fake now goes over the **real** ``service.stop_requested`` (``raising``
+    left at its default), which is what makes a renamed or re-signed service read
+    fail here instead of being silently shadowed. What it is still worth a fake
+    for is the call *shape* — the cycle id positional, ``principal`` and ``path``
+    forwarded verbatim, one fresh read per check. Whether the real service
+    answers correctly is asserted against a real database with no fake at all, in
+    ``tests/test_cycles.py::test_the_stop_switch_is_armed_and_the_runtime_reads_
+    the_real_service``.
     """
     asked: list[tuple[str, Principal, Any]] = []
 
@@ -478,16 +495,12 @@ def test_the_stop_check_reads_the_service_the_moment_that_read_exists(monkeypatc
         asked.append((cycle_id, principal, path))
         return len(asked) > 1
 
-    monkeypatch.setattr(agent.service, agent.SERVICE_STOP_READ, stop_requested, raising=False)
-    assert agent.stop_switch_available() is True
+    monkeypatch.setattr(agent.service, "stop_requested", stop_requested)
 
     check = agent.cycle_stop_check("cycle-1", principal=GARDENER, path="/tmp/x.db")
     assert check() is False
-    assert check() is True
-    assert asked[0] == ("cycle-1", GARDENER, "/tmp/x.db")
-
-    run = agent.for_cycle(cycle_id="cycle-1", principal=GARDENER)
-    assert run.report().stop_switch == agent.STOP_SWITCH_ARMED
+    assert check() is True, "a cached answer would be a switch nobody can hit mid-run"
+    assert asked == [("cycle-1", GARDENER, "/tmp/x.db")] * 2
 
 
 def test_the_kill_switch_is_not_a_reuse_of_abandon_cycle():
