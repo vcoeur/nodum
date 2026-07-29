@@ -20,7 +20,7 @@ from pathlib import Path
 import typer
 from pydantic import BaseModel
 
-from nodum import __version__, assets, auth, db, extract, ingest, projectors, service, urls
+from nodum import __version__, answers, assets, auth, db, extract, ingest, projectors, service, urls
 from nodum import consolidate as consolidate_module
 from nodum import search as search_module
 from nodum.assets import AssetNotFound, AssetSourceChanged, AssetTooLarge, UnsupportedRendition
@@ -63,6 +63,7 @@ asset_app = typer.Typer(
 ingest_app = typer.Typer(
     no_args_is_help=True, help="Ingestion: files and URLs in, reviewable subgraphs out."
 )
+llm_app = typer.Typer(no_args_is_help=True, help="The language-model provider this install uses.")
 app.add_typer(node_app, name="node")
 app.add_typer(edge_app, name="edge")
 app.add_typer(projector_app, name="projector")
@@ -72,6 +73,7 @@ app.add_typer(agent_app, name="agent")
 app.add_typer(mcp_app, name="mcp")
 app.add_typer(asset_app, name="asset")
 app.add_typer(ingest_app, name="ingest")
+app.add_typer(llm_app, name="llm")
 
 
 @app.callback(invoke_without_command=True)
@@ -544,7 +546,14 @@ def list_types(as_human: str = AS_OPTION) -> None:
 
 @app.command()
 def search(
-    query: str = typer.Argument(..., help="Free-text query; terms are ANDed."),
+    query: str = typer.Argument(
+        ...,
+        help=(
+            "Free-text query. Terms are ORed under a quorum: a node matches when the terms it "
+            "carries are worth at least half the query's discriminating weight, so a question "
+            "keeps working when the graph does not hold every one of its words."
+        ),
+    ),
     k: int = typer.Option(10, "--k", help="Maximum hits."),
     state: str = typer.Option(
         "active", "--state", help="Node-state filter ('any' searches all states)."
@@ -562,6 +571,11 @@ def search(
     expand: bool = typer.Option(
         False, "--expand", help="Append one-hop active-edge neighbors of the hits."
     ),
+    nl: bool = typer.Option(
+        False,
+        "--nl",
+        help="Let the model rewrite the question into search terms first (needs a provider).",
+    ),
     as_human: str = AS_OPTION,
 ) -> None:
     """Hybrid-search node title + content (BM25 + vector, RRF-fused).
@@ -569,22 +583,117 @@ def search(
     The vector signal participates when an embedding provider is available
     (fastembed installed and the model cached; otherwise search silently
     degrades to BM25). `signals` on each hit names what contributed.
+
+    `--nl` layers a model-written query on top (design E3) and adds a `rewrite`
+    object to the envelope saying what was asked on your behalf. It is a rewrite
+    of the *words*, not of the retrieval: every signal, filter and cap below it
+    is unchanged, and with no provider it is a no-op that says so and searches
+    your own words.
     """
-    result = _run(
-        search_module.search,
-        query,
-        k=k,
-        state=None if state == "any" else state,
-        type=type,
-        created_by=created_by,
-        created_after=created_after,
-        created_before=created_before,
-        include_meta=include_meta,
-        space=space,
-        expand=expand,
-        principal=_principal(as_human),
+    shared = {
+        "k": k,
+        "state": None if state == "any" else state,
+        "type": type,
+        "created_by": created_by,
+        "created_after": created_after,
+        "created_before": created_before,
+        "include_meta": include_meta,
+        "space": space,
+        "expand": expand,
+        "principal": _principal(as_human),
+    }
+    search_call = answers.natural_search if nl else search_module.search
+    _emit(_run(search_call, query, **shared))
+
+
+@app.command()
+def ask(
+    question: str = typer.Argument(..., help="What you want answered, in your own words."),
+    k: int = typer.Option(
+        answers.DEFAULT_ASK_K, "--k", help="Nodes to retrieve and put in front of the model."
+    ),
+    space: str | None = SPACE_FILTER_OPTION,
+    as_human: str = AS_OPTION,
+) -> None:
+    """Answer a question from the graph, with citations, or say it could not.
+
+    One retrieval and one model call. **It writes nothing** (design E1), and
+    `answered` is computed from citations that resolve to nodes you can read —
+    never from the model's own claim to have answered, which was measured
+    coming back `true` for a question its context could not answer.
+
+    An unanswered question is an ordinary result and exit 0, not an error: the
+    envelope carries `answered: false`, a `refusal` saying why, `unresolved`
+    listing anything the model cited that does not exist, and `used` saying what
+    the attempt cost. With no provider configured the refusal names
+    `NODUM_LLM_MODEL`.
+    """
+    _emit(
+        _run(
+            answers.ask,
+            question,
+            k=k,
+            space=space,
+            principal=_principal(as_human),
+        )
     )
-    _emit(result)
+
+
+@app.command()
+def summarize(
+    node_id: str = typer.Argument(..., help="Node at the centre of the region to summarise."),
+    depth: int = typer.Option(
+        answers.DEFAULT_SUMMARY_DEPTH, "--depth", help="Hops of neighbourhood to include."
+    ),
+    as_human: str = AS_OPTION,
+) -> None:
+    """Summarise a node and its neighbourhood. Reads only.
+
+    The subgraph is the bound, and it is read whether or not a provider is
+    configured — so a node that does not resolve is the ordinary not-found
+    refusal rather than a complaint about the model.
+
+    Design E1 sketches an opt-in flag that files the summary as a reviewable
+    `proposed` version. It is deliberately absent here: 5b-i is cut exactly at
+    the line where a model call causes a write.
+    """
+    _emit(
+        _run(
+            answers.summarize,
+            node_id,
+            depth=depth,
+            principal=_principal(as_human),
+        )
+    )
+
+
+@llm_app.command("status")
+def llm_status(
+    probe: bool = typer.Option(
+        True, "--probe/--no-probe", help="Make one small call to see whether the endpoint answers."
+    ),
+    as_human: str = AS_OPTION,
+) -> None:
+    """Say whether a model provider is configured, and whether it answers.
+
+    **Two different facts, reported apart.** `configured` comes from the
+    environment and costs nothing; `reachable` costs one small call, because
+    that is the only thing that can answer it. `nodum.llm` deliberately makes no
+    network call while resolving, so a server that is down at 03:00 and up at
+    03:05 is not a configuration change — and `reachable` is therefore
+    *tri-state*: `null` means the question was not asked, either because nothing
+    is configured to ask or because `--no-probe` declined it.
+
+    The probe is cheap in the case that matters: nothing listening is a refused
+    connection in well under a millisecond, and a model the server does not have
+    is an HTTP 404 in about one. It goes through the same runtime every other
+    model call does, which is why it takes `--as`: a command that spent a call
+    with nobody named would be the one unattributed spend in this system.
+
+    Nothing here is an error. An install with no provider is a perfectly good
+    install — the smart features are off — so this exits 0 and says so.
+    """
+    _emit(_run(answers.provider_status, principal=_principal(as_human), probe=probe))
 
 
 @app.command(name="suggest-links")

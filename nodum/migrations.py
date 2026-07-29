@@ -893,6 +893,65 @@ INSERT INTO grants (agent_id, space_id, level) VALUES
 """
 
 
+CYCLE_STOP_SWITCH_DDL = """
+-- The kill switch's row (Phase 5b, design K1-K3). `nodum cycle-stop <id>` typed
+-- at a terminal has to stop a cycle running inside `nodum serve`, and those are
+-- two interpreters -- so the stop is a **row rather than a process signal**, for
+-- the same reason 0014's one-running-consolidation guard is an index rather than
+-- a module-level lock. The runner reads it between jobs, between items, and
+-- immediately before every provider call (`nodum.agent.cycle_stop_check`).
+--
+-- It is deliberately **not** a reuse of `abandon_cycle`. That verb is a repair
+-- -- a human declaring somebody else's dead process dead -- and this is an
+-- instruction to a live run which is expected to notice and wind down honestly.
+-- A journal that could not tell "the operator stopped this" from "this process
+-- died" would fail the human reading a `failed` cycle at 09:00, so the two facts
+-- get different columns and different verbs.
+--
+-- **Two columns and no boolean flag.** `nodum.agent.cycle_stop_check`'s
+-- docstring proposes `stop_requested INTEGER NOT NULL DEFAULT 0` beside the two
+-- stamps; checked against the table it describes, that is one column too many.
+-- `cycles` already separates facts fixed when the row is inserted (`trigger`,
+-- `dry_run`, `status`, `started_at` -- NOT NULL, with defaults) from facts that
+-- arrive later, and every one of the second kind is a nullable column whose
+-- presence *is* the flag: `finished_at`, `report`, `rolled_back_by`. Nothing in
+-- this table carries a boolean beside a nullable stamp for the same event. A
+-- stop is the second kind, so it is written the way the table already writes
+-- them.
+--
+-- The flag would also be a fourth instance of the defect class this phase has
+-- recorded three times already (`merge_redirects`, `versions.state`, the
+-- rollback findings): state that a later reader has to reconcile with the record
+-- beside it. `stop_requested = 1` with no `stop_requested_by` is a stop nobody
+-- asked for, and SQLite's ALTER TABLE cannot add the table-level CHECK that
+-- would forbid it -- the alternative being a create-copy-drop-rename rebuild of
+-- a table on every install, to buy a column that answers `stop_requested_at IS
+-- NOT NULL`. `CycleOut.stop_requested` is that expression, computed on every
+-- read and stored nowhere, exactly as `CycleDetailOut.metrics` projects the
+-- report rather than copying it.
+--
+-- The one disagreement two columns can still have -- a requester with no time,
+-- or a time with no requester -- is closed by a CHECK, which `ALTER TABLE ...
+-- ADD COLUMN` *does* accept, cross-column and named. The name is the message
+-- SQLite prints (`CHECK constraint failed: <name>`), the same device 0014 uses
+-- for its reserved-prefix abort, because `RAISE()` is trigger-only here.
+--
+-- Both columns are pure additions with no back-fill: every existing row is a
+-- cycle nobody asked to stop, which is what two NULLs say. So an upgrade over a
+-- populated database rewrites nothing, and a database that somehow records this
+-- migration without the columns is repairable in place by re-running these two
+-- statements -- which is what `db._cycle_stop_problems` prints.
+--
+-- `stop_requested_at` is deliberately not cleared when the cycle closes: a
+-- journal entry has to go on saying that this night was stopped and by whom
+-- long after the run that obeyed it has ended.
+ALTER TABLE cycles ADD COLUMN stop_requested_at TEXT;
+ALTER TABLE cycles ADD COLUMN stop_requested_by TEXT
+    CONSTRAINT "a stop records who asked and when, or neither"
+    CHECK ((stop_requested_by IS NULL) = (stop_requested_at IS NULL));
+"""
+
+
 #: Ordered (name, SQL) migrations. Append-only — never edit a shipped entry.
 MIGRATIONS: list[tuple[str, str]] = [
     ("0001_core", CORE_DDL),
@@ -909,4 +968,5 @@ MIGRATIONS: list[tuple[str, str]] = [
     ("0012_url_tokens", URL_TOKENS_DDL),
     ("0013_unique_space_titles", UNIQUE_SPACE_TITLES_DDL),
     ("0014_cycles_and_gardener", CYCLES_AND_GARDENER_DDL),
+    ("0015_cycle_stop_switch", CYCLE_STOP_SWITCH_DDL),
 ]

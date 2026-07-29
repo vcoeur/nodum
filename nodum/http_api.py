@@ -146,7 +146,7 @@ from starlette.responses import FileResponse, JSONResponse, Response, StreamingR
 from starlette.routing import Match, Route
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from nodum import assets, auth, consolidate, db, ingest, scheduler, service, urls
+from nodum import answers, assets, auth, consolidate, db, ingest, scheduler, service, urls
 from nodum import search as search_module
 from nodum.assets import (
     AssetNotFound,
@@ -1231,6 +1231,24 @@ def _optional_str(body: dict[str, Any], key: str) -> str | None:
     return value
 
 
+def _optional_int(body: dict[str, Any], key: str, *, default: int) -> int:
+    """Return an optional integer body field, defaulting when absent or null.
+
+    :func:`_required_int` with a default, and it refuses ``bool`` for the same
+    reason: ``true`` as a result cap is a caller mistake and not a number.
+
+    Raises:
+        ValueError: If the key is present, non-null, and not an integer, or does
+            not fit in a signed 64-bit integer.
+    """
+    value = body.get(key)
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"field {key!r} must be an integer")
+    return _bounded_int(value, key)
+
+
 def _optional_bool(body: dict[str, Any], key: str, *, default: bool = False) -> bool:
     """Return an optional boolean body field, defaulting when absent or null.
 
@@ -1373,6 +1391,29 @@ def _proposal_filters(source: Any) -> dict[str, Any]:
     if filters["created_by"] is None:
         filters["created_by"] = source.get("agent")
     return filters
+
+
+def _search_filters(params: QueryParams) -> dict[str, Any]:
+    """Everything ``GET /api/search`` narrows a query with, except the query.
+
+    An allowlist by construction, like :func:`_proposal_filters`: the keys are
+    written here and nothing a caller invents becomes an argument. It exists
+    because ``?nl=1`` sends the identical filters to a different function
+    (``answers.natural_search`` rather than ``search.search``), and two
+    hand-written argument lists that must stay identical are two argument lists
+    that will not.
+    """
+    return {
+        "k": _int_param(params, "limit", "k", default=10),
+        "state": _state_param(params),
+        "type": params.get("type"),
+        "created_by": params.get("created_by"),
+        "created_after": params.get("created_after"),
+        "created_before": params.get("created_before"),
+        "include_meta": _bool_param(params, "include_meta"),
+        "space": params.get("space"),
+        "expand": _bool_param(params, "expand"),
+    }
 
 
 def _selective_filters(body: dict[str, Any], action: str) -> dict[str, Any]:
@@ -1850,19 +1891,85 @@ def create_app(
     # ── Search and link suggestions ───────────────────────────────────────
 
     async def search(request: Request) -> Response:
-        """Hybrid search (BM25 + vector, RRF-fused) with optional graph expansion."""
+        """Hybrid search (BM25 + vector, RRF-fused) with optional graph expansion.
+
+        ``?nl=1`` layers a model-written query on top (design E3): the model
+        contributes search *terms*, and every ranked signal, filter and cap
+        below them is unchanged. The response then carries the ordinary result
+        plus a ``rewrite`` object saying what was asked on the human's behalf —
+        an **additive** shape, so a request without ``nl`` is byte-identical to
+        what it has always been and to what ``nodum search`` prints.
+
+        With no provider the rewrite is a no-op that says so and the search
+        still runs, which is E3's second reason for layering rather than
+        replacing: search must work without a model. The rewrite runs off the
+        event loop for the reason ``POST /api/cycles`` does — a model call is
+        seconds of work on this hardware and the loop is single-threaded.
+        """
         params = request.query_params
+        query = _required_param(params, "q", "query")
+        if _bool_param(params, "nl"):
+            natural = await run_in_threadpool(
+                answers.natural_search,
+                query,
+                **_search_filters(params),
+                principal=_session_principal(request),
+                path=db_path,
+            )
+            return EnvelopeResponse(envelope(natural))
         result = search_module.search(
-            _required_param(params, "q", "query"),
-            k=_int_param(params, "limit", "k", default=10),
-            state=_state_param(params),
-            type=params.get("type"),
-            created_by=params.get("created_by"),
-            created_after=params.get("created_after"),
-            created_before=params.get("created_before"),
-            include_meta=_bool_param(params, "include_meta"),
-            space=params.get("space"),
-            expand=_bool_param(params, "expand"),
+            query, **_search_filters(params), principal=_session_principal(request), path=db_path
+        )
+        return EnvelopeResponse(envelope(result))
+
+    async def ask(request: Request) -> Response:
+        """Answer a question from the graph, with citations, or say it could not.
+
+        **Nothing writes** (design E1), and ``answered`` is computed from
+        citations that resolve to nodes this session can read — never from the
+        model's own claim to have answered, which was measured returning
+        ``true`` for a question its context could not answer.
+
+        Every failure is a 200 carrying ``answered: false`` and a ``refusal``
+        sentence rather than a 5xx: a provider that is not configured, one that
+        cannot be reached, an output ceiling, a filled context, an exhausted
+        budget. The request was well formed and the install could not answer it,
+        which is an outcome and not an error — so one response shape covers
+        every way this can end and a client reads one field. A malformed
+        *request* (no question, a ``k`` below 1, a space that does not resolve)
+        is still the ordinary 400, because saying "the model could not answer"
+        about a client bug would hide the bug.
+
+        It runs off the event loop for the reason ``POST /api/cycles`` does.
+        """
+        body = await _json_body(request)
+        result = await run_in_threadpool(
+            answers.ask,
+            _required_str(body, "question"),
+            k=_optional_int(body, "k", default=answers.DEFAULT_ASK_K),
+            space=_optional_str(body, "space"),
+            principal=_session_principal(request),
+            path=db_path,
+        )
+        return EnvelopeResponse(envelope(result))
+
+    async def summarize(request: Request) -> Response:
+        """Summarise a node and its neighbourhood. Reads only (design E1).
+
+        The subgraph read is the bound, and it happens whether or not a provider
+        is configured, so a node that does not resolve is a 404 rather than
+        "no LLM provider configured" — the wrong answer to the wrong question.
+
+        Design E1 sketches an opt-in ``propose=true`` that files the summary as
+        a reviewable ``proposed`` version. It is deliberately absent: 5b-i is
+        cut exactly at the line where a model call causes a write, and this
+        route is on the read side of it.
+        """
+        body = await _json_body(request)
+        result = await run_in_threadpool(
+            answers.summarize,
+            _required_str(body, "node_id"),
+            depth=_optional_int(body, "depth", default=answers.DEFAULT_SUMMARY_DEPTH),
             principal=_session_principal(request),
             path=db_path,
         )
@@ -2624,6 +2731,8 @@ def create_app(
         Route("/api/edges", list_edges),
         Route("/api/edges", create_edge, methods=["POST"]),
         Route("/api/search", search),
+        Route("/api/ask", ask, methods=["POST"]),
+        Route("/api/summarize", summarize, methods=["POST"]),
         Route("/api/links/suggest", suggest_links),
         Route("/api/graph/subgraph", get_subgraph),
         Route("/api/graph/path", get_path),

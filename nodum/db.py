@@ -184,6 +184,36 @@ _CREATE_THE_CYCLES_INDEX = (
     "'nodum cycle-abandon <id>' first."
 )
 
+#: ``0015``'s two stop-switch columns, in the order they must be added: the
+#: second one's CHECK names the first, so adding them the other way round fails
+#: on an unknown column. Kept next to the check that looks for them, exactly as
+#: :data:`CYCLES_RUNNING_INDEX_SQL` is, so a refusal prints the cure rather than
+#: a shape of the cure — and the refusal names only the columns it actually
+#: found missing, since ``ADD COLUMN`` has no ``IF NOT EXISTS`` and re-adding a
+#: column that is already there fails.
+CYCLE_STOP_COLUMN_SQL: tuple[tuple[str, str], ...] = (
+    ("stop_requested_at", "ALTER TABLE cycles ADD COLUMN stop_requested_at TEXT;"),
+    (
+        "stop_requested_by",
+        'ALTER TABLE cycles ADD COLUMN stop_requested_by TEXT CONSTRAINT "a stop records '
+        'who asked and when, or neither" CHECK ((stop_requested_by IS NULL) = '
+        "(stop_requested_at IS NULL));",
+    ),
+)
+
+#: The remedy for ``0015``'s drift, and it is the *fifth* check's kind rather
+#: than the first four's: both columns are pure additions with no back-fill —
+#: every row that predates them is a cycle nobody asked to stop, which is what
+#: two NULLs say — so nothing is lost and nothing has to be derived. Telling a
+#: human to delete their graph over a missing column with a constant default
+#: would be as wrong here as it was for the missing index.
+_ADD_THE_STOP_COLUMNS = (
+    "Nothing else about that migration is missing and no data is lost: the columns "
+    "are additions with no back-fill, so they can be added in place. Run the "
+    "statement each problem above names, in the order printed — the second column's "
+    "CHECK names the first."
+)
+
 
 def _verify_schema_consistency(conn: sqlite3.Connection) -> None:
     """Refuse a database whose live schema contradicts its recorded migrations.
@@ -215,6 +245,7 @@ def _verify_schema_consistency(conn: sqlite3.Connection) -> None:
         ("0010_principals", _principals_problems, _RECREATE_THE_FILE),
         ("0011_actor_strings", _actor_string_problems, _RECREATE_THE_FILE),
         ("0014_cycles_and_gardener", _cycles_problems, _CREATE_THE_CYCLES_INDEX),
+        ("0015_cycle_stop_switch", _cycle_stop_problems, _ADD_THE_STOP_COLUMNS),
     ):
         if name not in recorded:
             continue
@@ -301,6 +332,33 @@ def _cycles_problems(conn: sqlite3.Connection) -> list[str]:
     if "idx_cycles_one_running_consolidation" not in indexes:
         return ["index 'idx_cycles_one_running_consolidation' is missing (two runs could overlap)"]
     return []
+
+
+def _cycle_stop_problems(conn: sqlite3.Connection) -> list[str]:
+    """0015 guarantees the two columns the kill switch is written in.
+
+    Every recorded migration with a checkable guarantee has an entry here (Q13
+    review S6), and this one's guarantee is as checkable as they come: two
+    columns on ``cycles``, or the switch has nothing to write to. Without the
+    entry the drift would surface where the four earlier ones used to — deep
+    inside a write, as ``no such column: stop_requested_at`` from
+    :func:`nodum.service.request_stop`, on the run a human was trying to stop.
+
+    The route in is 0014's, not a hypothetical: ``init_db`` skips a migration
+    whose name it already holds, so a database built from an earlier cut of
+    ``0015`` — the three-column shape ``cycle_stop_check``'s docstring proposes,
+    say — carries the recorded name and not the columns, and nothing else would
+    ever notice. ``stop_switch_available()`` gates on the *service function*
+    existing, which it does on any install carrying this code, so it would read
+    ``armed`` on a database that cannot store a stop.
+    """
+    columns = _columns(conn, "cycles")
+    return [
+        f"table 'cycles' has no {column!r} column (a stop has nowhere to be "
+        f"recorded) — repair: {sql}"
+        for column, sql in CYCLE_STOP_COLUMN_SQL
+        if column not in columns
+    ]
 
 
 def init_db(conn: sqlite3.Connection) -> list[str]:

@@ -54,7 +54,7 @@ from starlette.requests import ClientDisconnect
 from typer.testing import CliRunner
 
 import nodum
-from nodum import assets, auth, cli, consolidate, db, http_api, ingest, service, urls
+from nodum import assets, auth, cli, consolidate, db, http_api, ingest, llm, service, urls
 from nodum.migrations import GARDENER_AGENT_ID
 from nodum.principal import Principal
 
@@ -1035,11 +1035,21 @@ def test_the_only_credential_path_is_the_session():
 #: Values that may be splatted into a call in ``nodum.http_api``. Each one is
 #: allowlisted at source, so what it produces cannot contain an identity:
 #: ``_proposal_filters``/``_selective_filters`` read only ``PROPOSAL_FILTERS``,
-#: ``fields`` is the ``PATCHABLE_FIELDS`` comprehension in ``update_node``, and
-#: ``kwargs`` is ``_write``'s own forward — the one place that *does* receive a
-#: caller's dict wholesale, and the one that refuses an ``actor`` key outright
+#: ``_search_filters`` writes its own key list and reads nothing else off the
+#: query string (it exists because ``?nl=1`` sends the identical filters to a
+#: different function, and two hand-written argument lists that must agree are
+#: two that will not), ``fields`` is the ``PATCHABLE_FIELDS`` comprehension in
+#: ``update_node``, and ``kwargs`` is ``_write``'s own forward — the one place
+#: that *does* receive a caller's dict wholesale, and the one that refuses an
+#: ``actor`` key outright
 #: (``test_the_write_helper_refuses_a_caller_supplied_actor``).
-ALLOWED_UNPACK_SOURCES = {"_proposal_filters", "_selective_filters", "fields", "kwargs"}
+ALLOWED_UNPACK_SOURCES = {
+    "_proposal_filters",
+    "_search_filters",
+    "_selective_filters",
+    "fields",
+    "kwargs",
+}
 
 
 def test_no_call_splats_anything_but_an_allowlisting_helper():
@@ -2837,6 +2847,223 @@ def test_events_and_undo(client, fresh_db):
     assert result["undone_op"] == "node.create"
     assert client.get(f"/api/nodes/{node['id']}").status_code == 404
     assert client.post("/api/undo", json={"seq": "nope"}).status_code == 400
+
+
+# ── 6a. The smart endpoints: /ask, /summarize, and the natural-language search ─
+#
+# Every test here injects a fake provider through `llm.set_provider`, which the
+# autouse `_no_llm_provider` fixture otherwise pins to *absent*. No test asserts
+# on model output text: temperature-0 determinism was measured on one backend
+# and is a property of that backend, not of the interface.
+
+
+class _FakeLLM:
+    """A provider that replays scripted completions over the ASGI boundary."""
+
+    provider_id = "fake://provider"
+    model_id = "fake-model"
+    context_tokens = 4096
+
+    def __init__(self, *replies) -> None:
+        self.replies = list(replies)
+        self.calls: list[dict] = []
+
+    def estimate_prompt_tokens(self, messages) -> int:
+        return llm.estimate_prompt_tokens(messages)
+
+    def chat(self, messages, *, schema=None, max_output_tokens, timeout):
+        self.calls.append({"messages": list(messages), "schema": schema})
+        reply = self.replies[min(len(self.calls) - 1, len(self.replies) - 1)]
+        if isinstance(reply, BaseException):
+            raise reply
+        return reply
+
+
+def _fake_completion(payload: dict, *, finish_reason: str = "stop", prompt_tokens: int = 100):
+    return llm.Completion(
+        text=json.dumps(payload),
+        prompt_tokens=prompt_tokens,
+        output_tokens=20,
+        finish_reason=finish_reason,
+        model_id="fake-model",
+        provider_id="fake://provider",
+        context_tokens=4096,
+        latency_ms=7,
+    )
+
+
+def _answerable(title: str = "Log compaction") -> str:
+    return service.create_node(
+        type="note",
+        title=title,
+        content="A compacted topic keeps the newest value per key, so it works as a state store.",
+        principal=owner(),
+    ).id
+
+
+def test_ask_answers_with_citations_and_writes_nothing(client, fresh_db):
+    node_id = _answerable()
+    before = max(event.seq for event in service.list_events(owner(), limit=5000))
+    llm.set_provider(
+        _FakeLLM(_fake_completion({"answer": "It keeps the newest value.", "cited": ["1"]}))
+    )
+
+    body = _ok(client.post("/api/ask", json={"question": "compacted topic state store"}))
+
+    assert body["answered"] is True
+    assert body["answer"]
+    assert [citation["node_id"] for citation in body["citations"]] == [node_id]
+    assert body["considered"] == [node_id]
+    assert body["used"]["model_id"] == "fake-model"
+    after = max(event.seq for event in service.list_events(owner(), limit=5000))
+    assert after == before, "the smart endpoints read; nothing writes by default (E1)"
+
+
+def test_ask_computes_answered_from_citations_and_not_from_the_model(client, fresh_db):
+    """The measured failure, driven over the wire.
+
+    A schema-valid object whose citations name nothing this search returned is
+    an unanswered question, whatever the object says, and the text does not
+    come back with it.
+    """
+    _answerable()
+    llm.set_provider(_FakeLLM(_fake_completion({"answer": "Yes, certainly.", "cited": ["id=n0"]})))
+
+    body = _ok(client.post("/api/ask", json={"question": "compacted topic state store"}))
+
+    assert body["answered"] is False
+    assert body["answer"] is None
+    assert body["citations"] == []
+    assert body["unresolved"] == ["id=n0"]
+    assert body["refusal"]
+
+
+def test_ask_without_a_provider_is_a_refusal_that_names_the_variable(client, fresh_db, monkeypatch):
+    """Not a 500, not a traceback, and not silence — the whole degradation rule.
+
+    It resolves the provider the way a shipped install does rather than reusing
+    the autouse fixture's stand-in reason: the sentence a human reads has to be
+    the *real* one, and the fixture's is a test string that would make this pass
+    while the shipped message said nothing useful.
+    """
+    monkeypatch.delenv(llm.ENV_MODEL, raising=False)
+    llm.reset_provider()
+    _answerable()
+    body = _ok(client.post("/api/ask", json={"question": "compacted topic state store"}))
+
+    assert body["answered"] is False
+    assert body["used"]["available"] is False
+    assert "NODUM_LLM_MODEL" in body["refusal"]
+
+
+def test_ask_renders_an_output_ceiling_as_a_failure_not_an_empty_answer(client, fresh_db):
+    _answerable()
+    llm.set_provider(_FakeLLM(_fake_completion({"answer": "Kafka Str"}, finish_reason="length")))
+
+    body = _ok(client.post("/api/ask", json={"question": "compacted topic state store"}))
+
+    assert body["answered"] is False
+    assert body["answer"] is None
+    assert "ceiling" in body["refusal"]
+
+
+def test_ask_reports_an_unreachable_provider_as_a_refusal(client, fresh_db):
+    _answerable()
+    llm.set_provider(_FakeLLM(llm.ProviderUnavailable("connection refused: localhost:11434")))
+
+    body = _ok(client.post("/api/ask", json={"question": "compacted topic state store"}))
+
+    assert body["answered"] is False
+    assert "connection refused" in body["refusal"]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {},
+        {"question": ""},
+        {"question": 7},
+        {"question": "x", "k": 0},
+        {"question": "x", "k": "six"},
+    ],
+)
+def test_a_malformed_ask_is_a_400_rather_than_a_refusal(client, fresh_db, body: dict):
+    """A client bug is not the model failing to answer, and must not read as one."""
+    llm.set_provider(_FakeLLM(_fake_completion({"answer": "x", "cited": ["1"]})))
+    assert client.post("/api/ask", json=body).status_code == 400
+
+
+def test_summarize_reads_a_neighbourhood_and_writes_nothing(client, fresh_db):
+    node_id = _answerable()
+    before = max(event.seq for event in service.list_events(owner(), limit=5000))
+    llm.set_provider(
+        _FakeLLM(_fake_completion({"summary": "Compaction, briefly.", "cited": ["1"]}))
+    )
+
+    body = _ok(client.post("/api/summarize", json={"node_id": node_id}))
+
+    assert body["summarized"] is True
+    assert [citation["node_id"] for citation in body["citations"]] == [node_id]
+    after = max(event.seq for event in service.list_events(owner(), limit=5000))
+    assert after == before
+
+
+def test_summarize_has_no_propose_flag_because_this_half_does_not_write(client, fresh_db):
+    """5b-i is cut at the line where a model call causes a write, so an opt-in
+    write is deliberately absent rather than accepted and ignored — an accepted
+    flag that does nothing is exactly the since-deleted policies API's bug."""
+    node_id = _answerable()
+    before = max(event.seq for event in service.list_events(owner(), limit=5000))
+    llm.set_provider(
+        _FakeLLM(_fake_completion({"summary": "Compaction, briefly.", "cited": ["1"]}))
+    )
+
+    _ok(client.post("/api/summarize", json={"node_id": node_id, "propose": True}))
+
+    after = max(event.seq for event in service.list_events(owner(), limit=5000))
+    assert after == before
+    assert not [row for row in service.list_proposals(principal=owner(), limit=50)]
+
+
+def test_summarize_answers_the_right_question_about_a_node_that_does_not_exist(client, fresh_db):
+    """With no provider this must still be a 404. Refusing an unreadable id with
+    "no LLM provider configured" would answer the wrong question."""
+    assert client.post("/api/summarize", json={"node_id": "nope"}).status_code == 404
+
+
+def test_nl_search_layers_a_rewrite_over_the_ordinary_matcher(client, fresh_db):
+    node_id = _answerable()
+    llm.set_provider(_FakeLLM(_fake_completion({"terms": ["compacted", "topic"]})))
+
+    body = _ok(client.get("/api/search?q=What+did+I+write+about+compacted+topics%3F&nl=1"))
+
+    assert body["rewrite"]["applied"] is True
+    assert body["rewrite"]["terms"] == ["compacted", "topic"]
+    assert body["rewrite"]["original"] == "What did I write about compacted topics?"
+    assert body["query"] == "compacted topic"
+    assert [hit["node_id"] for hit in body["hits"]] == [node_id]
+
+
+def test_nl_search_without_a_provider_still_searches(client, fresh_db, monkeypatch):
+    monkeypatch.delenv(llm.ENV_MODEL, raising=False)
+    llm.reset_provider()
+    node_id = _answerable()
+    body = _ok(client.get("/api/search?q=compacted+topic+state+store&nl=1"))
+
+    assert body["rewrite"]["applied"] is False
+    assert "NODUM_LLM_MODEL" in body["rewrite"]["refusal"]
+    assert [hit["node_id"] for hit in body["hits"]] == [node_id]
+
+
+def test_a_search_without_nl_is_byte_identical_to_the_command(client, fresh_db):
+    """The rewrite is additive: an ordinary search is unchanged, and the CLI and
+    the API still emit the same bytes for it."""
+    _answerable()
+    over_http = client.get("/api/search?q=compacted&limit=5")
+    over_cli = runner.invoke(cli.app, ["search", "compacted", "--k", "5", "--as", "owner"])
+    assert over_cli.exit_code == 0, over_cli.output
+    assert over_http.content == over_cli.stdout.encode("utf-8")
+    assert "rewrite" not in over_http.json()
 
 
 # ── 6b. The dream journal: cycles, the runner, and rollback ──────────────────

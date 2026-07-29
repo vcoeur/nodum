@@ -90,6 +90,8 @@ uv run nodum node create --type note --title "My note" --as owner \
 uv run nodum edge list --type mentions --as owner   # the wikilink became an edge
 
 uv run nodum search "graph theory" --as owner       # hybrid search (BM25 + vector, RRF-fused)
+uv run nodum llm status --as owner                  # is a model configured, and does it answer?
+uv run nodum ask "what did I write about graphs?" --as owner   # a cited answer, or an honest no
 uv run nodum projector status                 # derived-index checkpoints + availability
 uv run nodum projector rebuild fts            # drop + replay from event 0
 uv run nodum projector rebuild vec            # the model-change re-embed path
@@ -611,6 +613,24 @@ degrades to BM25 + graph expansion. `NODUM_EMBED_MODEL` switches the model
   lives in, since a result list spans every space in scope unless `--space`
   narrowed it. With no embedding
   provider, the vector signal drops out and search stays BM25 + graph.
+  **The keyword half ORs the terms under a quorum rather than ANDing them**: a
+  node matches when the query terms it carries are worth at least half the
+  query's inverse-document-frequency weight, so a rare word earns a match, a
+  common one costs nothing, and a question-shaped query works. When a search
+  comes back empty, the fix is a *rarer* word, not a shorter query.
+- **A model can read the graph, and it never writes it.** `nodum ask`,
+  `nodum summarize` and `nodum search --nl` (over HTTP: `POST /api/ask`,
+  `POST /api/summarize`, `GET /api/search?nl=1`) put a language model in front
+  of your notes, and `nodum llm status` says whether one is configured and
+  whether it answers — two different facts, reported apart. **Nothing writes.**
+  An answer is only an answer when its citations resolve to notes the retrieval
+  actually returned: the model's own claim to have answered is never read,
+  because a small model asked something its notes cannot answer will say yes.
+  Everything that can go wrong — no provider, an unreachable one, a truncated
+  reply, a spent budget — comes back as an ordinary result saying it could not
+  answer and why. Configure it with `NODUM_LLM_MODEL` (unset means off, which is
+  the default); it speaks any OpenAI-compatible endpoint, `ollama` on localhost
+  included.
 
 See [docs/architecture.md](docs/architecture.md) for the module map and
 [AGENTS.md](AGENTS.md) for contributor/agent workflow rules.

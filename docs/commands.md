@@ -104,11 +104,50 @@ including every parameter.
 
 - `search <query>` — Hybrid-search node title + content (BM25 + vector,
   RRF-fused). Takes the same two read-side space controls as `node list`:
-  `--space` and `--include-meta`.
+  `--space` and `--include-meta`. **Terms are ORed under a quorum, not ANDed**:
+  a node matches when the query terms it carries are worth at least half the
+  query's inverse-document-frequency weight, so a rare word earns a match and a
+  common one costs nothing. A question-shaped query works, and the fix for an
+  empty result is a *rarer* word rather than a shorter query.
+  `--nl` asks the model to rewrite the question into search terms first and adds
+  a `rewrite` object saying what was asked on your behalf; it is a rewrite of
+  the words only — every signal, filter and cap below it is unchanged — and with
+  no provider it is a no-op that says so and searches your own words.
 - `traverse` — Walk the subgraph reachable from a node over active edges.
 - `subgraph <root-id>` — Bounded, filtered neighborhood of a node — node and edge caps stop the walk.
 - `find-path` — Find the shortest path between two nodes over active edges.
 - `suggest-links <prefix>` — Suggest wikilink targets by title prefix (case-insensitive).
+
+### Asking the graph
+
+These three read and **never write**. Each prints one JSON object and exits 0
+whatever the model did: a question nothing answered is an ordinary result
+carrying `answered: false` and a `refusal` saying why, not a failure. Exit 1
+still means what it always did — your own error (a blank question, a node that
+does not resolve). With no provider configured the refusal names
+`NODUM_LLM_MODEL`.
+
+- `ask <question> [--k N] [--space S]` — Answer a question from the graph, with
+  citations. **`answered` is computed from the citations, never from the
+  model**: every id the model cites is checked against the notes this request
+  actually retrieved, anything else lands in `unresolved`, and zero surviving
+  citations means the question was not answered and the answer text is not
+  returned. `considered` is what the model saw, `dropped` is what the retrieval
+  found and the context window could not carry, and `used` is what the attempt
+  cost.
+- `summarize <node-id> [--depth N]` — Summarise a node and its neighbourhood,
+  under the same citation rule. It reads the subgraph whether or not a provider
+  is configured, so a node that does not exist is the ordinary not-found refusal
+  rather than a complaint about the model.
+- `llm status [--no-probe]` — Whether a provider is **configured**, and
+  separately whether it is **reachable**. The two are different facts:
+  configuration is free and permanent, reachability costs one small call and is
+  true only of this instant. `reachable` is therefore tri-state — `null` means
+  the question was not asked, because nothing was configured or because
+  `--no-probe` declined it. The failing probe is free (nothing listening answers
+  in about 3 ms, a model the server does not have in about 4); `--no-probe`
+  spends nothing at all. It takes `--as` although it reads no graph, because the
+  probe is a real model call and every model call in this system is attributed.
 
 ### History and state
 

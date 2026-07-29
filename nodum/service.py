@@ -4360,6 +4360,12 @@ def _cycle_out(row: sqlite3.Row) -> CycleOut:
         started_at=row["started_at"],
         finished_at=row["finished_at"],
         rolled_back_by=row["rolled_back_by"],
+        # Derived, never stored: `0015` writes the two stamps and no flag, so
+        # the boolean the surfaces render cannot drift from the record it is
+        # about. `CycleDetailOut.metrics` projects the report the same way.
+        stop_requested=row["stop_requested_at"] is not None,
+        stop_requested_by=row["stop_requested_by"],
+        stop_requested_at=row["stop_requested_at"],
     )
 
 
@@ -4676,6 +4682,147 @@ def abandon_cycle(
         principal=principal,
         path=path,
     )
+
+
+def request_stop(
+    cycle_id: str, *, principal: Principal, path: str | Path | None = None
+) -> CycleOut:
+    """Ask a ``running`` cycle to stop, and record who asked (human-only, K1–K3).
+
+    The kill switch's write half. It sets ``0015``'s two columns and **nothing
+    else**: the row stays ``running``, no event is emitted, and no write the
+    cycle already made is touched. The run notices at its next check — between
+    jobs, between items, or immediately before a provider call — and closes its
+    own cycle ``failed`` with a report that says it was stopped. Worst-case
+    latency is therefore one provider call, and honestly so: cancelling mid-call
+    would buy seconds and cost a torn transaction.
+
+    **Deliberately not** :func:`abandon_cycle`, and not a thin wrapper over it.
+    That verb is a *repair* — a human declaring somebody else's dead process
+    dead, closing the row from outside so its writes become rollback-able. This
+    one expects the run to be alive and to wind down honestly, and the journal
+    has to keep the two apart: a human reading a ``failed`` cycle at 09:00 needs
+    to know whether the operator stopped it or the process died. Building this
+    on top of the repair would erase exactly that distinction.
+
+    It does **not** roll back. Stopping and undoing are two decisions, and a
+    kill switch that also reverted would make "stop, look at what it did, then
+    decide" impossible — which is the reason a human hits one. Every write the
+    run made stays, stamped with the cycle id, and :func:`rollback_cycle` takes
+    them back like any other cycle's.
+
+    Human-only, for the reason :func:`abandon_cycle` is: it is an instruction
+    aimed at a process the caller cannot see, and an agent that could stop the
+    gardener's night could stop the review queue from ever being filled.
+
+    **Asking twice is not an error, and the first asker keeps the record.** A
+    kill switch that raised because the run was already stopping would make a
+    human hitting it twice doubt whether it worked at all, which is the one
+    moment that must not be ambiguous. The second call is a no-op that returns
+    the cycle carrying who actually stopped it and when.
+
+    Args:
+        cycle_id: The cycle to stop.
+        principal: Who is asking; must be a human, and is recorded in
+            ``stop_requested_by`` as their actor string.
+        path: Explicit database path.
+
+    Returns:
+        The cycle, now carrying the stop — or carrying the earlier one, if a
+        stop was already recorded.
+
+    Raises:
+        GrantNotPermitted: If the principal is not a human.
+        RecordNotFound: If the cycle id does not resolve.
+        InvalidTransition: If the cycle is not ``running``. A cycle that has
+            already said how it ended cannot be told to stop: there is nothing
+            left to obey it, and stamping one would put a stop in the journal
+            that no run ever saw.
+    """
+    conn = _connect(path)
+    try:
+        Store(conn, principal).require_human("stop a consolidation cycle")
+        row = _get_cycle_row(conn, cycle_id)
+        if row["status"] != "running":
+            raise InvalidTransition(
+                f"cycle {cycle_id} is already {row['status']}, not running: a stop is an "
+                "instruction to a live run, and a cycle that has said how it ended has nothing "
+                "left to obey it"
+            )
+        # `AND stop_requested_at IS NULL` is what makes the second asker a no-op
+        # rather than an overwrite: who stopped the night is the fact, and the
+        # first answer to it is the true one. It is also the whole of the race
+        # guard — two humans hitting the switch at once leave one row, not a
+        # torn one.
+        conn.execute(
+            "UPDATE cycles SET stop_requested_at = datetime('now'), stop_requested_by = ?"
+            " WHERE id = ? AND stop_requested_at IS NULL",
+            (principal.actor_string, cycle_id),
+        )
+        stopped = _get_cycle_row(conn, cycle_id)
+        conn.commit()
+        return _cycle_out(stopped)
+    finally:
+        conn.close()
+
+
+def stop_requested(cycle_id: str, *, principal: Principal, path: str | Path | None = None) -> bool:
+    """Has this cycle been told to stop? — the read a run obeys (K3).
+
+    One row read, and the runner calls it between jobs, between items, and
+    immediately before every provider call
+    (:func:`nodum.agent.cycle_stop_check`). Nothing caches it: a check answering
+    from a value read at the top of the run would be a kill switch that cannot
+    be hit after the run starts, which is the only time anyone hits one.
+
+    **Deliberately not human-only**, unlike :func:`get_cycle` and
+    :func:`list_cycles`. Those are human-only because a journal entry reports
+    what the gardener did across every space in the file, and an agent reading
+    one learns the shape of territory it holds no grant on. This returns a
+    single boolean about a run, discloses no node, no space and no count, and a
+    runner that cannot ask whether it was told to stop cannot obey.
+
+    **What it is scoped by instead: the authority to close the cycle**, asked
+    through the identical check :func:`open_cycle` and :func:`close_cycle` ask —
+    a human, or ``edit`` on the cycle's scope (:func:`_cycle_authority_spaces`
+    for what an unscoped cycle checks against). Obeying a stop *is* closing the
+    cycle, so a principal that could not close this one has no use for the
+    answer, and one that can is already trusted with the row's whole lifecycle.
+    That is a real bound and not a formality: an agent holding ``edit`` nowhere
+    is refused, which is exactly the set that cannot open or close a cycle
+    either. The alternative — "any principal may ask about any cycle" — was
+    rejected for buying nothing: the gardener passes this check on the cycles it
+    runs, and every principal that fails it is one that could not have opened
+    the run it is asking about.
+
+    The recorded scope is used rather than a re-resolution of it, as
+    :func:`close_cycle` does, so a space archived mid-run cannot make its own
+    cycle unstoppable.
+
+    Args:
+        cycle_id: The cycle to ask about.
+        principal: Who is asking — the principal the run acts as.
+        path: Explicit database path.
+
+    Returns:
+        ``True`` once a stop has been recorded, for good: the stamp outlives the
+        run, because a journal entry has to go on saying this night was stopped.
+
+    Raises:
+        RecordNotFound: If the cycle id does not resolve.
+        GrantNotPermitted: If the principal could not close this cycle either.
+    """
+    conn = _connect(path)
+    try:
+        store = Store(conn, principal)
+        row = _get_cycle_row(conn, cycle_id)
+        store.require_review(
+            _cycle_authority_spaces(principal, row["scope"]),
+            "ask whether a consolidation cycle has been told to stop",
+        )
+        return row["stop_requested_at"] is not None
+    finally:
+        conn.close()
 
 
 def get_cycle(cycle_id: str, *, principal: Principal, path: str | Path | None = None) -> CycleOut:

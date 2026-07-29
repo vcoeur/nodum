@@ -134,7 +134,12 @@ REVIEW_TOOLS = ("accept", "reject")
 #:   whole cycle at once, across spaces, and an operation strictly more powerful
 #:   than ``undo`` cannot be gated more weakly. ``abandon_cycle`` is the door
 #:   that *makes* an interrupted cycle's writes reversible — declaring somebody
-#:   else's run dead — so it is gated with them.
+#:   else's run dead — so it is gated with them, and ``request_stop`` (the kill
+#:   switch, ``nodum cycle-stop``) with it: an agent able to stop the gardener's
+#:   night could stop the review queue from ever being filled. Its **read** half,
+#:   ``service.stop_requested``, is deliberately not human-only — a runner that
+#:   cannot ask whether it was told to stop cannot obey — but it is one boolean
+#:   about a run this surface's callers never have, so no tool wraps it either.
 #: * **The journal spans the whole file** (``get_cycle``, ``list_cycles``). An
 #:   entry says what the gardener did across every space there is, so an agent
 #:   reading it would learn the shape of territory it holds no grant on — the
@@ -147,6 +152,8 @@ HUMAN_ONLY_TOOLS = (
     "rollback",
     "rollback_cycle",
     "abandon_cycle",
+    "cycle_stop",
+    "request_stop",
     "get_cycle",
     "list_cycles",
 )

@@ -23,6 +23,7 @@ import {
 } from "./searchState";
 import type { SearchState } from "./searchState";
 import { hitSpaceName } from "./resultSpace";
+import { describeNoResults } from "./noResults";
 import { describeSpaceFilterFailure } from "./spaceFailure";
 import type { SpaceFilterFailure } from "./spaceFailure";
 import { SIGNAL_HELP, SIGNAL_KEYS, describeSignals, readVectorEvidence } from "./signals";
@@ -474,13 +475,7 @@ export default function SearchView() {
       {searching && status === "ready" && hits.length === 0 ? (
         <EmptyState
           title={`Nothing matched “${query.trim()}”`}
-          body={
-            <>
-              Every term has to match — the query is ANDed. Try fewer words
-              {hasActiveFilters(uiState) ? ", or loosen the filters" : ""}
-              {expand ? "" : ", or include neighbours of matches"}.
-            </>
-          }
+          body={describeNoResults(uiState).join(" ")}
           action={
             stateFilter !== "any" ? (
               <button

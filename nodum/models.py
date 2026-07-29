@@ -505,6 +505,18 @@ class CycleOut(BaseModel):
     which is who *acted* (the gardener). ``report`` is the runner's summary,
     ``None`` while the cycle is still running, as ``finished_at`` is.
     ``rolled_back_by`` names the rollback cycle that reversed this one.
+
+    ``stop_requested_by`` and ``stop_requested_at`` are the kill switch's record
+    (design K1–K3): who told this run to stop, and when. They outlive the run,
+    because a journal entry has to go on saying that this night was stopped and
+    by whom. ``stop_requested`` is the boolean both surfaces render, and it is
+    **derived** — ``stop_requested_at is not None``, computed on every read and
+    stored in no column, the same rule :attr:`CycleDetailOut.metrics` follows.
+    A flag beside the stamps could disagree with them; an expression cannot.
+
+    A stop is deliberately not an abandon: the columns say the operator stopped
+    this run, ``report["abandoned"]`` says a human declared a dead process dead,
+    and a ``failed`` cycle at 09:00 is read differently depending on which.
     """
 
     id: str
@@ -517,6 +529,9 @@ class CycleOut(BaseModel):
     started_at: str
     finished_at: str | None
     rolled_back_by: str | None
+    stop_requested: bool
+    stop_requested_by: str | None
+    stop_requested_at: str | None
 
 
 class CycleDetailOut(BaseModel):

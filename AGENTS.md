@@ -220,8 +220,8 @@ commands on a saved node for exactly this reason.
   exactly the delegation that was there. Inert, not destroyed. `grant` on an
   archived space is refused and says why.
   **Consolidation cycles, the curative tier and rollback are here too** (design
-  §8.2/§8.4). `open_cycle` / `close_cycle` / `abandon_cycle` / `get_cycle` /
-  `list_cycles` own the
+  §8.2/§8.4). `open_cycle` / `close_cycle` / `abandon_cycle` / `request_stop` /
+  `stop_requested` / `get_cycle` / `list_cycles` own the
   `cycles` row — the dream journal's record of what ran, who asked, over what,
   and how it ended — and store **no diff**, because the diff is
   `list_events(cycle_id=…)` and a journal that kept its own copy could disagree
@@ -255,7 +255,36 @@ commands on a saved node for exactly this reason.
   cycle is already running" — which matters more since the guard became a
   database index, because one interrupted run blocks every later run in every
   process rather than only the ones sharing its interpreter. A door exists once
-  the thing that sends you to it says its name. The stamp itself is `in_cycle`, a `ContextVar` that
+  the thing that sends you to it says its name.
+  **The kill switch is two verbs and is deliberately not `abandon_cycle`**
+  (K1–K3). `request_stop(cycle_id, *, principal)` is **human-only**: it stamps
+  `0015`'s two columns on a `running` cycle and does nothing else — the row
+  stays `running`, no event is emitted, no write is touched — and the run
+  notices at its next check and closes *its own* entry `failed`. It refuses a
+  cycle that is not `running` (nothing is left to obey it, and the stamp would
+  name a run that never saw it), and **asking twice is a no-op that keeps the
+  first asker**: a switch that raised because the run was already stopping would
+  make a human hitting it twice doubt whether it worked, which is the one moment
+  that must not be ambiguous. It does not roll back — stopping and undoing are
+  two decisions, and a switch that also reverted would make "stop, look at what
+  it did, then decide" impossible. Building it on `abandon_cycle` would erase
+  the distinction the journal exists to keep: a repair closes somebody else's
+  dead process from outside, an instruction is obeyed by a live run.
+  `stop_requested(cycle_id, *, principal) -> bool` is the read the runner obeys,
+  and it is **deliberately not human-only** unlike `get_cycle`/`list_cycles`:
+  those are, because a journal entry says what the gardener did across every
+  space in the file, while this is one boolean about a run that discloses no
+  territory — and a runner that cannot ask whether it was told to stop cannot
+  obey. What bounds it instead is the **identical check `open_cycle` and
+  `close_cycle` ask** (`Store.require_review` over `_cycle_authority_spaces`
+  against the cycle's *recorded* scope): obeying a stop is closing the cycle, so
+  a principal that could not close this one has no use for the answer, and
+  `suggest` is refused exactly where it is refused for opening one. Nothing
+  caches it — a check answering from a value read at the top of the run would be
+  a switch that cannot be hit after the run starts, which is the only time
+  anyone hits one. The stamps outlive the run, so the journal goes on saying who
+  stopped that night. Neither verb is on MCP (`HUMAN_ONLY_TOOLS`).
+  The stamp itself is `in_cycle`, a `ContextVar` that
   `_emit` reads, so a cycle's writes go through the *ordinary* public functions
   and are stamped without any call site naming a cycle — a per-task variable
   rather than a module global, so the HTTP server handling a normal request
@@ -938,17 +967,88 @@ commands on a saved node for exactly this reason.
   could not tell them apart would fail the human reading a `failed` cycle at
   09:00), checked immediately before every provider call here and between jobs
   and items by the runner, read fresh every time because a cached answer is a
-  switch that cannot be hit after the run starts. **The column and its service
-  read are migration `0015`'s, not this wave's**: `cycle_stop_check` gates on
-  `service.stop_requested` existing, and until it does `stop_switch_available()`
-  is false and the report says `stop_switch: "pending…"` — because "no stop was
-  requested" and "no stop *could* be requested" are different facts. See
-  `agent.cycle_stop_check`'s docstring for the exact four things `0015` must
-  add. Configuration: `NODUM_LLM_CYCLE_BUDGET`, `NODUM_LLM_CYCLE_SECONDS`,
+  switch that cannot be hit after the run starts. **The row and its service read
+  landed in migration `0015`**, so the gate is closed: `cycle_stop_check`
+  resolves to `service.stop_requested`, `stop_switch_available()` is true, and
+  the report says `stop_switch: "armed"`. The gated branch stays and stays
+  correct — on a build without the read it answers "keep going" and the report
+  says `pending…`, because "no stop was requested" and "no stop *could* be
+  requested" are different facts and a journal entry must never print the second
+  as the first. What `0015` actually added deviates from the four things that
+  docstring asks for in one place: **two columns, not three** — the boolean is
+  derived (see `nodum.migrations`). Configuration: `NODUM_LLM_CYCLE_BUDGET`, `NODUM_LLM_CYCLE_SECONDS`,
   `NODUM_LLM_REQUEST_BUDGET`, `NODUM_LLM_REQUEST_SECONDS`,
   `NODUM_LLM_CALL_TIMEOUT`, `NODUM_LLM_MAX_OUTPUT_TOKENS` — each unparseable
   value falls back to its default rather than refusing to boot (the scheduler's
   precedent), and the cycle fallback is 0, so a typo cannot authorise spending.
+- **`nodum.answers`** — the read-only smart surface (Phase 5b-i, design E1–E3):
+  `ask`, `summarize`, `natural_search` and `provider_status`, behind
+  `POST /api/ask`, `POST /api/summarize`, `GET /api/search?nl=1` and
+  `nodum llm status`. **Nothing here writes.** It reads through the ordinary
+  public `nodum.service`/`nodum.search` calls and reaches the model only through
+  `nodum.agent`, so it is a peer client like the runner: no connection, no
+  service private, no minted principal. Its result models live here rather than
+  in `nodum.models`, beside the code that produces them, following
+  `nodum.agent`'s own precedent in this phase (`LLMReport`, `Generation`).
+  Route handlers stay thin delegates over it, and the CLI verbs call the same
+  functions, so "was this answered" is decided once.
+  **`answered` is computed, never read from the model** (E2). Every id the model
+  cites is resolved against the notes *this request* retrieved; ids outside that
+  set are dropped into `unresolved`, and **zero surviving citations means
+  `answered: false` and the answer text is not returned**. The schema carries no
+  `answered` field at all — the measured failure is a schema-valid
+  `{"answer": "false", …, "answered": true}`, and a field nobody may read is a
+  field the next reader wires up.
+  **Every provider failure is a 200 with `answered: false` and a `refusal`**:
+  no provider, an unreachable one, a `length` finish, a filled context, an
+  exhausted budget. The request was well formed and the install could not answer
+  it, which is an outcome; a malformed *request* is still the ordinary 400.
+  `used` is `agent.LLMReport` — the same object a cycle files under
+  `report["llm"]` — so a request's cost and a night's cost are one shape, and
+  `used.available`/`used.unavailable_reason` carry the provider's absence.
+  **The prompt is fitted to the model's context window before the call**
+  (`_fit_prompt`), narrowing every excerpt before dropping the worst-ranked
+  note, and `considered`/`dropped` say which notes reached the model. That is
+  E1's stated bound and **not** B3's forbidden truncation: B3 rejects shortening
+  a prompt to fit the remaining *spending* budget invisibly, this fits the
+  assembled context to the *window* and reports what it dropped.
+  **Three prompt findings, measured on `llama3.2:1b` and each pinned by a
+  test.** The first version scored **1/6** on a six-question battery and every
+  failure was an unparseable citation (`"]"`, `"/1"`, `"space main"`, a chat
+  template's `<|start_header_id|>`) — the validation working perfectly and the
+  endpoint useless. Three changes took it to **6/6**: the citation format is a
+  **`pattern` on the schema** (enforced by the server's constrained decoding —
+  verified against ollama — so bad strings are unrepresentable rather than
+  discouraged); a note is identified by a **small integer and nothing else**,
+  because with the 32-hex node id printed beside the marker the model cited
+  `"116"` and `"749"`, mining the id for digits; and the instructions contain
+  **no number the model can copy**, because a worked example (`write exactly:
+  ["1", "3"]`) came back as `"3"` on every call — it scored *better* that way
+  (5/6) and was still wrong, since on a graph returning three hits that copied
+  number resolves to a real note the answer never came from. The general rule:
+  **every number in the prompt is a candidate citation.**
+  The comparison against `qwen3:8b` says the same thing from the other side: it
+  makes the *identical* citation-format errors under the first prompt and costs
+  65–113 s a question against the 1B's 3–8 s, so the weak local model was never
+  the binding constraint on this surface — the prompt was. On the fixed prompt
+  both score **6/6**, the 1B in 25 s of wall clock and the 8B in 535 s; the 8B's
+  citations are cleaner (0 unresolved against the 1B's 3 spurious markers across
+  six questions, all correctly dropped), which is the only measured quality
+  difference between them here.
+  **A reasoning model spends its thinking tokens out of `max_output_tokens`,
+  and that is a trap worth stating.** `ollama` charges `<think>` to
+  `completion_tokens` and strips it from `content`, so `qwen3:8b` answers a
+  rewrite with an **empty body at `finish_reason: "length"`** — B3 then
+  correctly discards it, and the feature is off on that model with a message
+  about a ceiling nobody chose. The query rewrite therefore sets **no per-call
+  output ceiling of its own**; there is one knob and it is the human's
+  (`NODUM_LLM_MAX_OUTPUT_TOKENS`). A tight per-call number is not a saving, it
+  is a model-compatibility setting in disguise. **`NODUM_LLM_MAX_OUTPUT_TOKENS=2048`
+  is the verified cure** — the 8B rewrite then returns
+  `["compaction", "topic", "state store"]` and finds the note. The degradation
+  without it is graceful either way: the rewrite reports `applied: false` with
+  the exact reason and the search runs the human's own words, which found the
+  right note in 5 of 5.
 - **`nodum.assets`** — content-addressed binaries and their derived
   renditions (design §5.5/§5.7). Reads take a principal, and **an asset is as
   reachable as its describing nodes**: a principal may read an asset iff it can
@@ -1258,7 +1358,7 @@ commands on a saved node for exactly this reason.
   a database whose only cure is deletion never gets a new (possibly
   irreversible) migration committed onto it first.
 - **`nodum.migrations`** — the append-only migration list (`0001_core` …
-  `0014_cycles_and_gardener`). Never edit a shipped migration; append a
+  `0015_cycle_stop_switch`). Never edit a shipped migration; append a
   new one. A migration must never leave data readable only through a store a
   later migration replaces: introduce a table where its bytes already belong
   (this is why asset bytes are part of `0007` and there is no `path` column
@@ -1287,6 +1387,31 @@ commands on a saved node for exactly this reason.
   than most distributions ship, and a migration that fails to *parse* is a worse
   failure than one whose message carries the `LIKE` pattern to look them up
   with.
+  `0015` adds the kill switch's row: `cycles.stop_requested_at` and
+  `cycles.stop_requested_by`, **two columns and no boolean flag**. The runtime's
+  docstring proposed a `stop_requested INTEGER NOT NULL DEFAULT 0` beside them;
+  checked against the table, that is one column too many — `cycles` writes every
+  fact that arrives *after* the INSERT as a nullable column whose presence is
+  the flag (`finished_at`, `report`, `rolled_back_by`) and carries a boolean
+  only for `dry_run`, which is fixed at insert and never transitions. A flag
+  beside the stamps would be a fourth instance of *state a later reader has to
+  reconcile with the record next to it*, and `ALTER TABLE` cannot add the
+  table-level CHECK that would forbid `stop_requested = 1` with no requester.
+  `CycleOut.stop_requested` is `stop_requested_at IS NOT NULL`, computed on
+  every read and stored nowhere. The one disagreement two columns can still have
+  — a requester with no time, or a time with no requester — is closed by a
+  **cross-column CHECK, which `ADD COLUMN` does accept**, named so SQLite prints
+  the name as the message (0014's device, since `RAISE()` is trigger-only).
+  Both columns are pure additions with no back-fill: every row that predates
+  them is a cycle nobody asked to stop, which is what two NULLs say.
+  `db._cycle_stop_problems` asserts both exist on any file recording `0015`, for
+  the reason `_cycles_problems` asserts 0014's index — `init_db` skips a
+  migration whose name it already holds, and `stop_switch_available()` gates on
+  the *service function* existing, so it would read `armed` over a database that
+  cannot store a stop. Its remedy is `0014`'s kind, not the first four's: the
+  refusal prints the `ALTER TABLE` for each column it **found missing**, in
+  dependency order, because `ADD COLUMN` has no `IF NOT EXISTS` and a remedy
+  that always printed both would die on `duplicate column name`.
 - **`nodum.models`** — the pydantic I/O schema shared by every surface.
 - **`nodum.cli`** (Typer) — each command calls one service function and prints
   the result as a single JSON object on stdout; human/error messages go to
@@ -1571,6 +1696,9 @@ Phase-1 decision log.
   inherited from the edge being replaced, so naming none of them retires the
   edge with no successor), `bulk-relink [--src --dst --type --state]
   [--to-type --to-dst] [--dry-run]`,
+  `ask <question> [--k] [--space]` / `summarize <node-id> [--depth]` /
+  `search … [--nl]` / `llm status [--probe/--no-probe]` (the read-only smart
+  surface — see `nodum.answers`; none of the four writes anything),
   `mcp serve` (the agent token comes from `NODUM_AGENT_TOKEN`, never a flag),
   `serve [--host 127.0.0.1] [--port 8600] [--allow-host NAME]
   [--db PATH]`. `serve` prints the database path on stderr and translates
@@ -1589,6 +1717,27 @@ Phase-1 decision log.
   way round for the one setting that starts a background writer on the human's
   graph. The unparseable case is still announced exactly once, by `create_app`,
   which is also what decides to start without a schedule.
+- **The four smart verbs never fail because the model did.** `ask`,
+  `summarize`, `search --nl` and `llm status` all exit **0** and print their one
+  JSON object whatever the provider did — a question nothing answered is
+  `answered: false` with a `refusal`, a rewrite that could not run is
+  `rewrite.applied: false` with the ordinary results beside it, and an install
+  with no provider is a perfectly good install with the smart features off.
+  Exit 1 stays for what it always meant: the caller's error (a blank question, a
+  node that does not resolve, `--k 0`), one line on stderr. A script reading the
+  exit code learns "the command worked"; the envelope is where the outcome is.
+  **`llm status` takes `--as` although it reads no graph**, which is the one
+  place the "reports the install, not the graph" exemption (`ingest handlers`,
+  `projector status`) does not apply: the reachability probe is a real model
+  call, it is metered through `agent.for_request` like every other, and a
+  command that spent one with nobody named would be this system's only
+  unattributed spend. `--no-probe` reports the configuration and spends nothing.
+  `reachable` is deliberately **tri-state** — `null` means the question was not
+  asked (nothing configured, or `--no-probe`), because "no server answered" and
+  "nobody knocked" are different facts and `nodum.llm` keeps them apart on
+  purpose. Measured: an endpoint with nothing listening answers in **3 ms** and a
+  model the server does not have in **4 ms**, so the failing probe is free; a
+  live model costs one small call.
 - **A `--dry-run` here answers "what would happen", and each one is precise
   about what it costs.** `consolidate --dry-run` still writes its journal entry,
   flagged, because the journal has to say which it was — and emits **no** event,
@@ -1881,6 +2030,31 @@ Phase-1 decision log.
   Agent creation over HTTP is external-kind and owned by the session's human;
   the show-once token comes back in the create and token-rotate response
   bodies, since HTTP has no stderr to print it to the way the CLI does.
+- **The smart surface is three routes and all three are reads.** `POST /api/ask`
+  (`question`, optional `space` and `k`; answers with `answered`, `answer`,
+  `citations[]`, `considered[]`, `dropped[]`, `unresolved[]`, `refusal`,
+  `used`), `POST /api/summarize` (`node_id`, optional `depth`; the same shape
+  with `summarized`/`summary` plus `truncated`), and `GET /api/search?nl=1`,
+  which adds a `rewrite` object to the ordinary result. All three go through
+  `run_in_threadpool` for the reason `POST /api/cycles` does — a model call is
+  seconds of work on this hardware and the loop is single-threaded — and all
+  three delegate to `nodum.answers`, which is where the rules are.
+  **`?nl=1` is additive**: a search without it is byte-identical to what it has
+  always been and to `nodum search`, which is a test. **`/summarize` has no
+  `propose` flag**, and its absence is the cut: 5b-i ends exactly where a model
+  call causes a write, so an opt-in write belongs to 5b-ii and is not accepted
+  and ignored here — an accepted flag that does nothing is the since-deleted
+  policies API's bug.
+  **A provider failure is a 200, not a 5xx.** No provider, an unreachable one, a
+  `length` finish, a filled context, an exhausted budget: all of them are
+  `answered: false` with a `refusal` naming what happened and, where it applies,
+  the variable to set. The request was well formed and the install could not
+  answer it. A malformed *request* — no `question`, `k` below 1, a `space` that
+  does not resolve, a `node_id` that does not — is the ordinary 400/404 through
+  `EXCEPTION_STATUS`, because telling a client "the model could not answer"
+  about its own bug hides the bug. `/summarize` reads the subgraph **before**
+  looking at the provider for exactly that reason: a node that does not exist is
+  a 404 whether or not a model is configured.
 - **The dream journal is five routes, and the curative tier is none of them.**
   `GET /api/cycles` (newest first — byte-identical to `nodum cycle-list`, as
   every list endpoint is to its command), `POST /api/cycles` (run one now —
