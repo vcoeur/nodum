@@ -8,12 +8,21 @@
  * when a run is mostly right.
  *
  * Space is the outer level because of what it makes visible rather than what it
- * tidies. An `edit`-granted space **never reaches this queue**: its agents land
- * writes `active` and file no proposals. Grouped by agent alone, that territory
- * is simply absent, and the human cannot tell "nothing has been proposed here"
- * from "this space governs itself" — so this view renders a section for it
- * saying exactly that, and the section is empty on purpose. Absence is the bug
- * D4 exists to fix, so absence is the one thing that must not be the rendering.
+ * tidies. An `edit`-granted space **can bypass this queue**: `edit` is the level
+ * that lands `active`, so work done there may never be proposed at all. Grouped
+ * by agent alone, that territory is simply absent, and the human cannot tell
+ * "nothing has been proposed here" from "everything written here lands without
+ * review" — so this view renders a section for it saying exactly that, and the
+ * section is empty on purpose. Absence is the bug D4 exists to fix, so absence
+ * is the one thing that must not be the rendering.
+ *
+ * **A grant is a ceiling, not a mandate**, and the copy here says so because
+ * Phase 5a made it matter: `Store.cap_landing` lets a writer file *below* its
+ * own grant, and the consolidation runner does it for every inference — the
+ * gardener holds `edit` on `main` and still files each suggested edge
+ * `proposed`. So an `edit`-granted agent does appear in this queue, and a header
+ * reading "nothing below was filed by it" sat directly above four of its edges.
+ * `grouping.editGrantNote` and `grouping.selfGoverningNote` own that wording.
  *
  * There is deliberately **no space filter** here. The sections *are* the
  * navigation, and narrowing to one space would hide the self-governing sections
@@ -62,14 +71,28 @@ import { RejectDialog } from "./RejectDialog";
 import { ProposalCard } from "./ProposalCard";
 import {
   describeCounts,
+  editGrantNote,
   groupProposalsBySpace,
   PROPOSAL_KINDS,
+  PROPOSAL_PAGE_SIZE,
   proposalKind,
+  proposalPageKey,
+  queueCount,
+  queueTruncationNote,
+  restrictToPage,
+  sectionOrder,
+  selfGoverningNote,
 } from "./grouping";
 import type { AgentGroup, ProposalBatch, ProposalKind, SpaceSection } from "./grouping";
-import { formatAbsolute, formatRelative } from "../../lib";
+import { formatAbsolute, formatRelative, pageWindow } from "../../lib";
+import type { PageWindow } from "../../lib";
 import { plural } from "./format";
-import { classifyFailure, failureMessage, useReviewQueue } from "./useReviewQueue";
+import {
+  classifyFailure,
+  failureMessage,
+  REVIEW_QUEUE_LIMIT,
+  useReviewQueue,
+} from "./useReviewQueue";
 
 /** A destructive action waiting on confirmation. */
 interface PendingAction {
@@ -98,6 +121,7 @@ export function ReviewInbox() {
   const [result, setResult] = useState<ActionResult | null>(null);
   const [agentFilter, setAgentFilter] = useState<string>("");
   const [kindFilter, setKindFilter] = useState<ProposalKind | "">("");
+  const [page, setPage] = useState(0);
   const outcomeRef = useRef<HTMLDivElement | null>(null);
 
   /**
@@ -144,8 +168,28 @@ export function ReviewInbox() {
   // it is a statement about an absence, so it must not make an empty queue look
   // occupied, and it must survive the toolbar filters that would otherwise
   // strip the queue to nothing.
-  const withProposals = sections.filter((section) => section.total > 0);
+  const withProposals = useMemo(() => sections.filter((section) => section.total > 0), [sections]);
   const selfGoverning = sections.filter((section) => section.kind === "self-governing");
+
+  // The queue pages, for the reason the journal's event list does: a cycle files
+  // hundreds of proposals in one run, and rendering a card for each came to
+  // 10 673 DOM nodes. The pager slices the *render* order rather than the wire
+  // order, and `restrictToPage` narrows nothing but what is drawn — every count
+  // on every header stays the whole run's.
+  const order = useMemo(() => sectionOrder(withProposals), [withProposals]);
+  const view = pageWindow(order.length, page, PROPOSAL_PAGE_SIZE, "proposal");
+  const onPage = useMemo(
+    () => new Set(order.slice(view.from, view.to).map(proposalPageKey)),
+    [order, view.from, view.to],
+  );
+  const pagedSections = useMemo(
+    () => restrictToPage(withProposals, onPage),
+    [withProposals, onPage],
+  );
+  // The queue shrinks under the reader on every accept and on every poll;
+  // `pageWindow` clamps an out-of-range index, and this puts a reader whose
+  // filters changed back at the top rather than deep inside a different list.
+  useEffect(() => setPage(0), [agentFilter, kindFilter]);
 
   // A section whose space no picker lists is a space that was archived while
   // its proposals waited. The read that names it is lazy — see
@@ -305,6 +349,7 @@ export function ReviewInbox() {
       <QueueToolbar
         total={queue.proposals.length}
         shown={visible.length}
+        truncated={queue.truncated}
         spaceCount={withProposals.length}
         agents={agents}
         agentFilter={agentFilter}
@@ -332,6 +377,14 @@ export function ReviewInbox() {
         </p>
       ) : null}
 
+      {/* The queue's own truncation notice. `GET /api/review/queue` sends no
+          total and no flag, so a filled window is the only signal there is —
+          and saying nothing about it is how "500 proposals waiting" came to be
+          printed over a queue of 1043. */}
+      {queue.truncated ? (
+        <p className="nd-rv-flag nd-rv-flag--warn">{queueTruncationNote(REVIEW_QUEUE_LIMIT)}</p>
+      ) : null}
+
       {result ? (
         <ActionOutcome ref={outcomeRef} result={result} onDismiss={() => setResult(null)} />
       ) : null}
@@ -349,9 +402,9 @@ export function ReviewInbox() {
       {spaceList.failed ? (
         <p className="nd-rv-flag nd-rv-flag--warn">
           The space list could not be loaded, so these proposals are not grouped by space and
-          nothing below can say which spaces govern themselves. An <code>edit</code>-granted space
-          files no proposals at all — its silence here is not evidence of anything until this
-          list is readable again.
+          nothing below can say which spaces an agent may write to directly. An{" "}
+          <code>edit</code>-granted space need file no proposals at all — its silence here is not
+          evidence of anything until this list is readable again.
         </p>
       ) : null}
 
@@ -365,35 +418,41 @@ export function ReviewInbox() {
           }}
         />
       ) : (
-        withProposals.map((section) => {
-          const named = sectionSpaceName(section, spaceName);
-          const label = named.label;
-          return (
-            <SpacePanel
-              key={section.key}
-              section={section}
-              name={named}
-              spaceName={spaceName}
-              selected={selected}
-              expanded={expanded}
-              busy={busy}
-              onToggleSelect={toggleSelect}
-              onToggleExpand={toggleExpand}
-              onSetBatchSelection={setBatchSelection}
-              onAcceptOne={acceptOne}
-              // The space is in every confirmation scope, not only in the
-              // heading: a batch accept is a live write, and "which territory"
-              // is part of what is being confirmed.
-              onRejectOne={(proposal) => askReject([proposal], `One proposal in ${label}`)}
-              onAcceptBatch={(batch) =>
-                askAccept([...batch.proposals], `${label} · ${batchScope(batch)}`)
-              }
-              onRejectBatch={(batch) =>
-                askReject([...batch.proposals], `${label} · ${batchScope(batch)}`)
-              }
-            />
-          );
-        })
+        <>
+          {view.pages > 1 ? <QueuePager view={view} onPage={setPage} /> : null}
+
+          {pagedSections.map((section) => {
+            const named = sectionSpaceName(section, spaceName);
+            const label = named.label;
+            return (
+              <SpacePanel
+                key={section.key}
+                section={section}
+                name={named}
+                spaceName={spaceName}
+                selected={selected}
+                expanded={expanded}
+                busy={busy}
+                onToggleSelect={toggleSelect}
+                onToggleExpand={toggleExpand}
+                onSetBatchSelection={setBatchSelection}
+                onAcceptOne={acceptOne}
+                // The space is in every confirmation scope, not only in the
+                // heading: a batch accept is a live write, and "which territory"
+                // is part of what is being confirmed.
+                onRejectOne={(proposal) => askReject([proposal], `One proposal in ${label}`)}
+                onAcceptBatch={(batch) =>
+                  askAccept([...batch.proposals], `${label} · ${batchScope(batch)}`)
+                }
+                onRejectBatch={(batch) =>
+                  askReject([...batch.proposals], `${label} · ${batchScope(batch)}`)
+                }
+              />
+            );
+          })}
+
+          {view.pages > 1 ? <QueuePager view={view} onPage={setPage} /> : null}
+        </>
       )}
 
       {/* Outside the empty-queue branch on purpose: an empty queue is exactly
@@ -493,6 +552,7 @@ function SpacePanel({
   onRejectBatch: (batch: ProposalBatch) => void;
 }) {
   const unreported = section.kind === "unreported";
+  const editNote = editGrantNote(section.editAgents, section.total > 0);
 
   return (
     <section className="nd-rv-space">
@@ -554,12 +614,7 @@ function SpacePanel({
             endpoint spaces — each card names the far side.
           </p>
         ) : null}
-        {!unreported && section.editAgents.length > 0 ? (
-          <p className="nd-meta">
-            {section.editAgents.join(", ")} hold <code>edit</code> here and write directly —
-            nothing below was filed by {section.editAgents.length === 1 ? "it" : "them"}.
-          </p>
-        ) : null}
+        {!unreported && editNote !== null ? <p className="nd-meta">{editNote}</p> : null}
       </header>
 
       {section.agents.map((group) => (
@@ -584,18 +639,20 @@ function SpacePanel({
 }
 
 /**
- * The spaces that hold nothing here, and never will.
+ * The spaces that hold nothing here, where an agent may write without review.
  *
  * This panel is design decision D4's reason for existing. An `edit`-granted
- * space's agents land their writes `active`, so they file no proposals and the
- * space is simply missing from a queue grouped by agent — indistinguishable
- * from a space nobody has touched. Saying so is the only place in the UI where
- * "this territory governs itself" is visible, and it has to be said *here*,
- * where a human is deciding whether they have seen everything.
+ * space's agents *may* land their writes `active`, so they need file no
+ * proposals and the space can be simply missing from a queue grouped by agent —
+ * indistinguishable from a space nobody has touched. Saying so is the only place
+ * in the UI where "work here can bypass review" is visible, and it has to be
+ * said *here*, where a human is deciding whether they have seen everything.
  *
  * It renders zero counts rather than nothing at all, and it renders when the
  * whole queue is empty, because an empty screen is exactly the case it exists
- * to explain.
+ * to explain. What it must **not** say — and used to — is that such an agent
+ * never reaches the queue: a grant is a ceiling, a writer may file below it, and
+ * the gardener does exactly that for every inference.
  */
 function SelfGoverningSpaces({
   sections,
@@ -608,13 +665,8 @@ function SelfGoverningSpaces({
   return (
     <section className="nd-rv-space nd-rv-space--governed" aria-label="Self-governing spaces">
       <header className="nd-rv-space__head">
-        <h2 className="nd-rv-space__name">Self-governing — no review</h2>
-        <p className="nd-meta">
-          {plural(sections.length, "space")} where an agent holds <code>edit</code>. Those writes
-          land <code>active</code> immediately, so nothing from them ever reaches this queue. The
-          zero below is the design, not an empty inbox — and it is not a claim that nothing has
-          been written there.
-        </p>
+        <h2 className="nd-rv-space__name">Written directly — review not required</h2>
+        <p className="nd-meta">{selfGoverningNote(sections.length)}</p>
       </header>
       <ul className="nd-rv-space__governed-list">
         {sections.map((section) => (
@@ -623,8 +675,8 @@ function SelfGoverningSpaces({
               {spaceName(section.spaceId).label}
             </span>
             <span className="nd-meta">
-              0 proposals · written directly by{" "}
-              <span className="nd-mono">{section.editAgents.join(", ")}</span>
+              0 proposals · <span className="nd-mono">{section.editAgents.join(", ")}</span> may
+              write here directly
             </span>
           </li>
         ))}
@@ -633,10 +685,45 @@ function SelfGoverningSpaces({
   );
 }
 
+/** Previous / next over the queue's pages, with the range it is showing. */
+function QueuePager({
+  view,
+  onPage,
+}: {
+  /** The slice currently rendered, from `lib/paging.pageWindow`. */
+  view: PageWindow;
+  onPage: (page: number) => void;
+}) {
+  return (
+    <div className="nd-row nd-rv-pager">
+      <button
+        type="button"
+        className="nd-button nd-button--small"
+        onClick={() => onPage(view.page - 1)}
+        disabled={view.page === 0}
+      >
+        ← Previous
+      </button>
+      <span className="nd-meta nd-rv-pager__range">
+        {view.label} · page {view.page + 1} of {view.pages}
+      </span>
+      <button
+        type="button"
+        className="nd-button nd-button--small"
+        onClick={() => onPage(view.page + 1)}
+        disabled={view.page >= view.pages - 1}
+      >
+        Next →
+      </button>
+    </div>
+  );
+}
+
 /** Filters, freshness, and the manual refresh. */
 function QueueToolbar({
   total,
   shown,
+  truncated,
   spaceCount,
   agents,
   agentFilter,
@@ -650,6 +737,8 @@ function QueueToolbar({
 }: {
   total: number;
   shown: number;
+  /** Whether the read filled its window, so `total` is a floor and not a total. */
+  truncated: boolean;
   /** Spaces currently holding something, for the "across N spaces" line. */
   spaceCount: number;
   agents: string[];
@@ -702,7 +791,7 @@ function QueueToolbar({
 
       <div className="nd-row nd-rv-toolbar__status">
         <span className="nd-meta">
-          {shown === total ? plural(total, "proposal") : `${shown} of ${total} proposals`} waiting
+          {queueCount(shown, total, truncated)} waiting
           {spaceCount > 0 ? ` across ${plural(spaceCount, "space")}` : ""}
           {loadedAt !== null ? ` · checked ${new Date(loadedAt).toLocaleTimeString()}` : ""}
           {paused ? " · polling paused" : ""}
@@ -855,10 +944,20 @@ function BatchSection({
         A run is derived here from arrival times — proposals from one agent filed
         within two minutes of each other. Nothing in the schema records a batch id
         yet.
+        {batch.shown.length < batch.proposals.length ? (
+          // Said where the mismatch is visible: the two buttons above act on the
+          // whole run, and this is the line that explains why they count higher
+          // than the cards below.
+          <>
+            {" "}
+            Showing {batch.shown.length} of this run&rsquo;s {batch.proposals.length} on this page;
+            the two buttons above still act on all {batch.proposals.length}.
+          </>
+        ) : null}
       </p>
 
       <div className="nd-stack nd-rv-batch__items">
-        {batch.proposals.map((proposal) => (
+        {batch.shown.map((proposal) => (
           <ProposalCard
             key={`${proposal.kind}:${proposal.id}`}
             proposal={proposal}
@@ -1006,9 +1105,10 @@ function EmptyQueue({
       body={
         <>
           An empty queue is the normal state. Proposals land here when an agent
-          holding a <code>suggest</code> grant writes — over MCP, authenticated
-          by its token. An <code>edit</code> grant lands those writes directly
-          instead.
+          writes without the authority to land it live — over MCP, authenticated
+          by its token — or when it holds that authority and files below it
+          anyway, which is what the gardener does with every link it infers. An{" "}
+          <code>edit</code> grant is what lets a write land directly instead.
           Checked{" "}
           {loadedAt !== null ? new Date(loadedAt).toLocaleTimeString() : "just now"}; this
           view re-checks on a timer and whenever you come back to the window.

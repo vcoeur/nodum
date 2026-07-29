@@ -20,18 +20,21 @@ from pathlib import Path
 import typer
 from pydantic import BaseModel
 
-from nodum import __version__, assets, db, extract, ingest, projectors, service, urls
+from nodum import __version__, assets, auth, db, extract, ingest, projectors, service, urls
+from nodum import consolidate as consolidate_module
 from nodum import search as search_module
 from nodum.assets import AssetNotFound, AssetSourceChanged, AssetTooLarge, UnsupportedRendition
 from nodum.cli_schema import build_cli_schema
 from nodum.db import ENV_DB_VAR
 from nodum.envelope import envelope, list_envelope, render_json
+from nodum.models import RollbackOut, TransitionFailure
 from nodum.principal import Principal
 from nodum.service import (
     EventNotFound,
     GrantNotPermitted,
     InvalidTransition,
     RecordNotFound,
+    RollbackConflict,
     TypeNotFound,
     UndoNotPossible,
 )
@@ -111,6 +114,39 @@ def _emit_list(key: str, results: Sequence[BaseModel]) -> None:
     _print_json(list_envelope(key, results))
 
 
+def _emit_batch(result: BaseModel, failures: Sequence[TransitionFailure]) -> None:
+    """Print a batch result, name each per-item failure on stderr, exit 1 if any failed.
+
+    ``ingest file``'s rule, and it is the same rule for the same reason. A batch
+    never loses its successes, so the envelope is on stdout **before** the exit
+    code is decided; and a run where something did not happen must not report
+    success, so the exit code is 1 if any item failed. ``nodum retype main
+    --type note`` accomplished nothing, said so in ``failed[]``, opened a cycle
+    that closed ``completed`` with zero events — and exited 0, which is the one
+    thing a script reads.
+
+    The per-item reasons go to stderr as well as into the envelope, because an
+    exit code of 1 with nothing on stderr breaks the other half of the contract:
+    a failure is one readable line there.
+
+    Args:
+        result: The batch outcome to print as the command's one JSON object.
+        failures: Its per-item failures — the ``failed`` list, or ``bulk_relink``'s
+            ``skipped``. That list *is* the refusals now (a self-loop, a
+            duplicate, a space the caller may not edit): its diff annotation
+            ("nothing would change on this edge") moved to ``unchanged``, which
+            is what let ``bulk-relink`` join this rule at all. Its **dry run**
+            passes nothing here on purpose — a rehearsal's ``skipped`` is a
+            prediction, nothing was attempted and nothing was lost, so exit 1
+            would report a failure that has not happened.
+    """
+    _emit(result)
+    for failure in failures:
+        typer.echo(f"  failed {failure.id}: {failure.error}", err=True)
+    if failures:
+        raise typer.Exit(1)
+
+
 def _parse_set(pairs: list[str] | None) -> dict:
     """Parse repeatable ``--set key=value`` options into a props dict.
 
@@ -133,15 +169,24 @@ def _parse_set(pairs: list[str] | None) -> dict:
 
 
 def _read_content(content: str | None, content_file: str | None) -> str | None:
-    """Resolve node content from ``--content`` or ``--content-file`` (``-`` = stdin)."""
+    """Resolve node content from ``--content`` or ``--content-file`` (``-`` = stdin).
+
+    The file is read **through** :func:`_run`, not beside it, for the reason
+    :func:`_principal` is: this helper is evaluated inside the argument list of
+    the command's own ``_run(service.create_node, …)``, and Python builds that
+    list before ``_run`` is entered — so ``--content-file /missing.md`` raised
+    ``FileNotFoundError`` outside the error boundary and printed a full Rich
+    traceback, against a contract whose named example of what must never be one
+    is a missing file. Routing it here fixes ``node create`` and ``node update``
+    at once.
+    """
     if content is not None and content_file is not None:
         typer.echo("use either --content or --content-file, not both", err=True)
         raise typer.Exit(1)
     if content_file is not None:
         if content_file == "-":
             return sys.stdin.read()
-        with open(content_file) as handle:
-            return handle.read()
+        return _run(Path(content_file).read_text)
     return content
 
 
@@ -167,6 +212,11 @@ def _run(func, *args, **kwargs):
         RecordNotFound,
         TypeNotFound,
         EventNotFound,
+        # `--as` naming an account that does not exist. It reaches this list
+        # because `_principal` resolves *through* here rather than beside the
+        # call it feeds — see that function for why the argument-list position
+        # made it a traceback.
+        auth.UnknownPrincipal,
         AssetNotFound,
         AssetTooLarge,
         AssetSourceChanged,
@@ -174,6 +224,10 @@ def _run(func, *args, **kwargs):
         InvalidTransition,
         GrantNotPermitted,
         UndoNotPossible,
+        # A `UndoNotPossible` subclass, so already caught above; named because
+        # the surfaces wave has to see that a refused rollback is one readable
+        # line here and a 409 there, not a traceback.
+        RollbackConflict,
         ValueError,
     ) as exc:
         typer.echo(str(exc), err=True)
@@ -198,11 +252,18 @@ AS_OPTION = typer.Option(
 
 
 def _principal(as_human: str) -> Principal:
-    """Resolve ``--as`` to a human principal (trusted-local, no password)."""
-    from nodum import auth
+    """Resolve ``--as`` to a human principal (trusted-local, no password).
 
+    The resolution goes **through** :func:`_run` rather than beside it. Almost
+    every command spells this as ``_run(service.fn, …, principal=_principal(…))``,
+    where Python evaluates the argument list before ``_run`` is entered — so a
+    refused actor raised from outside the error boundary and printed a full
+    traceback, against the contract that says a failure is one readable line.
+    Routing it here fixes every call site at once, wherever in an argument list
+    it happens to sit, and Phase 5a adds several more of them.
+    """
     human_id = as_human.removeprefix("human:")
-    return auth.owner_principal(human_id)
+    return _run(auth.owner_principal, human_id)
 
 
 SET_OPTION = typer.Option(None, "--set", help="Repeatable key=value props (values parsed as JSON).")
@@ -378,7 +439,10 @@ def edge_create_batch(
     as_human: str = AS_OPTION,
 ) -> None:
     """Propose a batch of edges; bad suggestions are reported, not fatal."""
-    raw = sys.stdin.read() if suggestions_file == "-" else Path(suggestions_file).read_text()
+    # Through `_run`, so a missing or unreadable file is the contract's one line
+    # on stderr rather than a Rich traceback — the same reason `_read_content`
+    # and `_principal` read through it.
+    raw = sys.stdin.read() if suggestions_file == "-" else _run(Path(suggestions_file).read_text)
     try:
         suggestions = json.loads(raw)
     except json.JSONDecodeError:
@@ -456,10 +520,19 @@ def history(
 @app.command()
 def events(
     limit: int = typer.Option(50, "--limit", help="Maximum rows."),
+    cycle: str | None = typer.Option(
+        None, "--cycle", help="Only the events one consolidation cycle produced."
+    ),
     as_human: str = AS_OPTION,
 ) -> None:
-    """Show the most recent event-log entries (newest first)."""
-    rows = _run(service.list_events, _principal(as_human), limit=limit)
+    """Show the most recent event-log entries (newest first).
+
+    `--cycle` is a journal entry's diff: a `cycles` row stores what each job
+    examined and proposed, never a diff of its own, so what a cycle *changed* is
+    read back off the append-only log it wrote — one record, not two that can
+    disagree.
+    """
+    rows = _run(service.list_events, _principal(as_human), limit=limit, cycle_id=cycle)
     _emit_list("events", rows)
 
 
@@ -1023,7 +1096,7 @@ def serve(
     """
     import uvicorn
 
-    from nodum import http_api
+    from nodum import http_api, scheduler
 
     resolved_db = Path(db_path) if db_path is not None else db.db_path()
     loopback = http_api.bare_host(host) in http_api.LOOPBACK_BIND_ADDRESSES
@@ -1033,6 +1106,24 @@ def serve(
         "so every /api request still needs a human password (nodum human passwd).",
         err=True,
     )
+    try:
+        consolidate_at = scheduler.configured_time()
+    except ValueError:
+        # An unparseable value is announced by `create_app`, which is also what
+        # decides to start without a schedule. Saying it twice, in two voices,
+        # is worse than saying it once where the decision is made.
+        consolidate_at = None
+    if consolidate_at is not None:
+        # The *successful* configuration is the one that matters more, and it
+        # was the silent one: a typo got a warning while the setting that
+        # actually starts a background writer on the human's graph produced
+        # nothing at all on the console.
+        typer.echo(
+            f"nightly consolidation cycle: {consolidate_at.strftime('%H:%M')} local time "
+            f"(${scheduler.ENV_CONSOLIDATE_AT}) — the gardener will write to this graph "
+            "unasked; unset it to turn the schedule off.",
+            err=True,
+        )
     if not loopback:
         # uvicorn serves plain HTTP. The session cookie is marked Secure on a
         # non-loopback bind and so fails closed without TLS, but the login body
@@ -1230,16 +1321,25 @@ def human_enable(
 @agent_app.command("create")
 def agent_create(
     name: str = typer.Argument(..., help="Agent id (becomes agent:<name>)."),
-    kind: str = typer.Option("external", "--kind", help="'external' or 'internal'."),
-    owner: str = typer.Option("owner", "--owner", help="Owning human (external agents)."),
+    owner: str = typer.Option("owner", "--owner", help="Owning human."),
     as_human: str = AS_OPTION,
 ) -> None:
-    """Create an agent account and print its token — shown this once, only the hash is stored."""
+    """Create an agent account and print its token — shown this once, only the hash is stored.
+
+    Every account created here is **external**, and there is no flag for the
+    other kind. `service.create_agent` refuses `kind="internal"` outright:
+    `auth.internal_principal` selects the gardener by being the only row with
+    that kind and refuses to choose between two, so a second internal agent does
+    not add a gardener — it takes the existing one away and every consolidation
+    path dies. `disable_agent` is no cure (the count precedes the `disabled`
+    check) and no surface deletes an agent, so the install was recoverable only
+    by hand-editing the database. A flag whose one non-default value is a
+    permanent refusal is not a choice; HTTP already hardcodes `external`.
+    """
     created = _run(
         service.create_agent,
         name,
-        kind=kind,
-        owner_human_id=None if kind == "internal" else owner,
+        owner_human_id=owner,
         principal=_principal(as_human),
     )
     _emit(created)
@@ -1355,3 +1455,289 @@ def space_archive(
     while the space is archived, and come back if the archive is undone.
     """
     _emit(_run(service.archive_space, space, principal=_principal(as_human)))
+
+
+# ── Consolidation cycles, the journal, and the curative tier (§8.2/§8.4) ──────
+#
+# Flat commands rather than a group, the shape the spaces phase settled on
+# (`space-create`, `space-list`, …): each of these is one verb over one noun,
+# and `rollback` in particular belongs beside `undo`, which is its sibling —
+# an event with no cycle id is reversed by `undo`, an event with one by
+# `rollback`.
+
+
+@app.command()
+def consolidate(
+    scope: str | None = typer.Option(
+        None, "--scope", help="Confine the cycle to one space (id or name); default: every space."
+    ),
+    job: list[str] | None = typer.Option(
+        None, "--job", help="Job to run (repeatable; default: every registered job, in order)."
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Compute every job and write nothing but the journal entry."
+    ),
+    as_human: str = AS_OPTION,
+) -> None:
+    """Run a consolidation cycle: the gardener's deterministic jobs, and its report.
+
+    The writes are the gardener's (`agent:builtin-gardener`), because the
+    gardener made them; `--as` names who *asked*, which is what the cycle
+    records as `triggered_by`. `--dry-run` computes everything and emits **no**
+    event at all — the cycle row is still written and flagged, because the
+    journal has to say which it was, and `events --cycle <id>` on it is empty.
+
+    What the run changed is not in the report: it is `events --cycle <id>`.
+    """
+    _emit(
+        _run(
+            consolidate_module.consolidate,
+            scope=scope,
+            dry_run=dry_run,
+            jobs=job or None,
+            triggered_by=_principal(as_human).actor_string,
+        )
+    )
+
+
+@app.command(name="cycle-list")
+def cycle_list(
+    limit: int = typer.Option(50, "--limit", help="Maximum cycles."),
+    as_human: str = AS_OPTION,
+) -> None:
+    """List consolidation cycles, newest first — the dream journal (human-only)."""
+    _emit_list("cycles", _run(service.list_cycles, limit=limit, principal=_principal(as_human)))
+
+
+@app.command(name="cycle-get")
+def cycle_get(
+    cycle_id: str = typer.Argument(..., help="Cycle id."),
+    as_human: str = AS_OPTION,
+) -> None:
+    """Show one cycle's journal entry: what ran, what it measured, how it ended.
+
+    Human-only, for the reason `events` is: the journal says what the gardener
+    did across every space in the file.
+    """
+    _emit(_run(service.get_cycle, cycle_id, principal=_principal(as_human)))
+
+
+@app.command(name="cycle-abandon")
+def cycle_abandon(
+    cycle_id: str = typer.Argument(..., help="The interrupted cycle to close as failed."),
+    as_human: str = AS_OPTION,
+) -> None:
+    """Close an interrupted cycle nobody is going to finish — the door out (human-only).
+
+    A cycle left `running` by a `SIGKILL`, a power cut, or a server shutdown
+    that cancelled the nightly task is not a cosmetic wart in the journal: it
+    makes its own writes **irreversible on every surface**. `rollback` refuses a
+    cycle that is still running, because its event set is not closed yet, and
+    `undo` refuses every event a cycle stamped by name. This is what closes it,
+    as `failed`, with a report saying who abandoned it — after which
+    `rollback <cycle-id>` works normally.
+
+    It is not a general "close this cycle": a cycle that already said how it
+    ended is refused, since re-closing it would overwrite that record. Nothing
+    the run already wrote is touched — those writes are real, and taking them
+    back is exactly what this unlocks.
+    """
+    _emit(_run(service.abandon_cycle, cycle_id, principal=_principal(as_human)))
+
+
+def _rollback(cycle_id: str, *, dry_run: bool, principal: Principal) -> RollbackOut:
+    """Roll a cycle back, rendering a refusal as JSON rather than as a sentence.
+
+    Every other failure in this CLI is one line, because one line is all there
+    is to say. A refused rollback is a *list*: for each row in the way, which
+    event of the cycle wrote it and which later event moved it, plus that
+    event's actor and cycle. `RollbackConflict`'s message names only the first
+    few and drops the actor and the cycle entirely, so the structured list is
+    printed as the command's one JSON object and the message still goes to
+    stderr with exit 1, exactly as every other refusal does.
+    """
+    try:
+        return service.rollback_cycle(cycle_id, dry_run=dry_run, principal=principal)
+    except RollbackConflict as exc:
+        _print_json(
+            {
+                "error": {
+                    "type": "RollbackConflict",
+                    "message": str(exc),
+                    "conflicts": [conflict.model_dump(mode="json") for conflict in exc.conflicts],
+                }
+            }
+        )
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1) from exc
+
+
+@app.command()
+def rollback(
+    cycle_id: str = typer.Argument(..., help="Consolidation cycle to take back."),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Report what would be reversed, and what stands in the way."
+    ),
+    as_human: str = AS_OPTION,
+) -> None:
+    """Take a consolidation cycle back whole — all of it, or none of it (D7).
+
+    The sibling of `undo`, and the split is one line: an event with no cycle id
+    is reversed by `undo`, an event with one is reversed here. Human-only, for a
+    stronger version of `undo`'s own reason — it writes recorded payloads back
+    verbatim, across spaces, for a whole cycle at once.
+
+    It **refuses rather than clobbers**: if anything outside the cycle has
+    touched a row the cycle wrote, nothing is written and the refusal is this
+    command's one JSON object — `{"error": {"type", "message", "conflicts"}}`,
+    each conflict naming both ends of the collision — with the message on
+    stderr and exit 1. `--dry-run` asks the same question without the refusal:
+    it opens no cycle, writes nothing, and reports the conflicts in `conflicts`.
+    """
+    _emit(_run(_rollback, cycle_id, dry_run=dry_run, principal=_principal(as_human)))
+
+
+@app.command(name="merge-nodes")
+def merge_nodes(
+    ids: list[str] = typer.Argument(..., help="Nodes to merge away."),
+    into: str = typer.Option(..., "--into", help="The survivor's node id."),
+    as_human: str = AS_OPTION,
+) -> None:
+    """Merge nodes into a survivor — soft, reversible, nothing destroyed (D9).
+
+    Each merged-away node is archived and says where it went in
+    `props.merged_into`; every incident edge is repointed at the survivor,
+    keeping its original endpoints, or archived when repointing would make a
+    self-loop or duplicate an edge the survivor already carries. Reads are
+    unchanged: `node get` on a tombstone returns the tombstone.
+
+    The whole merge lands in one cycle, and `rollback <cycle-id>` is what takes
+    it back — `undo` refuses a cycle-stamped event by name, because reversing
+    one row of a merge would leave the other half standing.
+    """
+    _emit(_run(service.merge_nodes, ids, into=into, principal=_principal(as_human)))
+
+
+@app.command()
+def retype(
+    ids: list[str] = typer.Argument(..., help="Nodes to retype."),
+    type: str = typer.Option(..., "--type", "-t", help="Target node type id or name."),
+    as_human: str = AS_OPTION,
+) -> None:
+    """Change nodes' type — the one sanctioned exception to an immutable field (§8.2).
+
+    A node's type is fixed at creation *by design*, which is why this is a
+    curative operation rather than a field on `node update`. No props are
+    transformed: what a property means after a retype is a judgement call, and
+    this tier is the deterministic one. Per-item failures are reported rather
+    than fatal, exactly as a batch accept/reject reports them — in `failed`, on
+    stderr, and in the **exit code**, which is 1 if any node was skipped. That
+    is `ingest file`'s rule: a batch never loses its successes, so the envelope
+    is printed either way, but a run that accomplished nothing must not report
+    success to a script that only reads the code.
+    """
+    retyped = _run(service.retype, ids, type, principal=_principal(as_human))
+    _emit_batch(retyped, retyped.failed)
+
+
+@app.command(name="supersede-edge")
+def supersede_edge(
+    edge_id: str = typer.Argument(..., help="The edge to retire."),
+    src: str | None = typer.Option(None, "--src", help="Replacement's source node id."),
+    dst: str | None = typer.Option(None, "--dst", help="Replacement's target node id."),
+    type: str | None = typer.Option(None, "--type", "-t", help="Replacement's edge type."),
+    confidence: float | None = typer.Option(
+        None, "--confidence", help="Replacement's confidence in [0, 1]."
+    ),
+    set_props: list[str] | None = SET_OPTION,
+    as_human: str = AS_OPTION,
+) -> None:
+    """Retire an edge that stopped being true, optionally naming its successor.
+
+    Two facts are recorded because they are two facts: `valid_to` is closed
+    (*when* it stopped being true) and the edge is archived (*it is no longer
+    part of the live graph*).
+
+    Every option here describes the **replacement**, and every field it does not
+    name is inherited from the edge being replaced — so a supersede that only
+    changes a confidence says only that, and naming none of them retires the
+    edge with no successor at all.
+    """
+    replacement: dict = {}
+    if src is not None:
+        replacement["src_id"] = src
+    if dst is not None:
+        replacement["dst_id"] = dst
+    if type is not None:
+        replacement["type"] = type
+    if confidence is not None:
+        replacement["confidence"] = confidence
+    if set_props:
+        replacement["props"] = _parse_set(set_props)
+    _emit(
+        _run(
+            service.supersede_edge,
+            edge_id,
+            replacement=replacement or None,
+            principal=_principal(as_human),
+        )
+    )
+
+
+@app.command(name="bulk-relink")
+def bulk_relink(
+    src: str | None = typer.Option(None, "--src", help="Select edges out of this node."),
+    dst: str | None = typer.Option(None, "--dst", help="Select edges pointing at this node."),
+    type: str | None = typer.Option(None, "--type", "-t", help="Select edges of this type."),
+    state: str | None = typer.Option(
+        None, "--state", help="Select edges in this state (default: everything but archived)."
+    ),
+    to_type: str | None = typer.Option(None, "--to-type", help="New edge type."),
+    to_dst: str | None = typer.Option(None, "--to-dst", help="New target node id."),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Print the diff and write nothing at all."
+    ),
+    as_human: str = AS_OPTION,
+) -> None:
+    """Repoint or retype many edges at once, behind a reviewable dry run (§8.5).
+
+    The four selector options narrow; the two `--to-*` options say what changes.
+    Neither may be empty — an empty selector would match every edge in the file
+    — and the service refuses that rather than this adapter guessing at it.
+
+    `--dry-run` opens no cycle and emits no event: it is the diff §8.5 asks for
+    on a large refactor. The reversal of a run that did happen is
+    `rollback <cycle-id>`.
+
+    The batch rule applies, with one departure. `skipped[]` is the refusals — a
+    self-loop, a duplicate, a space you may not edit — so a real run that
+    refused an edge exits **1** and names each one on stderr, exactly as
+    `retype` does; `unchanged[]` is the diff annotation and never affects the
+    code. A `--dry-run` exits **0** whatever it predicts: nothing was attempted
+    there, so nothing failed.
+    """
+    selector: dict = {}
+    if src is not None:
+        selector["src_id"] = src
+    if dst is not None:
+        selector["dst_id"] = dst
+    if type is not None:
+        selector["type"] = type
+    if state is not None:
+        selector["state"] = state
+    changes: dict = {}
+    if to_type is not None:
+        changes["type"] = to_type
+    if to_dst is not None:
+        changes["dst_id"] = to_dst
+    result = _run(
+        service.bulk_relink,
+        selector,
+        changes,
+        dry_run=dry_run,
+        principal=_principal(as_human),
+    )
+    # The dry run's refusals are a prediction, not a loss, so they buy no exit
+    # code — read off the result rather than the flag, since the service is what
+    # decides which posture the run had.
+    _emit_batch(result, [] if result.dry_run else result.skipped)

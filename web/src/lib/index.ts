@@ -29,6 +29,9 @@ export {
 } from "./failure";
 export type { FailureDescription, FailureKind } from "./failure";
 
+export { pageWindow } from "./paging";
+export type { PageWindow } from "./paging";
+
 export { onUnauthorized, reportUnauthorized } from "./session";
 export type { UnauthorizedListener } from "./session";
 

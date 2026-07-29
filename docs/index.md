@@ -34,8 +34,9 @@ privileges enforced at the service layer**, not by convention:
 - An agent write lands `proposed` when its grant on the space is `suggest`, and
   `active` when its grant is `edit`.
 - Anything that retires or rewrites live state (`accept`, `reject`, `archive`,
-  `undo`, every `review` subcommand) is limited to a human — or, in-space, to an
-  agent holding `edit` — and `undo` is human-only.
+  every `review` subcommand, and the curative tier — `merge-nodes`, `retype`,
+  `supersede-edge`, `bulk-relink`, `consolidate`) is limited to a human — or,
+  in-space, to an agent holding `edit`. `undo` and `rollback` are human-only.
 
 An agent edit does not overwrite: it stages a `proposed` version recording
 *which fields it named*, so accepting it applies only those fields to the node
@@ -94,4 +95,20 @@ is reported rather than fatal. Also: `page:<n>` PDF page rasters, and
 short-lived, single-use capability URLs for agent hosts that share no
 filesystem with the graph.
 
-Still to come: claim proposals and the consolidation cycle.
+**Phase 5a (the gardener's spine)** landed: the graph maintains itself. A
+**consolidation cycle** groups a run of writes under one id, so `nodum rollback`
+can take the whole of it back — all of it, or none of it, and it refuses rather
+than clobbers when the graph has moved on. The **gardener** is an internal agent
+with ordinary grants that runs four deterministic jobs (duplicate candidates,
+link pruning and inference, housekeeping, a neglect report) and files what it
+infers in the review queue rather than asserting it. A **curative tier**
+(`merge-nodes`, `retype`, `supersede-edge`, `bulk-relink`) changes structure
+rather than adding to it, each operation inside a cycle. A **dream journal**
+(`nodum cycle-list` / `cycle-get`, and a view in the web UI) says what ran, who
+asked, what it measured and what it changed — and `nodum cycle-abandon <id>` is
+the way out of a run a crash left open, since a cycle that never closed cannot
+be rolled back and its events cannot be undone either. Cycles run on demand, and
+nightly when `NODUM_CONSOLIDATE_AT` says so — unset means off.
+
+Still to come: claim proposals and the gardener's LLM half — everything that
+needs a judgement rather than arithmetic.

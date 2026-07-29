@@ -126,6 +126,34 @@ To let the agent write directly, raise its grant (human only):
 nodum grant researcher main edit --as owner
 ```
 
+## Let the graph tend itself
+
+A consolidation cycle runs the gardener's deterministic jobs — duplicate
+candidates, link pruning and inference, housekeeping, a neglect report — and
+files what it finds in the review queue rather than asserting it. Rehearse one
+first; a dry run writes its journal entry and no event at all:
+
+```sh
+nodum consolidate --dry-run --as owner
+nodum consolidate --as owner
+nodum cycle-list --as owner            # the dream journal, newest first
+nodum cycle-get <cycle-id> --as owner  # what ran, and what it measured
+nodum events --cycle <cycle-id> --as owner   # what it actually changed
+```
+
+If a cycle did something you did not want, take the whole of it back. It is all
+or nothing, and it refuses rather than clobbering when the graph has moved on:
+
+```sh
+nodum rollback <cycle-id> --dry-run --as owner   # would this succeed?
+nodum rollback <cycle-id> --as owner
+```
+
+The same machinery is behind the curative commands you type yourself —
+`merge-nodes`, `retype`, `supersede-edge`, `bulk-relink` — so `rollback` is the
+way back from those too, and `undo` will tell you so rather than reversing half
+of one.
+
 ## Serve the UI
 
 ```sh
@@ -134,7 +162,13 @@ nodum serve
 
 This runs the HTTP API and the web UI from one process on
 `http://127.0.0.1:8600`. Every write through this surface is attributed to the
-session's human, and no request field can say otherwise.
+session's human, and no request field can say otherwise. To run one
+consolidation cycle a night, name a local time — unset means off, which is the
+default:
+
+```sh
+NODUM_CONSOLIDATE_AT=03:30 nodum serve
+```
 
 ## Next
 

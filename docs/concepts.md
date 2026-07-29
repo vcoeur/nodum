@@ -52,7 +52,10 @@ decision buys three properties at once:
 
 - **Versioned** — a node's history is a sequence of snapshots (`nodum history`).
 - **Auditable** — who changed what, when, and with what reason.
-- **Reversible** — `nodum undo` restores the prior state from the payload.
+- **Reversible** — `nodum undo` restores the prior state from the payload. An
+  event written inside a consolidation cycle carries that cycle's id and is
+  reversed by `nodum rollback <cycle-id>` instead, whole: see below for why one
+  row of a multi-row decision is the wrong unit to take back.
 
 The log is also the input to the projectors, below.
 
@@ -67,11 +70,21 @@ levels: `read` ⊂ `suggest` ⊂ `edit`.
 |---|---|---|
 | A write lands as | `active` | `proposed` on a `suggest` grant, `active` on `edit` |
 | Can accept / reject / archive | yes | only with `edit` on the item's space |
+| Can run curative operations | yes | only with `edit` on every space touched |
 | Can undo | yes | no |
+| Can roll a cycle back | yes | no |
 | Administers accounts and grants | yes | no |
 
 The human-only set is not delegable, whoever filed the proposal. `undo` most of
-all, since restoring an event's payload can write `state = 'active'` back.
+all, since restoring an event's payload can write `state = 'active'` back — and
+`rollback` above even that, since it does exactly the same thing for a whole
+cycle at once, across spaces.
+
+A grant is a **ceiling, not a mandate**. An agent holding `edit` may still file
+a write it is unsure of as `proposed` and put it in front of a human; what it
+may not do is ask to land above its grant, which is refused rather than quietly
+downgraded. This is how the gardener's inferences reach the review queue despite
+its `edit` grant.
 
 ### Proposed updates
 
@@ -152,6 +165,99 @@ agent, which is the only way a space that governs itself — an agent holds
 from a space where nothing happened. And because the server refuses an unknown
 space and an ungranted one with identical words, no screen ever reports a space
 as missing; it says what changed instead.
+
+## Consolidation cycles and the gardener
+
+The graph maintains itself, and the mechanism is an ordinary agent doing
+ordinary writes under an ordinary grant.
+
+A **consolidation cycle** groups a run of writes under one id. Every event a
+cycle produces carries that id, which buys one thing: `nodum rollback
+<cycle-id>` reverses the whole of it in a single transaction — all of it, or
+none of it. It **refuses rather than clobbers**, so if anything outside the
+cycle has touched a row the cycle touched, nothing is written and the refusal
+names both ends of every collision. A rollback is itself a cycle, so rolling
+*that* back re-applies the original.
+
+The **gardener** (`builtin-gardener`) is the agent that runs the cycle. It is an
+internal account: it holds no credential at all and authenticates by being
+in-process, so there is nothing to present and nothing to steal. Everything else
+about it is unremarkable on purpose — it has `read` on `meta` and `edit` on
+`main` as two
+ordinary grant rows, they appear in `nodum space-list` beside every other
+agent's, and `nodum revoke builtin-gardener main` takes them away with the
+command that was already there. There is no gardener-shaped exception anywhere
+in the grant model, which is the point. `read` on meta is what resolving a type
+costs; consolidation never writes the vocabulary, so it is never granted to.
+Any other space is an explicit `nodum grant builtin-gardener <space> edit`, and
+a cycle scoped to a space the gardener holds nothing on says so and names that
+command — rather than reporting that the space does not exist, which is true of
+neither the space nor the person reading it.
+
+A revoked grant takes effect from the **next** cycle: the gardener's principal
+is minted once when a run starts, so a cycle already in flight finishes under
+the grants it began with. A cycle is minutes at most, and rolling it back takes
+back whatever it wrote in the meantime.
+
+Its four jobs are arithmetic over data the file already holds — no model is
+involved, and a cycle runs fine on a machine that has none:
+
+- **Duplicate candidates** — normalised title equality, near-equality, and
+  embedding cosine where a provider exists. It writes a `proposed`
+  `duplicate_of` edge and never merges: a merge is always human-approved, and a
+  proposed edge is already a queue item with a diff and an accept button.
+- **Link maintenance** — the two prunings a machine can be right about (an exact
+  duplicate edge, an edge incident to an archived node), then `relates_to`
+  inference from embedding proximity and shared neighbours.
+- **Housekeeping** — the fractional-position check, and embedding catch-up by
+  running the `vec` projector rather than growing a second embedding path that
+  could disagree with search.
+- **Neglect report** — names the active nodes nobody has touched in ninety days,
+  and writes nothing. Age is arithmetic; deciding something has gone *stale* is
+  judgement, and judgement is a later phase.
+
+Everything it infers is filed `proposed`, even though its grant would let it
+write live — a suggestion nobody reviews is not a suggestion.
+
+The **dream journal** is what a cycle leaves behind: `nodum cycle-list` and
+`nodum cycle-get <id>` say what ran, who asked, what it measured (five coherence
+metrics, before and after) and how it ended. What it *changed* is a separate
+question with a separate answer — `nodum events --cycle <id>`, read off the same
+append-only log as everything else. The journal stores no diff of its own,
+because two records of one event are two records that can disagree.
+
+A cycle that never closed — a `SIGKILL`, a power cut, a server stopped
+mid-cycle — is not a cosmetic wart in that journal: it makes the run's own
+writes irreversible, because `rollback` refuses a cycle whose event set is not
+closed and `undo` refuses every cycle-stamped event. `nodum cycle-abandon <id>`
+closes it `failed`, with a report naming who declared it dead, and `rollback`
+then works normally. A cycle that already said how it ended is refused rather
+than re-closed.
+
+The **curative tier** is the human-facing half of the same machinery:
+`merge-nodes`, `retype`, `supersede-edge` and `bulk-relink` change structure
+rather than adding to it. Each runs inside a cycle even when you type it
+yourself, which is why `undo` refuses a cycle-stamped event and points at
+`rollback` instead: a merge is several rows from one decision, and reversing one
+of them would leave the other half standing. `rollback` is the only verb the
+refusal names — it briefly also named an `undo <seq>` for the last write outside
+the cycle, and that was the harm it exists to prevent, printed as a remedy:
+following it deletes something the cycle never named and turns the undo into a
+conflict that blocks the rollback.
+
+Cycles run on demand (`nodum consolidate`, or a button in the web UI) and
+nightly when `NODUM_CONSOLIDATE_AT` is set. Unset means off, which is the
+default; when it is set, `nodum serve` says so in its startup banner. Only one
+consolidation cycle runs at a time **against a database file**, not merely
+within one process: the guard is a uniqueness rule on the journal itself, so a
+`nodum consolidate` you type at a terminal while `nodum serve` is running one is
+refused just as an in-process caller is. A second caller is refused rather than
+queued, since queueing would run it over a graph the first had just changed —
+and the refusal names the cycle in the way, plus the `nodum cycle-abandon <id>`
+that clears it, because a run that was killed never closes itself and would
+otherwise block every later run behind advice nobody could act on. Curative
+operations and rollbacks are outside that rule: each is one short operation you
+asked for, and neither is what proposes a duplicate twice.
 
 ## Projectors and derived indexes
 

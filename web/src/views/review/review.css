@@ -49,6 +49,19 @@
 
 /* --- Toolbar ------------------------------------------------------------ */
 
+/* The queue's pager, above and below the sections. Same shape as the journal's
+   (`.nd-jn-pager`), because the two lists page for the same reason. */
+.nd-rv-pager {
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: var(--nd-space-4);
+}
+
+.nd-rv-pager__range {
+  white-space: nowrap;
+}
+
 .nd-rv-toolbar {
   display: flex;
   align-items: flex-end;

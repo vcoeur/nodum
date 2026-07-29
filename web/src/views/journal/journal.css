@@ -1,0 +1,538 @@
+/*
+ * The dream journal: the cycle list, one entry in full, and the rollback confirm.
+ *
+ * Two colour decisions, both deliberate:
+ *
+ * - **A cycle's status is not a node state**, so none of these pills borrow the
+ *   `proposed / active / archived` ramp. They take the feedback hues instead —
+ *   running is in progress, failed is a failure, a rehearsal changed nothing —
+ *   and a reversed cycle takes the archived colour, which is the lowest-contrast
+ *   one in the system, because a cycle that has been taken back should recede.
+ * - **The event diff borrows the danger and active washes for before/after**,
+ *   the same one convention `views/history/history.css` takes for the version
+ *   diff. It is the only place in this view that is not a feedback hue.
+ */
+
+.nd-jn__subtitle {
+  max-width: 66ch;
+}
+
+/* --- Run-now panel ---------------------------------------------------- */
+
+.nd-jn-run {
+  display: flex;
+  flex-direction: column;
+  gap: var(--nd-space-4);
+  padding: var(--nd-space-8);
+  border: 1px solid var(--nd-border);
+  border-radius: var(--nd-radius-lg);
+  background: var(--nd-surface);
+}
+
+.nd-jn-run__controls {
+  display: flex;
+  align-items: flex-end;
+  gap: var(--nd-space-8);
+  flex-wrap: wrap;
+}
+
+.nd-jn-run__scope {
+  min-width: 12rem;
+}
+
+.nd-jn-run__rehearse {
+  display: flex;
+  align-items: center;
+  gap: var(--nd-space-4);
+  font-size: var(--nd-text-sm);
+  color: var(--nd-text-muted);
+  padding-bottom: var(--nd-space-3);
+}
+
+.nd-jn-run__note {
+  max-width: 72ch;
+}
+
+/* --- The list --------------------------------------------------------- */
+
+.nd-jn__list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--nd-space-8);
+  list-style: none;
+}
+
+.nd-jn-entry {
+  gap: var(--nd-space-4);
+}
+
+.nd-jn-entry__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--nd-space-8);
+  flex-wrap: wrap;
+}
+
+.nd-jn-entry__work {
+  font-size: var(--nd-text-md);
+  font-weight: var(--nd-weight-medium);
+  line-height: var(--nd-leading-normal);
+  max-width: 72ch;
+}
+
+.nd-jn-entry__when {
+  white-space: nowrap;
+}
+
+.nd-jn-entry__caveats,
+.nd-jn-caveats {
+  display: flex;
+  flex-direction: column;
+  gap: var(--nd-space-3);
+  padding-left: var(--nd-space-12);
+  list-style: disc;
+  font-size: var(--nd-text-xs);
+  color: var(--nd-text-muted);
+  max-width: 80ch;
+}
+
+.nd-jn-caveats {
+  font-size: var(--nd-text-sm);
+}
+
+/* Why a cycle failed, one line per recorded failure. Kept out of the headline
+ * on purpose — see `journal.failureNote` — so it needs to read as the reason
+ * rather than as another caveat. */
+.nd-jn-entry__failures,
+.nd-jn-failures {
+  display: flex;
+  flex-direction: column;
+  gap: var(--nd-space-3);
+  padding-left: var(--nd-space-12);
+  list-style: disc;
+  font-size: var(--nd-text-xs);
+  color: var(--nd-danger);
+  max-width: 80ch;
+}
+
+.nd-jn-failures {
+  font-size: var(--nd-text-sm);
+}
+
+/* --- Status pills ----------------------------------------------------- */
+
+.nd-jn-badges {
+  flex-wrap: wrap;
+}
+
+.nd-jn-badges__id {
+  font-size: var(--nd-text-2xs);
+  color: var(--nd-text-faint);
+}
+
+.nd-jn-badge--done {
+  background: var(--nd-surface-raised);
+  border-color: var(--nd-border);
+  color: var(--nd-text-muted);
+}
+
+.nd-jn-badge--running {
+  background: var(--nd-info-wash);
+  border-color: rgb(106 147 196 / 35%);
+  color: var(--nd-info);
+}
+
+.nd-jn-badge--failed {
+  background: var(--nd-danger-wash);
+  border-color: rgb(210 104 95 / 35%);
+  color: var(--nd-danger);
+}
+
+.nd-jn-badge--reverted {
+  background: var(--nd-state-archived-wash);
+  border-color: rgb(118 127 143 / 30%);
+  color: var(--nd-state-archived);
+}
+
+.nd-jn-badge--rehearsal {
+  background: var(--nd-warn-wash);
+  border-color: rgb(208 154 74 / 35%);
+  color: var(--nd-warn);
+}
+
+/* --- One entry in full ------------------------------------------------ */
+
+.nd-jn-detail__heading {
+  display: flex;
+  flex-direction: column;
+  gap: var(--nd-space-4);
+  min-width: 0;
+}
+
+.nd-jn-detail__back {
+  font-size: var(--nd-text-xs);
+}
+
+.nd-jn-detail__actions {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: var(--nd-space-4);
+}
+
+.nd-jn-detail__reason {
+  max-width: 30ch;
+  text-align: right;
+}
+
+.nd-jn-section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--nd-space-6);
+}
+
+.nd-jn-section__head {
+  display: flex;
+  flex-direction: column;
+  gap: var(--nd-space-2);
+}
+
+.nd-jn-section__title {
+  font-size: var(--nd-text-lg);
+}
+
+.nd-jn-section__note {
+  max-width: 80ch;
+}
+
+/* A table is wide by nature; it scrolls inside its own box rather than
+ * pushing the page sideways. */
+.nd-jn-scroll {
+  overflow-x: auto;
+}
+
+/* --- Jobs ------------------------------------------------------------- */
+
+.nd-jn-jobs {
+  display: flex;
+  flex-direction: column;
+  gap: var(--nd-space-6);
+  list-style: none;
+}
+
+.nd-jn-job {
+  display: flex;
+  flex-direction: column;
+  gap: var(--nd-space-3);
+  padding: var(--nd-space-6);
+  border: 1px solid var(--nd-border);
+  border-radius: var(--nd-radius-md);
+  background: var(--nd-surface);
+}
+
+.nd-jn-job__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--nd-space-6);
+  flex-wrap: wrap;
+}
+
+.nd-jn-job__name {
+  font-size: var(--nd-text-sm);
+  color: var(--nd-text);
+}
+
+.nd-jn-job__warn {
+  color: var(--nd-warn);
+}
+
+.nd-jn-job__error {
+  font-size: var(--nd-text-xs);
+  color: var(--nd-danger);
+}
+
+.nd-jn-job__notes {
+  display: flex;
+  flex-direction: column;
+  gap: var(--nd-space-2);
+  padding-left: var(--nd-space-12);
+  list-style: disc;
+  font-size: var(--nd-text-xs);
+  color: var(--nd-text-muted);
+  max-width: 90ch;
+}
+
+/* --- Metrics ---------------------------------------------------------- */
+
+.nd-jn-metrics,
+.nd-jn-fields {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--nd-text-sm);
+}
+
+.nd-jn-metrics th,
+.nd-jn-fields th {
+  text-align: left;
+  font-weight: var(--nd-weight-medium);
+}
+
+.nd-jn-metrics thead th,
+.nd-jn-fields thead th {
+  font-size: var(--nd-text-2xs);
+  letter-spacing: var(--nd-tracking-label);
+  text-transform: uppercase;
+  color: var(--nd-text-faint);
+}
+
+.nd-jn-metrics th,
+.nd-jn-metrics td,
+.nd-jn-fields th,
+.nd-jn-fields td {
+  padding: var(--nd-space-3) var(--nd-space-8) var(--nd-space-3) 0;
+  border-bottom: 1px solid var(--nd-border);
+  vertical-align: top;
+}
+
+.nd-jn-metrics__label {
+  display: block;
+}
+
+.nd-jn-metrics__note {
+  display: block;
+  max-width: 44ch;
+  font-weight: var(--nd-weight-normal);
+}
+
+.nd-jn-metrics__arrow {
+  display: inline-block;
+  width: 1.2em;
+  color: var(--nd-text-faint);
+}
+
+/* --- The event diff --------------------------------------------------- */
+
+.nd-jn-events {
+  display: flex;
+  flex-direction: column;
+  gap: var(--nd-space-6);
+  list-style: none;
+}
+
+.nd-jn-event {
+  display: flex;
+  flex-direction: column;
+  gap: var(--nd-space-3);
+  padding: var(--nd-space-6);
+  border: 1px solid var(--nd-border);
+  border-left: 3px solid var(--nd-border-strong);
+  border-radius: var(--nd-radius-md);
+  background: var(--nd-surface);
+}
+
+.nd-jn-event--added {
+  border-left-color: var(--nd-state-active);
+}
+
+.nd-jn-event--removed,
+.nd-jn-event--retired {
+  border-left-color: var(--nd-danger);
+}
+
+.nd-jn-event--restored {
+  border-left-color: var(--nd-info);
+}
+
+.nd-jn-event--changed {
+  border-left-color: var(--nd-accent-dim);
+}
+
+.nd-jn-event__head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--nd-space-4);
+  flex-wrap: wrap;
+}
+
+.nd-jn-event__headline {
+  font-size: var(--nd-text-sm);
+  font-weight: var(--nd-weight-medium);
+  overflow-wrap: anywhere;
+}
+
+.nd-jn-event__type {
+  font-size: var(--nd-text-xs);
+  color: var(--nd-text-muted);
+}
+
+/* --- Paging the event list -------------------------------------------- */
+
+.nd-jn-pager {
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: var(--nd-space-4);
+}
+
+.nd-jn-pager__range {
+  white-space: nowrap;
+}
+
+.nd-jn-event__meta {
+  overflow-wrap: anywhere;
+}
+
+.nd-jn-shape {
+  text-transform: lowercase;
+}
+
+.nd-jn-shape--added {
+  background: var(--nd-state-active-wash);
+  border-color: rgb(90 161 127 / 35%);
+  color: var(--nd-state-active);
+}
+
+.nd-jn-shape--removed,
+.nd-jn-shape--retired {
+  background: var(--nd-danger-wash);
+  border-color: rgb(210 104 95 / 35%);
+  color: var(--nd-danger);
+}
+
+.nd-jn-shape--restored {
+  background: var(--nd-info-wash);
+  border-color: rgb(106 147 196 / 35%);
+  color: var(--nd-info);
+}
+
+.nd-jn-fields code {
+  font-family: var(--nd-font-mono);
+  font-size: var(--nd-text-xs);
+  line-height: 1.6;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.nd-jn-fields__before {
+  background: var(--nd-danger-wash);
+}
+
+.nd-jn-fields__after {
+  background: var(--nd-state-active-wash);
+}
+
+/* --- The rollback confirm --------------------------------------------- */
+
+.nd-jn-verdict {
+  padding: var(--nd-space-6);
+  border: 1px solid var(--nd-border);
+  border-radius: var(--nd-radius-md);
+  font-size: var(--nd-text-sm);
+  line-height: var(--nd-leading-normal);
+}
+
+.nd-jn-verdict--clear {
+  border-color: rgb(90 161 127 / 35%);
+  background: var(--nd-state-active-wash);
+}
+
+.nd-jn-verdict--blocked {
+  border-color: rgb(210 104 95 / 35%);
+  background: var(--nd-danger-wash);
+}
+
+.nd-jn-verdict__headline {
+  font-weight: var(--nd-weight-semibold);
+  margin-bottom: var(--nd-space-3);
+}
+
+/* The two things that can stand in the way of a rollback are shown apart: a
+   conflict is the graph having moved a row the cycle wrote, a blocker is the
+   graph having grown onto a row it created, and they have different answers.
+   The distinction is carried by the heading and the note rather than by a
+   colour — neither is an affordance nor a service-layer state, so neither is
+   entitled to one of the two colour axes. */
+.nd-jn-standoff {
+  display: flex;
+  flex-direction: column;
+  gap: var(--nd-space-3);
+}
+
+.nd-jn-standoff__title {
+  font-size: var(--nd-text-md);
+}
+
+.nd-jn-standoff__note {
+  max-width: 80ch;
+}
+
+.nd-jn-conflicts {
+  display: flex;
+  flex-direction: column;
+  gap: var(--nd-space-6);
+  list-style: none;
+}
+
+.nd-jn-dependants {
+  display: flex;
+  flex-direction: column;
+  gap: var(--nd-space-1);
+  list-style: none;
+}
+
+.nd-jn-conflict {
+  display: flex;
+  flex-direction: column;
+  gap: var(--nd-space-3);
+  padding: var(--nd-space-6);
+  border: 1px solid var(--nd-border);
+  border-radius: var(--nd-radius-md);
+  background: var(--nd-surface);
+}
+
+.nd-jn-conflict__row {
+  display: flex;
+  align-items: center;
+  gap: var(--nd-space-4);
+  min-width: 0;
+}
+
+.nd-jn-conflict__name {
+  font-weight: var(--nd-weight-medium);
+  overflow-wrap: anywhere;
+}
+
+.nd-jn-conflict__facts {
+  display: grid;
+  grid-template-columns: minmax(8rem, max-content) 1fr;
+  gap: var(--nd-space-2) var(--nd-space-8);
+  font-size: var(--nd-text-xs);
+}
+
+.nd-jn-conflict__facts dt {
+  color: var(--nd-text-faint);
+  text-transform: uppercase;
+  letter-spacing: var(--nd-tracking-label);
+  font-size: var(--nd-text-2xs);
+}
+
+.nd-jn-conflict__facts dd {
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 46rem) {
+  .nd-jn-detail__actions {
+    align-items: flex-start;
+  }
+
+  .nd-jn-detail__reason {
+    text-align: left;
+  }
+
+  .nd-jn-metrics,
+  .nd-jn-fields {
+    min-width: 32rem;
+  }
+}

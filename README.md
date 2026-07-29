@@ -36,8 +36,18 @@ through optional per-format handlers (PDF, OCR, audio; a missing one is
 reported, never fatal), an `asset_ref` node for the bytes, a `source` node
 carrying the extracted text, and one block per page — plus `page:<n>` PDF page
 rasters and short-lived, single-use capability URLs for hosts that share no
-filesystem with the graph. Still to come: claim proposals and the
-consolidation cycle.
+filesystem with the graph. **Phase 5a (the gardener's spine)** landed: the graph
+now maintains itself. A **consolidation cycle** groups a run of writes under one
+id so a human can take the whole of it back with `nodum rollback`; the
+**gardener** is an internal agent with ordinary grants that runs four
+deterministic jobs — duplicate candidates, link pruning and inference,
+housekeeping, a neglect report — and files everything it infers in the review
+queue rather than asserting it; a **curative tier** (`merge-nodes`, `retype`,
+`supersede-edge`, `bulk-relink`) changes structure rather than adding to it; and
+a **dream journal** in the CLI and the web UI says what ran, who asked, what it
+measured, and what it changed. It runs on demand and, if you ask for it,
+nightly. Still to come: claim proposals and the gardener's LLM half — everything
+that needs a judgement rather than arithmetic.
 
 ## Install
 
@@ -151,6 +161,24 @@ uv run nodum asset download-url <hash> --as owner
 uv run nodum asset upload-url --name scan.pdf --mime application/pdf \
     --size 120000 --as owner
 
+# The gardener: a consolidation cycle, its journal, and the way back.
+# `--as` names who *asked*; the writes are the internal agent's.
+uv run nodum consolidate --dry-run --as owner   # every job computed, no event written
+uv run nodum consolidate --as owner             # for real: candidates land in the queue
+uv run nodum cycle-list --as owner              # the dream journal, newest first
+uv run nodum cycle-get <cycle-id> --as owner    # what ran, what it measured, how it ended
+uv run nodum events --cycle <cycle-id> --as owner   # what it changed — the log, not a copy
+uv run nodum cycle-abandon <cycle-id> --as owner   # close a run a SIGKILL left open
+uv run nodum rollback <cycle-id> --dry-run --as owner   # would this succeed?
+uv run nodum rollback <cycle-id> --as owner     # all of it, or none of it
+
+# The curative tier: structure changes, each one inside a cycle, so `rollback`
+# is the single way back. `undo` refuses a cycle-stamped event and says so.
+uv run nodum merge-nodes <id-a> <id-b> --into <survivor> --as owner
+uv run nodum retype <id> --type claim --as owner
+uv run nodum supersede-edge <edge-id> --confidence 0.4 --as owner
+uv run nodum bulk-relink --dst <old> --to-dst <new> --dry-run --as owner
+
 # MCP server (stdio) for external agents — read + additive tiers only, no
 # review tools, no curative tools. The agent authenticates with its token in
 # NODUM_AGENT_TOKEN (minted by `nodum agent create`, shown once).
@@ -220,20 +248,108 @@ degrades to BM25 + graph expansion. `NODUM_EMBED_MODEL` switches the model
   brings the pending `mentions` edges its wikilinks materialized to `active` —
   those the acceptor could have reviewed directly, that is; a mention into a
   space they hold nothing on stays queued for someone who can.
-- **Live state is the human's, structurally.** Review (`accept`, `reject`, `archive`)
-  requires a human principal or an agent holding `edit` on the item's space;
-  `undo` is human-only. Either way is refused with `GrantNotPermitted`.
+- **Live state is the human's, structurally.** Review (`accept`, `reject`,
+  `archive`) and the curative tier (`merge-nodes`, `retype`, `supersede-edge`,
+  `bulk-relink`, `consolidate`)
+  require a human principal or an agent holding `edit` on the item's space;
+  `undo` and `rollback` are human-only. Either way is refused with
+  `GrantNotPermitted`.
   Reviewing turns proposed structure into live structure, archiving retires it,
   and `undo` writes an event's prior payload back verbatim — `state = 'active'`
   included — so leaving any of them open would hand an agent the live state it
-  may not write directly. None of them is an MCP tool either: agents may only
-  *grow* the graph.
+  may not write directly. `rollback` does exactly that for a whole cycle at
+  once, which is why it cannot be gated more weakly than `undo`. None of them is
+  an MCP tool either: agents may only *grow* the graph.
 - **Grants, not policies.** Each agent holds one grant per space at `read`,
   `suggest`, or `edit` (`nodum grant …` / `nodum revoke` / `nodum grants`,
   human-only, event-logged). `read` lets it query, `suggest` queues every write
   as `proposed`, and `edit` writes `active` and carries review authority inside
   that space. There is deliberately no auto-accept machinery: an agent earns
   `edit`, or it waits.
+- **The gardener is an agent, not an exception.** `nodum consolidate` runs the
+  internal agent `builtin-gardener` — seeded with `read` on `meta` and `edit` on
+  `main` as
+  ordinary grant rows, which show up in `nodum space-list` and on the `/spaces`
+  screen beside every other agent's, and which `nodum revoke builtin-gardener
+  main` takes away with the command that was already there. Consolidating any
+  *other* space is an explicit `nodum grant builtin-gardener <space> edit`, and
+  a cycle scoped to a space it holds no grant on says exactly that — on every
+  surface, the browser's own scope picker included, which is where that sentence
+  is most needed and where it used to arrive as `storage error`. It holds no
+  credential at all: it authenticates by being in-process, so there is nothing
+  to present and nothing to steal, and the supported way to stop it is
+  `nodum agent disable builtin-gardener`. Its four jobs are arithmetic over data
+  the file already holds — duplicate candidates by title similarity and
+  embedding cosine, exact-duplicate and dangling-edge pruning, `relates_to`
+  inference from embedding proximity and co-citation, a fractional-position
+  check, embedding catch-up, and a report of what nobody has touched in ninety
+  days. No model is involved anywhere, and it runs fine on a machine that has
+  none. **It proposes; it never merges.** A duplicate becomes a `proposed`
+  `duplicate_of` edge in the review queue — which already has a diff and an
+  accept button — because a merge is always human-approved. Everything it infers
+  is filed `proposed` even though its grant would let it write live: a grant is
+  a ceiling, not a mandate, and a suggestion nobody reviews is not a suggestion.
+- **A cycle is the unit you take back.** Every write a consolidation run makes
+  is stamped with the cycle's id, and `nodum rollback <cycle-id>` reverses the
+  whole of it inside one transaction — all of it, or none of it. It **refuses
+  rather than clobbers**: if anything outside the cycle has touched a row the
+  cycle touched, nothing is written and the refusal names both ends of each
+  collision, so you can go and look. `--dry-run` answers the same question
+  without writing: `conflicts` for rows that moved, `blockers` for rows the
+  graph has grown something onto (a created node that now has a child, a created
+  space that now carries a grant) — both empty is the only clean verdict.
+  A rollback is itself a cycle, so rolling
+  *that* back re-applies the original, at any depth. `nodum cycle-list` and
+  `nodum cycle-get`
+  are the journal — what ran, who asked, what it measured, how it ended — and
+  what a cycle *changed* is `nodum events --cycle <id>`, read off the same
+  append-only log as everything else, so the journal can never become a second
+  record that disagrees. If a run never closed — a `SIGKILL`, a power cut, a
+  server shut down mid-cycle — `nodum cycle-abandon <id>` closes it `failed`,
+  which is what makes its writes reversible at all: rollback refuses a cycle
+  that is still running and `undo` refuses every cycle-stamped event.
+  **Only one consolidation cycle runs at a time against a file**, and that is a
+  uniqueness rule on the journal rather than a lock inside one process: a `nodum
+  consolidate` typed at a terminal while `nodum serve` is running one is refused
+  (`CycleInProgress`, a 409 over HTTP) rather than queued. When it was a
+  process-level lock both ran, and every duplicate pair was proposed twice into
+  the review queue. The refusal names the cycle in the way and the `nodum
+  cycle-abandon <id>` that clears it, since a run that was killed never closes
+  itself and would otherwise block every later run. Curative operations and
+  rollbacks stay outside the rule: each is one short operation you asked for.
+- **The curative tier changes structure; the additive tier only adds to it.**
+  `merge-nodes` is soft — the merged-away node is archived, says where it went,
+  and its edges are repointed at the survivor keeping their original endpoints,
+  so nothing is destroyed. `retype` is the one sanctioned exception to a node's
+  type being fixed at creation. `supersede-edge` records two different facts:
+  *when* an edge stopped being true, and that it is no longer live.
+  `bulk-relink` repoints or retypes many edges at once behind a dry run that
+  writes nothing. All four are human-or-`edit`, all four are CLI-only — never
+  MCP — and all four run **inside a cycle**, even when you invoke one directly.
+  That is why `undo` refuses a cycle-stamped event and points at `rollback`, and
+  at nothing else: a merge is several rows from one decision, and undoing one of
+  them would leave the other half standing. The refusal briefly named an
+  `undo <seq>` for the last write outside the cycle as well, which is the harm it
+  exists to prevent printed as its own remedy — a reversal that reaches past a
+  cycle deletes what nobody named and blocks the rollback that would have put
+  the cycle back. A bare `nodum undo` right after a
+  curative operation gets that same refusal, naming the cycle — it does not walk
+  past the cycle to an older event, because "take back the last thing that
+  happened" never meant something you did not name.
+- **A schedule, if you ask for one.** Set `NODUM_CONSOLIDATE_AT=03:30` and
+  `nodum serve` runs one cycle a night, in the process that is already running —
+  no cron, no second process, no new dependency, and the banner says so at
+  startup. Unset means off, which is the
+  default: a background process that writes to your graph without being asked is
+  not something to enable by surprise. The run cannot overlap itself, a crash
+  leaves a `failed` entry in the journal and tries again tomorrow, and shutdown
+  never waits for a cycle to finish. "One a night" holds on the two nights a
+  year that are not 24 hours long: the wait is computed in aware local time, so
+  a daylight-saving change neither doubles the run nor moves it an hour.
+  And if you happen to be running a cycle yourself when the timer fires, the
+  night is **skipped** rather than queued — cycles are serialised — which is
+  logged as the skip it is and left out of the journal, since the journal
+  records the cycle that *did* run and who asked for it.
 - **Spaces: a filter for reading, a target for writing.** A space is a node of
   builtin type `space`, so its whole lifecycle is an ordinary node's
   (`space-create` / `space-rename` / `space-archive`, each event-logged,
@@ -273,9 +389,18 @@ degrades to BM25 + graph expansion. `NODUM_EMBED_MODEL` switches the model
   `request_upload_url`). Ingestion is **by reference** — the tool takes a path
   the server can read or a URL it can fetch, and no base64 ever crosses MCP; a
   host with no filesystem in common asks `request_upload_url` for somewhere to
-  PUT instead. That is the entire registry: the review tools
-  (`accept`/`reject`) and the curative tools (`merge_nodes`, `retype`, …) are
-  **never registered** — structural enforcement of §8.1/§8.2.
+  PUT instead. `create_node` takes a `space` like the ingestion tools do —
+  anything an agent has to be able to say is a real parameter here, because the
+  SDK drops an undeclared keyword rather than refusing it. That is the entire
+  registry: the review tools
+  (`accept`/`reject`), the curative tools (`merge_nodes`, `retype`,
+  `supersede_edge`, `bulk_relink`, `consolidate`) and reversal with the journal
+  that records it (`undo`, `rollback`, `abandon_cycle`, `get_cycle`,
+  `list_cycles`) are **never registered** —
+  structural enforcement of §8.1/§8.2. The curative tier is built and in use;
+  keeping it off MCP is a decision about a surface that exists, not a note about
+  code that does not. One call there could merge two nodes or rewrite five
+  hundred edges, and the only thing that takes those back is a human's rollback.
 - **HTTP API + web UI.** `nodum serve` runs one process that answers the JSON
   API under `/api` and serves the built UI at `/`. It is the mirror image of
   the MCP server: that surface authenticates an agent by token, this one is
@@ -286,8 +411,20 @@ degrades to BM25 + graph expansion. `NODUM_EMBED_MODEL` switches the model
   Responses are the same envelope the CLI prints, byte for byte, and failures are
   `{"error": {"type", "message"}}` carrying the CLI's own one-line message
   (missing id → 404, bad value → 400, human-only → 403, impossible undo → 409,
-  database busy → a retryable 503). With no UI bundle built, the API serves
-  normally and `/` is a page telling you to run `make web-build`.
+  database busy → a retryable 503). The consolidation journal is on it as
+  `GET /api/cycles`, `POST /api/cycles` (run one now, `dry_run` to rehearse),
+  `GET /api/cycles/{id}` (the entry plus the events it wrote),
+  `POST /api/cycles/{id}/abandon` (close a run that never finished) and
+  `POST /api/cycles/{id}/rollback` — where a graph that has moved on is a
+  **409** carrying the conflicting rows, not a bare refusal, and asking for a
+  cycle while one is running is a 409 too. Running one does not block the
+  server: it is the one route that hands its work to a thread, so the UI stays
+  answerable for the minutes a real cycle takes — though the database is still
+  a single-writer file, so a read issued *during* a cycle queues behind it
+  (1168 ms measured, against 5 ms on an idle server). Responsive is the claim;
+  free is not. The curative tier
+  is deliberately not there: it is the CLI's. With no UI bundle built, the API
+  serves normally and `/` is a page telling you to run `make web-build`.
 - **Origin control, which is not the same thing as auth.** Binding loopback is
   no defence against a *browser*: every page the user visits can reach
   `127.0.0.1`. So a state-changing request must prove it came from this origin
@@ -351,7 +488,7 @@ degrades to BM25 + graph expansion. `NODUM_EMBED_MODEL` switches the model
   properties of a human-only surface behind a password, which is exactly why
   this route sits inside the session gate while the two capability-URL routes
   do not — those carry no ambient credential to ride.
-- **The nine views.** `/login` is the session gate: password login with
+- **The ten views.** `/login` is the session gate: password login with
   argon2id. `/editor` is a CodeMirror-6 Markdown editor with slash commands,
   `[[` autocomplete, live Mermaid preview, drag-drop asset upload, and
   debounced autosave — a node's `type` is fixed at creation, so the type
@@ -365,7 +502,12 @@ degrades to BM25 + graph expansion. `NODUM_EMBED_MODEL` switches the model
   live node count and the agents granted on it, plus create, rename and archive.
   `/admin` is accounts and grants: humans, agents with show-once
   tokens, and the grant grid. `/history/:nodeId` is the version timeline and
-  side-by-side diff. Every route is a real URL that survives a reload. Source
+  side-by-side diff. The **dream journal** is the consolidation record: every
+  cycle newest-first, and one entry showing what ran, the coherence metrics
+  before and after, and the events it wrote — with a button to run a cycle (or
+  rehearse one) and the rollback that takes a whole cycle back, which asks first
+  and, when the graph has moved on, names both ends of every collision instead
+  of a count. Every route is a real URL that survives a reload. Source
   and conventions: [`web/README.md`](web/README.md).
 - **Spaces in the UI are a filter and a target, never a mode.** Search, the node
   graph and the review queue take a space *filter* that narrows and defaults to

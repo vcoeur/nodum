@@ -15,17 +15,27 @@
  * ## The space level (design decision D4)
  *
  * The outer grouping carries a claim the queue by itself cannot make: **an
- * `edit`-granted space never reaches this queue at all**, because its agents
- * write `active`. Grouped by agent alone that territory is simply missing, and
- * "nothing was proposed here" is indistinguishable from "this space governs
- * itself". So the section for such a space is emitted *because* it is empty,
- * and the tests below pin all three ways that could quietly stop working:
+ * `edit` grant is what lets a write land `active` without reaching this queue**.
+ * Grouped by agent alone such territory can be simply missing, and "nothing was
+ * proposed here" is indistinguishable from "everything written here lands
+ * without review". So the section for such a space is emitted *because* it is
+ * empty, and the tests below pin all three ways that could quietly stop working:
  *
  * - the self-governing section vanishing (D4's original bug, restored);
  * - it appearing for a space that is merely quiet, which would tell the human
- *   that a `suggest`-granted space governs itself when it does not;
+ *   that a `suggest`-granted space needs no review when it does;
  * - it appearing when the space list is unknown, which would state a fact the
  *   view is in no position to know.
+ *
+ * **What the section may not say is that such an agent never appears here.**
+ * Phase 5a's landing seam (`Store.cap_landing`, §8.3) made a grant a *ceiling
+ * rather than a mandate*: a writer may file below its own grant, and the
+ * consolidation runner does it for every inference — the gardener holds `edit`
+ * on `main` and files each suggested edge `proposed` anyway. The header read
+ * *"builtin-gardener hold `edit` here and write directly — nothing below was
+ * filed by it"* directly above four of the gardener's own edges, so
+ * `editGrantNote` and `selfGoverningNote` now own that wording and are pinned
+ * below.
  *
  * The other half is where a space comes from. The server states one for every
  * kind — a node on its row, an edge and an update in the reviewer context, where
@@ -43,11 +53,19 @@ import {
   describeCounts,
   edgeCrossing,
   editGrantedAgents,
+  editGrantNote,
   groupProposals,
   groupProposalsBySpace,
   PROPOSAL_KINDS,
+  PROPOSAL_PAGE_SIZE,
   proposalKind,
+  proposalPageKey,
   proposalSpace,
+  queueCount,
+  queueTruncationNote,
+  restrictToPage,
+  sectionOrder,
+  selfGoverningNote,
   UNREPORTED_SPACE,
 } from "./grouping";
 
@@ -332,9 +350,10 @@ describe("groupProposals", () => {
 });
 
 describe("editGrantedAgents", () => {
-  it("names only the agents that write directly", () => {
-    // `edit` lands `active`; `read` and `suggest` do not. Only `edit` explains
-    // an absence from the review queue.
+  it("names only the agents allowed to write directly", () => {
+    // `edit` is the level that *can* land `active`; `read` and `suggest` cannot.
+    // Only `edit` can explain an absence from the review queue — and it explains
+    // it as a permission, since a writer may still file below its own grant.
     const research = space("sp-research", "research", [
       grant("agent:reader", "sp-research", "read"),
       grant("agent:scribe", "sp-research", "edit"),
@@ -508,7 +527,7 @@ describe("groupProposalsBySpace", () => {
 
   it("does not call a merely quiet space self-governing", () => {
     // `read` and `suggest` grants produce proposals (or nothing at all); only
-    // `edit` explains an absence. Claiming otherwise tells the human a space
+    // `edit` can explain an absence. Claiming otherwise tells the human a space
     // needs no review when it does.
     const sections = groupProposalsBySpace([], [research, quiet]);
     expect(sections).toEqual([]);
@@ -527,16 +546,32 @@ describe("groupProposalsBySpace", () => {
   });
 
   it("keeps a space out of the self-governing list once it holds a proposal", () => {
-    // An `edit` agent files none, so a proposal here came from a *different*
-    // agent — the space has a real queue and belongs with the others.
+    // A space with something waiting has a real queue and belongs with the
+    // others, whoever filed it — including the `edit` agent itself, which may
+    // file below its own grant.
     const sections = groupProposalsBySpace(
       [nodeProposal("agent:scout", 0, "n-1", "sp-journal")],
       spaces,
     );
     expect(sections).toHaveLength(1);
     expect(sections[0]!.kind).toBe("queue");
-    // …and the `edit` grant is still reported, because it explains who did not
-    // file this.
+    // …and the `edit` grant is still reported, because it says who may write
+    // here without review.
+    expect(sections[0]!.editAgents).toEqual(["agent:scribe"]);
+  });
+
+  it("files an edit-granted agent's own proposal like any other", () => {
+    // The landing seam made this ordinary: `Store.cap_landing` lets a writer
+    // file below its own grant, and the consolidation runner does it for every
+    // inference. A queue that treated this as impossible printed "nothing below
+    // was filed by it" over four of the gardener's edges.
+    const sections = groupProposalsBySpace(
+      [nodeProposal("agent:scribe", 0, "n-1", "sp-journal")],
+      spaces,
+    );
+    expect(sections).toHaveLength(1);
+    expect(sections[0]!.kind).toBe("queue");
+    expect(sections[0]!.agents.map((group) => group.agent)).toEqual(["agent:scribe"]);
     expect(sections[0]!.editAgents).toEqual(["agent:scribe"]);
   });
 
@@ -660,5 +695,223 @@ describe("describeCounts", () => {
 
   it("is empty when there is nothing to count", () => {
     expect(describeCounts({ node: 0, edge: 0, update: 0 })).toBe("");
+  });
+});
+
+describe("editGrantNote", () => {
+  /** What a section header may never assert about an `edit`-granted agent. */
+  const FALSE_INFERENCES = [
+    "nothing below was filed",
+    "never appears",
+    "never reaches",
+    "files no proposals",
+  ];
+
+  it("states the permission and not an absence", () => {
+    // The bug, verbatim: "builtin-gardener hold edit here and write directly —
+    // nothing below was filed by it", printed immediately above a section headed
+    // `agent:builtin-gardener` holding four of the gardener's own edges.
+    const note = editGrantNote(["builtin-gardener"], true) ?? "";
+    for (const phrase of FALSE_INFERENCES) expect(note.toLowerCase()).not.toContain(phrase);
+    expect(note).toContain("may land active");
+    expect(note).toContain("ceiling");
+  });
+
+  it("agrees with its subject", () => {
+    // The other half of the same line: "builtin-gardener hold edit here".
+    expect(editGrantNote(["builtin-gardener"], false)).toContain("builtin-gardener holds edit");
+    expect(editGrantNote(["agent:a", "agent:b"], false)).toContain("agent:a, agent:b hold edit");
+  });
+
+  it("says what a grant does not imply, whether or not the section holds work", () => {
+    for (const hasProposals of [true, false]) {
+      const note = editGrantNote(["builtin-gardener"], hasProposals) ?? "";
+      expect(note).toContain("ceiling rather than a mandate");
+    }
+  });
+
+  it("has nothing to say when nobody holds edit", () => {
+    expect(editGrantNote([], true)).toBeNull();
+    expect(editGrantNote([], false)).toBeNull();
+  });
+});
+
+describe("selfGoverningNote", () => {
+  it("does not promise that such a space never reaches the queue", () => {
+    // The same false inference one level up: "Those writes land active
+    // immediately, so nothing from them ever reaches this queue."
+    const note = selfGoverningNote(2).toLowerCase();
+    expect(note).not.toContain("nothing from them ever reaches");
+    expect(note).not.toContain("never reaches");
+    expect(note).toContain("may land active");
+    expect(note).toContain("ceiling");
+  });
+
+  it("still says the zero is the design rather than an empty inbox", () => {
+    // The thing D4 exists to say has to survive the correction.
+    const note = selfGoverningNote(1);
+    expect(note).toContain("1 space");
+    expect(note).toContain("not an");
+    expect(note).toContain("empty inbox");
+    expect(selfGoverningNote(3)).toContain("3 spaces");
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* Paging, and saying how much is really there                          */
+/* ------------------------------------------------------------------ */
+
+describe("proposalPageKey", () => {
+  it("tells two kinds sharing an id apart", () => {
+    // An update proposal's id is a version row's integer, which lives in a
+    // different id space from a node's or an edge's uuid — so `id` alone is not
+    // a page-membership test, and the cards are keyed the same way.
+    const one = { ...proposal("agent:a", 0, "node"), id: "7" };
+    const other = { ...proposal("agent:a", 0, "update"), id: "7" };
+    expect(proposalPageKey(one)).not.toBe(proposalPageKey(other));
+  });
+});
+
+describe("sectionOrder", () => {
+  it("flattens the sections in the order the screen draws them", () => {
+    // The pager slices *this*, not the wire order. The server answers
+    // oldest-first and the screen renders space, then agent, then newest run
+    // first — so paging over the wire order would scatter one page's rows
+    // through the whole tree.
+    const sections = groupProposalsBySpace(
+      [
+        nodeProposal("agent:a", 0, "n1", "research"),
+        nodeProposal("agent:b", 1_000, "n2", "main"),
+        // A second run of agent:a, well past the batch gap.
+        nodeProposal("agent:a", BATCH_GAP_MS * 3, "n3", "research"),
+      ],
+      [space("research", "research"), space("main", "main")],
+    );
+    const drawn = sections.flatMap((section) =>
+      section.agents.flatMap((agent) => agent.batches.flatMap((batch) => batch.proposals)),
+    );
+    expect(sectionOrder(sections)).toEqual(drawn);
+    expect(sectionOrder(sections)).toHaveLength(3);
+  });
+
+  it("counts nothing for a self-governing section, which holds nothing", () => {
+    const sections = groupProposalsBySpace([], [space("main", "main", [grant("g", "main", "edit")])]);
+    expect(sections.some((section) => section.kind === "self-governing")).toBe(true);
+    expect(sectionOrder(sections)).toEqual([]);
+  });
+});
+
+describe("restrictToPage", () => {
+  /** One agent's run of `count` proposals, filed into one space. */
+  function oneRun(count: number) {
+    return groupProposalsBySpace(
+      Array.from({ length: count }, (_unused, index) =>
+        nodeProposal("agent:gardener", index * 1_000, `n${index}`, "main"),
+      ),
+      [space("main", "main")],
+    );
+  }
+
+  it("renders one page of a run and leaves every count whole", () => {
+    // The defect: a cycle files hundreds of proposals in one run and the queue
+    // rendered a card for each — 10 673 DOM nodes, no paging, on the screen
+    // whose whole job is not to lose a proposal.
+    const sections = oneRun(60);
+    const order = sectionOrder(sections);
+    const onPage = new Set(order.slice(0, PROPOSAL_PAGE_SIZE).map(proposalPageKey));
+    const paged = restrictToPage(sections, onPage);
+
+    const batch = paged[0]?.agents[0]?.batches[0];
+    expect(batch?.shown).toHaveLength(PROPOSAL_PAGE_SIZE);
+    // Every number a header prints stays the run's, because none of them is a
+    // statement about the page: "Accept run (60)" accepts sixty.
+    expect(batch?.proposals).toHaveLength(60);
+    expect(batch?.counts.node).toBe(60);
+    expect(paged[0]?.total).toBe(60);
+    expect(paged[0]?.agents[0]?.total).toBe(60);
+  });
+
+  it("drops the groups with nothing on this page", () => {
+    const sections = groupProposalsBySpace(
+      [
+        nodeProposal("agent:a", 0, "n1", "research"),
+        nodeProposal("agent:b", BATCH_GAP_MS * 3, "n2", "main"),
+      ],
+      [space("research", "research"), space("main", "main")],
+    );
+    const order = sectionOrder(sections);
+    const first = new Set([proposalPageKey(order[0]!)]);
+    const paged = restrictToPage(sections, first);
+    expect(paged).toHaveLength(1);
+    expect(paged[0]?.agents).toHaveLength(1);
+    expect(paged[0]?.agents[0]?.batches[0]?.shown).toHaveLength(1);
+  });
+
+  it("leaves the whole tree alone when the page holds all of it", () => {
+    const sections = oneRun(3);
+    const all = new Set(sectionOrder(sections).map(proposalPageKey));
+    const paged = restrictToPage(sections, all);
+    expect(paged[0]?.agents[0]?.batches[0]?.shown).toEqual(
+      sections[0]?.agents[0]?.batches[0]?.proposals,
+    );
+  });
+
+  it("shows a straddling run on both pages, with its full count each time", () => {
+    const sections = oneRun(4);
+    const order = sectionOrder(sections);
+    const firstHalf = new Set(order.slice(0, 2).map(proposalPageKey));
+    const secondHalf = new Set(order.slice(2).map(proposalPageKey));
+    for (const page of [firstHalf, secondHalf]) {
+      const batch = restrictToPage(sections, page)[0]?.agents[0]?.batches[0];
+      expect(batch?.shown).toHaveLength(2);
+      expect(batch?.proposals).toHaveLength(4);
+    }
+  });
+});
+
+describe("groupProposalsBySpace, unpaged", () => {
+  it("shows every proposal in a run until a page narrows it", () => {
+    // `shown` defaults to the whole run, so nothing that reads a batch changes
+    // behaviour until the pager is actually applied.
+    const sections = groupProposalsBySpace(
+      [nodeProposal("agent:a", 0, "n1", "main"), nodeProposal("agent:a", 1_000, "n2", "main")],
+      [space("main", "main")],
+    );
+    const batch = sections[0]?.agents[0]?.batches[0];
+    expect(batch?.shown).toEqual(batch?.proposals);
+  });
+});
+
+describe("queueCount", () => {
+  it("counts a queue the window did not cut", () => {
+    expect(queueCount(12, 12, false)).toBe("12 proposals");
+    expect(queueCount(1, 1, false)).toBe("1 proposal");
+    expect(queueCount(8, 12, false)).toBe("8 of 12 proposals");
+  });
+
+  it("never reports a filled window as a total", () => {
+    // The defect: `GET /api/review/queue` answers `rows[:limit]` and reports no
+    // total, so a queue of 1043 answered a request for 500 with 500 — and this
+    // line read "500 proposals waiting", silent truncation on the screen whose
+    // whole job is not to lose a proposal.
+    expect(queueCount(500, 500, true)).toBe("at least 500 proposals");
+    expect(queueCount(120, 500, true)).toBe("120 of at least 500 proposals");
+  });
+});
+
+describe("queueTruncationNote", () => {
+  it("says the window filled without claiming there is definitely more", () => {
+    // Conservative in the same way `events_truncated` is: exactly 500 rows for a
+    // limit of 500 may be the last 500 there are.
+    const note = queueTruncationNote(500);
+    expect(note).toContain("500-proposal window filled");
+    expect(note).toContain("may not be all of them");
+    expect(note).not.toMatch(/there are more|this is all/i);
+  });
+
+  it("says how to reach the rest, because there is a way", () => {
+    // The queue is oldest-first, so clearing this window brings the next up. A
+    // notice that only said "there may be more" would leave a reviewer stuck.
+    expect(queueTruncationNote(500)).toContain("refresh");
   });
 });

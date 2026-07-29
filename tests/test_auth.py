@@ -9,6 +9,7 @@ import pytest
 from helpers import OWNER_ACTOR, agent, owner
 
 from nodum import auth, db, service
+from nodum.migrations import GARDENER_AGENT_ID
 from nodum.store import GrantNotPermitted
 
 #: Cookie by session-row id, so a test can key the table and still present the
@@ -195,6 +196,91 @@ def test_disabling_the_owner_cascades_to_external_agents_tokens(fresh_db):
     service.disable_human("owner", principal=owner())
     with pytest.raises(auth.InvalidCredentials):
         auth.verify_agent_token(created.token)
+
+
+def test_a_human_cannot_create_an_agent_under_the_reserved_builtin_prefix(fresh_db):
+    """Not naming hygiene — the event log's ability to name one writer.
+
+    `agents.id` is the name verbatim and every agent, internal or external,
+    writes to the log as `agent:<id>`. Without the reservation a human could
+    mint an *external* `builtin-gardener`, hand its token to anything, and no
+    reader of `events.actor` could tell its writes from the gardener's.
+    """
+    with pytest.raises(ValueError, match="reserved"):
+        service.create_agent("builtin-gardener", owner_human_id="owner", principal=owner())
+    with pytest.raises(ValueError, match="reserved"):
+        service.create_agent("builtin-anything", kind="internal", grants={}, principal=owner())
+    # And nothing was written on the way to the refusal.
+    assert [row.id for row in service.list_agents(principal=owner())] == [GARDENER_AGENT_ID]
+
+
+# ── The internal agent: in-process, credential-less (design §8.4) ─────────────
+
+
+def test_internal_principal_loads_the_gardener_with_its_grants(fresh_db):
+    principal = auth.internal_principal()
+    assert principal.kind == "internal"
+    assert principal.actor_string == f"agent:{GARDENER_AGENT_ID}"
+    # `read` on meta, `edit` on main — the shape every curating agent in this
+    # suite holds. Consolidation only ever *reads* the type vocabulary; what
+    # `edit` on meta bought was authority no job reaches (see
+    # `tests/test_migrations.py`).
+    assert principal.grants == {"meta": "read", "main": "edit"}
+
+
+def test_internal_principal_reads_grants_through_the_same_archived_space_filter(fresh_db):
+    """A gardener grant is an ordinary grant: archiving the space makes it inert.
+
+    `agent_principal` gets this from `_grant_set`; loading the internal agent
+    any other way would have quietly exempted the one agent that writes most.
+    """
+    space = service.create_space("research", principal=owner())
+    service.grant(GARDENER_AGENT_ID, space.id, "edit", principal=owner())
+    assert space.id in auth.internal_principal().grants
+
+    service.archive_space(space.id, principal=owner())
+    assert space.id not in auth.internal_principal().grants
+    # The row survives so a human can still see and revoke it.
+    assert space.id in {g.space_id for g in service.list_grants(principal=owner())}
+
+
+def test_a_disabled_gardener_is_refused_rather_than_loaded(fresh_db):
+    """Disabling the agent is the supported way to stop the gardener.
+
+    Nothing checks a token on this path — it authenticates by being in-process —
+    so if the check did not live here it would live nowhere, and a disabled
+    account would go on writing.
+    """
+    service.disable_agent(GARDENER_AGENT_ID, principal=owner())
+    with pytest.raises(auth.PrincipalDisabled, match=GARDENER_AGENT_ID):
+        auth.internal_principal()
+    service.enable_agent(GARDENER_AGENT_ID, principal=owner())
+    assert auth.internal_principal().id == GARDENER_AGENT_ID
+
+
+def test_an_absent_internal_agent_is_a_refusal_not_an_empty_principal(fresh_db):
+    conn = db.connect()
+    try:
+        conn.execute("DELETE FROM grants WHERE agent_id = ?", (GARDENER_AGENT_ID,))
+        conn.execute("DELETE FROM agents WHERE kind = 'internal'")
+        conn.commit()
+    finally:
+        conn.close()
+    with pytest.raises(auth.UnknownPrincipal, match="0014"):
+        auth.internal_principal()
+
+
+def test_the_internal_agent_holds_no_credential_and_cannot_be_given_one(fresh_db):
+    conn = db.connect()
+    try:
+        row = conn.execute(
+            "SELECT credential_hash FROM agents WHERE id = ?", (GARDENER_AGENT_ID,)
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row["credential_hash"] is None
+    with pytest.raises(ValueError, match="internal"):
+        service.rotate_agent_token(GARDENER_AGENT_ID, principal=owner())
 
 
 # ── Sessions (server-side, 30-day sliding) ────────────────────────────────────

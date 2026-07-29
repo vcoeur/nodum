@@ -221,7 +221,11 @@ def test_every_agent_identity_is_seeded_once_under_its_bare_name(upgraded):
     the bare id, and minting a principal for it would attribute writes to
     `agent:agent:polconly`.
     """
-    assert sorted(_column(upgraded, "SELECT id FROM agents ORDER BY id")) == ["cook", "polconly"]
+    # Scoped to the external agents, which is what 0010 seeds from the log's
+    # actors; 0014's internal gardener is not one of them.
+    assert sorted(
+        _column(upgraded, "SELECT id FROM agents WHERE kind = 'external' ORDER BY id")
+    ) == ["cook", "polconly"]
     assert _column(upgraded, "SELECT id FROM agents WHERE id LIKE 'agent:%'") == []
     # A bare `agent:` actor names nobody and must seed nothing.
     assert _column(upgraded, "SELECT id FROM agents WHERE length(id) = 0") == []
@@ -242,6 +246,44 @@ def test_parity_grants_preserve_every_agents_reach(upgraded):
             ).fetchall()
         )
         assert grants == {"meta": "read", "main": "suggest"}
+
+
+def test_an_actor_string_under_the_reserved_prefix_stops_the_upgrade(tmp_path, monkeypatch):
+    """0010 invents accounts from the log, and 0014's guard has to see them.
+
+    Nothing before 0014 reserved the `builtin-` prefix, so an old log naming
+    `agent:builtin-librarian` back-fills a live external agent under it — one
+    `nodum agent token-rotate` gives a working token. Checking only the single
+    id `builtin-gardener` let that database upgrade clean; the prefix check is
+    what closes the route, and this is the route it was found on.
+    """
+    path = tmp_path / "reserved-actor.db"
+    monkeypatch.setenv("NODUM_DB", str(path))
+    names = [name for name, _ in MIGRATIONS]
+    monkeypatch.setattr(db, "MIGRATIONS", MIGRATIONS[: names.index(PRE_0009_THROUGH) + 1])
+    conn = db.connect(path)
+    try:
+        db.init_db(conn)
+        conn.execute(
+            "INSERT INTO events (actor, op, payload)"
+            " VALUES ('agent:builtin-librarian', 'node.propose', '{}')"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    monkeypatch.setattr(db, "MIGRATIONS", MIGRATIONS)
+    conn = db.connect(path)
+    try:
+        with pytest.raises(Exception, match="builtin-") as refusal:
+            db.init_db(conn)
+        assert "reserved" in str(refusal.value)
+        applied = db.applied_migrations(conn)
+        # 0010 still ran — it is what created the row — and 0014 is what stopped.
+        assert "0010_principals" in applied
+        assert "0014_cycles_and_gardener" not in applied
+    finally:
+        conn.close()
 
 
 def test_the_first_human_is_seeded_passwordless_and_policies_are_gone(upgraded):

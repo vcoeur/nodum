@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 import json
+import re
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 import pytest
-from helpers import agent, seed_space
+from helpers import agent, owner, seed_space
 from typer.testing import CliRunner
 
+from nodum import consolidate as consolidate_module
 from nodum import db, extract, service
 from nodum.cli import app
+from nodum.migrations import GARDENER_AGENT_ID
 
 runner = CliRunner()
 
@@ -158,6 +161,7 @@ def test_every_list_command_reports_a_count(fresh_db):
         (("ingest", "handlers"), "handlers"),
         (("projector", "run"), "projectors"),
         (("projector", "status"), "projectors"),
+        (("cycle-list",), "cycles"),
     ):
         payload = _run_json(*args)
         assert payload["count"] == len(payload[key]), args
@@ -268,6 +272,36 @@ def test_asset_register_missing_file_exits_1(fresh_db, tmp_path):
     assert result.exit_code == 1
     assert "missing.png" in result.stderr
     assert "Traceback" not in result.stderr
+
+
+def test_every_command_that_reads_a_file_reports_a_missing_one_in_one_line(fresh_db, tmp_path):
+    """A missing file is the CLI contract's own example of what must never be a traceback.
+
+    ``asset register`` and ``ingest file`` already held it; these three read
+    their file *outside* ``_run`` — ``Path(...).read_text()`` evaluated in the
+    argument list of the command's own ``_run(...)``, which Python builds before
+    ``_run`` is entered — so a missing path raised ``FileNotFoundError`` past the
+    error boundary and printed a full Rich traceback with an exit code that was
+    not 1. Exactly the trap ``_principal`` was moved inside ``_run`` to close.
+    """
+    missing = str(tmp_path / "missing.md")
+    node = _run_json("node", "create", "--type", "note", "--title", "Target")
+    for command in (
+        ["node", "create", "--type", "note", "--title", "T", "--content-file", missing],
+        ["node", "update", node["id"], "--content-file", missing],
+        ["edge", "create-batch", str(tmp_path / "missing.json")],
+        # The two that already behaved, swept with the rest so the rule is one
+        # rule rather than two commands that happen to agree.
+        ["asset", "register", str(tmp_path / "missing.png")],
+        ["ingest", "file", str(tmp_path / "missing.pdf")],
+    ):
+        args = [*command, "--as", "owner"] if _needs_as(command) else list(command)
+        result = runner.invoke(app, args)
+
+        assert result.exit_code == 1, command
+        assert "missing." in result.stderr, command
+        assert "Traceback" not in result.output, command
+        assert result.stdout == "", command
 
 
 def test_locked_database_exits_1(fresh_db, monkeypatch):
@@ -473,8 +507,10 @@ def test_human_and_agent_admin_over_the_cli(fresh_db):
     result = runner.invoke(app, ["agent", "create", "researcher", "--as", "owner"])
     assert result.exit_code == 0, result.output
     assert "ndm_" in result.stderr  # the token prints once, to stderr
-    agents = _run_json("agent", "list", "--as", "owner")
-    assert agents["agents"][0]["has_token"] is True
+    agents = {row["id"]: row for row in _run_json("agent", "list", "--as", "owner")["agents"]}
+    assert agents["researcher"]["has_token"] is True
+    # The gardener lists beside it, credential-less: it authenticates in-process.
+    assert agents[GARDENER_AGENT_ID]["has_token"] is False
 
     result = runner.invoke(app, ["agent", "token-rotate", "researcher", "--as", "owner"])
     assert result.exit_code == 0, result.output
@@ -489,7 +525,47 @@ def test_human_and_agent_admin_over_the_cli(fresh_db):
     assert [(g["space_id"], g["level"]) for g in remaining["grants"]] == [("meta", "read")]
 
     _run_json("agent", "disable", "researcher", "--as", "owner")
-    assert _run_json("agent", "list", "--as", "owner")["agents"][0]["disabled"] is True
+    disabled = {row["id"]: row for row in _run_json("agent", "list", "--as", "owner")["agents"]}
+    assert disabled["researcher"]["disabled"] is True
+
+
+def test_agent_create_has_no_kind_flag_at_all(fresh_db):
+    """The flag's one non-default value became a permanent refusal, so it is gone.
+
+    `service.create_agent` refuses `kind="internal"` outright — a second
+    internal agent does not add a gardener, it takes the existing one away, and
+    with no `agent delete` the install was recoverable only by hand-editing the
+    database. What was left was a flag with exactly one accepted value, offering
+    a choice the service does not have; HTTP already hardcoded `external`.
+
+    **Nothing here reads Typer's rendered error panel.** It used to assert
+    `"--kind" in refused.output`, which passed locally and failed on both CI
+    matrix jobs: the panel is wrapped to the terminal's width, and a narrow
+    runner cuts the flag out of it. That assertion was never about the
+    behaviour anyway — it checked how Click formats a message. The behaviour is
+    that the option is not accepted **whatever value follows it**, that no
+    account is written when one is passed, and that the flag is absent from the
+    self-describing surface. All three are readable without rendering anything.
+    """
+    for value in ("internal", "external"):
+        refused = runner.invoke(
+            app, ["agent", "create", "mygardener", "--kind", value, "--as", "owner"]
+        )
+        # 2 is Click's usage-error code; `external` was the flag's own default,
+        # so it failing too is what says the *option* is gone rather than one of
+        # its values.
+        assert refused.exit_code == 2, refused.output
+        assert "mygardener" not in {row["id"] for row in _run_json("agent", "list")["agents"]}
+    # And the flag is gone from the self-describing surface too.
+    payload = _run_json("schema-dump")
+    agent_group = next(row for row in payload["commands"] if row["name"] == "agent")
+    create = next(row for row in agent_group["subcommands"] if row["name"] == "create")
+    assert "--kind" not in {flag for param in create["params"] for flag in param.get("flags", ())}
+
+    # An ordinary create still works, and is external.
+    made = runner.invoke(app, ["agent", "create", "researcher", "--as", "owner"])
+    assert made.exit_code == 0, made.output
+    assert json.loads(made.stdout)["agent"]["kind"] == "external"
 
 
 def test_space_admin_over_the_cli(fresh_db):
@@ -1040,6 +1116,455 @@ def test_ingest_handlers_needs_no_principal_and_no_database(tmp_path, monkeypatc
     assert not (tmp_path / "never-created.db").exists()
 
 
+# ── Consolidation cycles, the journal, and the curative tier (§8.2/§8.4) ─────
+
+
+def _claim(title):
+    """One active claim node, written over the CLI like everything else here."""
+    return _run_json("node", "create", "--type", "claim", "--title", title)
+
+
+def test_consolidate_runs_the_gardeners_jobs_and_journals_them(fresh_db):
+    """The gardener acts, the human asks — and the journal records both."""
+    _claim("Kafka Stream")
+    _claim("Kafka Streams")
+
+    outcome = _run_json("consolidate")
+
+    cycle = outcome["cycle"]
+    assert cycle["trigger"] == "manual"
+    assert cycle["triggered_by"] == "human:owner"  # who asked
+    assert (cycle["status"], cycle["dry_run"]) == ("completed", False)
+    assert [job["name"] for job in outcome["report"]["jobs"]] == list(consolidate_module.JOBS)
+
+    jobs = {job["name"]: job for job in outcome["report"]["jobs"]}
+    (proposed,) = jobs["duplicate_candidates"]["proposed"]
+
+    # The diff is the log, never the report: the edge the cycle proposed is
+    # attributed to the gardener and stamped with the cycle.
+    diff = _run_json("events", "--cycle", cycle["id"])
+    assert [event["op"] for event in diff["events"]] == ["edge.propose"]
+    assert diff["events"][0]["actor"] == f"agent:{GARDENER_AGENT_ID}"
+    assert _run_json("edge", "list")["edges"][0]["id"] == proposed
+
+
+def test_consolidate_dry_run_journals_the_rehearsal_and_emits_no_event(fresh_db):
+    """A rehearsal is in the journal, and its event list is empty.
+
+    That emptiness is the machine-checkable form of "it changed nothing".
+    """
+    _claim("Kafka Stream")
+    _claim("Kafka Streams")
+
+    outcome = _run_json("consolidate", "--dry-run")
+
+    assert outcome["cycle"]["dry_run"] is True
+    assert outcome["cycle"]["status"] == "completed"
+    assert _run_json("events", "--cycle", outcome["cycle"]["id"])["count"] == 0
+    assert _run_json("edge", "list")["count"] == 0
+
+
+def test_consolidate_selects_jobs_and_a_scope(fresh_db):
+    scoped = _run_json("consolidate", "--job", "neglect_report", "--scope", "main")
+
+    assert [job["name"] for job in scoped["report"]["jobs"]] == ["neglect_report"]
+    assert scoped["cycle"]["scope"] == "main"
+    assert scoped["report"]["scope"] == "main"
+
+
+def test_cycle_list_and_cycle_get_are_the_journal(fresh_db):
+    first = _run_json("consolidate", "--dry-run")["cycle"]
+    second = _run_json("consolidate")["cycle"]
+
+    listing = _run_json("cycle-list")
+    assert [row["id"] for row in listing["cycles"]] == [second["id"], first["id"]]
+
+    assert _run_json("cycle-get", first["id"]) == first
+
+
+def test_cycle_abandon_is_the_door_out_of_an_interrupted_run(fresh_db):
+    """A cycle left `running` makes its own writes irreversible on every surface.
+
+    `rollback` refuses a cycle whose event set is not closed and `undo` refuses
+    every event a cycle stamped, so a run killed by a `SIGKILL`, a power cut, or
+    a server shutdown cancelling the nightly task stranded its writes behind
+    advice ("close it first") that no verb could carry out. `service.abandon_
+    cycle` existed and nothing called it.
+    """
+    cycle = service.open_cycle(trigger="manual", principal=owner())
+    with service.in_cycle(cycle.id):
+        node = service.create_node(type="claim", title="Half-written", principal=owner())
+
+    stuck = runner.invoke(app, ["rollback", cycle.id, "--as", "owner"])
+    assert stuck.exit_code == 1
+    assert "still running" in stuck.stderr
+
+    abandoned = _run_json("cycle-abandon", cycle.id)
+
+    assert abandoned["status"] == "failed"
+    assert abandoned["report"]["abandoned"] is True
+    assert abandoned["report"]["abandoned_by"] == "human:owner"
+    # And the writes it made are reachable again, which is the whole point.
+    _run_json("rollback", cycle.id)
+    assert _run_json("cycle-get", cycle.id)["status"] == "rolled_back"
+    gone = runner.invoke(app, ["node", "get", node.id, "--as", "owner"])
+    assert gone.exit_code == 1
+
+
+def test_cycle_abandon_refuses_a_cycle_that_already_ended(fresh_db):
+    """Not a general "close this" verb: re-closing would overwrite the record."""
+    finished = _run_json("consolidate")["cycle"]
+
+    result = runner.invoke(app, ["cycle-abandon", finished["id"], "--as", "owner"])
+
+    assert result.exit_code == 1
+    assert "already completed, not running" in result.stderr
+    assert "Traceback" not in result.output
+    assert _run_json("cycle-get", finished["id"])["status"] == "completed"
+
+
+def test_merge_nodes_over_the_cli(fresh_db):
+    survivor, duplicate, citer = _claim("Alpha"), _claim("Alpha (dup)"), _claim("Cites")
+    edge = _run_json("edge", "create", citer["id"], duplicate["id"], "--type", "supports")
+
+    merged = _run_json("merge-nodes", duplicate["id"], "--into", survivor["id"])
+
+    assert merged["into"]["id"] == survivor["id"]
+    assert [node["id"] for node in merged["tombstones"]] == [duplicate["id"]]
+    assert [row["id"] for row in merged["relinked"]] == [edge["id"]]
+    assert [row["tombstone_id"] for row in merged["redirects"]] == [duplicate["id"]]
+
+    # The read path is unchanged: the tombstone comes back and says where it went.
+    tombstone = _run_json("node", "get", duplicate["id"])
+    assert tombstone["state"] == "archived"
+    assert tombstone["props"]["merged_into"] == survivor["id"]
+
+    # And the reversal is the cycle, not `undo`: naming one of its events is
+    # refused and says what to use instead, because reversing one row of a merge
+    # would leave the other half standing.
+    stamped = _run_json("events", "--cycle", merged["cycle_id"])["events"][0]
+    refused = runner.invoke(app, ["undo", str(stamped["seq"]), "--as", "owner"])
+    assert refused.exit_code == 1
+    assert "Roll the cycle back instead." in refused.stderr
+    assert "Traceback" not in refused.output
+
+
+def test_retype_over_the_cli_and_its_per_item_failures(fresh_db):
+    """A batch keeps its successes on stdout and pays for its failures in the exit code.
+
+    `ingest file`'s rule, which the curative tier did not follow: the envelope
+    is printed whatever happened, each skipped item is named on stderr, and the
+    exit code is 1 if any of them was — so a script reading only the code is not
+    told a run succeeded when part of it did not happen.
+    """
+    node = _claim("Alpha")
+
+    result = runner.invoke(
+        app, ["retype", node["id"], "missing", "--type", "note", "--as", "owner"]
+    )
+
+    assert result.exit_code == 1
+    retyped = json.loads(result.stdout)
+    assert retyped["new_type"] == "note"
+    assert retyped["transitioned"] == [node["id"]]
+    assert [failure["id"] for failure in retyped["failed"]] == ["missing"]
+    assert retyped["cycle_id"]
+    # The reason is on stderr too: an exit code of 1 with a silent stderr breaks
+    # the other half of the contract.
+    assert "failed missing:" in result.stderr
+    assert "Traceback" not in result.output
+    # The success still landed — that is what "never loses its successes" means.
+    assert _run_json("node", "get", node["id"])["type"] == "note"
+
+
+def test_a_retype_that_changed_nothing_does_not_exit_zero(fresh_db):
+    """`nodum retype main --type note` accomplishes nothing and used to report success.
+
+    It reported the refusal in `failed[]`, opened a curative cycle that closed
+    `completed` with zero events, and exited **0** — the one thing a script
+    reads. `ingest file` had set exit 1 in exactly this situation since Phase 4.
+    """
+    result = runner.invoke(app, ["retype", "main", "--type", "note", "--as", "owner"])
+
+    assert result.exit_code == 1
+    payload = json.loads(result.stdout)
+    assert payload["transitioned"] == []
+    assert [failure["id"] for failure in payload["failed"]] == ["main"]
+    assert "failed main:" in result.stderr
+    assert "Traceback" not in result.output
+    # The cycle is still in the journal, and still says it changed nothing.
+    assert _run_json("events", "--cycle", payload["cycle_id"])["events"] == []
+
+
+def test_supersede_edge_with_and_without_a_replacement(fresh_db):
+    first, second = _claim("A"), _claim("B")
+    edge = _run_json("edge", "create", first["id"], second["id"], "--type", "supports")
+
+    result = _run_json("supersede-edge", edge["id"], "--confidence", "0.4")
+
+    # Two facts, both recorded: when it stopped being true, and that it is gone.
+    assert result["superseded"]["state"] == "archived"
+    assert result["superseded"]["valid_to"]
+    replacement = result["replacement"]
+    # Every field the replacement does not name is inherited from the original.
+    assert (replacement["src_id"], replacement["dst_id"], replacement["type"]) == (
+        first["id"],
+        second["id"],
+        "supports",
+    )
+    assert replacement["confidence"] == 0.4
+    assert replacement["props"]["supersedes"] == edge["id"]
+    assert result["superseded"]["props"]["superseded_by"] == replacement["id"]
+
+    # Naming no replacement option retires the edge with no successor at all.
+    plain = _run_json("edge", "create", first["id"], second["id"], "--type", "relates_to")
+    assert _run_json("supersede-edge", plain["id"])["replacement"] is None
+
+
+def test_bulk_relink_previews_before_it_writes(fresh_db):
+    first, second, third = _claim("A"), _claim("B"), _claim("C")
+    edge = _run_json("edge", "create", first["id"], second["id"], "--type", "supports")
+
+    preview = _run_json("bulk-relink", "--src", first["id"], "--to-dst", third["id"], "--dry-run")
+
+    assert (preview["dry_run"], preview["cycle_id"]) == (True, None)
+    assert [change["edge_id"] for change in preview["changes"]] == [edge["id"]]
+    assert _run_json("edge", "list", "--node", third["id"])["count"] == 0
+
+    applied = _run_json("bulk-relink", "--src", first["id"], "--to-dst", third["id"])
+
+    assert applied["dry_run"] is False
+    assert applied["cycle_id"]
+    assert _run_json("edge", "list", "--node", third["id"])["count"] == 1
+
+
+def test_a_bulk_relink_that_refused_an_edge_does_not_exit_zero(fresh_db):
+    """The batch rule, now that `skipped[]` is a failure list and nothing else.
+
+    `retype`'s defect, one command along. The exemption `bulk-relink` held was
+    that its `skipped[]` mixed a diff annotation ("nothing would change on this
+    edge") with real refusals under one field called `error`, so an exit code
+    derived from it would have been wrong more often than right. `unchanged`
+    took the annotation, `skipped` kept the refusals — and until this, a run
+    that could not relink an edge still reported success to the one thing a
+    script reads.
+    """
+    first, second, third = _claim("A"), _claim("B"), _claim("C")
+    moving = _run_json("edge", "create", first["id"], second["id"], "--type", "supports")
+    # Already saying what the relink asks for, so repointing `moving` onto it is
+    # the duplicate refusal — and this edge itself is an `unchanged` entry.
+    _run_json("edge", "create", first["id"], third["id"], "--type", "supports")
+
+    result = runner.invoke(
+        app, ["bulk-relink", "--src", first["id"], "--to-dst", third["id"], "--as", "owner"]
+    )
+
+    assert result.exit_code == 1
+    relinked = json.loads(result.stdout)
+    # The envelope is still on stdout, printed before the exit code was decided.
+    assert relinked["changes"] == []
+    assert [failure["id"] for failure in relinked["skipped"]] == [moving["id"]]
+    assert f"failed {moving['id']}:" in result.stderr
+    assert "Traceback" not in result.output
+
+    # And the annotation is not a failure: a run whose only non-change is
+    # `unchanged` accomplished exactly what was asked and exits 0.
+    unchanged = _run_json("bulk-relink", "--src", first["id"], "--to-type", "supports")
+    assert unchanged["skipped"] == []
+    assert len(unchanged["unchanged"]) == 2
+
+
+def test_a_bulk_relink_dry_run_exits_zero_even_when_it_would_refuse(fresh_db):
+    """A rehearsal's `skipped[]` is a prediction: nothing was attempted, nothing lost.
+
+    The one place this command departs from the flat batch rule. Every check a
+    real run makes runs on the dry run too, so the diff tells the truth about
+    what *would* be refused — but exit 1 there would report a failure that has
+    not happened, on a command whose whole job is to be read before it is run.
+    """
+    first, second, third = _claim("A"), _claim("B"), _claim("C")
+    _run_json("edge", "create", first["id"], second["id"], "--type", "supports")
+    _run_json("edge", "create", first["id"], third["id"], "--type", "supports")
+
+    result = runner.invoke(
+        app,
+        [
+            "bulk-relink",
+            "--src",
+            first["id"],
+            "--to-dst",
+            third["id"],
+            "--dry-run",
+            "--as",
+            "owner",
+        ],
+    )
+
+    assert result.exit_code == 0
+    preview = json.loads(result.stdout)
+    assert preview["dry_run"] is True
+    assert len(preview["skipped"]) == 1
+    # Nothing "failed": naming a prediction on stderr under that word would say
+    # an attempt was made and lost.
+    assert "failed" not in result.stderr
+
+
+def test_rollback_takes_a_curative_cycle_back_whole(fresh_db):
+    survivor, duplicate = _claim("Alpha"), _claim("Alpha (dup)")
+    merged = _run_json("merge-nodes", duplicate["id"], "--into", survivor["id"])
+    assert _run_json("node", "get", duplicate["id"])["state"] == "archived"
+
+    rolled = _run_json("rollback", merged["cycle_id"])
+
+    assert rolled["dry_run"] is False
+    assert rolled["conflicts"] == []
+    assert rolled["rollback_cycle_id"]
+    assert _run_json("node", "get", duplicate["id"])["state"] == "active"
+
+    taken_back = _run_json("cycle-get", merged["cycle_id"])
+    assert taken_back["status"] == "rolled_back"
+    assert taken_back["rolled_back_by"] == rolled["rollback_cycle_id"]
+
+
+def test_a_refused_rollback_prints_its_conflicts_as_one_json_object(fresh_db):
+    """The one refusal in this CLI that is a list rather than a sentence.
+
+    `RollbackConflict`'s message names the first few rows and drops the actor
+    and the cycle behind the later work entirely, so the structured list is what
+    the command prints — and the message still goes to stderr with exit 1, like
+    every other refusal here.
+    """
+    node = _claim("Alpha")
+    retyped = _run_json("retype", node["id"], "--type", "note")
+    # Work outside the cycle touches a row the cycle wrote.
+    _run_json("node", "update", node["id"], "--content", "moved on")
+
+    result = runner.invoke(app, ["rollback", retyped["cycle_id"], "--as", "owner"])
+
+    assert result.exit_code == 1
+    assert "Traceback" not in result.output
+    assert "cannot roll back cycle" in result.stderr
+    refusal = json.loads(result.stdout)["error"]
+    assert refusal["type"] == "RollbackConflict"
+    (conflict,) = refusal["conflicts"]
+    assert conflict == {
+        "kind": "node",
+        "row_id": node["id"],
+        "cycle_event_seq": conflict["cycle_event_seq"],
+        "cycle_event_op": "node.retype",
+        "conflicting_seq": conflict["conflicting_seq"],
+        "conflicting_op": "node.update",
+        "conflicting_actor": "human:owner",
+        "conflicting_cycle_id": None,
+    }
+    assert conflict["conflicting_seq"] > conflict["cycle_event_seq"]
+    # Nothing was written: the node still carries the later edit.
+    assert _run_json("node", "get", node["id"])["content"] == "moved on"
+
+    # The same question asked as a dry run is an answer, not a refusal.
+    preview = _run_json("rollback", retyped["cycle_id"], "--dry-run")
+    assert [row["row_id"] for row in preview["conflicts"]] == [node["id"]]
+    assert preview["rollback_cycle_id"] is None
+
+
+def test_an_unknown_principal_is_one_readable_line_and_never_a_traceback(fresh_db):
+    """`--as` is evaluated in the argument list, before `_run` is even entered.
+
+    That is why an unknown account used to print a full traceback: the
+    resolution sat outside the error boundary the command's own call goes
+    through. Phase 5a's verbs are all `--as`-taking, so the sweep covers them.
+    """
+    for command in (
+        ["node", "list"],
+        ["consolidate"],
+        ["cycle-list"],
+        ["cycle-get", "whatever"],
+        ["rollback", "whatever"],
+        ["merge-nodes", "a", "--into", "b"],
+        ["retype", "a", "--type", "note"],
+        ["supersede-edge", "a"],
+        ["bulk-relink", "--src", "a", "--to-type", "supports"],
+    ):
+        result = runner.invoke(app, [*command, "--as", "human:nope"])
+
+        assert result.exit_code == 1, command
+        assert result.stderr.splitlines() == ["unknown human account: nope"], command
+        assert result.stdout == "", command
+        assert "Traceback" not in result.output, command
+
+
+def test_a_disabled_human_is_refused_the_same_way(fresh_db):
+    """The sibling branch: `PrincipalDisabled` is an OSError, and still one line."""
+    alice = _run_json("human", "create", "alice")
+    _run_json("human", "disable", alice["id"])
+
+    result = runner.invoke(app, ["consolidate", "--as", alice["id"]])
+
+    assert result.exit_code == 1
+    assert result.stderr.splitlines() == [f"human account is disabled: {alice['id']}"]
+    assert "Traceback" not in result.output
+
+
+def test_consolidate_is_refused_on_a_scope_the_gardener_holds_nothing_on(fresh_db):
+    """The grant that has to be there is the gardener's, not the asker's.
+
+    A human passes `require_review` unconditionally, so no curative verb on this
+    surface can be refused for want of the *caller's* grant. The gardener's is
+    the one that bites: migration `0014` gives it `main` and `meta` and nothing
+    else, so every space made since needs an explicit grant.
+
+    The refusal names that grant. It used to be the Q13 non-oracle "unknown
+    space: <id>", which is the honest answer when the *caller* holds nothing and
+    a false one here — the caller just created the space and can see it in every
+    picker; it is the gardener that cannot. That sentence also outlived the
+    command, in a `failed` journal row whose message the dream journal splices
+    into the entry's headline.
+    """
+    _run_json("space-create", "research")
+
+    result = runner.invoke(app, ["consolidate", "--scope", "research", "--as", "owner"])
+
+    assert result.exit_code == 1
+    assert "nodum grant builtin-gardener research edit" in result.stderr
+    assert "unknown space" not in result.stderr
+    assert "Traceback" not in result.output
+    journal = _run_json("cycle-list")["cycles"][0]
+    assert journal["status"] == "failed"
+    assert "unknown space" not in journal["report"]["failed"][0]["error"]
+
+
+def test_consolidate_stops_when_the_gardener_is_disabled(fresh_db):
+    """Disabling the gardener is the supported way to stop it running."""
+    _run_json("agent", "disable", GARDENER_AGENT_ID)
+
+    result = runner.invoke(app, ["consolidate", "--as", "owner"])
+
+    assert result.exit_code == 1
+    assert result.stderr.splitlines() == [f"agent account is disabled: {GARDENER_AGENT_ID}"]
+    assert "Traceback" not in result.output
+
+
+def test_every_curative_refusal_is_one_line_and_never_a_traceback(fresh_db):
+    node, other = _claim("Alpha"), _claim("Beta")
+    proposed = service.create_edge(node["id"], other["id"], "supports", principal=agent("bot"))
+
+    for command, expected in (
+        (["merge-nodes", node["id"], "--into", node["id"]], "into itself"),
+        (["retype", node["id"], "--type", "space"], "cannot retype anything into"),
+        (["supersede-edge", proposed.id], "cannot supersede an edge in state 'proposed'"),
+        (["bulk-relink", "--to-type", "supports"], "needs a selector"),
+        (["bulk-relink", "--src", node["id"]], "needs changes"),
+        (["cycle-get", "missing"], "consolidation cycle not found"),
+        (["rollback", "missing"], "consolidation cycle not found"),
+        (["consolidate", "--job", "nope"], "unknown consolidation job"),
+    ):
+        result = runner.invoke(app, [*command, "--as", "owner"])
+
+        assert result.exit_code == 1, command
+        assert expected in result.stderr, command
+        assert "Traceback" not in result.output, command
+
+
 def test_version_flag_short_circuits():
     """`--version` prints the version and exits 0 without needing a database."""
     result = runner.invoke(app, ["--version"])
@@ -1070,3 +1595,119 @@ def test_schema_dump_surfaces_params():
     payload = _run_json("schema-dump")
     schema_command = next(c for c in payload["commands"] if c["name"] == "schema")
     assert any(p["kind"] == "argument" and p["name"] == "type" for p in schema_command["params"])
+
+
+# ── The docs name commands that exist ─────────────────────────────────────────
+
+#: Every prose file that spells commands at a reader. `schema-dump` is the
+#: authority they are checked against, which is the point: the CLI describes
+#: itself, so the docs can be checked against the surface rather than against a
+#: second list of it.
+DOC_SOURCES = ("README.md", "AGENTS.md", "docs")
+
+#: Hyphenated lowercase tokens the docs write in backticks that are *not*
+#: commands — a CSP directive, an HTTP header, a package, an agent id, a CI job.
+#: They share `cycle-rollback`'s exact shape, which is why the check needs them
+#: named; the test asserts every one of them is still in the docs, so an entry
+#: that stops being needed fails here instead of quietly widening the check.
+NOT_COMMANDS = frozenset(
+    {
+        "build-and-publish",  # the release workflow's job name
+        "builtin-gardener",  # the internal agent's id (`nodum grant` takes it)
+        "content-disposition",  # an HTTP response header
+        "cross-space",  # prose
+        "faster-whisper",  # the audio extra's package
+        "no-store",  # a Cache-Control directive
+        "script-src",  # a CSP directive
+    }
+)
+
+#: A backticked token shaped like a command name: lowercase, hyphenated. The
+#: shape is what makes a wrong one invisible — `cycle-rollback` reads exactly
+#: like `cycle-abandon` and `cycle-list` beside it.
+_COMMAND_SHAPED = re.compile(r"^[a-z][a-z0-9]*(?:-[a-z0-9]+)+$")
+
+#: An inline code span or a fenced block — the only places a command name is
+#: spelled. Scanning prose instead would trip over every sentence that says
+#: "nodum is a…", which is not a command and never was.
+_CODE_SPAN = re.compile(r"```.*?```|`[^`\n]+`", re.S)
+
+#: `nodum <command> [<subcommand>]` inside one of those spans. The trailing `*`
+#: is captured rather than cut off so a family reference (`nodum space-*`) can be
+#: recognised as one and skipped instead of resolving to `space-`.
+_INVOCATION = re.compile(r"\bnodum\s+([a-z][a-z0-9-]*\*?)(?:\s+([a-z][a-z0-9-]*\*?))?")
+
+
+def _doc_files() -> list[Path]:
+    """Every documentation file a reader could copy a command out of."""
+    repo = Path(__file__).resolve().parent.parent
+    files: list[Path] = []
+    for source in DOC_SOURCES:
+        target = repo / source
+        files.extend(sorted(target.rglob("*.md")) if target.is_dir() else [target])
+    files.append(repo / "docs" / "llms.txt")
+    return [path for path in files if path.exists()]
+
+
+def _command_tree() -> dict[str, dict]:
+    """The CLI's own command tree, keyed by name, from ``schema-dump``."""
+
+    def index(commands: list[dict]) -> dict[str, dict]:
+        return {c["name"]: index(c.get("subcommands", [])) for c in commands}
+
+    return index(_run_json("schema-dump")["commands"])
+
+
+def test_every_command_the_docs_name_exists():
+    """A documented command that does not resolve is worse than an undocumented one.
+
+    ``docs/commands.md`` told a reader that "an interrupted run is still one a
+    ``cycle-rollback`` can take back". There is no ``cycle-rollback``: the verb
+    is ``nodum rollback``, and the name appears nowhere in ``nodum/``. It reads
+    like a command because it is shaped like three real ones sitting beside it
+    (``cycle-list``, ``cycle-get``, ``cycle-abandon``), which is exactly why
+    nobody caught it — and a reader who types it gets "No such command", after
+    which the paragraph's actual advice is worth nothing.
+
+    Two passes, because the docs spell a command two ways. Full invocations
+    (``nodum grant builtin-gardener <space> edit``) are checked head and
+    subcommand against the tree. Bare, command-shaped names in backticks
+    (``space-list``, ``bulk-relink``) are checked against every name in the tree
+    at any depth, since the docs write ``token-rotate`` for ``agent
+    token-rotate``. Only code spans are read: prose says "nodum is a DB-native
+    knowledge graph", and "is" is not a command.
+    """
+    tree = _command_tree()
+    every_name = set(tree)
+    for group in tree.values():
+        every_name |= set(group)
+
+    unknown: list[str] = []
+    seen_exemptions: set[str] = set()
+    for path in _doc_files():
+        text = path.read_text(encoding="utf-8")
+        for span in _CODE_SPAN.finditer(text):
+            body = span.group(0)
+            for match in _INVOCATION.finditer(body):
+                head, sub = match.group(1), match.group(2)
+                # `pipx install nodum` on the line above a real invocation, and
+                # `nodum space-*`, which names a family rather than a command.
+                if head == "nodum" or head.endswith("*"):
+                    continue
+                sub = None if sub and sub.endswith("*") else sub
+                if head not in tree:
+                    unknown.append(f"{path.name}: nodum {head}")
+                elif tree[head] and sub and sub not in tree[head]:
+                    unknown.append(f"{path.name}: nodum {head} {sub}")
+            token = body.strip("`").strip().split(" ")[0] if "\n" not in body else ""
+            if not _COMMAND_SHAPED.match(token):
+                continue
+            if token in NOT_COMMANDS:
+                seen_exemptions.add(token)
+            elif token not in every_name:
+                unknown.append(f"{path.name}: `{token}`")
+
+    assert not unknown, f"the docs name commands that do not exist: {sorted(set(unknown))}"
+    assert seen_exemptions == set(NOT_COMMANDS), (
+        f"NOT_COMMANDS lists names the docs no longer use: {sorted(NOT_COMMANDS - seen_exemptions)}"
+    )

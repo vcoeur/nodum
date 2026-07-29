@@ -721,6 +721,178 @@ WHERE type_id = 'space' AND title IS NOT NULL;
 """
 
 
+#: The internal agent seeded by ``0014`` — the gardener, the only principal that
+#: authenticates by being in-process (design §8.4). Its id is also the whole of
+#: the reserved prefix below, for now.
+GARDENER_AGENT_ID = "builtin-gardener"
+
+#: Reserved id prefix for agents the system seeds. ``Principal.actor_string``
+#: renders every agent as ``agent:<id>``, so an *external* agent free to take
+#: this id would write events indistinguishable from the gardener's — and the
+#: event log is this system's answer to "who is answerable for this write".
+#: Enforced for new accounts in :func:`nodum.service.create_agent` and, for
+#: databases written before that check existed, by ``0014`` refusing to upgrade.
+BUILTIN_AGENT_PREFIX = "builtin-"
+
+
+CYCLES_AND_GARDENER_DDL = """
+-- Consolidation cycles and the gardener that runs them (Phase 5, design §8.4).
+--
+-- A cycle groups a set of graph writes under one id so that a human can take
+-- the whole of it back in one action. `events.cycle_id` has been there since
+-- 0001 and no caller ever set it; this is the table it points at, and the
+-- dream journal's record: what ran, who asked for it, over what, and how it
+-- ended. The per-cycle *diff* is deliberately not stored here — that is
+-- `list_events` filtered by `cycle_id`, so the journal can never become a
+-- second, disagreeing record of what happened.
+--
+-- `triggered_by` is who **asked** — a human's `human:<id>`, or the literal
+-- `scheduler` when the clock did. It is deliberately not the same thing as the
+-- `actor` on the events the cycle contains, which is who **acted**: the
+-- gardener. A journal entry that carried only one of the two could not answer
+-- "I did not ask for this" or "who ran this at 04:00", and they are different
+-- questions.
+--
+-- `scope` carries a space id or NULL (the whole file), and takes **no foreign
+-- key** on purpose, for the reason `url_tokens` takes none: a cycle row is
+-- history, and a reference from history into the live graph would let an old
+-- journal entry block an ordinary graph write (an undo deleting a space node)
+-- long after anyone cared. `rolled_back_by` does point at `cycles(id)` — that
+-- is one journal entry naming another, which is structure, not history
+-- reaching forward.
+CREATE TABLE cycles (
+    id             TEXT PRIMARY KEY,   -- uuid4().hex, like every other generated id
+    trigger        TEXT NOT NULL CHECK (trigger IN ('manual','scheduled','curative','rollback')),
+    triggered_by   TEXT NOT NULL,      -- who asked: 'human:<id>', or 'scheduler'
+    scope          TEXT,               -- a space id, or NULL for the whole file
+    dry_run        INTEGER NOT NULL DEFAULT 0,
+    status         TEXT NOT NULL CHECK (status IN ('running','completed','failed','rolled_back')),
+    report         TEXT,               -- JSON; NULL while the cycle is running
+    started_at     TEXT NOT NULL DEFAULT (datetime('now')),
+    finished_at    TEXT,               -- NULL while the cycle is running
+    rolled_back_by TEXT REFERENCES cycles(id)   -- the rollback cycle that reversed this one
+);
+
+-- The journal is read newest-first and, later, by date range; nothing else here
+-- is looked up by anything but the primary key.
+CREATE INDEX idx_cycles_started ON cycles(started_at);
+
+-- **One consolidation cycle at a time, in the whole file.** This index is the
+-- lock, and it is here rather than in Python because the thing it serialises
+-- crosses processes: a `nodum consolidate` fired while `nodum serve` runs one is
+-- two interpreters, and a module-level lock is in neither of the other's. Both
+-- runs completed, and since every job's "leave what is already there alone" is a
+-- read followed by a write with no transaction spanning it, every duplicate pair
+-- was proposed twice — 1580 `duplicate_of` edges over 790 pairs, and two journal
+-- rows for one human intention. The review queue is the human's; doubling it is
+-- the defect the in-process lock was raised against, and a lock that covers one
+-- process covers the wrong half of it.
+--
+-- The `cycles` table already *is* the cross-process state — a `running`
+-- consolidation row means one is running, whoever opened it — so the guard is a
+-- uniqueness constraint over exactly that, and the second opener loses on the
+-- INSERT. That matters: a `SELECT` then an `INSERT` is two statements with a
+-- window between them, and two runners racing that window is the case this
+-- exists for. `status` is the indexed column and it is constant 'running' across
+-- every indexed row, so the index admits at most one.
+--
+-- **Scoped to the two triggers a consolidation run opens.** A `curative` cycle
+-- is one human-driven operation and a `rollback` is the human's undo; both are
+-- short, both open a cycle of their own, and blocking either for the length of a
+-- nightly sweep would take the curative tier offline every night. They are not
+-- what proposes a duplicate pair twice.
+--
+-- A cycle left `running` by a `SIGKILL` or a power cut therefore blocks every
+-- later run, which is what `nodum cycle-abandon <id>` is the door out of —
+-- named in the refusal itself, since advice nobody can carry out is the failure
+-- shape this repo has already fixed once.
+CREATE UNIQUE INDEX idx_cycles_one_running_consolidation
+    ON cycles(status)
+    WHERE status = 'running' AND trigger IN ('manual', 'scheduled');
+
+-- The gardener's own account. D7 is "auto-apply by default", and a gardener
+-- with no grant does nothing at all — every write it makes goes through the
+-- same scope-bound store as an external agent's, so seeding the identity
+-- without seeding its authority would ship a phase that silently no-ops. The
+-- grants are **ordinary rows**: they show up in `nodum space-list` and on the
+-- `/spaces` screen beside every other agent's, and `nodum revoke
+-- builtin-gardener main` takes them away with the command that was already
+-- there. There is no gardener-shaped exception anywhere in the grant model,
+-- which is the point.
+--
+-- `internal` means it holds no credential: it authenticates by being
+-- in-process (`auth.internal_principal`), and `rotate_agent_token` already
+-- refuses to mint one for an internal agent.
+--
+-- **A collision under the reserved prefix refuses the upgrade rather than
+-- resolving it.** `agents.id` is a PRIMARY KEY and `create_agent` sets
+-- `agent_id = name` verbatim, so a database written before this migration can
+-- already hold a user's agent called `builtin-gardener`. Neither way out of
+-- that is safe: taking the id would attribute that agent's whole history —
+-- every `agent:builtin-gardener` in `events.actor`, `versions.actor` and both
+-- `created_by` columns — to the gardener, and renaming the impostor would
+-- detach that same history from the account it names, since the actor strings
+-- are immutable log entries and not references anything can follow. Both
+-- corrupt the one question the event log exists to answer. So the migration
+-- stops and says so, and the operator renames or removes the account by hand
+-- and re-runs; the whole migration rolls back as one transaction, exactly as
+-- any other failing one does.
+--
+-- **The check is the whole prefix, not the one id.** What is reserved is
+-- `builtin-` (`BUILTIN_AGENT_PREFIX`), because `Principal.actor_string` renders
+-- every agent as `agent:<id>` and the reservation is what keeps one such string
+-- naming one principal. Checking `builtin-gardener` alone let a pre-0010
+-- database whose log merely *mentions* `agent:builtin-librarian` upgrade
+-- clean — 0010 back-fills an `agents` row from every actor string it finds, so
+-- the upgrade installs a live, token-bearing external agent under the reserved
+-- prefix, and the collision this guard exists to refuse arrives pre-installed
+-- the day a second `builtin-*` agent is seeded. `LIKE 'builtin-%'` closes that,
+-- and it still catches the original single-id case.
+--
+-- `RAISE()` is a trigger-only construct in SQLite, so the abort is a CHECK
+-- constraint whose **name** carries the message (SQLite reports it verbatim as
+-- `CHECK constraint failed: <name>`). The name is static SQL and **cannot
+-- interpolate the ids it found**: SQLite accepts an expression as `RAISE()`'s
+-- second argument only from 3.47.1 (2024-11-25), newer than the library most
+-- distributions ship, and a migration that fails to *parse* on an ordinary
+-- machine is a far worse failure than one whose message has to be looked up. So
+-- the message carries the LIKE pattern instead — `nodum agent list`, or one
+-- `SELECT id FROM agents WHERE id LIKE 'builtin-%'`, names them. The insert
+-- below produces a row only when something under the prefix exists.
+CREATE TABLE _reserved_agent_id (
+    taken TEXT,
+    CONSTRAINT
+"agent ids matching 'builtin-%' are reserved: rename or remove them, then re-run"
+    CHECK (taken IS NULL)
+);
+INSERT INTO _reserved_agent_id (taken)
+SELECT id FROM agents WHERE id LIKE 'builtin-%';
+DROP TABLE _reserved_agent_id;
+
+INSERT INTO agents (id, kind, name, owner_human_id, credential_hash)
+VALUES ('builtin-gardener', 'internal', 'builtin-gardener', NULL, NULL);
+
+-- `read` on meta and `edit` on main — the shape every other curating agent in
+-- this system holds. Meta because resolving a node or edge type is a READ of
+-- the type vocabulary, and consolidation never writes it: every job filters
+-- through `consolidate._is_curatable`, which excludes the meta space and the
+-- structural types outright. `edit` on meta was the first cut, justified as
+-- "reads and writes the vocabulary", and the write half was never true — what
+-- the level actually bought was authority no shipped job reaches: creating
+-- spaces, renaming `main`, retitling the `concept` type, and archiving the
+-- `note` type, after which a *human* can no longer write a note either. A grant
+-- is a ceiling, and this one is now set at what the jobs need.
+--
+-- Main because that is where every write naming no space lands. Any other space
+-- is an explicit `nodum grant builtin-gardener <space> edit`, like it is for
+-- every other agent — which is also what a scoped cycle over a space created
+-- after this migration asks for by name.
+INSERT INTO grants (agent_id, space_id, level) VALUES
+    ('builtin-gardener', 'meta', 'read'),
+    ('builtin-gardener', 'main', 'edit');
+"""
+
+
 #: Ordered (name, SQL) migrations. Append-only — never edit a shipped entry.
 MIGRATIONS: list[tuple[str, str]] = [
     ("0001_core", CORE_DDL),
@@ -736,4 +908,5 @@ MIGRATIONS: list[tuple[str, str]] = [
     ("0011_actor_strings", ACTOR_STRINGS_DDL),
     ("0012_url_tokens", URL_TOKENS_DDL),
     ("0013_unique_space_titles", UNIQUE_SPACE_TITLES_DDL),
+    ("0014_cycles_and_gardener", CYCLES_AND_GARDENER_DDL),
 ]

@@ -483,6 +483,289 @@ class GrantOut(BaseModel):
     created_at: str
 
 
+class CycleOut(BaseModel):
+    """One consolidation cycle — a dream-journal entry (design §8.4).
+
+    A cycle groups a set of graph writes under one id so a human can take the
+    whole of it back in one action. The fields mirror the ``cycles`` table, and
+    the omission is deliberate: there is **no diff here**. What the cycle
+    changed is ``list_events(cycle_id=…)``, read from the append-only log
+    itself, so the journal can never become a second record that disagrees with
+    it.
+
+    ``triggered_by`` is who *asked* — a human's ``human:<id>``, or the literal
+    ``scheduler`` — and is deliberately not the ``actor`` on the events inside,
+    which is who *acted* (the gardener). ``report`` is the runner's summary,
+    ``None`` while the cycle is still running, as ``finished_at`` is.
+    ``rolled_back_by`` names the rollback cycle that reversed this one.
+    """
+
+    id: str
+    trigger: str
+    triggered_by: str
+    scope: str | None
+    dry_run: bool
+    status: str
+    report: dict[str, Any] | None
+    started_at: str
+    finished_at: str | None
+    rolled_back_by: str | None
+
+
+class CycleDetailOut(BaseModel):
+    """One journal entry with the diff a reviewer reads it by (design §8.4).
+
+    :class:`CycleOut` is the row; this is the row plus the two things a journal
+    view has to render beside it, and **neither is a second record**.
+
+    ``events`` is ``list_events(cycle_id=…)`` — the append-only log itself,
+    newest first, exactly as ``GET /api/events`` returns it — so the "what
+    changed" a reader sees is the log and cannot disagree with it.
+    ``events_truncated`` is true when the read hit its limit and is
+    deliberately conservative (the same rule :class:`SubgraphOut` follows): it
+    says the list may be short, not that it provably is.
+
+    ``metrics`` is a *projection* of ``cycle.report["metrics"]``, lifted out so
+    the before/after coherence numbers are one field rather than a path into an
+    untyped blob. It is read from the report on every request and stored
+    nowhere, so it cannot drift from it; a cycle whose report carries no metrics
+    — a rollback, or a one-op curative cycle — reports ``{}``.
+    """
+
+    cycle: CycleOut
+    metrics: dict[str, dict[str, float]] = {}
+    events: list[EventOut] = []
+    events_truncated: bool = False
+
+
+class MergeRedirectOut(BaseModel):
+    """One ``merge_redirects`` row: where a tombstone went, and on which event.
+
+    The table has existed since migration ``0001`` and the curative tier is its
+    first writer. ``event_seq`` names the ``node.merge`` event that archived the
+    tombstone, so the redirect and the log entry that caused it are one lookup
+    apart in either direction.
+    """
+
+    tombstone_id: str
+    into_id: str
+    event_seq: int
+    created_at: str
+
+
+class RetiredEdgeOut(EdgeOut):
+    """An edge a merge archived instead of repointing, **with its reason**.
+
+    Every :class:`EdgeOut` field is here unchanged, so a client that only wants
+    the edge keeps reading it as one. ``reason`` is the sentence the merge
+    recorded in the event payload — the repointing would have produced a
+    self-loop, or a duplicate of an edge the survivor already carries — lifted
+    into the return value because a caller reading the result should not have to
+    go to the event log to learn why an edge left the live graph.
+    """
+
+    reason: str
+
+
+class MergeOut(BaseModel):
+    """The outcome of a soft merge (design D9): reversible, nothing destroyed.
+
+    ``tombstones`` are the merged-away nodes as they now stand — ``archived``,
+    each carrying ``props.merged_into``. ``relinked`` are the edges repointed at
+    the survivor, each carrying its original endpoints in
+    ``props.merged_from``; ``retired`` are the incident edges that could not be
+    repointed because the repointing would have produced a self-loop or a
+    duplicate of an edge the survivor already carries — each carrying the
+    ``reason`` it was retired. Both lists are reported rather than summarised: an
+    edge that quietly vanished from the live graph is the kind of thing a merge
+    must never do without saying so, and "without saying so" includes saying
+    *which* of the two rules bit.
+
+    ``cycle_id`` is the consolidation cycle the whole merge was stamped with —
+    its own one-op ``curative`` cycle when a human invoked it directly, or the
+    ambient one when a runner did. It is what a rollback takes back.
+    """
+
+    into: NodeOut
+    tombstones: list[NodeOut]
+    redirects: list[MergeRedirectOut]
+    relinked: list[EdgeOut]
+    retired: list[RetiredEdgeOut]
+    cycle_id: str
+
+
+class RetypeOut(BatchTransitionOut):
+    """The outcome of a curative retype — a batch transition plus what it wrote.
+
+    A node's type is fixed at creation by design; ``retype`` is the one
+    sanctioned exception (design §8.2), which is why it is a curative operation
+    and not a field on ``PATCH /api/nodes/{id}``. ``transitioned`` lists the
+    nodes whose type actually changed and ``failed`` the ones skipped, exactly
+    as a batch accept/reject reports them.
+    """
+
+    new_type: str
+    cycle_id: str
+
+
+class SupersedeOut(BaseModel):
+    """The outcome of superseding one edge (design §8.2).
+
+    ``superseded`` is the original edge as it now stands: ``valid_to`` closed
+    (*when it stopped being true*) **and** ``archived`` (*it is no longer part
+    of the live graph*) — two different facts, both recorded. ``replacement``
+    is the edge that takes over, when one was given; the two are linked through
+    the seeded ``supersedes``/``superseded_by`` vocabulary carried in each
+    edge's ``props``, since an edge's endpoints are nodes and one edge cannot
+    point at another.
+    """
+
+    superseded: EdgeOut
+    replacement: EdgeOut | None
+    cycle_id: str
+
+
+class RelinkDiff(BaseModel):
+    """One edge a bulk relink would change (or did), stated as old → new."""
+
+    edge_id: str
+    src_id: str
+    from_dst_id: str
+    to_dst_id: str
+    from_type: str
+    to_type: str
+
+
+class BulkRelinkOut(BaseModel):
+    """The outcome — or, on a dry run, the proposal — of a bulk relink.
+
+    ``matched`` counts the edges the selector reached and ``changes`` the ones
+    that would change (or did). The rest are reported in **two** lists, because
+    they are two different facts. ``unchanged`` is a bare list of edge ids the
+    change would not alter — a diff annotation, and the reason a caller asked
+    for something that was already true. ``skipped`` is the refusals, each with
+    a reason: a self-loop, a duplicate of an edge the graph already carries, or
+    a space the caller may not edit.
+
+    They used to share one list under a field named ``error``, so "nothing would
+    change on this edge" and "you may not edit that space" were distinguishable
+    only by matching the sentence — which is why ``bulk-relink`` was for one
+    round the only batch verb whose exit code was not derived from its failure
+    list. It is derived from it now: ``skipped`` is the failures, ``unchanged``
+    is not one, and ``nodum bulk-relink`` exits 1 when ``skipped`` is non-empty
+    on a run that actually happened.
+
+    **A dry run is the exception, and it is the only one.** Every check a real
+    run makes runs on the rehearsal too, so ``skipped`` there is an accurate
+    *prediction* — but nothing was attempted and nothing was lost, so it costs
+    no exit code. Read ``dry_run`` before reading ``skipped`` as a failure.
+
+    ``truncated`` is true when the server-side ceiling stopped the selection
+    short of the whole match — never a silent truncation.
+
+    ``dry_run`` writes nothing at all: no cycle is opened and no event is
+    emitted, so ``cycle_id`` is ``None``. That is the reviewable diff §8.5 asks
+    for on a large refactor; the reversal, once it is applied for real, is the
+    cycle.
+    """
+
+    dry_run: bool
+    matched: int
+    changes: list[RelinkDiff]
+    unchanged: list[str]
+    skipped: list[TransitionFailure]
+    truncated: bool
+    cycle_id: str | None = None
+
+
+class RollbackConflictOut(BaseModel):
+    """One row that stands between a cycle and its rollback (decision C4).
+
+    Rollback is atomic and **refuses rather than clobbers**: if anything outside
+    the cycle has touched a row the cycle touched, reversing the cycle would
+    overwrite that later work, which is the failure shape this project has
+    already closed twice. So the refusal is a list of these, and each one names
+    both ends of the collision — the cycle's own event, and the event that moved
+    the row since — because a human told *which* rows are in the way can act,
+    and one told "rollback failed" cannot.
+
+    ``kind`` is ``node`` or ``edge``; ``conflicting_cycle_id`` is set when the
+    later work was itself a cycle's (still "outside this cycle", and still a
+    conflict).
+    """
+
+    kind: str
+    row_id: str
+    cycle_event_seq: int
+    cycle_event_op: str
+    conflicting_seq: int
+    conflicting_op: str
+    conflicting_actor: str
+    conflicting_cycle_id: str | None
+
+
+class RollbackBlockerOut(BaseModel):
+    """A row a rollback would have to delete but cannot — the guards, as data.
+
+    A conflict is the graph having *moved* a row the cycle wrote
+    (:class:`RollbackConflictOut`). A blocker is the other refusal shape: the
+    graph having *grown something onto* a row the cycle created, so the delete
+    that reverses that create would have to cascade past what the reversal was
+    asked to touch. Both stop a rollback; only one of them was visible to the
+    preflight before, which meant a dry run could report ``conflicts: []`` for a
+    rollback that then failed.
+
+    ``row_id`` is the row the cycle created, named by ``cycle_event_seq`` /
+    ``cycle_event_op``. ``dependants`` are the ids in the way — children of a
+    node, occupants of a space, nodes typed by a type node, agents granted on a
+    space, merge redirects naming a node — and ``reason`` is the guard's own
+    sentence, which is what the refusal says if the rollback is attempted.
+    """
+
+    kind: str
+    row_id: str
+    cycle_event_seq: int
+    cycle_event_op: str
+    dependants: list[str]
+    reason: str
+
+
+class RollbackOut(BaseModel):
+    """The outcome — or, on a dry run, the verdict — of rolling a cycle back.
+
+    ``cycle_id`` is the cycle taken back and ``rollback_cycle_id`` the new
+    ``trigger='rollback'`` cycle every reversal event is stamped with (decision
+    C5): a rollback is reversed the way everything else with a ``cycle_id`` is,
+    by rolling *it* back, which re-applies the original. It is ``None`` on a dry
+    run, which opens no cycle and writes nothing.
+
+    ``reversed_events`` lists the cycle's event seqs in the order they were
+    reversed (newest first, which is the only order in which a create and the
+    updates on top of it come apart). ``skipped_events`` are the cycle's
+    non-graph events — audit records like ``asset.download`` that have no graph
+    effect to reverse.
+
+    ``conflicts`` is empty on a rollback that happened; on a dry run it is the
+    reason it would not. ``blockers`` is the second half of that verdict — the
+    delete guards, which refuse for a different reason and used to be invisible
+    until the rollback was already running. Both lists are empty on a rollback
+    that happened, and a dry run reporting either is a rollback that would fail.
+    """
+
+    cycle_id: str
+    rollback_cycle_id: str | None
+    dry_run: bool
+    reversed_events: list[int]
+    skipped_events: list[int]
+    restored_nodes: list[str]
+    restored_edges: list[str]
+    deleted_nodes: list[str]
+    deleted_edges: list[str]
+    redirects_removed: list[str]
+    conflicts: list[RollbackConflictOut]
+    blockers: list[RollbackBlockerOut] = []
+
+
 class SpaceOut(NodeOut):
     """A space node plus what makes it *territory* rather than a name.
 

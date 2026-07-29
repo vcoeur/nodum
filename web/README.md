@@ -1,13 +1,15 @@
 # nodum web UI
 
-The human web UI for nodum (Phase 3). React 19 + TypeScript, built by Vite into
+The human web UI for nodum (Phase 3, plus Phase 5's dream journal). React 19 +
+TypeScript, built by Vite into
 `../nodum/_web/`, which the Python process serves at `/` — one process, one
 origin, no CORS.
 
-Nine views ship: **login** (`/login`), **editor** (`/editor`,
+Eleven views ship: **login** (`/login`), **editor** (`/editor`,
 `/editor/:nodeId`), **search** (`/search`, also the landing view), **review**
-(`/review`), **graph** (`/graph`, `/graph/:rootId`), **assets** (`/assets`),
-**spaces** (`/spaces`), **admin** (`/admin`), and **history**
+(`/review`), **journal** (`/journal`) with one entry in full
+(`/journal/:cycleId`), **graph** (`/graph`, `/graph/:rootId`), **assets**
+(`/assets`), **spaces** (`/spaces`), **admin** (`/admin`), and **history**
 (`/history/:nodeId`).
 
 **A space is two independent controls, not a mode** (design decision D1), and
@@ -31,7 +33,10 @@ belongs in none of them. Plenty of surfaces still have to name a space that
 listing will not carry: the review queue (a space archived while its proposals
 waited), search, the editor's meta bar, the graph inspector, `/admin`'s grant
 table (archiving makes a grant inert and keeps the row precisely so it can be
-revoked), the write-target and space-filter pickers, and every sentence the
+revoked), the write-target and space-filter pickers, **the journal** (a cycle's
+`scope` is the *resolved space id* — `open_cycle` runs the reference through
+`_resolve_space` before the row is written — so every scoped entry reports an id
+and nothing else), and every sentence the
 editor and search write about a write target or filter the server refused. They
 all go through `components/spaceNaming.ts` over two lists — the shared active
 one and `components/useArchivedSpaces.ts`, a lazy read of the archived space
@@ -187,7 +192,7 @@ file; the global config stays `node`.
 Covered today: `api/client.ts` (the unknown-space normalisation and the
 two-request capability upload — the only logic in the file that is not a URL and
 a verb), `lib/time.ts`,
-`lib/failure.ts`, `lib/session.ts`, `lib/writeTarget.ts`,
+`lib/failure.ts`, `lib/session.ts`, `lib/paging.ts`, `lib/writeTarget.ts`,
 `components/spaceOptions.ts`, `components/spaceNaming.ts`,
 `views/failureRouting.ts`,
 `views/graph/filters.ts`, `views/graph/graphElements.ts`,
@@ -196,18 +201,23 @@ a verb), `lib/time.ts`,
 `views/search/spaceFailure.ts`, `views/review/grouping.ts`,
 `views/spaces/spaces.ts`, `views/admin/grants.ts`,
 `views/search/resultSpace.ts`, `views/login/credentials.ts`,
-`views/editor/createOutcome.ts`,
+`views/editor/createOutcome.ts`, `views/journal/journal.ts`,
 `views/assets/uploadOutcome.ts`, `views/assets/uploadQueue.ts`,
 `views/editor/markdownRender.ts` + `views/editor/mermaidRender.ts` (the
 sanitising policies), and `views/editor/leftoverBuffer.ts`.
 
-`components/useSpaces.ts` and `components/useArchivedSpaces.ts` are deliberately
+`components/useSpaces.ts`, `components/useArchivedSpaces.ts` and
+`views/journal/useNodeTitles.ts` are deliberately
 **not** in that list: they are hooks, and the harness renders nothing, so there
 is no honest way to drive them here. Their behaviour is verified by
 type-checking and in a browser, like every component — but the *rule* that
-decides whether the archived read fires at all is a plain function
-(`unresolvedSpaceIds`) with a test, precisely because getting it wrong is
-invisible until you watch the network panel.
+decides what each of them fetches is a plain function with a test
+(`unresolvedSpaceIds`, `referencedNodeIds`, `verdictNodeIds`), precisely because
+getting it wrong is invisible until you watch the network panel. `useNodeTitles`
+has two callers for that reason: the event diff asks for the endpoints on the
+page it is drawing, and the rollback dialog asks for the endpoints and
+dependants of the rows its verdict names — a clean verdict names none and fetches
+nothing.
 
 **The run pins `TZ` to `Asia/Kathmandu`, and this matters.** SQLite's
 `datetime('now')` is UTC with no zone marker, so the bug `lib/time.ts` fixes —
@@ -232,12 +242,13 @@ type-checking it and driving it in a browser.
 |---|---|
 | `src/main.tsx`, `src/App.tsx`, `src/router.tsx` | entry, app shell (header, nav, toasts, crash boundary, health pill), route table |
 | `src/api/client.ts`, `src/api/types.ts` | the only `fetch` in the app, and the types mirroring `nodum/models.py` |
-| `src/lib/` | cross-view plain functions: timestamp parsing (`time.ts`), failure classification (`failure.ts`), the 401 broadcast (`session.ts`), and the sticky write target (`writeTarget.ts`, the one module here that also exports a hook) |
+| `src/lib/` | cross-view plain functions: timestamp parsing (`time.ts`), failure classification (`failure.ts`), the 401 broadcast (`session.ts`), which slice of a long list to render (`paging.ts` — the journal's event diff and the review queue), and the sticky write target (`writeTarget.ts`, the one module here that also exports a hook) |
 | `src/components/` | shared React components: `NodeBadge`, `Toast`, `Spinner`, `EmptyState`, `ErrorBoundary`, `Modal`, plus the whole space vocabulary — `SpaceFilter.tsx` with `spaceOptions.ts` (what a picker offers, which is the active list and never more) and `useSpaces.ts` (the `GET /api/spaces` read every space surface shares), and `spaceNaming.ts` with `useArchivedSpaces.ts` (what a surface that *displays* a space calls it, including one the active listing does not carry — and what names an archived value a picker is already holding) |
 | `src/styles/` | `tokens.css`, `base.css`, `primitives.css`, `app.css` |
 | `src/views/editor/` | CodeMirror-6 Markdown source editor, slash commands, `[[` autocomplete, live Mermaid preview, autosave, the write-target picker and the landing/refusal copy (`createOutcome.ts`) |
 | `src/views/search/` | query box, ranked hits, per-signal breakdown, signal grouping, the space filter + show-meta toggle in the URL (`searchState.ts`), refused-filter copy (`spaceFailure.ts`), when a row names its space (`resultSpace.ts`) |
-| `src/views/review/` | proposal queue grouped space → agent, per-kind cards, proposed-version diffs, self-governing space sections, cross-space edge marking (`grouping.edgeCrossing`) |
+| `src/views/review/` | proposal queue grouped space → agent, per-kind cards, proposed-version diffs, self-governing space sections, cross-space edge marking (`grouping.edgeCrossing`), and the pager over it (`grouping.sectionOrder` / `restrictToPage`, over `lib/pageWindow`) with the honest count above it (`grouping.queueCount`) |
+| `src/views/journal/` | the dream journal: cycles as sentences, one entry with its job report, the five coherence metrics before/after, the events it wrote as a paged diff, the run-now control, the abandon confirm for a cycle a crash left `running`, and the dry-run-then-confirm rollback — whose verdict is **two** lists, `conflicts` and `blockers`, and is clean only when both are empty (`journal.ts` owns every sentence and every reading of the untyped `report` blob; `useNodeTitles.ts` names the nodes an edge event points at) |
 | `src/views/graph/` | Cytoscape subgraph render, filters, cross-space edge styling and far-endpoint dimming, path panel |
 | `src/views/assets/` | rendition grid, lightbox, the ingesting drop-zone with its queue readout (`uploadOutcome.ts`) and its bookkeeping (`uploadQueue.ts` — batches, status labels, the refused second drop, the per-batch announcement), thin JSON export |
 | `src/views/login/` | password login against `POST /api/login` |
@@ -274,14 +285,47 @@ Conventions that hold across the tree:
   it.
 - **A refused space is `isUnknownSpace`, and only that.** `api/client.ts`
   normalises the refusal on every call that names a space — the two filtered
-  reads, the write target on `createNode`, all three lifecycle calls, and both
-  halves of the upload — into one `UnknownSpaceError`. Two views once kept their
+  reads, the write target on `createNode`, all three lifecycle calls, both
+  halves of the upload, and a cycle's `scope` on `runCycle` — into one
+  `UnknownSpaceError`. Two views once kept their
   own `^unknown space:` match because the write path was not wrapped; both are
   gone, and a third would be the bug, not the belt. If a call ever throws a bare
   `ApiError` carrying that message, fix the client. Facts a view needs *beyond*
   space-ness ride on a subclass rather than on a second test:
   `UnknownUploadSpaceError.phase` says which of the upload's two requests refused,
   and `isUnknownSpace` answers true for it too.
+  One refusal never arrives as a caught response at all: a cycle **records** its
+  failures as strings (`f"{type(failure).__name__}: {failure}"`), and the journal
+  renders them hours later. `recordedUnknownSpace` reads those, and it is the
+  *same* regex rather than a second copy — which is exactly why it lives in
+  `api/client.ts` beside `isUnknownSpace` and not in the view that needs it.
+  `recordedUngrantedScope` is its sibling and reads the **second** shape that
+  names a space: `consolidate._require_gardener_scope`'s *"the gardener holds no
+  grant on space '…'"*, which is the refusal a default install meets on the first
+  click of the journal's scope picker (migration `0014` grants the gardener
+  `main` and `meta`; the picker offers everything) and which echoes the caller's
+  reference — a 32-hex id for the one caller that arrives by clicking. It matches
+  a **live** `ApiError.message` too, because `http_api._failure_message` exempts
+  this package's own exceptions from the storage rewrite.
+- **A remedy the reader cannot carry out is not a remedy.** The third refusal
+  with copy of its own is `CycleInProgress` — a run refused because another
+  holds the file. The server's sentence ends *"run: `nodum cycle-abandon
+  <id>`"*, which is right on the surface it was written for and wrong on this
+  one twice: there is no terminal here, and `nameIdsIn` shortens the id the
+  command would need, so the instruction arrives unrunnable **and** truncated.
+  The journal's copy points at the button instead — the entry carrying the
+  `running` badge, and `ABANDON_ACTION_LABEL`, which is the same constant the
+  detail view's button renders, so the sentence and the control cannot drift
+  apart. Same rule as the two below: a refusal whose *wording* is a decision
+  gets copy the view owns.
+- **No server text reaches a screen carrying a raw id, known shape or not.**
+  Two message shapes have now been printed verbatim, so `journal.ts` does not
+  keep a list of rewrites to extend: the refusals whose *wording* is a
+  decision get named copy, and every other server sentence the journal renders —
+  a recorded cycle failure, a job's own `error`, a delete guard's `reason` —
+  goes through `journal.nameIdsIn`, which replaces each `[0-9a-f]{32}` with the
+  page's own name for that row or its shortened form. A third shape can carry an
+  id; it cannot put one on the screen.
 - **Never say a space does not exist.** Nothing user-facing may render "no such
   space", "does not exist", "unknown/missing/nonexistent space", or "not found"
   for a space failure — including by handing an `UnknownSpaceError` to
@@ -296,8 +340,18 @@ Conventions that hold across the tree:
   would turn the filter into an existence oracle over spaces the reader cannot
   read. Say what changed instead — a space stops resolving once it is archived,
   and a renamed one stops answering to its old name. `views/search/spaceFailure.ts`,
-  `views/editor/createOutcome.ts` and `views/spaces/spaces.ts` own that copy and
-  pin it with tests. The one refusal that *does* name a space — creating one
+  `views/editor/createOutcome.ts`, `views/spaces/spaces.ts` and
+  `views/journal/journal.ts`'s `describeRunFailure` **and
+  `describeRecordedFailure`** — a cycle's `scope` names a space, both when the run
+  is refused now and when the report says it was refused then — own that copy and
+  pin it with tests. The journal's headline (`cycleWork`) is the harder half of
+  the same rule and is solved by construction: it is built from counts and
+  registered names and **quotes no server text at all**, the reason moving to
+  `cycleFailures` one line below, where the copy rules reach it. `journal.test.ts`'s
+  `FORBIDDEN` guard therefore runs over every branch of `cycleWork` rather than
+  over one function's happy path — it used to cover `describeRunFailure` alone,
+  while the sentence that actually broke the rule was three functions away.
+  The one refusal that *does* name a space — creating one
   whose name an **archived** space still holds (a space title is reserved for
   good) — is not an exception to this: it is the server's message, shown
   verbatim, and creating a space means writing `meta`, which is exactly the
@@ -361,16 +415,37 @@ Conventions that hold across the tree:
 ## The API client
 
 `src/api/client.ts` is the only place that calls `fetch`. It covers the whole
-Phase-3 endpoint surface, typed, and every route it names is served by
-`nodum.http_api`.
+Phase-3 endpoint surface plus the five consolidation-cycle routes, typed, and
+every route it names is served by `nodum.http_api`.
 
 What it handles for you:
 
+- covers the **five** consolidation-cycle routes, `POST /api/cycles/{id}/abandon`
+  included — the door out of a cycle a crash left `running`, and the
+  precondition for the rollback route rather than a tidier journal: rollback
+  refuses a cycle that has not closed and `undo` refuses every event a cycle
+  stamped, so until the row is closed the run's writes are irreversible on every
+  surface;
 - prefixes `/api` (`getHealth` is the one exception — `/healthz` sits outside);
 - unwraps the `{"<plural>": [...], "count": n}` list envelope, so list calls
   return a plain array;
 - raises `ApiError` (carrying `status`, `type`, `message`) on any non-2xx, with
   `isNotFound` / `isForbidden` / `isRetryable` helpers;
+- raises `RollbackConflictError` (test it with `isRollbackConflict`) for the one
+  failure whose body carries more than `type` and `message`: a refused rollback
+  names the rows standing in its way, and those rows exist nowhere else once the
+  response is parsed. That is why the branch sits in `toApiError` rather than in
+  the calling route, unlike the unknown-space normalisation, which only re-reads
+  a message the caller already has. In practice a view rarely sees one — the
+  confirm dialog calls the same route with `dry_run: true` first, which answers
+  the same list under a 200 — so a 409 means the graph moved between the check
+  and the commit. **The dry run answers a second list too, `blockers`**: the
+  delete guards, which refuse a rollback for a different reason (something now
+  depends on a row the cycle created, so the delete that reverses that create
+  would have to cascade). A verdict is clean only when both lists are empty, and
+  a caller reading one of them offers a confirm button for a rollback that will
+  fail. Only `conflicts` has a 409 body to come back in — a guard met for real
+  raises `UndoNotPossible`, one sentence and no list;
 - raises `UnknownSpaceError` (test it with `isUnknownSpace`) whenever a call
   that named a space could not resolve it. The wire is inconsistent here by
   accretion — the node listing refuses with a **404** (the service's

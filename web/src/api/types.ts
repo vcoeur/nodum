@@ -462,12 +462,193 @@ export interface GrantOut {
  *   A space holding nothing but an agent's proposals is not empty, so this is
  *   deliberately not a count of `active` alone.
  * - `grants` lists the agents holding a grant on the space. It is how a human
- *   sees delegated territory at a glance — and an `edit`-granted space governs
- *   itself, so it never reaches the review queue at all.
+ *   sees delegated territory at a glance — and an `edit` grant is what lets a
+ *   write land `active` without reaching the review queue. It is a ceiling
+ *   rather than a mandate (`Store.cap_landing`, §8.3): a writer may file below
+ *   its own grant, and the consolidation runner does for every inference, so an
+ *   edit-granted space can still hold queued proposals.
  */
 export interface SpaceOut extends NodeOut {
   node_count: number;
   grants: GrantOut[];
+}
+
+/* ------------------------------------------------------------------ */
+/* Consolidation cycles — the dream journal (design §8.4)               */
+/* ------------------------------------------------------------------ */
+
+/** How a cycle came to exist — `service.CYCLE_TRIGGERS`. */
+export type CycleTrigger = "manual" | "scheduled" | "curative" | "rollback";
+
+/** Where a cycle is in its life — `service.CYCLE_STATUSES`. */
+export type CycleStatus = "running" | "completed" | "failed" | "rolled_back";
+
+/**
+ * One consolidation cycle — a dream-journal entry.
+ *
+ * The omission is the design's, not an oversight: there is **no diff here**.
+ * What the cycle changed is `list_events(cycle_id=…)`, which
+ * {@link CycleDetailOut} carries, so the journal can never become a second
+ * record that disagrees with the append-only log.
+ *
+ * `triggered_by` is who *asked* — a `human:<id>`, or the literal `scheduler` —
+ * and is deliberately not the actor on the events inside, which is who *acted*
+ * (the gardener). `report` is null while the cycle is still running, as
+ * `finished_at` is, and `rolled_back_by` names the rollback cycle that reversed
+ * this one.
+ *
+ * `trigger` and `status` are typed as plain strings for the same reason every
+ * other enum-shaped field here is: the server may add a value, and a union that
+ * silently excludes it would make a real row unrepresentable.
+ */
+export interface CycleOut {
+  id: string;
+  trigger: string;
+  triggered_by: string;
+  scope: string | null;
+  dry_run: boolean;
+  status: string;
+  report: JsonObject | null;
+  started_at: string;
+  finished_at: string | null;
+  rolled_back_by: string | null;
+}
+
+/**
+ * The coherence metrics, one snapshot per key: `{before: {...}, after: {...}}`.
+ *
+ * Keyed rather than fixed on purpose (`ConsolidationReport.metrics`): 5b's two
+ * judgement-dependent metrics join the object when they can be computed, with
+ * no migration and no change here.
+ */
+export type CycleMetrics = Record<string, Record<string, number>>;
+
+/**
+ * `GET /api/cycles/{id}` — one journal entry with the diff a reviewer reads it by.
+ *
+ * `events` is the append-only log narrowed to this cycle, newest first, and
+ * `events_truncated` is true when the read hit its limit. It is deliberately
+ * conservative — it says the list may be short, not that it provably is — so a
+ * surface must say the list may be incomplete rather than that it certainly is.
+ *
+ * `metrics` is a projection of `cycle.report["metrics"]`, `{}` for a cycle whose
+ * report carries none: a rollback, or a one-op curative cycle.
+ */
+export interface CycleDetailOut {
+  cycle: CycleOut;
+  metrics: CycleMetrics;
+  events: EventOut[];
+  events_truncated: boolean;
+}
+
+/**
+ * `POST /api/cycles` — the closed cycle plus its report typed.
+ *
+ * `cycle.report` and `report` are the same data, so a caller that just ran a
+ * cycle needs no second request to render it.
+ */
+export interface ConsolidationOut {
+  cycle: CycleOut;
+  report: JsonObject;
+}
+
+/** `POST /api/cycles` body. Both fields are the runner's own parameters. */
+export interface RunCycleBody {
+  /** Confine the cycle to one space, by id or name; absent is the whole file. */
+  scope?: string;
+  /**
+   * Rehearse it: every job computed, the report written, **no graph event
+   * emitted**. A real boolean — the server refuses the string `"false"` rather
+   * than coercing it, which is the right posture for a rehearsal flag.
+   */
+  dry_run?: boolean;
+}
+
+/**
+ * One row standing between a cycle and its rollback (decision C4).
+ *
+ * Rollback refuses rather than clobbers, so the refusal names both ends of the
+ * collision: the cycle's own event, and the event that moved the row since.
+ * `kind` is `node` or `edge`; `conflicting_cycle_id` is set when the later work
+ * was itself a cycle's — still outside this cycle, and still a conflict.
+ */
+export interface RollbackConflictOut {
+  kind: string;
+  row_id: string;
+  cycle_event_seq: number;
+  cycle_event_op: string;
+  conflicting_seq: number;
+  conflicting_op: string;
+  conflicting_actor: string;
+  conflicting_cycle_id: string | null;
+}
+
+/**
+ * One row a rollback would have to delete but cannot — a delete guard, as data.
+ *
+ * The *other* refusal shape, and it is not a conflict: a conflict is the graph
+ * having **moved** a row the cycle wrote, a blocker is the graph having **grown
+ * something onto** a row the cycle created, so the delete that reverses that
+ * create would cascade past what the reversal was asked to touch. Both stop a
+ * rollback; only conflicts were modelled before, which is why a dry run could
+ * answer `conflicts: []` for a rollback that then failed at apply time.
+ *
+ * `row_id` is the row the cycle created, named by `cycle_event_seq` /
+ * `cycle_event_op`. `dependants` are the ids in the way — children of a node,
+ * occupants of a space, nodes typed by a type node, agents granted on a space,
+ * merge redirects naming a node — and it is the **whole** list, not the capped
+ * handful `reason` spells out. `reason` is the guard's own sentence, which is
+ * what the run refuses with if the rollback is attempted anyway.
+ */
+export interface RollbackBlockerOut {
+  kind: string;
+  row_id: string;
+  cycle_event_seq: number;
+  cycle_event_op: string;
+  dependants: string[];
+  reason: string;
+}
+
+/**
+ * `POST /api/cycles/{id}/rollback` — the outcome, or on a dry run the verdict.
+ *
+ * `rollback_cycle_id` names the new `trigger='rollback'` cycle every reversal
+ * event is stamped with, and is null on a dry run, which opens no cycle and
+ * writes nothing. `skipped_events` are the cycle's non-graph events — audit
+ * records with no graph effect to reverse.
+ *
+ * The verdict is **two** lists and it is clean only when both are empty.
+ * `conflicts` is the graph having moved on; `blockers` is the delete guards,
+ * which refuse for a different reason and used to be invisible until the
+ * rollback was already running. Both are empty on a rollback that happened; on
+ * a dry run either one is a rollback that would fail. A **real** rollback that
+ * meets a conflict refuses with 409 and the same `conflicts` list in the error
+ * body (see `RollbackConflictError`); one that meets a blocker refuses with
+ * `UndoNotPossible`, whose body carries the guard's sentence and no list.
+ */
+export interface RollbackOut {
+  cycle_id: string;
+  rollback_cycle_id: string | null;
+  dry_run: boolean;
+  reversed_events: number[];
+  skipped_events: number[];
+  restored_nodes: string[];
+  restored_edges: string[];
+  deleted_nodes: string[];
+  deleted_edges: string[];
+  redirects_removed: string[];
+  conflicts: RollbackConflictOut[];
+  blockers: RollbackBlockerOut[];
+}
+
+/** `POST /api/cycles/{id}/rollback` body. */
+export interface RollbackCycleBody {
+  /**
+   * Compute the plan and return it without writing anything — the "would this
+   * succeed?" a confirm dialog needs, which answers **200** with the conflicts
+   * in `conflicts` instead of raising.
+   */
+  dry_run?: boolean;
 }
 
 /* ------------------------------------------------------------------ */
@@ -512,11 +693,19 @@ export type LinkSuggestion = NodeOut;
 /** The list envelope every nodum surface uses: `{"<plural>": [...], "count": n}`. */
 export type ListEnvelope<K extends string, T> = { [P in K]: T[] } & { count: number };
 
-/** The error body every non-2xx response carries. */
+/**
+ * The error body every non-2xx response carries.
+ *
+ * `conflicts` is the one failure on this surface whose body carries more than
+ * `type` and `message`: a refused rollback names the rows in the way, because a
+ * human told which four rows are blocking it can act and one told "rollback
+ * failed" cannot. Every other failure omits the key.
+ */
 export interface ApiErrorBody {
   error: {
     type: string;
     message: string;
+    conflicts?: RollbackConflictOut[];
   };
 }
 

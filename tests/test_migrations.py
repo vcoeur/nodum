@@ -8,8 +8,13 @@ from pathlib import Path
 import pytest
 from helpers import owner
 
-from nodum import assets, db, service
-from nodum.migrations import MIGRATIONS, SEED_EDGE_TYPES, SEED_NODE_TYPES
+from nodum import assets, auth, db, service
+from nodum.migrations import (
+    GARDENER_AGENT_ID,
+    MIGRATIONS,
+    SEED_EDGE_TYPES,
+    SEED_NODE_TYPES,
+)
 
 CORE_TABLES = {
     "nodes",
@@ -265,7 +270,11 @@ def test_0012_applies_to_a_populated_database_already_at_0011(tmp_path, monkeypa
     monkeypatch.setattr(db, "MIGRATIONS", MIGRATIONS)
     conn = db.connect()
     try:
-        assert db.init_db(conn) == ["0012_url_tokens", "0013_unique_space_titles"]
+        assert db.init_db(conn) == [
+            "0012_url_tokens",
+            "0013_unique_space_titles",
+            "0014_cycles_and_gardener",
+        ]
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
         conn.execute(
             "INSERT INTO url_tokens (id, token_hash, kind, asset_hash, created_by, expires_at)"
@@ -378,7 +387,7 @@ def test_0013_applies_to_a_populated_database_holding_duplicate_space_titles(tmp
     monkeypatch.setattr(db, "MIGRATIONS", MIGRATIONS)
     conn = db.connect()
     try:
-        assert db.init_db(conn) == ["0013_unique_space_titles"]
+        assert db.init_db(conn) == ["0013_unique_space_titles", "0014_cycles_and_gardener"]
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
         titles = dict(
             conn.execute("SELECT id, title FROM nodes WHERE id LIKE 'sp-%' ORDER BY id").fetchall()
@@ -449,7 +458,7 @@ def test_0013_finds_a_free_name_when_the_deduping_rename_would_itself_collide(
     monkeypatch.setattr(db, "MIGRATIONS", MIGRATIONS)
     conn = db.connect()
     try:
-        assert db.init_db(conn) == ["0013_unique_space_titles"]
+        assert db.init_db(conn) == ["0013_unique_space_titles", "0014_cycles_and_gardener"]
         titles = dict(
             conn.execute("SELECT id, title FROM nodes WHERE id LIKE 'sp-%' ORDER BY id").fetchall()
         )
@@ -494,7 +503,7 @@ def test_0013_deduplicates_a_title_that_is_another_spaces_id(tmp_path, monkeypat
     monkeypatch.setattr(db, "MIGRATIONS", MIGRATIONS)
     conn = db.connect()
     try:
-        assert db.init_db(conn) == ["0013_unique_space_titles"]
+        assert db.init_db(conn) == ["0013_unique_space_titles", "0014_cycles_and_gardener"]
         titles = dict(
             conn.execute("SELECT id, title FROM nodes WHERE id LIKE 'sp-%' ORDER BY id").fetchall()
         )
@@ -566,6 +575,347 @@ def test_0013_lets_a_space_change_state_without_touching_the_index(fresh_db):
             )
         conn.execute("UPDATE nodes SET state = 'active' WHERE id = 'sp-a'")
         conn.commit()
+    finally:
+        conn.close()
+
+
+# ── 0014: consolidation cycles and the gardener ──────────────────────────────
+
+
+def test_cycles_exists_on_a_database_built_from_scratch(fresh_db):
+    conn = db.connect()
+    try:
+        assert "0014_cycles_and_gardener" in db.applied_migrations(conn)
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(cycles)")}
+        assert columns == {
+            "id",
+            "trigger",
+            "triggered_by",
+            "scope",
+            "dry_run",
+            "status",
+            "report",
+            "started_at",
+            "finished_at",
+            "rolled_back_by",
+        }
+        indexes = {row["name"] for row in conn.execute("PRAGMA index_list(cycles)")}
+        assert "idx_cycles_started" in indexes
+    finally:
+        conn.close()
+
+
+def _insert_cycle(conn, cycle_id, trigger, status="running"):
+    conn.execute(
+        "INSERT INTO cycles (id, trigger, triggered_by, status) VALUES (?, ?, 'human:owner', ?)",
+        (cycle_id, trigger, status),
+    )
+
+
+def test_only_one_consolidation_cycle_may_be_running_in_the_whole_file(fresh_db):
+    """The cross-process lock, and it is the row rather than anything in Python.
+
+    A module-level lock serialises the runner inside **one** process, which
+    covers the HTTP route, the nightly task and an in-process caller — and
+    covers a `nodum consolidate` in a second process not at all. Both runs then
+    completed and every duplicate pair was proposed twice, so the human's review
+    queue doubled from one click and one command.
+
+    The `cycles` table already *is* the cross-process state: a `running`
+    consolidation row means one is running, whoever opened it. A partial unique
+    index makes the second opener lose atomically, rather than after a read that
+    was true when it was made.
+    """
+    conn = db.connect()
+    try:
+        indexes = {row["name"] for row in conn.execute("PRAGMA index_list(cycles)")}
+        assert "idx_cycles_one_running_consolidation" in indexes
+
+        _insert_cycle(conn, "first", "scheduled")
+        with pytest.raises(sqlite3.IntegrityError, match="UNIQUE"):
+            _insert_cycle(conn, "second", "manual")
+
+        # Closing the first frees it: the index is over `running` rows only.
+        conn.execute("UPDATE cycles SET status = 'completed' WHERE id = 'first'")
+        _insert_cycle(conn, "second", "manual")
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("trigger", ["curative", "rollback"])
+def test_a_curative_or_rollback_cycle_still_runs_beside_a_consolidation(fresh_db, trigger):
+    """The guard is scoped to consolidation triggers, and that scoping is the point.
+
+    A curative cycle is one human-driven operation and a rollback is the human's
+    undo; both are short, and blocking either for the length of a nightly sweep
+    would take the curative tier offline every night. Only the two triggers the
+    runner opens — `manual` and `scheduled` — are serialised against each other.
+    """
+    conn = db.connect()
+    try:
+        _insert_cycle(conn, "sweep", "scheduled")
+        _insert_cycle(conn, "beside-it", trigger)
+        _insert_cycle(conn, "and-another", trigger)
+    finally:
+        conn.close()
+
+
+def test_a_database_recorded_at_0014_without_the_lock_index_is_refused(tmp_path, monkeypatch):
+    """0014 was amended in place while unreleased, so a dev file can be stale.
+
+    `init_db` skips a migration whose name is already recorded, so a database
+    built from the first cut of `0014` keeps the name and loses the index — and
+    the cross-process guard is then absent with nothing saying so. That is the
+    exact drift `_verify_schema_consistency` exists for, and 0014 has a
+    checkable guarantee like the four migrations already listed there.
+    """
+    path = tmp_path / "stale.db"
+    monkeypatch.setenv(db.ENV_DB_VAR, str(path))
+    service.init()
+    conn = db.connect()
+    try:
+        conn.execute("DROP INDEX idx_cycles_one_running_consolidation")
+        conn.commit()
+        with pytest.raises(db.SchemaConsistencyError, match="0014_cycles_and_gardener"):
+            db.init_db(conn)
+    finally:
+        conn.close()
+
+
+def test_the_missing_index_is_refused_with_the_statement_that_repairs_it(tmp_path, monkeypatch):
+    """The remedy is per check, and this one is a `CREATE INDEX`, not a deletion.
+
+    The wrapper's sentence is shared with four checks whose only cure genuinely
+    is recreating the file — a missing table cannot be derived from rows. A
+    missing index can: it constrains rows the database already holds. Telling a
+    human to delete their graph over it is the wrong instruction by every node
+    they own.
+
+    So the refusal is followed here rather than pattern-matched. The statement it
+    prints is executed verbatim, and the file it prints it about goes back to
+    passing init *and* enforcing the guard the index exists for.
+    """
+    path = tmp_path / "stale.db"
+    monkeypatch.setenv(db.ENV_DB_VAR, str(path))
+    service.init()
+    conn = db.connect()
+    try:
+        conn.execute("DROP INDEX idx_cycles_one_running_consolidation")
+        conn.commit()
+        with pytest.raises(db.SchemaConsistencyError) as refused:
+            db.init_db(conn)
+        message = str(refused.value)
+        assert "delete the database file" not in message, "it told a human to bin their graph"
+        assert db.CYCLES_RUNNING_INDEX_SQL in message
+
+        # Follow it: the printed statement, run as printed, is the whole cure.
+        conn.executescript(db.CYCLES_RUNNING_INDEX_SQL)
+        conn.commit()
+        assert db.init_db(conn) == []
+    finally:
+        conn.close()
+
+    # And the repaired file enforces what the index is for — both halves of the
+    # predicate, so a statement that merely carried the right *name* would not
+    # pass: consolidations are serialised against each other, and a curative
+    # cycle is deliberately outside the rule.
+    first = service.open_cycle(trigger="scheduled", principal=owner())
+    with pytest.raises(service.CycleInProgress):
+        service.open_cycle(trigger="manual", principal=owner())
+    beside_it = service.open_cycle(trigger="curative", principal=owner())
+    service.close_cycle(beside_it.id, status="completed", report={}, principal=owner())
+    service.close_cycle(first.id, status="completed", report={}, principal=owner())
+
+
+@pytest.mark.parametrize(
+    ("columns", "values"),
+    [
+        ("id, trigger, triggered_by, status", "'c', 'sideways', 'human:owner', 'running'"),
+        ("id, trigger, triggered_by, status", "'c', 'manual', 'human:owner', 'sideways'"),
+    ],
+    ids=["unknown trigger", "unknown status"],
+)
+def test_a_cycle_row_outside_the_vocabulary_is_refused(fresh_db, columns, values):
+    """The journal's two enums are the schema's, so no writer can invent a fifth."""
+    conn = db.connect()
+    try:
+        with pytest.raises(sqlite3.IntegrityError, match="CHECK"):
+            conn.execute(f"INSERT INTO cycles ({columns}) VALUES ({values})")
+    finally:
+        conn.close()
+
+
+def test_0014_seeds_the_gardener_with_read_on_meta_and_edit_on_main(fresh_db):
+    """D7 is auto-apply by default, and a gardener with no grant does nothing.
+
+    The grants are ordinary rows on purpose: they list beside every other
+    agent's on `/spaces` and `nodum revoke` takes them away. There is no
+    gardener-shaped exception in the grant model.
+
+    **`read` on meta, not `edit`.** The first cut said `edit`, justified as
+    "consolidation reads and *writes* the type vocabulary"; it never writes it —
+    `consolidate._is_curatable` excludes the meta space and the structural types
+    from every job, so meta is only ever read, to resolve a type. `read` is
+    also exactly what every other curating agent in this suite holds. What the
+    extra level bought was authority no shipped job reaches: creating spaces,
+    renaming `main`, and archiving the `note` type, after which a human is
+    blocked from writing a note too. `tests/test_consolidate.py` pins the
+    behavioural half — a full cycle completes on `read`.
+    """
+    conn = db.connect()
+    try:
+        row = conn.execute("SELECT * FROM agents WHERE kind = 'internal'").fetchone()
+        assert row["id"] == GARDENER_AGENT_ID
+        assert row["name"] == GARDENER_AGENT_ID
+        assert row["owner_human_id"] is None
+        # An internal agent authenticates by being in-process; there is nothing
+        # to present and nothing to steal.
+        assert row["credential_hash"] is None
+        assert row["disabled"] == 0
+        levels = dict(
+            conn.execute(
+                "SELECT space_id, level FROM grants WHERE agent_id = ?", (GARDENER_AGENT_ID,)
+            ).fetchall()
+        )
+        assert levels == {"meta": "read", "main": "edit"}
+    finally:
+        conn.close()
+
+
+def test_0014_applies_to_a_populated_database_already_at_0013(tmp_path, monkeypatch):
+    """The upgrade path, not just the fresh-file one: 0013 is where users are."""
+    monkeypatch.setenv("NODUM_DB", str(tmp_path / "at0013.db"))
+    monkeypatch.setattr(db, "MIGRATIONS", _prefix_through("0013_unique_space_titles"))
+    service.init()
+    node = service.create_node(type="note", title="before the upgrade", principal=owner())
+    space = service.create_space("research", principal=owner())
+
+    monkeypatch.setattr(db, "MIGRATIONS", MIGRATIONS)
+    conn = db.connect()
+    try:
+        assert db.init_db(conn) == ["0014_cycles_and_gardener"]
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+        conn.execute(
+            "INSERT INTO cycles (id, trigger, triggered_by, scope, status)"
+            " VALUES ('c1', 'scheduled', 'scheduler', ?, 'running')",
+            (space.id,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    # The graph it was applied over is untouched, and the gardener it seeded is
+    # a usable principal on it.
+    assert service.get_node(node.id, principal=owner()).title == "before the upgrade"
+    gardener = auth.internal_principal()
+    assert gardener.id == GARDENER_AGENT_ID
+
+
+def test_0014_refuses_to_upgrade_a_database_whose_reserved_id_is_taken(tmp_path, monkeypatch):
+    """Stealing the id, or renaming the impostor, would both corrupt an identity.
+
+    `create_agent` sets `agent_id = name` verbatim and only reserves the prefix
+    from this migration onward, so a database written before it can already hold
+    a user's agent called `builtin-gardener` — with `agent:builtin-gardener` in
+    `events.actor`, `versions.actor` and both `created_by` columns behind it.
+    Taking the id attributes that history to the gardener; renaming the account
+    detaches it from the history that names it, because actor strings are log
+    entries and not references anything follows. So the migration stops.
+    """
+    monkeypatch.setenv("NODUM_DB", str(tmp_path / "impostor.db"))
+    monkeypatch.setattr(db, "MIGRATIONS", _prefix_through("0013_unique_space_titles"))
+    service.init()
+    conn = db.connect()
+    try:
+        conn.execute(
+            "INSERT INTO agents (id, kind, name, owner_human_id)"
+            " VALUES ('builtin-gardener', 'external', 'builtin-gardener', 'owner')"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    monkeypatch.setattr(db, "MIGRATIONS", MIGRATIONS)
+    conn = db.connect()
+    try:
+        with pytest.raises(sqlite3.IntegrityError, match="reserved"):
+            db.init_db(conn)
+        # Refused, not half-done: no cycles table, no migration row, and the
+        # impostor's own account is exactly as it was.
+        assert "0014_cycles_and_gardener" not in db.applied_migrations(conn)
+        assert (
+            conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'cycles'"
+            ).fetchone()
+            is None
+        )
+        assert (
+            conn.execute("SELECT kind FROM agents WHERE id = 'builtin-gardener'").fetchone()["kind"]
+            == "external"
+        )
+    finally:
+        conn.close()
+
+
+def test_0014_refuses_any_pre_existing_id_under_the_reserved_prefix(tmp_path, monkeypatch):
+    """The reservation is the **prefix**, and the upgrade guard has to say so.
+
+    Checking the one id `builtin-gardener` let a database holding, say,
+    `builtin-librarian` upgrade cleanly — leaving a live, token-bearing
+    *external* agent under the prefix whose whole purpose is that
+    `agent:<id>` in the event log names exactly one principal. Nothing is
+    impersonated the day it upgrades; the day 5b seeds a second `builtin-*`
+    agent, the collision this guard exists to refuse is already installed.
+    """
+    monkeypatch.setenv("NODUM_DB", str(tmp_path / "librarian.db"))
+    monkeypatch.setattr(db, "MIGRATIONS", _prefix_through("0013_unique_space_titles"))
+    service.init()
+    conn = db.connect()
+    try:
+        conn.execute(
+            "INSERT INTO agents (id, kind, name, owner_human_id)"
+            " VALUES ('builtin-librarian', 'external', 'builtin-librarian', 'owner')"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    monkeypatch.setattr(db, "MIGRATIONS", MIGRATIONS)
+    conn = db.connect()
+    try:
+        with pytest.raises(sqlite3.IntegrityError, match="builtin-") as refusal:
+            db.init_db(conn)
+        assert "reserved" in str(refusal.value)
+        assert "0014_cycles_and_gardener" not in db.applied_migrations(conn)
+        assert (
+            conn.execute("SELECT kind FROM agents WHERE id = 'builtin-librarian'").fetchone()[
+                "kind"
+            ]
+            == "external"
+        )
+    finally:
+        conn.close()
+
+
+def test_0014_lets_an_ordinary_agent_id_through(tmp_path, monkeypatch):
+    """The widened guard must still be a prefix and not a substring match."""
+    monkeypatch.setenv("NODUM_DB", str(tmp_path / "ordinary.db"))
+    monkeypatch.setattr(db, "MIGRATIONS", _prefix_through("0013_unique_space_titles"))
+    service.init()
+    conn = db.connect()
+    try:
+        conn.execute(
+            "INSERT INTO agents (id, kind, name, owner_human_id) VALUES"
+            " ('librarian', 'external', 'librarian', 'owner'),"
+            " ('my-builtin-helper', 'external', 'my-builtin-helper', 'owner')"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    monkeypatch.setattr(db, "MIGRATIONS", MIGRATIONS)
+    conn = db.connect()
+    try:
+        assert db.init_db(conn) == ["0014_cycles_and_gardener"]
     finally:
         conn.close()
 

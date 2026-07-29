@@ -7,10 +7,11 @@ import { EmptyState, Spinner } from "./components";
 /**
  * Every route in the app, registered up front.
  *
- * Fourteen routes over nine views: login, editor (blank and per-node),
- * search, review, graph (root picker and per-root), assets, per-node history,
- * admin, and spaces. `/` redirects to `/search`, and anything unmatched renders
- * {@link NotFoundView} rather than a blank screen.
+ * Sixteen routes over eleven views: login, editor (blank and per-node),
+ * search, review, journal (the cycle list and one cycle), graph (root picker and
+ * per-root), assets, per-node history, admin, and spaces. `/` redirects to
+ * `/search`, and anything unmatched renders {@link NotFoundView} rather than a
+ * blank screen.
  *
  * `/login` stands **outside** the app-shell route: the shell is the session
  * gate that redirects to login, and a gate that contained the login page
@@ -42,6 +43,8 @@ const GraphView = lazy(() => import("./views/graph/GraphView"));
 const AssetsView = lazy(() => import("./views/assets/AssetsView"));
 const HistoryView = lazy(() => import("./views/history/HistoryView"));
 const SpacesView = lazy(() => import("./views/spaces/SpacesView"));
+const JournalView = lazy(() => import("./views/journal/JournalView"));
+const CycleView = lazy(() => import("./views/journal/CycleView"));
 
 /** Shown while a view's chunk loads. */
 function ViewLoading() {
@@ -86,6 +89,14 @@ export const router = createBrowserRouter([
 
       { path: "search", element: lazyView(<SearchView />) },
       { path: "review", element: lazyView(<ReviewView />) },
+
+      // Journal — the dream journal: `/journal` lists the consolidation cycles,
+      // `/journal/:cycleId` opens one in full. Two modules rather than one
+      // branching view, because the list and the entry share only their data
+      // types: the list is a scan and the entry is a review with a diff, a
+      // metric table and a destructive action on it.
+      { path: "journal", element: lazyView(<JournalView />) },
+      { path: "journal/:cycleId", element: lazyView(<CycleView />) },
 
       // Graph — `/graph` picks a root, `/graph/:rootId` renders it.
       { path: "graph", element: lazyView(<GraphView />) },

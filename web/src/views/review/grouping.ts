@@ -16,14 +16,25 @@
  *
  * ## Why space is the outer level
  *
- * Not for tidiness. **An `edit`-granted space never reaches this queue at
- * all** — its agents write `active` directly, so they file no proposals. Group
- * by agent alone and that territory becomes invisible: the human sees nothing
- * and cannot tell "nothing has been proposed here" from "this space governs
- * itself". A section that says *self-governing — no review* is the only place
- * that fact can surface, so {@link groupProposalsBySpace} emits one for every
- * edit-granted space with an empty queue, and the emptiness is the point rather
- * than a reason to leave it out.
+ * Not for tidiness. **An `edit` grant is the only thing that can keep a space's
+ * writes out of this queue**, because `edit` is the level that lands `active`
+ * rather than `proposed`. Group by agent alone and such a space can be entirely
+ * absent, and the human cannot tell "nothing has been proposed here" from
+ * "everything written here lands without review". A section naming the agents
+ * that hold `edit` is the only place that fact can surface, so
+ * {@link groupProposalsBySpace} emits one for every edit-granted space with an
+ * empty queue, and the emptiness is the point rather than a reason to leave it
+ * out.
+ *
+ * **What that section may not say is that such an agent never appears here.**
+ * Phase 5a's landing seam (`Store.cap_landing`, §8.3) made a grant a *ceiling
+ * rather than a mandate*: a writer may file **below** its own grant, and the
+ * consolidation runner does exactly that for every inference it makes — the
+ * gardener holds `edit` on `main` and files every suggested edge `proposed`
+ * anyway, because the inferences are the uncertain half by construction. So the
+ * queue can and does hold work from an `edit`-granted agent, right under a
+ * section header that used to claim otherwise. What an `edit` grant states is a
+ * *permission*: those writes **may** land active without review.
  *
  * ## Where a proposal's space comes from
  *
@@ -42,6 +53,7 @@
 
 import type { ProposalOut, SpaceOut } from "../../api/types";
 import { timestampMs } from "../../lib";
+import { plural } from "./format";
 import { contextRef } from "./proposalText";
 
 /** The three things an agent can propose. `ProposalOut.kind` is a bare string. */
@@ -69,8 +81,25 @@ export interface ProposalBatch {
   key: string;
   /** The proposing actor, verbatim (`agent:researcher`, …). */
   agent: string;
-  /** Proposals in arrival order. */
+  /**
+   * Every proposal in the run, in arrival order.
+   *
+   * **The whole run, always**, whether the page renders it or not: this is what
+   * "Accept run (500)" counts and what it acts on. A batch action is defined on
+   * the run rather than on what happens to be visible, so paging must not be
+   * able to change either number.
+   */
   proposals: ProposalOut[];
+  /**
+   * The subset the current page renders — the whole run until {@link restrictToPage}
+   * has been applied.
+   *
+   * Separate from `proposals` so that paging is a rendering decision and nothing
+   * else. Folding the two together would have made every count on the screen
+   * page-local, which is the dishonesty paging was added to fix rather than a
+   * second one to introduce.
+   */
+  shown: ProposalOut[];
   /** Timestamp of the first proposal in the batch. */
   startedAt: string;
   /** Timestamp of the last proposal in the batch. */
@@ -149,6 +178,9 @@ export function groupProposals(
         key: `${agent}@${first.created_at}#${first.id}`,
         agent,
         proposals: current,
+        // Unpaged until a caller says otherwise, so every existing reading of a
+        // batch is unchanged and the pager is the only thing that narrows one.
+        shown: current,
         startedAt: first.created_at,
         endedAt: last.created_at,
         counts,
@@ -199,7 +231,11 @@ export type SpaceSectionKind =
   | "queue"
   /** It holds proposals whose referenced node no longer resolves. */
   | "unreported"
-  /** It holds none, and never will: every agent on it writes `active` directly. */
+  /**
+   * It holds none, and an agent on it holds `edit` — so its writes *may* land
+   * `active` without passing through here. Not a promise that they always do:
+   * a writer may file below its own grant (§8.3), and the gardener does.
+   */
   | "self-governing";
 
 /** One space's whole share of the queue, or its documented absence from it. */
@@ -224,19 +260,22 @@ export interface SpaceSection {
    */
   crossings: number;
   /**
-   * Agents holding `edit` here — they land writes `active`, so nothing they do
-   * reaches this queue. Populated on a queue section too: a space with both an
-   * `edit` agent and waiting proposals means some *other* agent holds only
-   * `suggest`, which is worth seeing rather than inferring.
+   * Agents holding `edit` here — their writes *may* land `active` without
+   * reaching this queue. Populated on a queue section too, and the section may
+   * well hold their proposals: a grant is a ceiling, so an `edit` agent that
+   * files below it appears here like any other.
    */
   editAgents: string[];
 }
 
 /**
- * The agents that write directly into a space.
+ * The agents allowed to write directly into a space.
  *
- * `edit` is the level that lands `active` rather than `proposed`, so these are
- * exactly the agents whose work never appears in the review queue.
+ * `edit` is the level that *can* land `active` rather than `proposed`. It is a
+ * ceiling and not a mandate — `Store.cap_landing` lets a writer file below its
+ * own grant, and the consolidation runner files every inference `proposed`
+ * whatever the gardener holds — so this answers "who may write here without
+ * review", never "whose work is absent below".
  *
  * @param space One row of `GET /api/spaces`.
  * @returns Agent ids holding `edit`, sorted.
@@ -246,6 +285,64 @@ export function editGrantedAgents(space: SpaceOut): string[] {
     .filter((grant) => grant.level === "edit")
     .map((grant) => grant.agent_id)
     .sort();
+}
+
+/**
+ * What a section header says about the agents holding `edit` on its space.
+ *
+ * A sentence rather than a component, because it is the sentence that was
+ * **wrong**: it read *"builtin-gardener hold `edit` here and write directly —
+ * nothing below was filed by it"*, and was printed immediately above a section
+ * headed `agent:builtin-gardener` holding four of the gardener's own edges. Two
+ * faults in one line: an inference the landing seam invalidated, and a plural
+ * verb on a single agent.
+ *
+ * @param editAgents Agent ids holding `edit` here, from {@link editGrantedAgents}.
+ * @param hasProposals Whether this section is currently holding any — a header
+ *   over a queue has to account for the work that is visibly there.
+ * @returns The sentence, or null when nobody holds `edit` and there is nothing
+ *   to say.
+ */
+export function editGrantNote(
+  editAgents: readonly string[],
+  hasProposals: boolean,
+): string | null {
+  if (editAgents.length === 0) return null;
+  const who = editAgents.join(", ");
+  const holds = editAgents.length === 1 ? "holds" : "hold";
+  const their = editAgents.length === 1 ? "its" : "their";
+  const permission =
+    `${who} ${holds} edit here, so ${their} writes may land active without passing through ` +
+    "this queue.";
+  // A grant is a ceiling, not a mandate: a writer may file below it, and the
+  // gardener files every inference as a proposal however it is granted. So the
+  // header states the permission and then says what it does *not* imply.
+  const ceiling = hasProposals
+    ? "A grant is a ceiling rather than a mandate, though — a writer may file below its own " +
+      "grant, and some of what is waiting here may be exactly that."
+    : "A grant is a ceiling rather than a mandate, though: an agent may still file a proposal " +
+      "below its own grant, and the gardener does that for every link it infers.";
+  return `${permission} ${ceiling}`;
+}
+
+/**
+ * The intro over the sections that hold nothing but name an `edit` grant.
+ *
+ * Its old wording — *"Those writes land `active` immediately, so nothing from
+ * them ever reaches this queue"* — is the same false inference
+ * {@link editGrantNote} exists to correct, one level up.
+ *
+ * @param spaceCount How many such sections there are.
+ */
+export function selfGoverningNote(spaceCount: number): string {
+  const spaces = `${spaceCount} space${spaceCount === 1 ? "" : "s"}`;
+  return (
+    `${spaces} where an agent holds edit. Those writes may land active immediately, so work ` +
+    "done there can bypass this queue entirely — the zero below is that permission and not an " +
+    "empty inbox, and it is not a claim that nothing has been written there. Nor is it a " +
+    "promise: a grant is a ceiling, so an agent may still file a proposal below it, and one " +
+    "that does appears in the queue above like any other."
+  );
 }
 
 /**
@@ -333,11 +430,14 @@ export interface SpaceGroupingOptions {
  * work rather than explain it.
  *
  * **Self-governing sections come last and hold nothing.** They exist to say
- * that an `edit`-granted space is absent from this queue *by design* rather
- * than by chance, which is the whole of D4. They are emitted only when the
- * space list is known: with `spaces` null (still loading, or the request
- * failed) the view has no way to tell a self-governing space from any other,
- * and inventing the distinction would be worse than admitting it is unknown.
+ * that an `edit`-granted space's silence here is a *permission* rather than
+ * chance — work done there may land without review — which is the whole of D4.
+ * What they may not say is that such a space can never appear above: a grant is
+ * a ceiling, and a writer that files below it queues up like any other. They are
+ * emitted only when the space list is known: with `spaces` null (still loading,
+ * or the request failed) the view has no way to tell an edit-granted space from
+ * any other, and inventing the distinction would be worse than admitting it is
+ * unknown.
  *
  * A space that is merely empty — no proposals, no `edit` grant — gets no
  * section. Nothing has been proposed there and nothing governs it, so there is
@@ -402,6 +502,135 @@ export function groupProposalsBySpace(
   selfGoverning.sort((a, b) => a.spaceId.localeCompare(b.spaceId));
 
   return [...sections, ...selfGoverning];
+}
+
+/* ------------------------------------------------------------------ */
+/* Paging, and saying how much is really there                          */
+/* ------------------------------------------------------------------ */
+
+/**
+ * How many proposal cards one page renders.
+ *
+ * The same value and the same reason as the journal's event page. A
+ * consolidation cycle files hundreds of proposals in one run, and the queue
+ * rendered every one of them: 10 673 DOM nodes on a queue of 500, on the screen
+ * whose whole job is not to lose a proposal. A card is heavier than an event
+ * row, so this is if anything generous.
+ */
+export const PROPOSAL_PAGE_SIZE = 25;
+
+/**
+ * What identifies a proposal for the page-membership test.
+ *
+ * `id` alone is not enough: an **update** proposal's id is a version row's
+ * integer id, which lives in a different id space from a node's or an edge's
+ * uuid — which is why the cards are keyed `kind:id` too.
+ *
+ * @param proposal One queue entry.
+ */
+export function proposalPageKey(proposal: ProposalOut): string {
+  return `${proposal.kind}:${proposal.id}`;
+}
+
+/**
+ * Every proposal in the exact order the sections render them.
+ *
+ * The pager slices *this*, not the flat list the server sent. They are different
+ * orders — the server answers oldest-first and the screen renders space, then
+ * agent, then newest run first — and paging over the wire order would scatter
+ * one page's rows through the whole tree.
+ *
+ * Self-governing sections contribute nothing, having no proposals: they are a
+ * statement about an absence and are rendered outside the pager entirely.
+ *
+ * @param sections The full grouping, from {@link groupProposalsBySpace}.
+ */
+export function sectionOrder(sections: readonly SpaceSection[]): ProposalOut[] {
+  return sections.flatMap((section) =>
+    section.agents.flatMap((agent) => agent.batches.flatMap((batch) => batch.proposals)),
+  );
+}
+
+/**
+ * The same sections with only one page's proposals rendered, and every count
+ * left whole.
+ *
+ * The counts are the point. A section header says how much is waiting in that
+ * space, an agent header says how much that agent is waiting on, and a batch
+ * header says how big the run is and how many "Accept run" would take — and none
+ * of those is a statement about the page. So `total`, `counts`, `crossings`,
+ * `oldestAt` and `proposals` are untouched, and the page moves exactly one field:
+ * {@link ProposalBatch.shown}.
+ *
+ * Groups with nothing on this page are dropped rather than rendered empty; a
+ * batch that straddles a page boundary appears on both, with its full count both
+ * times, which is what it is.
+ *
+ * @param sections The full grouping.
+ * @param onPage The page's keys, from {@link proposalPageKey}.
+ */
+export function restrictToPage(
+  sections: readonly SpaceSection[],
+  onPage: ReadonlySet<string>,
+): SpaceSection[] {
+  const paged: SpaceSection[] = [];
+  for (const section of sections) {
+    const agents: AgentGroup[] = [];
+    for (const agent of section.agents) {
+      const batches: ProposalBatch[] = [];
+      for (const batch of agent.batches) {
+        const shown = batch.proposals.filter((proposal) =>
+          onPage.has(proposalPageKey(proposal)),
+        );
+        if (shown.length > 0) batches.push({ ...batch, shown });
+      }
+      if (batches.length > 0) agents.push({ ...agent, batches });
+    }
+    if (agents.length > 0) paged.push({ ...section, agents });
+  }
+  return paged;
+}
+
+/**
+ * How much is waiting, said so that a filled window is not reported as a total.
+ *
+ * `GET /api/review/queue` takes a `limit` and answers `rows[:limit]` with no
+ * total and no truncation flag — the envelope's `count` is the length of what
+ * came back — so a queue of 1043 answered a request for 500 with 500, and this
+ * line read *"500 proposals waiting"*. Silent truncation, on the screen whose
+ * whole job is not to lose a proposal, while the journal two views away was
+ * already saying *"the 500-event window filled, so this may not be all of
+ * them"*.
+ *
+ * A filled window is **conservative**, exactly as `events_truncated` is: 500
+ * returned for a limit of 500 may be the last 500 there are. So the copy says
+ * *at least*, which is true either way, and never a number the client cannot
+ * know.
+ *
+ * @param shown How many survive the toolbar's filters.
+ * @param total How many came back from the server.
+ * @param truncated Whether the server's window filled.
+ */
+export function queueCount(shown: number, total: number, truncated: boolean): string {
+  const all = truncated ? `at least ${total} proposals` : plural(total, "proposal");
+  return shown === total ? all : `${shown} of ${all}`;
+}
+
+/**
+ * What to say beside {@link queueCount} when the window filled.
+ *
+ * It names the cap and what to do about it, because there *is* something to do:
+ * the queue is oldest-first, so clearing what is here and refreshing brings the
+ * next window up. A notice that only said "there may be more" would leave a
+ * reviewer unable to reach them.
+ *
+ * @param limit The window that was asked for.
+ */
+export function queueTruncationNote(limit: number): string {
+  return (
+    `The ${limit}-proposal window filled, so this may not be all of them. The queue is ` +
+    "oldest-first — accept or reject what is here and refresh to bring the rest up."
+  );
 }
 
 /** Render a counter as "3 nodes · 12 edges", skipping the zeroes. */

@@ -124,9 +124,9 @@ export function SpaceCard({ row, spaces, onRename, onArchive }: SpaceCardProps) 
           {row.selfGoverning ? (
             <span
               className="nd-badge nd-sp-badge--governing"
-              title="An agent holds edit here, so its writes land active and never reach the review queue"
+              title="An agent holds edit here, so its writes may land active without reaching the review queue. A grant is a ceiling, not a mandate — it may still file a proposal below it."
             >
-              self-governing
+              writes directly
             </span>
           ) : null}
           {renaming ? null : (

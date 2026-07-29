@@ -155,6 +155,36 @@ def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
     return {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
 
 
+#: The remedy for drift that cannot be repaired in place. Four of the five
+#: checks below are missing *tables and columns*, or rows that predate a
+#: rewrite: nothing can derive them from what the file holds, so recreating it
+#: is genuinely the only cure.
+_RECREATE_THE_FILE = (
+    "This database predates the final shape of that migration; it cannot be "
+    "auto-migrated — delete the database file and re-run 'nodum init' to recreate it."
+)
+
+#: ``0014``'s one-running-consolidation index, as the statement that creates it.
+#: Kept next to the check that looks for it so the refusal can print the cure
+#: rather than a shape of the cure.
+CYCLES_RUNNING_INDEX_SQL = (
+    "CREATE UNIQUE INDEX idx_cycles_one_running_consolidation ON cycles(status) "
+    "WHERE status = 'running' AND trigger IN ('manual', 'scheduled');"
+)
+
+#: The remedy for the fifth check, and the reason each check carries its own.
+#: A missing index is derived state — every row it constrains is already in the
+#: file — so one statement repairs it, and telling a human to delete their graph
+#: over it is the wrong instruction by an enormous margin.
+_CREATE_THE_CYCLES_INDEX = (
+    "Nothing else about that migration is missing and no data is lost: the index "
+    "constrains rows the file already has, so it can be created in place. Run this "
+    f"once against the database: {CYCLES_RUNNING_INDEX_SQL} If it fails, two "
+    "consolidation cycles are recorded 'running' at once — close the stale one with "
+    "'nodum cycle-abandon <id>' first."
+)
+
+
 def _verify_schema_consistency(conn: sqlite3.Connection) -> None:
     """Refuse a database whose live schema contradicts its recorded migrations.
 
@@ -166,16 +196,25 @@ def _verify_schema_consistency(conn: sqlite3.Connection) -> None:
     one (Q13 review S6): drift in a later migration used to pass init and
     surface much later as a missing table deep inside a write.
 
+    **The remedy is per check, not shared.** It was one sentence for all of them
+    — "delete the database file and re-run 'nodum init'" — which is true of the
+    first four and wildly disproportionate for the fifth: a missing index is
+    derived state, repairable by one ``CREATE UNIQUE INDEX``, and a refusal that
+    reads as *your graph is unrecoverable* over it would cost a human every node
+    they own. A refusal names what to do about the thing it found.
+
     Raises:
         SchemaConsistencyError: If any recorded migration's guarantee does not
-            hold, naming every problem found and the migration to blame.
+            hold, naming every problem found, the migration to blame, and the
+            cure for that migration.
     """
     recorded = set(applied_migrations(conn))
-    for name, check in (
-        ("0007_assets_and_renditions", _assets_problems),
-        ("0009_spaces_and_type_nodes", _spaces_problems),
-        ("0010_principals", _principals_problems),
-        ("0011_actor_strings", _actor_string_problems),
+    for name, check, remedy in (
+        ("0007_assets_and_renditions", _assets_problems, _RECREATE_THE_FILE),
+        ("0009_spaces_and_type_nodes", _spaces_problems, _RECREATE_THE_FILE),
+        ("0010_principals", _principals_problems, _RECREATE_THE_FILE),
+        ("0011_actor_strings", _actor_string_problems, _RECREATE_THE_FILE),
+        ("0014_cycles_and_gardener", _cycles_problems, _CREATE_THE_CYCLES_INDEX),
     ):
         if name not in recorded:
             continue
@@ -183,9 +222,7 @@ def _verify_schema_consistency(conn: sqlite3.Connection) -> None:
         if problems:
             raise SchemaConsistencyError(
                 f"database schema is inconsistent with its recorded migrations "
-                f"({name}): " + "; ".join(problems) + ". This database predates the "
-                "final shape of that migration; it cannot be auto-migrated — delete "
-                "the database file and re-run 'nodum init' to recreate it."
+                f"({name}): " + "; ".join(problems) + ". " + remedy
             )
 
 
@@ -246,6 +283,24 @@ def _actor_string_problems(conn: sqlite3.Connection) -> list[str]:
         if row is not None:
             problems.append(f"table {table!r} still carries unstructured 'human' actors")
     return problems
+
+
+def _cycles_problems(conn: sqlite3.Connection) -> list[str]:
+    """0014 guarantees the one-running-consolidation index that serialises runs.
+
+    The index is the cross-process lock: without it two ``nodum consolidate``
+    runs both open a cycle and every duplicate pair is proposed twice. ``0014``
+    was amended in place while it was still unreleased, so a database built from
+    its first cut carries the recorded name and not the index — and
+    :func:`init_db` skips a migration whose name it already has, so nothing else
+    would ever notice.
+    """
+    indexes = {
+        row["name"] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'index'")
+    }
+    if "idx_cycles_one_running_consolidation" not in indexes:
+        return ["index 'idx_cycles_one_running_consolidation' is missing (two runs could overlap)"]
+    return []
 
 
 def init_db(conn: sqlite3.Connection) -> list[str]:

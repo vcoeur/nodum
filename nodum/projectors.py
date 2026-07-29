@@ -100,8 +100,16 @@ class FtsProjector(Projector):
             self._apply_undo(conn, payload)
         elif op.startswith("node."):
             after = payload.get("after")
+            before = payload.get("before")
             if after is not None:
                 self._upsert(conn, after)
+            elif before is not None:
+                # A node event that *removed* the row: a rollback reversing a
+                # create (`node.rollback`) is the only writer of this shape. It
+                # is the mirror of a create, so the index has to mirror it too —
+                # ignoring it would leave the index describing a node the graph
+                # no longer has.
+                conn.execute("DELETE FROM node_fts WHERE node_id = ?", (before["id"],))
         # Edge events carry no node text; nothing to index.
 
     def _apply_undo(self, conn: sqlite3.Connection, payload: dict[str, Any]) -> None:
@@ -227,8 +235,12 @@ class VecProjector(Projector):
             self._apply_undo(conn, payload)
         elif op.startswith("node."):
             after = payload.get("after")
+            before = payload.get("before")
             if after is not None:
                 self._upsert(conn, after)
+            elif before is not None:
+                # A rollback reversing a create — see the FTS projector's twin.
+                self._delete(conn, before["id"])
 
     def _apply_undo(self, conn: sqlite3.Connection, payload: dict[str, Any]) -> None:
         """Mirror an undo: re-embed the restored node or drop a reverted create."""

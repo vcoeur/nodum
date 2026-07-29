@@ -92,8 +92,11 @@ describe("spaceRows", () => {
   });
 
   it("calls a space self-governing only when an agent holds edit on it", () => {
-    // The point of the flag: an edit-granted space never reaches the review
-    // queue, so "no proposals" there means self-rule, not silence (design D4).
+    // The point of the flag: `edit` is what lets a write land `active` without
+    // reaching the review queue, so "no proposals" there can mean permission
+    // rather than silence (design D4). A permission, not a prediction — a grant
+    // is a ceiling and a writer may file below it, which is what the gardener
+    // does with every inference.
     const governed = space("s1", "research", 0, [grant("scout", "s1", "edit")]);
     const suggesting = space("s2", "reading", 0, [grant("scout", "s2", "suggest")]);
     const bare = space("s3", "drafts");
