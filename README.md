@@ -326,11 +326,13 @@ degrades to BM25 + graph expansion. `NODUM_EMBED_MODEL` switches the model
   `bulk-relink` repoints or retypes many edges at once behind a dry run that
   writes nothing. All four are human-or-`edit`, all four are CLI-only — never
   MCP — and all four run **inside a cycle**, even when you invoke one directly.
-  That is why `undo` refuses a cycle-stamped event and points at `rollback` —
-  and at the last write belonging to no cycle, since a rollback is a cycle too
-  and "roll it back" alone is advice that loops back to the same refusal: a
-  merge is several rows from one decision, and undoing one of them would leave
-  the other half standing. A bare `nodum undo` right after a
+  That is why `undo` refuses a cycle-stamped event and points at `rollback`, and
+  at nothing else: a merge is several rows from one decision, and undoing one of
+  them would leave the other half standing. The refusal briefly named an
+  `undo <seq>` for the last write outside the cycle as well, which is the harm it
+  exists to prevent printed as its own remedy — a reversal that reaches past a
+  cycle deletes what nobody named and blocks the rollback that would have put
+  the cycle back. A bare `nodum undo` right after a
   curative operation gets that same refusal, naming the cycle — it does not walk
   past the cycle to an older event, because "take back the last thing that
   happened" never meant something you did not name.

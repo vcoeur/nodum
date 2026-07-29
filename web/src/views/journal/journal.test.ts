@@ -48,6 +48,7 @@ import type {
   RollbackOut,
 } from "../../api/types";
 import {
+  ABANDON_ACTION_LABEL,
   ABANDON_CONFIRM,
   abandonAvailability,
   abandonOutcome,
@@ -2096,12 +2097,38 @@ describe("describeRunFailure", () => {
     // The same fail-closed guard as the recorded path: `describeError` renders
     // `type: message` and a service message names rows.
     const said = describeRunFailure(
-      new ApiError(409, "CycleInProgress", `cycle ${CYCLE_ID} is already running`),
+      new ApiError(400, "InvalidTransition", `cycle ${CYCLE_ID} is already failed, not running`),
       RESEARCH,
     );
     expect(said).not.toMatch(BARE_ID);
-    expect(said).toContain("CycleInProgress");
+    expect(said).toContain("InvalidTransition");
     expect(said).toContain("6b1f0f2c9a4d…");
+  });
+
+  it("answers a refused second cycle with a remedy this reader can carry out", () => {
+    // The server's sentence ends `run: nodum cycle-abandon <id>`, which is right
+    // on the surface it was written for and wrong on this one twice over: there
+    // is no terminal here, and `nameIdsIn` truncates the id the command needs.
+    // The journal grew the button that does it, on the running entry.
+    const said = describeRunFailure(
+      new ApiError(
+        409,
+        "CycleInProgress",
+        `a consolidation cycle is already running: cycle ${CYCLE_ID}, started 2026-07-28 ` +
+          `03:00:00 for human:owner. Cycles are serialised across every process that shares ` +
+          `this file, so two runs cannot propose the same candidate twice, and this one was ` +
+          `refused rather than queued behind it. Try again when it has finished — or, if that ` +
+          `run was interrupted and will never close itself, run: nodum cycle-abandon ${CYCLE_ID}`,
+      ),
+      RESEARCH,
+    );
+    expect(said).not.toMatch(BARE_ID);
+    expect(said).not.toContain("nodum cycle-abandon");
+    expect(said).not.toContain("6b1f0f2c9a4d…");
+    // It names the control that exists on this screen, and where to find it —
+    // through the label the button itself renders, so neither can drift alone.
+    expect(said).toContain(ABANDON_ACTION_LABEL);
+    expect(said).toContain('"running" badge');
   });
 });
 

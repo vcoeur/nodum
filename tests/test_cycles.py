@@ -9,6 +9,9 @@ call them.
 
 from __future__ import annotations
 
+import sqlite3
+import uuid
+
 import pytest
 from helpers import agent, owner
 
@@ -227,6 +230,38 @@ def test_the_refusal_names_the_cycle_in_the_way_and_the_door_out_of_it(fresh_db)
     message = str(refused.value)
     assert stuck.id in message
     assert f"nodum cycle-abandon {stuck.id}" in message
+
+
+def test_an_integrity_error_that_is_not_the_guard_is_not_reported_as_a_busy_graph(
+    fresh_db, monkeypatch
+):
+    """`CycleInProgress` is a claim about the file, so it needs a running cycle behind it.
+
+    The `except sqlite3.IntegrityError` around the INSERT is there for exactly
+    one constraint — `0014`'s partial unique index. Every other constraint on
+    `cycles` is a bug, and translating one into "a consolidation cycle is
+    already running" would tell a caller to wait for a run that does not exist,
+    and put `nodum cycle-abandon <id>` in front of an id there is none of.
+
+    Forced here through the primary key, with the id generator pinned so two
+    opens collide. Nothing in the file is `running` when it happens.
+    """
+    first = _open(trigger="curative")
+    service.close_cycle(first.id, status="completed", report={}, principal=owner())
+
+    class _SameIdEveryTime:
+        @staticmethod
+        def uuid4():
+            return uuid.UUID(hex=first.id)
+
+    monkeypatch.setattr(service, "uuid", _SameIdEveryTime)
+    # Matched, so the fixture is known to have provoked the constraint it meant
+    # to rather than any `IntegrityError` that happens to reach the handler.
+    with pytest.raises(sqlite3.IntegrityError, match=r"UNIQUE constraint failed: cycles\.id"):
+        _open(trigger="curative")
+
+    # No cycle was left behind, and none is running to have blocked anything.
+    assert [cycle.status for cycle in service.list_cycles(principal=owner())] == ["completed"]
 
 
 def test_a_curative_or_rollback_cycle_is_not_blocked_by_a_running_consolidation(fresh_db):

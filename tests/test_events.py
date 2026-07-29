@@ -7,13 +7,32 @@ import re
 import pytest
 from helpers import OWNER_ACTOR, agent, owner
 
-from nodum import service
+from nodum import db, service
 from nodum.service import EventNotFound, NodeNotFound, RecordNotFound, UndoNotPossible
 from nodum.store import GrantNotPermitted
 
 
 def _events():
     return list(reversed(service.list_events(limit=1000, principal=owner())))  # chronological
+
+
+#: What "the graph" means for an identical-to-before comparison, with the column
+#: each table is read in order by. `merge_redirects` is in it for the reason
+#: `test_rollback.GRAPH_TABLES` has it: a stranded redirect is invisible in
+#: `nodes` and `edges` and is exactly what an incomplete reversal leaves behind.
+_GRAPH_TABLES = {"nodes": "id", "edges": "id", "merge_redirects": "tombstone_id"}
+
+
+def _graph_rows():
+    """Every graph row, in a form two moments in time compare by."""
+    conn = db.connect()
+    try:
+        return {
+            table: [dict(row) for row in conn.execute(f"SELECT * FROM {table} ORDER BY {order}")]
+            for table, order in _GRAPH_TABLES.items()
+        }
+    finally:
+        conn.close()
 
 
 def test_create_appends_event_with_full_after_payload(fresh_db):
@@ -235,45 +254,52 @@ def test_undo_with_no_seq_names_the_cycle_instead_of_reaching_past_it(fresh_db):
         service.undo(principal=owner())
 
 
-def test_the_refusal_names_the_undo_that_works_instead_of_looping(fresh_db):
-    """ "Run: nodum rollback <id>" is a loop, because a rollback is a cycle too.
+def test_the_refusal_names_rollback_and_no_undo_a_human_could_run(fresh_db):
+    """The refusal must not print the harm it exists to prevent as a remedy.
 
-    Bare `undo` after any cycle refuses and points at `rollback`. Following that
-    once is right; the rollback's own events are cycle-stamped, so following it
-    again re-applies exactly what was just taken back, and there is no state in
-    which a bare `undo` recovers. The refusal has to name the verb that does
-    work — and the query behind it already knows the answer: the most recent
-    undoable event carrying no cycle at all.
+    It briefly ended with "The last write outside a cycle is event N (…) —
+    `nodum undo N` takes that back", on the premise that pointing at rollback
+    alone was a loop. `nodum rollback <cycle>` is not a loop — it reverses the
+    cycle, and no state follows it in which a bare `undo` is needed — and the
+    event that sentence named is exactly the one `undo` refuses to step over.
+
+    The fixture is the graph from the paragraph inside `undo` itself: a merge
+    that relinked `Gamma → dup` onto the survivor. The last write outside the
+    cycle is that edge's create, so this fixture *does* reach the branch — a
+    two-unrelated-`node.create` fixture is the one graph shape where following
+    the sentence is harmless, and it was the shape the old test used. Here,
+    running the named undo deletes the edge the merge had just relinked and
+    turns that undo into a conflict standing between the merge and its rollback:
+    both reversal verbs spent, merge permanently unrollbackable.
+
+    So: the message carries one instruction, that instruction is rollback, and
+    following it puts the graph back exactly as it was — checked over the rows,
+    not over the one node the old assertion looked at.
     """
-    ordinary = service.create_node(type="note", title="mine", principal=owner())
-    outside_seq = _events()[-1].seq
-    cycle = service.open_cycle(trigger="scheduled", principal=owner())
-    with service.in_cycle(cycle.id):
-        service.create_node(type="note", title="gardened", principal=owner())
+    survivor = service.create_node(type="claim", title="Alpha", principal=owner())
+    duplicate = service.create_node(type="claim", title="Alpha (dup)", principal=owner())
+    other = service.create_node(type="claim", title="Gamma", principal=owner())
+    edge = service.create_edge(other.id, duplicate.id, "supports", principal=owner())
+    before = _graph_rows()
+    merge = service.merge_nodes([duplicate.id], into=survivor.id, principal=owner())
+
+    # The branch is reachable: an unstamped, undoable write exists, and it is the
+    # relinked edge's create — precisely what the removed sentence would name.
+    latest_outside = [event for event in _events() if event.cycle_id is None][-1]
+    assert (latest_outside.op, latest_outside.payload["after"]["id"]) == ("edge.create", edge.id)
 
     with pytest.raises(UndoNotPossible) as refused:
         service.undo(principal=owner())
-
     message = str(refused.value)
-    assert f"nodum undo {outside_seq}" in message
-    # And it is followable: that verb reverses the write it names, and nothing else.
-    service.undo(outside_seq, principal=owner())
-    with pytest.raises(NodeNotFound):
-        service.get_node(ordinary.id, principal=owner())
 
+    assert re.search(r"nodum undo\b", message) is None, "the refusal named an undo to run"
+    assert message.endswith(f"Run: nodum rollback {merge.cycle_id}."), (
+        "the refusal says something after the one verb that works"
+    )
 
-def test_the_refusal_says_so_when_there_is_no_write_outside_a_cycle_left(fresh_db):
-    """Naming an event that does not exist would be worse than the loop it replaces."""
-    cycle = service.open_cycle(trigger="scheduled", principal=owner())
-    with service.in_cycle(cycle.id):
-        service.create_node(type="note", title="gardened", principal=owner())
-
-    with pytest.raises(UndoNotPossible) as refused:
-        service.undo(principal=owner())
-
-    message = str(refused.value)
-    assert re.search(r"nodum undo \d", message) is None, "it named an event that does not exist"
-    assert "no write outside a cycle" in message
+    # And that one instruction is followable, whole: every row comes back.
+    service.rollback_cycle(merge.cycle_id, principal=owner())
+    assert _graph_rows() == before
 
 
 def test_a_single_row_cycle_is_not_explained_as_half_a_merge(fresh_db):

@@ -951,8 +951,44 @@ export function describeRunFailure(error: unknown, scope: SpaceName | null): str
   if (error instanceof ApiError && recordedUngrantedScope(error.message) !== null) {
     return gardenerHoldsNoGrant(scope);
   }
+  if (error instanceof ApiError && error.type === CYCLE_IN_PROGRESS) return CYCLE_ALREADY_RUNNING;
   return nameIdsIn(describeError(error));
 }
+
+/** The server's class name for a second consolidation refused by `0014`'s index. */
+const CYCLE_IN_PROGRESS = "CycleInProgress";
+
+/**
+ * The label on the button that closes an interrupted cycle.
+ *
+ * Exported and owned here rather than written into the detail view's JSX,
+ * because {@link CYCLE_ALREADY_RUNNING} sends a reader to look for it — copy
+ * that names a control by a string nothing ties to the control is copy that
+ * goes stale the first time somebody rewords a button.
+ */
+export const ABANDON_ACTION_LABEL = "Abandon this cycle";
+
+/**
+ * A run refused because another one holds the file, said to somebody in a browser.
+ *
+ * The server's own sentence ends *"run: nodum cycle-abandon <id>"*, and that is
+ * the right remedy on the surface it was written for. Here it is not one: this
+ * reader has no terminal in front of them, and {@link nameIdsIn} shortens the id
+ * it would have to type — so the instruction arrives both unrunnable and
+ * truncated. The journal grew the button that does it, and a remedy is only a
+ * remedy if the reader can carry it out.
+ *
+ * No id is spelt, and that is not only the never-print-a-raw-id rule: the
+ * blocking cycle is the entry carrying the `running` badge in the list this
+ * panel sits above, which is somewhere to look rather than a string to match. It
+ * is also the only entry that offers the button — `abandonAvailability` renders
+ * it on a `running` cycle and nowhere else.
+ */
+const CYCLE_ALREADY_RUNNING =
+  "A consolidation cycle is already running, and cycles are serialised across every process " +
+  "sharing this database — so this one was refused rather than queued behind it. It is the " +
+  'entry below carrying the "running" badge: wait for it to finish, or, if it was interrupted ' +
+  `and will never close itself, open that entry and use "${ABANDON_ACTION_LABEL}".`;
 
 /**
  * The gardener being ungranted on a scope, said with the space **named**.

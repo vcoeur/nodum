@@ -14,6 +14,8 @@ which re-applies the original.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 from helpers import agent, owner
 
@@ -601,6 +603,192 @@ def test_a_cycle_is_rolled_back_once(fresh_db):
         service.rollback_cycle(result.cycle_id, principal=owner())
 
 
+class _Killed(BaseException):
+    """Stands in for a `SIGKILL`: not an `Exception`, so no handler tidies up."""
+
+
+def _strand_the_rollback(cycle_id, monkeypatch):
+    """Roll ``cycle_id`` back with the process dying before the cycle closes.
+
+    Exactly the state a `SIGKILL` between `_apply_rollback`'s commit and
+    `close_cycle` leaves: the reversal is on disk and the rollback's own journal
+    entry is still `running`. Returns the stranded rollback's cycle id.
+    """
+    real_open, real_close = service.open_cycle, service.close_cycle
+    opened: list[str] = []
+
+    def remember(**kwargs):
+        cycle = real_open(**kwargs)
+        opened.append(cycle.id)
+        return cycle
+
+    def die(*args, **kwargs):
+        raise _Killed("the process died before the rollback cycle closed")
+
+    monkeypatch.setattr(service, "open_cycle", remember)
+    monkeypatch.setattr(service, "close_cycle", die)
+    try:
+        with pytest.raises(_Killed):
+            service.rollback_cycle(cycle_id, principal=owner())
+    finally:
+        monkeypatch.setattr(service, "open_cycle", real_open)
+        monkeypatch.setattr(service, "close_cycle", real_close)
+    stranded = opened[-1]
+    assert service.get_cycle(stranded, principal=owner()).status == "running", (
+        "the fixture did not reach the state it exists to build"
+    )
+    return stranded
+
+
+def test_a_rollback_a_human_abandoned_is_still_found_by_the_chain(fresh_db, monkeypatch):
+    """An abandoned rollback replaces its report, and the chain has to survive that.
+
+    The walk follows each rollback's recorded target, and the record it read was
+    the **report** — written by the `close_cycle` at the end of `rollback_cycle`.
+    A rollback a crash stranded never reaches that line, and `abandon_cycle`, the
+    door this branch advertises for exactly that state, closes it with a report
+    of its own: `{abandoned, abandoned_by, detail}`, naming no cycle. So the
+    report was a dead end, and reversing such a rollback left the cycle *below*
+    it marked `rolled_back` by a cycle that had itself been taken back.
+
+    What that costs the human is the point. The retype's writes are standing
+    again, so `rollback` on the retype refuses by name ("roll *that* cycle
+    back") — and the cycle it names is `rolled_back` too, so the advice is
+    refused as well. Both routes closed on a cycle whose writes are live.
+
+    The `cycle.rollback` summary event is the record that holds: it is emitted
+    inside the transaction that applies the reversal, so it exists whenever the
+    reversal does, and nothing rewrites an event.
+    """
+    node = _node("Alpha")
+    retype = service.retype([node.id], "concept", principal=owner())
+    assert service.get_node(node.id, principal=owner()).type == "concept"
+
+    stranded = _strand_the_rollback(retype.cycle_id, monkeypatch)
+    assert service.get_node(node.id, principal=owner()).type == "claim"
+    assert service.get_cycle(retype.cycle_id, principal=owner()).rolled_back_by == stranded
+
+    service.abandon_cycle(stranded, principal=owner())
+    # The abandon really did replace the report, so the walk's first record is
+    # gone rather than merely assumed to be.
+    assert "rolled_back" not in (service.get_cycle(stranded, principal=owner()).report or {})
+
+    service.rollback_cycle(stranded, principal=owner())
+
+    # The retype is back in force, so the journal must say its writes stand.
+    assert service.get_node(node.id, principal=owner()).type == "concept"
+    reapplied = service.get_cycle(retype.cycle_id, principal=owner())
+    assert reapplied.status == "completed"
+    assert reapplied.rolled_back_by is None
+    # And the human's route back is open rather than closed behind two refusals.
+    service.rollback_cycle(retype.cycle_id, principal=owner())
+    assert service.get_node(node.id, principal=owner()).type == "claim"
+
+
+def test_a_failed_cycle_put_back_into_force_is_failed_again(fresh_db):
+    """The restated status is the one that was recorded, not a constant.
+
+    A cycle the runner closed `failed` still wrote rows, and rolling it back and
+    then rolling *that* back puts those rows — and the entry describing them —
+    back exactly as they were. Restating it as `completed` would have the journal
+    claim a run succeeded because it was reversed twice.
+    """
+    cycle = service.open_cycle(trigger="manual", principal=owner())
+    with service.in_cycle(cycle.id):
+        node = service.create_node(type="claim", title="Half-written", principal=owner())
+    service.close_cycle(cycle.id, status="failed", report={"error": "boom"}, principal=owner())
+    assert service.get_cycle(cycle.id, principal=owner()).status == "failed"
+
+    first = service.rollback_cycle(cycle.id, principal=owner())
+    service.rollback_cycle(first.rollback_cycle_id, principal=owner())
+
+    assert service.get_node(node.id, principal=owner()).title == "Half-written"
+    restated = service.get_cycle(cycle.id, principal=owner())
+    assert restated.status == "failed"
+    assert restated.rolled_back_by is None
+
+
+def test_a_chain_that_loops_back_on_itself_stops_instead_of_spinning(fresh_db, monkeypatch):
+    """The `seen` guard, over the malformed data it exists for.
+
+    The walk follows a record — a report, or the reversal's own summary event —
+    and a record is data, not schema. Correct writes cannot make a ring (a
+    rollback always comes after what it reverses), so the loop below is forged:
+    the *reversed* cycle is rewritten to claim it is a rollback of the very
+    cycle that reversed it. Without the guard the walk alternates between the
+    two rows forever, holding the write transaction open — a hang, not an error.
+
+    The watchdog is a counter on the step function rather than a clock, so the
+    failure is deterministic and the suite cannot hang waiting for it. And the
+    steps record what each one *returned*, because "the walk stopped after two"
+    is also what a forgery that did not take looks like: if the second step
+    found no target the walk would end there for the ordinary reason and this
+    test would pass while covering nothing.
+    """
+    cycle_id, node = _cycle_with()
+    first = service.rollback_cycle(cycle_id, principal=owner())
+    forged = json.dumps(
+        {
+            "op": "rollback_cycle",
+            "rolled_back": first.rollback_cycle_id,
+            "previous_status": "completed",
+        }
+    )
+    conn = db.connect()
+    try:
+        conn.execute(
+            "UPDATE cycles SET trigger = 'rollback', report = ? WHERE id = ?", (forged, cycle_id)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    real_target = service._rollback_target
+    steps: list[tuple[str, bool]] = []
+
+    def counted(conn, cycle):
+        if len(steps) >= 8:
+            raise AssertionError(f"the chain walk did not terminate: {steps}")
+        found = real_target(conn, cycle)
+        steps.append((cycle["id"], found is not None))
+        return found
+
+    monkeypatch.setattr(service, "_rollback_target", counted)
+    service.rollback_cycle(first.rollback_cycle_id, principal=owner())
+
+    # Two steps, each cycle read once, and the *second* one found a target — so
+    # the walk stopped because the guard saw a repeat, not because the ring was
+    # never built. And the reversal it was part of still landed.
+    assert steps == [(first.rollback_cycle_id, True), (cycle_id, True)], (
+        f"the walk did not stop at the ring it was given: {steps}"
+    )
+    assert service.get_node(node.id, principal=owner()).title == "Made by the cycle"
+
+
+def test_a_failed_cycle_is_failed_again_through_an_abandoned_rollback(fresh_db, monkeypatch):
+    """The recorded status has to survive the crash path too, not only the report.
+
+    This is why the fallback reads the `cycle.rollback` summary event rather than
+    `cycles.rolled_back_by`: the mark says *which* cycle a rollback reversed and
+    nothing about the status it held, so a walk threaded through it would have to
+    guess — and the guess is `completed`, which is wrong here.
+    """
+    cycle = service.open_cycle(trigger="manual", principal=owner())
+    with service.in_cycle(cycle.id):
+        node = service.create_node(type="claim", title="Half-written", principal=owner())
+    service.close_cycle(cycle.id, status="failed", report={"error": "boom"}, principal=owner())
+    assert service.get_cycle(cycle.id, principal=owner()).status == "failed"
+
+    stranded = _strand_the_rollback(cycle.id, monkeypatch)
+    service.abandon_cycle(stranded, principal=owner())
+    service.rollback_cycle(stranded, principal=owner())
+
+    assert service.get_node(node.id, principal=owner()).title == "Half-written"
+    restated = service.get_cycle(cycle.id, principal=owner())
+    assert restated.status == "failed"
+    assert restated.rolled_back_by is None
+
+
 # ── History is added to, never rewritten ─────────────────────────────────────
 
 
@@ -763,6 +951,7 @@ def test_a_running_cycle_is_refused_and_says_what_to_do(fresh_db):
         service.rollback_cycle(cycle.id, principal=owner())
 
     service.close_cycle(cycle.id, status="failed", report={"error": "boom"}, principal=owner())
+    assert service.get_cycle(cycle.id, principal=owner()).status == "failed"
     service.rollback_cycle(cycle.id, principal=owner())
     with pytest.raises(NodeNotFound):
         service.get_node(node.id, principal=owner())

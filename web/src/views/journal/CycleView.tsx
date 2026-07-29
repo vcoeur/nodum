@@ -33,6 +33,7 @@ import { EventDiff } from "./EventDiff";
 import { MetricTable } from "./MetricTable";
 import { RollbackDialog } from "./RollbackDialog";
 import {
+  ABANDON_ACTION_LABEL,
   abandonAvailability,
   abandonOutcome,
   CYCLE_EVENT_LIMIT,
@@ -253,7 +254,7 @@ export default function CycleView() {
               onClick={() => setAbandoning(true)}
               title="Close this interrupted entry so what it wrote can be rolled back"
             >
-              Abandon this cycle
+              {ABANDON_ACTION_LABEL}
             </button>
           ) : null}
           <button

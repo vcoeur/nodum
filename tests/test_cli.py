@@ -537,14 +537,25 @@ def test_agent_create_has_no_kind_flag_at_all(fresh_db):
     with no `agent delete` the install was recoverable only by hand-editing the
     database. What was left was a flag with exactly one accepted value, offering
     a choice the service does not have; HTTP already hardcoded `external`.
-    """
-    refused = runner.invoke(
-        app, ["agent", "create", "mygardener", "--kind", "internal", "--as", "owner"]
-    )
 
-    assert refused.exit_code == 2  # typer: no such option
-    assert "--kind" in refused.output
-    assert "mygardener" not in {row["id"] for row in _run_json("agent", "list")["agents"]}
+    **Nothing here reads Typer's rendered error panel.** It used to assert
+    `"--kind" in refused.output`, which passed locally and failed on both CI
+    matrix jobs: the panel is wrapped to the terminal's width, and a narrow
+    runner cuts the flag out of it. That assertion was never about the
+    behaviour anyway — it checked how Click formats a message. The behaviour is
+    that the option is not accepted **whatever value follows it**, that no
+    account is written when one is passed, and that the flag is absent from the
+    self-describing surface. All three are readable without rendering anything.
+    """
+    for value in ("internal", "external"):
+        refused = runner.invoke(
+            app, ["agent", "create", "mygardener", "--kind", value, "--as", "owner"]
+        )
+        # 2 is Click's usage-error code; `external` was the flag's own default,
+        # so it failing too is what says the *option* is gone rather than one of
+        # its values.
+        assert refused.exit_code == 2, refused.output
+        assert "mygardener" not in {row["id"] for row in _run_json("agent", "list")["agents"]}
     # And the flag is gone from the self-describing surface too.
     payload = _run_json("schema-dump")
     agent_group = next(row for row in payload["commands"] if row["name"] == "agent")

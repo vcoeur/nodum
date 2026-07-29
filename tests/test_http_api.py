@@ -44,6 +44,7 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from importlib.util import find_spec
 from pathlib import Path
+from types import ModuleType
 
 import httpx
 import pytest
@@ -433,24 +434,69 @@ def _cli_run_caught_exceptions() -> list[type[BaseException]]:
     return resolved
 
 
+def _package_modules() -> list[ModuleType]:
+    """Every module this package contains, sub-packages included.
+
+    The package's own ``__init__`` is first, then everything under it. Both
+    halves were missing and both matter: ``_is_domain_failure`` exempts any
+    class whose root package is ``nodum``, which covers ``nodum/__init__.py``
+    and any future ``nodum.<sub>.<module>`` — while ``pkgutil.iter_modules``
+    skips the first and does not descend into the second.
+    """
+    modules = [nodum]
+    for found in pkgutil.walk_packages(nodum.__path__, prefix=f"{nodum.__name__}."):
+        modules.append(importlib.import_module(found.name))
+    return modules
+
+
 def _package_exception_classes() -> list[type[BaseException]]:
     """Every exception class this package defines, found by walking the package.
 
     Discovery, never a literal list: the defect below is a hand-maintained
     exemption that nothing audited, and a test restating the same names by hand
     would have missed the second case exactly as the code did.
+
+    The membership test is ``_is_domain_failure``'s own — the module's *root*
+    package, not a ``nodum.`` prefix — so the audit's reach is the exemption's
+    reach rather than a near-miss of it.
     """
+    root = nodum.__name__
     classes: dict[str, type[BaseException]] = {}
-    for found in pkgutil.iter_modules(nodum.__path__):
-        module = importlib.import_module(f"{nodum.__name__}.{found.name}")
+    for module in _package_modules():
         for value in vars(module).values():
             if (
                 isinstance(value, type)
                 and issubclass(value, BaseException)
-                and value.__module__.startswith(f"{nodum.__name__}.")
+                and value.__module__.partition(".")[0] == root
             ):
                 classes[f"{value.__module__}.{value.__qualname__}"] = value
     return sorted(classes.values(), key=lambda cls: cls.__name__)
+
+
+def test_the_exception_walk_covers_every_module_the_exemption_does():
+    """The audit's reach is checked against the filesystem, not against pkgutil.
+
+    `_is_domain_failure` exempts a class by its root package, so a class defined
+    in `nodum/__init__.py` or in a sub-package `nodum.foo.bar` is exempt from the
+    storage-error rewrite the day it is written. The walk under it read one level
+    of `nodum/` and skipped `__init__.py`, so either would have been exempt at
+    runtime and invisible to the audit — complete for today's flat tree and
+    silently wrong for the next one.
+
+    Every `.py` under the package directory is the reference, because that is
+    what a future sub-package looks like before anyone remembers this test.
+    """
+    package_root = Path(nodum.__path__[0])
+    on_disk = {
+        ".".join(
+            (nodum.__name__, *source.relative_to(package_root).with_suffix("").parts)
+        ).removesuffix(".__init__")
+        for source in package_root.rglob("*.py")
+    }
+    assert len(on_disk) > 1, "the filesystem reference found nothing, so it proves nothing"
+
+    walked = {module.__name__ for module in _package_modules()}
+    assert on_disk <= walked, f"modules outside the walk: {sorted(on_disk - walked)}"
 
 
 def _mapped_row(exc_type: type[BaseException]) -> type[BaseException] | None:

@@ -2650,23 +2650,14 @@ def _reinsert_rows(conn: sqlite3.Connection, rows: list[dict[str, Any]]) -> None
 _UNDOABLE_OPS = "op != 'undo' AND (op LIKE 'node.%' OR op LIKE 'edge.%')"
 
 
-def _latest_undoable(
-    conn: sqlite3.Connection, reversed_seqs: set[int], *, unstamped: bool = False
-) -> sqlite3.Row | None:
+def _latest_undoable(conn: sqlite3.Connection, reversed_seqs: set[int]) -> sqlite3.Row | None:
     """The most recent event :func:`undo` could reverse, or ``None``.
 
     Args:
         conn: The open connection.
         reversed_seqs: Seqs a previous ``undo`` already took back.
-        unstamped: Narrow to events carrying no ``cycle_id`` — the ones a bare
-            ``undo`` can still reach once a cycle has landed on top of them.
-            This is what the refusal below names, and it is the *same* search
-            with one clause added rather than a second query that could drift
-            from it.
     """
     clauses = [_UNDOABLE_OPS]
-    if unstamped:
-        clauses.append("cycle_id IS NULL")
     if reversed_seqs:
         clauses.append(f"seq NOT IN ({','.join(str(seq) for seq in sorted(reversed_seqs))})")
     return conn.execute(
@@ -2674,18 +2665,24 @@ def _latest_undoable(
     ).fetchone()
 
 
-def _cycle_stamped_refusal(
-    conn: sqlite3.Connection, event: sqlite3.Row, reversed_seqs: set[int]
-) -> str:
-    """Refuse an undo of a cycle-stamped event, naming a verb that actually works.
+def _cycle_stamped_refusal(conn: sqlite3.Connection, event: sqlite3.Row) -> str:
+    """Refuse an undo of a cycle-stamped event, naming the verb that takes it back.
 
-    ``nodum rollback <cycle-id>`` takes the cycle back, and that is the right
-    first sentence — but a rollback is **itself** a cycle and its own events are
-    stamped, so a human who follows that advice twice re-applies exactly what
-    they just took back. There is no state in which a bare ``nodum undo``
-    recovers; pointing only at rollback is a loop with no exit named in it. The
-    exit is the most recent undoable event carrying no cycle at all, which this
-    module's own search already knows how to find.
+    The message ends at ``nodum rollback <cycle-id>``, and that is the whole of
+    the advice because it is the whole of what works. It briefly also named "the
+    last write outside a cycle" as an ``undo <seq>`` a caller could still run,
+    on the premise that pointing at rollback alone was a loop — a rollback is
+    itself a cycle, so its own events are stamped too. **The premise was wrong
+    and the sentence was harmful.** ``nodum rollback <cycle>`` is not a loop: it
+    reverses the cycle, and there is no state in which a human needs a bare
+    ``undo`` afterwards. Meanwhile the event it named is exactly the one
+    :func:`undo` refuses to step over — a human who merged two nodes and ran it
+    got an unrelated edit undone and the edge the merge had just relinked
+    deleted with it, and that undo then became a conflict standing between the
+    merge and its rollback, so both reversal verbs were spent and the merge was
+    permanently unrollbackable. A reversal verb that reaches past a cycle is the
+    harm this refusal exists to prevent; printing one as a remedy was the
+    refusal instructing the human to cause it.
 
     The merge sentence is **scoped to a cycle that wrote more than one row**. It
     explains why a multi-row decision cannot come apart one event at a time, and
@@ -2703,18 +2700,10 @@ def _cycle_stamped_refusal(
         if rows_written > 1
         else ""
     )
-    outside = _latest_undoable(conn, reversed_seqs, unstamped=True)
-    alternative = (
-        f"The last write outside a cycle is event {outside['seq']} ({outside['op']}) — "
-        f"`nodum undo {outside['seq']}` takes that back."
-        if outside is not None
-        else "There is no write outside a cycle left to take back."
-    )
     return (
         f"cannot undo event {event['seq']} ({event['op']}): it belongs to consolidation "
         f"cycle {cycle_id}, and a cycle is taken back whole{whole}. Roll the cycle back "
-        f"instead. Run: nodum rollback {cycle_id}. A bare `nodum undo` will keep landing "
-        f"here, because a rollback is a cycle too. {alternative}"
+        f"instead. Run: nodum rollback {cycle_id}."
     )
 
 
@@ -2755,12 +2744,13 @@ def undo(
     reversal, while a cycle is simply the most recent thing that happened, and
     reaching past it to an older event is never what the caller meant.
 
-    That refusal also names **this** verb, with a ``seq``. A rollback is itself
-    a cycle, so pointing at rollback alone is a loop: following it twice
-    re-applies what was just taken back, and no state exists in which a bare
-    ``undo`` recovers. :func:`_cycle_stamped_refusal` names the most recent
-    write carrying no cycle instead, which is the one a caller can still reverse
-    here.
+    That refusal names ``nodum rollback <cycle>`` and stops there. It briefly
+    also named a ``seq`` this function could still reverse — "the last write
+    outside a cycle" — on the premise that rollback alone was a loop. It is not
+    one: a rollback reverses its cycle, and no state follows it in which a human
+    needs a bare ``undo``. The event that sentence named is precisely the one
+    this function refuses to step over, so the refusal was printing the harm it
+    exists to prevent as its own remedy (see :func:`_cycle_stamped_refusal`).
 
     Raises:
         GrantNotPermitted: If the principal is not a human.
@@ -2806,7 +2796,7 @@ def undo(
                 f"event {event['seq']} ({event['op']}) is not a graph event and cannot be undone"
             )
         if event["cycle_id"] is not None:
-            raise UndoNotPossible(_cycle_stamped_refusal(conn, event, reversed_seqs))
+            raise UndoNotPossible(_cycle_stamped_refusal(conn, event))
         if event["seq"] in reversed_seqs:
             raise ValueError(f"event {event['seq']} has already been undone")
 
@@ -5853,29 +5843,66 @@ def _conflict_message(cycle_id: str, conflicts: list[RollbackConflictOut]) -> st
     )
 
 
+def _reversal_record(conn: sqlite3.Connection, cycle: dict[str, Any]) -> tuple[str, Any] | None:
+    """What this rollback reversed and the status that cycle held, as recorded.
+
+    Two records say it, and **neither is** ``cycles.rolled_back_by``: that mark
+    is what :func:`_restate_reversal_chain` rewrites, so it cannot also be the
+    thread the walk follows.
+
+    The rollback's **report** is the first, written when the rollback closes.
+    The rollback's own ``cycle.rollback`` **summary event** is the second, and it
+    is the one that holds when the first is gone. A rollback whose process died
+    between :func:`_apply_rollback`'s commit and :func:`close_cycle` is left
+    ``running``, and :func:`abandon_cycle` is the door out of exactly that — but
+    abandoning replaces the report wholesale (``{abandoned, abandoned_by,
+    detail}``, naming no cycle), so a report-only walk stopped dead at the one
+    rollback a human had to close by hand and left every cycle below it marked
+    ``rolled_back`` by a cycle that had itself been taken back: writes standing
+    while both the journal and ``rollback``'s own refusal said otherwise.
+
+    The summary event is the right second record rather than merely an available
+    one. It is emitted inside the transaction that applies the reversal, so it
+    exists whenever the reversal does; it is an event, so nothing rewrites it at
+    all; and it carries ``previous_status`` too, which ``rolled_back_by`` cannot
+    — a ``failed`` cycle put back into force is ``failed`` again, and a fallback
+    that only knew *which* cycle would have had to guess ``completed``.
+    """
+    if cycle["report"]:
+        report = json.loads(cycle["report"])
+        target_id = report.get("rolled_back")
+        if isinstance(target_id, str):
+            return target_id, report.get("previous_status")
+    summary = conn.execute(
+        "SELECT payload FROM events WHERE cycle_id = ? AND op = ? ORDER BY seq LIMIT 1",
+        (cycle["id"], ROLLBACK_SUMMARY_OP),
+    ).fetchone()
+    if summary is None:
+        return None
+    payload = json.loads(summary["payload"])
+    target_id = payload.get("cycle_id")
+    if not isinstance(target_id, str):
+        return None
+    return target_id, payload.get("previous_status")
+
+
 def _rollback_target(
     conn: sqlite3.Connection, cycle: dict[str, Any]
 ) -> tuple[dict[str, Any], str] | None:
     """The cycle ``cycle`` reversed and the status it held before, or ``None``.
 
-    ``None`` when ``cycle`` is not a rollback, or its report does not name a
-    cycle that still exists.
-
-    Read from the rollback's own **report**, never from ``rolled_back_by``: the
-    mark is what :func:`_restate_reversal_chain` rewrites, so it cannot also be
-    the thread that walk follows. The report is written once, when the rollback
-    closes, and nothing rewrites it.
+    ``None`` when ``cycle`` is not a rollback, or nothing recorded a cycle that
+    still exists (:func:`_reversal_record`).
     """
-    if cycle["trigger"] != "rollback" or not cycle["report"]:
+    if cycle["trigger"] != "rollback":
         return None
-    report = json.loads(cycle["report"])
-    target_id = report.get("rolled_back")
-    if not isinstance(target_id, str):
+    recorded = _reversal_record(conn, cycle)
+    if recorded is None:
         return None
+    target_id, previous = recorded
     row = conn.execute("SELECT * FROM cycles WHERE id = ?", (target_id,)).fetchone()
     if row is None:
         return None
-    previous = report.get("previous_status")
     if previous not in CYCLE_CLOSED_STATUSES:
         previous = "completed"
     return _row_dict(row), previous

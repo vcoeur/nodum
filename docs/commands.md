@@ -290,13 +290,17 @@ standing. `rollback <cycle-id>` is therefore the way back from all of them, and
 quietly. A rollback is itself a cycle, so rolling *that* back re-applies the
 original.
 
-That last fact is why the refusal names **two** ways forward and not one. If it
-only said "roll the cycle back", a bare `nodum undo` typed afterwards would land
-on the identical sentence — the rollback is a cycle too, and its events are
-stamped — and following the advice twice re-applies exactly what you just took
-back. There is no state in which a bare `nodum undo` gets you out, so the
-message says so and names the last write that carries no cycle at all, with the
-`nodum undo <seq>` that reverses it.
+The refusal names **`rollback` and nothing else**, and that is deliberate. It
+briefly also named "the last write outside a cycle" as an `undo <seq>` you could
+still run, on the reasoning that pointing at rollback alone was a loop. It is
+not a loop — `nodum rollback <cycle-id>` reverses the cycle, and no state
+follows it in which a bare `undo` is what you need. Meanwhile the event that
+sentence named is exactly the one this refusal exists to keep `undo` away from:
+running it reaches *past* the cycle, so a merge you wanted back cost you an edge
+it had relinked, and that undo then became a conflict standing between the merge
+and its rollback — both reversal verbs spent, the merge unrollbackable. A
+reversal verb that reaches past a cycle is the harm the refusal prevents, so the
+refusal does not print one as a remedy.
 
 **A rollback refuses rather than clobbers.** If anything outside the cycle has
 touched a row the cycle touched, nothing is written and the refusal is this

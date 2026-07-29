@@ -239,11 +239,11 @@ The **curative tier** is the human-facing half of the same machinery:
 rather than adding to it. Each runs inside a cycle even when you type it
 yourself, which is why `undo` refuses a cycle-stamped event and points at
 `rollback` instead: a merge is several rows from one decision, and reversing one
-of them would leave the other half standing. The refusal also names the last
-write that belongs to no cycle, because "roll the cycle back" on its own is a
-loop — a rollback is a cycle too, so a bare `nodum undo` after one lands on the
-same sentence again, and doing what it says twice re-applies what you just
-reversed.
+of them would leave the other half standing. `rollback` is the only verb the
+refusal names — it briefly also named an `undo <seq>` for the last write outside
+the cycle, and that was the harm it exists to prevent, printed as a remedy:
+following it deletes something the cycle never named and turns the undo into a
+conflict that blocks the rollback.
 
 Cycles run on demand (`nodum consolidate`, or a button in the web UI) and
 nightly when `NODUM_CONSOLIDATE_AT` is set. Unset means off, which is the

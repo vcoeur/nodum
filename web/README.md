@@ -307,9 +307,20 @@ Conventions that hold across the tree:
   reference — a 32-hex id for the one caller that arrives by clicking. It matches
   a **live** `ApiError.message` too, because `http_api._failure_message` exempts
   this package's own exceptions from the storage rewrite.
+- **A remedy the reader cannot carry out is not a remedy.** The third refusal
+  with copy of its own is `CycleInProgress` — a run refused because another
+  holds the file. The server's sentence ends *"run: `nodum cycle-abandon
+  <id>`"*, which is right on the surface it was written for and wrong on this
+  one twice: there is no terminal here, and `nameIdsIn` shortens the id the
+  command would need, so the instruction arrives unrunnable **and** truncated.
+  The journal's copy points at the button instead — the entry carrying the
+  `running` badge, and `ABANDON_ACTION_LABEL`, which is the same constant the
+  detail view's button renders, so the sentence and the control cannot drift
+  apart. Same rule as the two below: a refusal whose *wording* is a decision
+  gets copy the view owns.
 - **No server text reaches a screen carrying a raw id, known shape or not.**
   Two message shapes have now been printed verbatim, so `journal.ts` does not
-  keep a list of rewrites to extend: the two refusals whose *wording* is a
+  keep a list of rewrites to extend: the refusals whose *wording* is a
   decision get named copy, and every other server sentence the journal renders —
   a recorded cycle failure, a job's own `error`, a delete guard's `reason` —
   goes through `journal.nameIdsIn`, which replaces each `[0-9a-f]{32}` with the

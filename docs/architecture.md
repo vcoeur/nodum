@@ -710,6 +710,16 @@ sections to the code:
   recent thing that happened. The alternative — teaching
   `undo` to recognise multi-row operations — is a second reversal mechanism to
   build and keep correct forever.
+  **The refusal names `rollback` and no other verb**, and that follows from the
+  paragraph above rather than being a separate style rule. It briefly ended with
+  a second sentence naming the last write outside the cycle and the
+  `nodum undo <seq>` that reverses it, on the premise that pointing at rollback
+  alone looped — a rollback being itself a cycle. `nodum rollback <cycle>` does
+  not loop: it reverses the cycle, and nothing follows it that a bare `undo`
+  fixes. And the event that sentence named is the one this refusal exists to
+  keep `undo` away from, so following the printed advice caused exactly the harm
+  described above. A reversal verb that reaches past a cycle is what the refusal
+  stops; a refusal must not print one as its remedy.
 - **An interrupted cycle needs a door, and `abandon_cycle` is it.** A cycle that
   never closed cannot be rolled back (its event set is not closed) and `undo`
   refuses every event it stamped, so a run killed by `SIGKILL`, a power cut, or

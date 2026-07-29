@@ -329,8 +329,25 @@ commands on a saved node for exactly this reason.
   `rolled_back_by` while its writes were reversed and standing that way. That
   is not only an entry a human misreads — `_rollback_plan` refuses an already
   `rolled_back` cycle by reading exactly that column, so a stale `completed`
-  handed it a row it would cheerfully reverse a second time. Finally,
-  the **landing seam**: `Store.cap_landing` and a
+  handed it a row it would cheerfully reverse a second time. **What the walk
+  follows is a *record*, and it needs two of them** (`_reversal_record`). It
+  cannot be `cycles.rolled_back_by`: that mark is what the walk rewrites, so it
+  cannot also be the thread. The rollback's **report** was the only other one,
+  and it is written by the `close_cycle` at the end of `rollback_cycle` — which
+  a rollback whose process died between `_apply_rollback`'s commit and that line
+  never reaches. `abandon_cycle` is the door out of exactly that state and it
+  replaces the report wholesale (`{abandoned, abandoned_by, detail}`, naming no
+  cycle), so a report-only walk stopped dead at the one rollback a human had to
+  close by hand and left every cycle below it marked `rolled_back` by a cycle
+  that had itself been taken back — writes standing while both the journal and
+  `rollback`'s own refusal ("roll *that* cycle back", itself refused) said
+  otherwise. The second record is the rollback's own `cycle.rollback` **summary
+  event**: emitted inside the transaction that applies the reversal, so it
+  exists whenever the reversal does; never rewritten, because nothing rewrites
+  an event; and carrying `previous_status` as well, which `rolled_back_by`
+  cannot — a `failed` cycle put back into force is `failed` again, and a
+  fallback that only knew *which* cycle would have had to guess `completed`.
+  Finally, the **landing seam**: `Store.cap_landing` and a
   keyword-only `landing=` on `create_edge`/`propose_edges` let a writer file
   below its own grant (§8.3 — a grant is a **ceiling, not a mandate**). It only
   ever lowers; asking to land *above* the grant is refused rather than quietly
@@ -584,7 +601,14 @@ commands on a saved node for exactly this reason.
   and blocking them for the length of a nightly sweep would take the curative
   tier offline every night. `db._cycles_problems` checks the index exists on any
   file recording `0014`, because `0014` was amended in place while unreleased and
-  `init_db` skips a migration whose name it already has. **A scoped cycle checks
+  `init_db` skips a migration whose name it already has — and **its remedy is its
+  own**, not the one the four checks beside it share. `_verify_schema_consistency`
+  used to end every refusal with "delete the database file and re-run `nodum
+  init`", which is true of a missing table and wildly wrong for a missing index:
+  the index constrains rows the file already has, so `db.CYCLES_RUNNING_INDEX_SQL`
+  repairs it in place and the refusal prints that statement. A refusal that reads
+  as *your graph is unrecoverable* over one `CREATE UNIQUE INDEX` costs a human
+  every node they own. **A scoped cycle checks
   the gardener's own grant** right after
   `open_cycle` and raises `GrantNotPermitted` naming `nodum grant
   builtin-gardener <space> edit` — every space created after `0014` is invisible
@@ -696,7 +720,15 @@ commands on a saved node for exactly this reason.
   name a space (`unknown space:` and the gardener's ungranted scope) get copy of
   the view's own, and every other server string it renders has its 32-hex ids
   replaced by the page's name for that row — so a message shape nobody
-  anticipated cannot put one on the screen. Full rules: `web/README.md`. `src/api/client.ts` is the only `fetch` in the
+  anticipated cannot put one on the screen. A third refusal has copy for a
+  different reason: `CycleInProgress` ends *"run: `nodum cycle-abandon <id>`"*,
+  which is the right remedy on a terminal and unrunnable in a browser — and the
+  id-shortening rule truncates the one argument the command needs, so it arrives
+  broken as well. The journal points at the Abandon button on the entry carrying
+  the `running` badge instead, through `ABANDON_ACTION_LABEL` — one constant, the
+  sentence and the button, so the copy cannot name a control that has been
+  reworded. A remedy the reader cannot carry out is not a remedy.
+  Full rules: `web/README.md`. `src/api/client.ts` is the only `fetch` in the
   app and has **no identity parameter anywhere** — the server's structural
   rule, mirrored in the client. It sends `Content-Type: application/json` on every
   non-GET request that goes to a JSON route, bodyless ones included, because the
@@ -1055,6 +1087,19 @@ Phase-1 decision log.
   pure-logic tests in `tests/test_embeddings.py` need no database at all), and
   the autouse `_no_embedding_provider` fixture forces the embedding provider
   unavailable so nothing can reach the network.
+- **Never assert on Typer's rendered error or help panel.** Those are Rich
+  output: wrapped to the terminal's width and styled by its colour support, so
+  an assertion reading them tests the runner's environment rather than the
+  behaviour. `test_agent_create_has_no_kind_flag_at_all` asserted `"--kind" in
+  refused.output` and was green locally and **red on both CI matrix jobs** —
+  same code, same lock file, different terminal. What a usage error offers that
+  is stable is the **exit code** (2) plus the state the command did not change;
+  what a flag's presence is really readable from is `nodum schema-dump`, this
+  CLI's own self-description. `cli._run`'s failure line is a different thing and
+  is safe to assert on: it is one `typer.echo` that neither wraps nor styles.
+  This is the same failure family as the release lesson below — a gate that
+  passes on a path the real run never takes — and this one would otherwise have
+  surfaced at tag time instead of PR time.
 - **Version** comes from the git tag (`vX.Y.Z`) via hatch-vcs at build time;
   never bump a version in code.
 - **Releasing.** Land the change on `main`, then push an annotated `vX.Y.Z`
@@ -1170,15 +1215,22 @@ Phase-1 decision log.
   unrollbackable. The only thing still skipped there is an event a previous
   `undo` already reversed: that one has a reversal, while a cycle is simply the
   most recent thing that happened.
-  **That refusal names a verb that actually works** (`_cycle_stamped_refusal`).
-  Pointing only at `nodum rollback <cycle-id>` was a loop with no exit written
-  in it: a rollback is *itself* a cycle and its own events are stamped, so a
-  human who follows the advice and then types `nodum undo` again lands on the
-  identical sentence — and following it twice re-applies exactly what they just
-  took back. There is no state in which a bare `nodum undo` recovers, so the
-  message says that and names **the last write carrying no cycle at all**
-  (`nodum undo <seq>`), found by the module's own search rather than by a
-  second one that could disagree with it. The merge sentence is now
+  **That refusal names `nodum rollback <cycle-id>` and stops there**
+  (`_cycle_stamped_refusal`). It briefly ended with a second sentence naming
+  "the last write outside a cycle" and the `nodum undo <seq>` that reverses it,
+  on the premise that pointing at rollback alone was a loop — a rollback being
+  itself a cycle. **The premise was wrong and the sentence was harmful.**
+  `nodum rollback <cycle>` is not a loop: it reverses the cycle, and there is no
+  state after it in which a human needs a bare `undo`. And the event that
+  sentence named is precisely the one this refusal keeps `undo` away from — a
+  reversal verb that reaches *past* a cycle. Following the printed advice on the
+  paragraph above's own graph deletes the edge the merge had just relinked and
+  turns that undo into the conflict standing between the merge and its rollback:
+  both reversal verbs spent, the merge permanently unrollbackable. A refusal
+  that prints the harm it exists to prevent as its remedy is worse than one that
+  says less, so the message ends at `Run: nodum rollback {cycle_id}.` and
+  `_latest_undoable` has no `unstamped=` narrowing to serve it. The merge
+  sentence is still
   **conditional on the cycle having written more than one row**: it exists to
   explain why a multi-row decision cannot come apart one event at a time, and a
   cycle carrying a lone `edge.propose` has no other half to leave standing — so

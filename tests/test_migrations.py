@@ -682,6 +682,51 @@ def test_a_database_recorded_at_0014_without_the_lock_index_is_refused(tmp_path,
         conn.close()
 
 
+def test_the_missing_index_is_refused_with_the_statement_that_repairs_it(tmp_path, monkeypatch):
+    """The remedy is per check, and this one is a `CREATE INDEX`, not a deletion.
+
+    The wrapper's sentence is shared with four checks whose only cure genuinely
+    is recreating the file — a missing table cannot be derived from rows. A
+    missing index can: it constrains rows the database already holds. Telling a
+    human to delete their graph over it is the wrong instruction by every node
+    they own.
+
+    So the refusal is followed here rather than pattern-matched. The statement it
+    prints is executed verbatim, and the file it prints it about goes back to
+    passing init *and* enforcing the guard the index exists for.
+    """
+    path = tmp_path / "stale.db"
+    monkeypatch.setenv(db.ENV_DB_VAR, str(path))
+    service.init()
+    conn = db.connect()
+    try:
+        conn.execute("DROP INDEX idx_cycles_one_running_consolidation")
+        conn.commit()
+        with pytest.raises(db.SchemaConsistencyError) as refused:
+            db.init_db(conn)
+        message = str(refused.value)
+        assert "delete the database file" not in message, "it told a human to bin their graph"
+        assert db.CYCLES_RUNNING_INDEX_SQL in message
+
+        # Follow it: the printed statement, run as printed, is the whole cure.
+        conn.executescript(db.CYCLES_RUNNING_INDEX_SQL)
+        conn.commit()
+        assert db.init_db(conn) == []
+    finally:
+        conn.close()
+
+    # And the repaired file enforces what the index is for — both halves of the
+    # predicate, so a statement that merely carried the right *name* would not
+    # pass: consolidations are serialised against each other, and a curative
+    # cycle is deliberately outside the rule.
+    first = service.open_cycle(trigger="scheduled", principal=owner())
+    with pytest.raises(service.CycleInProgress):
+        service.open_cycle(trigger="manual", principal=owner())
+    beside_it = service.open_cycle(trigger="curative", principal=owner())
+    service.close_cycle(beside_it.id, status="completed", report={}, principal=owner())
+    service.close_cycle(first.id, status="completed", report={}, principal=owner())
+
+
 @pytest.mark.parametrize(
     ("columns", "values"),
     [
