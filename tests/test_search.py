@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
+import threading
+
+import httpx
 import pytest
 from helpers import OWNER_ACTOR, agent, owner
 
-from nodum import db, projectors, search, service
+from nodum import db, http_api, projectors, search, service
 
 
 def test_search_returns_ranked_hits_with_snippet_and_signals(fresh_db):
@@ -299,6 +303,27 @@ def _seed_prose(count: int = 36) -> None:
         )
 
 
+def _compile(db_path, query: str):
+    """Compile one query the way a default `search()` call would.
+
+    The matcher counts document frequencies through the same filters the ranked
+    query applies, so a plan compiled with no filters at all is not the plan
+    search runs — hence the default filter set here rather than an empty one.
+    """
+    projectors.run_projectors(names=["fts"], path=db_path)
+    conn = db.connect(db_path)
+    try:
+        db.init_db(conn)
+        filters, params = search._node_filters(
+            "active", None, None, None, None, False, None, owner()
+        )
+        return search._compile_match(
+            conn, search._query_terms(query), filters=filters, filter_params=params
+        )
+    finally:
+        conn.close()
+
+
 def _assert_quorum_applies(db_path, query: str) -> None:
     """Fail unless this corpus and query actually compile a quorum restriction.
 
@@ -306,13 +331,7 @@ def _assert_quorum_applies(db_path, query: str) -> None:
     small (or a query too short) compiles to a bare disjunction, and the
     assertion that follows then measures FTS5 rather than the rule.
     """
-    projectors.run_projectors(names=["fts"], path=db_path)
-    conn = db.connect(db_path)
-    try:
-        db.init_db(conn)
-        plan = search._compile_match(conn, search._query_terms(query))
-    finally:
-        conn.close()
+    plan = _compile(db_path, query)
     assert plan.clause, f"no quorum compiled for {query!r} — the fixture is too small"
 
 
@@ -472,14 +491,8 @@ def test_a_one_term_query_compiles_no_quorum(fresh_db):
         content="Pozzolana and lime set under seawater.",
         principal=owner(),
     )
-    projectors.run_projectors(names=["fts"], path=fresh_db)
-    conn = db.connect(fresh_db)
-    try:
-        db.init_db(conn)
-        single = search._compile_match(conn, search._query_terms("framework"))
-        several = search._compile_match(conn, search._query_terms("pozzolana lime seawater"))
-    finally:
-        conn.close()
+    single = _compile(fresh_db, "framework")
+    several = _compile(fresh_db, "pozzolana lime seawater")
     assert (single.cte, single.clause) == ("", "")
     assert several.cte and several.clause
 
@@ -490,17 +503,499 @@ def test_a_term_in_most_of_the_graph_is_dropped_from_the_match_expression(fresh_
     Its weight is near zero either way, so this changes what search *costs*
     rather than what it returns — which is why it is asserted on the expression
     and not on the hits.
+
+    The term is `reader`, not `the`: `the` is on the function-word list, so it
+    would be dropped whatever the document frequency said and this test would
+    pass without exercising the ceiling at all. `reader` is an ordinary word
+    that happens to be in every one of these notes, which is the case the
+    ceiling exists for.
     """
     _seed_prose()
-    projectors.run_projectors(names=["fts"], path=fresh_db)
-    conn = db.connect(fresh_db)
+    assert not search._is_function_word('"reader"'), "the fixture term must reach the df ceiling"
+    plan = _compile(fresh_db, "reader framework")
+    assert '"reader"' not in plan.match
+    assert '"framework"' in plan.match
+
+
+# ── The quorum on a young graph ───────────────────────────────────────────────
+# Everything above runs against `_seed_prose`, where function words sit in
+# nearly every row and the df ceiling therefore drops them. That is what a
+# *prose-heavy* graph looks like. A young graph does not look like that: it is
+# mostly short factual sentences, and "what", "does" and "how" then sit in a
+# small minority of rows — under the ceiling, with more inverse-document-
+# frequency weight than half the topic vocabulary. Document frequency cannot
+# tell a function word from a term on a graph that size, which is why the
+# fixture below is claim-heavy and why these tests exist separately.
+
+#: Short factual sentences, deliberately telegraphic: the shape of a graph
+#: nobody has written prose into yet. None of them says "what", "does" or "how".
+_CLAIMS = (
+    "Log compaction retains the newest value for each key.",
+    "A tombstone record removes a key after the retention period.",
+    "Rebalancing reassigns partitions across the members of a group.",
+    "The group coordinator drives the join and sync phases.",
+    "Idempotent producers deduplicate retries by sequence number.",
+    "Transactions commit records across partitions atomically.",
+    "Raft elects one leader per term.",
+    "An entry is committed once a majority of servers store it.",
+    "Randomised election timeouts make split votes rare.",
+    "Joint consensus covers a membership change safely.",
+    "Vector clocks stamp events with a per-process counter.",
+    "Version vectors compare replicas of one data item.",
+    "Consistent hashing moves only the keys next to a departing node.",
+    "Virtual nodes even out the imbalance of a hash ring.",
+    "Two-phase commit blocks when the coordinator fails.",
+    "PACELC extends CAP with the case of a healthy network.",
+    "A watermark asserts that no earlier event will arrive.",
+    "Event-time windows replay reproducibly.",
+    "Backpressure slows an upstream stage instead of buffering.",
+    "Checkpoint barriers snapshot the state of an operator.",
+    "Write-ahead logging appends frames before a commit.",
+    "A checkpoint copies frames back into the main database.",
+    "Vacuum reclaims the space held by dead row versions.",
+    "A visibility map allows a scan to skip a clean page.",
+    "The porter tokenizer stems English words to a common root.",
+    "BM25 weights each indexed column separately.",
+    "Length normalisation penalises a long document.",
+    "Chunking splits a document before it is embedded.",
+    "Cosine similarity ignores the magnitude of a vector.",
+    "A sourdough starter needs feeding once a day.",
+    "Espresso extraction rises as the grind gets finer.",
+    "Oil paint hardens by oxidation rather than evaporation.",
+)
+
+#: The only rows carrying the question words — eight of forty-four, which is
+#: well under the half-the-graph ceiling, so `what`, `does` and `how` reach the
+#: compiled query carrying more weight than `compaction` does.
+_QUESTION_PROSE = (
+    "What I write here is what the thing does and how it behaves, because that"
+    " is what I forget first.",
+    "What follows does not explain how any of it is implemented; it is the"
+    " version I would say out loud.",
+    "How much of this does anybody need? What I keep is what I have had to look"
+    " up more than twice.",
+    "What is worth writing down is how a thing fails, and what it does when it"
+    " is pushed against its limits.",
+    "How this does or does not hold up against a real load is a separate note,"
+    " and what is here is only the shape.",
+    "What I do against a flaky component is write down how it fails and what"
+    " that does to everything downstream.",
+    "How does anybody remember what these settings do? What is here is the short version.",
+    "What does the reader need? How the thing is put together, and what it is for.",
+)
+
+
+def _seed_claim_graph() -> None:
+    """Seed the claim-heavy graph: 32 short claims plus 8 question-word notes."""
+    principal = owner()
+    for text in _CLAIMS:
+        service.create_node(
+            type="claim",
+            title=" ".join(text.split()[:4]),
+            content=text,
+            principal=principal,
+        )
+    for index, text in enumerate(_QUESTION_PROSE):
+        service.create_node(
+            type="note", title=f"Loose notes {index}", content=text, principal=principal
+        )
+
+
+def _document_frequencies(db_path, *words: str) -> dict[str, int]:
+    """Index rows carrying each word, and the total — the numbers the rule uses."""
+    projectors.run_projectors(names=["fts"], path=db_path)
+    conn = db.connect(db_path)
     try:
         db.init_db(conn)
-        plan = search._compile_match(conn, search._query_terms("the framework"))
+        counts = {
+            word: conn.execute(
+                "SELECT count(*) AS n FROM node_fts WHERE node_fts MATCH ?", (f'"{word}"',)
+            ).fetchone()["n"]
+            for word in words
+        }
+        counts["*rows*"] = conn.execute("SELECT count(*) AS n FROM node_fts").fetchone()["n"]
     finally:
         conn.close()
-    assert '"the"' not in plan.match
-    assert '"framework"' in plan.match
+    return counts
+
+
+def _assert_function_words_survive_the_df_ceiling(db_path, *words: str) -> None:
+    """Fail unless the fixture reaches the branch these tests are about.
+
+    The df ceiling drops a term in more than half the rows. If the fixture put
+    the question words in more than half of them, the *old* cost rule would
+    already be dropping them and the assertion below would pass without the
+    fix — a fixture that cannot reach its branch, which is the shape this
+    project keeps shipping. So: assert the question words are rare enough to
+    survive, and heavy enough to matter.
+    """
+    counts = _document_frequencies(db_path, *words)
+    rows = counts.pop("*rows*")
+    ceiling = max(1, int(rows * search._COMMON_TERM_DF_FRACTION))
+    for word, count in counts.items():
+        assert 0 < count <= ceiling, (
+            f"{word!r} is in {count} of {rows} rows (ceiling {ceiling}) — this fixture"
+            " tests the common-term drop, not the rule under test"
+        )
+
+
+def test_the_node_carrying_the_querys_only_rare_term_is_excluded_by_its_question_words(fresh_db):
+    """The blocker: the one node that answers the question is voted out by it.
+
+    `min.insync.replicas` is in one row of forty-four and is the only term in
+    this query that discriminates anything. The target carries it and nothing
+    else the query says; `What`, `does` and `against` are in 9, 8 and 3 rows,
+    all under the ceiling, and together they outweigh it. Measured on the real
+    47-row graph this fixture is modelled on: the same query answered with
+    nothing at all, while dropping the two question words answered with the
+    right node.
+
+    What comes back instead is the sharper half of the harm: three prose notes
+    that share only the question's phrasing, ranked and returned as if they
+    were answers.
+    """
+    _seed_claim_graph()
+    target = service.create_node(
+        type="note",
+        title="ISR and min.insync.replicas",
+        content=(
+            "The in-sync replica set is the set of replicas caught up with the leader."
+            " With replication factor 3 and min.insync.replicas=2, a partition whose"
+            " in-sync set has shrunk to one refuses a write with acks=all."
+        ),
+        principal=owner(),
+    )
+    _assert_function_words_survive_the_df_ceiling(fresh_db, "what", "does", "against")
+    query = "What does min.insync.replicas protect against?"
+    assert [hit.node_id for hit in search.search(query, k=10, principal=owner()).hits] == [
+        target.id
+    ]
+
+
+def test_a_question_word_does_not_let_a_draft_displace_the_canonical_claim(fresh_db):
+    """The sibling harm: a plausible list with the authoritative note missing.
+
+    Two claims say the same thing; the draft happens to phrase it with `let`,
+    which this graph holds in one row and therefore weighs heavier than
+    `compaction`. Under the shipped rule the draft clears the bar, the
+    canonical claim does not, and the caller gets a ranked list with nothing
+    saying the better node was dropped. That is worse than the conjunctive
+    rule's silence, which was at least obviously useless.
+    """
+    _seed_claim_graph()
+    canonical = service.create_node(
+        type="claim",
+        title="Log compaction and state stores",
+        content=(
+            "A compacted topic retains at least the most recent value for every key,"
+            " which is the property that makes it a durable state store."
+        ),
+        principal=owner(),
+    )
+    draft = service.create_node(
+        type="claim",
+        title="Log compaction and state stores (draft)",
+        content=(
+            "A compacted topic keeps the latest value per key and throws the rest"
+            " away, and that is what let it act as a state store in the first place."
+        ),
+        principal=owner(),
+    )
+    service.create_node(
+        type="note",
+        title="Pipeline notes",
+        content="A pull-based pipeline asks for the work it can handle, so it never buffers.",
+        principal=owner(),
+    )
+    _assert_function_words_survive_the_df_ceiling(fresh_db, "how", "does", "let", "work")
+    query = "How does compaction let a topic work as a state store?"
+    found = _ids(search.search(query, k=10, principal=owner()))
+    assert canonical.id in found
+    assert draft.id in found  # the draft was never the problem
+
+
+def test_a_term_only_in_an_unreadable_space_does_not_change_what_an_agent_sees(fresh_db):
+    """The df probes must not answer questions about rows outside the read set.
+
+    The probe counted `node_fts` with no principal and no space filter, so a
+    term's weight — and therefore the bar every readable node had to clear —
+    was computed from rows the caller cannot see. One planted word in a private
+    space turned six hits into none, which is a one-bit existence oracle over
+    the whole file, and repeating it with words planted at chosen frequencies
+    brackets the private term's document frequency. `search` is in
+    `mcp_server.READ_TOOLS`, so an external agent has this.
+    """
+    public = service.create_space("public", principal=owner())
+    private = service.create_space("private", principal=owner())
+    for index in range(6):
+        service.create_node(
+            type="note",
+            title=f"Apple note {index}",
+            content="An apple is a fruit that keeps for a long time in a cold room.",
+            space=public.id,
+            principal=owner(),
+        )
+    reader = agent("reader", grants={public.id: "read"})
+    without = _ids(search.search("apple zarquon", k=10, principal=reader))
+    service.create_node(
+        type="note",
+        title="Codename",
+        content="The project codename is zarquon and it must not leave this space.",
+        space=private.id,
+        principal=owner(),
+    )
+    with_planted = _ids(search.search("apple zarquon", k=10, principal=reader))
+    assert without == _ids(search.search("apple", k=10, principal=reader))
+    assert with_planted == without, "a term in an unreadable space changed the agent's results"
+
+
+def test_a_query_with_more_terms_than_the_cap_is_refused_as_a_caller_error(fresh_db):
+    """500 usable terms compile 500 `UNION ALL` branches; 501 is a SQLite error.
+
+    Measured: `GET /api/search` answered **503 "database error: too many terms
+    in compound SELECT"** for a 4 508-byte query, `POST /api/ask` the same, and
+    the CLI exited 1 in the storage voice. Three contract breaks for what is
+    plainly a caller-input problem — and 503 is reserved for retryable lock
+    contention, so a client retries it forever.
+
+    A term the index has never seen is dropped before the quorum is compiled,
+    so a query of 700 *invented* words never reaches the limit at all: the
+    fixture has to plant the vocabulary, or it cannot reach its branch.
+    """
+    vocabulary = [f"lexeme{index:04d}" for index in range(700)]
+    for index in range(3):
+        service.create_node(
+            type="note",
+            title=f"Vocabulary {index}",
+            content=" ".join(vocabulary),
+            principal=owner(),
+        )
+    counts = _document_frequencies(fresh_db, vocabulary[0], vocabulary[-1])
+    counts.pop("*rows*")
+    assert all(count > 0 for count in counts.values()), "the fixture must plant real terms"
+
+    assert search.search(" ".join(vocabulary[: search._MAX_QUERY_TERMS]), principal=owner()).hits
+    with pytest.raises(ValueError, match="at most"):
+        search.search(" ".join(vocabulary[:501]), principal=owner())
+
+
+def test_two_terms_of_equal_weight_require_both(fresh_db):
+    """Equal document frequency makes each term exactly half, and `>=` takes one.
+
+    Two words in the same number of notes is ordinary on a young graph, and
+    there the quorum silently became the bare OR it was chosen over: measured
+    at precision 0.111 over the returned list against the 0.722 the rule is
+    defended at. The two-term case is the one shape where "half the weight" is
+    ambiguous, so it is the one the comparison has to be strict for.
+    """
+    for index in range(29):
+        service.create_node(
+            type="note",
+            title=f"Ordinary note {index}",
+            content="This is a note about the way a thing is written down for the next reader.",
+            principal=owner(),
+        )
+    for index in range(5):
+        service.create_node(
+            type="note",
+            title=f"Kafka note {index}",
+            content="A note about kafka brokers and the log they are written to.",
+            principal=owner(),
+        )
+        service.create_node(
+            type="note",
+            title=f"Postgres note {index}",
+            content="A note about postgres vacuum and the dead row it reclaims.",
+            principal=owner(),
+        )
+    both = service.create_node(
+        type="note",
+        title="Together",
+        content="Comparing kafka topics with postgres tables, and what each of them is for.",
+        principal=owner(),
+    )
+    counts = _document_frequencies(fresh_db, "kafka", "postgres")
+    counts.pop("*rows*")
+    assert counts["kafka"] == counts["postgres"], "the fixture must give the terms equal weight"
+    assert _ids(search.search("kafka postgres", k=20, principal=owner())) == {both.id}
+
+
+def test_four_terms_of_equal_weight_still_only_need_half(fresh_db):
+    """The strict comparison is gated on two terms, and this is why.
+
+    A blanket `>` is not free: with four terms of equal weight it moves the bar
+    from two-of-four to three-of-four, which is a quorum nobody chose. This
+    test does not fail without the change — it fails if the gate is ever
+    removed.
+    """
+    for index in range(24):
+        service.create_node(
+            type="note",
+            title=f"Ordinary note {index}",
+            content="This is a note about the way a thing is written down for the next reader.",
+            principal=owner(),
+        )
+    # Four notes each for the two words the last node also carries, five for
+    # the two it does not: all four terms end at df 5, which is the only
+    # arrangement in which "half the weight" is ambiguous for four terms.
+    for word, count in (("kafka", 4), ("postgres", 5), ("sqlite", 5), ("duckdb", 4)):
+        for index in range(count):
+            service.create_node(
+                type="note",
+                title=f"{word} note {index}",
+                content=f"A note about {word} and the way it stores a row on disk.",
+                principal=owner(),
+            )
+    half = service.create_node(
+        type="note",
+        title="Two of four",
+        content="Comparing kafka with duckdb, and nothing else at all.",
+        principal=owner(),
+    )
+    counts = _document_frequencies(fresh_db, "kafka", "postgres", "sqlite", "duckdb")
+    counts.pop("*rows*")
+    assert len(set(counts.values())) == 1, "the fixture must give all four terms equal weight"
+    assert half.id in _ids(search.search("kafka postgres sqlite duckdb", k=20, principal=owner()))
+
+
+def test_a_query_of_nothing_but_function_words_is_still_weighed(fresh_db):
+    """Dropping every term needs a fallback, and the fallback is still a quorum.
+
+    "what does" is two function words and nothing else, so the drop empties the
+    query; the fallback searches them anyway, because a query the caller
+    actually typed is the best evidence available. What it must **not** do is
+    fall through to the bare disjunction — the node saying only *does* would
+    then be a hit, which is precisely the rule the quorum was chosen over.
+    Asserted on the decoy for that reason: without the fallback the target is
+    found either way, and only the decoy tells the two paths apart.
+
+    Does not fail without the change: it fails if the fallback is written as a
+    fall-through to `plain` rather than as the quorum's own next step.
+    """
+    for index in range(24):
+        service.create_node(
+            type="note",
+            title=f"Filler {index}",
+            content="A short factual sentence with no question words in sight at all.",
+            principal=owner(),
+        )
+    for index in range(11):
+        service.create_node(
+            type="note",
+            title=f"Common {index}",
+            content="This sentence does carry the commoner of the two words.",
+            principal=owner(),
+        )
+    decoy = service.create_node(
+        type="note",
+        title="Decoy",
+        content="This one also does, and stops there.",
+        principal=owner(),
+    )
+    for index in range(3):
+        service.create_node(
+            type="note",
+            title=f"Rare {index}",
+            content="What a sentence like this one is for is anybody's guess.",
+            principal=owner(),
+        )
+    target = service.create_node(
+        type="note",
+        title="Both",
+        content="What this sentence does is carry both of the words at once.",
+        principal=owner(),
+    )
+    assert search._is_function_word('"what"') and search._is_function_word('"does"')
+    counts = _document_frequencies(fresh_db, "what", "does")
+    rows = counts.pop("*rows*")
+    assert counts["what"] < counts["does"] <= rows // 2, "the fixture must weigh the two apart"
+    found = _ids(search.search("what does", k=20, principal=owner()))
+    assert target.id in found
+    assert decoy.id not in found
+
+
+# ── The search endpoint ───────────────────────────────────────────────────────
+
+_ENDPOINT_PASSWORD = "correct horse battery staple"
+
+
+def _logged_in_app(db_path):
+    """A Starlette app over the test database, plus a logged-in session cookie."""
+    app = http_api.create_app(db_path=db_path)
+    service.set_human_password("owner", _ENDPOINT_PASSWORD, principal=owner())
+
+    async def login() -> str:
+        transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+        async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:8600") as web:
+            response = await web.post(
+                "/api/login",
+                json={"name": "owner", "password": _ENDPOINT_PASSWORD},
+                headers={"Content-Type": "application/json", http_api.CLIENT_HEADER: "tests"},
+            )
+            assert response.status_code == 200, response.text
+            return response.cookies[http_api.SESSION_COOKIE]
+
+    return app, asyncio.run(login())
+
+
+def _get(app, session: str, path: str, **params) -> httpx.Response:
+    """One GET through the ASGI app, on its own event loop, as a browser would."""
+
+    async def run() -> httpx.Response:
+        transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+        async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:8600") as web:
+            return await web.get(
+                path,
+                params=params,
+                headers={"Cookie": f"{http_api.SESSION_COOKIE}={session}"},
+            )
+
+    return asyncio.run(run())
+
+
+def test_the_search_endpoint_runs_off_the_event_loop(fresh_db, monkeypatch):
+    """A GET must not stop the whole server for as long as it takes to answer.
+
+    The `?nl=1` branch of this handler already went through the thread pool
+    because a model call is seconds of work; the ordinary branch did not, and
+    it is not cheap either — measured, one `GET /api/search` carrying 400 terms
+    (a 4 KB query, nothing exotic) held the loop for 126 ms on a 120-row graph,
+    with `/healthz`, the SPA and every other tab waiting behind it.
+
+    Asserted on the thread rather than on a duration: a timing assertion in a
+    suite is a flake, and "it ran somewhere other than the loop" is the
+    property that matters.
+    """
+    service.create_node(type="note", title="T", content="mycelium networks", principal=owner())
+    app, session = _logged_in_app(fresh_db)
+    seen: dict[str, threading.Thread] = {}
+    real = search.search
+
+    def recording(*args, **kwargs):
+        seen["thread"] = threading.current_thread()
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(http_api.search_module, "search", recording)
+    response = _get(app, session, "/api/search", q="mycelium")
+    assert response.status_code == 200, response.text
+    assert response.json()["hits"], response.text
+    assert seen["thread"] is not threading.main_thread()
+
+
+def test_the_search_endpoint_refuses_an_oversized_query_as_a_caller_error(fresh_db):
+    """The 503 the compound-SELECT limit produced is a 400, and says why.
+
+    503 is this API's *retryable* status — lock contention — so a client that
+    backs off and retries would have retried this one forever.
+    """
+    vocabulary = [f"lexeme{index:04d}" for index in range(700)]
+    service.create_node(
+        type="note", title="Vocabulary", content=" ".join(vocabulary), principal=owner()
+    )
+    app, session = _logged_in_app(fresh_db)
+    response = _get(app, session, "/api/search", q=" ".join(vocabulary[:501]))
+    assert response.status_code == 400, response.text
+    assert "at most" in response.json()["error"]["message"]
 
 
 def test_bm25_length_normalisation_offsets_a_long_document(fresh_db):

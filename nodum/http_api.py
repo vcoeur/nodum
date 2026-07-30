@@ -1905,6 +1905,13 @@ def create_app(
         replacing: search must work without a model. The rewrite runs off the
         event loop for the reason ``POST /api/cycles`` does — a model call is
         seconds of work on this hardware and the loop is single-threaded.
+
+        **Both branches go through the thread pool**, not just the rewrite. The
+        ordinary branch is not a row read either: it catches two projectors up
+        and probes the index once per query term, and one 400-term ``GET``
+        (a 4 KB query string, nothing exotic) was measured holding the loop for
+        126 ms — long enough that ``/healthz``, the SPA and every other tab
+        waited behind a single search box.
         """
         params = request.query_params
         query = _required_param(params, "q", "query")
@@ -1917,8 +1924,12 @@ def create_app(
                 path=db_path,
             )
             return EnvelopeResponse(envelope(natural))
-        result = search_module.search(
-            query, **_search_filters(params), principal=_session_principal(request), path=db_path
+        result = await run_in_threadpool(
+            search_module.search,
+            query,
+            **_search_filters(params),
+            principal=_session_principal(request),
+            path=db_path,
         )
         return EnvelopeResponse(envelope(result))
 
@@ -1929,6 +1940,14 @@ def create_app(
         citations that resolve to nodes this session can read — never from the
         model's own claim to have answered, which was measured returning
         ``true`` for a question its context could not answer.
+
+        **``answered: true`` is four deterministic checks and not a claim that
+        the answer is true** — ``nodum.answers.ask`` states each one and what it
+        is worth. A client rendering this must not stop at the boolean: a note
+        can reach the model **in part** (``truncated_notes``, and ``truncated``
+        on every citation), notes the retrieval found can be missing altogether
+        (``dropped``), and ``considered`` is empty whenever no call was made, so
+        it never claims a note reached a model that was never called.
 
         Every failure is a 200 carrying ``answered: false`` and a ``refusal``
         sentence rather than a 5xx: a provider that is not configured, one that
@@ -1959,6 +1978,14 @@ def create_app(
         The subgraph read is the bound, and it happens whether or not a provider
         is configured, so a node that does not resolve is a 404 rather than
         "no LLM provider configured" — the wrong answer to the wrong question.
+
+        **What may be sent is narrower than what this session may read.** The
+        walk returns archived, proposed and meta-space nodes — ``subgraph``
+        filters edges by state and nodes not at all — and none of them go to the
+        provider, because ``/ask`` cannot reach any of them at any ``k`` and two
+        endpoints on one install must not disagree about what leaves the
+        machine. They are named in ``withheld``, and every note carries its
+        ``state``.
 
         Design E1 sketches an opt-in ``propose=true`` that files the summary as
         a reviewable ``proposed`` version. It is deliberately absent: 5b-i is

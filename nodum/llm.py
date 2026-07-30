@@ -70,11 +70,25 @@ re-verified in this wave, not carried from the design note:
   ``finish_reason: "stop"`` on both. The context window filled, everything past
   it was dropped, and *nothing in the response says so* — ``finish_reason``
   flags a truncated **output**, never a truncated **input**. The only legible
-  signal is ``prompt_tokens`` sitting at the ceiling, and it arrives after the
-  call has been paid for. That is why :meth:`OpenAICompatProvider.chat` refuses
-  an over-long prompt **before** sending it (:class:`PromptTooLong`) and why
-  :attr:`Completion.context_filled` exists for the case where the refusal was
-  computed against a ceiling the operator configured too high.
+  signal is in ``usage``, and it arrives after the call has been paid for. That
+  is why :meth:`OpenAICompatProvider.chat` refuses an over-long prompt
+  **before** sending it (:class:`PromptTooLong`).
+- **The window that binds is the *server's*, not the model's**, and that is
+  what makes the refusal's own number worth being careful about. ollama serves
+  every model at ``num_ctx`` — 4 096 unless ``OLLAMA_CONTEXT_LENGTH`` says
+  otherwise — while ``llama3.2:1b`` really has a 128 k window, so "raise
+  :data:`ENV_CONTEXT_TOKENS` for a model that has the room" produces the hole
+  rather than avoiding it. Measured at ``NODUM_LLM_CONTEXT_TOKENS=32768``
+  against that server: a 30 000-character prompt is **not** refused,
+  ``prompt_tokens`` comes back 4 096, ``finish_reason`` is ``"stop"``, and a
+  whole answer is returned from a prefix.
+- **So there are two after-the-fact signals, and they see different failures.**
+  :attr:`Completion.context_filled` compares the report against the *configured*
+  window, which catches a server whose window really is that one and is
+  structurally blind to the case above. :attr:`Completion.prompt_truncated`
+  compares it against the prompt's own bytes — the server read fewer tokens than
+  this many bytes can possibly cost — which is the one signal that does not
+  depend on the operator having configured the right number.
 - **A token ceiling gives unparseable JSON, not a short object.** Under a JSON
   schema with ``max_tokens=8``: ``finish_reason: "length"`` and the body
   ``'{\\n  "title": "Kafka'`` — cut mid-string. So a ``length`` finish is *no
@@ -101,17 +115,23 @@ generalised to "no provider = smart features off"):
 ``NODUM_LLM_API_KEY``
     Bearer token. Optional — the local default needs none.
 ``NODUM_LLM_CONTEXT_TOKENS``
-    The model's context window, defaulting to :data:`DEFAULT_CONTEXT_TOKENS`
-    (measured on the local default). **Setting it above the model's real window
-    re-opens the silent-truncation hole**, since the refusal is computed
-    against this number: the prompt then passes the check, the server drops
-    whatever did not fit, and ``prompt_tokens`` comes back below the configured
-    ceiling with nothing to notice. Raise it only for a model that really has
-    the room.
+    **The window the endpoint will actually serve**, defaulting to
+    :data:`DEFAULT_CONTEXT_TOKENS`. This is not the model card's number: with
+    ollama the binding limit is the server's ``num_ctx``
+    (``OLLAMA_CONTEXT_LENGTH``, 4 096 unless raised), applied to every model it
+    serves — ``llama3.2:1b`` has a 128 k window and is served 4 096 of it.
+    Setting this above the *serving* window re-opens the silent-truncation hole,
+    since the refusal is computed against this number: the prompt passes the
+    check, the server drops whatever did not fit, and ``prompt_tokens`` comes
+    back **below** the configured ceiling, where
+    :attr:`Completion.context_filled` cannot see it (measured — see above).
+    :attr:`Completion.prompt_truncated` is what catches that case. Raise this
+    only together with the serving window.
 """
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import time
@@ -150,6 +170,27 @@ TEMPLATE_OVERHEAD_TOKENS = 32
 #: chat template wraps it in.
 MESSAGE_OVERHEAD_TOKENS = 16
 
+#: The loosest bytes-per-token ratio a prompt may have before
+#: :attr:`Completion.prompt_truncated` calls the server's report impossible.
+#:
+#: :func:`estimate_tokens` is an *upper* bound, so "``prompt_tokens`` came back
+#: below the estimate" is true of nearly every honest call and detects nothing.
+#: The checkable statement is the other bound: *this many bytes cannot cost
+#: fewer than this many tokens*. How few depends entirely on the script, and the
+#: measured means on the local default model are 1.18 (32-hex ids) to **4.55**
+#: (Arabic), with English at 4.49 — the ten samples in
+#: ``tests/test_llm.py::MEASURED_TOKEN_COSTS``, which is what pins this constant
+#: from below. 6 leaves 32 % headroom over the loosest of them.
+#:
+#: What that buys and what it does not: at 6 the check fires when the server
+#: dropped roughly a quarter or more of an English prompt, and a *narrower*
+#: truncation is invisible — there is no per-call signal for it, because the
+#: estimate cannot tell "the tokeniser was efficient" from "the server read
+#: less". The error is one-sided by choice, the same way the estimate itself is:
+#: a false alarm is a visible, itemised refusal, and a miss is an answer from a
+#: prefix that nobody can tell from a good one.
+MAX_BYTES_PER_TOKEN = 6
+
 #: Environment variables. Named as constants so a test asserts on the same
 #: string the code reads.
 ENV_MODEL = "NODUM_LLM_MODEL"
@@ -176,12 +217,16 @@ class PromptTooLong(LLMError):
 
 
 class ContextOverflow(LLMError):
-    """The server filled its context — detected from ``usage`` after the call.
+    """The server did not read the whole prompt — detected from ``usage`` after.
 
-    The second line of defence, for the case where the configured window is
-    wider than the model's real one: :attr:`Completion.context_filled` is true,
-    the completion is charged against the budget because it was really spent,
-    and the body is discarded because part of the prompt was never read.
+    The second line of defence, and it has two halves because the configured
+    window can be wrong in either direction:
+    :attr:`Completion.context_filled` (the report reached the configured
+    ceiling) and :attr:`Completion.prompt_truncated` (the report is below what
+    the prompt's bytes can possibly cost, which is the case a window configured
+    *above* the serving one produces). Either way the completion is charged
+    against the budget because it was really spent, and the body is discarded
+    because part of the prompt was never read.
     """
 
     def __init__(self, message: str, completion: Completion) -> None:
@@ -228,9 +273,14 @@ class Completion(BaseModel):
     """One provider answer, with every field the wire already returns.
 
     Nothing here is computed by nodum except :attr:`latency_ms` (measured
-    around the call) and :attr:`context_tokens` (the configured window, carried
-    so that :attr:`context_filled` is answerable without reaching back to the
-    provider).
+    around the call), :attr:`context_tokens` (the configured window) and
+    :attr:`prompt_estimate` (the pre-send over-count the refusal was computed
+    against). The last two are carried so that :attr:`context_filled` and
+    :attr:`prompt_truncated` are answerable without reaching back to the
+    provider — and the estimate in particular is recorded **by the provider**,
+    because the provider is the only thing that has it: it computes that number
+    one line before sending, and a caller recomputing it afterwards would be a
+    second estimator free to disagree with the one that actually decided.
 
     **A schema-valid body is not a true one.** The measurement that shaped this
     phase is a model returning ``{"answer": "n0", "cited_ids": ["n0"],
@@ -247,6 +297,11 @@ class Completion(BaseModel):
     provider_id: str
     context_tokens: int
     latency_ms: int
+    #: The pre-send over-count of the prompt, or ``0`` for a completion nobody
+    #: measured (a replayed row, a hand-built fake). ``0`` means *unknown*, never
+    #: *a prompt of nothing*, so :attr:`prompt_truncated` stays ``False`` on it
+    #: rather than calling every such completion truncated.
+    prompt_estimate: int = 0
 
     @property
     def total_tokens(self) -> int:
@@ -260,13 +315,46 @@ class Completion(BaseModel):
 
     @property
     def context_filled(self) -> bool:
-        """Did the prompt fill the window — i.e. was part of it dropped?
+        """Did the report reach the **configured** window?
 
-        ``finish_reason`` never says so (measured: ``"stop"`` on a prompt
-        truncated from 70 000 characters to 4 096 tokens), so this is the only
-        signal there is, and it is only available afterwards.
+        ``finish_reason`` never says a prompt was truncated (measured:
+        ``"stop"`` on a prompt cut from 70 000 characters to 4 096 tokens), so
+        every signal there is lives in ``usage`` and arrives after the call is
+        paid for.
+
+        **What this one cannot see**, stated because both this docstring and
+        ``AGENTS.md`` used to claim the opposite: it compares the server's report
+        against :attr:`context_tokens`, which is the number *the operator
+        configured*. Configure 32 768 against a server serving 4 096 — the
+        ordinary ollama case, where ``num_ctx`` binds and the model card does not
+        — and a truncated prompt comes back at 4 096, which is nowhere near the
+        ceiling, so this is ``False`` on exactly the misconfiguration it was
+        described as defending against. :attr:`prompt_truncated` is the check
+        that sees that case; this one catches the server whose window really is
+        the configured one.
         """
         return self.prompt_tokens >= self.context_tokens
+
+    @property
+    def prompt_truncated(self) -> bool:
+        """Did the server read fewer tokens than the prompt can possibly cost?
+
+        The signal that does not depend on the configured window being right:
+        :attr:`prompt_estimate` bounds the prompt's bytes, and no byte-level BPE
+        prompt averages more than :data:`MAX_BYTES_PER_TOKEN` bytes per token
+        (measured ceiling 4.55, on Arabic). A report below that floor is a
+        server that dropped part of the input — the truncation nothing in the
+        response body admits to.
+
+        It is deliberately one-sided and deliberately not sharp: see
+        :data:`MAX_BYTES_PER_TOKEN` for what it catches (a truncation that lost
+        about a quarter of an English prompt or more) and what it cannot. A
+        completion carrying no estimate answers ``False``, because ``0`` there
+        means nobody measured.
+        """
+        if self.prompt_estimate <= 0:
+            return False
+        return self.prompt_tokens * MAX_BYTES_PER_TOKEN < self.prompt_estimate
 
 
 class LLMProvider(Protocol):
@@ -352,8 +440,9 @@ class OpenAICompatProvider:
         model: The model name sent as ``model``, and recorded as
             :attr:`model_id` on every completion.
         api_key: Bearer token, or ``None`` for a server that needs none.
-        context_tokens: The model's window. A prompt whose estimate plus its
-            reserved output exceeds this is refused rather than sent.
+        context_tokens: The window this endpoint *serves* — for ollama that is
+            ``num_ctx``, not the model card's number. A prompt whose estimate
+            plus its reserved output exceeds this is refused rather than sent.
     """
 
     def __init__(
@@ -443,8 +532,9 @@ class OpenAICompatProvider:
                 f"answer). Refused before sending: this server truncates a long prompt "
                 f"silently — same prompt_tokens, same finish_reason, no error — so a call "
                 f"made here would answer from a prefix and read exactly like a good answer. "
-                f"Send less context, or raise {ENV_CONTEXT_TOKENS} if the model really has "
-                f"the room"
+                f"Send less context, or raise {ENV_CONTEXT_TOKENS} — but only to a window "
+                f"the server really serves (for ollama that is num_ctx / "
+                f"OLLAMA_CONTEXT_LENGTH, not the model card)"
             )
         payload: dict[str, Any] = {
             "model": self._model,
@@ -462,7 +552,7 @@ class OpenAICompatProvider:
         started = time.monotonic()
         body = self._post(payload, timeout)
         latency_ms = int((time.monotonic() - started) * 1000)
-        return self._completion(body, latency_ms)
+        return self._completion(body, latency_ms, estimate)
 
     def _post(self, payload: dict[str, Any], timeout: float) -> dict[str, Any]:
         """POST the payload and return the parsed body, or raise."""
@@ -491,6 +581,19 @@ class OpenAICompatProvider:
             raise ProviderTimeout(
                 f"provider at {self._base_url} did not answer within {timeout:g}s"
             ) from failure
+        except http.client.HTTPException as failure:
+            # A provider that died mid-response: `response.read()` raises
+            # `IncompleteRead` when the body stops short of its
+            # `Content-Length`. That class derives from `HTTPException`, **not**
+            # from `OSError`, so the clause below misses it entirely — and it
+            # then escaped `LLMError`, escaped the callers' handlers and reached
+            # a CLI traceback and an HTTP 500. It is the shape a killed
+            # provider, a proxy timeout and a dropped load-balancer connection
+            # all produce, which is to say the ordinary way a long call dies.
+            raise ProviderUnavailable(
+                f"provider at {self._base_url} is not reachable: the response ended early "
+                f"({type(failure).__name__}: {failure})"
+            ) from failure
         except (urllib.error.URLError, OSError) as failure:
             # `URLError` wraps a socket timeout on some Python versions, so the
             # timeout case is re-checked here rather than trusted to land above.
@@ -514,7 +617,7 @@ class OpenAICompatProvider:
             )
         return parsed
 
-    def _completion(self, body: dict[str, Any], latency_ms: int) -> Completion:
+    def _completion(self, body: dict[str, Any], latency_ms: int, estimate: int) -> Completion:
         """Read the wire shape into a :class:`Completion`, or say what was missing.
 
         Every field is read defensively: a provider that answers 200 with a
@@ -545,6 +648,7 @@ class OpenAICompatProvider:
             provider_id=self._base_url,
             context_tokens=self._context_tokens,
             latency_ms=latency_ms,
+            prompt_estimate=estimate,
         )
 
 

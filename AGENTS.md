@@ -607,8 +607,9 @@ commands on a saved node for exactly this reason.
   `SIGKILL` or a shutdown mid-nightly-run makes its own writes irreversible
   until somebody closes it, and `POST /api/cycles` is here because a schedule
   that is off by default would otherwise leave the journal empty forever.
-  **`POST /api/cycles` is the one handler that does not call the service
-  inline** — it goes through `run_in_threadpool`. Every other handler here is a
+  **`POST /api/cycles` and `GET /api/search` are the handlers that do not call
+  the service inline** — both go through `run_in_threadpool`. Every other
+  handler here is a
   read or a single-row write, where inline is right; a cycle is every job over
   every node in scope (3.75 s measured on 450 nodes with no embeddings, minutes
   with them) and the event loop is single-threaded, so inline it froze
@@ -908,11 +909,36 @@ commands on a saved node for exactly this reason.
   point.** Measured: 16 000 characters report 2 932 prompt tokens while 64 000
   and 70 000 both report **4 096** — the window filled, the rest was dropped,
   and nothing in the response says so. `finish_reason` describes the *output*
-  only, so it reads `stop` on a prompt truncated from 70 000 characters; the
-  sole signal is `prompt_tokens` at the ceiling, and it arrives after the call
-  is paid for. So `chat` counts first and raises `PromptTooLong` without
-  sending, and `Completion.context_filled` is the second line of defence for a
-  window an operator configured too high. **The estimate is UTF-8 bytes**,
+  only, so it reads `stop` on a prompt truncated from 70 000 characters; every
+  signal there is lives in `usage`, and it arrives after the call is paid for.
+  So `chat` counts first and raises `PromptTooLong` without sending.
+  **`NODUM_LLM_CONTEXT_TOKENS` is the window the *server* serves, not the one
+  the model has**, and getting that backwards is how the hole re-opens from the
+  other side: ollama applies `num_ctx` (4096 unless `OLLAMA_CONTEXT_LENGTH`
+  raises it) to every model it serves, while `llama3.2:1b` really has 128 k — so
+  "raise it for a model that has the room" is advice that produces silent
+  truncation. Measured at `NODUM_LLM_CONTEXT_TOKENS=32768` against that server:
+  a 30 000-character prompt is **not** refused, `prompt_tokens` comes back 4096,
+  `finish_reason` is `stop`, and a whole answer is returned from a prefix.
+  **So the after-the-fact defence is two signals, and they see different
+  failures.** `Completion.context_filled` compares the report against the
+  *configured* window and is structurally blind to the case above (4096 is
+  nowhere near 32768) — it catches the server whose window really is the
+  configured one. `Completion.prompt_truncated` compares it against the prompt's
+  own bytes: the pre-send estimate rides back on the completion
+  (`Completion.prompt_estimate`, recorded by the provider, which is the only
+  thing that has it — a caller recomputing it would be a second estimator free
+  to disagree with the one that decided), and a report below
+  `estimate / MAX_BYTES_PER_TOKEN` is a server that read less than it was sent.
+  The constant is 6, against a measured worst case of 4.55 bytes per token
+  (Arabic; English 4.49, 32-hex ids 1.18), so it catches a truncation that lost
+  roughly a quarter of an English prompt or more and **cannot see a narrower
+  one** — there is no per-call signal for that, since the estimate cannot tell
+  an efficient tokeniser from a server that read less. The error is one-sided by
+  the same argument the estimate itself rests on: a false alarm is a visible,
+  itemised refusal, a miss is an answer from a prefix nobody can tell from a
+  good one. Either signal makes the call a `ContextOverflow` in `nodum.agent`:
+  charged, body discarded. **The estimate is UTF-8 bytes**,
   because a byte-level BPE token decodes to at least one byte and that makes it
   a *bound* rather than a heuristic; a `chars/4` estimate under-counts emoji by
   twelve times and a run of accented Latin by four, and an under-count is the
@@ -925,7 +951,18 @@ commands on a saved node for exactly this reason.
   else**: asked a question its context could not answer, under a schema, the
   model returned `{"answer": "n0", "cited_ids": ["n0"], "answered": false}`.
   Never read a schema-valid object as a true one; validating what the model
-  said against what was actually retrieved is the caller's job. Resolution
+  said against what was actually retrieved is the caller's job.
+  **Every way a provider can die here is an `LLMError`, and one of them had to
+  be added by hand**: `response.read()` raises `http.client.IncompleteRead` when
+  a body stops short of its `Content-Length`, and that class derives from
+  `HTTPException`, **not** `OSError` — so the clause catching a refused
+  connection missed it, and it escaped `LLMError`, escaped `answers.ask`'s
+  handler and escaped `cli._run`, reproducing as a Rich traceback with exit 1 on
+  the CLI and an HTTP 500 on `POST /api/ask`. It is the shape a killed provider,
+  a proxy timeout and a dropped load-balancer connection all make, which is to
+  say the ordinary way a long call dies; `_post` catches
+  `http.client.HTTPException` for it, and a test drives six death shapes and
+  asserts each lands on `LLMError` rather than on a message. Resolution
   reads configuration and makes **no network call** — unlike the embedding
   seam, whose construction loads a model — because "configured" and
   "reachable" are different facts and a probe would cache one instant's answer
@@ -933,8 +970,17 @@ commands on a saved node for exactly this reason.
   `tests/test_llm.py` walks the package's own import graph and asserts that
   `nodum.service`, `nodum.projectors`, `nodum.store` and `nodum.migrations`
   cannot reach this module **under any spelling** (aliased, relative,
-  `importlib.import_module`, an attribute chain) **or any number of hops**, and
-  that `nodum.agent` is the only module that imports it at all.
+  `importlib.import_module` / `__import__` **positionally or by keyword**, an
+  attribute chain) **or any number of hops**, and
+  that `nodum.agent` is the only module that imports it at all. Two of those
+  words were claims rather than facts until this wave. The extractor walked
+  `node.args` only, so `import_module(name="nodum.llm")` — a constant string,
+  spelled the way an editor's signature help suggests it — was invisible; and
+  the module glob skipped `__init__.py`, so the `nodum` node had *inbound* edges
+  from most of the package and no outbound ones at all, which made a one-line
+  re-export placed there invisible to **both** properties. The rail now carries a
+  test per hole, and the second one injects the re-export into the real graph
+  because the real `__init__` correctly has none.
 - **`nodum.agent`** — the internal agent's runtime and the **one door to the
   model** (design P3, A1–A3, B1–B4, K1–K3). `AgentRun.chat` takes a principal,
   a job budget and a prompt version, and returns the text with the provenance a
@@ -957,11 +1003,41 @@ commands on a saved node for exactly this reason.
   a night — 2 395 prompt tokens cost 47 s locally. Charging a job charges the
   cycle and the remainder is the minimum down the chain; a job budget shares
   the run's clock, so no ceiling is ever infinite (`cycles.report` is
-  `json.dumps`, which writes a bare `Infinity` that is not JSON).
+  `json.dumps`, which writes a bare `Infinity` that is not JSON — and that is
+  enforced where the number is *read*, since `float("inf")`, `"Infinity"` and
+  `"1e999"` all parse: `_positive_float` requires `math.isfinite`, measured after
+  `NODUM_LLM_REQUEST_SECONDS=inf` put `"budget_seconds": Infinity` on a 200 from
+  `POST /api/ask` and made the browser's `JSON.parse` throw. `nan` is refused by
+  the same line for a quieter reason: every comparison against it is false, so
+  the wall-clock check silently stops existing).
+  **The wall clock starts at the first provider call, not at construction** —
+  `for_cycle` is built when the cycle opens and the LLM jobs run last, so a
+  clock started in the constructor charged the four deterministic jobs' minutes
+  to the LLM's ceiling and reported time the model never had. **The per-call
+  timeout is clamped to what is left of it** (`min(call_timeout,
+  ledger.remaining_seconds)`): the clock was checked before a call and never
+  again, so a 2 s ceiling with the shipped 120 s call timeout measured `elapsed
+  3.0`, and a night could overrun by two minutes.
+  **Every share of a budget is measured against the same ceiling, across
+  calls.** `AgentRun.job` is one `split` per job, so a guard reading only its own
+  argument let three jobs at `share=0.6` each hold 600 of a 1000-token cycle —
+  180 % in `LLMReport.per_job`. Spending stayed bounded (the remainder is the
+  minimum down the chain); the *report* lied, about the one number a human
+  checks a night against. `Budget` therefore accumulates the shares it has
+  handed out, and a **repeated job name is refused** rather than replacing the
+  first — `AgentRun._jobs` is keyed by name, so the replacement took the
+  displaced job's calls and tokens out of the report with it.
   `NODUM_LLM_CYCLE_BUDGET` is **0 by default — the LLM jobs do not run** (K2
   level 1); `NODUM_LLM_REQUEST_BUDGET` defaults to *on*, because "off by
   default" exists to stop an unattended process spending the human's night and
-  a human pressing a button is not that. *At a ceiling* (B3): **refuse and
+  a human pressing a button is not that. **The refusal names the variable that
+  funds *this* run** (`AgentRun.budget_env`), because `for_request` reads the
+  request variable and `NODUM_LLM_REQUEST_BUDGET=0 nodum ask` used to answer
+  with "set `NODUM_LLM_CYCLE_BUDGET`", which does nothing for a request — and
+  "turn the LLM jobs on" is cycle vocabulary for something a human asked for by
+  hand. A *funded* run whose job share rounds to 0 gets a third sentence naming
+  the share, since the report says `enabled: true` and the variable is already
+  set. *At a ceiling* (B3): **refuse and
   itemise, never truncate** — the call's worst case (the over-counted estimate
   plus the whole output reservation) is measured before anything is sent, and a
   refusal names the item it skipped. **Exhaustion is deliberately a different
@@ -974,8 +1050,15 @@ commands on a saved node for exactly this reason.
   can afford nothing, and a flag read off the counter would report a truncated
   night as a complete one. A budget that was never turned on is refused as
   `kind="off"` and is **not** reported exhausted. A failed call — `length`
-  finish or filled context — is charged, because the tokens were really spent;
-  a `PromptTooLong` costs nothing, because nothing was sent. *The kill switch*
+  finish, filled context or a prompt the server truncated — is charged, because
+  the tokens were really spent, **and counted in `failed_calls`**, which means
+  *calls that produced no usable result* rather than *calls that never reached
+  the wire*: three discarded answers reported `calls 3, failed_calls 0` before,
+  which is a night of three successes. A `PromptTooLong` costs nothing, because
+  nothing was sent, and is neither a call nor a failure — but it **records a
+  skip**, because an item was left unexamined and three refusals used to report
+  `calls 0, failed_calls 0, skipped []`: byte-identical to a night with no work.
+  *The kill switch*
   (K1–K3): a `cycles.stop_requested` row, **not** a reuse of `abandon_cycle`
   (that verb is a *repair* — a human declaring somebody else's dead process
   dead — while a stop is an instruction a live run obeys, and a journal that
@@ -1013,6 +1096,24 @@ commands on a saved node for exactly this reason.
   `NODUM_LLM_CALL_TIMEOUT`, `NODUM_LLM_MAX_OUTPUT_TOKENS` — each unparseable
   value falls back to its default rather than refusing to boot (the scheduler's
   precedent), and the cycle fallback is 0, so a typo cannot authorise spending.
+  **A value out of range falls back too, and where the range starts is the
+  difference between a decision and a misconfiguration**: 0 on a budget is *off*
+  and is the shipped cycle default, while `NODUM_LLM_MAX_OUTPUT_TOKENS=0` is
+  nothing anybody chose — it reached the provider as `ValueError:
+  max_output_tokens must be at least 1`, which this stack renders as a **400**,
+  the client-error voice, on every `POST /api/ask` for a request that was
+  perfectly well formed. So the reader takes a `minimum=`, and the output
+  ceiling passes 1.
+  **`AgentRun` does not hand out the provider object** (`_provider`, private).
+  P3's rail checks *imports*, and a module holding `run.provider` imports
+  nothing: demonstrated, a call through `run.provider.chat(...)` succeeded with
+  the budget at 0 and a stop firing, and the run reported `calls 0, total_tokens
+  0, stopped True` — unmetered, unstoppable, unattributed. What a prompt builder
+  actually needs is two numbers, and the run answers both: `context_tokens`
+  (`None` with no provider, like `model_id` and `provider_id`) and
+  `estimate_prompt_tokens(messages)` (which raises `ProviderUnavailable` with
+  none, because there is no honest number). The estimate must be the provider's
+  own, so that what a caller fits is exactly what the provider would refuse.
 - **`nodum.answers`** — the read-only smart surface (Phase 5b-i, design E1–E3):
   `ask`, `summarize`, `natural_search` and `provider_status`, behind
   `POST /api/ask`, `POST /api/summarize`, `GET /api/search?nl=1` and
@@ -1325,16 +1426,73 @@ commands on a saved node for exactly this reason.
   discriminates in proportion to its rarity, so a document qualifies by carrying
   enough of the query's *discriminating power* rather than enough of its
   *words*, and the eight function words of a twelve-word question cost it
-  nothing. Two kinds of term are dropped before the quorum is computed, both
-  because they separate nothing: one the index has **never seen** (`df = 0` —
+  nothing. **Three** kinds of term are dropped before the quorum is computed,
+  all because they separate nothing: one the index has **never seen** (`df = 0` —
   BM25 already scores it zero, and requiring it is exactly how a hallucinated
-  term used to empty a result set) and one in **more than half the indexed
+  term used to empty a result set), one in **more than half the indexed
   rows** — that second is a *cost* rule and not a relevance one, since such a
   term's weight is near zero either way but leaving it in the expression makes
-  FTS5 walk a doclist the size of the graph. Measured on 312 nodes, a
-  question-shaped query costs **32 ms without the drop and 14 ms with it**, for
+  FTS5 walk a doclist the size of the graph — and one on a fixed **English
+  function-word list** (`_QUERY_STOPWORDS`). Measured on 312 nodes, a
+  question-shaped query costs **32 ms without the df drop and 14 ms with it**, for
   0.03 of recall and no measurable precision (0.766/0.622 against 0.737/0.632) —
-  a cost rule that is very nearly free, not a free one. A query left with one
+  a cost rule that is very nearly free, not a free one.
+  **The list exists because the df rule is an estimator of it and a small graph
+  breaks the estimator** (review, Phase 5b): a 47-row graph of short claims
+  holds *what* in 7 rows and *does* in 8, both far under any ceiling worth
+  setting, so on *"What does min.insync.replicas protect against?"* — where the
+  target carries the query's only `df = 1` term — the bar came out at 4.84 and
+  the target collected 3.47, short by exactly the weight of the two question
+  words it does not contain. Dropping the two question words by hand answered
+  with the right node. The same mechanism zeroed *"What did I write about how
+  exactly-once semantics work in Kafka?"* — the design note's own motivating
+  query — and, worse than silence, returned the **draft** near-duplicate first
+  while excluding the canonical claim on *"How does compaction let a topic work
+  as a state store?"*, because `let` (df 2) outweighs `compaction` (df 4). The
+  312-node measurement corpus was large enough to hide all of it. A list does
+  not move with corpus size, which is the property the defect asks for; it holds
+  no word that carries topic meaning here (`state`, `store`, `key`, `value`,
+  `log`, `set`, `order`, `time`, `long`, `work` are all deliberately absent),
+  and each drop **falls back** one step — function words, then ubiquitous terms,
+  then everything the graph knows — so *"what is it"* still searches those
+  words. Measured across five corpus sizes, question-shaped queries (recall,
+  precision over the returned list): **47 rows 0.74/0.65 → 0.87/0.73** (and the
+  zero-hit rate 0.19 → 0.00), 26 rows 0.79/0.63 → 0.88/0.65, 52 rows 0.73/0.57 →
+  0.89/0.69, 78 rows 0.70/0.52 → 0.81/0.63, **312 rows 0.74/0.63 → 0.86/0.77**.
+  The keyword, two-term and hallucinated-term suites are **byte-identical**
+  before and after at every size — a question's phrasing was the only thing
+  paying for the bar. Alternatives measured and rejected: an absolute IDF floor
+  (a df-fraction cut in disguise — it drops `Kafka` at 8 rows of 47), a tighter
+  df ceiling (0.25 recovers 0.00 of the 47-row recall), and a quorum over the
+  query's N heaviest terms (no better than the list on any corpus, and worse on
+  the 312-node one).
+  **Two terms of equal document frequency compare strictly** (`>` rather than
+  `>=`): equal df is equal weight, each term is then exactly half, and `>=`
+  admits either alone — the quorum silently becomes the bare OR it was chosen
+  over. Measured on a 40-row graph with `kafka` and `postgres` both at df 6:
+  10 hits at precision 0.100 against 1 hit at 1.000. The strictness is **gated
+  on the two-term case**, because with four equal terms a blanket `>` moves the
+  bar from two-of-four to three-of-four; gated, it is byte-identical to `>=` on
+  every suite at every corpus size, since two real terms are rarely exactly
+  equal — *rarely*, not never, which is what the carried claim got wrong.
+  **Document frequencies are counted through the search's own filters**, not
+  over the whole index. Counting the whole index made the bar depend on rows the
+  caller cannot read: with `zarquon` planted in a private space, an agent
+  holding `read` on one public space got **0 hits for `apple zarquon` and 6
+  without the planting** — a one-bit existence oracle over every space in the
+  file, and repeating it with words planted at chosen frequencies brackets a
+  private term's df. `search` is in `mcp_server.READ_TOOLS`, so an external
+  agent has it. Scoping also makes the weight *right*: rarity is a property of
+  the corpus being searched.
+  **A query carries at most `_MAX_QUERY_TERMS` = 64 distinct terms**, and more
+  is a `ValueError` — a 400, not a 503. Above 500 usable terms the quorum's
+  `UNION ALL` hits `SQLITE_LIMIT_COMPOUND_SELECT` and SQLite raises: measured,
+  a 4 508-byte query answered **503 "database error: too many terms in compound
+  SELECT"** from `GET /api/search` and `POST /api/ask` and exit 1 from the CLI,
+  three storage-voice failures for an oversized request — and 503 is this API's
+  *retryable* status, so a client retries it forever. The cap is far above
+  anything this system produces (the model's rewrite is capped at 8 terms, the
+  longest measured question is 11). A query left with one
   term compiles **no quorum at all**, so a
   one-word search runs the statement it always ran. The restriction is a CTE in
   the `WHERE`, never a filter over the ranked rows — ranking first and filtering
@@ -1351,9 +1509,13 @@ commands on a saved node for exactly this reason.
   rewrite laid over a conjunctive index can be zeroed by a single hallucinated
   token. A **bare OR** was measured as the third arm and rejected on precision:
   recall 0.94 on questions but precision-over-returned 0.24, and 1.00 → 0.32 on
-  keyword queries. `0.5` itself is measured rather than picked: 0.6 scores
-  better on the 312-node corpus and buys **no keyword recall at all** on 26- and
-  78-node ones, and a graph is small before it is large.
+  keyword queries. `0.5` itself is measured rather than picked, and was
+  re-measured under the function-word list: 0.6 scores better on question
+  precision (0.83 against 0.77 on 312 rows) and **costs keyword recall at every
+  size** (0.92 → 0.89 on 312, 0.96 → 0.92 on 47, 0.75 → 0.50 on 26), while 0.4
+  buys keyword recall and spends question precision (0.77 → 0.65 on 312). A
+  graph is small before it is large, so the constant is chosen where it still
+  works on a young one.
   **Phase 2's other carried finding — "source nodes outrank claim nodes" —
   does not reproduce as recorded, and the mechanism it names is wrong.** The
   note blamed BM25 length normalisation for not offsetting a `source` node
@@ -2139,11 +2301,15 @@ Phase-1 decision log.
   `ValueError` and so rendered as a clean 400 carrying the right sentence, but
   the request was well-formed and the graph was busy, which is what a client
   retries on and what 409 means. **And `POST /api/cycles` runs the cycle off the
-  event loop** (`run_in_threadpool`) — the one handler here that does not call
-  the service inline, because a cycle is minutes of work on a real graph and the
+  event loop** (`run_in_threadpool`), because a cycle is minutes of work on a
+  real graph and the
   loop is single-threaded, so inline it stalled `/healthz`, the SPA and every
   other request for the whole run. `_write` is what goes to the thread, so the
-  principal boundary is unchanged. **The caveat is the write lock, and it is
+  principal boundary is unchanged. **`GET /api/search` joins it** — both
+  branches, not just `?nl=1`: the ordinary branch catches two projectors up and
+  probes the index once per query term, and one 400-term `GET` (a 4 KB query
+  string, nothing exotic) was measured holding the loop **126 ms** with every
+  other tab waiting behind it. Those two are the whole exception list. **The caveat is the write lock, and it is
   measured**: the loop is free, but a `GET /api/nodes` issued while a cycle runs
   waited **1168 ms** against **5 ms** on an idle server, because SQLite has one
   writer and a reader queues behind the burst holding it. A client that times

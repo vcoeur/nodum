@@ -139,6 +139,7 @@ say so rather than promising a stop that would not arrive.
 from __future__ import annotations
 
 import hashlib
+import math
 import os
 import time
 from collections.abc import Mapping, Sequence
@@ -359,7 +360,15 @@ class SkippedItem(BaseModel):
 
 
 class JobCost(BaseModel):
-    """What one job's share of the budget bought."""
+    """What one job's share of the budget bought.
+
+    ``calls`` is every call that reached the wire and ``failed_calls`` is the
+    subset of them that **produced no usable result** — a timeout, an
+    unreachable server, an output cut at its ceiling, a prompt the server
+    truncated. The last two are charged as well as counted, because the tokens
+    were really spent; ``calls - failed_calls`` is the work that came back
+    usable.
+    """
 
     job: str
     budget_tokens: int
@@ -380,6 +389,14 @@ class LLMReport(BaseModel):
     itemised :attr:`skipped` — a statement about *this* run, false again
     tomorrow. Neither is ever written as a job ``note``, which is the
     vocabulary 5a's degraded path already owns.
+
+    :attr:`failed_calls` counts **calls that produced no usable result**, which
+    includes the ones that were paid for: a body cut at its output ceiling and a
+    prompt the server truncated are charged *and* counted here, because a night
+    of three discarded answers reporting three successes is the report telling
+    the opposite of what happened. :attr:`skipped` is the other half — items
+    nothing was even attempted for, whether a ceiling, a stop or a prompt that
+    could not fit refused them.
     """
 
     enabled: bool
@@ -414,11 +431,15 @@ class Budget:
     means the same thing at every level, and no budget ever holds an infinite
     ceiling that JSON cannot carry.
 
+    **The clock starts at the first call, not at construction** — see
+    :meth:`start`.
+
     Attributes:
         name: What this budget is for — a job name, or the run's purpose.
         tokens: The token ceiling. ``0`` means off.
         seconds: The wall-clock ceiling, measured from :attr:`started`.
         parent: The budget this one is a share of, if any.
+        started: When the wall clock started, or ``None`` while it has not.
     """
 
     name: str
@@ -429,7 +450,11 @@ class Budget:
     spent_output_tokens: int = 0
     calls: int = 0
     failed_calls: int = 0
-    started: float = field(default_factory=time.monotonic)
+    started: float | None = None
+    #: Shares this budget has already handed out, by job name. Kept because the
+    #: over-commit rule is about *every* share of this budget and not about the
+    #: ones that happened to arrive in the same call — see :meth:`split`.
+    _shares: dict[str, float] = field(default_factory=dict)
 
     @property
     def spent_tokens(self) -> int:
@@ -442,34 +467,58 @@ class Budget:
         """
         return self.spent_prompt_tokens + self.spent_output_tokens
 
+    @property
+    def declared_shares(self) -> Mapping[str, float]:
+        """Every share handed out of this budget so far, by job name."""
+        return dict(self._shares)
+
     def split(self, shares: Mapping[str, float]) -> dict[str, Budget]:
         """Derive per-job budgets from a declared split of this one (B1).
 
+        **The rule is about every share of this budget, not about the ones in
+        this call.** ``AgentRun.job`` is one ``split`` per job, so a guard
+        reading only its own argument let three jobs at 0.6 each hold 600 tokens
+        of a 1 000-token cycle — 180 % of the budget, reported as such in
+        :attr:`LLMReport.per_job`. Spending stayed bounded (the remainder is the
+        minimum down the chain); it was the report that lied, about the one
+        number a human checks a night against. So the shares accumulate here.
+
+        A **repeated name is refused** for a related reason: ``AgentRun._jobs``
+        is keyed by name, so a second budget under one name displaced the first
+        and took its calls and its tokens out of the report — a job that ran and
+        cost money, reported as never having had a turn.
+
         Args:
             shares: Job name → the fraction of this budget it may spend. Every
-                fraction must be positive and they must not sum above 1: a
-                split that over-committed would be per-job ceilings that add up
-                to more than the cycle agreed to, which is the defect a
-                per-cycle budget exists to prevent. Summing *below* 1 is fine
-                and is how a run holds some back.
+                fraction must be positive, no name may already have a share, and
+                the shares plus every share already handed out must not sum
+                above 1. Summing *below* 1 is fine and is how a run holds some
+                back.
 
         Returns:
             One budget per name, in the order given.
 
         Raises:
-            ValueError: If a share is not positive, or the shares over-commit.
+            ValueError: If a share is not positive, a name is already taken, or
+                the shares over-commit this budget.
         """
         for name, share in shares.items():
             if share <= 0:
                 raise ValueError(f"share for {name!r} must be positive, got {share}")
-        total = sum(shares.values())
+            if name in self._shares:
+                raise ValueError(
+                    f"the {self.name} budget already has a share for {name!r} "
+                    f"({self._shares[name]:g}); a second one would replace it and take the "
+                    f"first job's recorded spend out of the report"
+                )
+        total = sum(self._shares.values()) + sum(shares.values())
         # A float split of thirds sums to 0.9999999999999999 or 1.0000000000000002
         # depending on the order; the tolerance is for that and nothing wider.
         if total > 1.0 + 1e-9:
             raise ValueError(
                 f"job shares sum to {total:g}, which over-commits the {self.name} budget"
             )
-        return {
+        jobs = {
             name: Budget(
                 name=name,
                 tokens=int(self.tokens * share),
@@ -479,6 +528,8 @@ class Budget:
             )
             for name, share in shares.items()
         }
+        self._shares.update(shares)
+        return jobs
 
     @property
     def chain(self) -> list[Budget]:
@@ -490,9 +541,32 @@ class Budget:
             current = current.parent
         return budgets
 
+    def start(self) -> None:
+        """Start the wall clock for this budget and every ancestor, once.
+
+        The clock belongs to the *model use*, not to the object. ``for_cycle``
+        is built when the cycle opens and the LLM jobs run last, so a clock
+        started at construction charged the four deterministic jobs' minutes to
+        the LLM's ceiling: a report saying the model spent time it never had,
+        and — on a slow graph — a ceiling largely spent before the first prompt
+        was built. It reaches the whole chain because a child copies its
+        parent's :attr:`started` when it is split off, which for a job declared
+        before the first call is ``None``; one clock for the nesting means one
+        start for the nesting.
+
+        Idempotent: a budget already running keeps the instant it started, so
+        the second call of a run does not reset the night.
+        """
+        now = time.monotonic()
+        for budget in self.chain:
+            if budget.started is None:
+                budget.started = now
+
     @property
     def elapsed_seconds(self) -> float:
-        """Wall clock since the run started."""
+        """Wall clock since the first call, or 0 while none has been made."""
+        if self.started is None:
+            return 0.0
         return time.monotonic() - self.started
 
     @property
@@ -524,7 +598,15 @@ class Budget:
             budget.calls += 1
 
     def note_failure(self) -> None:
-        """Record a call that reached the wire and produced no usage to bill."""
+        """Record a call that produced no usable result.
+
+        Both kinds count: the call that never came back (a timeout, an
+        unreachable server — nothing to bill) and the call that came back and
+        was **thrown away** (a ``length`` finish, a prompt the server truncated
+        — charged, because the tokens were really spent). Counting only the
+        first made a night of three truncated answers report ``calls 3,
+        failed_calls 0``, which is a night of three successes.
+        """
         for budget in self.chain:
             budget.failed_calls += 1
 
@@ -579,14 +661,22 @@ def cycle_stop_check(
     return check
 
 
-def _positive_int(name: str, default: int) -> int:
-    """Read a non-negative whole number from the environment, or the default.
+def _positive_int(name: str, default: int, *, minimum: int = 0) -> int:
+    """Read a whole number of at least ``minimum`` from the environment.
 
     An unparseable value falls back and does **not** raise: the scheduler's
     precedent is that a server refusing to boot over a stray character in an
     optional setting is worse than one that says what it skipped — and here the
     fallback for the cycle budget is 0, which is *off*, so a typo cannot
     accidentally authorise spending.
+
+    ``minimum`` is what separates a *decision* from a *misconfiguration*, and
+    the two live behind the same reader. 0 on a budget means off, which is a
+    decision and the shipped default. 0 on the output ceiling is nothing
+    anybody chose: it reached the provider as ``ValueError: max_output_tokens
+    must be at least 1``, which the HTTP surface renders as a **400** — the
+    client-error voice — on every ``POST /api/ask``, about a request that was
+    perfectly well formed.
     """
     raw = (os.environ.get(name) or "").strip()
     if not raw:
@@ -595,11 +685,22 @@ def _positive_int(name: str, default: int) -> int:
         value = int(raw)
     except ValueError:
         return default
-    return value if value >= 0 else default
+    return value if value >= minimum else default
 
 
 def _positive_float(name: str, default: float) -> float:
-    """Read a positive number of seconds from the environment, or the default."""
+    """Read a positive, **finite** number of seconds from the environment.
+
+    ``float()`` reads ``inf``, ``Infinity`` and ``1e999`` happily, and neither
+    of the two serialisers this number reaches can carry the result:
+    ``cycles.report`` and every HTTP envelope are ``json.dumps`` with
+    ``allow_nan`` at its default, which writes a bare ``Infinity`` token that
+    is not JSON. Measured: ``NODUM_LLM_REQUEST_SECONDS=inf`` gave ``POST
+    /api/ask`` a 200 carrying ``"budget_seconds": Infinity``, and the browser's
+    ``JSON.parse`` threw on it. ``nan`` is worse in a quieter way — every
+    comparison against it is false, so ``remaining_seconds <= 0`` never fires
+    and the wall-clock ceiling stops existing without saying so.
+    """
     raw = (os.environ.get(name) or "").strip()
     if not raw:
         return default
@@ -607,7 +708,7 @@ def _positive_float(name: str, default: float) -> float:
         value = float(raw)
     except ValueError:
         return default
-    return value if value > 0 else default
+    return value if math.isfinite(value) and value > 0 else default
 
 
 class AgentRun:
@@ -630,23 +731,35 @@ class AgentRun:
         stop_switch: str = STOP_SWITCH_NONE,
         max_output_tokens: int | None = None,
         call_timeout: float | None = None,
+        budget_env: str = ENV_CYCLE_BUDGET,
     ) -> None:
         self.principal = principal
         self.purpose = purpose
         self.budget = budget
         self.stop = stop
         self.stop_switch = stop_switch
+        #: Which environment variable funds *this* run, so a refusal names the
+        #: one a human can act on: a request run reads
+        #: :data:`ENV_REQUEST_BUDGET` and is not affected by the cycle variable
+        #: at all.
+        self.budget_env = budget_env
         self.max_output_tokens = (
             max_output_tokens
             if max_output_tokens is not None
-            else _positive_int(ENV_MAX_OUTPUT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS)
+            else _positive_int(ENV_MAX_OUTPUT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, minimum=1)
         )
         self.call_timeout = (
             call_timeout
             if call_timeout is not None
             else _positive_float(ENV_CALL_TIMEOUT, DEFAULT_CALL_TIMEOUT)
         )
-        self.provider = llm.get_provider()
+        # Private, and that is the point (P3). A caller handed the provider
+        # object makes a call no budget, stop check or report can see, and the
+        # import rail cannot notice because holding an object imports nothing:
+        # demonstrated at `run.provider.chat(...)` with the budget at 0 and a
+        # stop firing, reporting `calls 0, total_tokens 0, stopped True`. What a
+        # caller legitimately needs is two numbers, and they are below.
+        self._provider = llm.get_provider()
         self.unavailable_reason = llm.unavailable_reason()
         self.stopped = False
         self._jobs: dict[str, Budget] = {}
@@ -665,7 +778,7 @@ class AgentRun:
     @property
     def available(self) -> bool:
         """Is a provider configured at all? (A configuration, not this run.)"""
-        return self.provider is not None
+        return self._provider is not None
 
     @property
     def enabled(self) -> bool:
@@ -682,19 +795,46 @@ class AgentRun:
 
     @property
     def model_id(self) -> str | None:
-        return self.provider.model_id if self.provider is not None else None
+        return self._provider.model_id if self._provider is not None else None
 
     @property
     def provider_id(self) -> str | None:
-        return self.provider.provider_id if self.provider is not None else None
+        return self._provider.provider_id if self._provider is not None else None
+
+    @property
+    def context_tokens(self) -> int | None:
+        """The window a prompt will be refused against, or ``None`` with no provider.
+
+        One of the two things a caller assembling a prompt needs from the
+        provider, and the reason it is answered *here*: a caller that fetched
+        the provider to read this number could go on to call it.
+        """
+        return self._provider.context_tokens if self._provider is not None else None
+
+    def estimate_prompt_tokens(self, messages: Sequence[Message]) -> int:
+        """The provider's own over-count of what these messages will cost.
+
+        The other thing a prompt builder needs — and it must be the *provider's*
+        estimate, because what gets fitted has to be exactly what would be
+        refused; a second estimator is free to disagree with the one that
+        decides.
+
+        Raises:
+            ProviderUnavailable: If none is configured. There is no honest
+                number to return, and the absence is reported the same way every
+                other reach for a missing provider here reports it.
+        """
+        if self._provider is None:
+            raise ProviderUnavailable(self.unavailable_reason or "no LLM provider configured")
+        return self._provider.estimate_prompt_tokens(messages)
 
     def generated_by(self, prompt_version_hash: str) -> GeneratedBy:
         """The provenance object for a write this run's text caused (A1)."""
-        if self.provider is None:
+        if self._provider is None:
             raise ProviderUnavailable(self.unavailable_reason or "no LLM provider configured")
         return GeneratedBy(
-            provider=self.provider.provider_id,
-            model_id=self.provider.model_id,
+            provider=self._provider.provider_id,
+            model_id=self._provider.model_id,
             prompt_version=prompt_version_hash,
         )
 
@@ -706,6 +846,15 @@ class AgentRun:
         The returned budgets are remembered, so :meth:`report` lists every job
         the run declared — including one that never made a call, which is how a
         reader tells "this job had no work" from "this job never got a turn".
+
+        Every share this run hands out is measured against the same ceiling,
+        across calls — see :meth:`Budget.split`, which is where the accumulation
+        lives so that a caller splitting ``run.budget`` directly is held to it
+        too. A name already declared is refused rather than replaced.
+
+        Raises:
+            ValueError: If a share is not positive, a name is already declared,
+                or the shares over-commit this run's budget.
         """
         jobs = self.budget.split(shares)
         self._jobs.update(jobs)
@@ -756,10 +905,12 @@ class AgentRun:
         over-counted estimate plus the whole output reservation — is measured
         against the budget next, and refused before anything is sent, so the
         budget is never overrun by a call whose cost was only discovered
-        afterwards. The provider then refuses an over-long prompt on its own
-        ceiling. Only after all three does a request go out; whatever comes
-        back is charged, *including* a failure, and a body that filled the
-        context or hit its output ceiling is discarded rather than returned.
+        afterwards. The per-call timeout is then lowered to whatever is left of
+        the run's clock, because a ceiling checked once and never again is not a
+        ceiling. The provider refuses an over-long prompt on its own window
+        last. Only after all four does a request go out; whatever comes back is
+        charged, *including* a failure, and a body the server truncated or cut
+        at its output ceiling is discarded rather than returned.
 
         Args:
             messages: The prompt.
@@ -785,9 +936,15 @@ class AgentRun:
                 configured could not be reached.
             PromptTooLong: If the prompt does not fit the model's window.
                 Nothing was spent — this is the refusal that exists so an
-                over-long prompt is never silently answered from a prefix.
-            ContextOverflow: If the server filled its context anyway. Charged.
-            OutputTruncated: If the output ceiling bit. Charged.
+                over-long prompt is never silently answered from a prefix — and
+                a named ``item_id`` is recorded as a skip, because something was
+                left unexamined even though nothing was billed.
+            ContextOverflow: If the server did not read the whole prompt after
+                all, by either signal (the report at the configured ceiling, or
+                below what the prompt's bytes can cost). Charged and counted as
+                a failed call.
+            OutputTruncated: If the output ceiling bit. Charged and counted as a
+                failed call.
         """
         ledger = job if job is not None else self.budget
         output_ceiling = (
@@ -796,12 +953,21 @@ class AgentRun:
         call_timeout = timeout if timeout is not None else self.call_timeout
 
         self.check_stop(job=job, item_id=item_id)
-        provider = self.provider
+        provider = self._provider
         if provider is None:
             raise ProviderUnavailable(self.unavailable_reason or "no LLM provider configured")
 
+        ledger.start()
         needed = provider.estimate_prompt_tokens(messages) + output_ceiling
         self._require_budget(ledger, needed, job=job, item_id=item_id)
+
+        # Per-call ⊂ per-job ⊂ per-cycle holds for the clock too, and it did not:
+        # the wall clock is checked before the call and never again, so with the
+        # shipped 120 s call timeout a run with a 2 s ceiling left reported an
+        # elapsed 3.0 — and a night overran its ceiling by up to two minutes.
+        # `_require_budget` has just refused a run with no time left, so what is
+        # left here is positive.
+        call_timeout = min(call_timeout, ledger.remaining_seconds)
 
         try:
             completion = provider.chat(
@@ -810,24 +976,38 @@ class AgentRun:
                 max_output_tokens=output_ceiling,
                 timeout=call_timeout,
             )
-        except PromptTooLong:
-            # Refused before the wire: no tokens spent, nothing to charge.
+        except PromptTooLong as failure:
+            # Refused before the wire: no tokens spent, nothing to charge, and
+            # not a failure of the provider's. But an item *was* left
+            # unexamined, and a run that refused three of them used to report
+            # `calls 0, failed_calls 0, skipped []` — byte-identical to a night
+            # on which the job found nothing to do.
+            if item_id is not None:
+                self.record_skip(
+                    job=job,
+                    item_id=item_id,
+                    reason=f"the prompt does not fit the model's window: {failure}",
+                )
             raise
         except ProviderUnavailable:
             ledger.note_failure()
             raise
 
         ledger.charge(completion)
-        if completion.context_filled:
+        if completion.context_filled or completion.prompt_truncated:
+            ledger.note_failure()
             raise ContextOverflow(
-                f"the provider filled its {completion.context_tokens}-token context "
-                f"({completion.prompt_tokens} prompt tokens), so part of the prompt was "
-                f"never read and the answer is from a prefix. The call is charged because "
-                f"it was really spent. Lower {llm.ENV_CONTEXT_TOKENS} to the model's real "
-                f"window, or send less context",
+                f"the provider read {completion.prompt_tokens} prompt tokens of a prompt "
+                f"estimated at {completion.prompt_estimate} against a configured "
+                f"{completion.context_tokens}-token window, so part of it was never read "
+                f"and the answer is from a prefix. The call is charged because it was "
+                f"really spent. Set {llm.ENV_CONTEXT_TOKENS} to the window the server "
+                f"actually serves (for ollama that is num_ctx / OLLAMA_CONTEXT_LENGTH, not "
+                f"the model card), or send less context",
                 completion,
             )
         if completion.output_truncated:
+            ledger.note_failure()
             raise OutputTruncated(
                 f"the answer hit its {output_ceiling}-token ceiling and is cut mid-token, "
                 f"so it is no result rather than a short one. The call is charged because "
@@ -906,6 +1086,25 @@ class AgentRun:
         one.
         """
         if ledger.tokens <= 0:
+            # Two different zeros, and telling a human to set a variable they
+            # have already set is worse than saying nothing. A *run* with no
+            # budget is the switch being off (K2 level 1) and names the variable
+            # that funds this posture — `for_request` reads
+            # `NODUM_LLM_REQUEST_BUDGET` and the cycle variable does nothing for
+            # it. A funded run whose job share rounded to zero is a split
+            # problem on a run whose report says `enabled: true`.
+            if self.budget.tokens > 0:
+                message = (
+                    f"the share of the {self.budget.name!r} budget allotted to "
+                    f"{ledger.name!r} rounds to 0 tokens, so no model call is made. Give "
+                    f"the job a larger share, or raise the run's {self.budget.tokens}-token "
+                    f"budget"
+                )
+            else:
+                message = (
+                    f"the LLM budget for {ledger.name!r} is 0, so no model call is made "
+                    f"(set {self.budget_env} to a token budget)"
+                )
             self._refuse(
                 ledger,
                 job=job,
@@ -913,10 +1112,7 @@ class AgentRun:
                 kind="off",
                 remaining=0,
                 needed=needed,
-                message=(
-                    f"the LLM budget for {ledger.name!r} is 0, so no model call is made "
-                    f"(set {ENV_CYCLE_BUDGET} to a token budget to turn the LLM jobs on)"
-                ),
+                message=message,
             )
         remaining_seconds = ledger.remaining_seconds
         if remaining_seconds <= 0:
@@ -1034,4 +1230,5 @@ def for_request(*, purpose: str, principal: Principal, budget: Budget | None = N
             tokens=_positive_int(ENV_REQUEST_BUDGET, DEFAULT_REQUEST_BUDGET),
             seconds=_positive_float(ENV_REQUEST_SECONDS, DEFAULT_REQUEST_SECONDS),
         ),
+        budget_env=ENV_REQUEST_BUDGET,
     )

@@ -106,9 +106,12 @@ including every parameter.
   RRF-fused). Takes the same two read-side space controls as `node list`:
   `--space` and `--include-meta`. **Terms are ORed under a quorum, not ANDed**:
   a node matches when the query terms it carries are worth at least half the
-  query's inverse-document-frequency weight, so a rare word earns a match and a
-  common one costs nothing. A question-shaped query works, and the fix for an
-  empty result is a *rarer* word rather than a shorter query.
+  query's inverse-document-frequency weight, counting **content words only** —
+  ordinary English function words (`what`, `does`, `how`, `let`, …) are dropped
+  first, so the words a question is *asked* with never outvote the word it is
+  *about*. A rare word earns a match and a common one costs nothing; the fix
+  for an empty result is a *rarer* word rather than a shorter query. A query
+  may carry at most 64 distinct terms.
   `--nl` asks the model to rewrite the question into search terms first and adds
   a `rewrite` object saying what was asked on your behalf; it is a rewrite of
   the words only — every signal, filter and cap below it is unchanged — and with
@@ -128,26 +131,53 @@ does not resolve). With no provider configured the refusal names
 `NODUM_LLM_MODEL`.
 
 - `ask <question> [--k N] [--space S]` — Answer a question from the graph, with
-  citations. **`answered` is computed from the citations, never from the
-  model**: every id the model cites is checked against the notes this request
-  actually retrieved, anything else lands in `unresolved`, and zero surviving
-  citations means the question was not answered and the answer text is not
-  returned. `considered` is what the model saw, `dropped` is what the retrieval
-  found and the context window could not carry, and `used` is what the attempt
-  cost.
+  citations. **`answered` is computed, never taken from the model**, and it is
+  exactly four deterministic checks: at least one cited id is a note this
+  request actually retrieved; the model did not *also* name a note that does not
+  exist while offering only one that does; every number in the answer appears in
+  the text that was really sent or in your question (`unsupported_numbers` lists
+  what did not); and there is answer text. Anything the model cited that this
+  retrieval did not return lands in `unresolved`, and a failed check means the
+  answer text is not returned.
+  **It does not mean the answer is true.** A model that invents content while
+  citing a real node passes all four — citation resolvability is not
+  groundedness — so the envelope is built to be read rather than trusted:
+  `considered` is what reached the model (empty when no call was made, which
+  `used.calls` corroborates), `truncated_notes` is what reached it **in part**
+  and every citation carries the same `truncated` flag, `dropped` is what the
+  retrieval found and the context window could not carry at all, and `used` is
+  what the attempt cost.
 - `summarize <node-id> [--depth N]` — Summarise a node and its neighbourhood,
-  under the same citation rule. It reads the subgraph whether or not a provider
-  is configured, so a node that does not exist is the ordinary not-found refusal
-  rather than a complaint about the model.
+  under the same citation and grounding rules. It reads the subgraph whether or
+  not a provider is configured, so a node that does not exist is the ordinary
+  not-found refusal rather than a complaint about the model. **What it sends is
+  narrower than what you can read**: archived, proposed and meta-space nodes the
+  walk returned are never put in front of the model — `ask` cannot reach them
+  either, and two endpoints on one install must not disagree about what leaves
+  the machine — and they are named in `withheld`, with each note's `state` in
+  the envelope. `truncated` stays the separate fact that the *walk* stopped at
+  its cap.
 - `llm status [--no-probe]` — Whether a provider is **configured**, and
   separately whether it is **reachable**. The two are different facts:
   configuration is free and permanent, reachability costs one small call and is
-  true only of this instant. `reachable` is therefore tri-state — `null` means
-  the question was not asked, because nothing was configured or because
-  `--no-probe` declined it. The failing probe is free (nothing listening answers
-  in about 3 ms, a model the server does not have in about 4); `--no-probe`
-  spends nothing at all. It takes `--as` although it reads no graph, because the
-  probe is a real model call and every model call in this system is attributed.
+  true only of this instant. `reachable` is therefore tri-state, and `null` is
+  *not established* rather than "not asked": nothing was configured, `--no-probe`
+  declined it, or the probe got no answer inside `call_timeout` — which is
+  deliberately not `false`, because a refused connection is a server that is not
+  running while no answer yet is very often a live server loading a model. The
+  failing probe is free (nothing listening answers in about 3 ms, a model the
+  server does not have in about 4); `--no-probe` spends nothing at all. It takes
+  `--as` although it reads no graph, because the probe is a real model call and
+  every model call in this system is attributed — and `used` reports what it
+  spent (34 tokens, measured). The probe waits the run's own
+  `NODUM_LLM_CALL_TIMEOUT`, so the sentence in `detail` and the number in
+  `call_timeout` agree.
+  The `context_tokens` it reports is `NODUM_LLM_CONTEXT_TOKENS` — **the window
+  your server serves, not the one the model card advertises**. With `ollama`
+  that is `num_ctx` (`OLLAMA_CONTEXT_LENGTH`, 4096 unless you raise it),
+  applied to every model it serves; setting this above it means an over-long
+  prompt is sent instead of refused, and the server answers from the part it
+  read without saying so.
 
 ### History and state
 

@@ -18,7 +18,12 @@ The keyword signal matches on a **quorum of the query's discriminating
 weight**, not on every term: see :func:`_compile_match`. A conjunctive matcher
 returns nothing as soon as one term of a question is absent, which on an
 install with no embedding provider — the default — makes a question-shaped
-query answer with silence.
+query answer with silence. The weight is measured over the query's *content*
+words only: a graph small enough that "what" sits in 7 rows of 47 gives its
+question words more inverse-document-frequency weight than the term that
+answers the question, so function words are named in a list
+(:data:`_QUERY_STOPWORDS`) rather than inferred from a frequency that has not
+got the corpus to say it with.
 
 Both projectors are caught up before querying, so search always reflects the
 latest committed events without a manual projector run.
@@ -73,6 +78,72 @@ _QUORUM_WEIGHT_FRACTION = 0.5
 #: match expression makes FTS5 walk a doclist the size of the graph.
 _COMMON_TERM_DF_FRACTION = 0.5
 
+#: English function words, dropped from the query beside the ubiquitous ones.
+#: The ceiling above is an *estimator* of "this word separates nothing", and on
+#: a small graph it is a broken one: a graph of short claims holds "what" in 7
+#: rows of 47, which is under any fraction worth setting, so the question words
+#: of a question outweigh the one term that answers it. Document frequency
+#: cannot tell a function word from a term at that size, and 47 rows is what
+#: every graph starts at — so the property is stated directly instead, as a
+#: list that does not move with corpus size. Nothing here carries topic meaning
+#: in a technical graph: `state`, `store`, `key`, `value`, `log`, `set`,
+#: `order`, `time`, `point`, `case`, `long`, `work`, `mean`, `group` and
+#: `number` are all deliberately absent, and a query left with nothing else
+#: falls back to searching these words like any other.
+#:
+#: Split from a string rather than written as a list literal (SIM905) because
+#: the formatter puts a list literal one word to a line, and 200 lines of that
+#: is a list nobody will read to check what is in it.
+_QUERY_STOPWORDS = frozenset(
+    """
+a an the this that these those
+i me my mine myself we us our ours you your yours he him his she her hers
+it its they them their theirs one ones oneself
+what which who whom whose when where why how whether
+am is are was were be been being
+do does did doing done
+have has had having
+can could will would shall should may might must ought
+let lets get gets got go goes going gone went
+make makes made making need needs want wants
+about above across after against along among and any anybody anyone anything
+around as at away
+back because before behind below beneath beside besides between beyond both
+but by
+despite down during
+each either else enough even ever every everybody everyone everything except
+few for from further
+here hereby however
+if in inside instead into
+just
+least less like likely
+many maybe more most much
+near neither never no nobody none nor not nothing now
+of off often on once only onto or other others otherwise out outside over own
+per perhaps please
+quite
+rather really
+same several since so some somebody someone something sometimes still such
+than then there therefore they though through throughout
+thus till to together too toward towards
+under underneath unless until up upon
+very via
+whatever whenever wherever while whilst with within without
+yet
+""".split()  # noqa: SIM905
+)
+
+#: The most distinct terms one query may carry. Above 500 usable terms the
+#: quorum's ``UNION ALL`` hits ``SQLITE_LIMIT_COMPOUND_SELECT`` and SQLite
+#: raises — which reached the caller as a **503** from ``GET /api/search`` and
+#: ``POST /api/ask`` and as *"database error"* from the CLI, three storage-voice
+#: failures for what is plainly an oversized request. The cap is what makes it
+#: a 400 instead, and it is set far above any query this system produces: the
+#: model's own rewrite is capped at eight terms
+#: (:data:`nodum.answers.MAX_REWRITE_TERMS`) and the longest question measured
+#: is eleven.
+_MAX_QUERY_TERMS = 64
+
 
 def _connect(path: str | Path | None) -> sqlite3.Connection:
     """Open a connection and apply any pending migrations (idempotent)."""
@@ -94,6 +165,12 @@ def _query_terms(query: str) -> list[str]:
     Repeats are dropped case-insensitively because the quorum weighs terms:
     typing a word twice would otherwise count its weight twice, both in what a
     document must reach and in what it can collect.
+
+    Raises:
+        ValueError: If the query has no terms, or more than
+            :data:`_MAX_QUERY_TERMS` distinct ones — both are malformed
+            requests, and the second used to be a storage failure (see the
+            constant).
     """
     seen: dict[str, str] = {}
     for token in query.split():
@@ -101,7 +178,22 @@ def _query_terms(query: str) -> list[str]:
             seen.setdefault(token.casefold(), '"' + token.replace('"', '""') + '"')
     if not seen:
         raise ValueError("query must contain at least one term")
+    if len(seen) > _MAX_QUERY_TERMS:
+        raise ValueError(
+            f"query has {len(seen)} distinct terms; at most {_MAX_QUERY_TERMS} are searched"
+        )
     return list(seen.values())
+
+
+def _is_function_word(term: str) -> bool:
+    """Whether a quoted term is one of :data:`_QUERY_STOPWORDS`.
+
+    The term is quoted FTS5 syntax by now, and a question mark rides along on
+    the last word of every question, so both come off before the lookup:
+    ``"against?"`` is the same function word as ``against``. Inner punctuation
+    stays, which is what keeps ``min.insync.replicas`` one term.
+    """
+    return term.strip('"').strip("?!.,;:()[]{}'…").casefold() in _QUERY_STOPWORDS
 
 
 class _MatchPlan(NamedTuple):
@@ -118,7 +210,13 @@ class _MatchPlan(NamedTuple):
     clause: str
 
 
-def _compile_match(conn: sqlite3.Connection, terms: list[str]) -> _MatchPlan:
+def _compile_match(
+    conn: sqlite3.Connection,
+    terms: list[str],
+    *,
+    filters: list[str],
+    filter_params: list,
+) -> _MatchPlan:
     """Compile terms into an ORed expression plus a quorum over their weight.
 
     The shipped rule was ``AND``, and it is the reason a question-shaped query
@@ -132,12 +230,9 @@ def _compile_match(conn: sqlite3.Connection, terms: list[str]) -> _MatchPlan:
     weight is its BM25 inverse document frequency, which is a measure of how
     much it discriminates — so a rare term counts for more than a common one,
     and a document qualifies by carrying enough of the query's *discriminating
-    power* rather than enough of its *words*. That distinction is what makes
-    the rule work on a question: eight of a question's twelve words are
-    function words the graph holds everywhere, they are worth almost nothing,
-    and the four words that mean something decide the outcome.
+    power* rather than enough of its *words*.
 
-    Two kinds of term are dropped before any of that, both for the same reason
+    Three kinds of term are dropped before any of that, all for the same reason
     — they separate nothing:
 
     * **absent** (``df = 0``): BM25 already scores it zero, and keeping it
@@ -146,18 +241,44 @@ def _compile_match(conn: sqlite3.Connection, terms: list[str]) -> _MatchPlan:
     * **everywhere** (``df`` above :data:`_COMMON_TERM_DF_FRACTION`): its
       weight is near zero anyway, but leaving it in the match expression makes
       FTS5 walk a doclist the size of the graph to rank on it.
+    * **a function word** (:data:`_QUERY_STOPWORDS`): the previous rule was
+      the estimator for this one, and on a young graph it estimates wrong.
+      A 47-row graph of short claims holds *what* in 7 rows and *does* in 8,
+      both far under any ceiling worth setting, so the bar became mostly the
+      weight of the question's phrasing — and the one node carrying the
+      question's only rare term was excluded by exactly the words it does not
+      contain. The list is the same on 47 rows and on 312, which is the whole
+      point of it being a list.
+
+    Each surviving term's document frequency is counted **over the rows this
+    search can actually return** — the same ``filters`` the ranked query
+    applies. Counting the whole index instead made the bar depend on rows the
+    caller cannot read: one word planted in a private space turned six hits
+    into none, which is an existence oracle over every space in the file for
+    anything holding ``search`` (it is in ``mcp_server.READ_TOOLS``). Scoping
+    also makes the weight *right*, since a term's rarity is a property of the
+    corpus being searched.
 
     A query left with one term needs no quorum — matching it *is* the quorum —
-    so a one-word search runs exactly the statement it ran before.
+    so a one-word search runs exactly the statement it ran before. With exactly
+    **two** terms the comparison is strict, because equal document frequency
+    gives equal weight and ``>=`` then admits either term alone: the quorum
+    silently becomes the bare OR it was chosen over, measured at 0.111
+    precision over the returned list against 0.722. The strictness is gated on
+    the two-term case rather than applied throughout: with four equal terms a
+    blanket ``>`` would move the bar from two-of-four to three-of-four, which
+    is a quorum nobody chose.
 
     The cost is one index probe per term plus one row count, all of which scale
-    with the *number* of indexed nodes rather than their text (measured: the
-    count is 0.14 ms over 312 rows holding 6.6 MB and 0.17 ms over 456 rows
-    holding 5.1 MB). At the scale this system is for that is well under a
-    millisecond; it is linear, so a graph two orders of magnitude larger would
-    want the total cached rather than counted.
+    with the *number* of indexed nodes rather than their text (measured: 0.02 ms
+    per probe over 312 rows holding 6.6 MB). The term count is capped
+    (:data:`_MAX_QUERY_TERMS`), so both are bounded.
     """
-    total_rows = conn.execute("SELECT count(*) AS n FROM node_fts").fetchone()["n"]
+    scope = " AND ".join(filters) if filters else "1 = 1"
+    total_rows = conn.execute(
+        f"SELECT count(*) AS n FROM node_fts JOIN nodes n ON n.id = node_fts.node_id WHERE {scope}",
+        filter_params,
+    ).fetchone()["n"]
     plain = _MatchPlan(match=" OR ".join(terms), cte="", cte_params=[], clause="")
     if total_rows == 0 or len(terms) == 1:
         return plain
@@ -165,18 +286,23 @@ def _compile_match(conn: sqlite3.Connection, terms: list[str]) -> _MatchPlan:
         (
             term,
             conn.execute(
-                "SELECT count(*) AS n FROM node_fts WHERE node_fts MATCH ?", (term,)
+                "SELECT count(*) AS n FROM node_fts JOIN nodes n ON n.id = node_fts.node_id"
+                f" WHERE node_fts MATCH ? AND {scope}",
+                (term, *filter_params),
             ).fetchone()["n"],
         )
         for term in terms
     ]
     ceiling = max(1, int(total_rows * _COMMON_TERM_DF_FRACTION))
-    kept = [(term, df) for term, df in frequencies if 0 < df <= ceiling]
-    if not kept:
-        # Every term is either absent or ubiquitous. On a small or single-topic
-        # graph the second is ordinary — every node really does say "kafka" —
-        # so fall back to the terms the graph knows rather than to nothing.
-        kept = [(term, df) for term, df in frequencies if df > 0]
+    known = [(term, df) for term, df in frequencies if df > 0]
+    ordinary = [(term, df) for term, df in known if df <= ceiling]
+    kept = [(term, df) for term, df in ordinary if not _is_function_word(term)]
+    # Each fallback is the previous rule relaxed by one step: a query of nothing
+    # but function words ("what is it") searches them, and on a small or
+    # single-topic graph where every node really does say "kafka", a query of
+    # nothing but ubiquitous terms searches those. Only a query the graph has
+    # never seen a word of falls through to matching nothing.
+    kept = kept or ordinary or known
     if not kept:
         return plain
     weights = [(term, math.log(1 + (total_rows - df + 0.5) / (df + 0.5))) for term, df in kept]
@@ -190,11 +316,12 @@ def _compile_match(conn: sqlite3.Connection, terms: list[str]) -> _MatchPlan:
     for term, weight in weights:
         params.extend((weight, term))
     params.append(_QUORUM_WEIGHT_FRACTION * sum(weight for _, weight in weights))
+    comparison = ">" if len(weights) == 2 else ">="
     return _MatchPlan(
         match=match,
         cte=(
             f"WITH matched(node_id, weight) AS ({branches}), quorum(node_id) AS ("
-            " SELECT node_id FROM matched GROUP BY node_id HAVING SUM(weight) >= ?)"
+            f" SELECT node_id FROM matched GROUP BY node_id HAVING SUM(weight) {comparison} ?)"
         ),
         cte_params=params,
         clause="node_fts.node_id IN (SELECT node_id FROM quorum)",
@@ -319,11 +446,15 @@ def _search_bm25(
     The quorum has to sit in the ``WHERE`` rather than filter the result:
     ranking first and filtering after would drop good rows off the end of
     ``LIMIT k`` before anything looked at them.
+
+    The filters are built first and handed to :func:`_compile_match`, which
+    counts document frequencies through them: the weights are over the corpus
+    being searched, never over the whole index.
     """
-    plan = _compile_match(conn, terms)
     filters, params = _node_filters(
         state, type_id, created_by, created_after, created_before, include_meta, space_id, principal
     )
+    plan = _compile_match(conn, terms, filters=filters, filter_params=params)
     clauses = ["node_fts MATCH ?", *([plan.clause] if plan.clause else []), *filters]
     weights = ", ".join(str(w) for w in _BM25_WEIGHTS)
     rows = conn.execute(
@@ -552,11 +683,13 @@ def search(
     to BM25 (+ graph expansion) without failing.
 
     Args:
-        query: Free-text query. The keyword signal keeps a node when the query
-            terms it carries are worth at least half the query's total
-            inverse-document-frequency weight (:func:`_compile_match`), so a
-            question keeps working when the graph does not hold every one of
-            its words; the vector signal embeds the query whole.
+        query: Free-text query, at most :data:`_MAX_QUERY_TERMS` distinct
+            terms. The keyword signal keeps a node when the query terms it
+            carries are worth at least half the query's total
+            inverse-document-frequency weight, counting content words only
+            (:func:`_compile_match`), so a question keeps working when the
+            graph does not hold every one of its words; the vector signal
+            embeds the query whole.
         k: Maximum hits.
         state: Node-state filter (default ``active``); ``None`` searches all
             states.
@@ -582,7 +715,8 @@ def search(
         ``vector``, ``graph``).
 
     Raises:
-        ValueError: If the query has no terms, if ``k`` is below 1, or if the
+        ValueError: If the query has no terms or more than
+            :data:`_MAX_QUERY_TERMS`, if ``k`` is below 1, or if the
             type or space does not resolve — an ungranted space and a
             nonexistent one read alike. ``k`` goes through
             :func:`nodum.service.require_positive_limit`, the same helper every
@@ -592,7 +726,7 @@ def search(
     """
     require_positive_limit(k, "k")
     # Term-splitting is the one validation that can fail before any work: an
-    # empty query must not cost a projector run.
+    # empty query (or an oversized one) must not cost a projector run.
     terms = _query_terms(query)
     # Derived indexes first: the projectors are incremental, so this is cheap.
     projectors.run_projectors(names=["fts", "vec"], path=path)

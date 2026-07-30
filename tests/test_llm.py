@@ -16,6 +16,7 @@ matching the convention ``tests/test_embeddings.py`` already set.
 from __future__ import annotations
 
 import ast
+import http.client
 import json
 import os
 import urllib.error
@@ -52,12 +53,22 @@ PROVIDER_MODULE = "nodum.llm"
 
 
 def _package_modules() -> dict[str, Path]:
-    """Every module in the package, by dotted name."""
-    return {
+    """Every module in the package, by dotted name — ``__init__.py`` included.
+
+    The package's own ``__init__`` is a node like any other and skipping it was
+    a hole rather than a tidiness: most modules here say ``from nodum import
+    …``, so the ``nodum`` node has inbound edges from most of the graph, and
+    with no outbound edges of its own a re-export placed there — the one-line
+    convenience somebody eventually adds — would put the provider one hop from
+    every guarded module with nothing to notice.
+    """
+    modules = {
         f"nodum.{path.stem}": path
         for path in Path(nodum.__file__).parent.glob("*.py")
         if path.stem != "__init__"
     }
+    modules["nodum"] = Path(nodum.__file__)
+    return modules
 
 
 def _nodum_imports(source: str) -> set[str]:
@@ -79,7 +90,10 @@ def _nodum_imports(source: str) -> set[str]:
     ``importlib.import_module("nodum.llm")`` / ``__import__("nodum.llm")``
         The dynamic spellings, which no AST walk over *imports* would see —
         which is precisely why a rail that only read ``ast.Import`` would be a
-        rail with a documented way around it.
+        rail with a documented way around it. **Positionally or by keyword**:
+        both take ``name``, and a walk over ``node.args`` alone was blind to
+        ``import_module(name="nodum.llm")`` — a constant string this claims to
+        catch, spelled the way an IDE's signature help suggests it.
     ``nodum.llm.something`` after a bare ``import nodum``
         An attribute chain. It only resolves if something else has already
         imported the submodule, so it is not on its own a working import — but
@@ -108,7 +122,8 @@ def _nodum_imports(source: str) -> set[str]:
             if isinstance(node.func, ast.Name):
                 name = node.func.id
             if name in {"import_module", "__import__"}:
-                for argument in node.args:
+                arguments = [*node.args, *(keyword.value for keyword in node.keywords)]
+                for argument in arguments:
                     if (
                         isinstance(argument, ast.Constant)
                         and isinstance(argument.value, str)
@@ -206,13 +221,47 @@ def test_the_rail_sees_every_spelling_of_the_import():
         "relative-package": "from . import llm",
         "relative-module": "from .llm import get_provider",
         "importlib": "import importlib\nbackend = importlib.import_module('nodum.llm')",
+        "importlib-keyword": (
+            "import importlib\nbackend = importlib.import_module(name='nodum.llm')"
+        ),
         "dunder-import": "backend = __import__('nodum.llm')",
+        "dunder-keyword": "backend = __import__(name='nodum.llm')",
         "attribute-chain": "import nodum\nbackend = nodum.llm.get_provider()",
     }
     blind = [
         name for name, source in spellings.items() if PROVIDER_MODULE not in _nodum_imports(source)
     ]
     assert blind == [], f"the rail cannot see these spellings: {blind}"
+
+
+def test_the_rail_sees_a_re_export_placed_in_the_package_init():
+    """``nodum/__init__.py`` is a node too, or a re-export there is invisible.
+
+    Most modules here say ``from nodum import …`` somewhere, so the package node
+    has an inbound edge from most of the graph. A glob that skips ``__init__.py``
+    gives that node no *outbound* edges at all — and ``from nodum.llm import
+    get_provider`` placed there, the one-line convenience re-export somebody
+    reaches for eventually, would put the provider one hop from every guarded
+    module while both properties in this file went on passing.
+
+    The injection is what makes the claim checkable: the real ``__init__``
+    correctly re-exports nothing, so an assertion over the real graph alone
+    could never exercise this edge.
+    """
+    modules = _package_modules()
+    assert "nodum" in modules, (
+        "the package's own __init__.py is not a node in the graph, so a re-export "
+        "placed there is invisible to both properties in this file"
+    )
+    assert modules["nodum"] == Path(nodum.__file__)
+
+    graph = _import_graph()
+    graph["nodum"] = graph["nodum"] | {PROVIDER_MODULE}
+    paths = _reachable("nodum.service", graph)
+    assert PROVIDER_MODULE in paths, (
+        "nodum.service does not reach the package node at all, so the re-export above "
+        "proves nothing; the extractor has stopped seeing `from nodum import …`"
+    )
 
 
 def test_the_rail_sees_a_reach_through_one_hop():
@@ -399,10 +448,13 @@ def test_the_estimate_of_an_empty_prompt_is_the_template_overhead():
 
 
 class _FakeResponse:
-    def __init__(self, body: bytes) -> None:
+    def __init__(self, body: bytes, *, read_raises: BaseException | None = None) -> None:
         self._body = body
+        self._read_raises = read_raises
 
     def read(self) -> bytes:
+        if self._read_raises is not None:
+            raise self._read_raises
         return self._body
 
     def __enter__(self) -> _FakeResponse:
@@ -413,11 +465,23 @@ class _FakeResponse:
 
 
 class _Wire:
-    """Records what was sent and replays a scripted answer."""
+    """Records what was sent and replays a scripted answer.
 
-    def __init__(self, answer: Any = None, *, raises: BaseException | None = None) -> None:
+    ``raises`` is a connection that never produced a response; ``read_raises``
+    is a response whose *body* died halfway — two different deaths, and the
+    second one only exists on this side of ``urlopen``.
+    """
+
+    def __init__(
+        self,
+        answer: Any = None,
+        *,
+        raises: BaseException | None = None,
+        read_raises: BaseException | None = None,
+    ) -> None:
         self.answer = answer
         self.raises = raises
+        self.read_raises = read_raises
         self.requests: list[urllib.request.Request] = []
         self.timeouts: list[float] = []
 
@@ -427,7 +491,7 @@ class _Wire:
         if self.raises is not None:
             raise self.raises
         body = self.answer if isinstance(self.answer, bytes) else json.dumps(self.answer).encode()
-        return _FakeResponse(body)
+        return _FakeResponse(body, read_raises=self.read_raises)
 
     @property
     def payload(self) -> dict[str, Any]:
@@ -458,8 +522,15 @@ def _answer(
 def wire(monkeypatch):
     """Replace the transport; return the recorder."""
 
-    def install(answer: Any = None, *, raises: BaseException | None = None) -> _Wire:
-        recorder = _Wire(answer if answer is not None else _answer(), raises=raises)
+    def install(
+        answer: Any = None,
+        *,
+        raises: BaseException | None = None,
+        read_raises: BaseException | None = None,
+    ) -> _Wire:
+        recorder = _Wire(
+            answer if answer is not None else _answer(), raises=raises, read_raises=read_raises
+        )
         monkeypatch.setattr(urllib.request, "urlopen", recorder)
         return recorder
 
@@ -647,6 +718,74 @@ def test_a_timeout_is_its_own_failure(wire, raised: BaseException):
     assert issubclass(llm.ProviderTimeout, llm.ProviderUnavailable)
 
 
+def test_a_provider_that_dies_mid_response_is_a_provider_failure_and_not_a_traceback(wire):
+    """The shape a killed provider, a proxy timeout or a dropped load balancer makes.
+
+    ``response.read()`` raises :class:`http.client.IncompleteRead` when the body
+    stops short of its ``Content-Length``. That class derives from
+    ``HTTPException``, **not** from ``OSError``, so the clause that catches a
+    refused connection misses it entirely: it escaped :class:`~nodum.llm.LLMError`,
+    escaped ``answers.ask``'s handler and escaped ``cli._run`` — reproduced as a
+    Rich traceback and exit 1 on the CLI, and an HTTP 500 on ``POST /api/ask``.
+    Every other way for a provider to die here is already clean, which is what
+    made this one worth a test of its own.
+    """
+    assert not issubclass(http.client.HTTPException, OSError), (
+        "the hierarchy this test exists for has changed; re-check the except clauses"
+    )
+    wire(read_raises=http.client.IncompleteRead(b"x" * 42, 358))
+    with pytest.raises(llm.ProviderUnavailable, match="not reachable"):
+        _provider().chat([llm.Message(role="user", content="hi")], max_output_tokens=8, timeout=5.0)
+
+
+def test_every_way_a_provider_can_die_here_is_an_llm_error(wire):
+    """The property the CLI and the HTTP surface both rest on.
+
+    ``answers.ask`` turns an :class:`~nodum.llm.LLMError` into a 200 with a
+    refusal and ``cli._run`` turns it into a named failure; anything else is a
+    traceback. So each death shape below is pinned as a *subclass check* rather
+    than as a message.
+
+    Each case's outcome is **recorded rather than skipped**, and a healthy wire
+    rides along expecting the opposite outcome, because "nothing escaped" is
+    also what a loop that raised nothing at all would report: a death shape that
+    quietly produced a completion, or a fixture that never installed itself,
+    would leave an escapes-only list empty and pass on a wire nothing was wrong
+    with. The control row is what proves this table can express both answers.
+    """
+    cases: list[tuple[str, dict[str, Any], str]] = [
+        ("healthy", {}, "no exception at all"),
+        (
+            "refused",
+            {"raises": urllib.error.URLError(ConnectionRefusedError(111, "refused"))},
+            "LLMError",
+        ),
+        ("timeout", {"raises": TimeoutError("timed out")}, "LLMError"),
+        ("reset", {"raises": ConnectionResetError(104, "Connection reset by peer")}, "LLMError"),
+        ("half-read", {"read_raises": http.client.IncompleteRead(b"x" * 42, 358)}, "LLMError"),
+        ("bad-status", {"read_raises": http.client.BadStatusLine("garbage")}, "LLMError"),
+        ("not-json", {"answer": b"<html>gateway timeout</html>"}, "LLMError"),
+    ]
+    outcomes = {}
+    for label, kwargs, _ in cases:
+        options = dict(kwargs)
+        answer = options.pop("answer", None)
+        wire(answer, **options)
+        try:
+            _provider().chat(
+                [llm.Message(role="user", content="hi")], max_output_tokens=8, timeout=5.0
+            )
+        except llm.LLMError:
+            outcomes[label] = "LLMError"
+        except BaseException as failure:  # noqa: BLE001 — that is the finding
+            outcomes[label] = f"escaped: {type(failure).__name__}"
+        else:
+            outcomes[label] = "no exception at all"
+    assert outcomes == {label: expected for label, _, expected in cases}, (
+        f"a provider death that does not reach the caller as an LLMError: {outcomes}"
+    )
+
+
 def test_a_body_that_is_not_json_is_unavailable(wire):
     wire(b"<html>gateway timeout</html>")
     with pytest.raises(llm.ProviderUnavailable, match="not JSON"):
@@ -721,6 +860,96 @@ def test_a_completion_well_inside_the_window_says_so(wire):
         [llm.Message(role="user", content="hi")], max_output_tokens=8, timeout=5.0
     )
     assert completion.context_filled is False
+    assert completion.prompt_truncated is False
+
+
+# ── The truncation the configured window cannot see ───────────────────────────
+
+
+def test_a_window_configured_above_the_serving_one_hides_the_truncation_from_context_filled(wire):
+    """The hole, reproduced: the binding limit is the **server's**, not the model's.
+
+    Measured with ``NODUM_LLM_CONTEXT_TOKENS=32768`` against ollama, which
+    serves every model at ``num_ctx`` 4 096 unless ``OLLAMA_CONTEXT_LENGTH``
+    says otherwise — while ``llama3.2:1b`` really does have a 128 k window, so
+    the docstring's "raise it only for a model that really has the room" is
+    advice that produces exactly this. A 30 000-character prompt is not refused,
+    ``prompt_tokens`` comes back 4 096, ``finish_reason`` is ``"stop"``, and
+    :attr:`~nodum.llm.Completion.context_filled` is **false**, because 4 096 is
+    nowhere near 32 768. A whole answer is returned from a prefix with nothing
+    saying so.
+    """
+    wire(_answer(prompt_tokens=4096, finish_reason="stop"))
+    completion = _provider(context_tokens=32768).chat(
+        [llm.Message(role="user", content="Kafka is a distributed commit log. " * 857)],
+        max_output_tokens=512,
+        timeout=5.0,
+    )
+    assert completion.context_filled is False, (
+        "context_filled compares the report against the *configured* number, so it "
+        "cannot see this case — that is the finding, not a regression"
+    )
+    assert completion.prompt_truncated is True, (
+        "the server read 4 096 tokens of a prompt that cannot cost fewer than "
+        f"{completion.prompt_estimate // llm.MAX_BYTES_PER_TOKEN}, and nothing said so"
+    )
+
+
+@pytest.mark.parametrize(
+    ("label", "text", "measured"),
+    MEASURED_TOKEN_COSTS,
+    ids=[row[0] for row in MEASURED_TOKEN_COSTS],
+)
+def test_a_prompt_the_server_read_whole_is_never_flagged_as_truncated(
+    wire, label: str, text: str, measured: int
+):
+    """The other half, and the one that decides :data:`~nodum.llm.MAX_BYTES_PER_TOKEN`.
+
+    The estimate over-counts — that is what makes it a *bound* — so "below the
+    estimate" is true of nearly every honest call and would flag them all. What
+    is checkable is "below the fewest tokens this many bytes can possibly be",
+    and how few that is depends on the script. These are the same ten measured
+    prompts the estimate is calibrated against, replayed with the token count
+    the real tokeniser charged (plus the chat template's measured 25-token
+    preamble): the loosest is Arabic at 4.55 bytes per token, and a constant
+    tighter than that would call a perfectly whole prompt truncated.
+    """
+    wire(_answer(prompt_tokens=measured + 25))
+    completion = _provider(context_tokens=200_000).chat(
+        [llm.Message(role="user", content=text)], max_output_tokens=8, timeout=5.0
+    )
+    assert completion.prompt_truncated is False, (
+        f"{label}: a whole prompt of {len(text.encode())} bytes really costing "
+        f"{measured} tokens was called truncated; MAX_BYTES_PER_TOKEN is too tight"
+    )
+
+
+def test_the_estimate_the_refusal_used_travels_back_on_the_completion(wire):
+    """How the estimate reaches :class:`~nodum.llm.Completion`: the provider puts it
+    there, because the provider is the only thing that has it — it computes the
+    number for the pre-send refusal one line earlier, and a caller recomputing it
+    would be a second estimator that can disagree with the one that decided."""
+    wire(_answer(prompt_tokens=91))
+    messages = [llm.Message(role="user", content="hi")]
+    completion = _provider().chat(messages, max_output_tokens=8, timeout=5.0)
+    assert completion.prompt_estimate == llm.estimate_prompt_tokens(messages)
+
+
+def test_a_completion_with_no_recorded_estimate_claims_no_truncation():
+    """0 means "nobody measured", not "a prompt of nothing" — a hand-built
+    completion (a test fake, a replayed row) must not read as truncated."""
+    completion = llm.Completion(
+        text="ok",
+        prompt_tokens=4096,
+        output_tokens=5,
+        finish_reason="stop",
+        model_id="m",
+        provider_id="p",
+        context_tokens=32768,
+        latency_ms=1,
+    )
+    assert completion.prompt_estimate == 0
+    assert completion.prompt_truncated is False
 
 
 # ── Resolution ────────────────────────────────────────────────────────────────
@@ -887,9 +1116,13 @@ def test_the_shipped_provider_drives_the_live_model():
 def test_the_live_model_still_truncates_silently_when_the_window_is_misconfigured():
     """The measurement the refusal exists for, reproduced end to end.
 
-    Configure a window wider than the model's real one — the operator mistake
-    ``NODUM_LLM_CONTEXT_TOKENS`` invites — and the refusal passes, the server
-    drops what did not fit, and **nothing in the response says so**.
+    Configure a window wider than the one the server *serves* — the operator
+    mistake ``NODUM_LLM_CONTEXT_TOKENS`` invites, and the one ollama makes easy
+    by serving every model at ``num_ctx`` 4 096 whatever its card says — and the
+    refusal passes, the server drops what did not fit, and **nothing in the
+    response body says so**. ``context_filled`` cannot see it either, because it
+    compares the report against that same wrong number; ``prompt_truncated``
+    can, because it compares against what the bytes really cost.
 
     Note what is deliberately *not* asserted: ``finish_reason``. It describes
     the output and only the output. This call comes back ``"length"`` because
@@ -911,7 +1144,12 @@ def test_the_live_model_still_truncates_silently_when_the_window_is_misconfigure
         "NODUM_LLM_CONTEXT_TOKENS says"
     )
     assert completion.context_filled is False, (
-        "the misconfigured provider cannot see the truncation, which is the hole"
+        "the configured-window check cannot see this truncation, which is the hole"
+    )
+    assert completion.prompt_truncated is True, (
+        "the estimate-based check is what closes it: the server read "
+        f"{completion.prompt_tokens} tokens of a prompt that cannot cost fewer than "
+        f"{completion.prompt_estimate // llm.MAX_BYTES_PER_TOKEN}"
     )
 
     # Configured honestly, the same prompt never leaves the process.

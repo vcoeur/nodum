@@ -631,9 +631,11 @@ degrades to BM25 + graph expansion. `NODUM_EMBED_MODEL` switches the model
   provider, the vector signal drops out and search stays BM25 + graph.
   **The keyword half ORs the terms under a quorum rather than ANDing them**: a
   node matches when the query terms it carries are worth at least half the
-  query's inverse-document-frequency weight, so a rare word earns a match, a
-  common one costs nothing, and a question-shaped query works. When a search
-  comes back empty, the fix is a *rarer* word, not a shorter query.
+  query's inverse-document-frequency weight, counting content words only — the
+  ordinary English a question is phrased with is dropped before the weighing,
+  so a rare word earns a match, a common one costs nothing, and the words you
+  ask with never outvote the word you are asking about. When a search comes
+  back empty, the fix is a *rarer* word, not a shorter query.
 - **A model can read the graph, and it never writes it.** `nodum ask`,
   `nodum summarize` and `nodum search --nl` (over HTTP: `POST /api/ask`,
   `POST /api/summarize`, `GET /api/search?nl=1`) put a language model in front

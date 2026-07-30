@@ -622,11 +622,21 @@ def ask(
     never from the model's own claim to have answered, which was measured
     coming back `true` for a question its context could not answer.
 
+    **`answered: true` means four deterministic checks held, not that the answer
+    is true.** At least one citation resolves; the model did not also name a
+    note that does not exist while offering only one that does; every number in
+    the answer appears in the text that was really sent or in your question; and
+    there is answer text. A model that invents content while citing a real node
+    passes all four — so read the citations, and read `truncated_notes`, which
+    names every note the model saw only part of.
+
     An unanswered question is an ordinary result and exit 0, not an error: the
     envelope carries `answered: false`, a `refusal` saying why, `unresolved`
-    listing anything the model cited that does not exist, and `used` saying what
-    the attempt cost. With no provider configured the refusal names
-    `NODUM_LLM_MODEL`.
+    listing anything the model cited that does not exist,
+    `unsupported_numbers` listing what the answer stated and the notes did not,
+    and `used` saying what the attempt cost. `considered` is what reached the
+    model and is empty when no call was made. With no provider configured the
+    refusal names `NODUM_LLM_MODEL`.
     """
     _emit(
         _run(
@@ -652,6 +662,12 @@ def summarize(
     The subgraph is the bound, and it is read whether or not a provider is
     configured — so a node that does not resolve is the ordinary not-found
     refusal rather than a complaint about the model.
+
+    **What is sent is narrower than what you can read.** Archived, proposed and
+    meta-space nodes the walk returned are not put in front of the model — `ask`
+    cannot reach them either — and they are named in `withheld`. Each note
+    carries its `state`, `truncated_notes` names any the window narrowed, and
+    `truncated` is still the separate fact that the *walk* stopped at its cap.
 
     Design E1 sketches an opt-in flag that files the summary as a reviewable
     `proposed` version. It is deliberately absent here: 5b-i is cut exactly at
@@ -681,14 +697,21 @@ def llm_status(
     that is the only thing that can answer it. `nodum.llm` deliberately makes no
     network call while resolving, so a server that is down at 03:00 and up at
     03:05 is not a configuration change — and `reachable` is therefore
-    *tri-state*: `null` means the question was not asked, either because nothing
-    is configured to ask or because `--no-probe` declined it.
+    *tri-state*, and `null` is **not established** rather than "not asked":
+    nothing is configured to ask, `--no-probe` declined it, or the probe was
+    asked and no answer arrived inside `call_timeout`. That last one is
+    deliberately not `false` — a refused connection is a server that is not
+    running, and no answer yet is very often a live server loading a model.
 
     The probe is cheap in the case that matters: nothing listening is a refused
     connection in well under a millisecond, and a model the server does not have
     is an HTTP 404 in about one. It goes through the same runtime every other
     model call does, which is why it takes `--as`: a command that spent a call
-    with nobody named would be the one unattributed spend in this system.
+    with nobody named would be the one unattributed spend in this system — and
+    `used` says what it cost (34 tokens, measured), because a spend nobody can
+    see is the same problem one step along. It waits the run's own
+    `NODUM_LLM_CALL_TIMEOUT` rather than a ceiling of its own, so the sentence
+    in `detail` and the number in `call_timeout` are the same number.
 
     Nothing here is an error. An install with no provider is a perfectly good
     install — the smart features are off — so this exits 0 and says so.
