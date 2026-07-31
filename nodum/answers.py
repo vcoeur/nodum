@@ -88,6 +88,16 @@ Retention window`` moved its own sentence inside note 1's body, both local
 models answered from it, and the 8B cited only the honest notes — so the
 citations pointed a human at a note that says the opposite of the answer.
 
+The rule is about **the prompt**, not about the graph, so it holds at both ends
+of the template. ``ASK_TEMPLATE`` prints the question *under* the notes, and a
+question carrying a line ``[3] …`` therefore opened one more note than the
+retrieval offered: measured, ``llama3.2:1b`` came back citing ``2`` and ``3``
+on a one-note graph. That is the caller's own text and no grant boundary is
+crossed — what is crossed is the invariant :attr:`AskOut.citations` rests on,
+that a note boundary is something this module wrote. Both the notes and the
+question are defused before they are fitted; ``question`` in the envelope is
+still what was typed.
+
 ## What the prompt may contain, measured rather than reasoned
 
 The first version of ``/ask`` scored **1 of 6** on a six-question battery
@@ -700,6 +710,11 @@ def _neutralise_markers(text: str) -> str:
     the truncation bound is unchanged, and it fires only on a line that would
     otherwise have opened a note.
 
+    It runs on **everything that reaches the prompt**, not only on node text:
+    the titles and excerpts :func:`_context_block` renders, and the question
+    :func:`ask` prints underneath them. The rule is a property of the prompt's
+    grammar, so any string interpolated into that grammar is subject to it.
+
     **Escaping is not a defence against a model, and does not pretend to be.**
     "Ignore previous instructions" in a note works on the 1B and nothing here
     stops it. What this restores is the narrower thing ``citations`` claims: a
@@ -737,7 +752,10 @@ def _context_block(offered: list[Offered]) -> str:
     the graph.
 
     Both the title and the excerpt go through :func:`_neutralise_markers`, so
-    the markers this function writes are the only ones in the block.
+    the markers this function writes are the only ones in the block — and
+    :func:`ask` defuses the question for the same reason, because the template
+    prints it below the block and a line ``[3] …`` there is one more boundary
+    in the same prompt.
     """
     return "\n\n".join(
         f"[{item.marker}] {_neutralise_markers(item.title or '(untitled)')}\n"
@@ -1070,7 +1088,13 @@ def ask(
             used=active.report(),
         )
 
-    offered, message = _fit_prompt(active, ASK_TEMPLATE, retrieved, question=question)
+    # The question is the last thing in the template, *under* the notes, so a
+    # line `[3] …` in it opens one more note than the retrieval offered. It goes
+    # through the same defusing the excerpts do; `question` in the envelope
+    # stays the human's own words.
+    offered, message = _fit_prompt(
+        active, ASK_TEMPLATE, retrieved, question=_neutralise_markers(question)
+    )
     considered = [item.node_id for item in offered]
     truncated_notes = [item.node_id for item in offered if item.truncated]
     dropped = [item.node_id for item in retrieved[len(offered) :]]

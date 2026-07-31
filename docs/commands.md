@@ -147,6 +147,10 @@ does not resolve). With no provider configured the refusal names
   and every citation carries the same `truncated` flag, `dropped` is what the
   retrieval found and the context window could not carry at all, and `used` is
   what the attempt cost.
+  A `[n]` at the start of a line is how a note is introduced to the model, so
+  one in your question — or in a node's text — is rewritten to `(n)` before the
+  prompt is built. It reads the same and can no longer open a note that was
+  never retrieved.
 - `summarize <node-id> [--depth N]` — Summarise a node and its neighbourhood,
   under the same citation and grounding rules. It reads the subgraph whether or
   not a provider is configured, so a node that does not exist is the ordinary

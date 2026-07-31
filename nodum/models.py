@@ -779,6 +779,13 @@ class RollbackOut(BaseModel):
     delete guards, which refuse for a different reason and used to be invisible
     until the rollback was already running. Both lists are empty on a rollback
     that happened, and a dry run reporting either is a rollback that would fail.
+
+    **Every other list means the same thing on both**: on a ``dry_run: true``
+    response the six outcome lists are what the rollback *would* restore, delete
+    and unlink, computed from the plan by the accounting the run itself fills.
+    They used to come back empty on a dry run whatever the rollback was about to
+    do, which made the preflight a confirm dialog calls disagree with the run —
+    the shape ``blockers`` was fixed for one round earlier.
     """
 
     cycle_id: str

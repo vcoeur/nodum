@@ -638,9 +638,14 @@ def cycle_stop_check(
     That function is deliberately **not** human-only, unlike ``get_cycle`` and
     ``list_cycles``: it is one boolean about the caller's own run, disclosing no
     node, space or count, and a runner that cannot ask whether it was told to
-    stop cannot obey. What bounds it instead is the authority to *close* this
-    cycle — obeying a stop is closing it — so a principal that could not have
-    opened the run gets ``GrantNotPermitted`` rather than an answer.
+    stop cannot obey. What bounds it instead is **exactly what admitted the
+    run** — the grant that resolves a scoped cycle's scope, or ``edit``
+    somewhere for an unscoped one. It was the authority to *close* the cycle
+    until that rule was found to refuse this very call on a scoped night the
+    gardener is entitled to run; the whole argument is in
+    :func:`nodum.service._may_watch_a_cycle`. A principal outside the run is
+    answered with the not-found refusal an unknown id gets, word for word, so
+    that this is not an existence oracle over cycle ids.
 
     This raises nothing itself; :meth:`AgentRun.check_stop` is what turns a
     ``True`` into :class:`CycleStopped`, and :meth:`AgentRun.chat` calls it

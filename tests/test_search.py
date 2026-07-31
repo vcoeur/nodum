@@ -714,6 +714,58 @@ def test_a_question_word_does_not_let_a_draft_displace_the_canonical_claim(fresh
     assert draft.id in found  # the draft was never the problem
 
 
+def test_a_question_about_a_word_the_graph_has_never_seen_answers_with_nothing(fresh_db):
+    """Question words are not an answer when the graph knows none of the rest.
+
+    The bare term answers with silence, which is correct and obviously useless.
+    Wrapping it in a question used to answer with three prose notes that share
+    only the phrasing — a plausible ranked list for a word the graph has never
+    heard of, and nothing saying so. That is the same conversion this phase
+    keeps finding: a visibly empty result turned into a confidently wrong one.
+
+    The fallback that did it is right for the query it was written for — *"what
+    is it"*, nothing but function words — and wrong the moment the caller typed
+    a content word too. So the fallback to phrasing is gated on the query
+    having had no content word at all.
+    """
+    _seed_claim_graph()
+    _assert_function_words_survive_the_df_ceiling(fresh_db, "what", "does", "against")
+    assert search.search("zarquon", principal=owner()).hits == []
+    assert search.search("What does zarquon protect against?", k=10, principal=owner()).hits == []
+
+
+def test_the_word_a_query_is_about_is_not_dropped_for_being_everywhere(fresh_db):
+    """The ubiquity cut is a cost rule, so it is the first thing given up.
+
+    A young graph is usually about one subject, so its subject is in most of
+    its rows and lands over the ceiling. Dropped, the query was left with its
+    question words, the fallback restored *those*, and *"What is kafka?"*
+    answered with every note that says "what" and not one that says "kafka" —
+    the exact inverse of the answer, on the most ordinary question there is.
+
+    Saving a doclist walk is worth less than the word the query is about, so
+    the ceiling is relaxed before the function-word fallback is reached.
+    """
+    for index in range(30):
+        service.create_node(
+            type="claim",
+            title=f"Kafka note {index}",
+            content=f"Kafka retains the segment while the broker holds offset {index}.",
+            principal=owner(),
+        )
+    for index, text in enumerate(_QUESTION_PROSE):
+        service.create_node(
+            type="note", title=f"Loose notes {index}", content=text, principal=owner()
+        )
+    counts = _document_frequencies(fresh_db, "kafka")
+    rows = counts.pop("*rows*")
+    ceiling = max(1, int(rows * search._COMMON_TERM_DF_FRACTION))
+    assert counts["kafka"] > ceiling, "the fixture must put the subject over the ubiquity ceiling"
+    assert _ids(search.search("What is kafka?", k=40, principal=owner())) == _ids(
+        search.search("kafka", k=40, principal=owner())
+    )
+
+
 def test_a_term_only_in_an_unreadable_space_does_not_change_what_an_agent_sees(fresh_db):
     """The df probes must not answer questions about rows outside the read set.
 

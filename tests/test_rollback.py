@@ -1285,6 +1285,76 @@ def test_a_dry_run_plans_the_rollback_and_writes_nothing(fresh_db):
     assert [entry.trigger for entry in service.list_cycles(principal=owner())] == ["curative"]
 
 
+def _one_cycle_over_every_reversal_shape(fresh_db_unused=None):
+    """A cycle whose rollback fills all six of `RollbackOut`'s outcome lists.
+
+    A node create and an edge create (rows the reversal deletes), an update (a
+    row it restores), a merge (a tombstone plus the `merge_redirects` row it
+    unlinks and the edge it repointed), an accepted proposal (a `versions` row
+    moved on the back of a `node.update`) and a rejected one (a `version.reject`
+    of its own). Anything narrower leaves a list empty on both paths and proves
+    nothing about whether the two agree.
+    """
+    kept, merged = _node("Kept"), _node("Merged away")
+    edited = _node("Edited", content="first")
+    other = _node("Other")
+    service.create_edge(merged.id, other.id, "supports", principal=owner())
+    accepted, rejected = _node("Accepted", content="first"), _node("Rejected", content="first")
+    to_accept, to_reject = _proposal(accepted.id), _proposal(rejected.id)
+
+    cycle = service.open_cycle(trigger="manual", principal=owner())
+    with service.in_cycle(cycle.id):
+        service.create_node(type="claim", title="Created inside", principal=owner())
+        service.update_node(edited.id, content="second", principal=owner())
+        service.merge_nodes([merged.id], into=kept.id, principal=owner())
+        service.create_edge(edited.id, other.id, "supports", principal=owner())
+        service.transition(str(to_accept.id), "accept", principal=owner())
+        service.transition(str(to_reject.id), "reject", principal=owner())
+    service.close_cycle(cycle.id, status="completed", report={}, principal=owner())
+    return cycle.id
+
+
+def test_a_dry_run_reports_what_the_run_reports_rather_than_six_empty_lists(fresh_db):
+    """The preflight and the run have to agree, and on these six they did not.
+
+    `blockers` was this exact shape one round earlier: a fact the run knew and
+    the plan did not model, so the confirm dialog a human presses answered with
+    something other than what pressing it would do. Here the plan modelled none
+    of the *outcome* — the dry run returned `restored_nodes`, `restored_edges`,
+    `restored_versions`, `deleted_nodes`, `deleted_edges` and `redirects_removed`
+    all empty, whatever the rollback was about to do — so a verdict built on them
+    understates a reversal that is going to put five rows back and take one out.
+
+    Asserted as *the same lists*, not as expected values: the claim is that one
+    accounting answers both paths, and hand-written expectations would let the
+    two drift apart the moment either grew a case.
+    """
+    cycle_id = _one_cycle_over_every_reversal_shape()
+
+    plan = service.rollback_cycle(cycle_id, dry_run=True, principal=owner())
+    outcome = service.rollback_cycle(cycle_id, principal=owner())
+
+    reported = {
+        "restored_nodes": plan.restored_nodes,
+        "restored_edges": plan.restored_edges,
+        "restored_versions": plan.restored_versions,
+        "deleted_nodes": plan.deleted_nodes,
+        "deleted_edges": plan.deleted_edges,
+        "redirects_removed": plan.redirects_removed,
+    }
+    assert reported == {
+        "restored_nodes": outcome.restored_nodes,
+        "restored_edges": outcome.restored_edges,
+        "restored_versions": outcome.restored_versions,
+        "deleted_nodes": outcome.deleted_nodes,
+        "deleted_edges": outcome.deleted_edges,
+        "redirects_removed": outcome.redirects_removed,
+    }
+    # And every one of them is non-empty, or the agreement above is an agreement
+    # about nothing — which is precisely how six empty lists passed for a year.
+    assert all(reported.values()), f"a shape this cycle covers reported nothing: {reported}"
+
+
 def test_a_dry_run_reports_the_conflicts_instead_of_raising_them(fresh_db):
     """The preflight exists to *report*, so the verdict is data rather than a raise.
 

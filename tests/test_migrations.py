@@ -1198,6 +1198,156 @@ def test_a_half_applied_0015_is_repaired_without_re_adding_the_column_it_has(tmp
         conn.close()
 
 
+def _stop_columns_without_the_check(conn):
+    """Leave `cycles` carrying both stamps and no constraint over them.
+
+    The shape an earlier cut of `0015` produced — the three-column proposal
+    leaned on a boolean instead of the cross-column CHECK — reproduced by
+    dropping the constrained column and adding it back bare, which is also what
+    a human following a half-remembered version of the repair would do.
+    """
+    conn.executescript(
+        "ALTER TABLE cycles DROP COLUMN stop_requested_by;"
+        "ALTER TABLE cycles ADD COLUMN stop_requested_by TEXT;"
+    )
+    conn.commit()
+
+
+def test_the_stop_columns_without_their_check_are_drift_the_check_has_to_see(fresh_db):
+    """`0015` guarantees two stamps *and one CHECK*, and only one was checked.
+
+    The constraint is the whole reason two nullable columns are honest: without
+    it the file can hold a time with no requester or a requester with no time,
+    which is precisely the state the migration chose two columns over a boolean
+    to make unstorable. `PRAGMA table_info` cannot see it — it answers what the
+    columns are and says nothing about what constrains them — so the check reads
+    the stored schema, and until it did, a file wearing the migration's name
+    with no constraint under its stamps passed init and stayed that way.
+    """
+    conn = db.connect()
+    try:
+        assert db._cycle_stop_problems(conn) == [], "a file straight from 0015 is not drift"
+        _stop_columns_without_the_check(conn)
+        # The columns are both there, so the earlier check has nothing to say.
+        assert {"stop_requested_at", "stop_requested_by"} <= db._columns(conn, "cycles")
+        problems = db._cycle_stop_problems(conn)
+        assert len(problems) == 1
+        assert db.CYCLE_STOP_CHECK_NAME in problems[0]
+        # And the file really is broken in the way the sentence claims: the
+        # half-stop the constraint exists to forbid goes straight in.
+        _insert_cycle(conn, "half", "scheduled")
+        conn.execute("UPDATE cycles SET stop_requested_at = datetime('now') WHERE id = 'half'")
+        conn.commit()
+        row = conn.execute("SELECT * FROM cycles WHERE id = 'half'").fetchone()
+        assert (row["stop_requested_at"], row["stop_requested_by"]) != (None, None)
+        assert row["stop_requested_by"] is None, "a stop nobody asked for, stored"
+    finally:
+        conn.close()
+
+
+def test_the_missing_stop_check_is_refused_with_a_rebuild_that_keeps_every_row(fresh_db):
+    """The remedy is this check's own, and putting a CHECK on is not adding a column.
+
+    `ALTER TABLE` adds a constraint only *with* a column, so the repair for a
+    column that already exists is the documented create-copy-drop-rename
+    rebuild — still a repair in place, with every row carried across and both
+    indexes recreated. What it must not be is the first four checks' sentence:
+    "delete the database file and re-run `nodum init`" reads as *your graph is
+    unrecoverable* over a constraint the file has all the rows for, which is the
+    mistake `0014`'s missing index already had to be rescued from.
+
+    The refusal is **followed** rather than pattern-matched: the statement it
+    prints is executed verbatim, and afterwards the file passes init, still
+    holds its rows, refuses the half-stop, and still serialises its cycles.
+    """
+    conn = db.connect()
+    try:
+        # Stopped *after* the drift, which is the only order a real file can
+        # have it in: a constraint-less schema is what the row was written on.
+        _stop_columns_without_the_check(conn)
+        _insert_cycle(conn, "stopped", "manual", status="failed")
+        conn.execute(
+            "UPDATE cycles SET stop_requested_at = '2026-07-30 01:00:00',"
+            " stop_requested_by = 'human:owner' WHERE id = 'stopped'"
+        )
+        conn.commit()
+
+        with pytest.raises(db.SchemaConsistencyError) as refused:
+            db.init_db(conn)
+        message = str(refused.value)
+        assert "delete the database file" not in message, "it told a human to bin their graph"
+        assert db.CYCLE_STOP_CHECK_REBUILD_SQL in message
+
+        conn.executescript(db.CYCLE_STOP_CHECK_REBUILD_SQL)
+        conn.commit()
+        assert db.init_db(conn) == []
+
+        # Every row came across, the recorded stop included — the journal has to
+        # go on saying who stopped that night.
+        row = conn.execute("SELECT * FROM cycles WHERE id = 'stopped'").fetchone()
+        assert (row["stop_requested_by"], row["stop_requested_at"]) == (
+            "human:owner",
+            "2026-07-30 01:00:00",
+        )
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+
+        # The constraint bites, by the name SQLite prints...
+        _insert_cycle(conn, "fresh", "scheduled")
+        conn.commit()
+        with pytest.raises(sqlite3.IntegrityError, match=db.CYCLE_STOP_CHECK_NAME):
+            conn.execute("UPDATE cycles SET stop_requested_at = datetime('now') WHERE id='fresh'")
+        conn.rollback()
+        # ...and the two indexes the rebuild dropped with the table are back, so
+        # the repair did not trade one guarantee for another.
+        with pytest.raises(sqlite3.IntegrityError, match="cycles.status"):
+            _insert_cycle(conn, "second", "manual")
+        conn.rollback()
+    finally:
+        conn.close()
+
+    # And the whole verb works over the repair, not just the schema read.
+    assert service.request_stop("fresh", principal=owner()).stop_requested is True
+
+
+def test_the_rebuild_that_a_half_stop_defeats_says_so_and_names_the_rows(fresh_db):
+    """A repair that dies with no next step is advice nobody can carry out.
+
+    The rebuild copies the rows through the constraint, so a file that ran
+    without one and stored a half-stop meets `CHECK constraint failed` there —
+    which is the constraint doing its job and, unexplained, a dead end at the
+    end of the one instruction the refusal gave. `_CREATE_THE_CYCLES_INDEX`
+    already answers the mirror of this ("if it fails, two cycles are recorded
+    running — close the stale one first"), and this says its own version.
+    """
+    conn = db.connect()
+    try:
+        _stop_columns_without_the_check(conn)
+        _insert_cycle(conn, "half", "scheduled")
+        conn.execute("UPDATE cycles SET stop_requested_at = datetime('now') WHERE id = 'half'")
+        conn.commit()
+
+        with pytest.raises(db.SchemaConsistencyError) as refused:
+            db.init_db(conn)
+        message = str(refused.value)
+        assert db.CYCLE_STOP_HALF_STOP_SQL in message
+
+        # The rebuild refuses, exactly as the sentence warns.
+        with pytest.raises(sqlite3.IntegrityError, match=db.CYCLE_STOP_CHECK_NAME):
+            conn.executescript(db.CYCLE_STOP_CHECK_REBUILD_SQL)
+        conn.rollback()
+
+        # And the query the refusal names finds the row in the way, so the
+        # second step is one a human can actually take.
+        assert [row["id"] for row in conn.execute(db.CYCLE_STOP_HALF_STOP_SQL)] == ["half"]
+        conn.execute("UPDATE cycles SET stop_requested_at = NULL WHERE id = 'half'")
+        conn.commit()
+        conn.executescript(db.CYCLE_STOP_CHECK_REBUILD_SQL)
+        conn.commit()
+        assert db.init_db(conn) == []
+    finally:
+        conn.close()
+
+
 # ── Atomicity: a migration and its schema_migrations row commit together ─────
 
 

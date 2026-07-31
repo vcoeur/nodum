@@ -14,6 +14,15 @@
  * words — measured on a 312-node corpus, question-shaped queries went from
  * 85% returning nothing at all to 3%.
  *
+ * **A query the graph knows no content word of still matches nothing**, and
+ * that is why the advice below names a missing word rather than a missing
+ * result. The drops relax in a fixed order — ubiquity first, because it is the
+ * only one about cost rather than meaning — and function words are searched
+ * only when the query has no content word at all. Otherwise *"What does
+ * zarquon protect against?"* would answer with notes that share its phrasing
+ * while `zarquon` alone correctly returns nothing, which is the empty result
+ * turned into a confidently wrong one.
+ *
  * Which makes *"try fewer words"* close to the opposite of the right advice.
  * Under the old rule every extra word was another way to match nothing, so
  * shortening was the only way through. Under the quorum a rare word is what

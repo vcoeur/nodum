@@ -725,8 +725,9 @@ export function cycleCaveats(cycle: CycleOut): string[] {
   if (cycle.stop_requested && cycle.status !== "failed") {
     caveats.push(
       cycle.status === "running"
-        ? "A stop has been asked for. The entry stays running until the run notices and closes " +
-            "itself, and nothing about a stop reverses anything it has already written."
+        ? "A stop has been asked for. The entry stays running until the run notices, and nothing " +
+            "about a stop reverses anything it has already written. " +
+            STOP_IS_NOTICED_AT_A_MODEL_CALL
         : cycle.status === "completed"
           ? // Reachable today, and the reading it needs is the opposite of
             // alarming: a stop is noticed at the *next* check, and the
@@ -912,6 +913,44 @@ export function abandonOutcome(cycle: CycleOut): string {
 export const STOP_ACTION_LABEL = "Stop this cycle";
 
 /**
+ * What a stop actually gets, said in one place because four surfaces say it.
+ *
+ * `AgentRun.chat` checks the switch immediately before a provider call and that
+ * is the only check that exists: the four deterministic consolidation jobs make
+ * no provider call, so a stop recorded against one of those runs is kept on the
+ * entry and the run finishes — to `completed`, if nothing else went wrong.
+ *
+ * **Three of the four places a human met this control said otherwise**, and each
+ * said it in its own words: the button's tooltip offered to *"ask this run to
+ * wind down and close its own entry"*, {@link RUNNING_ACTIONS_HINT} said the run
+ * "closes its own entry when it notices", and {@link stopOutcome} promised "the
+ * entry closes when the run notices". Only {@link STOP_CONFIRM} — the one screen
+ * a human reads *after* deciding — carried the caveat. The code was right and
+ * the copy was wrong, which is this whole defect class: the fix is the sentence,
+ * not a check wired into the deterministic jobs (that is 5b-ii, and
+ * `tests/test_consolidate.py::test_the_deterministic_runner_consults_no_stop_
+ * switch_and_the_copy_says_so` is what will fail the day it lands).
+ *
+ * One exported constant rather than four wordings, for the reason
+ * {@link STOP_ACTION_LABEL} is one: a caveat repeated in four voices is a caveat
+ * that stops being true in three of them.
+ */
+export const STOP_IS_NOTICED_AT_A_MODEL_CALL =
+  "What checks the switch today is a model call, and the deterministic jobs make none — so a " +
+  "run of those finishes even after you stop it, with the stop kept on the entry.";
+
+/**
+ * The stop button's own tooltip, which used to promise a wind-down.
+ *
+ * Exported rather than written into the button's JSX for the reason
+ * {@link STOP_CONFIRM} is an array: the harness renders no components, so a
+ * claim made inside one is a claim nothing checks — and this one was wrong for
+ * exactly as long as nothing checked it.
+ */
+export const STOP_ACTION_HINT =
+  `Record a stop on this entry. ${STOP_IS_NOTICED_AT_A_MODEL_CALL}`;
+
+/**
  * The line under the two controls a `running` entry offers, telling them apart.
  *
  * They are the only two places in this app where one screen offers two
@@ -923,10 +962,16 @@ export const STOP_ACTION_LABEL = "Stop this cycle";
  *
  * Named through the two action constants rather than by repeating their words,
  * so a reworded button cannot leave this sentence pointing at nothing.
+ *
+ * It used to end the first situation on *"the run closes its own entry when it
+ * notices"*, which is a wind-down this system does not deliver for the only
+ * cycles it ships today — see {@link STOP_IS_NOTICED_AT_A_MODEL_CALL}, which is
+ * now the sentence after it.
  */
 export const RUNNING_ACTIONS_HINT =
   `Two different situations. "${STOP_ACTION_LABEL}" is for a run that is going right now: it ` +
-  "asks, and the run closes its own entry when it notices. " +
+  "records the instruction, and the run closes its own entry at its next check. " +
+  `${STOP_IS_NOTICED_AT_A_MODEL_CALL} ` +
   `"${ABANDON_ACTION_LABEL}" is for one that is never going to finish — a server killed ` +
   "mid-cycle, a power cut — and closes the entry from outside. Neither reverses anything the run " +
   "wrote; rolling the cycle back afterwards is what does.";
@@ -967,8 +1012,7 @@ export function stopAvailability(cycle: CycleOut): RollbackAvailability {
       available: false,
       reason:
         "A stop has already been asked for on this run. The first asker is the one the journal " +
-        "records, so asking again would change nothing — the run closes its own entry when it " +
-        "notices.",
+        `records, so asking again would change nothing. ${STOP_IS_NOTICED_AT_A_MODEL_CALL}`,
     };
   }
   return { available: true, reason: null };
@@ -1035,9 +1079,8 @@ export const STOP_CONFIRM: readonly string[] = [
   "This is not abandoning. Abandoning closes the entry of a run nothing is going to finish, from " +
     "outside; a stop is an instruction a live run obeys and records itself. The journal keeps the " +
     "two apart, so a failed entry says which of them happened.",
-  "What checks the switch today is a model call, and the deterministic jobs make none — so a run " +
-    "of those finishes even after you stop it, with the stop kept on the entry. For a run that is " +
-    `never going to finish at all, "${ABANDON_ACTION_LABEL}" is the control.`,
+  `${STOP_IS_NOTICED_AT_A_MODEL_CALL} For a run that is never going to finish at all, ` +
+    `"${ABANDON_ACTION_LABEL}" is the control.`,
 ];
 
 /**
@@ -1047,12 +1090,17 @@ export const STOP_CONFIRM: readonly string[] = [
  * `running`, and saying "stopped" about a run that is still writing would be the
  * one claim this screen has no way to make good on.
  *
+ * It used to close on *"the entry closes when the run notices"* — a wind-down,
+ * promised in the one place a human reads immediately after pressing the button
+ * and therefore the one most likely to be believed. What replaces it is
+ * {@link STOP_IS_NOTICED_AT_A_MODEL_CALL}.
+ *
  * @param cycle The cycle row as the route answered with it — still `running`.
  */
 export function stopOutcome(cycle: CycleOut): string {
   return (
     `Cycle ${shortId(cycle.id)} has been asked to stop. It is still ${cycle.status}: nothing it ` +
-    "wrote has changed, and the entry closes when the run notices."
+    `wrote has changed. ${STOP_IS_NOTICED_AT_A_MODEL_CALL}`
   );
 }
 

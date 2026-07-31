@@ -147,6 +147,37 @@ it **warns before the drop** in the same register as the editor's meta bar —
 `/editor`, where the picker lives. A badge and nothing else let a human drop a
 whole batch into a target this panel already knew would fail every row.
 
+## The view Phase 5b-i deliberately does not ship
+
+`POST /api/ask` exists, it is a read-only surface, the client could call it in an
+afternoon — and **there is no Ask view in this app**. That is a decision, not a
+gap in the work.
+
+`/ask` can return a **confident, well-cited, wrong answer**. It was measured
+doing exactly that: asked which cloud provider hosts the production Kubernetes
+cluster, the local model answered *"AWS"* with `answered: true`, citing a Kafka
+textbook containing zero occurrences of AWS, cloud, Kubernetes, or provider,
+while the graph elsewhere says the cluster is k3s on three on-prem nodes.
+Citation *resolvability* is not groundedness: design decision E2 defends against
+an invented **id**, and that answer invented **content** and hung it on a real
+id.
+
+What catches that is the envelope, and the envelope survives one surface and not
+the other. A CLI reader gets `unresolved`, `considered` and `dropped` as JSON
+beside the answer — a marker the model cited for a note that was never offered is
+right there, and it is the signal that the model was not reading its context. A
+browser reader gets prose. Rendering the same envelope as a panel does not fix
+it, because a screen that has just answered the question in a paragraph is a
+screen whose lists nobody reads; the CLI's advantage is not the fields, it is
+that its reader is already looking at them.
+
+So the surface stays where its reader is equipped for it. **It moves here in
+5b-ii, once groundedness is real** — a deterministic check that the answer's
+claims are in the excerpts the request retrieved, rather than that its citations
+resolve. Until then, do not add an Ask view, an "ask about this node" button, or
+an answer panel bolted onto search: each is the same decision taken by accident.
+`/summarize` is the same call and the same rule.
+
 ## Running it
 
 ```bash

@@ -50,6 +50,7 @@ import {
   rollbackAvailability,
   rollbackOutcome,
   RUNNING_ACTIONS_HINT,
+  STOP_ACTION_HINT,
   STOP_ACTION_LABEL,
   stopAvailability,
   stopOutcome,
@@ -289,7 +290,12 @@ export default function CycleView() {
               type="button"
               className="nd-button nd-button--danger"
               onClick={() => setStopping(true)}
-              title="Ask this run to wind down and close its own entry"
+              // Owned by `journal.ts`, not written here: this tooltip promised
+              // a wind-down ("ask this run to wind down and close its own
+              // entry") that the deterministic jobs do not deliver, and it went
+              // on saying so because a claim inside a component is a claim the
+              // unit-only harness cannot check.
+              title={STOP_ACTION_HINT}
             >
               {STOP_ACTION_LABEL}
             </button>

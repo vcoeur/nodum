@@ -23,7 +23,9 @@ words only: a graph small enough that "what" sits in 7 rows of 47 gives its
 question words more inverse-document-frequency weight than the term that
 answers the question, so function words are named in a list
 (:data:`_QUERY_STOPWORDS`) rather than inferred from a frequency that has not
-got the corpus to say it with.
+got the corpus to say it with. They never decide a search on their own: a query
+the graph knows no content word of answers with nothing, rather than with the
+notes that happen to share its phrasing.
 
 Both projectors are caught up before querying, so search always reflects the
 latest committed events without a manual projector run.
@@ -250,6 +252,19 @@ def _compile_match(
       contain. The list is the same on 47 rows and on 312, which is the whole
       point of it being a list.
 
+    **A function word never decides a search on its own.** Every drop above
+    needs a fallback, and the order they are given up in is the whole of what
+    the fallbacks mean. The ubiquity cut goes first, because it is the only
+    one of the three that is about cost rather than meaning: a young graph is
+    usually *about* something, its subject is therefore in most of its rows,
+    and dropping it left *"What is kafka?"* matching every note that says
+    "what" and none that says "kafka" — the inverse of the answer. Only a
+    query with **no content word at all** ("what is it") falls back to its
+    function words; a query whose content words the graph has simply never
+    seen answers with the nothing those words alone would have answered with,
+    because a ranked list of notes sharing a question's phrasing is a
+    confident answer to a word the graph has never heard of.
+
     Each surviving term's document frequency is counted **over the rows this
     search can actually return** — the same ``filters`` the ranked query
     applies. Counting the whole index instead made the bar depend on rows the
@@ -294,17 +309,28 @@ def _compile_match(
         for term in terms
     ]
     ceiling = max(1, int(total_rows * _COMMON_TERM_DF_FRACTION))
+    content = [term for term in terms if not _is_function_word(term)]
     known = [(term, df) for term, df in frequencies if df > 0]
-    ordinary = [(term, df) for term, df in known if df <= ceiling]
-    kept = [(term, df) for term, df in ordinary if not _is_function_word(term)]
-    # Each fallback is the previous rule relaxed by one step: a query of nothing
-    # but function words ("what is it") searches them, and on a small or
-    # single-topic graph where every node really does say "kafka", a query of
-    # nothing but ubiquitous terms searches those. Only a query the graph has
-    # never seen a word of falls through to matching nothing.
-    kept = kept or ordinary or known
-    if not kept:
-        return plain
+    if content:
+        known_content = [(term, df) for term, df in known if not _is_function_word(term)]
+        # The ubiquity cut is relaxed first, because it is a *cost* rule: on a
+        # graph about one subject the subject is over the ceiling, and saving a
+        # doclist walk is worth less than the word the query is about.
+        kept = [(term, df) for term, df in known_content if df <= ceiling] or known_content
+        if not kept:
+            # The graph has never seen a content word of this query, so the
+            # honest answer is the one the content words alone give: nothing.
+            # Searching the phrasing instead answered a word the graph has
+            # never heard of with prose notes that share only its question
+            # words — a plausible list, and nothing saying it is not an answer.
+            return _MatchPlan(match=" OR ".join(content), cte="", cte_params=[], clause="")
+    else:
+        # Nothing but function words ("what is it"). The query the caller
+        # actually typed is the best evidence available, so it is searched —
+        # still as a quorum, never as the bare disjunction.
+        kept = [(term, df) for term, df in known if df <= ceiling] or known
+        if not kept:
+            return plain
     weights = [(term, math.log(1 + (total_rows - df + 0.5) / (df + 0.5))) for term, df in kept]
     match = " OR ".join(term for term, _ in weights)
     if len(weights) == 1:

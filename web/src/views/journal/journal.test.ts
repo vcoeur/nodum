@@ -83,8 +83,10 @@ import {
   RUNNING_ACTIONS_HINT,
   SCOPE_CONTROL_HINT,
   shortId,
+  STOP_ACTION_HINT,
   STOP_ACTION_LABEL,
   STOP_CONFIRM,
+  STOP_IS_NOTICED_AT_A_MODEL_CALL,
   stopAvailability,
   stopOutcome,
   stopRecord,
@@ -1318,6 +1320,76 @@ describe("stopOutcome", () => {
     expect(said).toContain("still running");
     expect(said).toContain("nothing it wrote has changed");
     expect(said).not.toMatch(BARE_ID);
+  });
+});
+
+describe("the stop control promises no wind-down anywhere", () => {
+  /**
+   * Every string this app puts in front of a human about the stop switch.
+   *
+   * Four surfaces, and three of them used to promise a wind-down in their own
+   * words: the button's tooltip ("ask this run to wind down and close its own
+   * entry"), the two-control hint ("the run closes its own entry when it
+   * notices") and the toast a human reads immediately after pressing ("the
+   * entry closes when the run notices"). Only the confirm carried the caveat.
+   * The code is right and the copy was wrong, which is the whole shape of this
+   * defect class — so what is asserted is that every one of them now carries
+   * the same sentence, not that each has been reworded well.
+   */
+  const stopCopy = (): Record<string, string> => {
+    const running = cycle({ status: "running", finished_at: null });
+    return {
+      "the button's tooltip": STOP_ACTION_HINT,
+      "the two-control hint": RUNNING_ACTIONS_HINT,
+      "the confirm dialog": STOP_CONFIRM.join(" "),
+      "the toast after pressing": stopOutcome(running),
+      "the already-stopped reason":
+        stopAvailability(
+          cycle({
+            status: "running",
+            finished_at: null,
+            stop_requested: true,
+            stop_requested_by: "human:owner",
+            stop_requested_at: STOPPED_AT,
+          }),
+        ).reason ?? "",
+      "the running caveat": cycleCaveats(
+        cycle({ status: "running", finished_at: null, stop_requested: true }),
+      ).join(" "),
+    };
+  };
+
+  it("carries the one caveat in every place a human meets the switch", () => {
+    for (const [surface, said] of Object.entries(stopCopy())) {
+      expect(said, surface).toContain(STOP_IS_NOTICED_AT_A_MODEL_CALL);
+    }
+  });
+
+  it("promises a wind-down in none of them", () => {
+    // The three wordings that were on the screen, plus the word itself. A stop
+    // is *recorded*; whether anything winds down depends on a check that today
+    // only a model call makes.
+    const promised = [
+      "wind down",
+      "closes its own entry when it notices",
+      "closes when the run notices",
+      "notices and closes itself",
+    ];
+    for (const [surface, said] of Object.entries(stopCopy())) {
+      for (const phrase of promised) {
+        expect(said.toLowerCase(), `${surface} still promises "${phrase}"`).not.toContain(phrase);
+      }
+    }
+  });
+
+  it("keeps the race the review drove live readable: a stopped run may complete", () => {
+    // The live pass stopped a consolidation and watched it run to `completed`,
+    // exactly as the confirm warned. The caveat has to stay true of that, and
+    // the entry a human then opens has to explain it rather than alarm them.
+    const completed = cycleCaveats(cycle({ status: "completed", stop_requested: true })).join(" ");
+    expect(completed).toContain("completed anyway");
+    expect(completed).toContain("a run with none left to make finishes");
+    expect(STOP_IS_NOTICED_AT_A_MODEL_CALL).toContain("finishes even after you stop it");
   });
 });
 
