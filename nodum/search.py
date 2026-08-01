@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import math
 import sqlite3
+from itertools import groupby
 from pathlib import Path
 from typing import NamedTuple
 
@@ -160,26 +161,68 @@ yet
 #: is eleven.
 _MAX_QUERY_TERMS = 64
 
-#: Characters trimmed off both ends of a token before it is compared to another
-#: token or to :data:`_QUERY_STOPWORDS`. The double quote is FTS5's own phrase
-#: syntax, the rest is the punctuation a human types around a word — a question
-#: mark rides along on the last word of every question. Only the *ends* are
-#: trimmed, which is what keeps ``min.insync.replicas`` and ``c++`` one term.
-_TERM_TRIM = "\"?!.,;:()[]{}'…"
-
 
 def _bare_word(token: str) -> str:
-    """Fold a raw or quoted token to the word FTS5 will tokenize it to.
+    """Fold a token to the words ``unicode61`` splits it into, lowercased.
 
-    Case and edge punctuation are exactly what the ``porter unicode61``
-    tokenizer discards, so this is the comparison two tokens are "the same
-    word" under. One helper rather than two, because the two callers
-    disagreeing about that was a defect: :func:`_is_function_word` stripped
-    punctuation before its lookup and :func:`_query_terms` did not before its
-    dedup, so ``kafka,`` and ``kafka`` were one function-word question and two
-    distinct quorum terms at the same time.
+    Every maximal run of alphanumeric characters, in order, joined by single
+    spaces — which is ``unicode61``'s rule and not an enumeration of the
+    punctuation a human happens to type. ``kafka,``, ``**kafka**``, ``“kafka”``
+    and ``#kafka`` all fold to ``kafka``; ``min.insync.replicas`` folds to
+    ``min insync replicas``, the three-token *phrase* FTS5 actually searches
+    for, which is what keeps it distinct from ``mininsyncreplicas`` while
+    merging it with ``min-insync-replicas``.
+
+    This is the comparison two tokens are "the same word" under, and both
+    callers use it: :func:`_query_terms` to dedup and :func:`_is_function_word`
+    to look one up. One helper rather than two, because the two disagreeing
+    about it was a defect — :func:`_is_function_word` stripped punctuation
+    before its lookup and :func:`_query_terms` did not before its dedup, so
+    ``kafka,`` and ``kafka`` were one function-word question and two distinct
+    quorum terms at the same time.
+
+    **The fold is sound and incomplete against ``porter unicode61``**, and the
+    asymmetry is deliberate, because the two directions of error cost different
+    things:
+
+    * *sound* — two tokens that fold alike always match the same rows. This is
+      the half that has to hold: :func:`_query_terms` keeps the first token of
+      a fold group and drops the rest, so an unsound merge makes a term the
+      caller typed **unreachable**. Measured at zero counterexamples over a
+      465-token probe (107 880 pairs), and pinned in ``tests/test_search.py``
+      against a live FTS5 table carrying the projector's own tokenizer.
+    * *incomplete* — the tokenizer merges pairs this does not, because it also
+      applies rules no character fold can reach: ``porter`` **stems**
+      (``retain``/``retains``) and ``unicode61`` folds **diacritics**
+      (``café``/``cafe``). The consequence is named rather than hidden:
+      ``retain retains postgres`` still buys one word two shares of the
+      quorum's weight, which is the bypass the dedup exists to close, still
+      open on the stemmer. Closing it needs a Python porter stemmer that agrees
+      with SQLite's on every word — and one that *disagrees* is worse than
+      none, since a disagreement in the merging direction is unsound.
+
+    An earlier fold trimmed fifteen ASCII characters off the ends and
+    ``casefold()``-ed. It was wrong in both directions and the enumeration was
+    the reason: 10 688 incomplete pairs on the same probe rather than 231, so
+    one decoration outside the list — a pasted ``**What**``, a smart quote —
+    turned a stopword into a content word carrying the stopword's real document
+    frequency and re-opened the refusal at :func:`_compile_match`.
+
+    Two rejected alternatives, both measured on that probe:
+
+    * ``casefold()`` instead of ``lower()`` merges ``straße``/``strasse`` and
+      ``ﬁle``/``file``, which the tokenizer keeps apart — three unsound pairs,
+      and unsound is the direction that loses a term.
+    * stripping combining marks (NFD) would close the diacritic residue, but
+      SQLite's default ``remove_diacritics=1`` deliberately leaves *precomposed*
+      codepoints carrying more than one diacritic alone, so it merges ``ộ`` with
+      ``o`` and ``ǭ`` with ``ō`` where the tokenizer does not — twelve unsound
+      pairs to buy back eleven incomplete ones. The *decomposed* spellings need
+      no help: a combining mark is not alphanumeric, so the run rule already
+      drops it and ``a``+``U+0301`` folds to ``a``, which is what the tokenizer
+      does with it.
     """
-    return token.strip(_TERM_TRIM).casefold()
+    return " ".join("".join(run) for is_word, run in groupby(token.lower(), str.isalnum) if is_word)
 
 
 def _connect(path: str | Path | None) -> sqlite3.Connection:
@@ -201,15 +244,22 @@ def _query_terms(query: str) -> list[str]:
 
     Repeats are dropped because the quorum weighs terms: typing a word twice
     would otherwise count its weight twice, both in what a document must reach
-    and in what it can collect. "The same word" is :func:`_bare_word` — what
-    the FTS5 tokenizer will reduce the token to — and not the raw token, which
-    is where this went wrong: folding case alone left ``kafka,`` and ``kafka``
-    two terms carrying one word's document frequency twice, enough to clear a
-    bar half of itself and turn the two-equal-terms rule back into the bare
-    disjunction it was chosen over. The token kept is the first one seen, still
-    quoted whole: FTS5 tokenizes the punctuation away itself, so ``"kafka,"``
+    and in what it can collect. "The same word" is :func:`_bare_word` — the
+    words ``unicode61`` splits the token into — and not the raw token, which is
+    where this went wrong: folding case alone left ``kafka,`` and ``kafka`` two
+    terms carrying one word's document frequency twice, enough to clear a bar
+    half of itself and turn the two-equal-terms rule back into the bare
+    disjunction it was chosen over. A fold that trimmed a *list* of punctuation
+    characters closed the comma and left the same bypass open on everything
+    outside the list, which is why the fold is the tokenizer's own rule now.
+    It remains incomplete on the stemmer — see :func:`_bare_word`.
+
+    The token kept is the first one seen, still quoted whole and **never
+    rewritten**: FTS5 tokenizes the punctuation away itself, so ``"kafka,"``
     matches the same rows as ``"kafka"`` and there is nothing to gain by
-    rewriting what the caller typed.
+    editing what the caller typed. That is also what keeps
+    ``min.insync.replicas`` and ``c++`` one term each — the fold splits them
+    for the purpose of comparison, the term does not.
 
     Raises:
         ValueError: If the query has no terms, or more than
@@ -234,10 +284,16 @@ def _is_function_word(term: str) -> bool:
     """Whether a quoted term is one of :data:`_QUERY_STOPWORDS`.
 
     The term is quoted FTS5 syntax by now, and a question mark rides along on
-    the last word of every question, so both come off before the lookup
-    (:func:`_bare_word`): ``"against?"`` is the same function word as
-    ``against``. Inner punctuation stays, which is what keeps
-    ``min.insync.replicas`` one term.
+    the last word of every question, so the fold takes both off before the
+    lookup (:func:`_bare_word`): ``"against?"``, ``"**against**"`` and
+    ``"against—"`` are all the same function word as ``against``. Getting that
+    wrong is not cosmetic — a decorated stopword the fold misses becomes a
+    *content* word carrying the plain word's real document frequency, which is
+    enough to keep :func:`_compile_match`'s refusal from ever firing.
+
+    A token holding inner punctuation folds to more than one word
+    (``min.insync.replicas`` → ``min insync replicas``) and so can never be a
+    function word: the list holds single words only.
     """
     return _bare_word(term) in _QUERY_STOPWORDS
 
@@ -331,9 +387,14 @@ def _compile_match(
     :data:`_QUERY_STOPWORDS` deliberately leaves on the content side, so one
     of them being in the index is enough to keep the query alive: measured on
     the claim graph of ``tests/test_search.py``, **six of twelve** questions
-    built around an invented subject go silent and six still answer, stable at
-    40, 72, 136 and 264 rows, against none of twelve silent under the previous
-    ordering. This rule closes half of that shape, not all of it.
+    built around an invented subject go silent and six still answer, against
+    none of twelve silent under the previous ordering. This rule closes half of
+    that shape, not all of it. Six is a measurement on that corpus and is not
+    claimed to be stable under a different one: the gate reads only whether a
+    content word has ``df > 0``, so it moves with the corpus's *composition*,
+    and an earlier "stable at 40/72/136/264 rows" note was withdrawn because it
+    varied size by repeating one fixture, which cannot change any word's
+    knownness.
 
     Widening the gate to "no content word at or under the ceiling" was measured
     and **rejected**, because it collides head-on with the ubiquity-first

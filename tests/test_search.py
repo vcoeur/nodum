@@ -734,6 +734,43 @@ def test_a_question_about_a_word_the_graph_has_never_seen_answers_with_nothing(f
     assert search.search("What does zarquon protect against?", k=10, principal=owner()).hits == []
 
 
+def test_a_decorated_question_word_does_not_re_open_the_refusal(fresh_db):
+    """One stray character on a function word used to undo the whole rule.
+
+    The refusal reads the query's *content* words, and a word is a function
+    word by lookup in `_QUERY_STOPWORDS` after `_bare_word`. So a fold that
+    misses a decoration promotes the decorated stopword to a content word —
+    and because FTS5 tokenizes the decoration away, that content word arrives
+    carrying the *undecorated* word's real document frequency. `known_content`
+    is non-empty, `kept` is non-empty, and the early return never fires.
+
+    Measured on this fixture with the pre-fix fold, which trimmed a list of
+    fifteen ASCII characters: the bare question refused correctly with **0**
+    hits, and `**What** does zarquon protect against?`, `“What” …`, `What- …`,
+    `#What …` and `What_ …` each answered with **8** — every one of them
+    `Loose notes N`, which is verbatim the harm the test above exists to
+    prevent. `… protect against—` answered with **3**, the same three prose
+    notes that test's docstring names one by one. Pasted markdown and a smart
+    quote are not exotic input, so this is the shape the rule actually meets.
+
+    Asserted over :data:`_SAME_WORD_DECORATIONS` on *every* word of the
+    question rather than on a sampled few: the decoration can land anywhere,
+    and a fold that handles the trailing one and not the leading one is the
+    fold this replaced.
+    """
+    _seed_claim_graph()
+    _assert_function_words_survive_the_df_ceiling(fresh_db, "what", "does", "against")
+    words = ["What", "does", "zarquon", "protect", "against?"]
+    for decoration in _SAME_WORD_DECORATIONS:
+        for position, word in enumerate(words):
+            if search._bare_word(f'"{word}"') == "zarquon":
+                continue  # the subject is the invented word, not a stopword
+            decorated = [*words]
+            decorated[position] = decoration.format(word=word.rstrip("?"))
+            query = " ".join(decorated)
+            assert search.search(query, k=10, principal=owner()).hits == [], query
+
+
 def test_the_word_a_query_is_about_is_not_dropped_for_being_everywhere(fresh_db):
     """The ubiquity cut is a cost rule, so it is the first thing given up.
 
@@ -766,23 +803,27 @@ def test_the_word_a_query_is_about_is_not_dropped_for_being_everywhere(fresh_db)
     )
 
 
-#: Twelve questions built around a subject the graph has never heard of. Their
-#: *other* content words are ordinary English on purpose — `_QUERY_STOPWORDS`
+#: Twelve questions built around a subject the graph has never heard of, each
+#: paired with the invented word (or words) it is built around. Their *other*
+#: content words are ordinary English on purpose — `_QUERY_STOPWORDS`
 #: deliberately holds no `store`, `work`, `long`, `node` or `first` — so this
-#: suite measures the gate as it really is rather than as it reads.
+#: suite measures the gate as it really is rather than as it reads. The
+#: pairing is what lets the test below delete the subject; deriving it by
+#: filtering function words instead keeps the invented word (it is a content
+#: word) and measures nothing.
 _INVENTED_SUBJECT_QUESTIONS = (
-    "What does zarquon protect against?",
-    "How does blorptide work?",
-    "What is a frimble?",
-    "Does quixolate replace vantrium?",
-    "What are the tradeoffs of snarfblat?",
-    "How do I configure gribblewatt?",
-    "What happens when plerkins fail?",
-    "Is thrumbolt safe to enable?",
-    "What does zarquon store?",
-    "How long does blorptide take?",
-    "What zarquon events arrive first?",
-    "Is frimble a node or a space?",
+    ("What does zarquon protect against?", ("zarquon",)),
+    ("How does blorptide work?", ("blorptide",)),
+    ("What is a frimble?", ("frimble",)),
+    ("Does quixolate replace vantrium?", ("quixolate", "vantrium")),
+    ("What are the tradeoffs of snarfblat?", ("snarfblat",)),
+    ("How do I configure gribblewatt?", ("gribblewatt",)),
+    ("What happens when plerkins fail?", ("plerkins",)),
+    ("Is thrumbolt safe to enable?", ("thrumbolt",)),
+    ("What does zarquon store?", ("zarquon",)),
+    ("How long does blorptide take?", ("blorptide",)),
+    ("What zarquon events arrive first?", ("zarquon",)),
+    ("Is frimble a node or a space?", ("frimble",)),
 )
 
 
@@ -802,29 +843,48 @@ def test_the_refusal_closes_half_the_invented_subject_shape_and_the_number_is_th
 
     So the honest number: **six of these twelve** answer with nothing, and the
     six that still answer are the six whose non-invented content words the
-    graph genuinely holds. Measured stable at 40, 72, 136 and 264 rows (the
-    same fixture repeated), against 0 of 12 silent under the pre-`47c867e`
-    ordering. That count is the number `AGENTS.md` quotes, which is the whole
-    reason it is asserted exactly rather than as a floor: change
+    graph genuinely holds. That count is the number `AGENTS.md` quotes, which
+    is the whole reason it is asserted exactly rather than as a floor: change
     `_QUERY_STOPWORDS` or the ordering and this fails, and the prose has to be
-    re-derived rather than left to drift.
+    re-derived rather than left to drift. Against 0 of 12 silent under the
+    pre-`47c867e` ordering.
+
+    The count carried a robustness claim — "stable at 40, 72, 136 and 264 rows"
+    — which is **withdrawn**, because it was measured by repeating this one
+    fixture and duplication *cannot* move it: the gate reads only whether a
+    content word has `df > 0`, and copying every row preserves that for every
+    word while scaling `df` and the ceiling by the same factor. It varied
+    corpus size while holding corpus composition fixed, and composition is the
+    only input the gate has. The number is a measurement on **this** corpus,
+    and nothing here claims more.
     """
     _seed_claim_graph()
     _assert_function_words_survive_the_df_ceiling(fresh_db, "what", "does", "how")
     answered = {
-        query: len(search.search(query, k=10, principal=owner()).hits)
-        for query in _INVENTED_SUBJECT_QUESTIONS
+        query: [hit.node_id for hit in search.search(query, k=10, principal=owner()).hits]
+        for query, _ in _INVENTED_SUBJECT_QUESTIONS
     }
-    silent = {query for query, count in answered.items() if count == 0}
+    silent = {query for query, hits in answered.items() if not hits}
     assert len(silent) == 6, f"AGENTS.md says six of twelve; measured {len(silent)}: {answered}"
-    # The six that survive do so through a content word the graph really holds,
-    # not through the question's phrasing: every one of them keeps answering
-    # when the invented subject is deleted from the query.
-    for query in set(answered) - silent:
+    # The six that survive do so through a content word the graph really holds
+    # and not through the question's phrasing — asserted by deleting the
+    # invented subject itself, which is the sharper form: the sub-query does
+    # not merely still answer, it answers with the **same ranked list**, so the
+    # invented word contributed nothing to the result at all. (An earlier
+    # version of this loop filtered out `_is_function_word` tokens instead,
+    # which keeps the invented subject — it is a content word — and so asserted
+    # only that the content words of a query that answered still answer, which
+    # the gate already guarantees.)
+    for query, invented in _INVENTED_SUBJECT_QUESTIONS:
+        if query in silent:
+            continue
         without_subject = " ".join(
-            word for word in query.split() if not search._is_function_word(f'"{word}"')
+            word for word in query.split() if search._bare_word(f'"{word}"') not in invented
         )
-        assert search.search(without_subject, k=10, principal=owner()).hits, query
+        assert len(without_subject.split()) == len(query.split()) - len(invented), query
+        assert [
+            hit.node_id for hit in search.search(without_subject, k=10, principal=owner()).hits
+        ] == answered[query], query
 
 
 def test_a_hallucinated_term_beside_the_subject_still_answers_on_a_single_subject_graph(
@@ -990,7 +1050,36 @@ def test_two_terms_of_equal_weight_require_both(fresh_db):
     assert _ids(search.search("kafka postgres", k=20, principal=owner())) == {both.id}
 
 
-def test_a_trailing_comma_does_not_buy_a_word_a_second_share_of_the_weight(fresh_db):
+#: Decorations of one word that `porter unicode61` tokenizes to that word
+#: alone, so every one of them is the *same term* as the bare word and must
+#: never buy it a second share of the quorum's weight. The first three are the
+#: only ones the pre-fix trim list held; the rest — markdown emphasis, a smart
+#: quote, a hyphen, an em dash, a hash, an underscore, a slash, an asterisk —
+#: are what a pasted question actually looks like, and every one of them
+#: re-opened the bypass. Kept as a shared constant because the same set has to
+#: hold for the dedup (here), for the stopword lookup
+#: (`test_a_decorated_question_word_does_not_re_open_the_refusal`) and against
+#: the real tokenizer (`test_the_fold_merges_only_what_the_tokenizer_merges`).
+_SAME_WORD_DECORATIONS = (
+    "{word},",
+    "{word}?",
+    "{word}.",
+    "**{word}**",
+    "“{word}”",
+    "{word}-",
+    "-{word}",
+    "{word}—",
+    "#{word}",
+    "{word}_",
+    "{word}/",
+    "{word}*",
+    "({word})",
+    "'{word}'",
+    "{word}…",
+)
+
+
+def test_a_decoration_does_not_buy_a_word_a_second_share_of_the_weight(fresh_db):
     """The dedup has to fold what FTS5 folds, or the quorum is bought off.
 
     `_query_terms` dedups so that typing a word twice cannot count its weight
@@ -1002,22 +1091,230 @@ def test_a_trailing_comma_does_not_buy_a_word_a_second_share_of_the_weight(fresh
     `kafka, kafka postgres` with six — the bare disjunction the quorum was
     chosen over, restored by a comma.
 
+    The first fix trimmed a hand-written list of fifteen ASCII characters,
+    which closed the comma and left the hole: measured on this fixture,
+    `kafka- kafka postgres`, `“kafka” kafka postgres`, `#kafka kafka postgres`
+    and `**kafka** kafka postgres` each answered with **six** again. A test
+    that probes only characters the trim list already contains cannot see
+    that — it passes for any trim list containing them — so the cases below
+    are driven off :data:`_SAME_WORD_DECORATIONS`, which is mostly characters
+    no trim list ever held. The fold is now the tokenizer's own character rule
+    (maximal alphanumeric runs, lowercased) rather than an enumeration, so
+    there is no list left to be incomplete.
+
     Trailing punctuation is not a hypothetical here: a question mark rides
-    along on the last word of every question, which is why
-    :func:`nodum.search._is_function_word` already stripped it before its own
-    lookup. The two functions disagreeing about what "the same word" is was
-    the whole of the defect, so they now share one helper.
+    along on the last word of every question, and `**What**` is what a pasted
+    markdown question looks like. The two functions disagreeing about what
+    "the same word" is was the whole of the original defect, so they share one
+    helper (`_bare_word`).
     """
     both = _seed_equal_df_pair()
-    assert search._query_terms("kafka, kafka postgres") == ['"kafka,"', '"postgres"']
-    assert search._query_terms("do do?") == ['"do"']
-    # Inner punctuation is not trimmed, or `min.insync.replicas` stops being
-    # one term — the property `_is_function_word`'s own docstring names.
-    assert search._query_terms("min.insync.replicas") == ['"min.insync.replicas"']
     plain = _ids(search.search("kafka postgres", k=20, principal=owner()))
     assert plain == {both.id}
-    for query in ("kafka, kafka postgres", "kafka kafka? postgres", "Kafka. kafka postgres"):
+    for decoration in _SAME_WORD_DECORATIONS:
+        decorated = decoration.format(word="kafka")
+        assert search._query_terms(f"{decorated} kafka postgres") == [
+            f'"{decorated}"',
+            '"postgres"',
+        ], decorated
+        query = f"{decorated} kafka postgres"
         assert _ids(search.search(query, k=20, principal=owner())) == plain, query
+    # Case is part of the same fold, and the kept token is the first one seen
+    # verbatim — FTS5 tokenizes the decoration away itself, so there is nothing
+    # to gain by rewriting what the caller typed.
+    assert search._query_terms("Kafka. kafka postgres") == ['"Kafka."', '"postgres"']
+    assert search._query_terms("do do?") == ['"do"']
+    # Inner punctuation is *not* a term boundary here, or `min.insync.replicas`
+    # stops being one term — the property `_is_function_word`'s own docstring
+    # names. Asserted on two tokens, because a one-token query returns
+    # `['"<token>"']` for **any** fold whatsoever (the fold is the dict key and
+    # the raw token is the value), so the single-token form could not fail: a
+    # fold stripping inner dots left all 42 tests of these two files green.
+    assert search._query_terms("min.insync.replicas mininsyncreplicas") == [
+        '"min.insync.replicas"',
+        '"mininsyncreplicas"',
+    ]
+    assert search._query_terms("min.insync.replicas") == ['"min.insync.replicas"']
+    # The other side of the same property: FTS5 tokenizes both spellings to the
+    # same three-token phrase, so they *are* one term — the fold reaches that
+    # because it is the tokenizer's rule and not a list of edge characters.
+    assert search._query_terms("min.insync.replicas min-insync-replicas") == [
+        '"min.insync.replicas"'
+    ]
+
+
+def test_the_stemmer_is_the_one_bypass_left_and_it_is_measured(fresh_db):
+    """The fold reaches the tokenizer's characters, not its English.
+
+    `porter` stems, so `retain`, `retains`, `retained` and `retaining` are one
+    FTS5 term and four `_bare_word` folds. That is the dedup bypass of the test
+    above, re-opened without a single punctuation mark: measured here,
+    `retain postgres` answers with the one node carrying both and
+    `retain retains postgres` with six.
+
+    Closing it needs a porter stemmer in Python that agrees with SQLite's own
+    on every word, which is a much larger commitment than this fix — and a
+    *disagreeing* stemmer is worse than none, because merging two tokens FTS5
+    keeps apart makes the second one unreachable. So it stays open, and it
+    stays measured: this test is what makes `nodum/search.py`'s "sound and
+    incomplete" claim falsifiable rather than a hedge, and it fails the moment
+    somebody closes the gap without rewriting the prose.
+    """
+    for index in range(29):
+        service.create_node(
+            type="note",
+            title=f"Ordinary note {index}",
+            content="This is a note about the way a thing is written down for the next reader.",
+            principal=owner(),
+        )
+    for index in range(5):
+        service.create_node(
+            type="note",
+            title=f"Broker note {index}",
+            content="A note about the way a broker will retain the batch it is given.",
+            principal=owner(),
+        )
+        service.create_node(
+            type="note",
+            title=f"Postgres note {index}",
+            content="A note about postgres vacuum and the dead row it reclaims.",
+            principal=owner(),
+        )
+    both = service.create_node(
+        type="note",
+        title="Together",
+        content="What a postgres table will retain is decided by the vacuum horizon.",
+        principal=owner(),
+    )
+    counts = _document_frequencies(fresh_db, "retain", "postgres")
+    counts.pop("*rows*")
+    assert counts["retain"] == counts["postgres"], "the fixture must give the terms equal weight"
+    # `retains` reaches the same rows as `retain` — the tokenizer stems both.
+    assert _document_frequencies(fresh_db, "retains")["retains"] == counts["retain"]
+    # …and the fold does not, so the pair is still two terms.
+    assert search._query_terms("retain retains") == ['"retain"', '"retains"']
+    assert _ids(search.search("retain postgres", k=20, principal=owner())) == {both.id}
+    assert len(_ids(search.search("retain retains postgres", k=20, principal=owner()))) == 6
+
+
+#: Tokens whose FTS5 row sets and `_bare_word` folds are compared pairwise
+#: below. Grouped by the axis each one probes, because the point of the set is
+#: coverage of the *ways* a fold can disagree with a tokenizer, not volume.
+_FOLD_PROBE = (
+    # One word wearing what a paste puts on it. Every one of these is `kafka`
+    # to the tokenizer, and only the first four were to the pre-fix fold.
+    "kafka",
+    "kafka,",
+    "kafka?",
+    "kafka.",
+    "Kafka",
+    "KAFKA",
+    "**kafka**",
+    "“kafka”",
+    "kafka-",
+    "-kafka",
+    "kafka—",
+    "#kafka",
+    "kafka_",
+    "kafka/",
+    "kafka*",
+    "(kafka)",
+    "'kafka'",
+    "kafka…",
+    # Inner punctuation: one term to `_query_terms`, a multi-token *phrase* to
+    # FTS5 — which is why the first two are the same query and the third is not.
+    "min.insync.replicas",
+    "min-insync-replicas",
+    "mininsyncreplicas",
+    "c++",
+    "c",
+    # The case axis. `casefold()` merged both of these pairs; the tokenizer
+    # keeps both apart, so `casefold()` was unsound and `lower()` is not.
+    "straße",
+    "strasse",
+    "ﬁle",
+    "file",
+    # The residue no character rule reaches: the tokenizer stems…
+    "retain",
+    "retains",
+    "retained",
+    # …and folds diacritics.
+    "café",
+    "cafe",
+)
+
+#: The complete list of probe pairs the tokenizer merges and `_bare_word` does
+#: not — the "incomplete" half of its claim, written out so that closing any of
+#: it fails this test rather than silently making the prose stale. Stemming
+#: (three pairs) and diacritic folding (one). Nothing else.
+_FOLD_RESIDUE = (
+    ("retain", "retains"),
+    ("retain", "retained"),
+    ("retained", "retains"),
+    ("cafe", "café"),
+)
+
+
+def test_the_fold_merges_only_what_the_tokenizer_merges(fresh_db):
+    """`_bare_word`'s invariant, measured against the tokenizer it names.
+
+    The fold decides two things — whether two query tokens are one term, and
+    whether a token is in `_QUERY_STOPWORDS` — and `nodum/search.py` documents
+    it as *sound and incomplete* against `porter unicode61`:
+
+    * **sound**: two tokens that fold alike always select the same rows. An
+      unsound merge is not a near miss, it makes a term the caller typed
+      unreachable — `_query_terms` keeps the first token of a fold group and
+      drops the rest.
+    * **incomplete**: the tokenizer merges pairs the fold does not, because
+      the tokenizer also stems and folds diacritics and no character rule
+      reaches that.
+
+    Both halves are asserted here rather than reasoned about, and asserted
+    against a real FTS5 table carrying the *projector's own* tokenizer read out
+    of the live schema — so if `node_fts` is ever rebuilt with a different one,
+    this fails instead of quietly measuring the wrong engine. The residue is
+    listed exactly, not as a floor: widening the fold has to come with a
+    rewrite of the prose, and narrowing it back to a punctuation list explodes
+    this list by two orders of magnitude (measured: 10 688 pairs against 231
+    over a 465-token probe).
+    """
+    conn = db.connect(fresh_db)
+    try:
+        db.init_db(conn)
+        schema = conn.execute("SELECT sql FROM sqlite_master WHERE name = 'node_fts'").fetchone()
+        assert "porter unicode61" in schema["sql"], schema["sql"]
+        conn.execute("CREATE VIRTUAL TABLE temp.probe USING fts5(x, tokenize='porter unicode61')")
+        for rowid, token in enumerate(_FOLD_PROBE):
+            conn.execute("INSERT INTO temp.probe(rowid, x) VALUES (?, ?)", (rowid, token))
+        rows = {
+            token: frozenset(
+                row[0]
+                for row in conn.execute(
+                    "SELECT rowid FROM temp.probe WHERE probe MATCH ?",
+                    ('"' + token.replace('"', '""') + '"',),
+                )
+            )
+            for token in _FOLD_PROBE
+        }
+    finally:
+        conn.close()
+
+    unsound, incomplete = [], []
+    for index, left in enumerate(_FOLD_PROBE):
+        for right in _FOLD_PROBE[index + 1 :]:
+            pair = tuple(sorted((left, right)))
+            same_fold = search._bare_word(left) == search._bare_word(right)
+            same_rows = rows[left] == rows[right]
+            if same_fold and not same_rows:
+                unsound.append(pair)
+            elif same_rows and not same_fold:
+                incomplete.append(pair)
+    assert unsound == [], f"the fold merged tokens FTS5 keeps apart: {unsound}"
+    assert sorted(incomplete) == sorted(tuple(sorted(pair)) for pair in _FOLD_RESIDUE), (
+        "the fold's incompleteness moved; `_bare_word`'s docstring names it as"
+        f" stemming and diacritics only. measured: {sorted(incomplete)}"
+    )
 
 
 def test_four_terms_of_equal_weight_still_only_need_half(fresh_db):

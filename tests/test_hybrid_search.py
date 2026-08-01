@@ -4,6 +4,11 @@ from __future__ import annotations
 
 from helpers import agent, owner
 
+# The prose the keyword refusal exists to suppress, imported rather than copied
+# so that editing it in one place cannot leave this file's fixture silently
+# unable to express the failure it names.
+from test_search import _QUESTION_PROSE
+
 from nodum import search, service
 
 
@@ -147,6 +152,20 @@ def test_the_keyword_refusal_is_the_keyword_arms_and_the_vector_arm_still_answer
     makes the disagreement fail loudly the moment somebody changes it — at
     which point `nodum/search.py`, `AGENTS.md` and
     `web/src/views/search/noResults.ts` all need the qualifier taken back out.
+
+    **The fixture is the whole test.** Seeded with the 20 claims alone it was
+    green under the mutation it exists to catch: `what`, `does`, `zarquon`,
+    `protect` and `against` were all at `df = 0` over those 20 rows, so the
+    keyword arm contributed nothing for the trivial reason that nothing
+    matched, and deleting the refusal outright (`return plain`) left every
+    assertion here satisfied. `_QUESTION_PROSE` is what makes the two cases
+    differ: it is the prose the refusal suppresses, it carries `what`, `does`
+    and `against` at a real document frequency, and with it seeded the same
+    mutation puts `bm25` on 8 of the 10 hits and reddens the first assertion.
+
+    The one-term `zarquon` leg was dropped for the same reason: `_compile_match`
+    returns `plain` at `len(terms) == 1` and never reaches the refusal branch,
+    so that leg asserted the absence of a match, not the presence of the rule.
     """
     for index in range(20):
         service.create_node(
@@ -155,13 +174,18 @@ def test_the_keyword_refusal_is_the_keyword_arms_and_the_vector_arm_still_answer
             content=f"Log compaction retains the newest value for key {index}.",
             principal=owner(),
         )
-    for query in ("zarquon", "What does zarquon protect against?"):
-        result = search.search(query, k=10, principal=owner())
-        # The keyword arm contributed nothing at all — no hit carries `bm25`.
-        assert not any("bm25" in hit.signals for hit in result.hits), query
-        # …and the vector arm answered anyway, the full `k` deep.
-        assert len(result.hits) == 10, query
-        assert all(set(hit.signals) == {"vector"} for hit in result.hits), query
+    for index, text in enumerate(_QUESTION_PROSE):
+        service.create_node(
+            type="note", title=f"Loose notes {index}", content=text, principal=owner()
+        )
+    query = "What does zarquon protect against?"
+    result = search.search(query, k=10, principal=owner())
+    # The keyword arm contributed nothing at all — no hit carries `bm25`. The
+    # prose above is exactly what it would have contributed without the rule.
+    assert not any("bm25" in hit.signals for hit in result.hits), result.hits
+    # …and the vector arm answered anyway, the full `k` deep.
+    assert len(result.hits) == 10
+    assert all(set(hit.signals) == {"vector"} for hit in result.hits)
 
 
 def test_degrades_to_bm25_when_no_provider(fresh_db):

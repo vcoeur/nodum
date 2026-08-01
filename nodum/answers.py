@@ -104,10 +104,16 @@ than ``\\n`` and a leading space.** The first version of the rule asked
 ``[9]`` walked through it: live on ``llama3.2:1b``, 3 of 3, ``answered: true``
 with citations pointing at two notes that said the opposite — and that
 character reaches the graph verbatim through ``nodum ingest url``. The line is
-now :meth:`str.splitlines`'s and the indent is anything that draws nothing, the
-defusing runs **last** so no later ``strip`` can promote what it shielded, and
-the invisible characters are defused in place rather than deleted, because
-width is what ``excerpt`` and the truncation bound are measured in.
+now :meth:`str.splitlines`'s and the indent is Unicode whitespace plus the
+``Cc``/``Cf``/``Cn``/``Co``/``Cs``/``Mn``/``Me`` categories plus five named
+blank-rendering characters — written out rather than called "anything that
+draws nothing", which is the sentence that shipped over a two-category class
+twice, and which left an ASCII ``[9]`` behind a HANGUL FILLER reaching all
+three prompt surfaces. What is *outside* the class is named too, furniture like
+``- [9]`` included (:func:`_neutralise_markers`, *The residual*). The defusing
+runs **last** so no later ``strip`` can promote what it shielded, and the
+invisible characters are defused in place rather than deleted, because width is
+what ``excerpt`` and the truncation bound are measured in.
 
 **The question is defused as grammar and trusted as evidence in the same call**
 (:func:`_unsupported_numbers`), and the two are consistent because only the
@@ -398,13 +404,40 @@ _CITATION_TRIM = " \t\r\n[](){}<>\"'`.,;:"
 #: than over ``re.MULTILINE``. See :func:`_neutralise_markers`.
 _MARKER = re.compile(r"\[([0-9]+)\]")
 
-#: Unicode general categories that put no glyph on the page: the C0/C1 controls
-#: and the format characters — the zero-width family (U+200B, U+FEFF, U+2060,
-#: the joiners), the bidi controls, the soft hyphen. Whitespace is *not* here
-#: because :meth:`str.isspace` already covers it and covers it better: it knows
-#: NBSP and the em/en/ideographic spaces, which are ``Zs`` and would otherwise
-#: need listing one by one.
-_INVISIBLE_CATEGORIES = ("Cc", "Cf")
+#: The Unicode general categories a line's indent may be made of, for two
+#: different reasons that are both exact:
+#:
+#: * **No advance width of their own.** ``Cc`` (the C0/C1 controls), ``Cf`` (the
+#:   format characters — the zero-width family U+200B/U+FEFF/U+2060, the
+#:   joiners, the bidi controls, the soft hyphen), ``Mn`` (nonspacing marks —
+#:   the combining accents and the variation selectors) and ``Me`` (enclosing
+#:   marks). A mark is drawn *on* the character before it, and at the start of a
+#:   line there is no character before it.
+#: * **No interchangeable rendering at all.** ``Cn`` (unassigned), ``Cs``
+#:   (surrogate) and ``Co`` (private use): whatever a font does with one of
+#:   these, no two readers are looking at the same thing. Leaving them out is
+#:   what left U+2065 — an unassigned hole *inside* U+2060..U+206F, whose
+#:   assigned neighbours are ``Cf`` and were closed — shielding a marker.
+#:
+#: Whitespace is *not* here because :meth:`str.isspace` already covers it and
+#: covers it better: it knows NBSP and the em/en/ideographic spaces, which are
+#: ``Zs`` and would otherwise need listing one by one.
+_INVISIBLE_CATEGORIES = ("Cc", "Cf", "Cn", "Co", "Cs", "Mn", "Me")
+
+#: Characters that are ordinary letters and symbols by general category and draw
+#: blank anyway. There are five and they are named one by one, because no
+#: category test reaches them without dragging in every CJK ideograph (``Lo``)
+#: and every dingbat (``So``): the four Hangul fillers, whose whole purpose is to
+#: occupy a syllable slot without a glyph, and the empty Braille cell. U+3164
+#: HANGUL FILLER is the most widely abused invisible character on the web and
+#: reaches this graph verbatim as ``&#12644;`` through ``nodum ingest url``.
+_BLANK_GLYPHS = frozenset(
+    "\N{HANGUL CHOSEONG FILLER}"
+    "\N{HANGUL JUNGSEONG FILLER}"
+    "\N{HANGUL FILLER}"
+    "\N{HALFWIDTH HANGUL FILLER}"
+    "\N{BRAILLE PATTERN BLANK}"
+)
 
 #: A run of digits, which is the one kind of claim this module can check
 #: deterministically against the text it sent (:func:`_unsupported_numbers`).
@@ -727,10 +760,26 @@ def _excerpt(text: str, limit: int) -> tuple[str, bool]:
 
 
 def _line_opening(line: str) -> int:
-    """Where this line's first glyph sits — past everything that draws nothing."""
+    """Where this line's first glyph sits, for one exactly-stated sense of glyph.
+
+    The class is **Unicode whitespace, plus the general categories** ``Cc``,
+    ``Cf``, ``Cn``, ``Co``, ``Cs``, ``Mn`` and ``Me``
+    (:data:`_INVISIBLE_CATEGORIES`), **plus five named characters that render
+    blank** (:data:`_BLANK_GLYPHS`) — and it is written out like that, here and
+    in :func:`_neutralise_markers`, rather than as "everything invisible",
+    because the sentence "anything that puts no glyph on the page" shipped twice
+    over a predicate two categories wide and neither reader nor test could tell.
+    What is outside the class is named too: :func:`_neutralise_markers`,
+    *The residual, named rather than left to be discovered*.
+
+    ``tests/test_answers.py`` pins the class against that sentence over all
+    0x110000 codepoints, so the two cannot move apart.
+    """
     index = 0
     while index < len(line) and (
-        line[index].isspace() or unicodedata.category(line[index]) in _INVISIBLE_CATEGORIES
+        line[index].isspace()
+        or line[index] in _BLANK_GLYPHS
+        or unicodedata.category(line[index]) in _INVISIBLE_CATEGORIES
     ):
         index += 1
     return index
@@ -793,8 +842,45 @@ def _neutralise_markers(text: str) -> str:
     hands that text to ``create_node`` unchanged.
 
     So the line is :meth:`str.splitlines`'s and the indent is
-    :func:`_line_opening`'s: anything that puts no glyph between the margin and
-    the bracket.
+    :func:`_line_opening`'s.
+
+    ## What the indent is, written out rather than described
+
+    "Anything that puts no glyph on the page" is what this docstring said, and
+    it was false in the direction the fix was made in: the class was whitespace
+    plus ``Cc`` and ``Cf``, and six other glyphless classes still carried an
+    **ASCII** ``[9]`` to all three prompt surfaces — U+3164 HANGUL FILLER
+    (``Lo``), U+FE0F VARIATION SELECTOR-16 (``Mn``), U+2065 (``Cn``, unassigned,
+    *inside* the U+2060..U+206F block whose assigned neighbours the fix did
+    close), U+2800 BRAILLE PATTERN BLANK (``So``), U+E000 (``Co``) and U+0300
+    (``Mn``). All six reach a ``source`` node verbatim through
+    ``extract.HtmlHandler``, which unescapes ``&#12644;`` like any other numeric
+    reference and strips each line with ``str.strip()``, which removes only
+    whitespace. Live on ``llama3.2:1b`` at temperature 0 the shielded arms take
+    ``unresolved`` from ``[]`` to ``['9']`` or ``['3'..'9']`` where the defused
+    arms stay clean.
+
+    "Draws nothing" is not a predicate — ``Lo`` holds every CJK ideograph and
+    ``Mn`` holds marks that visibly draw — so the class is stated as what it is:
+
+    * :meth:`str.isspace`, which is ``Zs``/``Zl``/``Zp`` and the whitespace
+      controls, and is exactly what ``str.strip`` removes;
+    * :data:`_INVISIBLE_CATEGORIES` — ``Cc``, ``Cf``, ``Mn`` and ``Me``, which
+      have no advance width of their own, and ``Cn``, ``Cs`` and ``Co``, which
+      have no interchangeable rendering at all;
+    * :data:`_BLANK_GLYPHS` — the four Hangul fillers and the empty Braille
+      cell, five characters named one by one.
+
+    ``Mn`` is the one worth arguing. Walking combining marks means a line
+    opening ``U+0300`` then ``[9]`` defuses, which is a false positive only if a
+    combining mark can *start* a line — it cannot follow a base character there
+    by definition, so the cost is a marker defused on a line no honest text
+    writes. Measured over 2.8 MB of this repo's prose and 200 KB of real
+    ``ingest url`` output, the widened class rewrites exactly what the old one
+    did: 7 markers, the same 7. ``Co`` is the mirror of the ``Mn`` argument: a
+    font may well draw a private-use character, so the class is one character
+    too wide there, in the direction that closes a boundary rather than leaves
+    one open.
 
     ## Defused, not normalised, and the invisible prefix survives
 
@@ -820,20 +906,49 @@ def _neutralise_markers(text: str) -> str:
     once mined a node id for ``"116"``. That resolves to nothing — the offered
     markers were 1 and 2 — so :func:`resolve_citation` drops it, ``citations``
     is empty, and the envelope is ``answered: false`` with the answer text
-    withheld. A forged number now costs a **refusal** where it used to buy
-    ``answered: true`` beside citations pointing at notes that said the
-    opposite, which is the whole of what this defence is for.
+    withheld. **On** ``qwen3:8b`` **a forged number costs a refusal** where it
+    used to buy ``answered: true`` beside citations pointing at notes that said
+    the opposite.
 
-    **The residual, named rather than left to be discovered.** A confusable
-    rendering of the grammar — ``［9］`` in fullwidth brackets, ``[٣]`` in
-    Arabic-Indic digits — is not rewritten. It cannot forge what ``citations``
-    claims, because :func:`resolve_citation` takes ASCII digits and nothing
-    else, so no such marker resolves to a note. What it could still do is
-    persuade a weak model that a line is a boundary, and that is the same
-    "escaping is not a defence against a model" limit the next paragraph draws
-    rather than a new one. ``tests/test_answers.py``'s audit matches those
-    grammars on purpose, so if one ever reaches a prompt the test says so
-    instead of the question being reasoned about again.
+    That sentence is scoped to the model it was measured on, because the other
+    local model contradicts it. On ``llama3.2:1b`` at temperature 0, with this
+    defence working and nothing shielding anything, the marker-reuse payload
+    above returns ``answered=True``, ``cited=[1, 2]``, ``unresolved=[]`` and the
+    answer *"records are kept for 9999 days, not thirty"* — 3 of 3 — while note
+    1 says thirty days. The defusing closes the prompt's grammar; it does not
+    make a 1B model read. Which is the next paragraph's point, and the reason
+    this one may not be generalised.
+
+    **The residual, named rather than left to be discovered.** Three things,
+    and each is a decision:
+
+    1. **A prefix that draws.** List and quote furniture — ``- ``, ``* ``,
+       ``+ ``, ``> ``, ``# ``, ``1. ``, ``| ``, ``• `` — is a line start to any
+       reader, is not walked, and never will be: ``- [9] Retention window``
+       reaches the prompt undefused and takes ``llama3.2:1b`` to
+       ``unresolved: ['3'..'9']``, exactly like an invisible shield. Closing it
+       would rewrite every ordinary markdown list item and every reference-link
+       definition ``[1]: https://…`` in every ingested page, which is a cost
+       nothing measured justifies. It is the residual most likely to occur by
+       accident rather than by design, so it is asserted as open in the tests
+       rather than merely left out of the class.
+    2. **A confusable rendering of the grammar** — ``［9］`` in fullwidth
+       brackets, ``[٣]`` in Arabic-Indic digits, ``[ 9 ]`` spaced — is not
+       rewritten. It cannot forge what ``citations`` claims, because
+       :func:`resolve_citation` takes ASCII digits and nothing else, so no such
+       marker resolves to a note. What it could still do is persuade a weak
+       model that a line is a boundary, and that is the same "escaping is not a
+       defence against a model" limit the next paragraph draws rather than a
+       new one.
+    3. **A character outside** :data:`_BLANK_GLYPHS` **that a particular font
+       happens to render blank** — a missing glyph substituted with a space, a
+       ``Lo`` or ``So`` codepoint nobody has named here. There is no offline
+       oracle for what a font draws, so the class is five named characters and
+       not a claim about rendering.
+
+    ``tests/test_answers.py``'s audit sees all three on purpose — the furniture
+    and the confusable grammars are matched there — so if one ever reaches a
+    prompt the test says so instead of the question being reasoned about again.
 
     ## It has to run last
 
