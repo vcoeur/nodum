@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import sqlite3
 from pathlib import Path
 
@@ -1219,17 +1220,121 @@ def _stop_columns_without_the_check(conn):
 
 
 def _rebuilt_with(conn, replacement):
-    """Rebuild `cycles` with `replacement` in place of `0015`'s `, <CONSTRAINT …>`.
+    """Rebuild `cycles` with `replacement` in place of `0015`'s `<CONSTRAINT …>`.
 
     The repair statement itself, with its one constraint swapped out — so the
     table under test differs from a sound one in exactly that clause and in
-    nothing else. The leading comma goes with it, since a table whose last
-    column declaration is followed by nothing needs no separator.
+    nothing else.
+
+    The separator goes with it — the last column declaration's trailing comma —
+    since a table whose columns are followed by nothing needs no separator.
+
+    The parked copy the repair leaves behind goes with it too: this is a
+    *fixture* building a drifted `cycles`, and a file also carrying
+    `cycles_before_repair` is a different drift, which `_cycle_stop_problems`
+    reports first and would hide everything the callers are asking about.
     """
     conn.executescript(
-        db.CYCLE_STOP_CHECK_REBUILD_SQL.replace(f", {db.CYCLE_STOP_CHECK_SQL}", replacement)
+        db.CYCLE_STOP_CHECK_REBUILD_SQL.replace(f",\n{db.CYCLE_STOP_CHECK_SQL}", replacement)
     )
+    conn.execute(f"DROP TABLE {db.CYCLES_PARKED_TABLE}")
     conn.commit()
+
+
+def _script_from_message(message, first_line, last_line):
+    """The statement a refusal printed, cut out of the message a human reads.
+
+    A test that runs the repair out of the module tests the module. What a human
+    has is the message, and between the two sits every renderer it ships
+    through — so the ones below take the SQL back out of the text, by lines
+    written here rather than by the constants they are checking.
+    """
+    lines = message.splitlines()
+    start = lines.index(first_line)
+    end = start + lines[start:].index(last_line)
+    return "\n".join(lines[start : end + 1])
+
+
+def _drop_the_parked_copy(conn):
+    """Take the second step the refusal prints, and check it is the one printed.
+
+    The rebuild parks a copy of `cycles` and leaves it, so the file goes on
+    being refused until a human has been told the copy is there — that refusal
+    is the only thing standing between "the copy did not finish" and an empty
+    journal nobody hears about. Here the copy is whole, so the statement is a
+    `DROP` and this asserts the message says exactly that.
+    """
+    with pytest.raises(db.SchemaConsistencyError) as refused:
+        db.init_db(conn)
+    message = str(refused.value)
+    assert "cycles_before_repair" in message
+    assert "not in 'cycles'" not in message, "it said rows were stranded when none are"
+    statement = _script_from_message(
+        message, "DROP TABLE cycles_before_repair;", "DROP TABLE cycles_before_repair;"
+    )
+    conn.executescript(statement)
+    conn.commit()
+
+
+def _statements(script):
+    """`script` split the way a SQL console reads it, statement by statement.
+
+    `sqlite3.complete_statement` is the predicate the `sqlite3` shell itself
+    uses to decide a statement has ended, so this is that shell's reading of the
+    text rather than a guess at one.
+    """
+    statements, current = [], ""
+    for character in script:
+        current += character
+        if character == ";" and sqlite3.complete_statement(current):
+            statements.append(current.strip())
+            current = ""
+    return statements
+
+
+def _run_as_a_console_does(path, script, *, stop_at_the_first_error):
+    """Run `script` a statement at a time against `path`, as a console does.
+
+    `executescript` is **one** execution model, and it is the forgiving one: it
+    abandons the whole script at the first error. A human does not necessarily
+    have that. An interactive shell, a database GUI and a notebook cell report
+    the error and read the next statement — `sqlite3` ships a `-bail` flag
+    precisely because stopping is not what it does by default — and every
+    statement after a failed one then runs against a half-built schema.
+
+    The connection is in autocommit, so the script's own `BEGIN`/`COMMIT` are
+    the only transaction control, exactly as they are for the human pasting it.
+
+    Returns the errors, in order.
+    """
+    connection = sqlite3.connect(path, isolation_level=None)
+    errors = []
+    try:
+        for statement in _statements(script):
+            try:
+                connection.execute(statement)
+            except sqlite3.Error as error:
+                errors.append(error)
+                if stop_at_the_first_error:
+                    break
+    finally:
+        connection.close()
+    return errors
+
+
+def _cycle_ids_anywhere_in(path):
+    """Every cycle id the file still holds, in `cycles` or in the parked copy."""
+    connection = sqlite3.connect(path)
+    try:
+        listed = connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        tables = {row[0] for row in listed}
+        found = set()
+        for table in ("cycles", db.CYCLES_PARKED_TABLE):
+            if table in tables:
+                found |= {row[0] for row in connection.execute(f"SELECT id FROM {table}")}
+        return found
+    finally:
+        connection.close()
 
 
 def _half_stop_is_storable(conn, cycle_id):
@@ -1263,7 +1368,7 @@ def test_the_constraint_name_in_a_comment_does_not_satisfy_the_check(fresh_db):
     """
     conn = db.connect()
     try:
-        _rebuilt_with(conn, f" /* {db.CYCLE_STOP_CHECK_SQL} */")
+        _rebuilt_with(conn, f"\n  /* {db.CYCLE_STOP_CHECK_SQL} */")
         # The name really is in the schema SQLite stored, which is what the
         # search used to be satisfied by...
         stored = conn.execute(
@@ -1279,6 +1384,105 @@ def test_the_constraint_name_in_a_comment_does_not_satisfy_the_check(fresh_db):
         assert db.CYCLE_STOP_CHECK_NAME in problems[0]
         with pytest.raises(db.SchemaConsistencyError):
             db.init_db(conn)
+    finally:
+        conn.close()
+
+
+def test_the_constraint_name_in_a_dash_comment_does_not_satisfy_the_check(fresh_db):
+    """The other half of the comment stripper, and it is the half this repo writes.
+
+    `_SQL_COMMENT_RE` has two alternatives and only `/* … */` was exercised.
+    Deleting the `--` arm outright passed all 155 tests — while `migrations.py`
+    contains no `/*` at all: every comment in the `cycles` DDL the docstring
+    cites as the motivation is a `--` comment, and they reach `sqlite_master`
+    verbatim. The motivating case was the untested one.
+    """
+    conn = db.connect()
+    try:
+        _rebuilt_with(conn, f'\n  -- the CHECK "{db.CYCLE_STOP_CHECK_NAME}" belongs here\n')
+        stored = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'cycles'"
+        ).fetchone()["sql"]
+        # The name is in the stored schema, in a `--` comment...
+        assert db.CYCLE_STOP_CHECK_NAME in stored
+        assert "--" in stored
+        # ...and nothing constrains the columns, so the drift is real.
+        assert _half_stop_is_storable(conn, "half") is True
+
+        assert db.CYCLE_STOP_CHECK_NAME not in db._table_sql(conn, "cycles")
+        problems = db._cycle_stop_problems(conn)
+        assert len(problems) == 1
+        assert db.CYCLE_STOP_CHECK_NAME in problems[0]
+        with pytest.raises(db.SchemaConsistencyError):
+            db.init_db(conn)
+    finally:
+        conn.close()
+
+
+def test_a_cycles_carrying_a_column_the_rebuild_never_heard_of_is_not_handed_it(fresh_db):
+    """The rebuild's column list is this version's, and the drifted file is not.
+
+    `CYCLES_COLUMNS` is pinned against `PRAGMA table_info(cycles)` on a freshly
+    migrated database — which is the one schema the repair never runs against,
+    because a file in this repo's own shape does not need repairing. The whole
+    population the statement exists for is files this repo did not produce, and
+    against one of those the hand-written list is a guess: a column added by a
+    hand-edited schema or an externally applied migration was rebuilt away, with
+    its data, silently, and `init_db` returned `[]` afterwards.
+
+    So the check compares the live columns to the list before printing anything,
+    and where they differ it prints the difference instead of the rebuild. A
+    repair whose column list is not the table's is not a repair.
+    """
+    conn = db.connect()
+    try:
+        _stop_columns_without_the_check(conn)
+        conn.execute("ALTER TABLE cycles ADD COLUMN operator_notes TEXT")
+        _insert_cycle(conn, "kept", "curative", status="completed")
+        conn.execute("UPDATE cycles SET operator_notes = 'why this ran' WHERE id = 'kept'")
+        conn.commit()
+
+        with pytest.raises(db.SchemaConsistencyError) as refused:
+            db.init_db(conn)
+        message = str(refused.value)
+        assert "operator_notes" in message, "it did not name the column it would have dropped"
+        assert db.CYCLE_STOP_CHECK_REBUILD_SQL not in message, (
+            "it printed a rebuild that drops a column of this file, with its data"
+        )
+        # The drift is still reported — refusing to print the rebuild is not
+        # refusing to notice — and the column and its value are still there.
+        assert db.CYCLE_STOP_CHECK_NAME in message
+        kept = conn.execute("SELECT operator_notes FROM cycles WHERE id = 'kept'").fetchone()
+        assert kept[0] == "why this ran"
+
+        # Reconciled, the rebuild comes back.
+        conn.execute("ALTER TABLE cycles DROP COLUMN operator_notes")
+        conn.commit()
+        with pytest.raises(db.SchemaConsistencyError) as second:
+            db.init_db(conn)
+        assert db.CYCLE_STOP_CHECK_REBUILD_SQL in str(second.value)
+    finally:
+        conn.close()
+
+
+def test_a_cycles_missing_a_column_the_rebuild_copies_is_not_handed_it_either(fresh_db):
+    """The same guard from the other side: the copy would die on a missing column.
+
+    `SELECT report FROM cycles` is not a repair on a file that has no `report`,
+    and the failure — `no such column` in the middle of the copy — is one the
+    message never anticipated. It only ever named the half-stop.
+    """
+    conn = db.connect()
+    try:
+        _stop_columns_without_the_check(conn)
+        conn.execute("ALTER TABLE cycles DROP COLUMN report")
+        conn.commit()
+
+        with pytest.raises(db.SchemaConsistencyError) as refused:
+            db.init_db(conn)
+        message = str(refused.value)
+        assert "report" in message
+        assert db.CYCLE_STOP_CHECK_REBUILD_SQL not in message
     finally:
         conn.close()
 
@@ -1300,7 +1504,7 @@ def test_an_unnamed_check_that_enforces_the_rule_is_still_reported(fresh_db):
     """
     conn = db.connect()
     try:
-        _rebuilt_with(conn, ", CHECK ((stop_requested_by IS NULL) = (stop_requested_at IS NULL))")
+        _rebuilt_with(conn, ",\nCHECK ((stop_requested_by IS NULL) = (stop_requested_at IS NULL))")
         # It bites, so the file is not broken in the way the message describes.
         assert _half_stop_is_storable(conn, "anonymous") is False
         # And it is reported anyway, because the constraint `0015` records is a
@@ -1310,9 +1514,11 @@ def test_an_unnamed_check_that_enforces_the_rule_is_still_reported(fresh_db):
         assert db.CYCLE_STOP_CHECK_NAME in problems[0]
 
         # The repair is a no-op for the rule and puts the name on, which is the
-        # whole of what it was missing.
+        # whole of what it was missing — and then names its own parked copy,
+        # which is the second half of the two-step it always is now.
         conn.executescript(db.CYCLE_STOP_CHECK_REBUILD_SQL)
         conn.commit()
+        _drop_the_parked_copy(conn)
         assert db.init_db(conn) == []
         assert _half_stop_is_storable(conn, "named") is False
         with pytest.raises(sqlite3.IntegrityError, match=db.CYCLE_STOP_CHECK_NAME):
@@ -1402,6 +1608,85 @@ def test_the_rebuilds_column_list_is_every_column_a_migrated_cycles_has(fresh_db
     )
 
 
+def _create_table_from_the_rebuild():
+    """The rebuild's replacement table, built in a scratch database of its own.
+
+    The statement out of `CYCLE_STOP_CHECK_REBUILD_SQL`, run nowhere near a real
+    graph, so the *declarations* can be interrogated: what a rebuilt `cycles`
+    would be, as opposed to what it would be called.
+    """
+    statement = _script_from_message(
+        db.CYCLE_STOP_CHECK_REBUILD_SQL, "CREATE TABLE cycles_rebuilt (", ");"
+    )
+    scratch = sqlite3.connect(":memory:")
+    scratch.row_factory = sqlite3.Row
+    scratch.executescript(statement)
+    return scratch
+
+
+#: Values probed against `trigger` and `status`, live table against rebuilt one.
+#: The four each column allows, plus one a widened CHECK would let through and
+#: two nothing should — a CHECK is a set of accepted values, so comparing the
+#: sets is comparing the constraint.
+_TRIGGER_PROBES = ("manual", "scheduled", "curative", "rollback", "repair", "", "MANUAL")
+_STATUS_PROBES = ("running", "completed", "failed", "rolled_back", "cancelled", "", "COMPLETED")
+
+
+def _accepts(conn, table, column, value, row_id):
+    """Does `table` accept `value` in `column`? Leaves nothing behind either way."""
+    other = "status" if column == "trigger" else "trigger"
+    fixed = "completed" if column == "trigger" else "curative"
+    try:
+        conn.execute(
+            f"INSERT INTO {table} (id, {column}, triggered_by, {other}) VALUES (?, ?, 'x', ?)",
+            (row_id, value, fixed),
+        )
+    except sqlite3.IntegrityError:
+        conn.rollback()
+        return False
+    conn.rollback()
+    return True
+
+
+def test_the_rebuilds_columns_are_the_migrated_ones_down_to_type_default_and_check(fresh_db):
+    """The names matching is not the table matching, and the rebuild declares the rest.
+
+    `test_the_rebuilds_column_list_is_every_column_a_migrated_cycles_has`
+    compares `row["name"]` and nothing else, so it is blind to everything the
+    rebuild's declarations actually assert. Three edits to the shipped `cycles`
+    DDL — retyping `report` to `BLOB`, dropping `dry_run`'s `NOT NULL`, widening
+    the `trigger` CHECK — passed the whole suite while leaving
+    `db.CYCLES_COLUMNS` untouched, and each of them is a repair that silently
+    rewrites the column back: a human runs the rebuild to put a CHECK on and
+    gets a differently-typed column, a re-imposed `NOT NULL` their rows may
+    violate, or a narrower CHECK than the file they started with.
+
+    So the comparison is the whole of `PRAGMA table_info` — type, `notnull`,
+    `dflt_value`, `pk` — plus, for the two columns whose declaration is a CHECK,
+    the set of values each table accepts. `table_info` cannot see a CHECK at
+    all, and a constraint is exactly the values it lets through.
+    """
+    conn = db.connect()
+    scratch = _create_table_from_the_rebuild()
+    try:
+        live = [tuple(row) for row in conn.execute("PRAGMA table_info(cycles)")]
+        rebuilt = [tuple(row) for row in scratch.execute("PRAGMA table_info(cycles_rebuilt)")]
+        assert live == rebuilt, (
+            "the table the rebuild would build is not the table the migrations leave: a "
+            "human running it to add a CHECK would get a different column back"
+        )
+
+        for column, probes in (("trigger", _TRIGGER_PROBES), ("status", _STATUS_PROBES)):
+            for index, value in enumerate(probes):
+                row_id = f"probe-{column}-{index}"
+                assert _accepts(conn, "cycles", column, value, row_id) == _accepts(
+                    scratch, "cycles_rebuilt", column, value, row_id
+                ), f"the two tables disagree about {column} = {value!r}"
+    finally:
+        scratch.close()
+        conn.close()
+
+
 def test_the_missing_stop_check_is_refused_with_a_rebuild_that_keeps_every_row(fresh_db):
     """The remedy is this check's own, and putting a CHECK on is not adding a column.
 
@@ -1445,8 +1730,13 @@ def test_the_missing_stop_check_is_refused_with_a_rebuild_that_keeps_every_row(f
         assert "delete the database file" not in message, "it told a human to bin their graph"
         assert db.CYCLE_STOP_CHECK_REBUILD_SQL in message
 
-        conn.executescript(db.CYCLE_STOP_CHECK_REBUILD_SQL)
+        # Run what the message printed, not what the module holds — and run it
+        # as a script, which is one of the three ways it has to survive.
+        conn.executescript(
+            _script_from_message(message, "PRAGMA foreign_keys=off;", "PRAGMA foreign_keys=on;")
+        )
         conn.commit()
+        _drop_the_parked_copy(conn)
         assert db.init_db(conn) == []
 
         # Every row came across, and every *column* of it — the recorded stop,
@@ -1478,15 +1768,21 @@ def test_the_missing_stop_check_is_refused_with_a_rebuild_that_keeps_every_row(f
     assert service.request_stop("fresh", principal=owner()).stop_requested is True
 
 
-def test_the_rebuild_that_a_half_stop_defeats_says_so_and_names_the_rows(fresh_db):
-    """A repair that dies with no next step is advice nobody can carry out.
+def test_a_half_stop_is_named_and_cleared_before_the_rebuild_is_printed_at_all(fresh_db):
+    """A repair that is *going* to fail is not handed to a human to run.
 
     The rebuild copies the rows through the constraint, so a file that ran
     without one and stored a half-stop meets `CHECK constraint failed` there —
-    which is the constraint doing its job and, unexplained, a dead end at the
-    end of the one instruction the refusal gave. `_CREATE_THE_CYCLES_INDEX`
-    already answers the mirror of this ("if it fails, two cycles are recorded
-    running — close the stale one first"), and this says its own version.
+    the constraint doing its job, and, at the end of the one instruction the
+    refusal gave, a dead end. It used to be printed anyway, with a sentence
+    about what to do *if* it failed.
+
+    That row is visible from the check, before anything is printed
+    (`CYCLE_STOP_HALF_STOP_SQL` is a query, and the check can run it), so the
+    order is the other way round now: name the rows, print the statement that
+    clears them, and print the rebuild on the next run, when it will work.
+    Advice that fails halfway is advice that gets abandoned halfway, and a
+    rebuild abandoned halfway is the state the test below this one is about.
     """
     conn = db.connect()
     try:
@@ -1498,21 +1794,383 @@ def test_the_rebuild_that_a_half_stop_defeats_says_so_and_names_the_rows(fresh_d
         with pytest.raises(db.SchemaConsistencyError) as refused:
             db.init_db(conn)
         message = str(refused.value)
+        # The row is named, the query that finds it is given...
+        assert "half" in message
         assert db.CYCLE_STOP_HALF_STOP_SQL in message
-
-        # The rebuild refuses, exactly as the sentence warns.
+        # ...and the rebuild is *withheld*, because running it here fails.
+        assert db.CYCLE_STOP_CHECK_REBUILD_SQL not in message
         with pytest.raises(sqlite3.IntegrityError, match=db.CYCLE_STOP_CHECK_NAME):
             conn.executescript(db.CYCLE_STOP_CHECK_REBUILD_SQL)
         conn.rollback()
 
-        # And the query the refusal names finds the row in the way, so the
-        # second step is one a human can actually take.
+        # The statement it prints instead is the one that unblocks it, and the
+        # query it names finds the row it is about.
         assert [row["id"] for row in conn.execute(db.CYCLE_STOP_HALF_STOP_SQL)] == ["half"]
-        conn.execute("UPDATE cycles SET stop_requested_at = NULL WHERE id = 'half'")
+        conn.executescript(
+            _script_from_message(
+                message,
+                "UPDATE cycles SET stop_requested_at = NULL,",
+                "     != (stop_requested_at IS NULL);",
+            )
+        )
         conn.commit()
+        assert conn.execute(db.CYCLE_STOP_HALF_STOP_SQL).fetchall() == []
+
+        # And now — and only now — the rebuild is printed, and it works.
+        with pytest.raises(db.SchemaConsistencyError) as second:
+            db.init_db(conn)
+        assert db.CYCLE_STOP_CHECK_REBUILD_SQL in str(second.value)
         conn.executescript(db.CYCLE_STOP_CHECK_REBUILD_SQL)
         conn.commit()
+        _drop_the_parked_copy(conn)
         assert db.init_db(conn) == []
+        # The cycle whose stop was recorded half-way is still a cycle.
+        assert [row["id"] for row in conn.execute("SELECT id FROM cycles")] == ["half"]
+    finally:
+        conn.close()
+
+
+def _four_cycles_and_a_half_stop(path):
+    """A drifted `cycles` with four journal entries, one of them a half-stop.
+
+    The half-stop is what makes the rebuild's copy fail, and the other three are
+    there to be counted afterwards: this fixture is about what survives.
+    """
+    conn = db.connect()
+    try:
+        _stop_columns_without_the_check(conn)
+        for index in range(4):
+            _insert_cycle(conn, f"cycle-{index}", "curative", status="completed")
+        conn.execute("UPDATE cycles SET stop_requested_at = datetime('now') WHERE id = 'cycle-0'")
+        conn.commit()
+    finally:
+        conn.close()
+    assert _cycle_ids_anywhere_in(path) == {f"cycle-{index}" for index in range(4)}
+
+
+def test_no_way_of_running_the_rebuild_can_lose_a_cycle(fresh_db):
+    """A console that runs on past an error emptied the journal, and nothing noticed.
+
+    The rebuild's copy can fail — that is the constraint doing its job on a file
+    that stored a half-stop while it had no constraint — and the four statements
+    after it were `DROP TABLE cycles`, the `RENAME`, the indexes and `COMMIT`.
+    Under `executescript` that never happens, because the first error abandons
+    the script; under a console that reports the error and reads the next
+    statement, all four ran, and a file with four cycles in it had none. The
+    `events` rows kept pointing at cycles that no longer existed, `init_db`
+    returned `[]` afterwards, and the only trace of any of it was in a terminal
+    scrollback.
+
+    A transaction is a guarantee about one execution model. What holds across
+    all of them is structural: **the repair carries no statement that can lose a
+    row.** The copy into `cycles_before_repair` is the first thing it does, and
+    the `DROP` is against a table whose every row is already in that copy. There
+    is nothing weaker that works — SQLite has no conditional DDL and no `RAISE`
+    outside a trigger, so no statement in the script can stop the next one from
+    running, and *not destroying anything* is the only guarantee left that does
+    not depend on the tool obeying an error.
+
+    Run here in the model that broke it, and the file is followed all the way
+    back: refused with the rows named, restored by the statements the refusal
+    prints, and passing `init` with all four cycles in it.
+    """
+    _four_cycles_and_a_half_stop(fresh_db)
+
+    errors = _run_as_a_console_does(
+        fresh_db, db.CYCLE_STOP_CHECK_REBUILD_SQL, stop_at_the_first_error=False
+    )
+
+    # The copy failed, as it must — and everything after it still ran.
+    assert [type(error).__name__ for error in errors] == ["IntegrityError"]
+    assert db.CYCLE_STOP_CHECK_NAME in str(errors[0])
+    assert _cycle_ids_anywhere_in(fresh_db) == {f"cycle-{index}" for index in range(4)}, (
+        "a run that stopped in the middle lost cycles"
+    )
+
+    conn = db.connect()
+    try:
+        # Nothing is allowed to quietly pass over a file in this state, which is
+        # the other half of what went wrong: the loss was silent.
+        with pytest.raises(db.SchemaConsistencyError) as refused:
+            db.init_db(conn)
+        message = str(refused.value)
+        assert "cycles_before_repair" in message
+        assert "Do not drop it" in message
+        for index in range(4):
+            assert f"cycle-{index}" in message, "it did not name the rows it is holding"
+
+        # Follow it. The copy carries the half-stop, so the insert refuses
+        # first — which the message says, with the statement for that too.
+        restore = _script_from_message(
+            message, "INSERT INTO cycles SELECT", "  WHERE id NOT IN (SELECT id FROM cycles);"
+        )
+        with pytest.raises(sqlite3.IntegrityError, match=db.CYCLE_STOP_CHECK_NAME):
+            conn.executescript(restore)
+        conn.rollback()
+        conn.executescript(
+            _script_from_message(
+                message,
+                "UPDATE cycles_before_repair SET stop_requested_at = NULL,",
+                "     != (stop_requested_at IS NULL);",
+            )
+        )
+        conn.executescript(restore)
+        conn.commit()
+
+        _drop_the_parked_copy(conn)
+        assert db.init_db(conn) == []
+        assert {row["id"] for row in conn.execute("SELECT id FROM cycles")} == {
+            f"cycle-{index}" for index in range(4)
+        }
+    finally:
+        conn.close()
+
+
+def test_a_console_that_stops_at_the_first_error_changes_nothing(fresh_db):
+    """The other statement-at-a-time model, and it must leave the file alone.
+
+    `-bail`, a script with `set -e`, a driver that raises: the copy fails, the
+    transaction is never committed, and closing the connection rolls it back.
+    Asserted beside its opposite because the two together are the claim — the
+    repair is safe *whatever* the tool does with an error, not safe in one
+    reading and merely survivable in the other.
+    """
+    _four_cycles_and_a_half_stop(fresh_db)
+
+    errors = _run_as_a_console_does(
+        fresh_db, db.CYCLE_STOP_CHECK_REBUILD_SQL, stop_at_the_first_error=True
+    )
+
+    assert [type(error).__name__ for error in errors] == ["IntegrityError"]
+    conn = db.connect()
+    try:
+        tables = {row["name"] for row in conn.execute("SELECT name FROM sqlite_master")}
+        assert db.CYCLES_PARKED_TABLE not in tables, "the rolled-back copy was left behind"
+        assert {row["id"] for row in conn.execute("SELECT id FROM cycles")} == {
+            f"cycle-{index}" for index in range(4)
+        }
+    finally:
+        conn.close()
+
+
+def test_a_repair_attempt_a_human_committed_can_be_run_again(fresh_db):
+    """Following the advice used to wedge the repair permanently, on one connection.
+
+    The failed copy leaves `CREATE TABLE cycles_rebuilt` pending in an open
+    transaction. The next thing the message asks for is clearing the half-stops
+    — and the `COMMIT` that persists *that* persists the orphaned scratch table
+    with it, so every later attempt died on "table cycles_rebuilt already
+    exists" and the message named no way out. Data was safe; the repair was not
+    runnable, forever.
+
+    `DROP TABLE IF EXISTS cycles_rebuilt` leads the script for this, and the
+    parked copy the attempt also left behind is reported rather than silently
+    reused. Both steps are taken here on one connection, in the order the
+    messages give them.
+    """
+    _four_cycles_and_a_half_stop(fresh_db)
+    console = sqlite3.connect(fresh_db, isolation_level=None)
+    try:
+        for statement in _statements(db.CYCLE_STOP_CHECK_REBUILD_SQL):
+            try:
+                console.execute(statement)
+            except sqlite3.IntegrityError:
+                break
+        # The human now does what the refusal asked and commits it, which is
+        # what used to commit the wreckage of the attempt along with it.
+        console.execute(db.CYCLE_STOP_CLEAR_HALF_STOP_SQL)
+        console.execute("COMMIT")
+        assert {row[0] for row in console.execute("SELECT name FROM sqlite_master")} >= {
+            "cycles_rebuilt",
+            db.CYCLES_PARKED_TABLE,
+        }, "this test is not reproducing the wedge it is about"
+    finally:
+        console.close()
+
+    conn = db.connect()
+    try:
+        _drop_the_parked_copy(conn)
+        with pytest.raises(db.SchemaConsistencyError) as refused:
+            db.init_db(conn)
+        script = _script_from_message(
+            str(refused.value), "PRAGMA foreign_keys=off;", "PRAGMA foreign_keys=on;"
+        )
+        conn.executescript(script)
+        conn.commit()
+        _drop_the_parked_copy(conn)
+        assert db.init_db(conn) == []
+        assert {row["id"] for row in conn.execute("SELECT id FROM cycles")} == {
+            f"cycle-{index}" for index in range(4)
+        }
+    finally:
+        conn.close()
+
+
+def _every_statement_a_refusal_can_print():
+    """Every SQL statement in `db`, by the naming convention they all share.
+
+    Collected from the module rather than listed here on purpose: a statement
+    added to a refusal next year is one nobody will remember to add to a list,
+    and the property below is about all of them.
+    """
+    statements = {}
+    for name, value in vars(db).items():
+        if not name.endswith("_SQL"):
+            continue
+        if isinstance(value, str):
+            statements[name] = value
+        elif isinstance(value, tuple):
+            statements.update({f"{name}[{key}]": sql for key, sql in value})
+    return statements
+
+
+def test_every_statement_a_refusal_prints_is_narrower_than_a_terminal():
+    """SQL a human must paste verbatim must not be something a renderer re-wraps.
+
+    The refusal reaches a human through rich, which re-wraps any line wider than
+    the window it is drawn in. That is harmless for almost all SQL — SQL does
+    not care where its whitespace falls — and it is not harmless for this SQL,
+    because the CHECK these repairs put back is a **named** constraint and the
+    name has spaces in it. At a terminal 90 columns wide, `CONSTRAINT "a stop
+    records who asked and when, or neither"` was broken across two lines; the
+    paste ran without error, kept every row, installed a working constraint, and
+    left `nodum init` refusing with the identical message, because the stored
+    name now had a newline in it. 60 of the 141 widths between 60 and 200 did
+    that. Width 80 did not, and a non-tty pipe gets 80 — which is why nothing
+    ever saw it.
+
+    A renderer only re-wraps a line that does not fit, so every statement is
+    written pre-wrapped narrower than any terminal anyone runs. This is the
+    property, checked on the statements themselves; the test below checks it
+    through the renderer.
+    """
+    statements = _every_statement_a_refusal_can_print()
+    assert "CYCLE_STOP_CHECK_REBUILD_SQL" in statements, "the collector stopped collecting"
+    too_wide = {
+        name: max(len(line) for line in sql.splitlines())
+        for name, sql in statements.items()
+        if any(len(line) > db._SQL_WIDTH for line in sql.splitlines())
+    }
+    assert too_wide == {}, (
+        f"a terminal narrower than these re-wraps them: {too_wide} — and a line break inside "
+        f"the quoted constraint name is a repair that runs and does not satisfy the check"
+    )
+    # And the width is one no terminal is under: 58 columns is narrower than
+    # the 80 a pipe reports and narrower than any window a person works in.
+    assert db._SQL_WIDTH <= 58
+
+
+def _rendered_at(width, error, *, with_frames=False):
+    """What a terminal `width` columns wide shows for `error`.
+
+    rich is what draws the traceback typer prints for an unhandled exception —
+    it is a hard dependency of typer, so this is the channel every install
+    delivers the refusal over, not one of several.
+
+    The frames are off by default because they are two-thirds of a second per
+    render to syntax-highlight and none of them is what wraps; the sweep below
+    turns them on once, at a width in the range that used to break, to show the
+    two renderings agree about the part being asserted on.
+    """
+    from rich.console import Console
+    from rich.traceback import Traceback
+
+    console = Console(file=io.StringIO(), width=width, force_terminal=False, no_color=True)
+    frames = error.__traceback__ if with_frames else None
+    console.print(Traceback.from_exception(type(error), error, frames))
+    return console.file.getvalue()
+
+
+def _repair_out_of(text):
+    """The rebuild as it appears in rendered `text`, or None if it is not there."""
+    lines = [line.rstrip() for line in text.splitlines()]
+    if "PRAGMA foreign_keys=off;" not in lines or "PRAGMA foreign_keys=on;" not in lines:
+        return None
+    start = lines.index("PRAGMA foreign_keys=off;")
+    end = len(lines) - 1 - lines[::-1].index("PRAGMA foreign_keys=on;")
+    return "\n".join(lines[start : end + 1])
+
+
+def test_the_repair_survives_the_renderer_it_ships_through_at_every_width(fresh_db):
+    """Pin the mangle where it happened: in the terminal, not in the constant.
+
+    Both repair tests here run `db.CYCLE_STOP_CHECK_REBUILD_SQL` directly, so
+    they pass whatever the human actually sees. This one takes the SQL back out
+    of the rendered refusal, at every width from 58 to 200, and requires it to
+    be byte-identical to the statement the module meant to give — and then runs
+    one of those pastes, a statement at a time, against a real drifted file.
+    """
+    conn = db.connect()
+    try:
+        _stop_columns_without_the_check(conn)
+        _insert_cycle(conn, "kept", "curative", status="completed")
+        conn.commit()
+        with pytest.raises(db.SchemaConsistencyError) as refused:
+            db.init_db(conn)
+    finally:
+        conn.close()
+
+    mangled = [
+        width
+        for width in range(58, 201)
+        if _repair_out_of(_rendered_at(width, refused.value)) != db.CYCLE_STOP_CHECK_REBUILD_SQL
+    ]
+    assert mangled == [], f"the terminal changed the repair at {len(mangled)} widths: {mangled[:5]}"
+    # The full rendering, frames and all, says the same thing at a width that
+    # used to break — so the sweep above is measuring the real channel.
+    paste = _repair_out_of(_rendered_at(61, refused.value, with_frames=True))
+    assert paste == db.CYCLE_STOP_CHECK_REBUILD_SQL
+
+    # And that paste is a repair, run the way a console runs it.
+    errors = _run_as_a_console_does(fresh_db, paste, stop_at_the_first_error=False)
+    assert errors == []
+    conn = db.connect()
+    try:
+        _drop_the_parked_copy(conn)
+        assert db.init_db(conn) == []
+        assert [row["id"] for row in conn.execute("SELECT id FROM cycles")] == ["kept"]
+    finally:
+        conn.close()
+
+
+def test_a_constraint_name_a_renderer_already_broke_still_answers_to_the_name(fresh_db):
+    """The files that were mangled before the emitter was fixed must not be stuck.
+
+    A repair pasted out of a terminal too narrow for it installs the constraint
+    under a name with a newline inside it. It enforces the rule — SQLite is
+    indifferent to whitespace inside a quoted identifier — and an exact
+    substring search does not find it, so `nodum init` refused, with the
+    identical message, *after* its owner had done everything the message asked.
+    That is the worst refusal this check can produce, and pre-wrapping the
+    statement does nothing for the databases where it already happened.
+
+    So the search is by words, not by whitespace, and this is the file it is for.
+    """
+    conn = db.connect()
+    try:
+        _stop_columns_without_the_check(conn)
+        _insert_cycle(conn, "kept", "curative", status="completed")
+        conn.commit()
+        # Exactly what a 50-column terminal hands back: a break between two
+        # words of the name, inside the quotes.
+        conn.executescript(
+            db.CYCLE_STOP_CHECK_REBUILD_SQL.replace(
+                "who asked and when, or neither", "who asked and when, or\nneither"
+            )
+        )
+        conn.execute(f"DROP TABLE {db.CYCLES_PARKED_TABLE}")
+        conn.commit()
+
+        stored = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'cycles'"
+        ).fetchone()["sql"]
+        assert db.CYCLE_STOP_CHECK_NAME not in stored, "the fixture is not the mangle it claims"
+        # The rule is enforced, under a name spelled with a newline...
+        assert _half_stop_is_storable(conn, "half") is False
+        # ...and the file passes, instead of being refused forever.
+        assert db._cycle_stop_problems(conn) == []
+        assert db.init_db(conn) == []
+        assert {row["id"] for row in conn.execute("SELECT id FROM cycles")} == {"kept", "half"}
     finally:
         conn.close()
 

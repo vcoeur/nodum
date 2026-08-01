@@ -799,19 +799,65 @@ commands on a saved node for exactly this reason.
   columns over a boolean to make unstorable, and the earlier three-column cut a
   drifted file comes from is the one that leaned on the boolean instead. `PRAGMA
   table_info` cannot see a constraint, so the check reads the stored schema and
-  looks for `CYCLE_STOP_CHECK_NAME` in it. **Its two repairs are its own and they
-  are different repairs**: a missing column is added by the migration's own
-  `ALTER`, which carries the CHECK with it — so a missing constraint is only
-  reported once both columns are there, and no file is ever handed both cures at
-  once — while putting a constraint under a column that already exists is the one
-  thing `ALTER TABLE` cannot do, making that repair the documented
-  create-copy-drop-rename rebuild (`CYCLE_STOP_CHECK_REBUILD_SQL`), which carries
-  every row across and recreates both indexes. Neither is "delete the database
-  file and re-run `nodum init`". And the rebuild can legitimately fail, because a
-  file that ran without the constraint may already hold a row the constraint
-  forbids — so the refusal says so and names `CYCLE_STOP_HALF_STOP_SQL`, in
-  `_CREATE_THE_CYCLES_INDEX`'s own "if it fails, …" idiom, because a repair that
-  dies with no next step is advice nobody can carry out.
+  looks for `CYCLE_STOP_CHECK_NAME` in it — **word for word, not whitespace for
+  whitespace** (`_CYCLE_STOP_CHECK_NAME_RE`). By name is a deliberate narrowing
+  and it stays one: an unnamed CHECK enforcing the same rule is still reported,
+  because SQLite prints the name verbatim as `CHECK constraint failed: <name>`
+  and that sentence is half of what `0015` guarantees. What the narrowing must
+  not do is refuse a file whose owner *did* run the repair, and it did: the name
+  is 45 characters of prose with spaces in it, the refusal ships through rich,
+  and a terminal narrower than the line broke the quoted identifier across two
+  lines — 60 of the 141 widths between 60 and 200, including every one from 61 to
+  79. That paste ran without error, kept every row and installed a **working**
+  constraint under a name spelled with a newline, and `init` went on refusing
+  with the identical message forever. Width 80 is safe and a non-tty pipe reports
+  80, which is why nothing in CI could see it. Both halves are fixed: every
+  statement a refusal prints is written pre-wrapped to `db._SQL_WIDTH` (58
+  columns, narrower than any terminal anyone runs, so nothing re-wraps it), and
+  the search accepts a name a renderer already broke, because those databases
+  exist either way.
+  **Its repairs are its own and they are different repairs**: a missing column is
+  added by the migration's own `ALTER`, which carries the CHECK with it — so a
+  missing constraint is only reported once both columns are there, and no file is
+  ever handed both cures at once — while putting a constraint under a column that
+  already exists is the one thing `ALTER TABLE` cannot do, making that repair the
+  documented create-copy-drop-rename rebuild (`CYCLE_STOP_CHECK_REBUILD_SQL`),
+  which carries every row across and recreates both indexes. Neither is "delete
+  the database file and re-run `nodum init`".
+  **The rebuild carries no statement that can lose a row, and that is structural
+  rather than transactional.** It used to be `DROP TABLE cycles` with nothing but
+  the transaction between a failed copy and an empty journal — and a transaction
+  is a guarantee about *one* execution model. `executescript` abandons the script
+  at the first error; an interactive console, a database GUI and a notebook cell
+  report the error and read the next statement, and on a file holding a half-stop
+  they ran the `DROP`, the `RENAME` and the `COMMIT` after the copy had already
+  failed. Four cycles to none, `events` left pointing at cycles that no longer
+  existed, `init_db` returning `[]` afterwards so nothing ever noticed. Nothing
+  weaker than "destroy nothing" reaches that property: SQLite has no conditional
+  DDL and no `RAISE` outside a trigger, so no statement in a pasted script can
+  stop the one after it from running. So the first thing the rebuild does is copy
+  every row into `db.CYCLES_PARKED_TABLE` (`cycles_before_repair`), a table with
+  no constraints of its own to fail on, and every destructive statement after
+  that is destroying a copy. The park is **left behind on purpose**, including
+  when the repair works perfectly: `_cycle_stop_problems` reports it and prints
+  the one statement that removes it, so a file does not pass `init` until a human
+  has been told it is there — which is what turns "the rebuild stopped in the
+  middle" from an empty table that reads as an empty journal into a refusal that
+  names the stranded rows and the two statements that put them back.
+  **And it refuses to print the rebuild at all in the three states where running
+  it would fail.** A file already holding a row the CHECK forbids gets the row ids
+  and `CYCLE_STOP_CLEAR_HALF_STOP_SQL` instead — `CYCLE_STOP_HALF_STOP_SQL` is a
+  query, the check can run it, and knowing in advance beats
+  `_CREATE_THE_CYCLES_INDEX`'s "if it fails, …" idiom, which was the shape used
+  here before. A `cycles` carrying a column `CYCLES_COLUMNS` does not list gets
+  the column named rather than a rebuild that would drop it *with its data* — the
+  pin on that list compares it against a freshly migrated database, which is
+  precisely the one schema the repair never runs against. A `cycles` missing a
+  column the copy selects gets the same treatment. And `DROP TABLE IF EXISTS
+  cycles_rebuilt` leads the script because a failed attempt a human then commits —
+  which is exactly what the "clear the half-stops, then re-run" advice asks them
+  to do — used to leave that scratch table behind and wedge every later attempt on
+  `table cycles_rebuilt already exists`, with no next step named.
   **A scoped cycle checks
   the gardener's own grant** right after
   `open_cycle` and raises `GrantNotPermitted` naming `nodum grant
@@ -1415,11 +1461,33 @@ commands on a saved node for exactly this reason.
   through verbatim (NBSP *is* removed by the line-stripping there; the
   zero-width family is not, because it is not whitespace), and
   `ingest._source_content` hands that to `create_node` unchanged. So the line is
-  now `str.splitlines`'s and the indent is anything that puts no glyph on the
-  page — Unicode whitespace plus the `Cc`/`Cf` categories, which is the
-  zero-width family, the bidi controls and the soft hyphen. After the fix, same
-  payload, same model, same temperature: `cited: ["1","2"]`, 3 of 3,
-  `unresolved: []`.
+  now `str.splitlines`'s, and the indent is written out rather than described:
+  **Unicode whitespace, plus the `Cc`/`Cf`/`Cn`/`Co`/`Cs`/`Mn`/`Me` general
+  categories, plus five named blank-rendering characters** (the four Hangul
+  fillers and U+2800 BRAILLE PATTERN BLANK). "Anything that puts no glyph on the
+  page" is what this said, and it was false in exactly the direction the fix was
+  made in: the class was whitespace plus two categories, and **six other
+  glyphless classes still carried an ASCII `[9]` to all three prompt surfaces** —
+  U+3164 HANGUL FILLER (`Lo`), U+FE0F VARIATION SELECTOR-16 (`Mn`), U+2065
+  (`Cn`, an unassigned hole *inside* U+2060..U+206F whose assigned neighbours the
+  fix did close), U+2800 (`So`), U+E000 (`Co`) and U+0300 (`Mn`). All six reach a
+  `source` node verbatim through the same path as the zero-width family:
+  `extract.HtmlHandler` unescapes `&#12644;` like any other numeric reference and
+  its per-line `str.strip()` removes only whitespace. Measured live on
+  `llama3.2:1b` at temperature 0 before the widening, on a three-node graph:
+  HANGUL FILLER `unresolved: ['3','4','5','6','7','8','9']`, U+2065 `['3']`,
+  U+E000 `['9']`, U+0300 `['3']`, against `[]` for the defused baseline and for
+  the two the previous round had closed. After the widening every one of those
+  arms returns `unresolved: []`, identical to the baseline. **"Draws nothing" is
+  not a predicate** — `Lo` holds every CJK ideograph and `Mn` holds marks that
+  visibly draw — so the class is stated as what it is and the pin is exhaustive:
+  a test enumerates the sentence above over all 0x110000 codepoints and asserts
+  `_line_opening` agrees, so prose and code cannot move apart again. The widening
+  costs nothing measurable: over 2.8 MB of this repo's prose and 200 KB of real
+  `ingest url` output (PEP 8, RFC 8259, three Wikipedia articles, arXiv,
+  `docs.python.org`) the old class and the new one rewrite **the same 7
+  markers**. After the fix, same payload, same model, same temperature:
+  `cited: ["1","2"]`, 3 of 3, `unresolved: []`.
   **Defused, not normalised, and the shield survives in the text.** Stripping
   the zero-width characters and folding the exotic line breaks first would make
   the defence's notion of a line and the model's coincide by construction, and
@@ -1435,17 +1503,40 @@ commands on a saved node for exactly this reason.
   candidate citation* — live on `qwen3:8b`, the fixed prompt came back
   `cited: ["9"]`, mining the defused marker exactly as it once mined a node id
   for `"116"`. It resolves to nothing, so the envelope is `answered: false`
-  with the answer withheld. **A forged number now costs a refusal where it used
-  to buy `answered: true` beside citations that said the opposite.** **The
-  residual is named rather than left to be discovered**: a confusable rendering
-  — `［9］` in fullwidth brackets, `[٣]` in Arabic-Indic digits — is *not*
-  rewritten. It cannot forge what `citations` claims, because `resolve_citation`
-  takes ASCII digits and nothing else, so no such marker resolves; what it could
-  still do is persuade a weak model that a line is a boundary, which is the same
-  "escaping is not a defence against a model" limit already drawn and not a new
-  one. The test suite's audit matches those grammars **on purpose**, so if one
-  ever reaches a prompt the suite says so instead of the question being
-  re-reasoned.
+  with the answer withheld. **On `qwen3:8b` a forged number costs a refusal where
+  it used to buy `answered: true` beside citations that said the opposite** — and
+  that sentence is scoped to the model it was measured on, because the other
+  local model contradicts it. On `llama3.2:1b` at temperature 0, **with this
+  defence working and nothing shielding anything**, the marker-reuse payload
+  returns `answered: true`, `cited: ["1","2"]`, `unresolved: []` and the answer
+  *"records are kept for 9999 days, not thirty"* — 3 of 3 — while note 1 says
+  thirty days. That is verbatim the failure described two paragraphs above,
+  occurring with the defence correct. The defusing closes the prompt's grammar;
+  it does not make a 1B model read, which is the next paragraph's point and the
+  reason this one may not be generalised. **The
+  residual is named rather than left to be discovered**, and it is three things.
+  (1) **A prefix that draws.** List and quote furniture — `- `, `* `, `+ `,
+  `> `, `# `, `1. `, `| `, `• ` — is a line start to any reader, is not walked,
+  and never will be. `- [9] Retention window` reaches the prompt undefused and
+  takes `llama3.2:1b` to `unresolved: ['3'..'9']`, exactly like an invisible
+  shield; closing it would rewrite every ordinary markdown list item and every
+  reference-link definition `[1]: https://…` in every ingested page, which is a
+  cost nothing measured justifies. It is the residual most likely to arrive by
+  accident rather than by design, so the suite **asserts it open**: eight
+  furniture prefixes are parametrized with `closed=False`, and anyone who later
+  closes one has to move the row and say why. (2) **A confusable rendering of the
+  grammar** — `［9］` fullwidth, `[٣]` Arabic-Indic, `[ 9 ]` spaced — is *not*
+  rewritten; it cannot forge what `citations` claims, because `resolve_citation`
+  takes ASCII digits and nothing else, so no such marker resolves, and what it
+  could still do is persuade a weak model that a line is a boundary, which is the
+  same "escaping is not a defence against a model" limit already drawn and not a
+  new one. (3) **A character outside the five named blanks that a particular font
+  happens to render blank** — a substituted missing glyph, an unnamed `Lo` or
+  `So` codepoint. There is no offline oracle for what a font draws, so the class
+  is five named characters and not a claim about rendering. The test suite's
+  audit sees all three **on purpose** — the furniture and the confusable grammars
+  are both matched there — so if one ever reaches a prompt the suite says so
+  instead of the question being re-reasoned.
   **The defusing has to run last, and `/summarize` is where that was found.**
   `_excerpt`'s own `str.strip()` is Unicode-aware where the indent class was
   `[ \t]`, so a leading NBSP shielded a marker from the defusing and was then
@@ -1474,8 +1565,24 @@ commands on a saved node for exactly this reason.
   tests that the grammar equals itself**: the suite's own marker audit was
   `_LINE_MARKER` character for character, so it could not have detected the gap,
   and it is now deliberately looser on every axis the defence could narrow on,
-  with a property test pinning the containment so a later simplification back
-  towards the module's regex fails instead of quietly restoring the blind spot.
+  with the containment pinned **exhaustively over all 0x110000 codepoints on the
+  character axis and by a seeded 20 000-string fuzz on the marker axis** (there
+  is no `hypothesis` in this repo and the check was never property-based; a
+  seven-item corpus pins seven items) so a later simplification back towards the
+  module's regex fails instead of quietly restoring the blind spot.
+  **The same mistake reappeared one round later in the *fixtures*.** Every
+  payload the widening was tested with was drawn from `str.isspace() ∪ Cc ∪ Cf`,
+  the implementation's own predicate written out as a parametrize list, so the
+  six classes it missed could not be expressed — and for three of them the
+  non-vacuity guard fired first and reported *"this case carries no forgery, so
+  it tests nothing"*, which is an instruction to delete the row that finds a real
+  bypass. The corpus is now authored from the character database with the Unicode
+  or markdown fact recorded beside every row, the rows the defence does **not**
+  close sit in the same list marked `closed=False`, and **every non-vacuity guard
+  is structural** — it asserts the fixture was built as stated, never that the
+  function under test changed something. Where a guard does consult the audit it
+  reports a failure as a claim about the audit ("widen `_carries_no_glyph`, and
+  do not delete this row"), never as a claim about the payload.
   The comparison against `qwen3:8b` says the same thing from the other side: it
   makes the *identical* citation-format errors under the first prompt and costs
   65–113 s a question against the 1B's 3–8 s, so the weak local model was never
@@ -1813,10 +1920,17 @@ commands on a saved node for exactly this reason.
   from the other side and would contradict
   `test_vector_only_hit_surfaces_with_vector_signal` directly. Carried to 5b-ii. Measured across five corpus sizes, questions whose content is
   invented returned **4.8 / 5.1 / 5.9 / 7.9 mean hits and were never silent**
-  before — measured on the claim graph of `tests/test_search.py` repeated to 40,
-  72, 136 and 264 rows, twelve questions built around an invented subject — and
-  **six of the twelve are silent now, at every one of those sizes** (mean hits
-  0.7 / 1.2 / 2.2 / 4.2). **This rule closes half of that shape, not all of
+  before — measured on the claim graph of `tests/test_search.py`, twelve
+  questions built around an invented subject — and **six of the twelve are
+  silent now** (mean hits 0.7 / 1.2 / 2.2 / 4.2). The count was previously
+  reported as "stable at 40, 72, 136 and 264 rows"; that claim is **withdrawn**,
+  because those sizes were reached by repeating the one fixture and duplication
+  cannot move the number: the gate reads only whether a content word has
+  `df > 0`, and copying every row preserves that for every word while scaling
+  `df` and the ceiling together. It varied corpus *size* while holding corpus
+  *composition* fixed, and composition is the only input the gate has. Six is a
+  measurement on that corpus and nothing here claims more; a test asserts it
+  exactly, so this sentence cannot drift from the code. **This rule closes half of that shape, not all of
   it.** What the gate tests is "no content word *known*", not "no content word
   that *discriminates*": ordinary English nouns and verbs stay on the content
   side on purpose, so the six that still answer are the six whose *other*
@@ -1863,6 +1977,83 @@ commands on a saved node for exactly this reason.
   `_is_function_word` now share one fold (`_bare_word`) — they had disagreed
   about what "the same word" is, one stripping edge punctuation and the other
   not. Pre-existing; the fallback re-ordering made it load-bearing.
+  **The fold is the tokenizer's rule, not a list of characters.** A first fix
+  trimmed fifteen ASCII characters off each end, which closed the comma and left
+  the same bypass open on everything outside the list: measured on the same
+  fixture, `kafka- kafka postgres`, `“kafka” kafka postgres`, `#kafka kafka
+  postgres` and `**kafka** kafka postgres` each answered with **six** again, and
+  the same hole re-opened the refusal — `**What** does zarquon protect against?`
+  and `“What” …` answered with **8** prose notes where the undecorated question
+  correctly answered with **0**. `_bare_word` is now every maximal run of
+  alphanumeric characters, lowercased — `unicode61`'s own rule — and is
+  **incomplete, and sound on every script SQLite's case table has caught up
+  with**: what it merges the tokenizer merges (zero counterexamples over a
+  465-token probe, 107 880 pairs), and what the tokenizer merges it may not.
+  The soundness half is **not** an absolute, and the exception is a version skew
+  rather than a corner case: SQLite's fold table is frozen at the Unicode
+  version `fts5_unicode2.c` was written against, so a simple case mapping added
+  since folds in Python and does not fold in FTS5. Swept exhaustively over every
+  alphanumeric codepoint below U+30000 (133 808 of them) against a live table:
+  **417** fold groups Python merges and SQLite splits — Cherokee, Old Hungarian,
+  Vithkuqi, Georgian Mtavruli, Adlam, Garay, Osage, Warang Citi, Medefaidrin,
+  Glagolitic, and a tail of Latin, Greek and Cyrillic letters — and
+  `search("ᲓᲦᲔ დღე")` really does reach only the
+  Mtavruli row, the lowercase term the caller typed having been dropped as its
+  duplicate. Deseret (cased since Unicode 3.1) folds correctly on both sides, so
+  the axis is the table's vintage and not "non-ASCII" or "non-BMP". Blast radius
+  on this corpus is nil — nothing in ASCII, Latin-1 or any Western European
+  language is affected — so the fold is deliberately **not** changed: merging a
+  case pair SQLite refuses to merge is the more correct behaviour
+  linguistically, and it was the stated invariant that was wrong, not the code.
+  One pair per block is pinned as `_FOLD_UNSOUND` in `tests/test_search.py`,
+  with a sound control beside it, so SQLite catching up fails the test rather
+  than making this paragraph quietly stale. **Both counts are a reading of two
+  moving tables and neither is a constant** — `_bare_word` calls `str.lower()`,
+  so the Python side moves with the interpreter's Unicode version just as the
+  SQLite side moves with its build. The figures above are CPython 3.14 against
+  SQLite 3.50.4; on CPython 3.12 and Unicode 15.0, **which is what CI runs**,
+  the identical sweep gives **390 of 128 804**. The pinned pairs are Unicode
+  7-to-11 mappings and hold identically on both, which is why the pin is a
+  test and the counts are only prose — a paragraph that replaced one unqualified
+  absolute should not quietly introduce two more.
+  The residue is named, not hidden, and the stemmer's half of it is the more
+  serious of the two. `porter` **stems**, and `_is_function_word` looks a
+  *character* fold up in `_QUERY_STOPWORDS` — so any word that stems onto a
+  stopword arrives at `_compile_match` as a **content** word while matching the
+  stopword's rows in the index, which **re-opens the refusal** exactly as a
+  decorated stopword used to: `known_content` is non-empty, `kept` is non-empty,
+  and the early return never fires. This is not exotic input — 167 of the 63 875
+  lowercase words in `/usr/share/dict/american-english` collide this way, and
+  the worst is the commonest verb a technical question carries, since `use`,
+  `used`, `using`, `uses` and `useful` all stem to `us`, which is in the list.
+  Measured: on a corpus saying the pronoun *us* in six rows, all five spellings
+  answer *"How is zarquon used?"* with those six rows and nothing else, and the
+  shipped claim fixture needs no help at all — *"What does zarquon doe?"*
+  answers with **8** hits, every one of them prose sharing only the question's
+  phrasing, where the undecorated question correctly answers with **0**. The
+  cheaper half is the dedup: `retain retains postgres` still answers with
+  **six** and still buys one word two shares of the quorum's weight. `unicode61`
+  folds **diacritics** (`café`/`cafe`) besides. All of it is pinned by tests
+  that fail if any of it is closed without rewriting this paragraph. Closing
+  the stemmer half needs a Python porter stemmer that agrees with SQLite's on
+  every word, and one that *disagrees* is worse than none; stemming
+  `_QUERY_STOPWORDS` at import would fix the lookup without a whole stemmer but
+  carries the same risk with the sign flipped — an over-merge there demotes a
+  real content word to a function word and refuses a query that should have
+  answered. A different error, not obviously a cheaper one, so both halves stay
+  open and both stay measured. `casefold()` was rejected for
+  `lower()` (it merges `straße`/`strasse` and `ﬁle`/`file`, which the tokenizer
+  keeps apart — unsound, and unsound loses a term the caller typed), and NFD
+  diacritic-stripping was rejected too (SQLite's default `remove_diacritics=1`
+  leaves *precomposed* multi-diacritic codepoints alone, so stripping merges
+  `ộ` with `o` where the tokenizer does not: twelve unsound pairs to buy back
+  eleven incomplete ones).
+  On the harness's four query suites the two folds are **identical at every
+  corpus size** (26 / 47 / 52 / 78 / 312 rows, 75 queries each, 0 diffs). They
+  differ only on a fifth, decorated suite, and every difference is a
+  restoration: `“kafka” kafka read` goes from 4-7 hits to 3, and
+  `**What** does clickhouse do when the disk fills up?` goes from 0 hits to 2,
+  because the decorated `What` stops being counted as a content word.
   The strictness is **gated
   on the two-term case**, because with four equal terms a blanket `>` moves the
   bar from two-of-four to three-of-four; gated, it is byte-identical to `>=` on

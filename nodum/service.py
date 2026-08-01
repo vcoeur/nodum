@@ -4388,12 +4388,13 @@ def _no_such_cycle(cycle_id: str) -> RecordNotFound:
 def _find_cycle_row(conn: sqlite3.Connection, cycle_id: str) -> sqlite3.Row | None:
     """The ``cycles`` row with this id, or ``None``.
 
-    One query, because there are two callers and they differ only in what they
-    do with a miss: :func:`_get_cycle_row` raises, and :func:`stop_requested`
-    has to fold the miss into a check it makes afterwards. That was two copies
-    of the ``SELECT`` for one round, which is the argument :func:`_no_such_cycle`
-    itself is written from — a filter added to one of them is a filter the other
-    silently does not have.
+    One query, because there are three callers and they differ only in what they
+    do with a miss: :func:`_get_cycle_row` raises, :func:`stop_requested` folds
+    the miss into a check it makes afterwards, and :func:`_rollback_target`
+    treats it as "this rollback reversed nothing that still exists" and walks no
+    further. That was three copies of the ``SELECT``, which is the argument
+    :func:`_no_such_cycle` itself is written from — a filter added to one of them
+    is a filter the others silently do not have.
     """
     return conn.execute("SELECT * FROM cycles WHERE id = ?", (cycle_id,)).fetchone()
 
@@ -6393,7 +6394,7 @@ def _rollback_target(
     if recorded is None:
         return None
     target_id, previous = recorded
-    row = conn.execute("SELECT * FROM cycles WHERE id = ?", (target_id,)).fetchone()
+    row = _find_cycle_row(conn, target_id)
     if row is None:
         return None
     if previous not in CYCLE_CLOSED_STATUSES:

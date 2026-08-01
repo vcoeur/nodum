@@ -176,11 +176,20 @@ def _table_sql(conn: sqlite3.Connection, table: str) -> str:
     well name a constraint in a comment while carrying no constraint at all —
     and a search that matched it would report a sound schema over a file where
     the half-stop goes straight in. That is a check failing *open*, which is the
-    only failure direction that matters here (failing noisily is a human reading
-    a repair they did not need). So comments come out first, and callers search
-    what actually constrains the table. It is a lexer's job done with a regex,
-    so a ``--`` inside a string literal comes out too — which costs a false
-    alarm, the direction this is allowed to be wrong in.
+    direction that costs something here (failing noisily is a human reading a
+    repair they did not need, and :func:`_cycle_stop_problems` will not print a
+    rebuild that drops anything).
+
+    **It is a lexer's job done with a regex, and it can be wrong both ways.** A
+    ``--`` inside a string literal takes the rest of that line with it, hiding a
+    constraint that is really there — a false alarm, the cheap direction. But
+    removing text also *joins* what was on either side of it, so a string
+    literal carrying the constraint's exact prose split by a ``/* */`` comes out
+    of here spelling the name, and the check reads a constraint the table has
+    not got. That needs the name, word for word, inside a literal in the
+    ``cycles`` DDL with a comment through the middle of it — contrived enough to
+    accept, not so contrived that the docstring gets to claim this can only fail
+    safe.
 
     Returns:
         The stored statement with SQL comments removed, or ``""`` when the table
@@ -203,12 +212,32 @@ _RECREATE_THE_FILE = (
     "auto-migrated — delete the database file and re-run 'nodum init' to recreate it."
 )
 
+#: The column width every statement a refusal prints is written to.
+#:
+#: SQL a human is told to paste ships through whatever renders the refusal, and
+#: in a terminal that is rich, which re-wraps any line wider than the window.
+#: Re-wrapping SQL is *usually* harmless — SQL does not care where its
+#: whitespace falls — but the CHECK these repairs carry is a **named** one and
+#: the name has spaces in it, so a break inside ``"a stop records who asked and
+#: when, or neither"`` stores a name with a newline in it: a constraint that
+#: enforces the rule and does not answer to the name, which
+#: :func:`_cycle_stop_problems` then goes on reporting forever. A renderer only
+#: re-wraps a line that does not fit, so the statements are written pre-wrapped
+#: narrower than any terminal anyone runs, and nothing has to be re-wrapped at
+#: all. (The other half of that answer is in
+#: :data:`_CYCLE_STOP_CHECK_NAME_RE`, which accepts a name a renderer already
+#: broke — because a file repaired by a mangled paste is out there either way.)
+_SQL_WIDTH = 58
+
 #: ``0014``'s one-running-consolidation index, as the statement that creates it.
 #: Kept next to the check that looks for it so the refusal can print the cure
-#: rather than a shape of the cure.
+#: rather than a shape of the cure, and pre-wrapped for :data:`_SQL_WIDTH`'s
+#: reason.
 CYCLES_RUNNING_INDEX_SQL = (
-    "CREATE UNIQUE INDEX idx_cycles_one_running_consolidation ON cycles(status) "
-    "WHERE status = 'running' AND trigger IN ('manual', 'scheduled');"
+    "CREATE UNIQUE INDEX idx_cycles_one_running_consolidation\n"
+    "  ON cycles(status)\n"
+    "  WHERE status = 'running'\n"
+    "    AND trigger IN ('manual', 'scheduled');"
 )
 
 #: The remedy for the fifth check, and the reason each check carries its own.
@@ -218,7 +247,7 @@ CYCLES_RUNNING_INDEX_SQL = (
 _CREATE_THE_CYCLES_INDEX = (
     "Nothing else about that migration is missing and no data is lost: the index "
     "constrains rows the file already has, so it can be created in place. Run this "
-    f"once against the database: {CYCLES_RUNNING_INDEX_SQL} If it fails, two "
+    f"once against the database:\n{CYCLES_RUNNING_INDEX_SQL}\nIf it fails, two "
     "consolidation cycles are recorded 'running' at once — close the stale one with "
     "'nodum cycle-abandon <id>' first."
 )
@@ -229,13 +258,40 @@ _CREATE_THE_CYCLES_INDEX = (
 #: meets and what :func:`_cycle_stop_problems` looks for in the live schema.
 CYCLE_STOP_CHECK_NAME = "a stop records who asked and when, or neither"
 
+#: :data:`CYCLE_STOP_CHECK_NAME` as a pattern that accepts any run of whitespace
+#: where the name has a space, which is what the check searches the stored DDL
+#: with instead of the plain string.
+#:
+#: The name is 45 characters of prose with spaces in it, and it travels to the
+#: human inside a repair statement rendered by a terminal — so a window narrower
+#: than the line puts a newline inside the identifier, and the paste installs a
+#: constraint that enforces the rule under a name spelled with a newline.
+#: :data:`_SQL_WIDTH` is why that no longer happens; this is why the files where
+#: it already did are not stuck. An exact-substring check refuses those forever,
+#: with the identical message, *after* a repair that did everything it claimed —
+#: which is the worst refusal this module can produce, because the advice was
+#: followed and the file is sound. SQLite is indifferent to the whitespace, so
+#: this is a check that had a stricter opinion about the schema than the engine
+#: does.
+#:
+#: It does not loosen the narrowing in the direction that matters: the words and
+#: their order are still matched exactly, and a run of whitespace cannot appear
+#: between two of them by accident (see :func:`_cycle_stop_problems` for what
+#: the search must not do).
+_CYCLE_STOP_CHECK_NAME_RE = re.compile(
+    r"\s+".join(re.escape(word) for word in CYCLE_STOP_CHECK_NAME.split())
+)
+
 #: That CHECK as SQL, written once and spliced into both statements that carry
 #: it — the ``ADD COLUMN`` below and the rebuild that puts it back under columns
 #: a drifted file already has. Two copies of a constraint are two constraints
-#: the day one of them is edited.
+#: the day one of them is edited. Its own line, and the name alone on it, for
+#: :data:`_SQL_WIDTH`'s reason: this is the one fragment in the module whose
+#: meaning changes if a renderer breaks it.
 CYCLE_STOP_CHECK_SQL = (
-    f'CONSTRAINT "{CYCLE_STOP_CHECK_NAME}" '
-    "CHECK ((stop_requested_by IS NULL) = (stop_requested_at IS NULL))"
+    f'CONSTRAINT "{CYCLE_STOP_CHECK_NAME}"\n'
+    "  CHECK ((stop_requested_by IS NULL)\n"
+    "       = (stop_requested_at IS NULL))"
 )
 
 #: ``0015``'s two stop-switch columns, in the order they must be added: the
@@ -249,7 +305,7 @@ CYCLE_STOP_COLUMN_SQL: tuple[tuple[str, str], ...] = (
     ("stop_requested_at", "ALTER TABLE cycles ADD COLUMN stop_requested_at TEXT;"),
     (
         "stop_requested_by",
-        f"ALTER TABLE cycles ADD COLUMN stop_requested_by TEXT {CYCLE_STOP_CHECK_SQL};",
+        f"ALTER TABLE cycles ADD COLUMN stop_requested_by TEXT\n{CYCLE_STOP_CHECK_SQL};",
     ),
 )
 
@@ -265,18 +321,23 @@ CYCLE_STOP_COLUMN_SQL: tuple[tuple[str, str], ...] = (
 #: the commit that adds it — which is the only moment anyone can be expected to
 #: remember this constant exists, and the alternative is a repair that drops
 #: that column and its data with nothing left to notice.
+#: The declarations are written pre-wrapped, and continuation lines carry their
+#: own indent, for the reason :data:`_SQL_WIDTH` gives — this list is spliced
+#: into a statement a human reads off a terminal.
 CYCLES_COLUMNS: tuple[tuple[str, str], ...] = (
     ("id", "id TEXT PRIMARY KEY"),
     (
         "trigger",
-        "trigger TEXT NOT NULL CHECK (trigger IN ('manual','scheduled','curative','rollback'))",
+        "trigger TEXT NOT NULL CHECK (trigger IN\n"
+        "    ('manual','scheduled','curative','rollback'))",
     ),
     ("triggered_by", "triggered_by TEXT NOT NULL"),
     ("scope", "scope TEXT"),
     ("dry_run", "dry_run INTEGER NOT NULL DEFAULT 0"),
     (
         "status",
-        "status TEXT NOT NULL CHECK (status IN ('running','completed','failed','rolled_back'))",
+        "status TEXT NOT NULL CHECK (status IN\n"
+        "    ('running','completed','failed','rolled_back'))",
     ),
     ("report", "report TEXT"),
     ("started_at", "started_at TEXT NOT NULL DEFAULT (datetime('now'))"),
@@ -286,13 +347,49 @@ CYCLES_COLUMNS: tuple[tuple[str, str], ...] = (
     ("stop_requested_by", "stop_requested_by TEXT"),
 )
 
+
+def _cycles_column_lines() -> str:
+    """Every ``cycles`` column name, comma-separated, wrapped to :data:`_SQL_WIDTH`."""
+    lines: list[str] = []
+    for name, _ in CYCLES_COLUMNS:
+        piece = f"{name},"
+        if lines and len(lines[-1]) + 1 + len(piece) <= _SQL_WIDTH:
+            lines[-1] += f" {piece}"
+        else:
+            lines.append(f"  {piece}")
+    return "\n".join(lines).rstrip(",")
+
+
+#: Where the rebuild parks the table it is replacing.
+#:
+#: The rebuild used to ``DROP TABLE cycles`` with nothing but the transaction
+#: standing between a failed copy and an empty journal, and a transaction is a
+#: guarantee about *one* execution model. A console that reports an error and
+#: goes on to the next statement — an interactive shell, a database GUI, a
+#: notebook cell — ran the ``DROP``, the ``RENAME`` and the ``COMMIT`` after the
+#: copy had already failed, and took a file from four cycles to none with
+#: nothing left to notice. No statement can prevent the next one from running in
+#: that model, so the only structure that survives it is one where **no
+#: statement destroys anything**: the rows are copied here first, into a table
+#: with no constraints of its own to fail on, and every destructive step after
+#: that is destroying a copy.
+#:
+#: It is left behind on purpose, including when the repair works perfectly.
+#: :func:`_cycle_stop_problems` reports it and prints the one statement that
+#: removes it — so the file does not pass ``init`` until a human has been told
+#: it is there, which is what makes "the rebuild stopped half-way" a state
+#: somebody hears about instead of an empty table that reads as an empty
+#: journal.
+CYCLES_PARKED_TABLE = "cycles_before_repair"
+
 #: The repair for a file that has both columns and **not** the CHECK under them,
 #: which is a different drift from a missing column and cannot be fixed the same
 #: way: SQLite's ``ALTER TABLE`` adds a constraint only *with* a column, so
 #: putting one under a column that already exists is the documented
-#: create-copy-drop-rename rebuild. It is still a repair in place — every row is
-#: carried across and the two indexes are recreated with it — which is why this
-#: is a statement to run and not another reason to delete a graph.
+#: create-copy-drop-rename rebuild, here with the original **parked rather than
+#: dropped** (:data:`CYCLES_PARKED_TABLE`). It is still a repair in place —
+#: every row is carried across and the two indexes are recreated with it — which
+#: is why this is a statement to run and not another reason to delete a graph.
 #:
 #: The CHECK goes on as a **table-level** constraint here rather than a column
 #: one. It is cross-column, the two spellings are equivalent to SQLite, and
@@ -301,12 +398,34 @@ CYCLES_COLUMNS: tuple[tuple[str, str], ...] = (
 #: because that index already has one home and a second copy of it here would be
 #: the next thing to drift.
 #:
-#: It can legitimately fail, and :data:`CYCLE_STOP_HALF_STOP_SQL` is why — a
-#: file that ran without the constraint may already hold a row the constraint
-#: forbids, and the copy is where that surfaces. The refusal says so and names
-#: the query, because a repair that dies on ``CHECK constraint failed`` with no
-#: next step is advice nobody can carry out, which is the failure shape
-#: :data:`_CREATE_THE_CYCLES_INDEX` was already written against.
+#: **It carries no statement that can lose a row, in any execution model.** The
+#: copy into :data:`CYCLES_PARKED_TABLE` is the first thing it does and the
+#: ``DROP`` is against a table whose every row is already in that copy, so a
+#: console that reports an error and runs the next statement anyway — the model
+#: that emptied the journal outright when the ``DROP`` came before any copy —
+#: now ends with the rows parked and a file that says so at the next ``init``.
+#: Nothing weaker reaches that property: SQLite has no conditional DDL and no
+#: ``RAISE`` outside a trigger, so no statement here can stop the one after it
+#: from running, and *not destroying anything* is the only guarantee left that
+#: does not depend on the tool obeying an error.
+#:
+#: It can still legitimately fail — the copy goes through the constraint, and a
+#: file that ran without one may hold a row it forbids — but a human is not
+#: handed this statement in that state at all: :func:`_cycle_stop_problems`
+#: looks for those rows first (:data:`CYCLE_STOP_HALF_STOP_SQL`) and prints the
+#: statement that clears them instead, because a repair that dies on ``CHECK
+#: constraint failed`` is advice nobody can carry out, which is the failure
+#: shape :data:`_CREATE_THE_CYCLES_INDEX` was already written against. The
+#: same check refuses to print it against a ``cycles`` whose columns are not the
+#: ones below.
+#:
+#: ``DROP TABLE IF EXISTS cycles_rebuilt`` leads because the *first* attempt is
+#: not always the only one: a failed run that a human then commits (which is
+#: exactly what the "clear the half-stops, then re-run" advice asks them to do)
+#: leaves that scratch table behind, and without this line every later attempt
+#: died on "table cycles_rebuilt already exists" with no way forward. It is the
+#: one ``DROP`` here that can be unconditional: nothing but this statement ever
+#: creates that name.
 #:
 #: Its column list is :data:`CYCLES_COLUMNS` rather than a literal, for the
 #: reason the index is spliced in: the rebuild names every column **twice** —
@@ -314,25 +433,63 @@ CYCLES_COLUMNS: tuple[tuple[str, str], ...] = (
 #: column missing from either list is a column the repair drops, *with its
 #: data*, in a statement a human is told to run against their own graph.
 CYCLE_STOP_CHECK_REBUILD_SQL = (
-    "PRAGMA foreign_keys=off; BEGIN; "
-    "CREATE TABLE cycles_rebuilt ("
-    + ", ".join(declaration for _, declaration in CYCLES_COLUMNS)
-    + f", {CYCLE_STOP_CHECK_SQL}); "
-    "INSERT INTO cycles_rebuilt SELECT "
-    + ", ".join(name for name, _ in CYCLES_COLUMNS)
-    + " FROM cycles; "
-    "DROP TABLE cycles; "
-    "ALTER TABLE cycles_rebuilt RENAME TO cycles; "
-    "CREATE INDEX idx_cycles_started ON cycles(started_at); "
-    f"{CYCLES_RUNNING_INDEX_SQL} "
-    "COMMIT; PRAGMA foreign_keys=on;"
+    "PRAGMA foreign_keys=off;\n"
+    "BEGIN;\n"
+    f"CREATE TABLE {CYCLES_PARKED_TABLE} AS SELECT * FROM cycles;\n"
+    "DROP TABLE IF EXISTS cycles_rebuilt;\n"
+    "CREATE TABLE cycles_rebuilt (\n"
+    + "".join(f"  {declaration},\n" for _, declaration in CYCLES_COLUMNS)
+    + f"{CYCLE_STOP_CHECK_SQL}\n"
+    ");\n"
+    "INSERT INTO cycles_rebuilt SELECT\n"
+    f"{_cycles_column_lines()}\n"
+    "  FROM cycles;\n"
+    "DROP TABLE cycles;\n"
+    "ALTER TABLE cycles_rebuilt RENAME TO cycles;\n"
+    "CREATE INDEX idx_cycles_started ON cycles(started_at);\n"
+    f"{CYCLES_RUNNING_INDEX_SQL}\n"
+    "COMMIT;\n"
+    "PRAGMA foreign_keys=on;"
 )
 
 #: The rows a file without the CHECK may already hold, which the rebuild's copy
-#: is where a human meets. Named in the refusal so the second step exists before
-#: it is needed.
+#: would meet. Run by the check itself before it prints the rebuild, and named
+#: in the refusal so a human can see the same list.
 CYCLE_STOP_HALF_STOP_SQL = (
-    "SELECT id FROM cycles WHERE (stop_requested_by IS NULL) != (stop_requested_at IS NULL);"
+    "SELECT id FROM cycles\n"
+    "  WHERE (stop_requested_by IS NULL)\n"
+    "     != (stop_requested_at IS NULL);"
+)
+
+#: What the constraint would have left where a half-stop is: two NULLs. The
+#: statement the refusal prints when it finds one, since naming the rows without
+#: saying what to do to them is half an instruction.
+CYCLE_STOP_CLEAR_HALF_STOP_SQL = (
+    "UPDATE cycles SET stop_requested_at = NULL,\n"
+    "                  stop_requested_by = NULL\n"
+    "  WHERE (stop_requested_by IS NULL)\n"
+    "     != (stop_requested_at IS NULL);"
+)
+
+#: Removing the parked copy once ``cycles`` demonstrably holds everything in it.
+_DROP_PARKED_SQL = f"DROP TABLE {CYCLES_PARKED_TABLE};"
+
+#: Putting rows back that the rebuild's copy did not carry across — the other
+#: end of the parked table, and the reason it is parked rather than dropped.
+_RESTORE_PARKED_SQL = (
+    "INSERT INTO cycles SELECT\n"
+    f"{_cycles_column_lines()}\n"
+    f"  FROM {CYCLES_PARKED_TABLE}\n"
+    "  WHERE id NOT IN (SELECT id FROM cycles);"
+)
+
+#: :data:`CYCLE_STOP_CLEAR_HALF_STOP_SQL` against the parked copy, which is
+#: where the half-stops are once the rebuild has already swapped the table out.
+_CLEAR_PARKED_HALF_STOP_SQL = (
+    f"UPDATE {CYCLES_PARKED_TABLE} SET stop_requested_at = NULL,\n"
+    "                                 stop_requested_by = NULL\n"
+    "  WHERE (stop_requested_by IS NULL)\n"
+    "     != (stop_requested_at IS NULL);"
 )
 
 #: The remedy for ``0015``'s drift, and it is the *fifth* check's kind rather
@@ -346,8 +503,10 @@ CYCLE_STOP_HALF_STOP_SQL = (
 _REPAIR_THE_STOP_SWITCH = (
     "No data is lost and nothing has to be derived: the columns are additions with no "
     "back-fill, and the CHECK under them constrains rows the file already has. Run the "
-    "statement each problem above names, in the order printed — the second column's CHECK "
-    "names the first, and the rebuild carries every row across."
+    "statement each problem above names, in the order printed and exactly as printed — the "
+    "second column's CHECK names the first, and the rebuild copies every row into "
+    f"'{CYCLES_PARKED_TABLE}' before it drops anything, so a run that stops part-way through "
+    "loses nothing. Re-run 'nodum init' afterwards: it says what is left to do."
 )
 
 
@@ -391,9 +550,12 @@ def _verify_schema_consistency(conn: sqlite3.Connection) -> None:
             continue
         problems = check(conn)
         if problems:
+            # One problem per line rather than "; "-joined: a problem now ends
+            # in the statement that repairs it, and a statement a human has to
+            # paste cannot share a line with the next sentence.
             raise SchemaConsistencyError(
                 f"database schema is inconsistent with its recorded migrations "
-                f"({name}): " + "; ".join(problems) + ". " + remedy
+                f"({name}):\n" + "\n".join(problems) + "\n" + remedy
             )
 
 
@@ -517,11 +679,22 @@ def _cycle_stop_problems(conn: sqlite3.Connection) -> list[str]:
     it is what :data:`CYCLE_STOP_CHECK_REBUILD_SQL` puts back. So an *unnamed*
     CHECK enforcing the same rule is reported here, and that is the right answer
     rather than a false alarm: the file enforces the rule and does not carry the
-    migration, and the cost of saying so is a human reading a repair that turns
-    out to be a no-op. The direction this must not fail in is open, which is
-    what :func:`_table_sql` strips comments for.
+    migration, and the cost of saying so is a rebuild that changes only the name,
+    plus the statement that clears the copy it parks. That cost is bounded
+    because of what this function will not print — a rebuild that drops a column
+    of theirs is not one of the outcomes, which it was when the only thing this
+    said about the column list was that it existed. The direction this must not
+    fail in is open, which is what :func:`_table_sql` strips comments for.
 
-    **Its two repairs are its own, and they are different repairs.** A missing
+    **The name is matched word for word and not whitespace for whitespace**
+    (:data:`_CYCLE_STOP_CHECK_NAME_RE`). A 45-character identifier with spaces
+    in it does not survive being rendered into a terminal narrower than the line
+    it sits on, and the file where it did not is a file whose owner pasted the
+    repair, got a working constraint, and would otherwise be told the same
+    sentence forever. Refusing a sound file *after* its owner did what the
+    message said is worse than every failure mode this check exists to catch.
+
+    **Its repairs are its own, and they are different repairs.** A missing
     column is added by the migration's own ``ALTER``, which carries the CHECK
     with it — so a missing constraint is only reported when both columns are
     already there, and a file missing a column is never handed both cures at
@@ -532,28 +705,138 @@ def _cycle_stop_problems(conn: sqlite3.Connection) -> list[str]:
     that sentence is true of a missing table and reads as *your graph is
     unrecoverable* over a constraint the file has all the rows for, which is
     ``0014``'s lesson said once more.
+
+    **What it refuses to print matters as much as what it prints.** The rebuild
+    is a statement a human runs against their own graph, so it goes out only
+    against the table it was written for: not while the rebuild's parked copy is
+    still there (:data:`CYCLES_PARKED_TABLE`), not over a ``cycles`` carrying
+    columns :data:`CYCLES_COLUMNS` does not list — it would drop them with their
+    data — and not over a file already holding a row the CHECK forbids, where
+    the copy is guaranteed to fail. Each of those states has an answer of its
+    own, and each of them was, until this round, either a silent loss or a dead
+    end at the end of the only instruction given.
     """
+    if CYCLES_PARKED_TABLE in _tables(conn):
+        return [_parked_copy_problem(conn)]
     columns = _columns(conn, "cycles")
     missing = [
-        f"table 'cycles' has no {column!r} column (a stop has nowhere to be "
-        f"recorded) — repair: {sql}"
+        f"table 'cycles' has no {column!r} column (a stop has nowhere to be recorded)"
+        f" — repair:\n{sql}"
         for column, sql in CYCLE_STOP_COLUMN_SQL
         if column not in columns
     ]
     if missing:
         return missing
-    if CYCLE_STOP_CHECK_NAME not in _table_sql(conn, "cycles"):
-        return [
-            "table 'cycles' has both stop columns and not the CHECK under them "
-            f"({CYCLE_STOP_CHECK_NAME!r}), so a half-stop — a time with no requester, or a "
-            "requester with no time — is storable by anything that does not go through "
-            f"request_stop — repair: {CYCLE_STOP_CHECK_REBUILD_SQL} If the copy fails, this "
-            "file already holds one of those rows; the constraint cannot go on over it. "
-            f"Name them with: {CYCLE_STOP_HALF_STOP_SQL} Each is a cycle whose stop was "
-            "recorded half-way, and clearing both of its columns is what the constraint "
-            "would have left."
-        ]
-    return []
+    if _CYCLE_STOP_CHECK_NAME_RE.search(_table_sql(conn, "cycles")):
+        return []
+    return [_missing_stop_check_problem(conn, columns)]
+
+
+def _named_rows(ids: list[str], limit: int = 5) -> str:
+    """``ids`` as a readable list, capped — a refusal is read, not parsed."""
+    shown = ", ".join(ids[:limit])
+    return shown if len(ids) <= limit else f"{shown} and {len(ids) - limit} more"
+
+
+def _missing_stop_check_problem(conn: sqlite3.Connection, columns: set[str]) -> str:
+    """The CHECK is missing: the rebuild, or the reason it is not being printed.
+
+    Three states get an answer other than the rebuild, and all three are
+    detectable from here — which is the point, because each of them is a way for
+    the rebuild to fail *after* a human has already run it.
+    """
+    head = (
+        "table 'cycles' has both stop columns and not the CHECK under them "
+        f"({CYCLE_STOP_CHECK_NAME!r}), so a half-stop — a time with no requester, or a "
+        "requester with no time — is storable by anything that does not go through "
+        "request_stop"
+    )
+    known = [name for name, _ in CYCLES_COLUMNS]
+    unknown = sorted(columns - set(known))
+    absent = [name for name in known if name not in columns]
+    if unknown or absent:
+        differences = []
+        if unknown:
+            differences.append(
+                f"it carries {', '.join(repr(name) for name in unknown)}, which the rebuild "
+                "does not list and would drop, with the data in them"
+            )
+        if absent:
+            differences.append(
+                f"it has no {', '.join(repr(name) for name in absent)}, which the rebuild copies"
+            )
+        return (
+            f"{head}. The repair for that is a rebuild of the table, and it is not printed "
+            "here, because this 'cycles' is not the table this version of nodum knows: "
+            f"{'; and '.join(differences)}. Reconcile the table with the schema this version "
+            "ships — or write the rebuild by hand from the one in nodum/db.py, with those "
+            "columns in both of its lists — and run 'nodum init' again."
+        )
+    half_stops = [row["id"] for row in conn.execute(CYCLE_STOP_HALF_STOP_SQL)]
+    if half_stops:
+        return (
+            f"{head}, and {len(half_stops)} row(s) already in it are exactly that "
+            f"({_named_rows(half_stops)}). The rebuild that puts the CHECK on copies every "
+            "row through it, so it cannot run until those are cleared, and it is not printed "
+            "until they are. Each is a cycle whose stop was recorded half-way, and clearing "
+            "both of its columns is what the constraint would have left:\n"
+            f"{CYCLE_STOP_CLEAR_HALF_STOP_SQL}\n"
+            f"Name them yourself with:\n{CYCLE_STOP_HALF_STOP_SQL}\n"
+            "Then run 'nodum init' again for the rebuild."
+        )
+    return (
+        f"{head}. Run this repair as one script, exactly as printed, on a connection with "
+        "no transaction already open (the leading PRAGMA is a no-op inside one):\n"
+        f"{CYCLE_STOP_CHECK_REBUILD_SQL}\n"
+        f"It copies every row into '{CYCLES_PARKED_TABLE}' before it drops anything, so no "
+        "way of running it can lose one; 'nodum init' then names that copy and the single "
+        "statement that removes it."
+    )
+
+
+def _parked_copy_problem(conn: sqlite3.Connection) -> str:
+    """The rebuild's parked copy is still there — which of the two ways it can be.
+
+    Either ``cycles`` holds everything in the copy, and the copy is one
+    statement from gone; or it does not, and the copy is the only place those
+    cycles still exist. The difference is the difference between a repair that
+    finished and one that stopped in the middle, and a human cannot be asked to
+    work out which from a message that reports the table and nothing else.
+    """
+    head = (
+        f"table {CYCLES_PARKED_TABLE!r} is present — it is the copy of 'cycles' the "
+        "stop-switch rebuild parks before it swaps, and while it is there that repair is "
+        "not finished"
+    )
+    if "id" not in _columns(conn, CYCLES_PARKED_TABLE) or "id" not in _columns(conn, "cycles"):
+        return (
+            f"{head}. This check cannot tell whether it holds rows 'cycles' has not got — "
+            "one of the two has no 'id' column — so compare them yourself before running:\n"
+            f"{_DROP_PARKED_SQL}"
+        )
+    stranded = [
+        row["id"]
+        for row in conn.execute(
+            f"SELECT id FROM {CYCLES_PARKED_TABLE} WHERE id NOT IN (SELECT id FROM cycles)"
+        )
+    ]
+    if not stranded:
+        kept = conn.execute(f"SELECT count(*) FROM {CYCLES_PARKED_TABLE}").fetchone()[0]
+        return (
+            f"{head}: all {kept} of its rows are in 'cycles', so it holds nothing 'cycles' "
+            f"has not got and the rebuild's copy came across whole. Remove it with:\n"
+            f"{_DROP_PARKED_SQL}"
+        )
+    return (
+        f"{head}, and {len(stranded)} of its rows are not in 'cycles' "
+        f"({_named_rows(stranded)}) — the rebuild's copy did not finish, and this table is "
+        "the only place those cycles still exist. Do not drop it. Put them back with:\n"
+        f"{_RESTORE_PARKED_SQL}\n"
+        "If that fails with 'CHECK constraint failed', those rows are half-stops — a time "
+        "with no requester, or a requester with no time — which is what stopped the copy in "
+        f"the first place. Clear them in the copy, then insert again:\n"
+        f"{_CLEAR_PARKED_HALF_STOP_SQL}"
+    )
 
 
 def init_db(conn: sqlite3.Connection) -> list[str]:
