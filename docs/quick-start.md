@@ -77,6 +77,14 @@ Hybrid search fuses BM25 and vector results by reciprocal rank fusion, then
 re-ranks by graph expansion. Without the `embeddings` extra installed this
 degrades to BM25 alone rather than failing.
 
+You can ask a question rather than name keywords — `nodum search "how does
+compaction let a topic work as a state store?"`. The keyword half does not
+require every word: a node is kept when the query terms it carries are worth
+at least half the query's weight, where a rare word counts for more than a
+common one and a word the graph has never seen counts for nothing. So a
+question's *"how does … work as a"* costs nothing, and a typo does not empty
+the result.
+
 Check what the derived indexes know:
 
 ```sh
@@ -139,6 +147,16 @@ nodum consolidate --as owner
 nodum cycle-list --as owner            # the dream journal, newest first
 nodum cycle-get <cycle-id> --as owner  # what ran, and what it measured
 nodum events --cycle <cycle-id> --as owner   # what it actually changed
+```
+
+A cycle that is still going can be asked to stop, which records who asked and
+when and leaves everything it has written alone — the run closes its own entry
+at its next check. It is not the same verb as `cycle-abandon`, which closes the
+entry of a run nothing is going to finish, and neither of them reverses a write:
+
+```sh
+nodum cycle-stop <cycle-id> --as owner    # a run that is going right now
+nodum cycle-abandon <cycle-id> --as owner # a run a SIGKILL left open
 ```
 
 If a cycle did something you did not want, take the whole of it back. It is all

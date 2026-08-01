@@ -9,11 +9,12 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 import pytest
+import typer
 from helpers import agent, owner, seed_space
 from typer.testing import CliRunner
 
 from nodum import consolidate as consolidate_module
-from nodum import db, extract, service
+from nodum import db, extract, llm, service
 from nodum.cli import app
 from nodum.migrations import GARDENER_AGENT_ID
 
@@ -1223,6 +1224,73 @@ def test_cycle_abandon_refuses_a_cycle_that_already_ended(fresh_db):
     assert _run_json("cycle-get", finished["id"])["status"] == "completed"
 
 
+def test_cycle_stop_records_the_instruction_and_closes_nothing(fresh_db):
+    """The kill switch's verb — and it is neither `cycle-abandon` nor `rollback`.
+
+    `service.request_stop` shipped with migration `0015` and no surface reached
+    it, which is the defect this repo keeps re-committing: a door nothing opens.
+
+    What it must *not* do is as load-bearing as what it does. The entry stays
+    `running` (the run is expected to notice and close its own), and every write
+    the run already made stands — a switch that also reverted would make "stop,
+    look at what it did, then decide" impossible.
+    """
+    cycle = service.open_cycle(trigger="manual", principal=owner())
+    with service.in_cycle(cycle.id):
+        node = service.create_node(type="claim", title="Half-written", principal=owner())
+
+    stopped = _run_json("cycle-stop", cycle.id)
+
+    assert stopped["status"] == "running", "a stop is an instruction, not a close"
+    assert stopped["stop_requested"] is True
+    assert stopped["stop_requested_by"] == "human:owner"
+    assert stopped["stop_requested_at"] is not None
+    # Nothing was reversed, and the journal keeps the stamp where a reader finds it.
+    assert _run_json("node", "get", node.id)["state"] == "active"
+    assert _run_json("cycle-get", cycle.id)["stop_requested_by"] == "human:owner"
+    # And a stop is not an abandon: no report claims a human closed this entry.
+    assert _run_json("cycle-get", cycle.id)["report"] is None
+
+
+def test_cycle_stop_twice_keeps_the_first_asker_and_is_not_an_error(fresh_db):
+    """A switch that raised on the second press would make a human doubt the first.
+
+    That is the one moment which must not be ambiguous, so the second call is a
+    no-op — exit 0, the same row back — and the journal keeps whoever actually
+    stopped the night.
+    """
+    second = service.create_human("second", principal=owner())
+    cycle = service.open_cycle(trigger="manual", principal=owner())
+
+    first = _run_json("cycle-stop", cycle.id)
+    again = runner.invoke(app, ["cycle-stop", cycle.id, "--as", second.id])
+
+    assert again.exit_code == 0
+    assert json.loads(again.stdout)["stop_requested_by"] == "human:owner"
+    assert json.loads(again.stdout)["stop_requested_at"] == first["stop_requested_at"]
+
+
+def test_cycle_stop_refuses_a_cycle_that_already_ended(fresh_db):
+    """Nothing is left to obey it, and the stamp would name a run that never saw it.
+
+    The refusal is asserted by its *own* sentence rather than by the shared
+    "already completed, not running" prefix: `cycle-abandon` refuses the same row
+    with the same prefix, so a `cycle-stop` mis-wired to `abandon_cycle` would
+    pass a test that read only that much.
+    """
+    finished = _run_json("consolidate")["cycle"]
+
+    result = runner.invoke(app, ["cycle-stop", finished["id"], "--as", "owner"])
+
+    assert result.exit_code == 1
+    assert "already completed, not running" in result.stderr
+    assert "a stop is an instruction to a live run" in result.stderr
+    assert "Traceback" not in result.output
+    assert _run_json("cycle-get", finished["id"])["stop_requested"] is False
+    # And the refused stop closed nothing: the row still says how it really ended.
+    assert _run_json("cycle-get", finished["id"])["report"]["jobs"] != []
+
+
 def test_merge_nodes_over_the_cli(fresh_db):
     survivor, duplicate, citer = _claim("Alpha"), _claim("Alpha (dup)"), _claim("Cites")
     edge = _run_json("edge", "create", citer["id"], duplicate["id"], "--type", "supports")
@@ -1595,6 +1663,242 @@ def test_schema_dump_surfaces_params():
     payload = _run_json("schema-dump")
     schema_command = next(c for c in payload["commands"] if c["name"] == "schema")
     assert any(p["kind"] == "argument" and p["name"] == "type" for p in schema_command["params"])
+
+
+# ── The smart verbs: ask, summarize, search --nl, llm status ──────────────────
+#
+# The autouse `_no_llm_provider` fixture pins the provider absent, which is the
+# shipped default (`NODUM_LLM_MODEL` unset means no provider), so the tests that
+# want a completion inject a fake and the rest exercise the degraded path they
+# would meet on a real install. No test asserts on model output text.
+
+
+class _FakeLLM:
+    """A provider that replays scripted completions."""
+
+    provider_id = "fake://provider"
+    model_id = "fake-model"
+    context_tokens = 4096
+
+    def __init__(self, *replies) -> None:
+        self.replies = list(replies)
+        self.calls: list[dict] = []
+
+    def estimate_prompt_tokens(self, messages) -> int:
+        return llm.estimate_prompt_tokens(messages)
+
+    def chat(self, messages, *, schema=None, max_output_tokens, timeout):
+        self.calls.append({"messages": list(messages), "schema": schema})
+        reply = self.replies[min(len(self.calls) - 1, len(self.replies) - 1)]
+        if isinstance(reply, BaseException):
+            raise reply
+        return reply
+
+
+def _completion(payload: dict, *, finish_reason: str = "stop"):
+    return llm.Completion(
+        text=json.dumps(payload),
+        prompt_tokens=100,
+        output_tokens=20,
+        finish_reason=finish_reason,
+        model_id="fake-model",
+        provider_id="fake://provider",
+        context_tokens=4096,
+        latency_ms=7,
+    )
+
+
+def _seed_note(fresh_db) -> str:
+    return service.create_node(
+        type="note",
+        title="Log compaction",
+        content="A compacted topic keeps the newest value per key, so it works as a state store.",
+        principal=owner(),
+    ).id
+
+
+def test_ask_prints_one_object_with_citations_and_writes_nothing(fresh_db):
+    node_id = _seed_note(fresh_db)
+    before = max(event.seq for event in service.list_events(owner(), limit=5000))
+    llm.set_provider(
+        _FakeLLM(_completion({"answer": "It keeps the newest value.", "cited": ["1"]}))
+    )
+
+    payload = _run_json("ask", "compacted topic state store")
+
+    assert payload["answered"] is True
+    assert [citation["node_id"] for citation in payload["citations"]] == [node_id]
+    assert payload["used"]["model_id"] == "fake-model"
+    after = max(event.seq for event in service.list_events(owner(), limit=5000))
+    assert after == before
+
+
+def test_an_unanswered_question_is_exit_zero_and_a_stated_refusal(fresh_db):
+    """Not answering is an outcome, not a failure. Exit 1 would tell a script the
+    command broke, and the envelope on stdout is the whole answer."""
+    _seed_note(fresh_db)
+    llm.set_provider(_FakeLLM(_completion({"answer": "Yes, certainly.", "cited": ["id=n0"]})))
+
+    result = runner.invoke(app, ["ask", "compacted topic state store", "--as", "owner"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["answered"] is False
+    assert payload["answer"] is None
+    assert payload["unresolved"] == ["id=n0"]
+    assert payload["refusal"]
+
+
+def test_ask_with_no_provider_names_the_variable_to_set(fresh_db, monkeypatch):
+    monkeypatch.delenv(llm.ENV_MODEL, raising=False)
+    llm.reset_provider()
+    _seed_note(fresh_db)
+
+    payload = _run_json("ask", "compacted topic state store")
+
+    assert payload["answered"] is False
+    assert "NODUM_LLM_MODEL" in payload["refusal"]
+
+
+def test_a_blank_question_is_one_line_on_stderr_and_exit_one(fresh_db):
+    llm.set_provider(_FakeLLM(_completion({"answer": "x", "cited": ["1"]})))
+    result = runner.invoke(app, ["ask", "   ", "--as", "owner"])
+    assert result.exit_code == 1
+    assert result.stdout.strip() == ""
+
+
+def test_summarize_prints_one_object_and_writes_nothing(fresh_db):
+    node_id = _seed_note(fresh_db)
+    before = max(event.seq for event in service.list_events(owner(), limit=5000))
+    llm.set_provider(_FakeLLM(_completion({"summary": "Compaction, briefly.", "cited": ["1"]})))
+
+    payload = _run_json("summarize", node_id)
+
+    assert payload["summarized"] is True
+    assert [citation["node_id"] for citation in payload["citations"]] == [node_id]
+    after = max(event.seq for event in service.list_events(owner(), limit=5000))
+    assert after == before
+
+
+def test_summarizing_a_node_that_does_not_exist_is_the_ordinary_refusal(fresh_db):
+    result = runner.invoke(app, ["summarize", "nope", "--as", "owner"])
+    assert result.exit_code == 1
+    assert result.stdout.strip() == ""
+
+
+def test_search_nl_adds_a_rewrite_and_plain_search_does_not(fresh_db):
+    node_id = _seed_note(fresh_db)
+    llm.set_provider(_FakeLLM(_completion({"terms": ["compacted", "topic"]})))
+
+    rewritten = _run_json("search", "What did I write about compacted topics?", "--nl")
+    assert rewritten["rewrite"]["applied"] is True
+    assert rewritten["query"] == "compacted topic"
+    assert [hit["node_id"] for hit in rewritten["hits"]] == [node_id]
+
+    plain = _run_json("search", "compacted")
+    assert "rewrite" not in plain
+
+
+def test_search_nl_without_a_provider_still_searches(fresh_db, monkeypatch):
+    monkeypatch.delenv(llm.ENV_MODEL, raising=False)
+    llm.reset_provider()
+    node_id = _seed_note(fresh_db)
+
+    payload = _run_json("search", "compacted topic state store", "--nl")
+
+    assert payload["rewrite"]["applied"] is False
+    assert "NODUM_LLM_MODEL" in payload["rewrite"]["refusal"]
+    assert [hit["node_id"] for hit in payload["hits"]] == [node_id]
+
+
+def test_llm_status_reports_an_unconfigured_install_without_failing(fresh_db, monkeypatch):
+    """No provider is a perfectly good install — the smart features are off."""
+    monkeypatch.delenv(llm.ENV_MODEL, raising=False)
+    llm.reset_provider()
+
+    payload = _run_json("llm", "status")
+
+    assert payload["configured"] is False
+    assert payload["reachable"] is None, "nothing was configured, so nothing was asked"
+    assert "NODUM_LLM_MODEL" in payload["detail"]
+
+
+def test_llm_status_probes_a_configured_provider(fresh_db):
+    provider = _FakeLLM(_completion({"pong": True}))
+    llm.set_provider(provider)
+
+    payload = _run_json("llm", "status")
+
+    assert (payload["configured"], payload["reachable"]) == (True, True)
+    assert payload["model"] == "fake-model"
+    assert len(provider.calls) == 1
+    assert payload["probe_ms"] is not None
+
+
+def test_llm_status_separates_configured_from_reachable(fresh_db):
+    """The two facts `nodum.llm` deliberately keeps apart. A configured provider
+    that cannot be reached is not an unconfigured one, and reporting it as one
+    would send a human to edit an environment variable that is already right."""
+    llm.set_provider(_FakeLLM(llm.ProviderUnavailable("connection refused: localhost:11434")))
+
+    payload = _run_json("llm", "status")
+
+    assert payload["configured"] is True
+    assert payload["reachable"] is False
+    assert "connection refused" in payload["detail"]
+
+
+def test_llm_status_can_decline_the_probe(fresh_db):
+    provider = _FakeLLM(_completion({"pong": True}))
+    llm.set_provider(provider)
+
+    payload = _run_json("llm", "status", "--no-probe")
+
+    assert payload["configured"] is True
+    assert payload["reachable"] is None
+    assert provider.calls == [], "--no-probe spends nothing"
+
+
+def _declared_help() -> dict[str, str]:
+    """Every help string this CLI declares, keyed by where it is declared.
+
+    The *declared* strings, read off the command objects — never the rendered
+    ``--help`` panel, which is Rich output wrapped to the terminal's width and
+    styled by its colour support, so an assertion on it tests the runner's
+    environment rather than the CLI. ``schema-dump`` cannot serve here: it
+    carries an option's help and an argument's name alone, and the sentence
+    under test is on an argument.
+    """
+    texts: dict[str, str] = {}
+
+    def walk(prefix: str, command) -> None:
+        texts[prefix] = command.help or command.short_help or ""
+        for param in command.params:
+            texts[f"{prefix} <{param.name}>"] = getattr(param, "help", "") or ""
+        for name, sub in (getattr(command, "commands", None) or {}).items():
+            walk(f"{prefix} {name}".strip(), sub)
+
+    walk("nodum", typer.main.get_command(app))
+    return texts
+
+
+def test_no_help_text_anywhere_still_states_the_conjunctive_rule():
+    """`search --help` told a reader "terms are ANDed", which the quorum ended.
+
+    Swept over the whole adapter rather than the one string that was wrong: the
+    rule was stated in two places (here and the search view's empty state) and
+    finding the second one was luck. A sweep is what makes the third one a test
+    failure.
+    """
+    texts = _declared_help()
+    query_help = texts.get("nodum search <query>")
+    assert query_help, "the search query's help is gone; this sweep guards nothing"
+    # Word-bounded: "landed" is not a claim about the matcher, and `ingest
+    # file`'s help says it four times.
+    stale = re.compile(r"\bANDed\b|\bevery term\b", re.I)
+    offenders = {where: text for where, text in texts.items() if stale.search(text)}
+    assert offenders == {}, f"help text still states the conjunctive rule: {offenders}"
+    assert "quorum" in query_help.casefold(), "and it should say what replaced it"
 
 
 # ── The docs name commands that exist ─────────────────────────────────────────

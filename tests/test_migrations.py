@@ -274,6 +274,7 @@ def test_0012_applies_to_a_populated_database_already_at_0011(tmp_path, monkeypa
             "0012_url_tokens",
             "0013_unique_space_titles",
             "0014_cycles_and_gardener",
+            "0015_cycle_stop_switch",
         ]
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
         conn.execute(
@@ -387,7 +388,11 @@ def test_0013_applies_to_a_populated_database_holding_duplicate_space_titles(tmp
     monkeypatch.setattr(db, "MIGRATIONS", MIGRATIONS)
     conn = db.connect()
     try:
-        assert db.init_db(conn) == ["0013_unique_space_titles", "0014_cycles_and_gardener"]
+        assert db.init_db(conn) == [
+            "0013_unique_space_titles",
+            "0014_cycles_and_gardener",
+            "0015_cycle_stop_switch",
+        ]
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
         titles = dict(
             conn.execute("SELECT id, title FROM nodes WHERE id LIKE 'sp-%' ORDER BY id").fetchall()
@@ -458,7 +463,11 @@ def test_0013_finds_a_free_name_when_the_deduping_rename_would_itself_collide(
     monkeypatch.setattr(db, "MIGRATIONS", MIGRATIONS)
     conn = db.connect()
     try:
-        assert db.init_db(conn) == ["0013_unique_space_titles", "0014_cycles_and_gardener"]
+        assert db.init_db(conn) == [
+            "0013_unique_space_titles",
+            "0014_cycles_and_gardener",
+            "0015_cycle_stop_switch",
+        ]
         titles = dict(
             conn.execute("SELECT id, title FROM nodes WHERE id LIKE 'sp-%' ORDER BY id").fetchall()
         )
@@ -503,7 +512,11 @@ def test_0013_deduplicates_a_title_that_is_another_spaces_id(tmp_path, monkeypat
     monkeypatch.setattr(db, "MIGRATIONS", MIGRATIONS)
     conn = db.connect()
     try:
-        assert db.init_db(conn) == ["0013_unique_space_titles", "0014_cycles_and_gardener"]
+        assert db.init_db(conn) == [
+            "0013_unique_space_titles",
+            "0014_cycles_and_gardener",
+            "0015_cycle_stop_switch",
+        ]
         titles = dict(
             conn.execute("SELECT id, title FROM nodes WHERE id LIKE 'sp-%' ORDER BY id").fetchall()
         )
@@ -587,7 +600,11 @@ def test_cycles_exists_on_a_database_built_from_scratch(fresh_db):
     try:
         assert "0014_cycles_and_gardener" in db.applied_migrations(conn)
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(cycles)")}
-        assert columns == {
+        # What `0014` puts on the table, as a subset: later migrations add
+        # columns to it (`0015` adds the stop switch's two), and the exact-set
+        # assertion belongs to whichever migration is at the tail — otherwise
+        # every append rewrites an assertion about a migration it did not touch.
+        assert columns >= {
             "id",
             "trigger",
             "triggered_by",
@@ -793,7 +810,7 @@ def test_0014_applies_to_a_populated_database_already_at_0013(tmp_path, monkeypa
     monkeypatch.setattr(db, "MIGRATIONS", MIGRATIONS)
     conn = db.connect()
     try:
-        assert db.init_db(conn) == ["0014_cycles_and_gardener"]
+        assert db.init_db(conn) == ["0014_cycles_and_gardener", "0015_cycle_stop_switch"]
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
         conn.execute(
             "INSERT INTO cycles (id, trigger, triggered_by, scope, status)"
@@ -915,7 +932,587 @@ def test_0014_lets_an_ordinary_agent_id_through(tmp_path, monkeypatch):
     monkeypatch.setattr(db, "MIGRATIONS", MIGRATIONS)
     conn = db.connect()
     try:
-        assert db.init_db(conn) == ["0014_cycles_and_gardener"]
+        assert db.init_db(conn) == ["0014_cycles_and_gardener", "0015_cycle_stop_switch"]
+    finally:
+        conn.close()
+
+
+# ── 0015: the kill switch's row ──────────────────────────────────────────────
+
+
+#: A database recorded at ``0015`` whose columns are not ``0015``'s. The route
+#: in is ``0014``'s, walked twice already: ``init_db`` skips a migration whose
+#: name it holds, so a file built from an earlier cut — the three-column shape
+#: ``agent.cycle_stop_check``'s docstring proposes, say — keeps the name and
+#: loses the columns, and nothing else would ever notice.
+STALE_0015_NAME = "0015_cycle_stop_switch"
+
+
+def _at_0014(tmp_path, monkeypatch, filename):
+    """Build a populated database stopped at ``0014``, and return its path.
+
+    Raw INSERTs for the cycle rows on purpose: ``service.open_cycle`` returns a
+    ``CycleOut``, which reads the columns ``0015`` has not added yet.
+    """
+    path = tmp_path / filename
+    monkeypatch.setenv("NODUM_DB", str(path))
+    monkeypatch.setattr(db, "MIGRATIONS", _prefix_through("0014_cycles_and_gardener"))
+    service.init()
+    return path
+
+
+def test_the_stop_switch_columns_exist_on_a_database_built_from_scratch(fresh_db):
+    """Two columns and no boolean flag, which is this migration's one decision.
+
+    `agent.cycle_stop_check`'s docstring proposes `stop_requested INTEGER NOT
+    NULL DEFAULT 0` beside the two stamps. Checked against the table it
+    describes, that is one column too many: `cycles` writes every fact that
+    arrives *after* the INSERT as a nullable column whose presence is the flag —
+    `finished_at`, `report`, `rolled_back_by` — and carries a boolean only for
+    `dry_run`, which is fixed when the row is created and never transitions. A
+    third representation of one event is a flag that can contradict the record
+    beside it, and `ALTER TABLE` cannot add the table-level CHECK that would
+    forbid it. `CycleOut.stop_requested` is `stop_requested_at IS NOT NULL`,
+    computed on every read and stored nowhere.
+    """
+    conn = db.connect()
+    try:
+        assert "0015_cycle_stop_switch" in db.applied_migrations(conn)
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(cycles)")}
+        assert columns == {
+            "id",
+            "trigger",
+            "triggered_by",
+            "scope",
+            "dry_run",
+            "status",
+            "report",
+            "started_at",
+            "finished_at",
+            "rolled_back_by",
+            "stop_requested_at",
+            "stop_requested_by",
+        }
+        assert "stop_requested" not in columns, "the boolean is derived, never stored"
+    finally:
+        conn.close()
+
+
+def test_a_stop_records_who_asked_and_when_or_neither(fresh_db):
+    """Two columns can still disagree, and the CHECK is what stops them.
+
+    A `stop_requested_at` with no `stop_requested_by` is a stop nobody asked
+    for; the reverse is an asker with no moment. `ALTER TABLE ... ADD COLUMN`
+    does accept a cross-column CHECK, and its **name** is the message SQLite
+    prints — the device `0014` uses for its reserved-prefix abort, because
+    `RAISE()` is trigger-only here.
+    """
+    conn = db.connect()
+    try:
+        _insert_cycle(conn, "c", "scheduled")
+        for column, value in (
+            ("stop_requested_at", "datetime('now')"),
+            ("stop_requested_by", "'human:owner'"),
+        ):
+            with pytest.raises(sqlite3.IntegrityError, match="a stop records who asked and when"):
+                conn.execute(f"UPDATE cycles SET {column} = {value} WHERE id = 'c'")
+            # The refused half really was refused, so the next case starts from
+            # both-NULL rather than from a row the previous one half-stamped.
+            assert conn.execute("SELECT * FROM cycles WHERE id = 'c'").fetchone()[column] is None
+
+        conn.execute(
+            "UPDATE cycles SET stop_requested_at = datetime('now'),"
+            " stop_requested_by = 'human:owner' WHERE id = 'c'"
+        )
+        row = conn.execute("SELECT * FROM cycles WHERE id = 'c'").fetchone()
+        assert row["stop_requested_by"] == "human:owner"
+        assert row["stop_requested_at"] is not None
+    finally:
+        conn.close()
+
+
+def test_0015_applies_to_a_populated_database_already_at_0014(tmp_path, monkeypatch):
+    """The upgrade path on a populated file: `0014` is where v0.7.0 users are.
+
+    A migration only ever run against an empty database is a migration whose
+    upgrade path nothing has walked — Phase 5a's Q13 review found one that could
+    not upgrade any populated database at all, and the suite could not see it.
+    So this file holds a graph, a finished cycle carrying a report, and a cycle
+    still `running`; and the switch has to work on that last row, which predates
+    the columns it is written in.
+    """
+    _at_0014(tmp_path, monkeypatch, "at0014.db")
+    node = service.create_node(type="note", title="before the upgrade", principal=owner())
+    conn = db.connect()
+    try:
+        conn.execute(
+            "INSERT INTO cycles (id, trigger, triggered_by, status, report, finished_at)"
+            " VALUES ('finished', 'manual', 'human:owner', 'completed', '{\"merged\": 2}',"
+            " datetime('now'))"
+        )
+        conn.execute(
+            "INSERT INTO cycles (id, trigger, triggered_by, status)"
+            " VALUES ('mid-run', 'scheduled', 'scheduler', 'running')"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    monkeypatch.setattr(db, "MIGRATIONS", MIGRATIONS)
+    conn = db.connect()
+    try:
+        assert db.init_db(conn) == ["0015_cycle_stop_switch"]
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+    finally:
+        conn.close()
+
+    # Both rows survived the upgrade saying what they said, plus "nobody asked
+    # this to stop" — which is what two NULLs mean and needs no back-fill.
+    journal = {entry.id: entry for entry in service.list_cycles(principal=owner())}
+    assert journal["finished"].report == {"merged": 2}
+    assert [journal[cycle].stop_requested for cycle in ("finished", "mid-run")] == [False, False]
+    assert service.get_node(node.id, principal=owner()).title == "before the upgrade"
+
+    # And the switch works on the row that predates it, read by the principal
+    # that would be running it.
+    gardener = auth.internal_principal()
+    assert service.stop_requested("mid-run", principal=gardener) is False
+    stopped = service.request_stop("mid-run", principal=owner())
+    assert (stopped.stop_requested, stopped.stop_requested_by) == (True, "human:owner")
+    assert service.stop_requested("mid-run", principal=gardener) is True
+
+
+def test_a_database_recorded_at_0015_without_the_columns_is_refused(tmp_path, monkeypatch):
+    """Every recorded migration with a checkable guarantee has a check (Q13 S6).
+
+    `0015`'s is as checkable as they come — two columns, or the switch has
+    nowhere to write. Without the entry the drift would surface where the four
+    earlier ones used to: deep inside a write, as `no such column` raised by the
+    very call a human made to stop a run. Nothing in the runtime catches it
+    first: `LLMReport.stop_switch` reports the posture a *run* had, so a cycle
+    over such a database reads `armed` right up to the failed write.
+    """
+    _at_0014(tmp_path, monkeypatch, "stale.db")
+    conn = db.connect()
+    try:
+        conn.execute("INSERT INTO schema_migrations (name) VALUES (?)", (STALE_0015_NAME,))
+        conn.commit()
+    finally:
+        conn.close()
+
+    monkeypatch.setattr(db, "MIGRATIONS", MIGRATIONS)
+    conn = db.connect()
+    try:
+        with pytest.raises(db.SchemaConsistencyError, match=STALE_0015_NAME) as refused:
+            db.init_db(conn)
+        assert "stop_requested_at" in str(refused.value)
+        assert "stop_requested_by" in str(refused.value)
+    finally:
+        conn.close()
+
+
+def test_the_missing_stop_columns_are_refused_with_the_statements_that_add_them(
+    tmp_path, monkeypatch
+):
+    """The remedy is per check, and this one adds columns rather than binning a graph.
+
+    Both columns are pure additions with no back-fill — every row that predates
+    them is a cycle nobody asked to stop, which is what two NULLs say — so the
+    file is repairable in place, exactly as `0014`'s missing index is. The
+    refusal is therefore *followed* here rather than pattern-matched: every
+    statement it prints is executed verbatim, in the order printed, and the file
+    goes back to passing init **and** enforcing what the columns are for.
+    """
+    _at_0014(tmp_path, monkeypatch, "stale.db")
+    conn = db.connect()
+    try:
+        conn.execute("INSERT INTO schema_migrations (name) VALUES (?)", (STALE_0015_NAME,))
+        conn.commit()
+    finally:
+        conn.close()
+
+    monkeypatch.setattr(db, "MIGRATIONS", MIGRATIONS)
+    conn = db.connect()
+    try:
+        with pytest.raises(db.SchemaConsistencyError) as refused:
+            db.init_db(conn)
+        message = str(refused.value)
+        assert "delete the database file" not in message, "it told a human to bin their graph"
+
+        # Follow it: the printed statements, run as printed and in the printed
+        # order — the second column's CHECK names the first.
+        for _, statement in db.CYCLE_STOP_COLUMN_SQL:
+            assert statement in message
+            conn.executescript(statement)
+        conn.commit()
+        assert db.init_db(conn) == []
+
+        # And the repaired file enforces the coherence the CHECK exists for, so
+        # a statement carrying only the right column *names* would not pass.
+        _insert_cycle(conn, "c", "scheduled")
+        conn.commit()
+        with pytest.raises(sqlite3.IntegrityError, match="a stop records who asked and when"):
+            conn.execute("UPDATE cycles SET stop_requested_at = datetime('now') WHERE id = 'c'")
+        conn.rollback()
+    finally:
+        conn.close()
+
+    # The whole verb works over the repair, not just the schema read.
+    assert service.request_stop("c", principal=owner()).stop_requested is True
+
+
+def test_a_half_applied_0015_is_repaired_without_re_adding_the_column_it_has(tmp_path, monkeypatch):
+    """The refusal names the columns it *found* missing, and that is load-bearing.
+
+    `ADD COLUMN` has no `IF NOT EXISTS`, so a remedy that always printed both
+    statements would hand a human one that dies on `duplicate column name` —
+    advice nobody can carry out, which is the failure shape this repo has
+    already fixed once in `CycleInProgress`. A file carrying the first column
+    and not the second is the shape an interrupted upgrade leaves, since the two
+    ALTERs are separate statements.
+    """
+    _at_0014(tmp_path, monkeypatch, "half.db")
+    conn = db.connect()
+    try:
+        conn.executescript(db.CYCLE_STOP_COLUMN_SQL[0][1])
+        conn.execute("INSERT INTO schema_migrations (name) VALUES (?)", (STALE_0015_NAME,))
+        conn.commit()
+    finally:
+        conn.close()
+
+    monkeypatch.setattr(db, "MIGRATIONS", MIGRATIONS)
+    conn = db.connect()
+    try:
+        with pytest.raises(db.SchemaConsistencyError) as refused:
+            db.init_db(conn)
+        message = str(refused.value)
+        assert "stop_requested_by" in message
+        assert db.CYCLE_STOP_COLUMN_SQL[0][1] not in message, (
+            "it printed a statement that would die on 'duplicate column name'"
+        )
+
+        conn.executescript(db.CYCLE_STOP_COLUMN_SQL[1][1])
+        conn.commit()
+        assert db.init_db(conn) == []
+    finally:
+        conn.close()
+
+
+def _stop_columns_without_the_check(conn):
+    """Leave `cycles` carrying both stamps and no constraint over them.
+
+    **Not a shape this repo has ever produced.** `0015` landed with both columns
+    and the CHECK attached and `nodum/migrations.py` has not changed since, so
+    unlike `0014` — genuinely amended in place while unreleased — no database
+    built from this history can record `0015` and lack the constraint. What the
+    check guards, and what this reproduces, is a file drifted by something
+    outside the migration runner: a hand-edited schema, an externally applied
+    migration, or a human following half of the repair. Dropping the constrained
+    column and adding it back bare is the shortest route to that state and is
+    also, precisely, what the last of those does.
+    """
+    conn.executescript(
+        "ALTER TABLE cycles DROP COLUMN stop_requested_by;"
+        "ALTER TABLE cycles ADD COLUMN stop_requested_by TEXT;"
+    )
+    conn.commit()
+
+
+def _rebuilt_with(conn, replacement):
+    """Rebuild `cycles` with `replacement` in place of `0015`'s `, <CONSTRAINT …>`.
+
+    The repair statement itself, with its one constraint swapped out — so the
+    table under test differs from a sound one in exactly that clause and in
+    nothing else. The leading comma goes with it, since a table whose last
+    column declaration is followed by nothing needs no separator.
+    """
+    conn.executescript(
+        db.CYCLE_STOP_CHECK_REBUILD_SQL.replace(f", {db.CYCLE_STOP_CHECK_SQL}", replacement)
+    )
+    conn.commit()
+
+
+def _half_stop_is_storable(conn, cycle_id):
+    """Can this file hold a time with no requester — the state the CHECK forbids?
+
+    Leaves the row behind either way, at whichever of the two states it reached,
+    so the caller can go on asking about the same file.
+    """
+    _insert_cycle(conn, cycle_id, "curative")
+    try:
+        conn.execute(
+            "UPDATE cycles SET stop_requested_at = datetime('now') WHERE id = ?", (cycle_id,)
+        )
+    except sqlite3.IntegrityError:
+        conn.commit()
+        return False
+    conn.commit()
+    return True
+
+
+def test_the_constraint_name_in_a_comment_does_not_satisfy_the_check(fresh_db):
+    """A check over stored DDL must not fail *open*, and by default it does.
+
+    SQLite keeps a `CREATE TABLE` verbatim, comments included, and the `cycles`
+    DDL this repo ships is heavily commented — so a substring search for the
+    constraint name is satisfied by a file that merely *mentions* it. That is
+    the one failure direction that costs something: the check reports a sound
+    schema, `init_db` returns `[]`, and the half-stop the constraint exists to
+    forbid goes straight in. `_table_sql` strips comments before anything
+    searches, and this is what says so.
+    """
+    conn = db.connect()
+    try:
+        _rebuilt_with(conn, f" /* {db.CYCLE_STOP_CHECK_SQL} */")
+        # The name really is in the schema SQLite stored, which is what the
+        # search used to be satisfied by...
+        stored = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'cycles'"
+        ).fetchone()["sql"]
+        assert db.CYCLE_STOP_CHECK_NAME in stored
+        # ...and nothing constrains the columns, so the drift is real.
+        assert _half_stop_is_storable(conn, "half") is True
+
+        assert db.CYCLE_STOP_CHECK_NAME not in db._table_sql(conn, "cycles")
+        problems = db._cycle_stop_problems(conn)
+        assert len(problems) == 1
+        assert db.CYCLE_STOP_CHECK_NAME in problems[0]
+        with pytest.raises(db.SchemaConsistencyError):
+            db.init_db(conn)
+    finally:
+        conn.close()
+
+
+def test_an_unnamed_check_that_enforces_the_rule_is_still_reported(fresh_db):
+    """Reported on purpose: the name is half of what `0015` guarantees.
+
+    SQLite prints a named constraint verbatim as `CHECK constraint failed:
+    <name>`, so the name is the sentence a human meets when the stop stamps
+    disagree — `0014`'s device, since `RAISE()` is trigger-only — and it is what
+    the rebuild puts back. A file enforcing the same rule anonymously enforces
+    the rule and does not carry the migration, so saying so is the right answer
+    and not a false alarm. The cost is bounded and in the safe direction: a human
+    reads a repair that turns out to change only the message.
+
+    Asserted rather than left implicit because the alternative reading — "this
+    check over-fires" — invites loosening it, and loosening a search over DDL is
+    how it starts failing open instead.
+    """
+    conn = db.connect()
+    try:
+        _rebuilt_with(conn, ", CHECK ((stop_requested_by IS NULL) = (stop_requested_at IS NULL))")
+        # It bites, so the file is not broken in the way the message describes.
+        assert _half_stop_is_storable(conn, "anonymous") is False
+        # And it is reported anyway, because the constraint `0015` records is a
+        # named one and this file has not got it.
+        problems = db._cycle_stop_problems(conn)
+        assert len(problems) == 1
+        assert db.CYCLE_STOP_CHECK_NAME in problems[0]
+
+        # The repair is a no-op for the rule and puts the name on, which is the
+        # whole of what it was missing.
+        conn.executescript(db.CYCLE_STOP_CHECK_REBUILD_SQL)
+        conn.commit()
+        assert db.init_db(conn) == []
+        assert _half_stop_is_storable(conn, "named") is False
+        with pytest.raises(sqlite3.IntegrityError, match=db.CYCLE_STOP_CHECK_NAME):
+            conn.execute(
+                "UPDATE cycles SET stop_requested_at = datetime('now') WHERE id = 'anonymous'"
+            )
+        conn.rollback()
+    finally:
+        conn.close()
+
+
+def test_the_stop_columns_without_their_check_are_drift_the_check_has_to_see(fresh_db):
+    """`0015` guarantees two stamps *and one CHECK*, and only one was checked.
+
+    The constraint is the whole reason two nullable columns are honest: without
+    it the file can hold a time with no requester or a requester with no time,
+    which is precisely the state the migration chose two columns over a boolean
+    to make unstorable. `PRAGMA table_info` cannot see it — it answers what the
+    columns are and says nothing about what constrains them — so the check reads
+    the stored schema, and until it did, a file wearing the migration's name
+    with no constraint under its stamps passed init and stayed that way.
+    """
+    conn = db.connect()
+    try:
+        assert db._cycle_stop_problems(conn) == [], "a file straight from 0015 is not drift"
+        _stop_columns_without_the_check(conn)
+        # The columns are both there, so the earlier check has nothing to say.
+        assert {"stop_requested_at", "stop_requested_by"} <= db._columns(conn, "cycles")
+        problems = db._cycle_stop_problems(conn)
+        assert len(problems) == 1
+        assert db.CYCLE_STOP_CHECK_NAME in problems[0]
+        # And the file really is broken in the way the sentence claims: the
+        # half-stop the constraint exists to forbid goes straight in.
+        _insert_cycle(conn, "half", "scheduled")
+        conn.execute("UPDATE cycles SET stop_requested_at = datetime('now') WHERE id = 'half'")
+        conn.commit()
+        row = conn.execute("SELECT * FROM cycles WHERE id = 'half'").fetchone()
+        assert (row["stop_requested_at"], row["stop_requested_by"]) != (None, None)
+        assert row["stop_requested_by"] is None, "a stop nobody asked for, stored"
+    finally:
+        conn.close()
+
+
+#: One `cycles` row with a distinct, non-NULL value in **every** column the
+#: table has, for the rebuild's "keeps every row" claim — which is a claim about
+#: all twelve and was asserted over five. `_insert_cycle` only ever fills four,
+#: so a rebuild that dropped `report` — every cycle's journal body — passed the
+#: whole suite. Keyed by column so the test can check it still covers the table.
+_EVERY_COLUMN_FILLED = {
+    "id": "stopped",
+    "trigger": "curative",
+    "triggered_by": "human:owner",
+    "scope": "research",
+    "dry_run": 1,
+    "status": "failed",
+    "report": '{"jobs": ["duplicates"], "detail": "the body of the journal entry"}',
+    "started_at": "2026-07-29 22:00:00",
+    "finished_at": "2026-07-30 01:30:00",
+    "rolled_back_by": "the-rollback",
+    "stop_requested_at": "2026-07-30 01:00:00",
+    "stop_requested_by": "human:owner",
+}
+
+
+def test_the_rebuilds_column_list_is_every_column_a_migrated_cycles_has(fresh_db):
+    """A column list written by hand is a data-loss bug the day a migration adds one.
+
+    `CYCLE_STOP_CHECK_REBUILD_SQL` builds its replacement table from
+    `db.CYCLES_COLUMNS` and copies the same list across, so the two halves of
+    the repair cannot disagree — but nothing inside the repair can know whether
+    that list is still the table. A column `0016` adds to `cycles` would be
+    dropped by it, **with its data**, in a statement a human is told to run
+    against their own graph, silently, with `init_db` returning `[]` afterwards
+    because no check looks for it.
+
+    This is the pin, and it fails on the commit that adds the column rather than
+    on the install that runs the repair.
+    """
+    conn = db.connect()
+    try:
+        live = [row["name"] for row in conn.execute("PRAGMA table_info(cycles)")]
+    finally:
+        conn.close()
+    assert live == [name for name, _ in db.CYCLES_COLUMNS], (
+        "a migration changed `cycles` and `db.CYCLES_COLUMNS` did not follow: the rebuild "
+        "printed by `_cycle_stop_problems` would drop the difference and its data"
+    )
+
+
+def test_the_missing_stop_check_is_refused_with_a_rebuild_that_keeps_every_row(fresh_db):
+    """The remedy is this check's own, and putting a CHECK on is not adding a column.
+
+    `ALTER TABLE` adds a constraint only *with* a column, so the repair for a
+    column that already exists is the documented create-copy-drop-rename
+    rebuild — still a repair in place, with every row carried across and both
+    indexes recreated. What it must not be is the first four checks' sentence:
+    "delete the database file and re-run `nodum init`" reads as *your graph is
+    unrecoverable* over a constraint the file has all the rows for, which is the
+    mistake `0014`'s missing index already had to be rescued from.
+
+    The refusal is **followed** rather than pattern-matched: the statement it
+    prints is executed verbatim, and afterwards the file passes init, still
+    holds its rows, refuses the half-stop, and still serialises its cycles.
+
+    "Every row" is asserted over **every column**, which it was not: the row went
+    in through `_insert_cycle`, which fills four of the twelve, and the test then
+    looked at the two stop stamps. `scope`, `dry_run`, `report`, `started_at`,
+    `finished_at` and `rolled_back_by` were neither written nor read, so NULLing
+    `report` in the copy — destroying every cycle's journal body — passed here.
+    A row-preservation test is worth exactly the columns it populates.
+    """
+    conn = db.connect()
+    try:
+        assert set(_EVERY_COLUMN_FILLED) == {name for name, _ in db.CYCLES_COLUMNS}
+        # Stopped *after* the drift, which is the only order a real file can
+        # have it in: a constraint-less schema is what the row was written on.
+        _stop_columns_without_the_check(conn)
+        # `rolled_back_by` is a self-reference, so the row it names has to exist.
+        _insert_cycle(conn, "the-rollback", "rollback", status="completed")
+        columns = ", ".join(_EVERY_COLUMN_FILLED)
+        conn.execute(
+            f"INSERT INTO cycles ({columns}) VALUES ({', '.join('?' * len(_EVERY_COLUMN_FILLED))})",
+            tuple(_EVERY_COLUMN_FILLED.values()),
+        )
+        conn.commit()
+
+        with pytest.raises(db.SchemaConsistencyError) as refused:
+            db.init_db(conn)
+        message = str(refused.value)
+        assert "delete the database file" not in message, "it told a human to bin their graph"
+        assert db.CYCLE_STOP_CHECK_REBUILD_SQL in message
+
+        conn.executescript(db.CYCLE_STOP_CHECK_REBUILD_SQL)
+        conn.commit()
+        assert db.init_db(conn) == []
+
+        # Every row came across, and every *column* of it — the recorded stop,
+        # the scope, the rehearsal flag, both timestamps, the rollback link, and
+        # the report, which is the whole readable body of a journal entry.
+        row = conn.execute("SELECT * FROM cycles WHERE id = 'stopped'").fetchone()
+        assert dict(row) == _EVERY_COLUMN_FILLED
+        assert {r["id"] for r in conn.execute("SELECT id FROM cycles")} == {
+            "stopped",
+            "the-rollback",
+        }
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+
+        # The constraint bites, by the name SQLite prints...
+        _insert_cycle(conn, "fresh", "scheduled")
+        conn.commit()
+        with pytest.raises(sqlite3.IntegrityError, match=db.CYCLE_STOP_CHECK_NAME):
+            conn.execute("UPDATE cycles SET stop_requested_at = datetime('now') WHERE id='fresh'")
+        conn.rollback()
+        # ...and the two indexes the rebuild dropped with the table are back, so
+        # the repair did not trade one guarantee for another.
+        with pytest.raises(sqlite3.IntegrityError, match="cycles.status"):
+            _insert_cycle(conn, "second", "manual")
+        conn.rollback()
+    finally:
+        conn.close()
+
+    # And the whole verb works over the repair, not just the schema read.
+    assert service.request_stop("fresh", principal=owner()).stop_requested is True
+
+
+def test_the_rebuild_that_a_half_stop_defeats_says_so_and_names_the_rows(fresh_db):
+    """A repair that dies with no next step is advice nobody can carry out.
+
+    The rebuild copies the rows through the constraint, so a file that ran
+    without one and stored a half-stop meets `CHECK constraint failed` there —
+    which is the constraint doing its job and, unexplained, a dead end at the
+    end of the one instruction the refusal gave. `_CREATE_THE_CYCLES_INDEX`
+    already answers the mirror of this ("if it fails, two cycles are recorded
+    running — close the stale one first"), and this says its own version.
+    """
+    conn = db.connect()
+    try:
+        _stop_columns_without_the_check(conn)
+        _insert_cycle(conn, "half", "scheduled")
+        conn.execute("UPDATE cycles SET stop_requested_at = datetime('now') WHERE id = 'half'")
+        conn.commit()
+
+        with pytest.raises(db.SchemaConsistencyError) as refused:
+            db.init_db(conn)
+        message = str(refused.value)
+        assert db.CYCLE_STOP_HALF_STOP_SQL in message
+
+        # The rebuild refuses, exactly as the sentence warns.
+        with pytest.raises(sqlite3.IntegrityError, match=db.CYCLE_STOP_CHECK_NAME):
+            conn.executescript(db.CYCLE_STOP_CHECK_REBUILD_SQL)
+        conn.rollback()
+
+        # And the query the refusal names finds the row in the way, so the
+        # second step is one a human can actually take.
+        assert [row["id"] for row in conn.execute(db.CYCLE_STOP_HALF_STOP_SQL)] == ["half"]
+        conn.execute("UPDATE cycles SET stop_requested_at = NULL WHERE id = 'half'")
+        conn.commit()
+        conn.executescript(db.CYCLE_STOP_CHECK_REBUILD_SQL)
+        conn.commit()
+        assert db.init_db(conn) == []
     finally:
         conn.close()
 

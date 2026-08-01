@@ -105,9 +105,12 @@ infers in the review queue rather than asserting it. A **curative tier**
 (`merge-nodes`, `retype`, `supersede-edge`, `bulk-relink`) changes structure
 rather than adding to it, each operation inside a cycle. A **dream journal**
 (`nodum cycle-list` / `cycle-get`, and a view in the web UI) says what ran, who
-asked, what it measured and what it changed — and `nodum cycle-abandon <id>` is
-the way out of a run a crash left open, since a cycle that never closed cannot
-be rolled back and its events cannot be undone either. Cycles run on demand, and
+asked, what it measured and what it changed. Three verbs act on an entry and
+they are not interchangeable: `nodum cycle-stop <id>` asks a run that is still
+going to wind down, `nodum cycle-abandon <id>` is the way out of a run a crash
+left open — since a cycle that never closed cannot be rolled back and its events
+cannot be undone either — and `nodum rollback <cycle-id>` is the only one of the
+three that reverses a write. Cycles run on demand, and
 nightly when `NODUM_CONSOLIDATE_AT` says so — unset means off.
 
 Still to come: claim proposals and the gardener's LLM half — everything that

@@ -205,6 +205,126 @@ def test_undo_create_of_a_node_with_children_is_refused(fresh_db):
         service.get_node(page.id, principal=owner())
 
 
+# ── A version review, reversed on both halves ────────────────────────────────
+#
+# A review moves two rows from one decision, and only the node is a graph
+# record. Both of these run *outside* a cycle on purpose: `undo` is the only
+# verb that reaches an ordinary human review, and both halves were outside it.
+
+
+def _versions():
+    """Every version row, keyed by id, read past every filter."""
+    return {row["id"]: row for row in _rows("versions")}
+
+
+def _rows(table):
+    conn = db.connect()
+    try:
+        return [dict(row) for row in conn.execute(f"SELECT * FROM {table}")]
+    finally:
+        conn.close()
+
+
+def _staged(content="a second thought"):
+    """A node with one proposed update pending on it, as ``(node, version)``."""
+    node = service.create_node(type="note", title="Alpha", content="first", principal=owner())
+    service.update_node(node.id, content=content, principal=agent("proposer"))
+    version = next(
+        entry for entry in service.history(node.id, principal=owner()) if entry.state == "proposed"
+    )
+    return node, version
+
+
+def test_undoing_an_accepted_proposal_puts_the_proposal_back(fresh_db):
+    """Accepting rewrites the node *and* flips the version, and undo owed both.
+
+    Reversing the `node.update` an accept emits restored the node and left the
+    proposal marked `applied`. A version leaves `proposed` exactly once, so that
+    is not a stale flag: the proposal could never be accepted or rejected again,
+    over a node whose content had gone back. This needs no cycle and no
+    gardener — a human accepting their own queue and pressing undo reaches it.
+    """
+    node, version = _staged()
+    graph, history = _graph_rows(), _versions()
+
+    service.transition(str(version.id), "accept", principal=owner())
+    assert _versions()[version.id]["state"] == "applied"
+
+    result = service.undo(principal=owner())
+
+    assert result.undone_op == "node.update"
+    assert _versions()[version.id]["state"] == "proposed"
+    assert result.restored_version["state"] == "proposed"
+    assert service.get_node(node.id, principal=owner()).content == "first"
+    assert _graph_rows() == graph
+    for version_id, row in history.items():
+        assert _versions()[version_id] == row, f"versions row {version_id} did not come back"
+    # A proposal again, not a row wearing the word: it is back in the queue and
+    # accepting it a second time works.
+    assert [
+        item.version.id for item in service.list_proposals(kind="update", principal=owner())
+    ] == [version.id]
+    service.transition(str(version.id), "accept", principal=owner())
+    assert service.get_node(node.id, principal=owner()).content == "a second thought"
+
+
+def test_a_rejected_proposal_can_be_undone_and_reviewed_again(fresh_db):
+    """`version.reject` is a proper event that neither reversal verb could reach.
+
+    It carries the version rows as `before`/`after` — exactly the shape every
+    other reversal reads — but `version.` was in neither `_UNDOABLE_OPS` nor the
+    rollback plan's set, so the one review outcome that *did* record itself was
+    the one nothing could take back. Undoing it is the whole of the fix.
+    """
+    node, version = _staged()
+    graph, history = _graph_rows(), _versions()
+
+    service.transition(str(version.id), "reject", reason="not yet", principal=owner())
+    assert _versions()[version.id]["state"] == "archived"
+
+    result = service.undo(principal=owner())
+
+    assert result.undone_op == "version.reject"
+    assert result.restored["state"] == "proposed"
+    assert result.restored_version is None, "the reject's own row is the one under `restored`"
+    assert _graph_rows() == graph
+    assert history, "no version rows to check: the fixture staged nothing"
+    for version_id, row in history.items():
+        assert _versions()[version_id] == row, f"versions row {version_id} did not come back"
+    # The bare undo found the reject rather than reaching *past* it. It used to
+    # reach the node's own create — the last `node.`/`edge.` event, since a
+    # proposal emits `version.propose` — and delete the node, taking the
+    # rejected proposal's row with it. That is the harm `undo` already refuses
+    # to commit across a cycle, committed on an ordinary human review.
+    assert service.get_node(node.id, principal=owner()).content == "first"
+    service.transition(str(version.id), "accept", principal=owner())
+    assert service.get_node(node.id, principal=owner()).content == "a second thought"
+
+
+def test_a_review_inside_a_cycle_is_refused_by_name_and_pointed_at_rollback(fresh_db):
+    """Both halves, refused with the remedy rather than with "not a graph event".
+
+    A cycle-stamped `version.reject` used to be turned away by the non-graph
+    check, which fires *before* the cycle check — so the refusal named no cycle
+    and no verb, for an event rollback can now take back. The accept half was
+    already covered, since it emits a `node.update`.
+    """
+    _, to_accept = _staged()
+    _, to_reject = _staged(content="another second thought")
+    cycle = service.open_cycle(trigger="manual", principal=owner())
+    with service.in_cycle(cycle.id):
+        service.transition(str(to_accept.id), "accept", principal=owner())
+        service.transition(str(to_reject.id), "reject", principal=owner())
+
+    stamped = {event.op: event.seq for event in _events() if event.cycle_id == cycle.id}
+    assert set(stamped) == {"node.update", "version.reject"}, "the fixture reviewed nothing"
+    for seq in stamped.values():
+        with pytest.raises(UndoNotPossible, match=f"nodum rollback {cycle.id}"):
+            service.undo(seq, principal=owner())
+    assert _versions()[to_accept.id]["state"] == "applied"
+    assert _versions()[to_reject.id]["state"] == "archived"
+
+
 def test_undo_refuses_an_event_that_belongs_to_a_consolidation_cycle(fresh_db):
     """The guard that makes the curative tier safe to name under `node.`/`edge.`.
 

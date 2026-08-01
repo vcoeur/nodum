@@ -147,6 +147,37 @@ it **warns before the drop** in the same register as the editor's meta bar —
 `/editor`, where the picker lives. A badge and nothing else let a human drop a
 whole batch into a target this panel already knew would fail every row.
 
+## The view Phase 5b-i deliberately does not ship
+
+`POST /api/ask` exists, it is a read-only surface, the client could call it in an
+afternoon — and **there is no Ask view in this app**. That is a decision, not a
+gap in the work.
+
+`/ask` can return a **confident, well-cited, wrong answer**. It was measured
+doing exactly that: asked which cloud provider hosts the production Kubernetes
+cluster, the local model answered *"AWS"* with `answered: true`, citing a Kafka
+textbook containing zero occurrences of AWS, cloud, Kubernetes, or provider,
+while the graph elsewhere says the cluster is k3s on three on-prem nodes.
+Citation *resolvability* is not groundedness: design decision E2 defends against
+an invented **id**, and that answer invented **content** and hung it on a real
+id.
+
+What catches that is the envelope, and the envelope survives one surface and not
+the other. A CLI reader gets `unresolved`, `considered` and `dropped` as JSON
+beside the answer — a marker the model cited for a note that was never offered is
+right there, and it is the signal that the model was not reading its context. A
+browser reader gets prose. Rendering the same envelope as a panel does not fix
+it, because a screen that has just answered the question in a paragraph is a
+screen whose lists nobody reads; the CLI's advantage is not the fields, it is
+that its reader is already looking at them.
+
+So the surface stays where its reader is equipped for it. **It moves here in
+5b-ii, once groundedness is real** — a deterministic check that the answer's
+claims are in the excerpts the request retrieved, rather than that its citations
+resolve. Until then, do not add an Ask view, an "ask about this node" button, or
+an answer panel bolted onto search: each is the same decision taken by accident.
+`/summarize` is the same call and the same rule.
+
 ## Running it
 
 ```bash
@@ -248,7 +279,7 @@ type-checking it and driving it in a browser.
 | `src/views/editor/` | CodeMirror-6 Markdown source editor, slash commands, `[[` autocomplete, live Mermaid preview, autosave, the write-target picker and the landing/refusal copy (`createOutcome.ts`) |
 | `src/views/search/` | query box, ranked hits, per-signal breakdown, signal grouping, the space filter + show-meta toggle in the URL (`searchState.ts`), refused-filter copy (`spaceFailure.ts`), when a row names its space (`resultSpace.ts`) |
 | `src/views/review/` | proposal queue grouped space → agent, per-kind cards, proposed-version diffs, self-governing space sections, cross-space edge marking (`grouping.edgeCrossing`), and the pager over it (`grouping.sectionOrder` / `restrictToPage`, over `lib/pageWindow`) with the honest count above it (`grouping.queueCount`) |
-| `src/views/journal/` | the dream journal: cycles as sentences, one entry with its job report, the five coherence metrics before/after, the events it wrote as a paged diff, the run-now control, the abandon confirm for a cycle a crash left `running`, and the dry-run-then-confirm rollback — whose verdict is **two** lists, `conflicts` and `blockers`, and is clean only when both are empty (`journal.ts` owns every sentence and every reading of the untyped `report` blob; `useNodeTitles.ts` names the nodes an edge event points at) |
+| `src/views/journal/` | the dream journal: cycles as sentences, one entry with its job report, the five coherence metrics before/after, the events it wrote as a paged diff, the run-now control, the **stop** confirm for a run that is still going and the **abandon** confirm for one a crash left `running` (three verbs, three situations: a stop is an instruction a live run obeys, an abandon closes a dead run's entry from outside, and only the rollback reverses a write — a stopped run and a crashed one both close `failed`, so the entry renders who asked for the stop and when), and the dry-run-then-confirm rollback — whose verdict is **two** lists, `conflicts` and `blockers`, and is clean only when both are empty (`journal.ts` owns every sentence and every reading of the untyped `report` blob; `useNodeTitles.ts` names the nodes an edge event points at) |
 | `src/views/graph/` | Cytoscape subgraph render, filters, cross-space edge styling and far-endpoint dimming, path panel |
 | `src/views/assets/` | rendition grid, lightbox, the ingesting drop-zone with its queue readout (`uploadOutcome.ts`) and its bookkeeping (`uploadQueue.ts` — batches, status labels, the refused second drop, the per-batch announcement), thin JSON export |
 | `src/views/login/` | password login against `POST /api/login` |
@@ -415,17 +446,20 @@ Conventions that hold across the tree:
 ## The API client
 
 `src/api/client.ts` is the only place that calls `fetch`. It covers the whole
-Phase-3 endpoint surface plus the five consolidation-cycle routes, typed, and
+Phase-3 endpoint surface plus the six consolidation-cycle routes, typed, and
 every route it names is served by `nodum.http_api`.
 
 What it handles for you:
 
-- covers the **five** consolidation-cycle routes, `POST /api/cycles/{id}/abandon`
+- covers the **six** consolidation-cycle routes, `POST /api/cycles/{id}/abandon`
   included — the door out of a cycle a crash left `running`, and the
   precondition for the rollback route rather than a tidier journal: rollback
   refuses a cycle that has not closed and `undo` refuses every event a cycle
   stamped, so until the row is closed the run's writes are irreversible on every
-  surface;
+  surface — and `POST /api/cycles/{id}/stop`, which takes that route's shape and
+  is deliberately not it: a stop leaves the row `running` and stamps who asked
+  and when, because a repair performed on a dead process and an instruction
+  obeyed by a live run are two facts the journal has to keep apart;
 - prefixes `/api` (`getHealth` is the one exception — `/healthz` sits outside);
 - unwraps the `{"<plural>": [...], "count": n}` list envelope, so list calls
   return a plain array;

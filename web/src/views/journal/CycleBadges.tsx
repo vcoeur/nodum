@@ -32,6 +32,24 @@ export function CycleBadges({ cycle }: { cycle: CycleOut }) {
           rehearsal
         </span>
       ) : null}
+      {cycle.stop_requested ? (
+        // The one fact `status` cannot carry. A stopped run closes itself
+        // `failed`, so the pill beside this one says the same word for a run the
+        // operator stopped and a run whose process died — and those are the two
+        // readings the journal exists to keep apart. It is the *instruction*
+        // that is pinned here, never an outcome: a `running` entry carrying this
+        // has been asked to stop and has not stopped yet.
+        <span
+          className="nd-badge nd-jn-badge--stopped"
+          title={
+            cycle.stop_requested_by === null
+              ? "A stop was asked for on this run"
+              : `A stop was asked for by ${cycle.stop_requested_by}`
+          }
+        >
+          stop asked
+        </span>
+      ) : null}
       {cycle.rolled_back_by === null ? null : (
         <span
           className="nd-badge nd-jn-badge--reverted"

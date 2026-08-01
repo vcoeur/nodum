@@ -104,12 +104,18 @@ proposals**, which moved to Phase 5b deliberately rather than being forgotten �
 deciding that a sentence *is* a claim is a judgement call and belongs to the
 research agent in design §3, and splitting prose into sentences would fill the
 review queue with noise instead of knowledge, so ingestion proposes sources and
-structure and stops; the **LLM half of the gardener** (Phase 5b) — props
-migration on a retype, deciding that an untouched claim has gone *stale*
-rather than merely old, the abstraction job, and the two Q12 metrics that need
-it — design Constraint 4 keeps the model out of validation, the state machine
-and the projectors, and every line of `nodum.consolidate` runs on a machine
-with no model present; **Markdown Mirror** and any whole-graph export (the only
+structure and stops; the **LLM *jobs* of the gardener** — props migration on a
+retype, deciding that an untouched claim has gone *stale* rather than merely
+old, the abstraction job, learned queue curation, and the two Q12 metrics that
+need it — which Phase 5b-ii lands on top of 5b-i's runtime (`nodum.llm` +
+`nodum.agent`, below): the provider, the accounting, the budgets and the kill
+switch ship first, so the thing being observed arrives after the observability
+and can be judged rather than trusted. Design Constraint 4 is unchanged and now
+structurally enforced — the model stays out of validation, the state machine
+and the projectors (`tests/test_llm.py` proves those modules cannot reach
+`nodum.llm` at all), and every line of `nodum.consolidate` still runs on a
+machine with no model present. Also not built: **Markdown Mirror** and any
+whole-graph export (the only
 export that exists is the thin per-node snapshot,
 `GET /api/export/node/{id}?depth=`, which is `get_neighborhood` with a
 `content-disposition` header — not a format, not a backup). Each lands as its
@@ -214,8 +220,8 @@ commands on a saved node for exactly this reason.
   exactly the delegation that was there. Inert, not destroyed. `grant` on an
   archived space is refused and says why.
   **Consolidation cycles, the curative tier and rollback are here too** (design
-  §8.2/§8.4). `open_cycle` / `close_cycle` / `abandon_cycle` / `get_cycle` /
-  `list_cycles` own the
+  §8.2/§8.4). `open_cycle` / `close_cycle` / `abandon_cycle` / `request_stop` /
+  `stop_requested` / `get_cycle` / `list_cycles` own the
   `cycles` row — the dream journal's record of what ran, who asked, over what,
   and how it ended — and store **no diff**, because the diff is
   `list_events(cycle_id=…)` and a journal that kept its own copy could disagree
@@ -249,7 +255,120 @@ commands on a saved node for exactly this reason.
   cycle is already running" — which matters more since the guard became a
   database index, because one interrupted run blocks every later run in every
   process rather than only the ones sharing its interpreter. A door exists once
-  the thing that sends you to it says its name. The stamp itself is `in_cycle`, a `ContextVar` that
+  the thing that sends you to it says its name.
+  **The kill switch is two verbs and is deliberately not `abandon_cycle`**
+  (K1–K3). `request_stop(cycle_id, *, principal)` is **human-only**: it stamps
+  `0015`'s two columns on a `running` cycle and does nothing else — the row
+  stays `running`, no event is emitted, no write is touched — and the run
+  notices at its next check and closes *its own* entry `failed`. It refuses a
+  cycle that is not `running` (nothing is left to obey it, and the stamp would
+  name a run that never saw it), and **asking twice is a no-op that keeps the
+  first asker**: a switch that raised because the run was already stopping would
+  make a human hitting it twice doubt whether it worked, which is the one moment
+  that must not be ambiguous. It does not roll back — stopping and undoing are
+  two decisions, and a switch that also reverted would make "stop, look at what
+  it did, then decide" impossible. Building it on `abandon_cycle` would erase
+  the distinction the journal exists to keep: a repair closes somebody else's
+  dead process from outside, an instruction is obeyed by a live run.
+  `stop_requested(cycle_id, *, principal) -> bool` is the read the runner obeys,
+  and it is **deliberately not human-only** unlike `get_cycle`/`list_cycles`:
+  those are, because a journal entry says what the gardener did across every
+  space in the file, while this is one boolean about a run that discloses no
+  territory — and a runner that cannot ask whether it was told to stop cannot
+  obey. **What bounds it instead is the rule that would admit the caller to run
+  this cycle's territory** (`_may_watch_a_cycle`): a scoped cycle asks for the
+  grant that resolves its scope, which is the check
+  `consolidate._require_gardener_scope` already makes before the run starts, and
+  an unscoped one asks what `open_cycle` asks of an unscoped cycle — `edit`
+  somewhere, since no grant confers the whole file. **Caller-relative, not
+  run-relative, and the difference is a schema gap rather than a wording
+  choice**: `cycles` records `triggered_by`, who *asked*, and has no column at
+  all for who is *running*, so "exactly what admitted this run" is not a question
+  the row can answer. The width that buys is real and named rather than papered
+  over — any agent holding *any* grant on space S now reads the switch on every
+  cycle ever scoped to S, including a human's and another agent's. Concretely:
+  `create_agent`'s own minimum grant set, `read` on `meta`, watches every
+  `meta`-scoped cycle, and the parity pair `0010` backfilled onto the agents that
+  predate it (`meta: read`, `main: suggest`) watches every cycle over `main` too.
+  `require_review` refused both, since neither level reaches `edit`. It is one
+  boolean per cycle id, no surface hands an agent a cycle id, and stating a
+  narrower rule than the code enforces is how a later reader grants themselves
+  the narrower one. It
+  asked `require_review` over `_cycle_authority_spaces` for both, on the argument
+  that *obeying a stop is closing the cycle, so a principal that could not close
+  this one has no use for the answer*, and **that argument is unsound on both
+  triggers, in two different ways**. On a `manual` run the gardener never closes
+  the cycle at all: `_run_cycle` closes as the *opener* and `_opener` resolves a
+  human-triggered run's opener to the human, so the check demanded of the
+  gardener an authority the gardener does not exercise. On a `scheduled` run the
+  gardener **is** the opener and does close its own cycle — but `open_cycle` had
+  then already required `edit` on the scope before the run could start, so the
+  check was re-asking a question the door had answered `yes`, and could refuse
+  nothing a scheduled run would ever meet. Either way it only ever bit where it
+  was wrong: a
+  gardener holding `read` on a space is entitled to consolidate it and was then
+  refused the switch over its own run — a night dying at its first provider call
+  on `GrantNotPermitted`, which is a kill switch killing the run by being
+  unreadable. A check on the far side of a door must not be stricter than the
+  door. Nothing caches it — a check answering from a value read at the top of the
+  run would be a switch that cannot be hit after the run starts, which is the
+  only time anyone hits one. The stamps outlive the run, so the journal goes on
+  saying who stopped that night. Neither verb is on MCP (`HUMAN_ONLY_TOOLS`).
+  **And this read is no longer an existence oracle.** The
+  two answers it gave a principal it turned away — `RecordNotFound` for an id
+  naming nothing, `GrantNotPermitted` for a cycle it may not watch — told those
+  cases apart, so anything holding one grant could probe a cycle id and learn
+  whether a cycle wearing it exists. Cycle ids are `uuid4` and both journal reads
+  are human-only, which bounds the damage and does not close the class. The
+  ordering trick the space-name check uses — ask the grant first, so the
+  existence question is never reached — is unavailable here, because the grant to
+  ask for is recorded *on the row*; so it takes `_resolve_space`'s shape instead,
+  the Q13 non-oracle one: **one refusal for both cases**, the not-found one,
+  echoing back nothing but the id the caller supplied. `_no_such_cycle` owns that
+  sentence so the two answers cannot drift apart again, and humans — unfiltered
+  here as everywhere — are never told a cycle they can see does not exist.
+  **Closed here and nowhere else, which is the whole claim.** It is not the
+  *class* of cycle-id oracles: `close_cycle` takes a cycle id, is not human-only,
+  and still answers `GrantNotPermitted` for a cycle the caller may not close
+  against `RecordNotFound` for an id that names nothing — the only one of the
+  seven cycle-id surfaces that still tells them apart (`get_cycle`,
+  `request_stop`, `abandon_cycle`, `rollback_cycle` and `list_events` all refuse
+  before they read the row, so none of them can). That is deliberate.
+  `close_cycle`'s refusal is the *same* `require_review` `open_cycle` raises, on
+  the same spaces, and `open_cycle` cannot be an oracle at all because it takes a
+  scope and not an id; collapsing one half of that pair would leave a principal
+  that opened a cycle and cannot close it reading *this cycle does not exist*
+  about a row it is holding open, and would falsify the symmetry
+  `Store.require_review` documents. The exposure argument is the stop read's own,
+  unchanged — an unguessable id, no agent-facing model carrying one — and it is
+  an argument about reach, not a reason to widen the collapse onto a write.
+  **What the collapse costs, said once.** The refusal a principal outside the run
+  now meets is `consolidation cycle not found`, and that sentence reaches a
+  *legitimate* runner too. Grants go inert at **mint** time (`auth._grant_set`
+  drops grants on archived spaces), not at check time, so a run whose scope is
+  archived under it keeps reading its switch — `_run_cycle` mints the gardener
+  once and holds it, the module's own "revocation bites at the next cycle, not
+  mid-flight" — while the **next** principal minted for that cycle, in a later
+  process or after a restart, is told its own cycle does not exist. It used to be
+  told it needed `edit` on the item's space, which at least pointed at the cause.
+  Both refusals are wrong for that reader; this one is quieter about the thing an
+  outsider must not learn, which is the trade that was taken. Reading the
+  *recorded* scope rather than re-resolving it is what keeps the lookup working
+  at all (`_resolve_space` matches active spaces only) — it does not, and cannot,
+  keep an archived space's cycle readable by a re-minted runner.
+  **`request_stop` is reachable on both human surfaces** — `nodum cycle-stop
+  <id>`, `POST /api/cycles/{id}/stop`, and a confirm on the journal entry, which
+  also renders who asked and when — for the reason `cycle-abandon` is: a door
+  nothing opens is not a door, and this one shipped with its schema, its runtime
+  and no surface at all. The three verbs a `running` entry can meet are stop,
+  abandon and rollback, and every surface states the difference rather than
+  leaving a human to infer it from three similar buttons. What *obeys* a stop
+  today is `agent.AgentRun.chat`, immediately before a provider call; the four
+  deterministic jobs in `nodum.consolidate` make none and read the switch
+  nowhere, so a stop recorded against one of those runs is kept and the run
+  finishes — which every surface says, rather than promising a wind-down that
+  would not arrive.
+  The stamp itself is `in_cycle`, a `ContextVar` that
   `_emit` reads, so a cycle's writes go through the *ordinary* public functions
   and are stamped without any call site naming a cycle — a per-task variable
   rather than a module global, so the HTTP server handling a normal request
@@ -303,7 +422,21 @@ commands on a saved node for exactly this reason.
   in the plan too**, as a second list: a conflict is the graph having *moved* a
   row the cycle wrote, a `blockers[]` entry is the graph having *grown something
   onto* a row the cycle created, and modelling only the first made the preflight
-  a UI's confirm dialog calls disagree with the run. Every foreign key into
+  a UI's confirm dialog calls disagree with the run. **The outcome was the same
+  shape and was fixed the same way**: a dry run returned `restored_nodes`,
+  `restored_edges`, `restored_versions`, `deleted_nodes`, `deleted_edges` and
+  `redirects_removed` all empty whatever the rollback was about to do, so the
+  preflight answered *"reversing 17 446 events"* about a reversal that was going
+  to delete 17 446 edges — measured on a live graph. One accounting
+  (`_RollbackEffects`) now answers both paths: `_apply_rollback` fills it as it
+  reverses and `_planned_effects` fills it from the same plan without writing,
+  and the test asserts *the lists are equal* rather than pinning expected values,
+  because hand-written expectations are exactly how two implementations start to
+  drift. The one live read in it — whether a `merge_redirects` row is there to
+  remove — is taken before the reversal touches anything, which is when the run
+  takes it too. What still under-reports is the web journal's rollback **toast**,
+  which counts nodes and edges only; itemising versions there is the follow-up
+  `RollbackOut.restored_versions` already carries the data for. Every foreign key into
   `nodes(id)` is guarded — `nodes.parent_id`, `nodes.space_id`,
   `merge_redirects`, `grants.space_id` and `nodes.type_id` — because an
   unguarded one is a bare `IntegrityError`: a 500 over HTTP, and
@@ -347,6 +480,54 @@ commands on a saved node for exactly this reason.
   an event; and carrying `previous_status` as well, which `rolled_back_by`
   cannot — a `failed` cycle put back into force is `failed` again, and a
   fallback that only knew *which* cycle would have had to guess `completed`.
+  **A version review is the fourth instance of the same class, and it was
+  two-sided.** A review changes two rows from one decision and only one of them
+  is a graph record, so both halves sat outside both reversal verbs by two
+  different mechanisms. Accepting emitted an ordinary `node.update`, which
+  reversed correctly, and *also* flipped `versions.state` to `applied` through
+  no event of its own — the `merge_redirects` shape exactly. Rejecting did emit
+  `version.reject` carrying the version rows, and that event was skipped by
+  `_rollback_plan` (its op prefix was not in `_TABLE_KIND`) and excluded from
+  `undo` (`_UNDOABLE_OPS` matched `node.%`/`edge.%` only) — so the one review
+  outcome that *had* recorded itself properly was the one nothing could read.
+  Neither was hypothetical: `_transition_row` gates a version through
+  `store.require_review`, which passes for an `edit`-granted agent, and `0014`
+  gives the gardener `edit` on `main` — the authority is live in the shipped
+  release and only the call site is missing. And the accept half needed no agent
+  at all: a human accepting their own queue item and pressing `undo` reached it,
+  leaving the proposal marked `applied` over content that had gone back, which
+  strands it for good because a version leaves `proposed` exactly once. The fix
+  is the one `merge_redirects` already established rather than a fifth
+  mechanism: the accept's `node.update` payload carries the version row's own
+  before/after under `VERSION_STATE_KEY`, and `_restore_version_state` writes
+  the recorded row back and returns the **mirrored** record for the reversal's
+  own payload — so rolling a rollback back re-applies the accept, at every
+  depth, with no inverse code path. The reject needed no new payload: `version.`
+  simply joins the reversible kinds (`_REVERSIBLE_TABLES`, which is *not*
+  `_TABLE_KIND` — a version row is reversible but carries no conflict, since
+  `_transition_row` is its only writer and moves it out of `proposed` once), so
+  the rollback plan reverses it and emits `version.rollback`. That op is
+  deliberately **outside** the `node.`/`edge.` namespaces the projectors
+  dispatch on — the mirror of the rule the curative ops follow: an op that
+  changes node text must be `node.*` or the index desynchronises, and an op that
+  changes *only* a `versions` row must stay out of it or the index reprojects a
+  node nothing touched. `undo` reaches both halves too, and `version.%` in
+  `_UNDOABLE_OPS` fixed a second thing on the way: a bare `nodum undo` after a
+  rejection used to reach *past* it to the node's own create — a proposal emits
+  `version.propose`, so the create was the last `node.` event — and delete the
+  node, taking the rejected proposal's row with it. `RollbackOut.restored_versions`
+  and `UndoResult.restored_version` are the reported half; a reversal that moved
+  a row its own result did not mention is the smell this whole class is made of.
+  Both are additive with defaults, so no adapter had to change — and the web
+  journal's rollback toast (`rollbackOutcome`) still counts nodes and edges
+  only, which understates a review-only rollback rather than misstating it: it
+  leads with "N events reversed", which stays true. Itemising versions there is
+  the follow-up, and it is a `web/` change rather than a service one.
+  **Events written before this fix are not covered**, deliberately: the recorded
+  move is what the reversal reads, an accept that predates the key recorded
+  none, and a branch inferring one from `applied_version_id` would be a second
+  path no test can reach honestly. A pre-fix accept-then-reverse leaves its
+  version on `applied`; putting it back is a `versions` UPDATE, not a mechanism.
   Finally, the **landing seam**: `Store.cap_landing` and a
   keyword-only `landing=` on `create_edge`/`propose_edges` let a writer file
   below its own grant (§8.3 — a grant is a **ceiling, not a mandate**). It only
@@ -512,8 +693,9 @@ commands on a saved node for exactly this reason.
   `SIGKILL` or a shutdown mid-nightly-run makes its own writes irreversible
   until somebody closes it, and `POST /api/cycles` is here because a schedule
   that is off by default would otherwise leave the journal empty forever.
-  **`POST /api/cycles` is the one handler that does not call the service
-  inline** — it goes through `run_in_threadpool`. Every other handler here is a
+  **`POST /api/cycles` and `GET /api/search` are the handlers that do not call
+  the service inline** — both go through `run_in_threadpool`. Every other
+  handler here is a
   read or a single-row write, where inline is right; a cycle is every job over
   every node in scope (3.75 s measured on 450 nodes with no embeddings, minutes
   with them) and the event loop is single-threaded, so inline it froze
@@ -608,7 +790,29 @@ commands on a saved node for exactly this reason.
   the index constrains rows the file already has, so `db.CYCLES_RUNNING_INDEX_SQL`
   repairs it in place and the refusal prints that statement. A refusal that reads
   as *your graph is unrecoverable* over one `CREATE UNIQUE INDEX` costs a human
-  every node they own. **A scoped cycle checks
+  every node they own.
+  **`db._cycle_stop_problems` is the same rule one migration along, and it was
+  checking half of `0015`'s guarantee.** `0015` records a stop as two nullable
+  stamps *and one cross-column CHECK*, and the constraint is the whole reason the
+  pair is honest — without it a file can hold a time with no requester or a
+  requester with no time, which is precisely the state the migration chose two
+  columns over a boolean to make unstorable, and the earlier three-column cut a
+  drifted file comes from is the one that leaned on the boolean instead. `PRAGMA
+  table_info` cannot see a constraint, so the check reads the stored schema and
+  looks for `CYCLE_STOP_CHECK_NAME` in it. **Its two repairs are its own and they
+  are different repairs**: a missing column is added by the migration's own
+  `ALTER`, which carries the CHECK with it — so a missing constraint is only
+  reported once both columns are there, and no file is ever handed both cures at
+  once — while putting a constraint under a column that already exists is the one
+  thing `ALTER TABLE` cannot do, making that repair the documented
+  create-copy-drop-rename rebuild (`CYCLE_STOP_CHECK_REBUILD_SQL`), which carries
+  every row across and recreates both indexes. Neither is "delete the database
+  file and re-run `nodum init`". And the rebuild can legitimately fail, because a
+  file that ran without the constraint may already hold a row the constraint
+  forbids — so the refusal says so and names `CYCLE_STOP_HALF_STOP_SQL`, in
+  `_CREATE_THE_CYCLES_INDEX`'s own "if it fails, …" idiom, because a repair that
+  dies with no next step is advice nobody can carry out.
+  **A scoped cycle checks
   the gardener's own grant** right after
   `open_cycle` and raises `GrantNotPermitted` naming `nodum grant
   builtin-gardener <space> edit` — every space created after `0014` is invisible
@@ -710,7 +914,10 @@ commands on a saved node for exactly this reason.
   dry run beside it), the **abandon** confirm
   (`POST /api/cycles/{id}/abandon`, offered only on a `running` entry — the
   browser half of "a door nothing opens is not a door", and the thing that turns
-  the rollback button's refusal from a dead end into a route) and the rollback
+  the rollback button's refusal from a dead end into a route), the **stop**
+  confirm (`POST /api/cycles/{id}/stop`, the same rule one verb along: offered
+  only on a `running` entry nobody has stopped yet, and giving way to the record
+  of who asked and when once one is on the row) and the rollback
   confirm — which is the only place a human
   meets a 409 with a `conflicts` list, so it has to render *both* ends of each
   collision rather than a count. It reads the journal; it does not summarise
@@ -784,6 +991,513 @@ commands on a saved node for exactly this reason.
   `NODUM_EMBED_MODEL` overrides the model name (a different dimensionality
   needs a new migration — the vec0 table is fixed at 384). Tests inject a
   deterministic hashing fake via `embeddings.set_provider`.
+- **`nodum.llm`** — the LLM provider seam (Phase 5b, design P1), shaped
+  deliberately like `nodum.embeddings`: a `Protocol`, a cached
+  `get_provider()` → provider or `None`, an `unavailable_reason()`, and a
+  `set_provider()` test seam — because that is the seam every adapter here
+  already knows how to be absent through, and a second shape would mean two
+  ways to be offline. **One class covers both halves**
+  (`OpenAICompatProvider`): ollama serves an OpenAI-compatible
+  `/v1/chat/completions` that honours `response_format: {type: json_schema}`
+  and returns `usage` plus `finish_reason` — verified by driving it — so the
+  local default (`http://localhost:11434/v1`, no key) and a remote API are the
+  same wire. ollama's richer native `/api/chat` was rejected as a second code
+  path only the local half can exercise. It deliberately abstracts over
+  **nothing else**: no streaming, no tool calling, no embeddings, no retries
+  (the retry policy belongs where the budget is), no prompt templates (a
+  prompt change would become a provider change), and no sampling —
+  `TEMPERATURE` is pinned at 0, and *nothing may depend on the determinism
+  that produced locally*, which is a property of one backend. **There is no
+  module-level `chat`**: every provider call goes through `nodum.agent` (P3),
+  and a second door would be a second place with its own accounting.
+  Configuration is `NODUM_LLM_MODEL` (**unset means no provider** — there is no
+  guessed default), `NODUM_LLM_BASE_URL`, `NODUM_LLM_API_KEY`,
+  `NODUM_LLM_CONTEXT_TOKENS` (4096 by default, the measured local window).
+  **An over-long prompt is refused before the call, and that is the whole
+  point.** Measured: 16 000 characters report 2 932 prompt tokens while 64 000
+  and 70 000 both report **4 096** — the window filled, the rest was dropped,
+  and nothing in the response says so. `finish_reason` describes the *output*
+  only, so it reads `stop` on a prompt truncated from 70 000 characters; every
+  signal there is lives in `usage`, and it arrives after the call is paid for.
+  So `chat` counts first and raises `PromptTooLong` without sending.
+  **`NODUM_LLM_CONTEXT_TOKENS` is the window the *server* serves, not the one
+  the model has**, and getting that backwards is how the hole re-opens from the
+  other side: ollama applies `num_ctx` (4096 unless `OLLAMA_CONTEXT_LENGTH`
+  raises it) to every model it serves, while `llama3.2:1b` really has 128 k — so
+  "raise it for a model that has the room" is advice that produces silent
+  truncation. Measured at `NODUM_LLM_CONTEXT_TOKENS=32768` against that server:
+  a 30 000-character prompt is **not** refused, `prompt_tokens` comes back 4096,
+  `finish_reason` is `stop`, and a whole answer is returned from a prefix.
+  **So the after-the-fact defence is two signals, and they see different
+  failures.** `Completion.context_filled` compares the report against the
+  *configured* window and is structurally blind to the case above (4096 is
+  nowhere near 32768) — it catches the server whose window really is the
+  configured one. `Completion.prompt_truncated` compares it against the prompt's
+  own bytes: the pre-send estimate rides back on the completion
+  (`Completion.prompt_estimate`, recorded by the provider, which is the only
+  thing that has it — a caller recomputing it would be a second estimator free
+  to disagree with the one that decided), and a report below
+  `estimate / MAX_BYTES_PER_TOKEN` is a server that read less than it was sent.
+  The constant is 6, against a measured worst case of 4.55 bytes per token
+  (Arabic; English 4.49, 32-hex ids 1.18), so it catches a truncation that lost
+  roughly a quarter of an English prompt or more and **cannot see a narrower
+  one** — there is no per-call signal for that, since the estimate cannot tell
+  an efficient tokeniser from a server that read less. The error is one-sided by
+  the same argument the estimate itself rests on: a false alarm is a visible,
+  itemised refusal, a miss is an answer from a prefix nobody can tell from a
+  good one. Either signal makes the call a `ContextOverflow` in `nodum.agent`:
+  charged, body discarded. **The estimate is UTF-8 bytes**,
+  because a byte-level BPE token decodes to at least one byte and that makes it
+  a *bound* rather than a heuristic; a `chars/4` estimate under-counts emoji by
+  twelve times and a run of accented Latin by four, and an under-count is the
+  one failure this may not have. The price is refusing about four times too
+  eagerly on English prose, which is the trade an over-refusal (visible,
+  itemisable) versus an under-refusal (an answer nobody can tell from a good
+  one) forces. **A token ceiling gives unparseable JSON, not a short object** —
+  measured `'{\n  "title": "Kafka'` at `finish_reason: "length"` — so a
+  `length` finish is no result. **A JSON schema fixes the envelope and nothing
+  else**: asked a question its context could not answer, under a schema, the
+  model returned `{"answer": "n0", "cited_ids": ["n0"], "answered": false}`.
+  Never read a schema-valid object as a true one; validating what the model
+  said against what was actually retrieved is the caller's job.
+  **Every way a provider can die here is an `LLMError`, and one of them had to
+  be added by hand**: `response.read()` raises `http.client.IncompleteRead` when
+  a body stops short of its `Content-Length`, and that class derives from
+  `HTTPException`, **not** `OSError` — so the clause catching a refused
+  connection missed it, and it escaped `LLMError`, escaped `answers.ask`'s
+  handler and escaped `cli._run`, reproducing as a Rich traceback with exit 1 on
+  the CLI and an HTTP 500 on `POST /api/ask`. It is the shape a killed provider,
+  a proxy timeout and a dropped load-balancer connection all make, which is to
+  say the ordinary way a long call dies; `_post` catches
+  `http.client.HTTPException` for it, and a test drives six death shapes and
+  asserts each lands on `LLMError` rather than on a message. Resolution
+  reads configuration and makes **no network call** — unlike the embedding
+  seam, whose construction loads a model — because "configured" and
+  "reachable" are different facts and a probe would cache one instant's answer
+  for the process. Design Constraint 4 is held structurally:
+  `tests/test_llm.py` walks the package's own import graph and asserts that
+  `nodum.service`, `nodum.projectors`, `nodum.store` and `nodum.migrations`
+  cannot reach this module **under any spelling** (aliased, relative,
+  `importlib.import_module` / `__import__` **positionally or by keyword**, an
+  attribute chain) **or any number of hops**, and
+  that `nodum.agent` is the only module that imports it at all. Two of those
+  words were claims rather than facts until this wave. The extractor walked
+  `node.args` only, so `import_module(name="nodum.llm")` — a constant string,
+  spelled the way an editor's signature help suggests it — was invisible; and
+  the module glob skipped `__init__.py`, so the `nodum` node had *inbound* edges
+  from most of the package and no outbound ones at all, which made a one-line
+  re-export placed there invisible to **both** properties. The rail now carries a
+  test per hole, and the second one injects the re-export into the real graph
+  because the real `__init__` correctly has none.
+- **`nodum.agent`** — the internal agent's runtime and the **one door to the
+  model** (design P3, A1–A3, B1–B4, K1–K3). `AgentRun.chat` takes a principal,
+  a job budget and a prompt version, and returns the text with the provenance a
+  write must record. **A peer client, like the runner**: it opens no
+  connection, imports no service private, and mints no principal — it receives
+  one. *Accounting* (A1): `GeneratedBy` = `{provider, model_id,
+  prompt_version}` goes on the **event**, because the log is already this
+  system's answer to who is answerable for a write; `actor` stays
+  `agent:builtin-gardener` (the gardener made the write, the model is *how* —
+  `agent:llama3.2:1b` would be an actor with no account and nothing to revoke);
+  cost goes on the **cycle report** under `report["llm"]`, because cost is a
+  property of the run. This is **not** `chunks.model_id`'s mechanism (A3):
+  embeddings are derived and a model change is `projector rebuild vec`, while
+  generated text cannot be regenerated by replaying the log — so do not later
+  "unify" them into a `model_id` column on `nodes`. `prompt_version` (A2) is a
+  short hash of the prompt template, because two cycles a month apart can name
+  the same model and differ only in the prompt. *Budgets* (B1/B2): **per-call ⊂
+  per-job ⊂ per-cycle**, the unit is tokens metered from `usage`, and an
+  **independent wall-clock ceiling** sits beside it because tokens do not bound
+  a night — 2 395 prompt tokens cost 47 s locally. Charging a job charges the
+  cycle and the remainder is the minimum down the chain; a job budget shares
+  the run's clock, so no ceiling is ever infinite (`cycles.report` is
+  `json.dumps`, which writes a bare `Infinity` that is not JSON — and that is
+  enforced where the number is *read*, since `float("inf")`, `"Infinity"` and
+  `"1e999"` all parse: `_positive_float` requires `math.isfinite`, measured after
+  `NODUM_LLM_REQUEST_SECONDS=inf` put `"budget_seconds": Infinity` on a 200 from
+  `POST /api/ask` and made the browser's `JSON.parse` throw. `nan` is refused by
+  the same line for a quieter reason: every comparison against it is false, so
+  the wall-clock check silently stops existing).
+  **The wall clock starts at the first provider call, not at construction** —
+  `for_cycle` is built when the cycle opens and the LLM jobs run last, so a
+  clock started in the constructor charged the four deterministic jobs' minutes
+  to the LLM's ceiling and reported time the model never had. **The per-call
+  timeout is clamped to what is left of it** (`min(call_timeout,
+  ledger.remaining_seconds)`): the clock was checked before a call and never
+  again, so a 2 s ceiling with the shipped 120 s call timeout measured `elapsed
+  3.0`, and a night could overrun by two minutes.
+  **Every share of a budget is measured against the same ceiling, across
+  calls.** `AgentRun.job` is one `split` per job, so a guard reading only its own
+  argument let three jobs at `share=0.6` each hold 600 of a 1000-token cycle —
+  180 % in `LLMReport.per_job`. Spending stayed bounded (the remainder is the
+  minimum down the chain); the *report* lied, about the one number a human
+  checks a night against. `Budget` therefore accumulates the shares it has
+  handed out, and a **repeated job name is refused** rather than replacing the
+  first — `AgentRun._jobs` is keyed by name, so the replacement took the
+  displaced job's calls and tokens out of the report with it.
+  `NODUM_LLM_CYCLE_BUDGET` is **0 by default — the LLM jobs do not run** (K2
+  level 1); `NODUM_LLM_REQUEST_BUDGET` defaults to *on*, because "off by
+  default" exists to stop an unattended process spending the human's night and
+  a human pressing a button is not that. **The refusal names the variable that
+  funds *this* run** (`AgentRun.budget_env`), because `for_request` reads the
+  request variable and `NODUM_LLM_REQUEST_BUDGET=0 nodum ask` used to answer
+  with "set `NODUM_LLM_CYCLE_BUDGET`", which does nothing for a request — and
+  "turn the LLM jobs on" is cycle vocabulary for something a human asked for by
+  hand. A *funded* run whose job share rounds to 0 gets a third sentence naming
+  the share, since the report says `enabled: true` and the variable is already
+  set. *At a ceiling* (B3): **refuse and
+  itemise, never truncate** — the call's worst case (the over-counted estimate
+  plus the whole output reservation) is measured before anything is sent, and a
+  refusal names the item it skipped. **Exhaustion is deliberately a different
+  report shape from 5a's degraded path**: a provider absence is `available:
+  false` + `unavailable_reason` (a stable fact about this install, and 5a's
+  `notes` vocabulary), exhaustion is `exhausted: true` + an itemised `skipped`
+  (a fact about *this* run, false again tomorrow) — `LLMReport` has no `notes`
+  field at all, and a test pins that. `exhausted` means *a spending ceiling
+  stopped work*, not that a counter reached zero: a budget with 10 tokens left
+  can afford nothing, and a flag read off the counter would report a truncated
+  night as a complete one. A budget that was never turned on is refused as
+  `kind="off"` and is **not** reported exhausted. A failed call — `length`
+  finish, filled context or a prompt the server truncated — is charged, because
+  the tokens were really spent, **and counted in `failed_calls`**, which means
+  *calls that produced no usable result* rather than *calls that never reached
+  the wire*: three discarded answers reported `calls 3, failed_calls 0` before,
+  which is a night of three successes. A `PromptTooLong` costs nothing, because
+  nothing was sent, and is neither a call nor a failure — but it **records a
+  skip**, because an item was left unexamined and three refusals used to report
+  `calls 0, failed_calls 0, skipped []`: byte-identical to a night with no work.
+  *The kill switch*
+  (K1–K3): a `cycles.stop_requested` row, **not** a reuse of `abandon_cycle`
+  (that verb is a *repair* — a human declaring somebody else's dead process
+  dead — while a stop is an instruction a live run obeys, and a journal that
+  could not tell them apart would fail the human reading a `failed` cycle at
+  09:00), checked immediately before every provider call here and between jobs
+  and items by the runner, read fresh every time because a cached answer is a
+  switch that cannot be hit after the run starts. **The row and its service read
+  landed in migration `0015`**, so `cycle_stop_check` calls
+  `service.stop_requested` directly and a cycle's report says
+  `stop_switch: "armed"`. What `0015` actually added deviates from the four
+  things that docstring asked for in one place: **two columns, not three** — the
+  boolean is derived (see `nodum.migrations`). **The gate under it is gone, and
+  so is `STOP_SWITCH_PENDING`.** That branch was the only way to reach the armed
+  path before `0015`, and afterwards it was three kinds of stale at once: the
+  string named a column (`cycles.stop_requested`) the migration never created,
+  the gate keyed on the *service function* rather than on the column, and no
+  build carrying this module could reach it. The field still has two values,
+  because the distinction it exists for is still real — a cycle has a row
+  anybody can stamp (`STOP_SWITCH_ARMED`), and a human's request has none
+  (`STOP_SWITCH_NONE`, `for_request`'s posture, previously reported as a
+  migration that had already landed). Whether a *database* can store a stop is
+  the question with two live answers, and it belongs to `db._cycle_stop_problems`
+  at `init_db` where the answer comes with the statements that repair it —
+  never to a string in a report written after the write already failed.
+  **The human end is `nodum cycle-stop <id>`, `POST /api/cycles/{id}/stop`, and
+  a confirm on the journal entry** — all three through `service.request_stop`.
+  What obeys a stop today is `AgentRun.chat`, before a provider call; the four
+  deterministic jobs in `nodum.consolidate` make none and check nothing, so a
+  run of those finishes with the stop recorded on it. **Every surface says that
+  rather than promising a wind-down that would not arrive**, and
+  `test_the_deterministic_runner_consults_no_stop_switch_and_the_copy_says_so`
+  fails the day 5b-ii wires a check in, so the copy is rewritten rather than
+  quietly becoming an understatement. Configuration: `NODUM_LLM_CYCLE_BUDGET`, `NODUM_LLM_CYCLE_SECONDS`,
+  `NODUM_LLM_REQUEST_BUDGET`, `NODUM_LLM_REQUEST_SECONDS`,
+  `NODUM_LLM_CALL_TIMEOUT`, `NODUM_LLM_MAX_OUTPUT_TOKENS` — each unparseable
+  value falls back to its default rather than refusing to boot (the scheduler's
+  precedent), and the cycle fallback is 0, so a typo cannot authorise spending.
+  **A value out of range falls back too, and where the range starts is the
+  difference between a decision and a misconfiguration**: 0 on a budget is *off*
+  and is the shipped cycle default, while `NODUM_LLM_MAX_OUTPUT_TOKENS=0` is
+  nothing anybody chose — it reached the provider as `ValueError:
+  max_output_tokens must be at least 1`, which this stack renders as a **400**,
+  the client-error voice, on every `POST /api/ask` for a request that was
+  perfectly well formed. So the reader takes a `minimum=`, and the output
+  ceiling passes 1.
+  **`AgentRun` does not hand out the provider object** (`_provider`, private).
+  P3's rail checks *imports*, and a module holding `run.provider` imports
+  nothing: demonstrated, a call through `run.provider.chat(...)` succeeded with
+  the budget at 0 and a stop firing, and the run reported `calls 0, total_tokens
+  0, stopped True` — unmetered, unstoppable, unattributed. What a prompt builder
+  actually needs is two numbers, and the run answers both: `context_tokens`
+  (`None` with no provider, like `model_id` and `provider_id`) and
+  `estimate_prompt_tokens(messages)` (which raises `ProviderUnavailable` with
+  none, because there is no honest number). The estimate must be the provider's
+  own, so that what a caller fits is exactly what the provider would refuse.
+- **`nodum.answers`** — the read-only smart surface (Phase 5b-i, design E1–E3):
+  `ask`, `summarize`, `natural_search` and `provider_status`, behind
+  `POST /api/ask`, `POST /api/summarize`, `GET /api/search?nl=1` and
+  `nodum llm status`. **Nothing here writes.** It reads through the ordinary
+  public `nodum.service`/`nodum.search` calls and reaches the model only through
+  `nodum.agent`, so it is a peer client like the runner: no connection, no
+  service private, no minted principal. Its result models live here rather than
+  in `nodum.models`, beside the code that produces them, following
+  `nodum.agent`'s own precedent in this phase (`LLMReport`, `Generation`).
+  Route handlers stay thin delegates over it, and the CLI verbs call the same
+  functions, so "was this answered" is decided once.
+  **`answered` is computed, never read from the model** (E2). Every id the model
+  cites is resolved against the notes *this request* retrieved; ids outside that
+  set are dropped into `unresolved`, and **zero surviving citations means
+  `answered: false` and the answer text is not returned**. The schema carries no
+  `answered` field at all — the measured failure is a schema-valid
+  `{"answer": "false", …, "answered": true}`, and a field nobody may read is a
+  field the next reader wires up.
+  **Citation resolvability is not groundedness, and `answered: true` does not
+  claim otherwise.** E2's rule defends against an invented *id*; it says nothing
+  about invented *content citing a real id*, which is the failure a model
+  actually has. Live: asked which cloud provider hosts the production Kubernetes
+  cluster, `llama3.2:1b` answered **AWS**, `answered: true`, citing a
+  28 100-character Kafka textbook containing **zero** occurrences of AWS, cloud,
+  Kubernetes, k8s, Azure, GCP or provider — on a graph that says elsewhere the
+  cluster is k3s on three on-prem nodes. **The endpoint had the signal that
+  would have caught it and threw it away**: the model also cited marker `2` when
+  exactly one note had been offered, which is proof it was not reading the
+  context, and the response filed that in `unresolved` while standing behind the
+  other citation. Two further deterministic rules follow, both cheap, both drawn
+  from a live failure rather than from reasoning about one.
+  **A citation that resolves beside one that does not, on its own, is not an
+  answer** (`_ungrounded`). It is deliberately *not* widened to "any unresolved
+  citation voids the answer": two surviving citations beside one spurious marker
+  is a different picture — a model that placed two real notes has demonstrably
+  read them — and voiding it would refuse answers the graph really contains.
+  **A number the sent text does not contain is not an answer**
+  (`_unsupported_numbers`). It compares the answer's digit runs against the
+  **excerpts as sent** plus their titles plus the question, and reports what is
+  in neither; runs rather than substrings, because `2024` does not contain `24`
+  and a substring test would read a year as corroboration for a duration. The
+  prompt's own markers are excluded — they are this module's numbers, not the
+  graph's, and counting them would make every single-digit claim
+  self-supporting. Measured: a source saying an escalation deadline is *fourteen
+  minutes*, of which the model was shown a 1 213-character prefix stopping well
+  before that sentence, answered "…is 24 hours". A false positive is the trade
+  taken on purpose — a model rendering *fourteen* as `14` is refused with the
+  number named — because that is `nodum.llm`'s own rule for its token estimate:
+  an over-refusal is visible and itemised, an under-refusal is an answer nobody
+  can tell from a good one.
+  **Numbers are checked and language is not, and that is a boundary rather than
+  an oversight.** Deciding whether a sentence is supported by a paragraph is a
+  judgement, and a judgement is a second model call — 5b-ii's job, not this
+  wave's. **An answer can pass every check here and be false.** The envelope is
+  built so a reader can see that for themselves rather than being asked to trust
+  a boolean, which is also why 5b-i ships **no Ask view in the browser**: a CLI
+  reader seeing `unresolved`, `truncated_notes` and `dropped` in JSON is far
+  better equipped to catch a confident wrong answer than a browser reader seeing
+  prose.
+  **What may be *sent* is narrower than what may be *read*** (`SENDABLE_STATES`).
+  `service.subgraph` filters *edges* by state and never filters nodes at all, so
+  the walk hands `/summarize` archived, proposed and meta-space nodes — and it
+  used to put every one of them in front of the provider while `/ask`, which
+  searches `state="active", include_meta=False`, could not reach any of them at
+  any `k`. Neither is a grant violation: the caller is a human who may read all
+  of it. What was wrong is that **two endpoints on one install disagreed about
+  what leaves the machine**, and only one of them agreed with what a human means
+  by archiving a note — "circulation" has to include the one path that puts a
+  note's text on somebody else's machine. They are named in `withheld` rather
+  than being silently absent.
+  **Every provider failure is a 200 with `answered: false` and a `refusal`**:
+  no provider, an unreachable one, a `length` finish, a filled context, an
+  exhausted budget. The request was well formed and the install could not answer
+  it, which is an outcome; a malformed *request* is still the ordinary 400.
+  `used` is `agent.LLMReport` — the same object a cycle files under
+  `report["llm"]` — so a request's cost and a night's cost are one shape, and
+  `used.available`/`used.unavailable_reason` carry the provider's absence.
+  **The prompt is fitted to the model's context window before the call**
+  (`_fit_prompt`), narrowing every excerpt before dropping the worst-ranked
+  note. That is E1's stated bound and **not** B3's forbidden truncation: B3
+  rejects shortening a prompt to fit the remaining *spending* budget invisibly,
+  this fits the assembled context to the *window*.
+  **A bound that is not reported is a lie the caller cannot detect**, and this
+  one went unreported for the *ordinary* case rather than the edge case — Phase
+  4's whole output is `source` nodes carrying whole documents, and
+  `MAX_CONTEXT_CHARS` is 1 200. Measured: a **6 832-character source whose
+  answer sat at character 3 433 was sent as 1 213 characters that did not
+  contain it**, and `/ask` returned `answered: true`, a confabulated number,
+  that node in `considered`, an empty `dropped` and no `refusal` — a wrong
+  answer inside a clean provenance envelope, produced by the module's own bound
+  and not by any attacker or any weak retrieval. `/summarize` was worse the
+  same way: it narrows to `MIN_CONTEXT_CHARS` (240) and still reported
+  `truncated: false`, because the only `truncated` it had belonged to the
+  subgraph *walk*.
+  So **four lists say four different things and none is a synonym for
+  another**: `considered` is what reached the model, `truncated_notes` is what
+  reached it **in part**, `dropped` is what the window refused outright, and
+  `withheld` (summarize only) is what this module declined to send. Every
+  `Citation` carries `truncated` too, because without it a citation says "the
+  answer came from this note" and means "the answer came from *some prefix of*
+  this note" — a human who opens the node and finds the sentence there has
+  confirmed nothing, since the model may never have been shown that line.
+  **`considered` is empty on every path where no call was made**, and
+  `used.calls` is its corroboration: listing node ids beside `calls: 0` said
+  notes reached a model that was never called.
+  **Three prompt findings, measured on `llama3.2:1b` and each pinned by a
+  test.** The first version scored **1/6** on a six-question battery and every
+  failure was an unparseable citation (`"]"`, `"/1"`, `"space main"`, a chat
+  template's `<|start_header_id|>`) — the validation working perfectly and the
+  endpoint useless. Three changes took it to **6/6**: the citation format is a
+  **`pattern` on the schema** (enforced by the server's constrained decoding —
+  verified against ollama — so bad strings are unrepresentable rather than
+  discouraged); a note is identified by a **small integer and nothing else**,
+  because with the 32-hex node id printed beside the marker the model cited
+  `"116"` and `"749"`, mining the id for digits; and the instructions contain
+  **no number the model can copy**, because a worked example (`write exactly:
+  ["1", "3"]`) came back as `"3"` on every call — it scored *better* that way
+  (5/6) and was still wrong, since on a graph returning three hits that copied
+  number resolves to a real note the answer never came from. The general rule:
+  **every number in the prompt is a candidate citation.**
+  **That rule had a twin nobody had drawn: every `[n]` at the start of a line in
+  the prompt is a note boundary, and until `_neutralise_markers` ran, the graph
+  could write one.** `_context_block` renders `[n] title` followed by the note's
+  text, so a `source` node — the shape `ingest url` produces — carrying the line
+  `[1] Retention window` opened a second note inside another note's body.
+  Measured against both local models: two honest notes saying a retention window
+  is thirty days plus one forged correction, and **both answered 9999**.
+  `qwen3:8b` was the worse of the two — it repeated the forged claim while
+  citing **only the honest notes**, so a human auditing the citations opens
+  *Retention window*, reads "thirty days", and the answer said otherwise.
+  The defusing keeps the digits and the line's width (`[12]` → `(12)`), so the
+  note reads the same to a human and the excerpt bound above it is unchanged,
+  and it fires only on a line that would otherwise have opened a note.
+  **The rule is about the prompt, not about the graph, so it holds at both ends
+  of the template.** `ASK_TEMPLATE` prints the question *underneath* the notes,
+  so a question carrying a line `[3] …` opened one more note than the retrieval
+  offered — measured, `llama3.2:1b` came back citing `2` and `3` on a one-note
+  graph, having read the block as notes. That is the caller's own text and no
+  grant boundary is crossed; what is crossed is the invariant `citations` rests
+  on, that **a note boundary is something this module wrote**. Notes and question
+  are both defused before they are fitted, and the envelope still echoes the
+  question as typed — the neutralised question is what is *sent*, exactly as
+  `excerpt` is what is sent of a node.
+  **The question is defused as grammar and counted as evidence in the same call,
+  and that pair is a position rather than an oversight.** Measured on identical
+  graphs and an identical model reply: `ledger retention window` refuses with
+  `unsupported_numbers: ['9999']`, and `ledger retention window 9999` answers,
+  citing two notes that say *thirty days*. Four typed characters switch off the
+  only groundedness check the module has, so which of the two claims is about
+  the human matters. Only one is. The defusing says nothing about the caller —
+  `[n]` at the start of a line is **this module's grammar**, and every string
+  interpolated into the prompt is subject to the prompt's grammar whoever wrote
+  it; defusing the question is the same rule the notes get and not an
+  accusation. The corroboration is the claim that rests on the human, and it
+  rests on a fact rather than on goodwill: `ask` is reachable from `nodum ask`
+  and from `POST /api/ask` behind a session the middleware resolved to an
+  **enabled human**, and from nowhere else — no MCP tool
+  (`READ_TOOLS`/`ADDITIVE_TOOLS` carry neither verb), no job, no endpoint
+  calling another. So the question is the human's own text, and a human who
+  types a number is asking about that number; refusing the answer that repeats
+  it would be refusing the question. That makes **reachability load-bearing
+  rather than incidental**, so a test pins the caller set over the package's AST
+  instead of a comment claiming it: a third caller reddens it, and a caller that
+  *composes* a question rather than typing one changes the answer — the question
+  stops being evidence, and only what a human supplied should reach
+  `_unsupported_numbers`.
+  **Escaping is not a defence against a model and does not pretend to be** —
+  "ignore previous instructions" in a note works on the 1B and nothing here
+  stops it. What this restores is the narrower thing `citations` claims: a cited
+  note is where the sentence was printed. Minting a per-request nonce into the
+  marker was the alternative and was rejected for a measured reason: the markers
+  are the only numbers in the prompt on purpose, and hex in front of every note
+  is exactly what took the citation format from 6/6 back to 4/6.
+  **A line start is whatever a reader takes for one, and the first version of
+  the rule was two sizes too small.** It asked `re.MULTILINE` for the line and
+  `[ \t]` for the indent: `^` matches at position 0 and after `\n` and after
+  nothing else — not `\r`, `\v`, `\f`, the file/group/record separators, U+0085,
+  U+2028 or U+2029, every one of which `str.splitlines` treats as a line and a
+  model reads as one — and the indent covered space and tab, so not NBSP, not
+  the em/en/ideographic spaces, and not the zero-width family, which is not
+  whitespace at all. **16 of 21 candidate line-starts survived, including every
+  one that renders identically to a defused one.** Measured live on
+  `llama3.2:1b` at temperature 0, 3 of 3 identical: one zero-width space in
+  front of a forged `[9]` on a two-note graph came back
+  `{"answer": "Ledger records are kept for 9999 days.", "cited": ["1","2","9"]}`
+  — `answered: true`, `unresolved: ['9']`, no `unsupported_numbers`, no refusal,
+  citations pointing at two notes that say *thirty days*. Verbatim the failure
+  the defusing exists to prevent, restored by a character with no glyph, and
+  reachable through the very path the rule was written for:
+  `extract.HtmlHandler` unescapes `&#8203;`/`&#65279;`/`&#8288;` and passes them
+  through verbatim (NBSP *is* removed by the line-stripping there; the
+  zero-width family is not, because it is not whitespace), and
+  `ingest._source_content` hands that to `create_node` unchanged. So the line is
+  now `str.splitlines`'s and the indent is anything that puts no glyph on the
+  page — Unicode whitespace plus the `Cc`/`Cf` categories, which is the
+  zero-width family, the bidi controls and the soft hyphen. After the fix, same
+  payload, same model, same temperature: `cited: ["1","2"]`, 3 of 3,
+  `unresolved: []`.
+  **Defused, not normalised, and the shield survives in the text.** Stripping
+  the zero-width characters and folding the exotic line breaks first would make
+  the defence's notion of a line and the model's coincide by construction, and
+  it is the wrong trade: **every deletion changes a width**, and width is what
+  the excerpt bound is measured in. `excerpt` claims to be *what was sent*,
+  `_unsupported_numbers` checks the answer against exactly that string, and
+  `…[truncated]` claims the cut fell at `MAX_CONTEXT_CHARS` — normalising makes
+  all three approximate, and does it to *every* note rather than to the one
+  carrying a forgery. Rewriting two brackets in place keeps them exact, and
+  leaves the shield visible to anyone who looks instead of silently editing the
+  caller's own note. Keeping the digits has a measured cost and it is the cheap
+  direction: `(9)` is still a number, and *every number in the prompt is a
+  candidate citation* — live on `qwen3:8b`, the fixed prompt came back
+  `cited: ["9"]`, mining the defused marker exactly as it once mined a node id
+  for `"116"`. It resolves to nothing, so the envelope is `answered: false`
+  with the answer withheld. **A forged number now costs a refusal where it used
+  to buy `answered: true` beside citations that said the opposite.** **The
+  residual is named rather than left to be discovered**: a confusable rendering
+  — `［9］` in fullwidth brackets, `[٣]` in Arabic-Indic digits — is *not*
+  rewritten. It cannot forge what `citations` claims, because `resolve_citation`
+  takes ASCII digits and nothing else, so no such marker resolves; what it could
+  still do is persuade a weak model that a line is a boundary, which is the same
+  "escaping is not a defence against a model" limit already drawn and not a new
+  one. The test suite's audit matches those grammars **on purpose**, so if one
+  ever reaches a prompt the suite says so instead of the question being
+  re-reasoned.
+  **The defusing has to run last, and `/summarize` is where that was found.**
+  `_excerpt`'s own `str.strip()` is Unicode-aware where the indent class was
+  `[ \t]`, so a leading NBSP shielded a marker from the defusing and was then
+  *deleted* by the strip — putting a bare `[9]` at column 0 of the excerpt after
+  the defence had already run. Deterministic, no argument about what a model
+  treats as a line required: the module's own strict regex read `['1','2','9']`
+  off the prompt `/summarize` really sent on a two-node region. `/ask` escaped
+  it by accident — `_offered_hit` builds `text=node.content.strip()`, so the
+  strip had already happened — while `summarize` builds `text=node.content`
+  unstripped, and **no marker test in the suite had ever reached `summarize`**;
+  the endpoint with only *one* end of the template was the one left untested and
+  broken. Two things hold it now, because one of them being enough is how it
+  came back: the indent class covers everything `str.strip` removes (asserted
+  over the whole of Unicode, not over the four characters that were measured),
+  *and* `_narrowed` excerpts first and defuses second, so the defusing runs on
+  the exact string that goes into the message. The second is the one that does
+  not depend on two character sets continuing to agree, and it is pinned over
+  the source rather than over an input — there is no payload left that
+  distinguishes the two orders, so a test built from one would pass under the
+  order that was wrong. `_context_block` defuses the excerpt again at the point
+  it writes the grammar, which costs one idempotent width-preserving scan and
+  buys the property that no caller's ordering can be wrong; that also makes its
+  docstring true, which it was not — it claimed to defuse the excerpt when only
+  `_narrowed` had, and an `Offered` built by hand with `excerpt=` set reached
+  the prompt unread. **An audit that shares a grammar with the code it audits
+  tests that the grammar equals itself**: the suite's own marker audit was
+  `_LINE_MARKER` character for character, so it could not have detected the gap,
+  and it is now deliberately looser on every axis the defence could narrow on,
+  with a property test pinning the containment so a later simplification back
+  towards the module's regex fails instead of quietly restoring the blind spot.
+  The comparison against `qwen3:8b` says the same thing from the other side: it
+  makes the *identical* citation-format errors under the first prompt and costs
+  65–113 s a question against the 1B's 3–8 s, so the weak local model was never
+  the binding constraint on this surface — the prompt was. On the fixed prompt
+  both score **6/6**, the 1B in 25 s of wall clock and the 8B in 535 s; the 8B's
+  citations are cleaner (0 unresolved against the 1B's 3 spurious markers across
+  six questions, all correctly dropped), which is the only measured quality
+  difference between them here.
+  **A reasoning model spends its thinking tokens out of `max_output_tokens`,
+  and that is a trap worth stating.** `ollama` charges `<think>` to
+  `completion_tokens` and strips it from `content`, so `qwen3:8b` answers a
+  rewrite with an **empty body at `finish_reason: "length"`** — B3 then
+  correctly discards it, and the feature is off on that model with a message
+  about a ceiling nobody chose. The query rewrite therefore sets **no per-call
+  output ceiling of its own**; there is one knob and it is the human's
+  (`NODUM_LLM_MAX_OUTPUT_TOKENS`). A tight per-call number is not a saving, it
+  is a model-compatibility setting in disguise. **`NODUM_LLM_MAX_OUTPUT_TOKENS=2048`
+  is the verified cure** — the 8B rewrite then returns
+  `["compaction", "topic", "state store"]` and finds the note. The degradation
+  without it is graceful either way: the rewrite reports `applied: false` with
+  the exact reason and the search runs the human's own words, which found the
+  right note in 5 of 5.
 - **`nodum.assets`** — content-addressed binaries and their derived
   renditions (design §5.5/§5.7). Reads take a principal, and **an asset is as
   reachable as its describing nodes**: a principal may read an asset iff it can
@@ -1021,6 +1735,203 @@ commands on a saved node for exactly this reason.
   builds its own `SearchHit`); adding a fourth means carrying it there too.
   With no embedding provider the vector signal is skipped —
   search silently degrades to BM25 + graph.
+  **The keyword half matches on a quorum, not a conjunction** (`_compile_match`,
+  Phase 5b): a node is a candidate when the query terms it carries are worth at
+  least **half** the query's total inverse-document-frequency weight. Weighting
+  by IDF is the whole of why the rule works rather than being a knob — a term
+  discriminates in proportion to its rarity, so a document qualifies by carrying
+  enough of the query's *discriminating power* rather than enough of its
+  *words*, and the eight function words of a twelve-word question cost it
+  nothing. **Three** kinds of term are dropped before the quorum is computed,
+  all because they separate nothing: one the index has **never seen** (`df = 0` —
+  BM25 already scores it zero, and requiring it is exactly how a hallucinated
+  term used to empty a result set), one in **more than half the indexed
+  rows** — that second is a *cost* rule and not a relevance one, since such a
+  term's weight is near zero either way but leaving it in the expression makes
+  FTS5 walk a doclist the size of the graph — and one on a fixed **English
+  function-word list** (`_QUERY_STOPWORDS`). Measured on 312 nodes, a
+  question-shaped query costs **32 ms without the df drop and 14 ms with it**, for
+  0.03 of recall and no measurable precision (0.766/0.622 against 0.737/0.632) —
+  a cost rule that is very nearly free, not a free one.
+  **The list exists because the df rule is an estimator of it and a small graph
+  breaks the estimator** (review, Phase 5b): a 47-row graph of short claims
+  holds *what* in 7 rows and *does* in 8, both far under any ceiling worth
+  setting, so on *"What does min.insync.replicas protect against?"* — where the
+  target carries the query's only `df = 1` term — the bar came out at 4.84 and
+  the target collected 3.47, short by exactly the weight of the two question
+  words it does not contain. Dropping the two question words by hand answered
+  with the right node. The same mechanism zeroed *"What did I write about how
+  exactly-once semantics work in Kafka?"* — the design note's own motivating
+  query — and, worse than silence, returned the **draft** near-duplicate first
+  while excluding the canonical claim on *"How does compaction let a topic work
+  as a state store?"*, because `let` (df 2) outweighs `compaction` (df 4). The
+  312-node measurement corpus was large enough to hide all of it. A list does
+  not move with corpus size, which is the property the defect asks for; it holds
+  no word that carries topic meaning here (`state`, `store`, `key`, `value`,
+  `log`, `set`, `order`, `time`, `point`, `case`, `long`, `work`, `mean`,
+  `group` and `number` are all deliberately absent — the list is
+  `_QUERY_STOPWORDS`' own docstring, and the two had already drifted apart
+  once),
+  and **a function word never decides a search on its own**, which is what the
+  fallbacks are ordered by. The **ubiquity cut is given up first**, because it
+  is the only one of the three that is about cost rather than meaning: a young
+  graph is usually *about* something, so its subject sits over the ceiling, and
+  dropping it left *"What is kafka?"* matching every note that says "what" and
+  **not one that says "kafka"** — the exact inverse of the answer, on the most
+  ordinary question there is, measured at 20/30/60 subject rows and wrong at all
+  three. **That hands the `32 ms → 14 ms` saving back on precisely the shape
+  the cut was written for**, and the number belongs here rather than in a
+  comment: measured on a single-subject graph at 80/170/320 rows, median of 31
+  interleaved pairs, *"What is kafka?"* costs **+19 % to +29 % with ~9 KB
+  documents** (where the doclist walk is real) and **−1 % to +6 % with short
+  ones**. A cost rule given up on the one graph it was paying for is still the
+  right trade — the old plan was cheaper because it was answering a different
+  question — but it is not free, and the earlier `32 ms / 14 ms` figure now
+  describes a case this ordering rarely reaches. Only a query with **no content
+  word at all** ("what is it") falls back to its function words. A query whose content words the graph has simply
+  **never seen** answers with the nothing those words alone answer with:
+  `zarquon` returns nothing from the keyword arm, so *"What does zarquon
+  protect against?"* must not return three prose notes that share its phrasing.
+  That was the same conversion the JSON-schema finding names — a visibly empty
+  result turned into a confidently wrong one — reached this time by wrapping an
+  unknown word in a question.
+  **That refusal is the keyword arm's, and on an install with an embedding
+  provider it is not the whole answer**: `_search_vector` has no similarity
+  threshold — the ANN list is always `k` deep — so the vector arm answers the
+  query the keyword arm just refused, `k` rows deep, every hit carrying the
+  `vector` signal alone. Measured with the repo's own `HashEmbedder` on a 20-row
+  graph: `zarquon` and *"What does zarquon protect against?"* both come back
+  with **10 of 10 hits, none carrying `bm25`**. On the default install — no
+  provider — the refusal is the whole answer, which is the install
+  `tests/test_search.py` asserts it on; `tests/test_hybrid_search.py` asserts
+  what happens beside it when a provider exists. **No similarity floor was
+  added**, because a floor is a number nothing here can measure yet: it needs a
+  real embedding model over a real graph, since the test provider's similarity
+  *is* token overlap and every threshold measured against it would look free
+  while costing exactly the paraphrase recall the vector arm exists for.
+  Suppressing the fused list on the keyword arm's refusal has the same problem
+  from the other side and would contradict
+  `test_vector_only_hit_surfaces_with_vector_signal` directly. Carried to 5b-ii. Measured across five corpus sizes, questions whose content is
+  invented returned **4.8 / 5.1 / 5.9 / 7.9 mean hits and were never silent**
+  before — measured on the claim graph of `tests/test_search.py` repeated to 40,
+  72, 136 and 264 rows, twelve questions built around an invented subject — and
+  **six of the twelve are silent now, at every one of those sizes** (mean hits
+  0.7 / 1.2 / 2.2 / 4.2). **This rule closes half of that shape, not all of
+  it.** What the gate tests is "no content word *known*", not "no content word
+  that *discriminates*": ordinary English nouns and verbs stay on the content
+  side on purpose, so the six that still answer are the six whose *other*
+  content words — `fail`, `safe`, `store`, `long`, `node`, `space`, `first` —
+  the graph genuinely holds. A test asserts that six exactly, so this sentence
+  cannot drift from the code.
+  **Widening the gate to "no content word at or under the ubiquity ceiling" was
+  measured and rejected**, because it collides head-on with the ubiquity-first
+  relaxation above. On a single-subject graph at 38, 56, 120 and 308 rows it
+  takes *"What is kafka?"* from **30 hits to 0 at every size**. The surgical
+  variant — refuse only when an unknown content word sits beside an
+  over-ceiling one — keeps that question but takes `kafka concretoid` from 30
+  hits to 0, which is the E3 guarantee that a hallucinated term must not empty a
+  query, and it fires on `apple zarquon` inside a six-row read set too. Neither
+  variant closes **one extra** invented-subject question at any of those sizes
+  (silence stays 0.83 for all three gates at all four sizes). The two rules
+  cannot both be maximised; the ubiquity relaxation is worth more, because a
+  graph that is about one subject is the graph every graph starts as. Measured across five corpus sizes, question-shaped queries (recall,
+  precision over the returned list): **47 rows 0.74/0.65 → 0.87/0.73** (and the
+  zero-hit rate 0.19 → 0.00), 26 rows 0.79/0.63 → 0.88/0.65, 52 rows 0.73/0.57 →
+  0.89/0.69, 78 rows 0.70/0.52 → 0.81/0.63, **312 rows 0.74/0.63 → 0.86/0.77**.
+  The keyword, two-term and hallucinated-term suites are **byte-identical**
+  before and after at every size — a question's phrasing was the only thing
+  paying for the bar — and identical again after the fallback re-ordering, which
+  is reachable only on the two shapes those four suites do not contain: a query
+  the graph knows no content word of, and a graph whose subject is over the
+  ubiquity ceiling. Alternatives measured and rejected: an absolute IDF floor
+  (a df-fraction cut in disguise — it drops `Kafka` at 8 rows of 47), a tighter
+  df ceiling (0.25 recovers 0.00 of the 47-row recall), and a quorum over the
+  query's N heaviest terms (no better than the list on any corpus, and worse on
+  the 312-node one).
+  **Two terms of equal document frequency compare strictly** (`>` rather than
+  `>=`): equal df is equal weight, each term is then exactly half, and `>=`
+  admits either alone — the quorum silently becomes the bare OR it was chosen
+  over. Measured on a 40-row graph with `kafka` and `postgres` both at df 6:
+  10 hits at precision 0.100 against 1 hit at 1.000.
+  **A repeat wearing punctuation is still a repeat.** The dedup folded the raw
+  token while FTS5 (`porter unicode61`) tokenizes `kafka,` and `kafka`
+  identically, so the same word arrived as two terms carrying one word's
+  document frequency twice — enough to clear a bar half of itself. Measured on
+  the 40-row equal-df fixture: `kafka postgres` answered with the one node
+  carrying both and `kafka, kafka postgres` with **six**, the bare disjunction
+  the quorum was chosen over, restored by a comma. `_query_terms` and
+  `_is_function_word` now share one fold (`_bare_word`) — they had disagreed
+  about what "the same word" is, one stripping edge punctuation and the other
+  not. Pre-existing; the fallback re-ordering made it load-bearing.
+  The strictness is **gated
+  on the two-term case**, because with four equal terms a blanket `>` moves the
+  bar from two-of-four to three-of-four; gated, it is byte-identical to `>=` on
+  every suite at every corpus size, since two real terms are rarely exactly
+  equal — *rarely*, not never, which is what the carried claim got wrong.
+  **Document frequencies are counted through the search's own filters**, not
+  over the whole index. Counting the whole index made the bar depend on rows the
+  caller cannot read: with `zarquon` planted in a private space, an agent
+  holding `read` on one public space got **0 hits for `apple zarquon` and 6
+  without the planting** — a one-bit existence oracle over every space in the
+  file, and repeating it with words planted at chosen frequencies brackets a
+  private term's df. `search` is in `mcp_server.READ_TOOLS`, so an external
+  agent has it. Scoping also makes the weight *right*: rarity is a property of
+  the corpus being searched.
+  **A query carries at most `_MAX_QUERY_TERMS` = 64 distinct terms**, and more
+  is a `ValueError` — a 400, not a 503. Above 500 usable terms the quorum's
+  `UNION ALL` hits `SQLITE_LIMIT_COMPOUND_SELECT` and SQLite raises: measured,
+  a 4 508-byte query answered **503 "database error: too many terms in compound
+  SELECT"** from `GET /api/search` and `POST /api/ask` and exit 1 from the CLI,
+  three storage-voice failures for an oversized request — and 503 is this API's
+  *retryable* status, so a client retries it forever. The cap is far above
+  anything this system produces (the model's rewrite is capped at 8 terms, the
+  longest measured question is 11). A query left with one
+  term compiles **no quorum at all**, so a
+  one-word search runs the statement it always ran. The restriction is a CTE in
+  the `WHERE`, never a filter over the ranked rows — ranking first and filtering
+  after would drop good rows off the end of `LIMIT k` before anything looked at
+  them — and it changes *which rows are candidates* and nothing else: the BM25
+  weights, the `k` cap, RRF's rank arithmetic and the post-fusion graph
+  expansion are all untouched. **The conjunctive rule it replaces was Phase 2's
+  carried "BM25 goes silent" finding**, and the numbers are the argument: on a
+  312-node corpus with 40 question-shaped queries, **85 % returned no hits at
+  all** (recall 0.06, precision-over-returned 0.15) against 3 % after (recall
+  0.74, precision 0.63); on 16 short keyword queries recall 0.79 → 0.92 with
+  precision 1.00 → 0.72; and on those same keyword queries plus **one invented
+  term**, recall 0.00 → 0.92 — which is the E3 prerequisite, since a query
+  rewrite laid over a conjunctive index can be zeroed by a single hallucinated
+  token. A **bare OR** was measured as the third arm and rejected on precision:
+  recall 0.94 on questions but precision-over-returned 0.24, and 1.00 → 0.32 on
+  keyword queries. `0.5` itself is measured rather than picked, and was
+  re-measured under the function-word list: 0.6 scores better on question
+  precision (0.83 against 0.77 on 312 rows) and **costs keyword recall at every
+  size** (0.92 → 0.89 on 312, 0.96 → 0.92 on 47, 0.75 → 0.50 on 26), while 0.4
+  buys keyword recall and spends question precision (0.77 → 0.65 on 312). A
+  graph is small before it is large, so the constant is chosen where it still
+  works on a young one.
+  **Phase 2's other carried finding — "source nodes outrank claim nodes" —
+  does not reproduce as recorded, and the mechanism it names is wrong.** The
+  note blamed BM25 length normalisation for not offsetting a `source` node
+  carrying a whole document's text. Normalisation offsets it and then some: with
+  term coverage held fixed and only length varying, the same sentence scores
+  −14.6 at 112 characters and −0.5 at 60 KB (more negative is better) — a 28×
+  penalty for length alone — and a one-sentence `claim` beats a 20 KB `source`
+  carrying that same sentence under the same title.
+  `asset_ref` text in the `extracted_text` column — the design pass's named
+  suspect if it *had* reproduced — does not change that either. What is real is
+  the observation, and its cause is the **conjunction**: a whole-document node
+  is the only node in a graph that contains every word of a question, so under
+  the AND rule it was the only node that could match one. Measured on the
+  312-node corpus: of the six question-shaped queries the conjunctive matcher
+  answered at all, **all six put a `source` node first**; after the quorum,
+  `source` holds 7 of 40 first places and `claim` 15. The two carried findings
+  were one defect seen from two sides, and fixing the first closes the second —
+  which is why **no ranking weight was touched**. Where a source still outranks
+  a claim (11 of 37 comparable queries), it does so having matched strictly more
+  of the query's terms in *every* case, which is BM25 being right. Do not retune
+  `_BM25_WEIGHTS` against this finding; `tests/test_search.py` pins the
+  normalisation property so a later change cannot quietly make the old
+  explanation true.
 - **`nodum.db`** — connection management (WAL, foreign keys), `NODUM_DB`
   resolution, the migration runner. Each migration's script and its
   `schema_migrations` row are one transaction (`apply_migration`), so an
@@ -1034,7 +1945,7 @@ commands on a saved node for exactly this reason.
   a database whose only cure is deletion never gets a new (possibly
   irreversible) migration committed onto it first.
 - **`nodum.migrations`** — the append-only migration list (`0001_core` …
-  `0014_cycles_and_gardener`). Never edit a shipped migration; append a
+  `0015_cycle_stop_switch`). Never edit a shipped migration; append a
   new one. A migration must never leave data readable only through a store a
   later migration replaces: introduce a table where its bytes already belong
   (this is why asset bytes are part of `0007` and there is no `path` column
@@ -1063,6 +1974,32 @@ commands on a saved node for exactly this reason.
   than most distributions ship, and a migration that fails to *parse* is a worse
   failure than one whose message carries the `LIKE` pattern to look them up
   with.
+  `0015` adds the kill switch's row: `cycles.stop_requested_at` and
+  `cycles.stop_requested_by`, **two columns and no boolean flag**. The runtime's
+  docstring proposed a `stop_requested INTEGER NOT NULL DEFAULT 0` beside them;
+  checked against the table, that is one column too many — `cycles` writes every
+  fact that arrives *after* the INSERT as a nullable column whose presence is
+  the flag (`finished_at`, `report`, `rolled_back_by`) and carries a boolean
+  only for `dry_run`, which is fixed at insert and never transitions. A flag
+  beside the stamps would be a fourth instance of *state a later reader has to
+  reconcile with the record next to it*, and `ALTER TABLE` cannot add the
+  table-level CHECK that would forbid `stop_requested = 1` with no requester.
+  `CycleOut.stop_requested` is `stop_requested_at IS NOT NULL`, computed on
+  every read and stored nowhere. The one disagreement two columns can still have
+  — a requester with no time, or a time with no requester — is closed by a
+  **cross-column CHECK, which `ADD COLUMN` does accept**, named so SQLite prints
+  the name as the message (0014's device, since `RAISE()` is trigger-only).
+  Both columns are pure additions with no back-fill: every row that predates
+  them is a cycle nobody asked to stop, which is what two NULLs say.
+  `db._cycle_stop_problems` asserts both exist on any file recording `0015`, for
+  the reason `_cycles_problems` asserts 0014's index — `init_db` skips a
+  migration whose name it already holds, and nothing in the runtime catches the
+  drift first: `LLMReport.stop_switch` reports the posture a *run* had rather
+  than what the file can store, so a cycle over such a database reads `armed`
+  right up to the failed write. Its remedy is `0014`'s kind, not the first four's: the
+  refusal prints the `ALTER TABLE` for each column it **found missing**, in
+  dependency order, because `ADD COLUMN` has no `IF NOT EXISTS` and a remedy
+  that always printed both would die on `duplicate column name`.
 - **`nodum.models`** — the pydantic I/O schema shared by every surface.
 - **`nodum.cli`** (Typer) — each command calls one service function and prints
   the result as a single JSON object on stdout; human/error messages go to
@@ -1339,7 +2276,23 @@ Phase-1 decision log.
   surface — `rollback` refuses a running cycle and `undo` refuses every
   cycle-stamped event — so this closes it `failed`, with a report naming who
   abandoned it, and `rollback` then works. It refuses a cycle that already said
-  how it ended, because re-closing it would overwrite that record),
+  how it ended, because re-closing it would overwrite that record.
+  **`cycle-stop` is the kill switch and is the third verb of three, not a
+  softer `cycle-abandon`**: it stamps who asked and when on a `running` cycle and
+  changes nothing else — the entry stays `running`, no event is emitted, no
+  write is touched — and the run notices at its next check and closes its *own*
+  entry. Abandoning is a repair performed on somebody else's dead process from
+  outside; a stop is an instruction a live run obeys. Both end `failed`, so the
+  stamps rather than the status are what answer "did the operator stop this or
+  did the process die?", which is the question the journal exists for. Neither
+  reverses anything: `rollback` is still the only verb that does, and it runs
+  *after* the entry closes. Asking twice is a no-op that keeps the first asker —
+  a switch that raised on the second press would make a human doubt the first —
+  and a cycle that has said how it ended is refused, since nothing is left to
+  obey it. **What obeys a stop today is `AgentRun.chat`, before a provider
+  call**; the four deterministic jobs make none, so a run of those finishes with
+  the stop recorded on it, and the help text, the docs and the browser confirm
+  all say so rather than promising a wind-down that would not arrive),
   `rollback <cycle-id> [--dry-run]`,
   `merge-nodes <ids…> --into <id>`, `retype <ids…> --type <t>`,
   `supersede-edge <edge-id> [--src --dst --type --confidence --set]` (every
@@ -1347,6 +2300,9 @@ Phase-1 decision log.
   inherited from the edge being replaced, so naming none of them retires the
   edge with no successor), `bulk-relink [--src --dst --type --state]
   [--to-type --to-dst] [--dry-run]`,
+  `ask <question> [--k] [--space]` / `summarize <node-id> [--depth]` /
+  `search … [--nl]` / `llm status [--probe/--no-probe]` (the read-only smart
+  surface — see `nodum.answers`; none of the four writes anything),
   `mcp serve` (the agent token comes from `NODUM_AGENT_TOKEN`, never a flag),
   `serve [--host 127.0.0.1] [--port 8600] [--allow-host NAME]
   [--db PATH]`. `serve` prints the database path on stderr and translates
@@ -1365,6 +2321,42 @@ Phase-1 decision log.
   way round for the one setting that starts a background writer on the human's
   graph. The unparseable case is still announced exactly once, by `create_app`,
   which is also what decides to start without a schedule.
+- **The four smart verbs never fail because the model did.** `ask`,
+  `summarize`, `search --nl` and `llm status` all exit **0** and print their one
+  JSON object whatever the provider did — a question nothing answered is
+  `answered: false` with a `refusal`, a rewrite that could not run is
+  `rewrite.applied: false` with the ordinary results beside it, and an install
+  with no provider is a perfectly good install with the smart features off.
+  Exit 1 stays for what it always meant: the caller's error (a blank question, a
+  node that does not resolve, `--k 0`), one line on stderr. A script reading the
+  exit code learns "the command worked"; the envelope is where the outcome is.
+  **`llm status` takes `--as` although it reads no graph**, which is the one
+  place the "reports the install, not the graph" exemption (`ingest handlers`,
+  `projector status`) does not apply: the reachability probe is a real model
+  call, it is metered through `agent.for_request` like every other, and a
+  command that spent one with nobody named would be this system's only
+  unattributed spend. `--no-probe` reports the configuration and spends nothing.
+  `reachable` is deliberately **tri-state**, and `null` is **not established**
+  rather than "not asked". Three ways to get it: nothing is configured to ask,
+  `--no-probe` declined it, or **the probe was asked and no answer arrived
+  inside `call_timeout`**. That third one used to report `false`, collapsing a
+  distinction `nodum.llm` makes on purpose — `ProviderTimeout` subclasses
+  `ProviderUnavailable`, but "a refused connection" is a server that is not
+  running and "no answer yet" is very often a live server loading a model for
+  the first time, and saying `false` about the second sends a human to fix an
+  install that works. Measured: an endpoint with nothing listening answers in
+  **3 ms** and a model the server does not have in **4 ms**, so the failing
+  probe is free; a live model costs one small call.
+  **The probe waits exactly as long as the envelope says it will.** It used to
+  hold its own 30-second constant that `NODUM_LLM_CALL_TIMEOUT` did not reach,
+  so a slow install printed `did not answer within 30s` three lines under
+  `"call_timeout": 600.0` and raising the knob changed nothing. There is one
+  per-call ceiling and it is the run's.
+  **And what it spends is reported**, in `used` — 34 tokens a probe, measured.
+  This was the one provider call in the phase that reported none, which made
+  `llm status` the single place in this system where something is spent and the
+  caller cannot see it. `--no-probe` reports the configuration, spends nothing,
+  and says `calls: 0` to prove it.
 - **A `--dry-run` here answers "what would happen", and each one is precise
   about what it costs.** `consolidate --dry-run` still writes its journal entry,
   flagged, because the journal has to say which it was — and emits **no** event,
@@ -1657,13 +2649,56 @@ Phase-1 decision log.
   Agent creation over HTTP is external-kind and owned by the session's human;
   the show-once token comes back in the create and token-rotate response
   bodies, since HTTP has no stderr to print it to the way the CLI does.
-- **The dream journal is five routes, and the curative tier is none of them.**
+- **The smart surface is three routes and all three are reads.** `POST /api/ask`
+  (`question`, optional `space` and `k`; answers with `answered`, `answer`,
+  `citations[]`, `considered[]`, `truncated_notes[]`, `dropped[]`,
+  `unresolved[]`, `unsupported_numbers[]`, `refusal`, `used`),
+  `POST /api/summarize` (`node_id`, optional `depth`; the same shape with
+  `summarized`/`summary`, plus `withheld[]` and the separate `truncated` that
+  is the *walk* stopping at its cap), and `GET /api/search?nl=1`,
+  which adds a `rewrite` object to the ordinary result. All three go through
+  `run_in_threadpool` for the reason `POST /api/cycles` does — a model call is
+  seconds of work on this hardware and the loop is single-threaded — and all
+  three delegate to `nodum.answers`, which is where the rules are.
+  **`?nl=1` is additive**: a search without it is byte-identical to what it has
+  always been and to `nodum search`, which is a test. **`/summarize` has no
+  `propose` flag**, and its absence is the cut: 5b-i ends exactly where a model
+  call causes a write, so an opt-in write belongs to 5b-ii and is not accepted
+  and ignored here — an accepted flag that does nothing is the since-deleted
+  policies API's bug.
+  **A client rendering `/api/ask` must not stop at the boolean.** `answered:
+  true` is four deterministic checks and none of them says the answer is *true*:
+  a note can have reached the model **in part** (`truncated_notes`, and
+  `truncated` on every citation), notes the retrieval found can be missing
+  altogether (`dropped`), and `considered` is empty whenever no call was made,
+  so it never claims a note reached a model that was never called. Each
+  `citations[]` entry carries `marker`, `node_id`, `title`, `space_id`, `state`
+  and `truncated`. **This is why there is no Ask view in `web/` for 5b-i** — see
+  the frontend contract.
+  **A provider failure is a 200, not a 5xx.** No provider, an unreachable one, a
+  `length` finish, a filled context, an exhausted budget: all of them are
+  `answered: false` with a `refusal` naming what happened and, where it applies,
+  the variable to set. The request was well formed and the install could not
+  answer it. A malformed *request* — no `question`, `k` below 1, a `space` that
+  does not resolve, a `node_id` that does not — is the ordinary 400/404 through
+  `EXCEPTION_STATUS`, because telling a client "the model could not answer"
+  about its own bug hides the bug. `/summarize` reads the subgraph **before**
+  looking at the provider for exactly that reason: a node that does not exist is
+  a 404 whether or not a model is configured.
+- **The dream journal is six routes, and the curative tier is none of them.**
   `GET /api/cycles` (newest first — byte-identical to `nodum cycle-list`, as
   every list endpoint is to its command), `POST /api/cycles` (run one now —
   `scope` and `dry_run` are the runner's own parameters and this route invents
   neither), `POST /api/cycles/{id}/abandon` (close an interrupted run `failed`,
   which is what makes its writes rollback-able at all; 400 on a cycle that is
-  not `running`), `GET /api/cycles/{id}` (the row, its metrics, and
+  not `running`), **`POST /api/cycles/{id}/stop`** (the kill switch: stamp who
+  asked and when on a `running` cycle and close nothing — the row comes back
+  still `running`, the run closes its own entry when it notices; 400 on a cycle
+  that is not `running`, and **200 on a second stop**, keeping the first asker,
+  because a switch that refused the second press would make a human doubt the
+  first. It takes the `/abandon` shape and is deliberately not that route: a
+  repair closes a dead process's entry from outside, an instruction is obeyed by
+  a live run, and both end `failed`), `GET /api/cycles/{id}` (the row, its metrics, and
   `list_events(cycle_id=…)` composed into one round trip, bounded by `?limit=`
   with `events_truncated` when it bit), and `POST /api/cycles/{id}/rollback`.
   `POST /api/cycles` exists because the schedule is off unless configured: a
@@ -1685,11 +2720,15 @@ Phase-1 decision log.
   `ValueError` and so rendered as a clean 400 carrying the right sentence, but
   the request was well-formed and the graph was busy, which is what a client
   retries on and what 409 means. **And `POST /api/cycles` runs the cycle off the
-  event loop** (`run_in_threadpool`) — the one handler here that does not call
-  the service inline, because a cycle is minutes of work on a real graph and the
+  event loop** (`run_in_threadpool`), because a cycle is minutes of work on a
+  real graph and the
   loop is single-threaded, so inline it stalled `/healthz`, the SPA and every
   other request for the whole run. `_write` is what goes to the thread, so the
-  principal boundary is unchanged. **The caveat is the write lock, and it is
+  principal boundary is unchanged. **`GET /api/search` joins it** — both
+  branches, not just `?nl=1`: the ordinary branch catches two projectors up and
+  probes the index once per query term, and one 400-term `GET` (a 4 KB query
+  string, nothing exotic) was measured holding the loop **126 ms** with every
+  other tab waiting behind it. Those two are the whole exception list. **The caveat is the write lock, and it is
   measured**: the loop is free, but a `GET /api/nodes` issued while a cycle runs
   waited **1168 ms** against **5 ms** on an idle server, because SQLite has one
   writer and a reader queues behind the burst holding it. A client that times
@@ -1973,6 +3012,25 @@ Phase-1 decision log.
   tier as a whole is CLI-only, so nothing in this UI may offer a merge, a
   supersede or a bulk relink; what it *does* offer is the reverse of all of
   them, because rollback is the human's undo for a cycle.
+- **There is no Ask view, and that is a decision.** `POST /api/ask` is a
+  read-only surface a client could call in an afternoon, and 5b-i deliberately
+  does not. `/ask` can return a **confident, well-cited, wrong answer** — it
+  was measured answering "AWS" with `answered: true`, citing a Kafka textbook
+  containing no occurrence of AWS, cloud or Kubernetes, against a graph that
+  says k3s on three on-prem nodes — because citation *resolvability* is not
+  groundedness: E2 defends against an invented **id**, and that answer invented
+  **content** and hung it on a real one. What catches it is the envelope, and
+  the envelope survives one surface and not the other: a CLI reader gets
+  `unresolved`, `considered` and `dropped` as JSON beside the answer and is
+  already looking at them, while a browser reader gets prose, and a screen that
+  has just answered the question in a paragraph is a screen whose lists nobody
+  reads. So the surface stays where its reader is equipped for it. **It moves
+  here in 5b-ii, once groundedness is real** — a deterministic check that the
+  answer's claims are in the excerpts the request retrieved, rather than that
+  its citations resolve. Until then an Ask view, an "ask about this node"
+  button, and an answer panel bolted onto search are all the same decision
+  taken by accident; `/summarize` is the same call and the same rule. Full
+  version: `web/README.md`.
 - **The journal shows the two records apart, and never merges them.** A cycle's
   `report` says what each job examined, proposed, applied and skipped; the
   events say what actually changed. They are two records on purpose — a journal
@@ -1981,6 +3039,47 @@ Phase-1 decision log.
   the other. A **dry-run** entry has a report and no events at all, and that is
   the point rather than an empty state to hide: it is the checkable form of "it
   changed nothing", and copy that says "no changes recorded" reads as a failure.
+  **Three actions, three situations, and the copy is what keeps them apart.**
+  `stop` asks a live run to wind down (the entry stays `running`; who asked and
+  when is rendered on it), `abandon` closes the entry of a run nothing is going
+  to finish, and `rollback` is the only one of the three that reverses a write —
+  and it only works once the entry has closed. A stopped run and a crashed one
+  both close `failed`, so the *record* rather than the status is what a reader
+  has to be given. Each action names itself in **one exported constant**
+  (`STOP_ACTION_LABEL`, `ABANDON_ACTION_LABEL`) used by both the button and any
+  copy that sends a reader to look for it, since a control named by an
+  unattached string goes stale the first time somebody rewords the button —
+  which is also why `RUNNING_ACTIONS_HINT`, the line that gives each of the two
+  its situation, is rendered **only while both buttons are on screen**: it names
+  each by its own label, and beside a control that is no longer offered it would
+  point at nothing. Each
+  confirm's copy is an exported array (`STOP_CONFIRM`, `ABANDON_CONFIRM`) rather
+  than JSX, because the harness renders no components and a claim made inside
+  one is a claim nothing checks. **Every line of that copy has to be something
+  the system delivers**, including the awkward one — and it was true in one place
+  out of four. What checks the kill switch today is a provider call, the
+  deterministic jobs make none, so a run of those finishes even after a stop; the
+  *confirm* said so, and the button's tooltip offered to "ask this run to wind
+  down and close its own entry", `RUNNING_ACTIONS_HINT` said the run "closes its
+  own entry when it notices", and the toast a human reads immediately after
+  pressing promised "the entry closes when the run notices". The code was right
+  and three of the four surfaces were wrong, which is this defect class exactly:
+  the fix is the sentence, never a stop check wired into the deterministic jobs.
+  That caveat is now one exported constant (`STOP_IS_NOTICED_AT_A_MODEL_CALL`)
+  carried by every surface, for the reason `STOP_ACTION_LABEL` is one constant —
+  a caveat repeated in four voices is a caveat that stops being true in three of
+  them — and the tooltip moved out of the JSX into `journal.ts` with it, because
+  the harness renders no components and a claim inside one is a claim nothing
+  checks, which is how that one stayed wrong. `tests/test_consolidate.py` still
+  fails the day 5b-ii wires a check in. **Verified against the race the review
+  drove**: a consolidation stopped mid-run through `POST /api/cycles/{id}/stop`
+  ran to `completed` with the stop kept on its entry, and the journal entry for
+  it reads *"a stop was asked for on this run and it completed anyway"*.
+  Neither stop nor
+  abandon is offered on an entry it cannot act on, and a stop already recorded
+  gives way to the record: the service makes a second stop a *no-op* so a human
+  pressing twice never doubts the first press, and a button that provably
+  changes nothing would put that doubt back on the screen.
   A **rollback confirm** has one hard rule: a 409 carries a `conflicts` list,
   and each conflict names *both* ends of a collision — the cycle's event and the
   later one that moved the row. Render both. A count, or the server's message

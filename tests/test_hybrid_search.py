@@ -118,6 +118,52 @@ def test_graph_expansion_applies_after_fusion(fresh_db, fake_embedder):
     assert result.hits[1].signals == {"graph": 0.5}  # relates_to weight × 1.0
 
 
+def test_the_keyword_refusal_is_the_keyword_arms_and_the_vector_arm_still_answers(
+    fresh_db, fake_embedder
+):
+    """The honest empty is a property of the *keyword* arm, not of `search`.
+
+    `_compile_match` refuses a query the graph knows no content word of, and
+    `tests/test_search.py` pins that — but it pins it on the default install,
+    where `conftest._no_embedding_provider` has already switched the other arm
+    off. With a provider present the vector arm has no similarity threshold
+    (`_search_vector`: *"the ANN list is always `k` deep"*), so it answers the
+    query the keyword arm just refused, `k` rows deep, and the caller gets a
+    ranked list whose every hit carries the `vector` signal alone.
+
+    That is asserted here rather than fixed, because the fix is a number this
+    repo has no way to measure yet. A cosine floor is a threshold, and an
+    unmeasured threshold is what turns a visible failure into an invisible one
+    — the rule `/ask`'s groundedness gate is held to. Measuring one needs a
+    real embedding model (`fastembed` is not a test dependency and is not
+    installed) over a real graph: `HashEmbedder` above is a signed hashing
+    bag-of-words, so its similarity *is* token overlap, and every floor
+    measured against it would look free while costing exactly the paraphrase
+    recall the vector arm exists for. Suppressing the fused list on the
+    keyword arm's refusal has the same problem from the other side, and would
+    contradict `test_vector_only_hit_surfaces_with_vector_signal` directly.
+
+    So the two arms disagree, deliberately and visibly, and this test is what
+    makes the disagreement fail loudly the moment somebody changes it — at
+    which point `nodum/search.py`, `AGENTS.md` and
+    `web/src/views/search/noResults.ts` all need the qualifier taken back out.
+    """
+    for index in range(20):
+        service.create_node(
+            type="claim",
+            title=f"Claim {index}",
+            content=f"Log compaction retains the newest value for key {index}.",
+            principal=owner(),
+        )
+    for query in ("zarquon", "What does zarquon protect against?"):
+        result = search.search(query, k=10, principal=owner())
+        # The keyword arm contributed nothing at all — no hit carries `bm25`.
+        assert not any("bm25" in hit.signals for hit in result.hits), query
+        # …and the vector arm answered anyway, the full `k` deep.
+        assert len(result.hits) == 10, query
+        assert all(set(hit.signals) == {"vector"} for hit in result.hits), query
+
+
 def test_degrades_to_bm25_when_no_provider(fresh_db):
     # No fake embedder: search must not crash and stays BM25-only.
     target = service.create_node(type="note", title="T", content="xylem vessels", principal=owner())

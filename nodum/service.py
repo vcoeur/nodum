@@ -1762,6 +1762,13 @@ def _transition_version(
     reviewer owns every state change the accept causes (new ``mentions`` edges
     go live, dropped ones are archived), not the agent that proposed the text.
     Rejecting flips it to ``archived`` and emits ``version.reject``.
+
+    **Both spellings record the version row's own move**, because a review
+    changes two rows and only one of them is a graph record. The accept carries
+    it as :data:`VERSION_STATE_KEY` inside the ``node.update`` payload (the
+    ``merge_redirects`` shape: state no event of its own covers rides on the
+    event that caused it), and the reject's own before/after *is* that move. A
+    reversal reads both — see :func:`_restore_version_state`.
     """
     version_id = before["id"]
     if action == "accept":
@@ -1792,6 +1799,10 @@ def _transition_version(
                 "applied_version_id": version_id,
                 "applied_fields": fields,
                 "proposed_event_seq": before["event_seq"],
+                VERSION_STATE_KEY: {
+                    "before": before,
+                    "after": _row_dict(_get_version_row(conn, version_id)),
+                },
             },
         )
         if "content" in fields:
@@ -2619,6 +2630,82 @@ def _restore_row(
     return before
 
 
+#: Payload key carrying the **version row's own** before/after on the event
+#: that moved it. A review changes two rows from one decision: the node, which
+#: is a graph record with an event of its own, and the ``versions`` row's
+#: ``state``, which is not. Accepting therefore hangs the second off the first,
+#: exactly as a merge hangs its ``merge_redirects`` row off the tombstone's
+#: ``node.merge`` — *state changed outside the event log is state a reversal
+#: cannot see*, and this is the fourth row in this file to learn it.
+VERSION_STATE_KEY = "version_state"
+
+#: Kinds a reversal can put a row back for, and the table each lives in.
+#: ``version`` is here and deliberately **not** in :data:`_TABLE_KIND`: a
+#: version row is reversible but carries no conflict of its own, because
+#: :func:`_transition_row` is the only writer of ``versions.state`` and it moves
+#: a row out of ``proposed`` exactly once — there is no second write for a
+#: rollback to collide with.
+_REVERSIBLE_TABLES = {"node": "nodes", "edge": "edges", "version": "versions"}
+
+#: The ``version.`` ops a reversal can read, named rather than matched by
+#: prefix. **The namespace is not the predicate; the payload shape is.**
+#: ``version.propose`` is in the same namespace and is not here: it records the
+#: *creation* of a version row rather than a move of one, its ``before`` is the
+#: **node** row, it carries no ``after`` at all, and it does not name the
+#: version it made — the event is emitted before the insert so the row can point
+#: back at it. A prefix match over the namespace swept it into both reversal
+#: verbs, where a cycle that staged a proposal and reviewed it in the same run
+#: died on ``KeyError: 'after'``. Reversing a *proposal* would be a different
+#: operation with a different payload; rejecting it is the one that exists.
+_REVERSIBLE_VERSION_OPS = ("version.reject", "version.rollback")
+
+
+def _is_reversible(op: str) -> bool:
+    """Does this event record a row move a reversal can write back?
+
+    The one question :func:`undo` and :func:`_rollback_plan` both have to answer
+    the same way, so they ask it here rather than each spelling out a filter.
+    """
+    kind = op.split(".", 1)[0]
+    if kind == "version":
+        return op in _REVERSIBLE_VERSION_OPS
+    return kind in _REVERSIBLE_TABLES
+
+
+def _restore_version_state(
+    conn: sqlite3.Connection,
+    payload: dict[str, Any],
+    principal: Principal,
+    context: str,
+) -> dict[str, Any] | None:
+    """Put a version row back to where a payload's :data:`VERSION_STATE_KEY` says it was.
+
+    The accept half of the version-review reversal. Reversing the
+    ``node.update`` an accept emits restores the node and would leave the
+    proposal marked ``applied`` — permanently, since a version only ever leaves
+    ``proposed`` once, so nothing could accept or reject it again.
+
+    Args:
+        conn: The open connection (the caller commits).
+        payload: The event payload being reversed. An event that moved no
+            version simply lacks the key.
+        principal: Passed through to :func:`_restore_row`.
+        context: The refusal's leading phrase.
+
+    Returns:
+        The **mirrored** record for the reversal's own payload (``before`` and
+        ``after`` swapped), or ``None`` when the event moved no version. The
+        mirror is what makes reversing a reversal re-apply the accept, at every
+        depth, without a second inverse code path — the rule the rest of this
+        module already holds for node and edge rows.
+    """
+    recorded = payload.get(VERSION_STATE_KEY)
+    if recorded is None:
+        return None
+    _restore_row(conn, "version", "versions", recorded["before"], principal, context)
+    return {"before": recorded["after"], "after": recorded["before"]}
+
+
 def _reinsert_rows(conn: sqlite3.Connection, rows: list[dict[str, Any]]) -> None:
     """Put back rows a reversal removed, in foreign-key order.
 
@@ -2646,8 +2733,18 @@ def _reinsert_rows(conn: sqlite3.Connection, rows: list[dict[str, Any]]) -> None
         )
 
 
-#: What :func:`undo` can reverse: a graph write, and not its own reversal.
-_UNDOABLE_OPS = "op != 'undo' AND (op LIKE 'node.%' OR op LIKE 'edge.%')"
+#: What :func:`undo` can reverse, as SQL — :func:`_is_reversible`'s predicate in
+#: the form the newest-first search needs, and not its own reversal. The version
+#: ops are **listed**, never `LIKE 'version.%'`: `version.propose` is in that
+#: namespace and reverses nothing (see :data:`_REVERSIBLE_VERSION_OPS`), so a
+#: prefix here would make a bare ``undo`` after an agent's proposal stop on an
+#: event it then cannot reverse. The names are module constants, interpolated
+#: the way the table names in :func:`_reinsert_rows` are.
+_UNDOABLE_OPS = (
+    "op != 'undo' AND (op LIKE 'node.%' OR op LIKE 'edge.%' OR op IN ("
+    + ", ".join(f"'{op}'" for op in _REVERSIBLE_VERSION_OPS)
+    + "))"
+)
 
 
 def _latest_undoable(conn: sqlite3.Connection, reversed_seqs: set[int]) -> sqlite3.Row | None:
@@ -2718,9 +2815,18 @@ def undo(
     by writing the ``before`` state back. Undoing a node restore re-runs
     wikilink materialisation so the graph stays consistent with the restored
     content. The reversal itself is appended as an ``undo`` event; undo
-    events cannot themselves be undone. Only graph events (``node.*`` /
-    ``edge.*``) are reversible — audited non-graph events
-    are skipped by default and refused when named explicitly.
+    events cannot themselves be undone. Only events naming a row a reversal can
+    put back (``node.*``, ``edge.*``, ``version.*`` — :data:`_REVERSIBLE_TABLES`)
+    are reversible; audited non-graph events are skipped by default and refused
+    when named explicitly.
+
+    **A version review is reversible on both halves.** Undoing the
+    ``node.update`` an accept emits also puts the proposal back to ``proposed``
+    (:func:`_restore_version_state`), and a ``version.reject`` is reversed the
+    way any other recorded row move is. Without the first, an undo restored the
+    node and left the proposal marked ``applied`` with no way to accept or
+    reject it again; without the second, the rejection was the one review
+    outcome no verb in this file could take back.
 
     Undo is the **human tier**: restoring an event's payload writes arbitrary
     prior state back, ``state = 'active'`` included, so an agent allowed to
@@ -2791,7 +2897,7 @@ def undo(
         if event["op"] == "undo":
             raise ValueError(f"event {event['seq']} is an undo event and cannot be undone")
         kind = event["op"].split(".", 1)[0]
-        if kind not in ("node", "edge"):
+        if not _is_reversible(event["op"]):
             raise ValueError(
                 f"event {event['seq']} ({event['op']}) is not a graph event and cannot be undone"
             )
@@ -2801,7 +2907,7 @@ def undo(
             raise ValueError(f"event {event['seq']} has already been undone")
 
         payload = json.loads(event["payload"])
-        table = "nodes" if kind == "node" else "edges"
+        table = _REVERSIBLE_TABLES[kind]
         before, after = payload["before"], payload["after"]
         context = f"cannot undo event {event['seq']} ({event['op']})"
         deleted: list[dict[str, Any]] = []
@@ -2813,17 +2919,17 @@ def undo(
             restored = None
         else:
             restored = _restore_row(conn, kind, table, before, principal, context)
-        undo_seq = _emit(
-            conn,
-            actor,
-            "undo",
-            {
-                "reversed_seq": event["seq"],
-                "reversed_op": event["op"],
-                "restored": restored,
-                "deleted": deleted,
-            },
-        )
+        # An accept moved a version row too, recorded on this same event.
+        version_state = _restore_version_state(conn, payload, principal, context)
+        undo_payload: dict[str, Any] = {
+            "reversed_seq": event["seq"],
+            "reversed_op": event["op"],
+            "restored": restored,
+            "deleted": deleted,
+        }
+        if version_state is not None:
+            undo_payload[VERSION_STATE_KEY] = version_state
+        undo_seq = _emit(conn, actor, "undo", undo_payload)
         if restored is not None and kind == "node":
             _write_version(conn, restored, actor, undo_seq)
             _materialize_mentions(conn, restored, actor, store)
@@ -2833,6 +2939,7 @@ def undo(
             undone_op=event["op"],
             restored=restored,
             deleted=deleted,
+            restored_version=None if version_state is None else version_state["after"],
             undo_event_seq=undo_seq,
         )
     finally:
@@ -4253,17 +4360,48 @@ def _cycle_out(row: sqlite3.Row) -> CycleOut:
         started_at=row["started_at"],
         finished_at=row["finished_at"],
         rolled_back_by=row["rolled_back_by"],
+        # Derived, never stored: `0015` writes the two stamps and no flag, so
+        # the boolean the surfaces render cannot drift from the record it is
+        # about. `CycleDetailOut.metrics` projects the report the same way.
+        stop_requested=row["stop_requested_at"] is not None,
+        stop_requested_by=row["stop_requested_by"],
+        stop_requested_at=row["stop_requested_at"],
     )
 
 
+def _no_such_cycle(cycle_id: str) -> RecordNotFound:
+    """The single refusal a cycle id can meet, whoever asked and for whatever reason.
+
+    One function owns the sentence because :func:`stop_requested` answers a
+    principal it may not answer with **this** refusal rather than a permission
+    one — the non-oracle rule — and two copies of a sentence that has to be
+    identical are how it stops being identical.
+
+    The message names the thing the caller asked for, not the table it lives
+    in: ``no cycles row with id`` is this module's own vocabulary reaching a
+    human who typed ``nodum cycle-get <id>`` and has no reason to know the
+    schema. Every other lookup here says ``<thing> not found: <id>``.
+    """
+    return RecordNotFound(f"consolidation cycle not found: {cycle_id}")
+
+
+def _find_cycle_row(conn: sqlite3.Connection, cycle_id: str) -> sqlite3.Row | None:
+    """The ``cycles`` row with this id, or ``None``.
+
+    One query, because there are two callers and they differ only in what they
+    do with a miss: :func:`_get_cycle_row` raises, and :func:`stop_requested`
+    has to fold the miss into a check it makes afterwards. That was two copies
+    of the ``SELECT`` for one round, which is the argument :func:`_no_such_cycle`
+    itself is written from — a filter added to one of them is a filter the other
+    silently does not have.
+    """
+    return conn.execute("SELECT * FROM cycles WHERE id = ?", (cycle_id,)).fetchone()
+
+
 def _get_cycle_row(conn: sqlite3.Connection, cycle_id: str) -> sqlite3.Row:
-    # The message names the thing the caller asked for, not the table it lives
-    # in: `no cycles row with id` is this module's own vocabulary reaching a
-    # human who typed `nodum cycle-get <id>` and has no reason to know the
-    # schema. Every other lookup here says `<thing> not found: <id>`.
-    row = conn.execute("SELECT * FROM cycles WHERE id = ?", (cycle_id,)).fetchone()
+    row = _find_cycle_row(conn, cycle_id)
     if row is None:
-        raise RecordNotFound(f"consolidation cycle not found: {cycle_id}")
+        raise _no_such_cycle(cycle_id)
     return row
 
 
@@ -4569,6 +4707,260 @@ def abandon_cycle(
         principal=principal,
         path=path,
     )
+
+
+def request_stop(
+    cycle_id: str, *, principal: Principal, path: str | Path | None = None
+) -> CycleOut:
+    """Ask a ``running`` cycle to stop, and record who asked (human-only, K1–K3).
+
+    The kill switch's write half. It sets ``0015``'s two columns and **nothing
+    else**: the row stays ``running``, no event is emitted, and no write the
+    cycle already made is touched. The run notices at its next check — between
+    jobs, between items, or immediately before a provider call — and closes its
+    own cycle ``failed`` with a report that says it was stopped. Worst-case
+    latency is therefore one provider call, and honestly so: cancelling mid-call
+    would buy seconds and cost a torn transaction.
+
+    **What checks it today is one of those three points**: :meth:`nodum.agent.
+    AgentRun.chat`, immediately before a provider call. The four deterministic
+    jobs in :mod:`nodum.consolidate` make no provider call and read this switch
+    nowhere, so a stop recorded against one of those runs is kept on the row and
+    the run finishes — the between-jobs and between-items checks belong to the
+    LLM jobs 5b-ii lands on that runtime. Every human surface says so rather than
+    promising a wind-down that would not arrive, and
+    ``test_the_deterministic_runner_consults_no_stop_switch_and_the_copy_says_so``
+    is what makes that copy fail when it stops being true.
+
+    **Deliberately not** :func:`abandon_cycle`, and not a thin wrapper over it.
+    That verb is a *repair* — a human declaring somebody else's dead process
+    dead, closing the row from outside so its writes become rollback-able. This
+    one expects the run to be alive and to wind down honestly, and the journal
+    has to keep the two apart: a human reading a ``failed`` cycle at 09:00 needs
+    to know whether the operator stopped it or the process died. Building this
+    on top of the repair would erase exactly that distinction.
+
+    It does **not** roll back. Stopping and undoing are two decisions, and a
+    kill switch that also reverted would make "stop, look at what it did, then
+    decide" impossible — which is the reason a human hits one. Every write the
+    run made stays, stamped with the cycle id, and :func:`rollback_cycle` takes
+    them back like any other cycle's.
+
+    Human-only, for the reason :func:`abandon_cycle` is: it is an instruction
+    aimed at a process the caller cannot see, and an agent that could stop the
+    gardener's night could stop the review queue from ever being filled.
+
+    **Asking twice is not an error, and the first asker keeps the record.** A
+    kill switch that raised because the run was already stopping would make a
+    human hitting it twice doubt whether it worked at all, which is the one
+    moment that must not be ambiguous. The second call is a no-op that returns
+    the cycle carrying who actually stopped it and when.
+
+    Args:
+        cycle_id: The cycle to stop.
+        principal: Who is asking; must be a human, and is recorded in
+            ``stop_requested_by`` as their actor string.
+        path: Explicit database path.
+
+    Returns:
+        The cycle, now carrying the stop — or carrying the earlier one, if a
+        stop was already recorded.
+
+    Raises:
+        GrantNotPermitted: If the principal is not a human.
+        RecordNotFound: If the cycle id does not resolve.
+        InvalidTransition: If the cycle is not ``running``. A cycle that has
+            already said how it ended cannot be told to stop: there is nothing
+            left to obey it, and stamping one would put a stop in the journal
+            that no run ever saw.
+    """
+    conn = _connect(path)
+    try:
+        Store(conn, principal).require_human("stop a consolidation cycle")
+        row = _get_cycle_row(conn, cycle_id)
+        if row["status"] != "running":
+            raise InvalidTransition(
+                f"cycle {cycle_id} is already {row['status']}, not running: a stop is an "
+                "instruction to a live run, and a cycle that has said how it ended has nothing "
+                "left to obey it"
+            )
+        # `AND stop_requested_at IS NULL` is what makes the second asker a no-op
+        # rather than an overwrite: who stopped the night is the fact, and the
+        # first answer to it is the true one. It is also the whole of the race
+        # guard — two humans hitting the switch at once leave one row, not a
+        # torn one.
+        conn.execute(
+            "UPDATE cycles SET stop_requested_at = datetime('now'), stop_requested_by = ?"
+            " WHERE id = ? AND stop_requested_at IS NULL",
+            (principal.actor_string, cycle_id),
+        )
+        stopped = _get_cycle_row(conn, cycle_id)
+        conn.commit()
+        return _cycle_out(stopped)
+    finally:
+        conn.close()
+
+
+def _may_watch_a_cycle(row: sqlite3.Row, principal: Principal) -> bool:
+    """May this principal ask whether the cycle in ``row`` was told to stop?
+
+    **The rule is: what would have admitted *you* to run this cycle's
+    territory.** It is a question about the caller, not about the run — and the
+    difference is not a nicety. ``cycles`` records ``triggered_by``, who *asked*
+    for the run, and has no column at all for who is *running* it: the runner is
+    a principal minted inside :func:`nodum.consolidate._run_cycle` and never
+    written down. So "exactly what admitted this run" — which is how this was
+    first stated — is not a question this row can answer, and a check that
+    claimed to ask it would be describing a column that does not exist. What is
+    checkable is the admission rule itself, applied to whoever is asking.
+
+    A **scoped** cycle is admitted by :func:`nodum.consolidate.
+    _require_gardener_scope`, which asks only that the runner can *resolve* the
+    scope — any grant, ``read`` included — so that is what is asked here.
+    An **unscoped** cycle covers the whole file, which no grant confers, and
+    :func:`open_cycle` admits it on ``edit`` *somewhere*
+    (:func:`_cycle_authority_spaces` with no scope); that half is unchanged,
+    because nothing was ever wrong with it. Humans pass, as they pass every
+    other check here.
+
+    **Caller-relative is wider than run-relative, and the width is the delta.**
+    Any agent holding *any* grant on space S can read the switch on every cycle
+    ever scoped to S — cycles a human opened, cycles another agent opened, runs
+    it has no part in. Concretely: the minimum grant set :func:`create_agent`
+    gives a new agent, ``read`` on ``meta`` — the least anything needs to resolve
+    a type — now watches every cycle scoped to ``meta``, and the parity set
+    ``0010`` backfilled onto the agents that predate it, ``meta: read`` plus
+    ``main: suggest``, watches every cycle over ``main`` too. ``require_review``
+    refused both, since neither level reaches ``EDIT``. It is a boolean per
+    cycle id and no id is reachable from anything an agent can call — cycle ids
+    are ``uuid4``, both journal reads are human-only, and no agent-facing model
+    carries one — but the width is real and stating a narrower rule than the code
+    enforces is how a later reader grants themselves the narrower one.
+
+    **The scoped half is not the rule that shipped, and the one it replaces was
+    wrong.** :func:`stop_requested` asked ``Store.require_review`` over
+    :func:`_cycle_authority_spaces` for *both* cases — the identical check
+    ``open_cycle`` and ``close_cycle`` ask — justified as *obeying a stop is
+    closing the cycle, so a principal that could not close this one has no use
+    for the answer*. That justification is unsound on **both** triggers, in two
+    different ways, and the widening is right on both:
+
+    * On a ``manual`` run the gardener never closes the cycle at all.
+      ``consolidate._run_cycle`` closes as the **opener**, and ``_opener``
+      resolves a human-triggered run's opener to the human — so the check was
+      demanding of the gardener an authority the gardener does not exercise.
+    * On a ``scheduled`` run the gardener *is* the opener and *does* close its
+      own cycle — but then ``open_cycle`` already required ``edit`` on the scope
+      before the run could start, so the check was re-asking a question the door
+      had already answered ``yes``. It could refuse nothing a scheduled run
+      would ever meet.
+
+    Either way the old check only ever bit where it was wrong: a scoped run
+    needs no more than to resolve its scope, so a gardener holding ``read`` on a
+    space is entitled to consolidate it and was then refused the switch over its
+    own run — a night dying at the first provider call with
+    ``GrantNotPermitted``, which is a kill switch killing the run by being
+    unreadable. A check on the far side of a door must not be stricter than the
+    door.
+    """
+    if principal.is_human:
+        return True
+    if row["scope"] is not None:
+        return principal.level_on(row["scope"]) >= READ
+    return bool(_cycle_authority_spaces(principal, None))
+
+
+def stop_requested(cycle_id: str, *, principal: Principal, path: str | Path | None = None) -> bool:
+    """Has this cycle been told to stop? — the read a run obeys (K3).
+
+    One row read, and the runner calls it between jobs, between items, and
+    immediately before every provider call
+    (:func:`nodum.agent.cycle_stop_check`). Nothing caches it: a check answering
+    from a value read at the top of the run would be a kill switch that cannot
+    be hit after the run starts, which is the only time anyone hits one.
+
+    **Deliberately not human-only**, unlike :func:`get_cycle` and
+    :func:`list_cycles`. Those are human-only because a journal entry reports
+    what the gardener did across every space in the file, and an agent reading
+    one learns the shape of territory it holds no grant on. This returns a
+    single boolean about a run, discloses no node, no space and no count, and a
+    runner that cannot ask whether it was told to stop cannot obey.
+
+    **What bounds it instead is** :func:`_may_watch_a_cycle` — the admission
+    rule for this cycle's territory, asked of whoever is calling, which for a
+    scoped cycle is the grant that resolves its scope and no longer the
+    authority to close it. That rule changed here, and why — along with how much
+    wider caller-relative is than run-relative — is written where the rule is.
+
+    **And this refusal is no longer an existence oracle.** The two answers this
+    function used to give a principal it turned away — ``RecordNotFound`` for an
+    id that names nothing, ``GrantNotPermitted`` for a cycle it may not watch —
+    told those two cases apart, so anything holding a single grant could probe a
+    cycle id and learn whether it exists. Cycle ids are unguessable and both
+    journal reads are human-only, which bounds the damage and does not close the
+    class: the space-name check and the Q13 non-oracle rule are both settled the
+    other way, and the rule they settle on is that **the refusal is one sentence
+    for both cases**. The ordering trick the space-name check uses — ask the
+    grant first, so the existence question is never reached — is unavailable
+    here, because the grant to ask for is recorded *on the row*. So this takes
+    ``_resolve_space``'s shape instead: one refusal, the not-found one, echoing
+    nothing back but the id the caller supplied. A principal that may watch the
+    cycle still gets the truthful answer, and a human — unfiltered, as everywhere
+    — is never told a cycle it can see does not exist.
+
+    **It is closed here and nowhere else, and that is the claim.** It is not
+    "the class of cycle-id oracles, closed": :func:`close_cycle` takes a cycle
+    id, is not human-only, and still answers ``GrantNotPermitted`` for a cycle
+    the caller may not close against ``RecordNotFound`` for an id that names
+    nothing — the only one of the seven cycle-id surfaces that still tells them
+    apart. That is deliberate. ``close_cycle``'s refusal is the *same*
+    ``require_review`` :func:`open_cycle` raises, on the same spaces, and
+    ``open_cycle`` cannot be an oracle at all because it takes a scope and not an
+    id; collapsing one half of that pair would leave a principal that opened a
+    cycle and cannot close it reading *this cycle does not exist* about a row it
+    is holding open, and would falsify the symmetry
+    :meth:`~nodum.store.Store.require_review` documents. The exposure argument is
+    this function's own, unchanged — an unguessable id, no agent-facing model
+    carrying one — and it is an argument about reach, not a reason to widen the
+    collapse onto a write.
+
+    **What the collapse costs, said plainly.** The refusal a principal outside
+    the run now meets is ``consolidation cycle not found``, and that sentence
+    reaches a *legitimate* runner too. Grants are read when a principal is minted
+    (``auth._grant_set``, which drops grants on archived spaces), so a run whose
+    scope is archived under it keeps reading its switch — ``_run_cycle`` mints
+    the gardener once and holds it — while the **next** principal minted for that
+    cycle, in a later process or after a restart, is told its own cycle does not
+    exist. It used to be told it needed ``edit`` on the item's space, which at
+    least pointed at the cause. Both refusals are wrong for that reader; this one
+    is quieter about the thing an outsider must not learn, which is the trade
+    that was taken. The recorded scope is used rather than a re-resolution of it
+    (as :func:`close_cycle` does) so that an archived space does not make the
+    *lookup* fail on top of it — but it does not, and cannot, keep an archived
+    space's cycle readable by a re-minted runner.
+
+    Args:
+        cycle_id: The cycle to ask about.
+        principal: Who is asking — the principal the run acts as.
+        path: Explicit database path.
+
+    Returns:
+        ``True`` once a stop has been recorded, for good: the stamp outlives the
+        run, because a journal entry has to go on saying this night was stopped.
+
+    Raises:
+        RecordNotFound: If the cycle id names no cycle — **or** names one this
+            principal may not watch. Word for word the same refusal, on purpose:
+            see above.
+    """
+    conn = _connect(path)
+    try:
+        row = _find_cycle_row(conn, cycle_id)
+        if row is None or not _may_watch_a_cycle(row, principal):
+            raise _no_such_cycle(cycle_id)
+        return row["stop_requested_at"] is not None
+    finally:
+        conn.close()
 
 
 def get_cycle(cycle_id: str, *, principal: Principal, path: str | Path | None = None) -> CycleOut:
@@ -5501,21 +5893,32 @@ def _relink(
 # refuses cycle-stamped events, no new guard is needed to keep `undo` out of a
 # rollback's own writes.
 
-#: The op a rollback emits per row it reverses, by kind. They stay inside the
-#: `node.`/`edge.` namespaces for the same reason the curative ops do:
-#: :mod:`nodum.projectors` dispatches on ``op.startswith("node.")`` to reproject
-#: FTS and the embeddings, and an op outside it would leave the search index
-#: quietly describing a graph that no longer exists.
-ROLLBACK_OPS = {"node": "node.rollback", "edge": "edge.rollback"}
+#: The op a rollback emits per row it reverses, by kind. The first two stay
+#: inside the `node.`/`edge.` namespaces for the same reason the curative ops
+#: do: :mod:`nodum.projectors` dispatches on ``op.startswith("node.")`` to
+#: reproject FTS and the embeddings, and an op outside it would leave the search
+#: index quietly describing a graph that no longer exists. ``version.rollback``
+#: is outside it for the mirror of that reason — reversing a review decision
+#: moves a ``versions`` row and no node text, so a projector reading it would
+#: reindex a node nothing changed.
+ROLLBACK_OPS = {
+    "node": "node.rollback",
+    "edge": "edge.rollback",
+    "version": "version.rollback",
+}
 
 #: The rollback's own summary event. Deliberately *outside* the graph
 #: namespaces: it changes no row, so a projector reading it as one would index
 #: nothing, and :func:`undo` refuses it as the audit record it is.
 ROLLBACK_SUMMARY_OP = "cycle.rollback"
 
-#: Payload table names mapped to the kind of graph record they hold. Used to
-#: read an ``undo``'s reach out of its ``deleted`` list — `versions` rows are
-#: not graph records and carry no conflict of their own.
+#: Payload table names mapped to the kind of graph record they hold. This is the
+#: **conflict** map, not the reversal map (:data:`_REVERSIBLE_TABLES`): it is
+#: what reads an ``undo``'s reach out of its ``deleted`` list, and `versions`
+#: rows are absent because they carry no conflict of their own —
+#: :func:`_transition_row` is the only writer of ``versions.state`` and it moves
+#: a row out of ``proposed`` exactly once, so there is no later write for a
+#: rollback to collide with.
 _TABLE_KIND = {"nodes": "node", "edges": "edge"}
 
 #: How many conflicts a refusal spells out before summarising the rest. The
@@ -5531,6 +5934,97 @@ class _RollbackPlan(NamedTuple):
     skipped: list[int]
     conflicts: list[RollbackConflictOut]
     blockers: list[RollbackBlockerOut]
+
+
+class _RollbackEffects(NamedTuple):
+    """Which rows a reversal puts back, takes out and unlinks — its reported half.
+
+    **One accounting, read by both paths.** :func:`_apply_rollback` fills it as
+    it reverses and the ``dry_run`` preflight fills it from the same plan
+    without writing, so ``RollbackOut``'s six lists mean the same thing on the
+    verdict and on the outcome. They did not: the dry run returned every one of
+    them empty and answered *"reversing 4 events"* about a rollback that was
+    going to restore three nodes, delete one and drop a merge redirect — the
+    confirm dialog a human presses is built on that response. It is the shape
+    ``blockers`` was in one round earlier, and it has the same fix: model it in
+    the plan rather than only in the run.
+
+    The lists are mutable and the tuple is not, deliberately — a caller adds to
+    an accounting it cannot re-point.
+    """
+
+    restored_nodes: list[str]
+    restored_edges: list[str]
+    restored_versions: list[int]
+    deleted_nodes: list[str]
+    deleted_edges: list[str]
+    redirects_removed: list[str]
+
+    @classmethod
+    def nothing(cls) -> _RollbackEffects:
+        """An empty accounting, for a walk that has not started."""
+        return cls([], [], [], [], [], [])
+
+    def record(self, conn: sqlite3.Connection, op: str, payload: dict[str, Any]) -> None:
+        """Add what reversing one event accounts for, deciding nothing else.
+
+        Read the payload, and the payload only, with one exception: whether a
+        ``merge_redirects`` row is actually there to remove is a fact about the
+        file. It is probed **before** the reversal touches anything, which is
+        also when :func:`_apply_rollback` probes it — and no plan can hold both
+        a merge of a tombstone and the un-merge that would put its redirect
+        back, since a cycle merges a given node at most once and the reversal of
+        that merge belongs to a different cycle.
+
+        Args:
+            conn: The open connection, read from and never written.
+            op: The event's op, whose namespace is the row kind.
+            payload: The event payload being reversed.
+        """
+        kind = op.split(".", 1)[0]
+        before, after = payload["before"], payload["after"]
+        if _applies_a_merge(kind, before, after):
+            redirect = conn.execute(
+                "SELECT 1 FROM merge_redirects WHERE tombstone_id = ?", (after["id"],)
+            ).fetchone()
+            # Defensive, and known to be: no test reaches the `None` arm and no
+            # cycle shape produces it — at every involution depth tried, the
+            # redirect is present exactly when `_applies_a_merge` is true, since
+            # the merge that wrote the payload wrote the redirect in the same
+            # transaction. The probe stays because this list is a *report* of
+            # rows removed and `_apply_rollback`'s DELETE removes none when
+            # there is nothing there; counting unconditionally would be the
+            # accounting claiming a removal that did not happen the first time
+            # anything does delete a redirect out from under a cycle.
+            if redirect is not None:
+                self.redirects_removed.append(after["id"])
+        if before is None:
+            # The event created the row, so reversing it takes the row out.
+            (self.deleted_nodes if kind == "node" else self.deleted_edges).append(after["id"])
+        else:
+            {
+                "node": self.restored_nodes,
+                "edge": self.restored_edges,
+                "version": self.restored_versions,
+            }[kind].append(before["id"])
+        # An accept's version move rides on the `node.update` it caused, so it
+        # is counted from the same payload rather than from an event of its own.
+        recorded = payload.get(VERSION_STATE_KEY)
+        if recorded is not None:
+            self.restored_versions.append(int(recorded["before"]["id"]))
+
+
+def _planned_effects(conn: sqlite3.Connection, plan: _RollbackPlan) -> _RollbackEffects:
+    """What reversing ``plan`` would restore, delete and unlink — nothing written.
+
+    The preflight half of :class:`_RollbackEffects`, walking the plan in the
+    order the run reverses it (newest first) so the lists come back in the order
+    the run reports them.
+    """
+    effects = _RollbackEffects.nothing()
+    for event in reversed(plan.events):
+        effects.record(conn, event["op"], json.loads(event["payload"]))
+    return effects
 
 
 def _merged_into(row: dict[str, Any] | None) -> str | None:
@@ -5682,16 +6176,15 @@ def _rollback_plan(conn: sqlite3.Connection, cycle_id: str) -> _RollbackPlan:
     ).fetchall():
         # Non-graph events a cycle happens to contain are audit records — an
         # `asset.download` says a URL was redeemed, and there is no row behind
-        # it to put back. The one shape this leaves uncovered is a **version
-        # review inside a cycle**: accepting a proposed version emits an
-        # ordinary `node.update` (reversed here like any other) but also flips
-        # `versions.state` to `applied` through no event of its own, and a
-        # `version.reject` is skipped here as the audit record it looks like —
-        # so the version's own state would survive the rollback of the node
-        # change it caused. Nothing in the curative tier reviews versions, so
-        # nothing reaches it today; a runner that starts accepting proposals
-        # inside a cycle has to close this first.
-        if row["op"].split(".", 1)[0] in _TABLE_KIND.values():
+        # it to put back. A **version review inside a cycle** is not one of
+        # them, and used to be read as one on both halves: the accept's
+        # `node.update` came through here like any other event while the
+        # `versions.state` flip it also made rode on no event at all, and the
+        # reject's `version.reject` — which does carry the version rows — was
+        # skipped as the audit record it looks like. Both are covered now: the
+        # accept records the move in its own payload (:data:`VERSION_STATE_KEY`)
+        # and `version.` joins the reversible kinds here.
+        if _is_reversible(row["op"]):
             events.append(_row_dict(row))
         else:
             skipped.append(int(row["seq"]))
@@ -5980,20 +6473,20 @@ def _apply_rollback(
     The reversal payloads are the mirror image of the events they reverse
     (``before`` and ``after`` swapped), which is what makes rolling a rollback
     back re-apply the original rather than needing a second, inverse code path.
+    That holds for the ``versions`` row a review moves too: an accept's move
+    rides on the ``node.update`` it caused (:data:`VERSION_STATE_KEY`) and is
+    mirrored onto the ``node.rollback``, while a reject is a ``version.reject``
+    reversed like any other recorded row move.
     """
     actor = principal.actor_string
     cycle_id = plan.cycle["id"]
     reversed_events: list[int] = []
-    restored_nodes: list[str] = []
-    restored_edges: list[str] = []
-    deleted_nodes: list[str] = []
-    deleted_edges: list[str] = []
-    redirects_removed: list[str] = []
+    effects = _RollbackEffects.nothing()
 
     for event in reversed(plan.events):
         payload = json.loads(event["payload"])
         kind = event["op"].split(".", 1)[0]
-        table = "nodes" if kind == "node" else "edges"
+        table = _REVERSIBLE_TABLES[kind]
         context = f"cannot roll back event {event['seq']} ({event['op']})"
         before, after = payload["before"], payload["after"]
         removed: list[dict[str, Any]] = []
@@ -6003,6 +6496,11 @@ def _apply_rollback(
         # versions and edges that reference it.
         if payload.get("deleted"):
             _reinsert_rows(conn, payload["deleted"])
+
+        # What this reversal accounts for, decided before it changes anything —
+        # through the same function the `dry_run` verdict is built from, so the
+        # preflight a confirm dialog reads cannot disagree with the run.
+        effects.record(conn, event["op"], payload)
 
         # `merge_redirects` is covered by no event of its own. It is derivable
         # (the tombstone and the survivor are both in the payload) but it has to
@@ -6016,7 +6514,6 @@ def _apply_rollback(
             if redirect is not None:
                 removed.append({"table": "merge_redirects", "row": _row_dict(redirect)})
                 conn.execute("DELETE FROM merge_redirects WHERE tombstone_id = ?", (after["id"],))
-                redirects_removed.append(after["id"])
 
         if before is None:
             # The event created the row: take it back out. The live row is what
@@ -6029,7 +6526,6 @@ def _apply_rollback(
             current = _row_dict(live)
             removed.extend(_delete_created_row(conn, kind, table, current, context))
             reversal: dict[str, Any] = {"before": current, "after": None}
-            (deleted_nodes if kind == "node" else deleted_edges).append(after["id"])
             restored: dict[str, Any] | None = None
         elif after is None:
             # The event removed the row — only a previous rollback emits that
@@ -6037,12 +6533,16 @@ def _apply_rollback(
             if not payload.get("deleted"):
                 _reinsert_rows(conn, [{"table": table, "row": before}])
             reversal = {"before": None, "after": before}
-            (restored_nodes if kind == "node" else restored_edges).append(before["id"])
             restored = before
         else:
             restored = _restore_row(conn, kind, table, before, principal, context)
             reversal = {"before": after, "after": before}
-            (restored_nodes if kind == "node" else restored_edges).append(before["id"])
+
+        # An accept moved a version row on top of the node it rewrote, recorded
+        # on this same event. The mirror goes on the reversal so that rolling
+        # *this* back re-applies the accept — the involution the rest of these
+        # payloads already hold, at every depth.
+        version_state = _restore_version_state(conn, payload, principal, context)
 
         reversal.update(
             {
@@ -6051,6 +6551,8 @@ def _apply_rollback(
                 "rolled_back_cycle": cycle_id,
             }
         )
+        if version_state is not None:
+            reversal[VERSION_STATE_KEY] = version_state
         if removed:
             reversal["deleted"] = removed
         seq = _emit(conn, actor, ROLLBACK_OPS[kind], reversal, cycle_id=rollback_cycle_id)
@@ -6101,12 +6603,8 @@ def _apply_rollback(
         dry_run=False,
         reversed_events=reversed_events,
         skipped_events=plan.skipped,
-        restored_nodes=restored_nodes,
-        restored_edges=restored_edges,
-        deleted_nodes=deleted_nodes,
-        deleted_edges=deleted_edges,
-        redirects_removed=redirects_removed,
         conflicts=[],
+        **effects._asdict(),
     )
 
 
@@ -6154,7 +6652,12 @@ def rollback_cycle(
             and the delete guards in ``blockers`` rather than as exceptions;
             every other refusal is raised on both paths, because they are
             refusals to plan rather than results of one. A dry run reporting
-            either list is a rollback that would fail.
+            either list is a rollback that would fail. **And it reports what the
+            run would report**: the six outcome lists are filled from the same
+            :class:`_RollbackEffects` accounting the run fills, because a
+            preflight answering *"reversing 4 events"* and nothing else about a
+            reversal that deletes a node is the disagreement ``blockers``
+            already had to be fixed for.
         principal: Who is rolling it back. Must be a human.
         path: Explicit database path.
 
@@ -6175,22 +6678,22 @@ def rollback_cycle(
     try:
         Store(conn, principal).require_human("roll back a consolidation cycle")
         plan = _rollback_plan(conn, cycle_id)
+        # Read on the planning connection, which is the only one a dry run
+        # opens: the verdict must describe the graph the plan was computed
+        # against, not one a second connection might have seen move.
+        planned = _planned_effects(conn, plan) if dry_run else None
     finally:
         conn.close()
-    if dry_run:
+    if planned is not None:
         return RollbackOut(
             cycle_id=cycle_id,
             rollback_cycle_id=None,
             dry_run=True,
             reversed_events=[int(event["seq"]) for event in reversed(plan.events)],
             skipped_events=plan.skipped,
-            restored_nodes=[],
-            restored_edges=[],
-            deleted_nodes=[],
-            deleted_edges=[],
-            redirects_removed=[],
             conflicts=plan.conflicts,
             blockers=plan.blockers,
+            **planned._asdict(),
         )
     if plan.conflicts:
         raise RollbackConflict(_conflict_message(cycle_id, plan.conflicts), plan.conflicts)

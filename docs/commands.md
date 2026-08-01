@@ -104,11 +104,92 @@ including every parameter.
 
 - `search <query>` — Hybrid-search node title + content (BM25 + vector,
   RRF-fused). Takes the same two read-side space controls as `node list`:
-  `--space` and `--include-meta`.
+  `--space` and `--include-meta`. **Terms are ORed under a quorum, not ANDed**:
+  a node matches when the query terms it carries are worth at least half the
+  query's inverse-document-frequency weight, counting **content words only** —
+  ordinary English function words (`what`, `does`, `how`, `let`, …) are dropped
+  first, so the words a question is *asked* with never outvote the word it is
+  *about*. A rare word earns a match and a common one costs nothing, so the fix
+  for an empty result is usually a *different* word rather than a shorter query
+  — but a **rarer** one only helps if the graph holds it. **A query the graph
+  knows no content word of matches nothing at all**, deliberately: `zarquon`
+  finds nothing, so *"What does zarquon protect against?"* answers with nothing
+  too, rather than with whatever notes happen to share its phrasing. In that
+  case the word to change is the one the question is *about*. (With an embedding
+  provider configured, the vector signal has no such rule and still returns its
+  nearest chunks — a result whose every hit shows only a `vector` signal is
+  telling you the keyword half found nothing.) A query may carry at most 64
+  distinct terms.
+  `--nl` asks the model to rewrite the question into search terms first and adds
+  a `rewrite` object saying what was asked on your behalf; it is a rewrite of
+  the words only — every signal, filter and cap below it is unchanged — and with
+  no provider it is a no-op that says so and searches your own words.
 - `traverse` — Walk the subgraph reachable from a node over active edges.
 - `subgraph <root-id>` — Bounded, filtered neighborhood of a node — node and edge caps stop the walk.
 - `find-path` — Find the shortest path between two nodes over active edges.
 - `suggest-links <prefix>` — Suggest wikilink targets by title prefix (case-insensitive).
+
+### Asking the graph
+
+These three read and **never write**. Each prints one JSON object and exits 0
+whatever the model did: a question nothing answered is an ordinary result
+carrying `answered: false` and a `refusal` saying why, not a failure. Exit 1
+still means what it always did — your own error (a blank question, a node that
+does not resolve). With no provider configured the refusal names
+`NODUM_LLM_MODEL`.
+
+- `ask <question> [--k N] [--space S]` — Answer a question from the graph, with
+  citations. **`answered` is computed, never taken from the model**, and it is
+  exactly four deterministic checks: at least one cited id is a note this
+  request actually retrieved; the model did not *also* name a note that does not
+  exist while offering only one that does; every number in the answer appears in
+  the text that was really sent or in your question (`unsupported_numbers` lists
+  what did not); and there is answer text. Anything the model cited that this
+  retrieval did not return lands in `unresolved`, and a failed check means the
+  answer text is not returned.
+  **It does not mean the answer is true.** A model that invents content while
+  citing a real node passes all four — citation resolvability is not
+  groundedness — so the envelope is built to be read rather than trusted:
+  `considered` is what reached the model (empty when no call was made, which
+  `used.calls` corroborates), `truncated_notes` is what reached it **in part**
+  and every citation carries the same `truncated` flag, `dropped` is what the
+  retrieval found and the context window could not carry at all, and `used` is
+  what the attempt cost.
+  A `[n]` at the start of a line is how a note is introduced to the model, so
+  one in your question — or in a node's text — is rewritten to `(n)` before the
+  prompt is built. It reads the same and can no longer open a note that was
+  never retrieved.
+- `summarize <node-id> [--depth N]` — Summarise a node and its neighbourhood,
+  under the same citation and grounding rules. It reads the subgraph whether or
+  not a provider is configured, so a node that does not exist is the ordinary
+  not-found refusal rather than a complaint about the model. **What it sends is
+  narrower than what you can read**: archived, proposed and meta-space nodes the
+  walk returned are never put in front of the model — `ask` cannot reach them
+  either, and two endpoints on one install must not disagree about what leaves
+  the machine — and they are named in `withheld`, with each note's `state` in
+  the envelope. `truncated` stays the separate fact that the *walk* stopped at
+  its cap.
+- `llm status [--no-probe]` — Whether a provider is **configured**, and
+  separately whether it is **reachable**. The two are different facts:
+  configuration is free and permanent, reachability costs one small call and is
+  true only of this instant. `reachable` is therefore tri-state, and `null` is
+  *not established* rather than "not asked": nothing was configured, `--no-probe`
+  declined it, or the probe got no answer inside `call_timeout` — which is
+  deliberately not `false`, because a refused connection is a server that is not
+  running while no answer yet is very often a live server loading a model. The
+  failing probe is free (nothing listening answers in about 3 ms, a model the
+  server does not have in about 4); `--no-probe` spends nothing at all. It takes
+  `--as` although it reads no graph, because the probe is a real model call and
+  every model call in this system is attributed — and `used` reports what it
+  spent (34 tokens, measured). The probe waits the run's own
+  `NODUM_LLM_CALL_TIMEOUT`, so the sentence in `detail` and the number in
+  `call_timeout` agree.
+  The `context_tokens` it reports is `NODUM_LLM_CONTEXT_TOKENS` — **the window
+  your server serves, not the one the model card advertises**. With `ollama`
+  that is `num_ctx` (`OLLAMA_CONTEXT_LENGTH`, 4096 unless you raise it),
+  applied to every model it serves; setting this above it means an over-long
+  prompt is sent instead of refused, and the server answers from the part it
+  read without saying so.
 
 ### History and state
 
@@ -119,8 +200,14 @@ including every parameter.
 - `diff <a> <b>` — Unified diff between two versions of one node.
 - `undo [seq]` — Reverse an event, restoring the prior state from its payload.
   An event carrying a `cycle_id` is **not** undoable here — `rollback` takes
-  the whole cycle instead — and the no-argument search skips those rather than
-  stopping on one.
+  the whole cycle instead — and the no-argument search *finds* those rather than
+  stepping over them, so a bare `undo` after a consolidation is answered by a
+  refusal naming the cycle instead of by silently reversing an older write.
+  **A version review comes back whole on both halves.** Undoing an `accept`
+  restores the node *and* puts the proposal back to `proposed` (reported as
+  `restored_version`), so it is a queue item again rather than a row stuck on
+  `applied` over content that has gone back; a `reject` is itself reversible, so
+  a rejection made by mistake is one command away from being reviewable again.
 - `accept <id>` — Accept a proposed node, edge, or update (proposed → active). Human only.
 - `reject <id> --reason` — Reject a proposed node, edge, or update (proposed → archived). Human only.
 - `archive <id>` — Archive an active node or edge (active → archived).
@@ -217,9 +304,18 @@ including every parameter.
   with the id already filled in — the `rollback` refusal, and the "a
   consolidation cycle is already running" that now blocks *every* later run
   rather than only the ones in the same process.
+- `cycle-stop <id>` — Ask a **running** cycle to stop: the kill switch.
+  Human-only. It records who asked and when, and changes nothing else — the
+  entry stays `running`, and the run closes its own entry `failed` when it
+  next checks. Asking twice keeps the first asker rather than raising, so
+  pressing it again is never ambiguous; a cycle that has said how it ended is
+  refused, since nothing is left to obey it. See *stop, abandon, rollback*
+  below for which of the three you want.
 - `rollback <cycle-id>` — Take a whole cycle back, all of it or none of it.
   `--dry-run` reports what would be reversed and what stands in the way.
-  Human-only.
+  Human-only. A review the cycle performed is part of "the whole of it":
+  `restored_versions` names the proposals put back to `proposed`, and a cycle
+  that did nothing but reject is a cycle with something to take back.
 - `merge-nodes <ids…> --into <id>` — Merge nodes into a survivor. Soft and
   reversible: nothing is destroyed.
 - `retype <ids…> --type <t>` — Change nodes' type. The one sanctioned exception
@@ -242,6 +338,29 @@ including every parameter.
   on stderr. `unchanged` never affects it. **A `--dry-run` exits 0 whatever it
   predicts** — every check a real run makes runs on the rehearsal, so its
   `skipped` is accurate, but nothing was attempted there and nothing was lost.
+
+**Stop, abandon, rollback — three verbs, three different situations.** They all
+end up near a `failed` journal entry, which is exactly why they are worth
+keeping straight.
+
+| You want to | Run | What it does | What it does *not* do |
+|---|---|---|---|
+| Wind down a run that is going right now | `cycle-stop <id>` | Records who asked and when. The entry stays `running`; the run closes its own entry `failed` when it next checks. | Close the entry. Reverse anything. |
+| Close the entry of a run that is never going to finish | `cycle-abandon <id>` | Closes it `failed` from outside, with a report naming who closed it — which is what makes its writes reversible at all. | Stop a process. Reverse anything. |
+| Take back what a closed cycle wrote | `rollback <cycle-id>` | Reverses every event the cycle wrote, all of it or none of it. | Work on a cycle that has not closed. |
+
+The order is the order: a run you stopped closes itself, and then you can roll it
+back. A run a `SIGKILL` ended never closes itself, so you abandon it first and
+roll it back after. **Neither stop nor abandon reverses a single write** —
+stopping and undoing are two decisions, and a switch that did both would make
+"stop, look at what it did, then decide" impossible.
+
+`cycle-stop` records an instruction; what obeys it is the run. Today the only
+check is the one immediately before a model call, so a run of the **four
+deterministic jobs** — which make none — finishes even after you stop it, with
+the stop kept on the entry. The switch is worth having now because it is the
+model-spending half it was built to bound, and the entry says who asked and when
+whichever way the run ended.
 
 The writes a cycle makes are the **gardener's** (`agent:builtin-gardener`), an
 internal agent seeded with `read` on `meta` and `edit` on `main` as ordinary

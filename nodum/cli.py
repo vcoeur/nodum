@@ -20,7 +20,7 @@ from pathlib import Path
 import typer
 from pydantic import BaseModel
 
-from nodum import __version__, assets, auth, db, extract, ingest, projectors, service, urls
+from nodum import __version__, answers, assets, auth, db, extract, ingest, projectors, service, urls
 from nodum import consolidate as consolidate_module
 from nodum import search as search_module
 from nodum.assets import AssetNotFound, AssetSourceChanged, AssetTooLarge, UnsupportedRendition
@@ -63,6 +63,7 @@ asset_app = typer.Typer(
 ingest_app = typer.Typer(
     no_args_is_help=True, help="Ingestion: files and URLs in, reviewable subgraphs out."
 )
+llm_app = typer.Typer(no_args_is_help=True, help="The language-model provider this install uses.")
 app.add_typer(node_app, name="node")
 app.add_typer(edge_app, name="edge")
 app.add_typer(projector_app, name="projector")
@@ -72,6 +73,7 @@ app.add_typer(agent_app, name="agent")
 app.add_typer(mcp_app, name="mcp")
 app.add_typer(asset_app, name="asset")
 app.add_typer(ingest_app, name="ingest")
+app.add_typer(llm_app, name="llm")
 
 
 @app.callback(invoke_without_command=True)
@@ -544,7 +546,14 @@ def list_types(as_human: str = AS_OPTION) -> None:
 
 @app.command()
 def search(
-    query: str = typer.Argument(..., help="Free-text query; terms are ANDed."),
+    query: str = typer.Argument(
+        ...,
+        help=(
+            "Free-text query. Terms are ORed under a quorum: a node matches when the terms it "
+            "carries are worth at least half the query's discriminating weight, so a question "
+            "keeps working when the graph does not hold every one of its words."
+        ),
+    ),
     k: int = typer.Option(10, "--k", help="Maximum hits."),
     state: str = typer.Option(
         "active", "--state", help="Node-state filter ('any' searches all states)."
@@ -562,6 +571,11 @@ def search(
     expand: bool = typer.Option(
         False, "--expand", help="Append one-hop active-edge neighbors of the hits."
     ),
+    nl: bool = typer.Option(
+        False,
+        "--nl",
+        help="Let the model rewrite the question into search terms first (needs a provider).",
+    ),
     as_human: str = AS_OPTION,
 ) -> None:
     """Hybrid-search node title + content (BM25 + vector, RRF-fused).
@@ -569,22 +583,140 @@ def search(
     The vector signal participates when an embedding provider is available
     (fastembed installed and the model cached; otherwise search silently
     degrades to BM25). `signals` on each hit names what contributed.
+
+    `--nl` layers a model-written query on top (design E3) and adds a `rewrite`
+    object to the envelope saying what was asked on your behalf. It is a rewrite
+    of the *words*, not of the retrieval: every signal, filter and cap below it
+    is unchanged, and with no provider it is a no-op that says so and searches
+    your own words.
     """
-    result = _run(
-        search_module.search,
-        query,
-        k=k,
-        state=None if state == "any" else state,
-        type=type,
-        created_by=created_by,
-        created_after=created_after,
-        created_before=created_before,
-        include_meta=include_meta,
-        space=space,
-        expand=expand,
-        principal=_principal(as_human),
+    shared = {
+        "k": k,
+        "state": None if state == "any" else state,
+        "type": type,
+        "created_by": created_by,
+        "created_after": created_after,
+        "created_before": created_before,
+        "include_meta": include_meta,
+        "space": space,
+        "expand": expand,
+        "principal": _principal(as_human),
+    }
+    search_call = answers.natural_search if nl else search_module.search
+    _emit(_run(search_call, query, **shared))
+
+
+@app.command()
+def ask(
+    question: str = typer.Argument(..., help="What you want answered, in your own words."),
+    k: int = typer.Option(
+        answers.DEFAULT_ASK_K, "--k", help="Nodes to retrieve and put in front of the model."
+    ),
+    space: str | None = SPACE_FILTER_OPTION,
+    as_human: str = AS_OPTION,
+) -> None:
+    """Answer a question from the graph, with citations, or say it could not.
+
+    One retrieval and one model call. **It writes nothing** (design E1), and
+    `answered` is computed from citations that resolve to nodes you can read —
+    never from the model's own claim to have answered, which was measured
+    coming back `true` for a question its context could not answer.
+
+    **`answered: true` means four deterministic checks held, not that the answer
+    is true.** At least one citation resolves; the model did not also name a
+    note that does not exist while offering only one that does; every number in
+    the answer appears in the text that was really sent or in your question; and
+    there is answer text. A model that invents content while citing a real node
+    passes all four — so read the citations, and read `truncated_notes`, which
+    names every note the model saw only part of.
+
+    An unanswered question is an ordinary result and exit 0, not an error: the
+    envelope carries `answered: false`, a `refusal` saying why, `unresolved`
+    listing anything the model cited that does not exist,
+    `unsupported_numbers` listing what the answer stated and the notes did not,
+    and `used` saying what the attempt cost. `considered` is what reached the
+    model and is empty when no call was made. With no provider configured the
+    refusal names `NODUM_LLM_MODEL`.
+    """
+    _emit(
+        _run(
+            answers.ask,
+            question,
+            k=k,
+            space=space,
+            principal=_principal(as_human),
+        )
     )
-    _emit(result)
+
+
+@app.command()
+def summarize(
+    node_id: str = typer.Argument(..., help="Node at the centre of the region to summarise."),
+    depth: int = typer.Option(
+        answers.DEFAULT_SUMMARY_DEPTH, "--depth", help="Hops of neighbourhood to include."
+    ),
+    as_human: str = AS_OPTION,
+) -> None:
+    """Summarise a node and its neighbourhood. Reads only.
+
+    The subgraph is the bound, and it is read whether or not a provider is
+    configured — so a node that does not resolve is the ordinary not-found
+    refusal rather than a complaint about the model.
+
+    **What is sent is narrower than what you can read.** Archived, proposed and
+    meta-space nodes the walk returned are not put in front of the model — `ask`
+    cannot reach them either — and they are named in `withheld`. Each note
+    carries its `state`, `truncated_notes` names any the window narrowed, and
+    `truncated` is still the separate fact that the *walk* stopped at its cap.
+
+    Design E1 sketches an opt-in flag that files the summary as a reviewable
+    `proposed` version. It is deliberately absent here: 5b-i is cut exactly at
+    the line where a model call causes a write.
+    """
+    _emit(
+        _run(
+            answers.summarize,
+            node_id,
+            depth=depth,
+            principal=_principal(as_human),
+        )
+    )
+
+
+@llm_app.command("status")
+def llm_status(
+    probe: bool = typer.Option(
+        True, "--probe/--no-probe", help="Make one small call to see whether the endpoint answers."
+    ),
+    as_human: str = AS_OPTION,
+) -> None:
+    """Say whether a model provider is configured, and whether it answers.
+
+    **Two different facts, reported apart.** `configured` comes from the
+    environment and costs nothing; `reachable` costs one small call, because
+    that is the only thing that can answer it. `nodum.llm` deliberately makes no
+    network call while resolving, so a server that is down at 03:00 and up at
+    03:05 is not a configuration change — and `reachable` is therefore
+    *tri-state*, and `null` is **not established** rather than "not asked":
+    nothing is configured to ask, `--no-probe` declined it, or the probe was
+    asked and no answer arrived inside `call_timeout`. That last one is
+    deliberately not `false` — a refused connection is a server that is not
+    running, and no answer yet is very often a live server loading a model.
+
+    The probe is cheap in the case that matters: nothing listening is a refused
+    connection in well under a millisecond, and a model the server does not have
+    is an HTTP 404 in about one. It goes through the same runtime every other
+    model call does, which is why it takes `--as`: a command that spent a call
+    with nobody named would be the one unattributed spend in this system — and
+    `used` says what it cost (34 tokens, measured), because a spend nobody can
+    see is the same problem one step along. It waits the run's own
+    `NODUM_LLM_CALL_TIMEOUT` rather than a ceiling of its own, so the sentence
+    in `detail` and the number in `call_timeout` are the same number.
+
+    Nothing here is an error. An install with no provider is a perfectly good
+    install — the smart features are off — so this exits 0 and says so.
+    """
+    _emit(_run(answers.provider_status, principal=_principal(as_human), probe=probe))
 
 
 @app.command(name="suggest-links")
@@ -1543,6 +1675,44 @@ def cycle_abandon(
     back is exactly what this unlocks.
     """
     _emit(_run(service.abandon_cycle, cycle_id, principal=_principal(as_human)))
+
+
+@app.command(name="cycle-stop")
+def cycle_stop(
+    cycle_id: str = typer.Argument(..., help="The running cycle to ask to stop."),
+    as_human: str = AS_OPTION,
+) -> None:
+    """Ask a running cycle to stop, and record who asked — the kill switch (human-only).
+
+    It stamps the cycle with who asked and when, and does nothing else: the entry
+    stays `running`, no event is emitted, and nothing the run already wrote is
+    touched. The run notices at its next check — between jobs, between items, or
+    immediately before a model call — and closes its own entry `failed`, so the
+    journal says the operator stopped that night rather than that a process died.
+
+    **Not `cycle-abandon`.** That is a repair: a human closing a dead process's
+    entry from *outside*, which is what makes its writes reversible. This is an
+    instruction to a run that is still alive and expected to obey it. A `failed`
+    entry read the next morning has to say which of the two happened, so the two
+    verbs stay apart.
+
+    **Not `rollback` either.** Stopping reverses nothing: every write the run made
+    stays in the graph, stamped with the cycle, and `rollback <cycle-id>` is what
+    takes those back once the entry has closed. Stopping and undoing are two
+    decisions, and a switch that also reverted would make "stop, look at what it
+    did, then decide" impossible — which is the reason a human hits one.
+
+    Asking twice is a no-op that keeps the first asker. A cycle that has already
+    said how it ended is refused: there is nothing left to obey the instruction,
+    and the stamp would name a run that never saw it.
+
+    **What obeys it today** is the model-calling runtime (`nodum.agent`), which
+    checks the switch before every provider call. The four deterministic
+    consolidation jobs make no model call and no such check, so a stop recorded
+    against one is kept in the journal and that run finishes on its own —
+    `cycle-abandon` is the verb for a run that will never finish at all.
+    """
+    _emit(_run(service.request_stop, cycle_id, principal=_principal(as_human)))
 
 
 def _rollback(cycle_id: str, *, dry_run: bool, principal: Principal) -> RollbackOut:

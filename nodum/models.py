@@ -114,12 +114,19 @@ class UndoResult(BaseModel):
     deleted a created row); ``deleted`` lists rows removed by a create
     reversal (the created row plus, for nodes, its versions and incident
     edges).
+
+    ``restored_version`` is the second row a reversal can move: accepting a
+    proposed update rewrites the node *and* flips the ``versions`` row to
+    ``applied``, so undoing it puts the proposal back to ``proposed`` and says
+    so here. It is ``None`` on every reversal that moved no version — and on
+    undoing a *rejection*, where the version row is the one under ``restored``.
     """
 
     undone_seq: int
     undone_op: str
     restored: dict[str, Any] | None
     deleted: list[dict[str, Any]]
+    restored_version: dict[str, Any] | None = None
     undo_event_seq: int
 
 
@@ -498,6 +505,18 @@ class CycleOut(BaseModel):
     which is who *acted* (the gardener). ``report`` is the runner's summary,
     ``None`` while the cycle is still running, as ``finished_at`` is.
     ``rolled_back_by`` names the rollback cycle that reversed this one.
+
+    ``stop_requested_by`` and ``stop_requested_at`` are the kill switch's record
+    (design K1–K3): who told this run to stop, and when. They outlive the run,
+    because a journal entry has to go on saying that this night was stopped and
+    by whom. ``stop_requested`` is the boolean both surfaces render, and it is
+    **derived** — ``stop_requested_at is not None``, computed on every read and
+    stored in no column, the same rule :attr:`CycleDetailOut.metrics` follows.
+    A flag beside the stamps could disagree with them; an expression cannot.
+
+    A stop is deliberately not an abandon: the columns say the operator stopped
+    this run, ``report["abandoned"]`` says a human declared a dead process dead,
+    and a ``failed`` cycle at 09:00 is read differently depending on which.
     """
 
     id: str
@@ -510,6 +529,9 @@ class CycleOut(BaseModel):
     started_at: str
     finished_at: str | None
     rolled_back_by: str | None
+    stop_requested: bool
+    stop_requested_by: str | None
+    stop_requested_at: str | None
 
 
 class CycleDetailOut(BaseModel):
@@ -745,11 +767,35 @@ class RollbackOut(BaseModel):
     non-graph events — audit records like ``asset.download`` that have no graph
     effect to reverse.
 
+    ``restored_versions`` names the ``versions`` rows the reversal put back —
+    the review decisions inside the cycle, by version id. A review moves two
+    rows from one decision and only the node is a graph record, so an accept's
+    version move rides on the ``node.update`` it caused and a reject is a
+    ``version.reject`` of its own; both are reversed, and both are counted here
+    rather than in ``restored_nodes``.
+
     ``conflicts`` is empty on a rollback that happened; on a dry run it is the
     reason it would not. ``blockers`` is the second half of that verdict — the
     delete guards, which refuse for a different reason and used to be invisible
     until the rollback was already running. Both lists are empty on a rollback
     that happened, and a dry run reporting either is a rollback that would fail.
+
+    **Every other list means the same thing on both**: on a ``dry_run: true``
+    response the six outcome lists are what the rollback *would* restore, delete
+    and unlink, computed from the plan by the accounting the run itself fills.
+    They used to come back empty on a dry run whatever the rollback was about to
+    do, which made the preflight a confirm dialog calls disagree with the run —
+    the shape ``blockers`` was fixed for one round earlier.
+
+    **On a dry run, read ``conflicts`` and ``blockers`` before reading the six
+    as an outcome.** They are computed from the payloads alone and say nothing
+    about whether the rollback can run, so a blocked verdict describes a
+    reversal in the same object that says it would be refused — *"this would
+    delete node X"* beside *"it cannot, X has a child"*. That is the honest
+    shape for a preflight (the six answer "what is this rollback", the two
+    answer "would it go through"), and it is only readable as a contradiction by
+    a client that renders the six without checking the two. The verdict is clean
+    only when both lists are empty.
     """
 
     cycle_id: str
@@ -759,6 +805,7 @@ class RollbackOut(BaseModel):
     skipped_events: list[int]
     restored_nodes: list[str]
     restored_edges: list[str]
+    restored_versions: list[int] = []
     deleted_nodes: list[str]
     deleted_edges: list[str]
     redirects_removed: list[str]

@@ -93,6 +93,17 @@ a `proposed` **version** that records *which fields it named*. Accepting applies
 only those fields to the node as it stands at that moment, so a human edit made
 while the proposal waited survives.
 
+**A review is reversible, on both halves.** A version leaves `proposed` exactly
+once, so a reversal that put the node back and left the proposal marked
+`applied` would strand it: neither acceptable nor rejectable, over content that
+had gone back. Both `undo` and `rollback` therefore move the version row with
+the node — an accept records that move on the `node.update` it emits, a reject
+is an event in its own right — and a rejection is as reversible as an
+acceptance. This matters more than it looks: the gardener holds `edit` on
+`main`, which is authority to *review*, so a proposal accepted inside a
+consolidation cycle is taken back by `nodum rollback <cycle-id>` like every
+other write the cycle made.
+
 ### Grants
 
 A grant is one row per (agent, space). It is set with
@@ -234,6 +245,37 @@ closes it `failed`, with a report naming who declared it dead, and `rollback`
 then works normally. A cycle that already said how it ended is refused rather
 than re-closed.
 
+### Stopping a run, and the three verbs it sits between
+
+`nodum cycle-stop <id>` (or the button on the journal entry) is the **kill
+switch**: it records that a human asked this run to stop, and who, and when. It
+changes nothing else — the entry stays `running`, and the run closes its own
+entry `failed` when it next checks. Asking twice keeps the first asker rather
+than raising, because a switch that objected to a second press would make a
+human doubt the first, which is the one moment that must not be ambiguous.
+
+**A stop is not an abandon.** Abandoning is a *repair*: a human declaring
+somebody else's dead process dead and closing its entry from outside, so that
+what it wrote becomes reversible. A stop is an *instruction* to a run that is
+still alive and expected to obey it and close itself honestly. The two end in
+the same status, so the journal keeps them apart in the record instead: an
+abandoned entry carries who abandoned it, a stopped one carries who asked it to
+stop and when. Reading a `failed` cycle at 09:00, that difference is the whole
+question.
+
+**Neither one reverses anything.** Every write the run made stays in the graph,
+stamped with the cycle, and `nodum rollback <cycle-id>` is what takes those back
+once the entry has closed. Stopping and undoing are two decisions, and a switch
+that did both would make "stop, look at what it did, then decide" impossible —
+which is the reason a human hits one.
+
+What obeys a stop is the run. The check that exists today sits immediately
+before every model call, so a cycle of the four **deterministic** jobs — which
+call no model — runs to completion even after you stop it, and closes
+`completed` with the stop recorded on it. That is not a failure and the journal
+does not read it as one. For a run that is never going to finish at all,
+`cycle-abandon` is the verb.
+
 The **curative tier** is the human-facing half of the same machinery:
 `merge-nodes`, `retype`, `supersede-edge` and `bulk-relink` change structure
 rather than adding to it. Each runs inside a cycle even when you type it
@@ -272,7 +314,11 @@ nodum projector rebuild vec     # e.g. after an embedding-model change
 
 Two ship today:
 
-- **`fts`** — a SQLite FTS5 full-text index, giving BM25 keyword ranking. An
+- **`fts`** — a SQLite FTS5 full-text index, giving BM25 keyword ranking. A
+  query's terms are not all required: a node is kept when the ones it carries
+  are worth at least half the query's weight, rare words counting for more than
+  common ones and unknown words for nothing, so a question-shaped query works
+  and one absent term does not empty the result. An
   ingested document's full extracted text is joined onto the `asset_ref` node
   that stands for its bytes — and onto that node only, so a word on page 3 does
   not match every other page of the document just as strongly.

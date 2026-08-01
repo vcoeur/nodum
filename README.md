@@ -90,6 +90,8 @@ uv run nodum node create --type note --title "My note" --as owner \
 uv run nodum edge list --type mentions --as owner   # the wikilink became an edge
 
 uv run nodum search "graph theory" --as owner       # hybrid search (BM25 + vector, RRF-fused)
+uv run nodum llm status --as owner                  # is a model configured, and does it answer?
+uv run nodum ask "what did I write about graphs?" --as owner   # a cited answer, or an honest no
 uv run nodum projector status                 # derived-index checkpoints + availability
 uv run nodum projector rebuild fts            # drop + replay from event 0
 uv run nodum projector rebuild vec            # the model-change re-embed path
@@ -168,6 +170,7 @@ uv run nodum consolidate --as owner             # for real: candidates land in t
 uv run nodum cycle-list --as owner              # the dream journal, newest first
 uv run nodum cycle-get <cycle-id> --as owner    # what ran, what it measured, how it ended
 uv run nodum events --cycle <cycle-id> --as owner   # what it changed — the log, not a copy
+uv run nodum cycle-stop <cycle-id> --as owner      # ask a live run to wind down
 uv run nodum cycle-abandon <cycle-id> --as owner   # close a run a SIGKILL left open
 uv run nodum rollback <cycle-id> --dry-run --as owner   # would this succeed?
 uv run nodum rollback <cycle-id> --as owner     # all of it, or none of it
@@ -308,6 +311,14 @@ degrades to BM25 + graph expansion. `NODUM_EMBED_MODEL` switches the model
   server shut down mid-cycle — `nodum cycle-abandon <id>` closes it `failed`,
   which is what makes its writes reversible at all: rollback refuses a cycle
   that is still running and `undo` refuses every cycle-stamped event.
+  **A run that is still alive is a different verb**: `nodum cycle-stop <id>`
+  is the kill switch, and it records that a human asked this run to stop, who,
+  and when — the entry stays `running`, nothing it wrote is touched, and the run
+  closes its own entry at its next check. Abandoning is a *repair* (somebody
+  else's dead process, closed from outside); a stop is an *instruction* a live
+  run obeys. Both end `failed`, so the record rather than the status is what
+  tells a human at 09:00 which of the two happened, and neither reverses a
+  single write — `rollback` is still the only verb that does.
   **Only one consolidation cycle runs at a time against a file**, and that is a
   uniqueness rule on the journal rather than a lock inside one process: a `nodum
   consolidate` typed at a terminal while `nodum serve` is running one is refused
@@ -395,8 +406,9 @@ degrades to BM25 + graph expansion. `NODUM_EMBED_MODEL` switches the model
   registry: the review tools
   (`accept`/`reject`), the curative tools (`merge_nodes`, `retype`,
   `supersede_edge`, `bulk_relink`, `consolidate`) and reversal with the journal
-  that records it (`undo`, `rollback`, `abandon_cycle`, `get_cycle`,
-  `list_cycles`) are **never registered** —
+  that records it, plus the kill switch beside it (`undo`, `rollback`,
+  `abandon_cycle`, `request_stop`, `get_cycle`, `list_cycles`) are **never
+  registered** —
   structural enforcement of §8.1/§8.2. The curative tier is built and in use;
   keeping it off MCP is a decision about a surface that exists, not a note about
   code that does not. One call there could merge two nodes or rewrite five
@@ -414,7 +426,9 @@ degrades to BM25 + graph expansion. `NODUM_EMBED_MODEL` switches the model
   database busy → a retryable 503). The consolidation journal is on it as
   `GET /api/cycles`, `POST /api/cycles` (run one now, `dry_run` to rehearse),
   `GET /api/cycles/{id}` (the entry plus the events it wrote),
-  `POST /api/cycles/{id}/abandon` (close a run that never finished) and
+  `POST /api/cycles/{id}/abandon` (close a run that never finished),
+  `POST /api/cycles/{id}/stop` (ask a run that is still going to wind down —
+  the row comes back still `running`, carrying who asked and when) and
   `POST /api/cycles/{id}/rollback` — where a graph that has moved on is a
   **409** carrying the conflicting rows, not a bare refusal, and asking for a
   cycle while one is running is a 409 too. Running one does not block the
@@ -507,7 +521,11 @@ degrades to BM25 + graph expansion. `NODUM_EMBED_MODEL` switches the model
   before and after, and the events it wrote — with a button to run a cycle (or
   rehearse one) and the rollback that takes a whole cycle back, which asks first
   and, when the graph has moved on, names both ends of every collision instead
-  of a count. Every route is a real URL that survives a reload. Source
+  of a count. A `running` entry offers the two verbs that are not a rollback and
+  keeps them apart in words: **stop** asks a live run to wind down (the entry
+  stays running, and who asked and when is shown on it), **abandon** closes the
+  entry of a run nothing is going to finish. Neither reverses a write, and both
+  confirms say so before the button rather than in a toast afterwards. Every route is a real URL that survives a reload. Source
   and conventions: [`web/README.md`](web/README.md).
 - **Spaces in the UI are a filter and a target, never a mode.** Search, the node
   graph and the review queue take a space *filter* that narrows and defaults to
@@ -611,6 +629,26 @@ degrades to BM25 + graph expansion. `NODUM_EMBED_MODEL` switches the model
   lives in, since a result list spans every space in scope unless `--space`
   narrowed it. With no embedding
   provider, the vector signal drops out and search stays BM25 + graph.
+  **The keyword half ORs the terms under a quorum rather than ANDing them**: a
+  node matches when the query terms it carries are worth at least half the
+  query's inverse-document-frequency weight, counting content words only — the
+  ordinary English a question is phrased with is dropped before the weighing,
+  so a rare word earns a match, a common one costs nothing, and the words you
+  ask with never outvote the word you are asking about. When a search comes
+  back empty, the fix is a *rarer* word, not a shorter query.
+- **A model can read the graph, and it never writes it.** `nodum ask`,
+  `nodum summarize` and `nodum search --nl` (over HTTP: `POST /api/ask`,
+  `POST /api/summarize`, `GET /api/search?nl=1`) put a language model in front
+  of your notes, and `nodum llm status` says whether one is configured and
+  whether it answers — two different facts, reported apart. **Nothing writes.**
+  An answer is only an answer when its citations resolve to notes the retrieval
+  actually returned: the model's own claim to have answered is never read,
+  because a small model asked something its notes cannot answer will say yes.
+  Everything that can go wrong — no provider, an unreachable one, a truncated
+  reply, a spent budget — comes back as an ordinary result saying it could not
+  answer and why. Configure it with `NODUM_LLM_MODEL` (unset means off, which is
+  the default); it speaks any OpenAI-compatible endpoint, `ollama` on localhost
+  included.
 
 See [docs/architecture.md](docs/architecture.md) for the module map and
 [AGENTS.md](AGENTS.md) for contributor/agent workflow rules.
