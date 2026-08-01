@@ -786,6 +786,16 @@ class RollbackOut(BaseModel):
     They used to come back empty on a dry run whatever the rollback was about to
     do, which made the preflight a confirm dialog calls disagree with the run —
     the shape ``blockers`` was fixed for one round earlier.
+
+    **On a dry run, read ``conflicts`` and ``blockers`` before reading the six
+    as an outcome.** They are computed from the payloads alone and say nothing
+    about whether the rollback can run, so a blocked verdict describes a
+    reversal in the same object that says it would be refused — *"this would
+    delete node X"* beside *"it cannot, X has a child"*. That is the honest
+    shape for a preflight (the six answer "what is this rollback", the two
+    answer "would it go through"), and it is only readable as a contradiction by
+    a client that renders the six without checking the two. The verdict is clean
+    only when both lists are empty.
     """
 
     cycle_id: str

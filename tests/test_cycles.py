@@ -813,6 +813,114 @@ def test_the_stop_read_refuses_an_unwatchable_cycle_in_an_unknown_ids_own_words(
     assert service.stop_requested(over_main.id, principal=owner()) is False
 
 
+def test_a_human_reads_the_switch_on_an_unscoped_cycle_they_hold_no_grant_on(fresh_db):
+    """Humans hold `grants == {}`, so the short circuit is load-bearing, not tidy.
+
+    `Principal.level_on` answers `EDIT` for a human whatever the space, so the
+    *scoped* branch would pass a human on its own — every human assertion in the
+    tests beside this one is on a scoped cycle and so proves nothing about the
+    `is_human` line. The **unscoped** branch is different: it asks
+    `_cycle_authority_spaces(principal, None)`, which iterates `principal.grants`
+    — and a human has none, because authority everywhere is not spelled as a
+    grant anywhere. Without the short circuit that set is empty, `bool()` is
+    False, and the owner is told their own unscoped cycle does not exist.
+    """
+    cycle = _open()  # `manual`, no scope: the whole file
+    assert cycle.scope is None
+    assert owner().grants == {}, "a human's authority is not spelled as grants"
+    assert service._cycle_authority_spaces(owner(), None) == set()
+
+    assert service.stop_requested(cycle.id, principal=owner()) is False
+    service.request_stop(cycle.id, principal=owner())
+    assert service.stop_requested(cycle.id, principal=owner()) is True
+
+
+def test_the_widened_rule_is_the_callers_and_admits_agents_with_no_part_in_the_run(fresh_db):
+    """The rule is caller-relative, and this is the width that buys.
+
+    `cycles` records `triggered_by` — who *asked* — and has no column for who is
+    *running*, so "exactly what admitted this run" is not a question the row can
+    answer. What is asked instead is the admission rule applied to the caller,
+    which admits every agent granted on the scope, including ones with no part
+    in the run at all. Named here rather than left implicit: the delta is the
+    reason a reader should not believe the narrower sentence.
+
+    The grant sets are the two that arrive without anybody choosing them — the
+    `read` on `meta` `create_agent` gives every new agent, and the `meta: read` +
+    `main: suggest` parity pair `0010` backfilled onto the agents that predate
+    it. Both were refused by `require_review`, which needs `edit`.
+    """
+    parity = agent("parity", grants={"meta": "read", "main": "suggest"})
+    minimal = agent("minimal", grants={"meta": "read"})
+    assert parity.level_on("main") < 3 and minimal.level_on("meta") < 3
+
+    # A cycle over `main` neither of them opened, asked for, or can close.
+    over_main = _open(scope="main")
+    assert over_main.triggered_by == "human:owner"
+    for refused in (parity, minimal):
+        with pytest.raises(GrantNotPermitted, match="close a consolidation cycle"):
+            service.close_cycle(over_main.id, status="completed", report={}, principal=refused)
+
+    assert service.stop_requested(over_main.id, principal=parity) is False
+    with pytest.raises(RecordNotFound, match="consolidation cycle not found"):
+        service.stop_requested(over_main.id, principal=minimal)
+
+    # And `meta`, which the minimal set does reach — a cycle over the type
+    # vocabulary is watchable by anything that can resolve a type.
+    service.close_cycle(over_main.id, status="completed", report={}, principal=owner())
+    over_meta = _open(scope="meta")
+    for watcher in (parity, minimal):
+        assert service.stop_requested(over_meta.id, principal=watcher) is False
+
+
+def test_close_cycle_still_names_the_grant_and_the_collapse_is_the_stop_reads_alone(fresh_db):
+    """The oracle is closed on this read, not on the class, and that is deliberate.
+
+    `close_cycle` takes a cycle id, is not human-only, and answers a principal
+    that may not close one with `GrantNotPermitted` where an unknown id gets
+    `RecordNotFound` — the shape `stop_requested` was just taken out of. It is
+    the only cycle-id surface left that tells the two apart, and it stays that
+    way: the refusal is the *same* `require_review` `open_cycle` raises, on the
+    same spaces, and `open_cycle` takes a scope rather than an id and so cannot
+    be an oracle at all. Collapsing half of that pair would tell a principal
+    holding a cycle open that the cycle does not exist, and would falsify the
+    symmetry `Store.require_review` documents.
+
+    Asserted rather than left as a comment so that a later collapse is a
+    decision somebody makes, and so the shipped claim — the stop read's, not the
+    class's — can be checked against what the code does.
+    """
+    research = service.create_space("research", principal=owner())
+    elsewhere = agent("elsewhere", grants={"meta": "read", research.id: "edit"})
+    over_main = _open(scope="main")
+    invented = uuid.uuid4().hex
+
+    with pytest.raises(GrantNotPermitted, match="close a consolidation cycle"):
+        service.close_cycle(over_main.id, status="completed", report={}, principal=elsewhere)
+    with pytest.raises(RecordNotFound, match="consolidation cycle not found"):
+        service.close_cycle(invented, status="completed", report={}, principal=elsewhere)
+
+    # The read beside it collapses both onto one sentence, which is the whole of
+    # what the commit claims.
+    for cycle_id in (over_main.id, invented):
+        with pytest.raises(RecordNotFound, match="consolidation cycle not found"):
+            service.stop_requested(cycle_id, principal=elsewhere)
+
+    # Every other cycle-id surface refuses this principal before it reads the
+    # row at all, so none of them can distinguish either.
+    for call in (
+        lambda cycle_id: service.get_cycle(cycle_id, principal=elsewhere),
+        lambda cycle_id: service.request_stop(cycle_id, principal=elsewhere),
+        lambda cycle_id: service.abandon_cycle(cycle_id, principal=elsewhere),
+        lambda cycle_id: service.rollback_cycle(cycle_id, principal=elsewhere),
+        lambda cycle_id: service.list_events(cycle_id=cycle_id, principal=elsewhere),
+    ):
+        with pytest.raises(GrantNotPermitted):
+            call(over_main.id)
+        with pytest.raises(GrantNotPermitted):
+            call(invented)
+
+
 def test_the_spaces_the_stop_read_is_checked_against_are_the_cycles_own(fresh_db):
     """A scoped cycle is checked against its scope, not against the caller's map.
 
@@ -835,14 +943,22 @@ def test_a_cycle_the_gardener_may_run_on_a_read_grant_can_read_its_own_switch(fr
     """The rule that shipped killed a night this system genuinely licenses.
 
     `consolidate._require_gardener_scope` admits a scoped run on any grant that
-    *resolves* the space — `read` included — and `_run_cycle` closes the cycle
-    as the **opener**, which for a human-triggered run is the human. So the
-    gardener never exercises the closing authority the old check demanded of it,
-    and a run the human asked for over a space the gardener reads was refused
-    its own switch: `GrantNotPermitted` out of the first provider call, a kill
-    switch killing the run by being unreadable.
+    *resolves* the space — `read` included — so a run the human asked for over a
+    space the gardener reads was refused its own switch: `GrantNotPermitted` out
+    of the first provider call, a kill switch killing the run by being
+    unreadable.
 
-    Both halves are asserted together on purpose — the claim is not "the check
+    **Who closes the cycle depends on the trigger, and the old check was unsound
+    either way.** `_run_cycle` closes as the *opener*, and `_opener` resolves
+    that to the human on a `manual` run and to the **gardener itself** on a
+    `scheduled` one — so the check demanded closing authority of a principal
+    that does not close (manual), or re-asked a question `open_cycle` had
+    already answered `yes` before the run started (scheduled). Both are asserted
+    below, because the unqualified sentence "the runner does not close the
+    cycle" is false of half the runs this system makes and survived three copies
+    of the rationale with nothing pinning it.
+
+    The scoped assertions are together on purpose — the claim is not "the check
     passes" but "the check is no stricter than the door it sits behind".
     """
     research = service.create_space("research", principal=owner())
@@ -859,24 +975,65 @@ def test_a_cycle_the_gardener_may_run_on_a_read_grant_can_read_its_own_switch(fr
     service.request_stop(cycle.id, principal=owner())
     assert check() is True
 
+    # Who the closer actually is, per trigger. A human-triggered run closes as
+    # the human — the gardener never exercises the authority the old check
+    # wanted of it...
+    trigger, opener = consolidate._opener("human:owner", gardener, None)
+    assert (trigger, opener.actor_string) == ("manual", "human:owner")
+    # ...and a scheduled one closes as the gardener, which `open_cycle` had
+    # already required `edit` on the scope for. The old check could refuse
+    # nothing there that the door had not refused first.
+    trigger, opener = consolidate._opener(service.SCHEDULER_ACTOR, gardener, None)
+    assert (trigger, opener.actor_string) == ("scheduled", f"agent:{GARDENER_AGENT_ID}")
+    with pytest.raises(GrantNotPermitted, match="open a consolidation cycle"):
+        service.open_cycle(trigger="scheduled", scope=research.id, principal=opener)
 
-def test_a_space_archived_mid_run_does_not_make_its_cycle_unstoppable(fresh_db):
-    """The recorded scope, not a fresh resolution of it — `close_cycle`'s rule.
 
-    Resolving it again would refuse (`_resolve_space` matches active spaces
-    only), and a run would then go on spending against a switch it could not
-    read. The principal is an **agent** on purpose: a human passes
-    `require_review` before the scope is looked at at all, so a human-only
-    fixture could not reach the branch this is about.
+def test_a_space_archived_mid_run_keeps_the_switch_readable_for_the_running_principal(fresh_db):
+    """What the recorded scope buys, and — the second half — what it does not.
+
+    Reading the recorded scope rather than resolving it again is what keeps the
+    *lookup* working: `_resolve_space` matches active spaces only, so a
+    re-resolution would refuse outright. But it does not make an archived
+    space's cycle readable, because that is not how archiving cuts an agent off:
+    `auth._grant_set` drops grants on archived spaces **when a principal is
+    minted**, so the switch stays readable exactly as long as the principal
+    reading it predates the archive. `consolidate._run_cycle` mints the gardener
+    once and holds it for the whole cycle, which is the case that matters and
+    the first half below.
+
+    The second half is the cost, asserted rather than left to be discovered: the
+    *next* principal minted for that cycle — a later process, a restart, a CLI
+    invocation — holds no grant on the archived scope and is refused, and since
+    the refusal collapsed into the not-found one it now tells a legitimate
+    runner that **its own cycle does not exist**. That is not a regression;
+    `require_review` refused the same principal for the same reason, in words
+    that at least named grants. It is the price of the non-oracle collapse, and
+    a test that only ever reused one principal object (as this one did) reads as
+    a guarantee that no such price was paid.
+
+    The principal is an **agent** on purpose: a human passes before the scope is
+    looked at at all, so a human-only fixture could not reach the branch.
     """
     space = service.create_space("research", principal=owner())
     writer = agent("writer", grants={"meta": "read", space.id: "edit"})
     cycle = _open(trigger="curative", scope=space.id, principal=writer)
     service.archive_space(space.id, principal=owner())
 
+    # Held across the archive: the grant set was read before it happened.
+    assert writer.level_on(space.id) >= 3
     assert service.stop_requested(cycle.id, principal=writer) is False
     service.request_stop(cycle.id, principal=owner())
     assert service.stop_requested(cycle.id, principal=writer) is True
+
+    # Minted after it: the same account, the same cycle, no grant, and the
+    # refusal is the one an id naming nothing gets.
+    reminted = auth.agent_principal("writer")
+    assert reminted.level_on(space.id) == 0, "archiving is what makes the grant inert"
+    with pytest.raises(RecordNotFound, match=f"consolidation cycle not found: {cycle.id}"):
+        service.stop_requested(cycle.id, principal=reminted)
+    # And the human who archived it still reads the switch, as everywhere.
+    assert service.stop_requested(cycle.id, principal=owner()) is True
 
 
 def test_the_stop_switch_is_armed_and_the_runtime_reads_the_real_service(fresh_db):

@@ -24,8 +24,22 @@ question words more inverse-document-frequency weight than the term that
 answers the question, so function words are named in a list
 (:data:`_QUERY_STOPWORDS`) rather than inferred from a frequency that has not
 got the corpus to say it with. They never decide a search on their own: a query
-the graph knows no content word of answers with nothing, rather than with the
-notes that happen to share its phrasing.
+the graph knows no content word of answers with **nothing from the keyword
+arm**, rather than with the notes that happen to share its phrasing.
+
+**That refusal is the keyword arm's, and it is not the whole of `search`.**
+:func:`_search_vector` has no similarity threshold — the ANN list is always
+``k`` deep — so on an install that *has* an embedding provider the vector arm
+answers the query the keyword arm just refused, and the caller gets ``k`` hits
+each carrying the ``vector`` signal alone. On the default install, which has no
+provider, the refusal is the whole answer. Both are pinned:
+``tests/test_search.py`` for the keyword arm, ``tests/test_hybrid_search.py``
+for what the vector arm does beside it. Closing the gap means a similarity
+floor, and a floor is a number nothing here can measure yet: it needs a real
+embedding model over a real graph, because the test provider's similarity is
+token overlap and every threshold measured against it would look free while
+costing the paraphrase recall the vector arm exists for. Until then the
+disagreement is stated rather than papered over.
 
 Both projectors are caught up before querying, so search always reflects the
 latest committed events without a manual projector run.
@@ -146,6 +160,27 @@ yet
 #: is eleven.
 _MAX_QUERY_TERMS = 64
 
+#: Characters trimmed off both ends of a token before it is compared to another
+#: token or to :data:`_QUERY_STOPWORDS`. The double quote is FTS5's own phrase
+#: syntax, the rest is the punctuation a human types around a word — a question
+#: mark rides along on the last word of every question. Only the *ends* are
+#: trimmed, which is what keeps ``min.insync.replicas`` and ``c++`` one term.
+_TERM_TRIM = "\"?!.,;:()[]{}'…"
+
+
+def _bare_word(token: str) -> str:
+    """Fold a raw or quoted token to the word FTS5 will tokenize it to.
+
+    Case and edge punctuation are exactly what the ``porter unicode61``
+    tokenizer discards, so this is the comparison two tokens are "the same
+    word" under. One helper rather than two, because the two callers
+    disagreeing about that was a defect: :func:`_is_function_word` stripped
+    punctuation before its lookup and :func:`_query_terms` did not before its
+    dedup, so ``kafka,`` and ``kafka`` were one function-word question and two
+    distinct quorum terms at the same time.
+    """
+    return token.strip(_TERM_TRIM).casefold()
+
 
 def _connect(path: str | Path | None) -> sqlite3.Connection:
     """Open a connection and apply any pending migrations (idempotent)."""
@@ -164,9 +199,17 @@ def _query_terms(query: str) -> list[str]:
     Nothing else in this module builds a MATCH expression, so this is the one
     place a user string becomes FTS5 syntax.
 
-    Repeats are dropped case-insensitively because the quorum weighs terms:
-    typing a word twice would otherwise count its weight twice, both in what a
-    document must reach and in what it can collect.
+    Repeats are dropped because the quorum weighs terms: typing a word twice
+    would otherwise count its weight twice, both in what a document must reach
+    and in what it can collect. "The same word" is :func:`_bare_word` — what
+    the FTS5 tokenizer will reduce the token to — and not the raw token, which
+    is where this went wrong: folding case alone left ``kafka,`` and ``kafka``
+    two terms carrying one word's document frequency twice, enough to clear a
+    bar half of itself and turn the two-equal-terms rule back into the bare
+    disjunction it was chosen over. The token kept is the first one seen, still
+    quoted whole: FTS5 tokenizes the punctuation away itself, so ``"kafka,"``
+    matches the same rows as ``"kafka"`` and there is nothing to gain by
+    rewriting what the caller typed.
 
     Raises:
         ValueError: If the query has no terms, or more than
@@ -177,7 +220,7 @@ def _query_terms(query: str) -> list[str]:
     seen: dict[str, str] = {}
     for token in query.split():
         if token.strip():
-            seen.setdefault(token.casefold(), '"' + token.replace('"', '""') + '"')
+            seen.setdefault(_bare_word(token), '"' + token.replace('"', '""') + '"')
     if not seen:
         raise ValueError("query must contain at least one term")
     if len(seen) > _MAX_QUERY_TERMS:
@@ -191,19 +234,36 @@ def _is_function_word(term: str) -> bool:
     """Whether a quoted term is one of :data:`_QUERY_STOPWORDS`.
 
     The term is quoted FTS5 syntax by now, and a question mark rides along on
-    the last word of every question, so both come off before the lookup:
-    ``"against?"`` is the same function word as ``against``. Inner punctuation
-    stays, which is what keeps ``min.insync.replicas`` one term.
+    the last word of every question, so both come off before the lookup
+    (:func:`_bare_word`): ``"against?"`` is the same function word as
+    ``against``. Inner punctuation stays, which is what keeps
+    ``min.insync.replicas`` one term.
     """
-    return term.strip('"').strip("?!.,;:()[]{}'…").casefold() in _QUERY_STOPWORDS
+    return _bare_word(term) in _QUERY_STOPWORDS
 
 
 class _MatchPlan(NamedTuple):
     """A compiled query: the FTS5 expression plus the quorum restriction.
 
-    ``cte`` is a ``WITH`` prefix and ``clause`` a WHERE fragment naming it;
-    both are empty when the quorum cannot exclude anything, in which case the
-    query is the bare expression and costs exactly what it did before.
+    ``cte`` is a ``WITH`` prefix and ``clause`` a WHERE fragment naming it.
+    Both empty means only that there is no quorum to apply, and **three
+    different plans share that shape** — reading it as "permissive" is wrong
+    for one of them:
+
+    * the quorum is **unnecessary**: no rows to search, one term, or one
+      surviving term. The query is the bare expression and costs exactly what
+      it did before.
+    * the quorum is **given up**: ``plain``, every term restored because the
+      drops left nothing at all.
+    * the quorum is **refused**: :func:`_compile_match`'s early return, where
+      ``match`` is deliberately an expression the index cannot satisfy —
+      the content words of a query the graph has never seen one of. This one
+      is the *opposite* of permissive, and it is the one a reader of this
+      class alone would get backwards.
+
+    Nothing downstream needs to tell them apart — :func:`_search_bm25` treats
+    an empty ``cte``/``clause`` identically in all three — which is why the
+    distinction lives here in prose rather than in a fourth field.
     """
 
     match: str
@@ -265,6 +325,30 @@ def _compile_match(
     because a ranked list of notes sharing a question's phrasing is a
     confident answer to a word the graph has never heard of.
 
+    **What that early return tests is "no content word *known*", not "no
+    content word that *discriminates*"** — and the difference is not small.
+    An ordinary question carries ordinary English nouns and verbs that
+    :data:`_QUERY_STOPWORDS` deliberately leaves on the content side, so one
+    of them being in the index is enough to keep the query alive: measured on
+    the claim graph of ``tests/test_search.py``, **six of twelve** questions
+    built around an invented subject go silent and six still answer, stable at
+    40, 72, 136 and 264 rows, against none of twelve silent under the previous
+    ordering. This rule closes half of that shape, not all of it.
+
+    Widening the gate to "no content word at or under the ceiling" was measured
+    and **rejected**, because it collides head-on with the ubiquity-first
+    relaxation above. On a graph about one subject it takes the subject with
+    it: over 38, 56, 120 and 308 rows, *"What is kafka?"* goes from 30 hits to
+    **0** at every size. The surgical variant — refuse only when an unknown
+    content word sits beside an over-ceiling one — keeps that question but
+    takes ``kafka concretoid`` from 30 hits to 0, which is the E3 guarantee
+    that a hallucinated term must not empty a query, and it re-fires on
+    ``apple zarquon`` inside a six-row read set. Neither variant closes one
+    extra invented-subject question at any of those sizes. **The two rules
+    cannot both be maximised**, and the ubiquity relaxation is worth more,
+    because a graph that is about one subject is the graph every graph starts
+    as. ``tests/test_search.py`` pins both halves of that trade.
+
     Each surviving term's document frequency is counted **over the rows this
     search can actually return** — the same ``filters`` the ranked query
     applies. Counting the whole index instead made the bar depend on rows the
@@ -315,7 +399,11 @@ def _compile_match(
         known_content = [(term, df) for term, df in known if not _is_function_word(term)]
         # The ubiquity cut is relaxed first, because it is a *cost* rule: on a
         # graph about one subject the subject is over the ceiling, and saving a
-        # doclist walk is worth less than the word the query is about.
+        # doclist walk is worth less than the word the query is about. That
+        # hands the saving back on exactly the shape the cut was written for,
+        # and the number is worth having: measured on a single-subject graph at
+        # 80/170/320 rows, "What is kafka?" costs +19 % to +29 % with ~9 KB
+        # documents (where the walk is real) and −1 % to +6 % with short ones.
         kept = [(term, df) for term, df in known_content if df <= ceiling] or known_content
         if not kept:
             # The graph has never seen a content word of this query, so the
@@ -529,6 +617,11 @@ def _search_vector(
     There is no similarity threshold — the ANN list is always ``k`` deep,
     which is exactly what RRF expects: a weak vector hit still fuses, just
     with a small contribution.
+
+    The cost of that is :func:`_compile_match`'s refusal not reaching here: a
+    query whose content words the graph has never seen is answered ``k`` deep
+    by this function, vector-signal-only, while the keyword arm returns
+    nothing. See the module docstring for why a floor is not simply added.
     """
     filters, params = _node_filters(
         state, type_id, created_by, created_after, created_before, include_meta, space_id, principal

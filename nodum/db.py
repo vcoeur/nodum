@@ -155,18 +155,43 @@ def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
     return {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
 
 
+#: ``--`` to end of line, and ``/* … */`` across lines. Stripped from stored DDL
+#: before anything searches it: SQLite keeps a ``CREATE TABLE`` verbatim,
+#: comments included, and a comment is text that looks like schema and
+#: constrains nothing.
+_SQL_COMMENT_RE = re.compile(r"--[^\n]*|/\*.*?\*/", re.DOTALL)
+
+
 def _table_sql(conn: sqlite3.Connection, table: str) -> str:
-    """The ``CREATE TABLE`` text SQLite stored for ``table`` (empty when absent).
+    """The ``CREATE TABLE`` text SQLite stored for ``table``, comments removed.
 
     ``PRAGMA table_info`` answers what the columns are and says nothing about
     the constraints over them, so a check about a CHECK has to read the schema
     SQLite kept — which is the statement as written, ``ALTER TABLE ADD COLUMN``
     clauses appended verbatim included.
+
+    **As written includes its comments**, and that is a hole in any search over
+    this text rather than a detail: the ``cycles`` DDL this repo ships is itself
+    heavily commented, so a hand-edited or externally-migrated file can perfectly
+    well name a constraint in a comment while carrying no constraint at all —
+    and a search that matched it would report a sound schema over a file where
+    the half-stop goes straight in. That is a check failing *open*, which is the
+    only failure direction that matters here (failing noisily is a human reading
+    a repair they did not need). So comments come out first, and callers search
+    what actually constrains the table. It is a lexer's job done with a regex,
+    so a ``--`` inside a string literal comes out too — which costs a false
+    alarm, the direction this is allowed to be wrong in.
+
+    Returns:
+        The stored statement with SQL comments removed, or ``""`` when the table
+        is absent.
     """
     row = conn.execute(
         "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
     ).fetchone()
-    return "" if row is None or row["sql"] is None else str(row["sql"])
+    if row is None or row["sql"] is None:
+        return ""
+    return _SQL_COMMENT_RE.sub("", str(row["sql"]))
 
 
 #: The remedy for drift that cannot be repaired in place. Four of the six
@@ -228,6 +253,39 @@ CYCLE_STOP_COLUMN_SQL: tuple[tuple[str, str], ...] = (
     ),
 )
 
+#: ``cycles`` as the migrations leave it: every column, in schema order, as the
+#: fragment that declares it. Written once and spliced into both halves of
+#: :data:`CYCLE_STOP_CHECK_REBUILD_SQL`, so the table that repair builds and the
+#: columns it carries across cannot say different things.
+#:
+#: It is still a list written by hand, and what keeps it honest is a test rather
+#: than anything here: ``test_the_rebuilds_column_list_is_every_column_a_
+#: migrated_cycles_has`` compares it against ``PRAGMA table_info(cycles)`` on a
+#: freshly migrated database. So a column added by ``0016`` fails that test on
+#: the commit that adds it — which is the only moment anyone can be expected to
+#: remember this constant exists, and the alternative is a repair that drops
+#: that column and its data with nothing left to notice.
+CYCLES_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("id", "id TEXT PRIMARY KEY"),
+    (
+        "trigger",
+        "trigger TEXT NOT NULL CHECK (trigger IN ('manual','scheduled','curative','rollback'))",
+    ),
+    ("triggered_by", "triggered_by TEXT NOT NULL"),
+    ("scope", "scope TEXT"),
+    ("dry_run", "dry_run INTEGER NOT NULL DEFAULT 0"),
+    (
+        "status",
+        "status TEXT NOT NULL CHECK (status IN ('running','completed','failed','rolled_back'))",
+    ),
+    ("report", "report TEXT"),
+    ("started_at", "started_at TEXT NOT NULL DEFAULT (datetime('now'))"),
+    ("finished_at", "finished_at TEXT"),
+    ("rolled_back_by", "rolled_back_by TEXT REFERENCES cycles(id)"),
+    ("stop_requested_at", "stop_requested_at TEXT"),
+    ("stop_requested_by", "stop_requested_by TEXT"),
+)
+
 #: The repair for a file that has both columns and **not** the CHECK under them,
 #: which is a different drift from a missing column and cannot be fixed the same
 #: way: SQLite's ``ALTER TABLE`` adds a constraint only *with* a column, so
@@ -249,25 +307,20 @@ CYCLE_STOP_COLUMN_SQL: tuple[tuple[str, str], ...] = (
 #: the query, because a repair that dies on ``CHECK constraint failed`` with no
 #: next step is advice nobody can carry out, which is the failure shape
 #: :data:`_CREATE_THE_CYCLES_INDEX` was already written against.
+#:
+#: Its column list is :data:`CYCLES_COLUMNS` rather than a literal, for the
+#: reason the index is spliced in: the rebuild names every column **twice** —
+#: once to create the replacement table, once to copy the rows into it — and a
+#: column missing from either list is a column the repair drops, *with its
+#: data*, in a statement a human is told to run against their own graph.
 CYCLE_STOP_CHECK_REBUILD_SQL = (
     "PRAGMA foreign_keys=off; BEGIN; "
     "CREATE TABLE cycles_rebuilt ("
-    "id TEXT PRIMARY KEY, "
-    "trigger TEXT NOT NULL CHECK (trigger IN ('manual','scheduled','curative','rollback')), "
-    "triggered_by TEXT NOT NULL, "
-    "scope TEXT, "
-    "dry_run INTEGER NOT NULL DEFAULT 0, "
-    "status TEXT NOT NULL CHECK (status IN ('running','completed','failed','rolled_back')), "
-    "report TEXT, "
-    "started_at TEXT NOT NULL DEFAULT (datetime('now')), "
-    "finished_at TEXT, "
-    "rolled_back_by TEXT REFERENCES cycles(id), "
-    "stop_requested_at TEXT, "
-    "stop_requested_by TEXT, "
-    f"{CYCLE_STOP_CHECK_SQL}); "
-    "INSERT INTO cycles_rebuilt SELECT id, trigger, triggered_by, scope, dry_run, status, "
-    "report, started_at, finished_at, rolled_back_by, stop_requested_at, stop_requested_by "
-    "FROM cycles; "
+    + ", ".join(declaration for _, declaration in CYCLES_COLUMNS)
+    + f", {CYCLE_STOP_CHECK_SQL}); "
+    "INSERT INTO cycles_rebuilt SELECT "
+    + ", ".join(name for name, _ in CYCLES_COLUMNS)
+    + " FROM cycles; "
     "DROP TABLE cycles; "
     "ALTER TABLE cycles_rebuilt RENAME TO cycles; "
     "CREATE INDEX idx_cycles_started ON cycles(started_at); "
@@ -424,34 +477,49 @@ def _cycles_problems(conn: sqlite3.Connection) -> list[str]:
 def _cycle_stop_problems(conn: sqlite3.Connection) -> list[str]:
     """0015 guarantees the two columns the kill switch is written in — **and the CHECK**.
 
-    Every recorded migration with a checkable guarantee has an entry here (Q13
-    review S6), and this one's guarantee is as checkable as they come: two
-    columns on ``cycles``, or the switch has nothing to write to. Without the
-    entry the drift would surface where the four earlier ones used to — deep
-    inside a write, as ``no such column: stop_requested_at`` from
-    :func:`nodum.service.request_stop`, on the run a human was trying to stop.
+    Two columns on ``cycles``, or the switch has nothing to write to.
 
-    The route in is 0014's, not a hypothetical: ``init_db`` skips a migration
-    whose name it already holds, so a database built from an earlier cut of
-    ``0015`` — the three-column shape ``cycle_stop_check``'s docstring used to
-    propose, say — carries the recorded name and not the columns, and nothing
-    else would ever notice. **Nothing in the runtime can notice it either**, and
-    that is the point of asking here: ``LLMReport.stop_switch`` reports which
-    posture a *run* had, not what a file can store, so a cycle over this database
-    would say ``armed`` right up until the write failed. Whether a stop has
-    somewhere to go is a question about the schema, so it is asked at ``init_db``
-    — where the answer comes with the statements that repair it.
+    **This one's route in is not 0014's, and saying it was would be false.**
+    ``0014`` really was amended in place while unreleased — the
+    one-running-consolidation index was added in a commit after the migration
+    itself — so a dev file built from its first cut genuinely lacks the index it
+    records. ``0015`` has no such history: it landed with both columns and the
+    CHECK already attached and ``nodum/migrations.py`` has not changed since, so
+    **no database this repo has ever produced can record ``0015`` and lack any
+    of them**. What this check guards is a file drifted by something other than
+    this repo — a hand-edited schema, an externally applied migration, a
+    ``cycles`` rebuilt by a human following half of the repair below — which is
+    a smaller claim than ``0014``'s and still worth the entry, because every
+    recorded migration with a checkable guarantee has one (Q13 review S6) and
+    this guarantee is as checkable as they come.
+
+    **Nothing in the runtime can notice the drift**, which is why the question
+    is asked here: ``LLMReport.stop_switch`` reports which posture a *run* had,
+    not what a file can store, so a cycle over a drifted database would say
+    ``armed`` right up until the write failed — as ``no such column:
+    stop_requested_at`` out of :func:`nodum.service.request_stop`, on the run a
+    human was trying to stop. Whether a stop has somewhere to go is a question
+    about the schema, so it is asked at ``init_db``, where the answer comes with
+    the statements that repair it.
 
     **The columns are not the whole guarantee.** ``0015`` records a stop as two
     nullable stamps *and one cross-column CHECK*, and the constraint is the
     entire reason the pair is honest: without it a file can hold a time with no
     requester or a requester with no time — a stop nobody asked for, or one
     nobody can date — which is the state the migration chose two columns over a
-    boolean specifically to make unstorable. That very same earlier cut is where
-    a file without it comes from, since the three-column shape leaned on the
-    boolean instead. A check that reads ``PRAGMA table_info`` sees the columns
-    and nothing about what constrains them, so this reads the stored schema and
-    looks for the constraint by name.
+    boolean specifically to make unstorable. A check that reads ``PRAGMA
+    table_info`` sees the columns and nothing about what constrains them, so this
+    reads the stored schema and looks for the constraint **by name**.
+
+    By name is a deliberate narrowing, not a shortcut. The name is half of what
+    ``0015`` guarantees: SQLite prints it verbatim as ``CHECK constraint failed:
+    <name>``, which is the sentence a human meets when the constraint bites, and
+    it is what :data:`CYCLE_STOP_CHECK_REBUILD_SQL` puts back. So an *unnamed*
+    CHECK enforcing the same rule is reported here, and that is the right answer
+    rather than a false alarm: the file enforces the rule and does not carry the
+    migration, and the cost of saying so is a human reading a repair that turns
+    out to be a no-op. The direction this must not fail in is open, which is
+    what :func:`_table_sql` strips comments for.
 
     **Its two repairs are its own, and they are different repairs.** A missing
     column is added by the migration's own ``ALTER``, which carries the CHECK

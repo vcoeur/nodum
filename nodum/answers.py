@@ -98,6 +98,26 @@ that a note boundary is something this module wrote. Both the notes and the
 question are defused before they are fitted; ``question`` in the envelope is
 still what was typed.
 
+**A line start is whatever a reader takes for one, which is a much wider thing
+than ``\\n`` and a leading space.** The first version of the rule asked
+``re.MULTILINE`` and ``[ \\t]``, and one zero-width space in front of a forged
+``[9]`` walked through it: live on ``llama3.2:1b``, 3 of 3, ``answered: true``
+with citations pointing at two notes that said the opposite — and that
+character reaches the graph verbatim through ``nodum ingest url``. The line is
+now :meth:`str.splitlines`'s and the indent is anything that draws nothing, the
+defusing runs **last** so no later ``strip`` can promote what it shielded, and
+the invisible characters are defused in place rather than deleted, because
+width is what ``excerpt`` and the truncation bound are measured in.
+
+**The question is defused as grammar and trusted as evidence in the same call**
+(:func:`_unsupported_numbers`), and the two are consistent because only the
+second is a claim about the human: the grammar belongs to this module whoever
+writes into it, while a number the human typed is a number they are asking
+about. That rests on ``ask`` being reachable only from the CLI and from an
+authenticated ``POST /api/ask`` — a caller that *composes* a question would
+change the answer, so a test pins the caller set rather than a comment claiming
+it.
+
 ## What the prompt may contain, measured rather than reasoned
 
 The first version of ``/ask`` scored **1 of 6** on a six-question battery
@@ -159,6 +179,7 @@ from __future__ import annotations
 import json
 import re
 import time
+import unicodedata
 from pathlib import Path
 from typing import Any
 
@@ -371,11 +392,19 @@ _CITATION_PREFIXES = ("node_id=", "node_id:", "node=", "note=", "id=", "id:", "#
 #: ``[3]`` returns ``[3]``, ``"3"`` or ``3`` depending on the day.
 _CITATION_TRIM = " \t\r\n[](){}<>\"'`.,;:"
 
-#: A note boundary as :func:`_context_block` writes one: ``[`` digits ``]`` at
-#: the start of a line. Matched against *graph text* so that a node whose
-#: content carries one can be stopped from opening a second note inside note
-#: *n*'s body — see :func:`_neutralise_markers`.
-_LINE_MARKER = re.compile(r"^([ \t]*)\[([0-9]+)\]", re.MULTILINE)
+#: A note marker as :func:`_context_block` writes one: ``[`` digits ``]``. Where
+#: a *line* starts is not this pattern's business and was the whole defect — it
+#: is :func:`_line_opening` that decides, over :meth:`str.splitlines` rather
+#: than over ``re.MULTILINE``. See :func:`_neutralise_markers`.
+_MARKER = re.compile(r"\[([0-9]+)\]")
+
+#: Unicode general categories that put no glyph on the page: the C0/C1 controls
+#: and the format characters — the zero-width family (U+200B, U+FEFF, U+2060,
+#: the joiners), the bidi controls, the soft hyphen. Whitespace is *not* here
+#: because :meth:`str.isspace` already covers it and covers it better: it knows
+#: NBSP and the em/en/ideographic spaces, which are ``Zs`` and would otherwise
+#: need listing one by one.
+_INVISIBLE_CATEGORIES = ("Cc", "Cf")
 
 #: A run of digits, which is the one kind of claim this module can check
 #: deterministically against the text it sent (:func:`_unsupported_numbers`).
@@ -441,6 +470,12 @@ class AskOut(BaseModel):
     it did not name a note that does not exist while offering only one that
     does; every number in the answer text appears in the text that was actually
     sent, or in the question; and there is answer text.
+
+    **"or in the question" is a decision and is argued for**, in
+    :func:`_unsupported_numbers`: the question is the human's own text on both
+    surfaces that reach here, so a number they typed is a number they are asking
+    about. It is also the reason that check is switched off by typing one — a
+    caller who cannot see why should read that docstring before widening it.
 
     **What it does not claim.** It does not say the answer is true, and it does
     not say the cited note contains it. Nothing here can: a citation is
@@ -691,8 +726,27 @@ def _excerpt(text: str, limit: int) -> tuple[str, bool]:
     return collapsed[:limit].rstrip() + " …[truncated]", True
 
 
+def _line_opening(line: str) -> int:
+    """Where this line's first glyph sits — past everything that draws nothing."""
+    index = 0
+    while index < len(line) and (
+        line[index].isspace() or unicodedata.category(line[index]) in _INVISIBLE_CATEGORIES
+    ):
+        index += 1
+    return index
+
+
+def _defuse_line(line: str) -> str:
+    """One line, with the marker it opens with — if it opens with one — made ``(n)``."""
+    start = _line_opening(line)
+    match = _MARKER.match(line, start)
+    if match is None:
+        return line
+    return f"{line[:start]}({match.group(1)}){line[match.end() :]}"
+
+
 def _neutralise_markers(text: str) -> str:
-    """Stop graph text from forging a note boundary (``[2] Some Title``).
+    """Stop text from forging a note boundary (``[2] Some Title``).
 
     :func:`_context_block` renders each note as ``[n] title`` followed by its
     text, so **every ``[n]`` at the start of a line is a note boundary** — and
@@ -715,6 +769,90 @@ def _neutralise_markers(text: str) -> str:
     :func:`ask` prints underneath them. The rule is a property of the prompt's
     grammar, so any string interpolated into that grammar is subject to it.
 
+    ## Where a line starts is the whole of it, and it was two sizes too small
+
+    The first version asked ``re.MULTILINE`` for the line and ``[ \\t]`` for the
+    indent, and both are narrower than a reader. ``^`` under ``re.MULTILINE``
+    matches at position 0 and after ``\\n`` and after nothing else — not ``\\r``,
+    ``\\v``, ``\\f``, the file/group/record separators, U+0085, U+2028 or U+2029,
+    every one of which :meth:`str.splitlines` treats as a line and a model reads
+    as one. And the indent was space and tab, so not NBSP, not the em/en/
+    ideographic spaces, and not the zero-width family, which is not whitespace
+    at all. 16 of 21 candidate line-starts survived, **including every one that
+    renders identically to a defused one**. Measured live on ``llama3.2:1b`` at
+    temperature 0, 3 of 3 identical: a single zero-width space in front of a
+    forged ``[9]`` on a two-note graph produced ``{"answer": "Ledger records are
+    kept for 9999 days.", "cited": ["1", "2", "9"]}`` — ``answered: true``, no
+    ``unsupported_numbers``, no refusal, citations pointing at two notes that
+    say *thirty days*. Verbatim the failure above, restored by one character.
+
+    It is not hypothetical about the path either: ``extract.HtmlHandler``
+    unescapes ``&#8203;``/``&#65279;``/``&#8288;`` and passes them through
+    verbatim — NBSP is removed by the line-stripping there and the zero-width
+    family is not, because it is not whitespace — and ``ingest._source_content``
+    hands that text to ``create_node`` unchanged.
+
+    So the line is :meth:`str.splitlines`'s and the indent is
+    :func:`_line_opening`'s: anything that puts no glyph between the margin and
+    the bracket.
+
+    ## Defused, not normalised, and the invisible prefix survives
+
+    The tempting fix is to strip the zero-width characters and fold the exotic
+    line breaks to ``\\n`` first, so that this function's notion of a line and
+    the model's coincide by construction. It is the wrong trade here, for one
+    reason that outranks the rest: **every deletion changes a width**, and width
+    is what the excerpt bound is measured in. ``excerpt`` claims to be *what was
+    sent* (:class:`Offered`), :func:`_unsupported_numbers` checks the answer
+    against exactly that string, and ``…[truncated]`` claims the cut fell at
+    :data:`MAX_CONTEXT_CHARS`. Normalising first makes all three approximate,
+    and it does it to *every* note rather than to the one carrying a forgery.
+    Rewriting two brackets in place keeps them exact — so the shield stays in
+    the text, defused and visible to anyone who looks, rather than being
+    silently edited out of the caller's own note.
+
+    Keeping the digits does have a measured cost, and it is the cheap direction.
+    ``(9)`` is still a number in the prompt, and *every number in the prompt is a
+    candidate citation* — the rule this whole section is the twin of. Live on
+    ``qwen3:8b``, the fixed prompt above came back
+    ``{"answer": "…9999 days, as per the revised retention window note.",
+    "cited": ["9"]}``: it mined the defused marker for a citation exactly as it
+    once mined a node id for ``"116"``. That resolves to nothing — the offered
+    markers were 1 and 2 — so :func:`resolve_citation` drops it, ``citations``
+    is empty, and the envelope is ``answered: false`` with the answer text
+    withheld. A forged number now costs a **refusal** where it used to buy
+    ``answered: true`` beside citations pointing at notes that said the
+    opposite, which is the whole of what this defence is for.
+
+    **The residual, named rather than left to be discovered.** A confusable
+    rendering of the grammar — ``［9］`` in fullwidth brackets, ``[٣]`` in
+    Arabic-Indic digits — is not rewritten. It cannot forge what ``citations``
+    claims, because :func:`resolve_citation` takes ASCII digits and nothing
+    else, so no such marker resolves to a note. What it could still do is
+    persuade a weak model that a line is a boundary, and that is the same
+    "escaping is not a defence against a model" limit the next paragraph draws
+    rather than a new one. ``tests/test_answers.py``'s audit matches those
+    grammars on purpose, so if one ever reaches a prompt the test says so
+    instead of the question being reasoned about again.
+
+    ## It has to run last
+
+    Whatever else happens to a string on its way into the message must happen
+    *before* this: a transform that runs after the defusing can promote a
+    marker the defusing had shielded. That is not theoretical — it was the
+    defect. :func:`_excerpt`'s ``str.strip()`` is Unicode-aware where the indent
+    class was ``[ \\t]``, so a leading NBSP shielded a marker from the defusing
+    and was then deleted, putting a bare ``[9]`` at column 0 *after* the defence
+    had run, in every ``/summarize`` prompt. Widening the indent class closes
+    that particular pair — ``str.strip`` removes exactly what
+    :meth:`str.isspace` matches, which :func:`_line_opening` now covers — but
+    the ordering is what does not depend on two character sets continuing to
+    agree. :func:`_narrowed` defuses after excerpting, and
+    :func:`_context_block` defuses again at the point it writes the grammar;
+    this is idempotent (``(9)`` is not a marker) and width-preserving, so the
+    second pass costs a scan and buys the property that no caller's ordering
+    can be wrong.
+
     **Escaping is not a defence against a model, and does not pretend to be.**
     "Ignore previous instructions" in a note works on the 1B and nothing here
     stops it. What this restores is the narrower thing ``citations`` claims: a
@@ -723,15 +861,31 @@ def _neutralise_markers(text: str) -> str:
     markers are the only numbers in the prompt on purpose, and hex in front of
     every note is exactly what took the citation format from 6/6 back to 4/6.
     """
-    return _LINE_MARKER.sub(lambda match: f"{match.group(1)}({match.group(2)})", text)
+    return "".join(_defuse_line(line) for line in text.splitlines(keepends=True))
 
 
 def _narrowed(offered: list[Offered], limit: int) -> list[Offered]:
-    """Copies carrying the excerpt that will be sent, and whether it was cut."""
+    """Copies carrying the excerpt that will be sent, and whether it was cut.
+
+    **Excerpt first, defuse second**, which is the order that cannot be wrong:
+    :func:`_neutralise_markers` runs on the exact string that goes into the
+    message, so nothing downstream of it can promote a shielded marker to a line
+    start. The reverse order was the ``/summarize`` defect
+    (:func:`_neutralise_markers`, *It has to run last*).
+
+    Nothing is given up by it. Neutralisation is width-preserving, so the
+    truncation bound is measured on the same number of characters either way;
+    truncating first cannot open a boundary, since a marker cut in half leaves
+    ``[12`` and the ``…[truncated]`` suffix carries no digits and — after
+    :func:`_excerpt`'s ``rstrip`` — never opens a line. It is also less work:
+    the defusing now scans an excerpt rather than a whole 28 KB source.
+    """
     narrowed: list[Offered] = []
     for item in offered:
-        excerpt, cut = _excerpt(_neutralise_markers(item.text), limit)
-        narrowed.append(item.model_copy(update={"excerpt": excerpt, "truncated": cut}))
+        excerpt, cut = _excerpt(item.text, limit)
+        narrowed.append(
+            item.model_copy(update={"excerpt": _neutralise_markers(excerpt), "truncated": cut})
+        )
     return narrowed
 
 
@@ -751,15 +905,23 @@ def _context_block(offered: list[Offered]) -> str:
     carries exactly one number per note and the caller owns the mapping back to
     the graph.
 
-    Both the title and the excerpt go through :func:`_neutralise_markers`, so
-    the markers this function writes are the only ones in the block — and
+    Both the title and the excerpt go through :func:`_neutralise_markers` here,
+    so the markers this function writes are the only ones in the block — and
     :func:`ask` defuses the question for the same reason, because the template
     prints it below the block and a line ``[3] …`` there is one more boundary
     in the same prompt.
+
+    The excerpt was defused once already, in :func:`_narrowed`, and is defused
+    again here on purpose: **this is the function that writes the grammar, so
+    this is where owning it belongs.** ``excerpt`` is a plain field with a ``""``
+    default, so an ``Offered`` assembled by hand — trivially easy, and the next
+    caller after this one — would otherwise reach the prompt unread while this
+    docstring said it had not. The second pass is free of consequence:
+    neutralisation is idempotent (``(9)`` is not a marker) and width-preserving.
     """
     return "\n\n".join(
         f"[{item.marker}] {_neutralise_markers(item.title or '(untitled)')}\n"
-        f"{item.excerpt or '(no text)'}"
+        f"{_neutralise_markers(item.excerpt) or '(no text)'}"
         for item in offered
     )
 
@@ -794,6 +956,33 @@ def _unsupported_numbers(answer: str, offered: list[Offered], *asked: str) -> li
     The prompt's own markers are deliberately **not** in the supporting text —
     they are this module's numbers, not the graph's, and counting them would
     make every single-digit claim self-supporting.
+
+    **The question is defused before it is sent and counted as evidence here,
+    and that pair is a position rather than an oversight.** Measured, on
+    identical graphs and an identical model reply: ``ledger retention window``
+    refuses with ``unsupported_numbers: ['9999']``, and ``ledger retention
+    window 9999`` answers, citing two notes that say *thirty days*. Four typed
+    characters switch off the only groundedness check here, so it is worth
+    saying which of the two claims is about the human.
+
+    Only this one is. :func:`_neutralise_markers` says nothing about the caller
+    — ``[n]`` at the start of a line is *this module's* grammar, and every
+    string interpolated into the prompt is subject to the prompt's grammar
+    whoever wrote it, notes included; defusing the question is the same rule the
+    notes get and not an accusation. This check is the one that rests on the
+    human, and it rests on a fact rather than on goodwill: ``ask`` is reachable
+    from ``nodum ask`` and from ``POST /api/ask`` behind a verified human
+    session, and from nowhere else — no MCP tool, no job, no endpoint calling
+    another. So the question is the human's own text, and a human who types a
+    number is asking about that number; refusing the answer that repeats it
+    would be refusing the question.
+
+    That makes reachability load-bearing rather than incidental, which is why a
+    test pins the caller set (``tests/test_answers.py``, *reachable only from a
+    surface a human types at*) instead of a comment claiming it. **A caller that
+    composes a question rather than typing one changes this answer**: the
+    question stops being evidence, and ``*asked`` should then carry only what a
+    human supplied.
 
     A false positive is possible and is the trade taken on purpose: a model that
     renders *fourteen* as ``14`` is refused with the number named in the
@@ -1092,6 +1281,9 @@ def ask(
     # line `[3] …` in it opens one more note than the retrieval offered. It goes
     # through the same defusing the excerpts do; `question` in the envelope
     # stays the human's own words.
+    #
+    # Defused here and trusted as evidence at `_unsupported_numbers` below —
+    # deliberately, and that docstring is where the argument is.
     offered, message = _fit_prompt(
         active, ASK_TEMPLATE, retrieved, question=_neutralise_markers(question)
     )

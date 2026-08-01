@@ -275,17 +275,37 @@ commands on a saved node for exactly this reason.
   those are, because a journal entry says what the gardener did across every
   space in the file, while this is one boolean about a run that discloses no
   territory — and a runner that cannot ask whether it was told to stop cannot
-  obey. **What bounds it instead is exactly what admitted the run**
-  (`_may_watch_a_cycle`): a scoped cycle asks for the grant that resolves its
-  scope, which is the check `consolidate._require_gardener_scope` already makes
-  before the run starts, and an unscoped one asks what `open_cycle` asks of an
-  unscoped cycle — `edit` somewhere, since no grant confers the whole file. It
+  obey. **What bounds it instead is the rule that would admit the caller to run
+  this cycle's territory** (`_may_watch_a_cycle`): a scoped cycle asks for the
+  grant that resolves its scope, which is the check
+  `consolidate._require_gardener_scope` already makes before the run starts, and
+  an unscoped one asks what `open_cycle` asks of an unscoped cycle — `edit`
+  somewhere, since no grant confers the whole file. **Caller-relative, not
+  run-relative, and the difference is a schema gap rather than a wording
+  choice**: `cycles` records `triggered_by`, who *asked*, and has no column at
+  all for who is *running*, so "exactly what admitted this run" is not a question
+  the row can answer. The width that buys is real and named rather than papered
+  over — any agent holding *any* grant on space S now reads the switch on every
+  cycle ever scoped to S, including a human's and another agent's. Concretely:
+  `create_agent`'s own minimum grant set, `read` on `meta`, watches every
+  `meta`-scoped cycle, and the parity pair `0010` backfilled onto the agents that
+  predate it (`meta: read`, `main: suggest`) watches every cycle over `main` too.
+  `require_review` refused both, since neither level reaches `edit`. It is one
+  boolean per cycle id, no surface hands an agent a cycle id, and stating a
+  narrower rule than the code enforces is how a later reader grants themselves
+  the narrower one. It
   asked `require_review` over `_cycle_authority_spaces` for both, on the argument
   that *obeying a stop is closing the cycle, so a principal that could not close
-  this one has no use for the answer*, and **both halves of that are false of a
-  run this system licenses**. The runner does not close the cycle: `_run_cycle`
-  closes it as the *opener*, which for a human-triggered run is the human. And a
-  scoped run is admitted on a grant that merely *resolves* the scope, so a
+  this one has no use for the answer*, and **that argument is unsound on both
+  triggers, in two different ways**. On a `manual` run the gardener never closes
+  the cycle at all: `_run_cycle` closes as the *opener* and `_opener` resolves a
+  human-triggered run's opener to the human, so the check demanded of the
+  gardener an authority the gardener does not exercise. On a `scheduled` run the
+  gardener **is** the opener and does close its own cycle — but `open_cycle` had
+  then already required `edit` on the scope before the run could start, so the
+  check was re-asking a question the door had answered `yes`, and could refuse
+  nothing a scheduled run would ever meet. Either way it only ever bit where it
+  was wrong: a
   gardener holding `read` on a space is entitled to consolidate it and was then
   refused the switch over its own run — a night dying at its first provider call
   on `GrantNotPermitted`, which is a kill switch killing the run by being
@@ -294,7 +314,7 @@ commands on a saved node for exactly this reason.
   run would be a switch that cannot be hit after the run starts, which is the
   only time anyone hits one. The stamps outlive the run, so the journal goes on
   saying who stopped that night. Neither verb is on MCP (`HUMAN_ONLY_TOOLS`).
-  **And the refusal is the fourth existence oracle this project has closed.** The
+  **And this read is no longer an existence oracle.** The
   two answers it gave a principal it turned away — `RecordNotFound` for an id
   naming nothing, `GrantNotPermitted` for a cycle it may not watch — told those
   cases apart, so anything holding one grant could probe a cycle id and learn
@@ -307,6 +327,35 @@ commands on a saved node for exactly this reason.
   echoing back nothing but the id the caller supplied. `_no_such_cycle` owns that
   sentence so the two answers cannot drift apart again, and humans — unfiltered
   here as everywhere — are never told a cycle they can see does not exist.
+  **Closed here and nowhere else, which is the whole claim.** It is not the
+  *class* of cycle-id oracles: `close_cycle` takes a cycle id, is not human-only,
+  and still answers `GrantNotPermitted` for a cycle the caller may not close
+  against `RecordNotFound` for an id that names nothing — the only one of the
+  seven cycle-id surfaces that still tells them apart (`get_cycle`,
+  `request_stop`, `abandon_cycle`, `rollback_cycle` and `list_events` all refuse
+  before they read the row, so none of them can). That is deliberate.
+  `close_cycle`'s refusal is the *same* `require_review` `open_cycle` raises, on
+  the same spaces, and `open_cycle` cannot be an oracle at all because it takes a
+  scope and not an id; collapsing one half of that pair would leave a principal
+  that opened a cycle and cannot close it reading *this cycle does not exist*
+  about a row it is holding open, and would falsify the symmetry
+  `Store.require_review` documents. The exposure argument is the stop read's own,
+  unchanged — an unguessable id, no agent-facing model carrying one — and it is
+  an argument about reach, not a reason to widen the collapse onto a write.
+  **What the collapse costs, said once.** The refusal a principal outside the run
+  now meets is `consolidation cycle not found`, and that sentence reaches a
+  *legitimate* runner too. Grants go inert at **mint** time (`auth._grant_set`
+  drops grants on archived spaces), not at check time, so a run whose scope is
+  archived under it keeps reading its switch — `_run_cycle` mints the gardener
+  once and holds it, the module's own "revocation bites at the next cycle, not
+  mid-flight" — while the **next** principal minted for that cycle, in a later
+  process or after a restart, is told its own cycle does not exist. It used to be
+  told it needed `edit` on the item's space, which at least pointed at the cause.
+  Both refusals are wrong for that reader; this one is quieter about the thing an
+  outsider must not learn, which is the trade that was taken. Reading the
+  *recorded* scope rather than re-resolving it is what keeps the lookup working
+  at all (`_resolve_space` matches active spaces only) — it does not, and cannot,
+  keep an archived space's cycle readable by a re-minted runner.
   **`request_stop` is reachable on both human surfaces** — `nodum cycle-stop
   <id>`, `POST /api/cycles/{id}/stop`, and a confirm on the journal entry, which
   also renders who asked and when — for the reason `cycle-abandon` is: a door
@@ -1316,6 +1365,29 @@ commands on a saved node for exactly this reason.
   are both defused before they are fitted, and the envelope still echoes the
   question as typed — the neutralised question is what is *sent*, exactly as
   `excerpt` is what is sent of a node.
+  **The question is defused as grammar and counted as evidence in the same call,
+  and that pair is a position rather than an oversight.** Measured on identical
+  graphs and an identical model reply: `ledger retention window` refuses with
+  `unsupported_numbers: ['9999']`, and `ledger retention window 9999` answers,
+  citing two notes that say *thirty days*. Four typed characters switch off the
+  only groundedness check the module has, so which of the two claims is about
+  the human matters. Only one is. The defusing says nothing about the caller —
+  `[n]` at the start of a line is **this module's grammar**, and every string
+  interpolated into the prompt is subject to the prompt's grammar whoever wrote
+  it; defusing the question is the same rule the notes get and not an
+  accusation. The corroboration is the claim that rests on the human, and it
+  rests on a fact rather than on goodwill: `ask` is reachable from `nodum ask`
+  and from `POST /api/ask` behind a session the middleware resolved to an
+  **enabled human**, and from nowhere else — no MCP tool
+  (`READ_TOOLS`/`ADDITIVE_TOOLS` carry neither verb), no job, no endpoint
+  calling another. So the question is the human's own text, and a human who
+  types a number is asking about that number; refusing the answer that repeats
+  it would be refusing the question. That makes **reachability load-bearing
+  rather than incidental**, so a test pins the caller set over the package's AST
+  instead of a comment claiming it: a third caller reddens it, and a caller that
+  *composes* a question rather than typing one changes the answer — the question
+  stops being evidence, and only what a human supplied should reach
+  `_unsupported_numbers`.
   **Escaping is not a defence against a model and does not pretend to be** —
   "ignore previous instructions" in a note works on the 1B and nothing here
   stops it. What this restores is the narrower thing `citations` claims: a cited
@@ -1323,6 +1395,87 @@ commands on a saved node for exactly this reason.
   marker was the alternative and was rejected for a measured reason: the markers
   are the only numbers in the prompt on purpose, and hex in front of every note
   is exactly what took the citation format from 6/6 back to 4/6.
+  **A line start is whatever a reader takes for one, and the first version of
+  the rule was two sizes too small.** It asked `re.MULTILINE` for the line and
+  `[ \t]` for the indent: `^` matches at position 0 and after `\n` and after
+  nothing else — not `\r`, `\v`, `\f`, the file/group/record separators, U+0085,
+  U+2028 or U+2029, every one of which `str.splitlines` treats as a line and a
+  model reads as one — and the indent covered space and tab, so not NBSP, not
+  the em/en/ideographic spaces, and not the zero-width family, which is not
+  whitespace at all. **16 of 21 candidate line-starts survived, including every
+  one that renders identically to a defused one.** Measured live on
+  `llama3.2:1b` at temperature 0, 3 of 3 identical: one zero-width space in
+  front of a forged `[9]` on a two-note graph came back
+  `{"answer": "Ledger records are kept for 9999 days.", "cited": ["1","2","9"]}`
+  — `answered: true`, `unresolved: ['9']`, no `unsupported_numbers`, no refusal,
+  citations pointing at two notes that say *thirty days*. Verbatim the failure
+  the defusing exists to prevent, restored by a character with no glyph, and
+  reachable through the very path the rule was written for:
+  `extract.HtmlHandler` unescapes `&#8203;`/`&#65279;`/`&#8288;` and passes them
+  through verbatim (NBSP *is* removed by the line-stripping there; the
+  zero-width family is not, because it is not whitespace), and
+  `ingest._source_content` hands that to `create_node` unchanged. So the line is
+  now `str.splitlines`'s and the indent is anything that puts no glyph on the
+  page — Unicode whitespace plus the `Cc`/`Cf` categories, which is the
+  zero-width family, the bidi controls and the soft hyphen. After the fix, same
+  payload, same model, same temperature: `cited: ["1","2"]`, 3 of 3,
+  `unresolved: []`.
+  **Defused, not normalised, and the shield survives in the text.** Stripping
+  the zero-width characters and folding the exotic line breaks first would make
+  the defence's notion of a line and the model's coincide by construction, and
+  it is the wrong trade: **every deletion changes a width**, and width is what
+  the excerpt bound is measured in. `excerpt` claims to be *what was sent*,
+  `_unsupported_numbers` checks the answer against exactly that string, and
+  `…[truncated]` claims the cut fell at `MAX_CONTEXT_CHARS` — normalising makes
+  all three approximate, and does it to *every* note rather than to the one
+  carrying a forgery. Rewriting two brackets in place keeps them exact, and
+  leaves the shield visible to anyone who looks instead of silently editing the
+  caller's own note. Keeping the digits has a measured cost and it is the cheap
+  direction: `(9)` is still a number, and *every number in the prompt is a
+  candidate citation* — live on `qwen3:8b`, the fixed prompt came back
+  `cited: ["9"]`, mining the defused marker exactly as it once mined a node id
+  for `"116"`. It resolves to nothing, so the envelope is `answered: false`
+  with the answer withheld. **A forged number now costs a refusal where it used
+  to buy `answered: true` beside citations that said the opposite.** **The
+  residual is named rather than left to be discovered**: a confusable rendering
+  — `［9］` in fullwidth brackets, `[٣]` in Arabic-Indic digits — is *not*
+  rewritten. It cannot forge what `citations` claims, because `resolve_citation`
+  takes ASCII digits and nothing else, so no such marker resolves; what it could
+  still do is persuade a weak model that a line is a boundary, which is the same
+  "escaping is not a defence against a model" limit already drawn and not a new
+  one. The test suite's audit matches those grammars **on purpose**, so if one
+  ever reaches a prompt the suite says so instead of the question being
+  re-reasoned.
+  **The defusing has to run last, and `/summarize` is where that was found.**
+  `_excerpt`'s own `str.strip()` is Unicode-aware where the indent class was
+  `[ \t]`, so a leading NBSP shielded a marker from the defusing and was then
+  *deleted* by the strip — putting a bare `[9]` at column 0 of the excerpt after
+  the defence had already run. Deterministic, no argument about what a model
+  treats as a line required: the module's own strict regex read `['1','2','9']`
+  off the prompt `/summarize` really sent on a two-node region. `/ask` escaped
+  it by accident — `_offered_hit` builds `text=node.content.strip()`, so the
+  strip had already happened — while `summarize` builds `text=node.content`
+  unstripped, and **no marker test in the suite had ever reached `summarize`**;
+  the endpoint with only *one* end of the template was the one left untested and
+  broken. Two things hold it now, because one of them being enough is how it
+  came back: the indent class covers everything `str.strip` removes (asserted
+  over the whole of Unicode, not over the four characters that were measured),
+  *and* `_narrowed` excerpts first and defuses second, so the defusing runs on
+  the exact string that goes into the message. The second is the one that does
+  not depend on two character sets continuing to agree, and it is pinned over
+  the source rather than over an input — there is no payload left that
+  distinguishes the two orders, so a test built from one would pass under the
+  order that was wrong. `_context_block` defuses the excerpt again at the point
+  it writes the grammar, which costs one idempotent width-preserving scan and
+  buys the property that no caller's ordering can be wrong; that also makes its
+  docstring true, which it was not — it claimed to defuse the excerpt when only
+  `_narrowed` had, and an `Offered` built by hand with `excerpt=` set reached
+  the prompt unread. **An audit that shares a grammar with the code it audits
+  tests that the grammar equals itself**: the suite's own marker audit was
+  `_LINE_MARKER` character for character, so it could not have detected the gap,
+  and it is now deliberately looser on every axis the defence could narrow on,
+  with a property test pinning the containment so a later simplification back
+  towards the module's regex fails instead of quietly restoring the blind spot.
   The comparison against `qwen3:8b` says the same thing from the other side: it
   makes the *identical* citation-format errors under the first prompt and costs
   65–113 s a question against the 1B's 3–8 s, so the weak local model was never
@@ -1615,7 +1768,10 @@ commands on a saved node for exactly this reason.
   312-node measurement corpus was large enough to hide all of it. A list does
   not move with corpus size, which is the property the defect asks for; it holds
   no word that carries topic meaning here (`state`, `store`, `key`, `value`,
-  `log`, `set`, `order`, `time`, `long`, `work` are all deliberately absent),
+  `log`, `set`, `order`, `time`, `point`, `case`, `long`, `work`, `mean`,
+  `group` and `number` are all deliberately absent — the list is
+  `_QUERY_STOPWORDS`' own docstring, and the two had already drifted apart
+  once),
   and **a function word never decides a search on its own**, which is what the
   fallbacks are ordered by. The **ubiquity cut is given up first**, because it
   is the only one of the three that is about cost rather than meaning: a young
@@ -1623,17 +1779,62 @@ commands on a saved node for exactly this reason.
   dropping it left *"What is kafka?"* matching every note that says "what" and
   **not one that says "kafka"** — the exact inverse of the answer, on the most
   ordinary question there is, measured at 20/30/60 subject rows and wrong at all
-  three. Only a query with **no content word at all** ("what is it") falls back
-  to its function words. A query whose content words the graph has simply
+  three. **That hands the `32 ms → 14 ms` saving back on precisely the shape
+  the cut was written for**, and the number belongs here rather than in a
+  comment: measured on a single-subject graph at 80/170/320 rows, median of 31
+  interleaved pairs, *"What is kafka?"* costs **+19 % to +29 % with ~9 KB
+  documents** (where the doclist walk is real) and **−1 % to +6 % with short
+  ones**. A cost rule given up on the one graph it was paying for is still the
+  right trade — the old plan was cheaper because it was answering a different
+  question — but it is not free, and the earlier `32 ms / 14 ms` figure now
+  describes a case this ordering rarely reaches. Only a query with **no content
+  word at all** ("what is it") falls back to its function words. A query whose content words the graph has simply
   **never seen** answers with the nothing those words alone answer with:
-  `zarquon` returns nothing, so *"What does zarquon protect against?"* must not
-  return three prose notes that share its phrasing. That was the same conversion
-  the JSON-schema finding names — a visibly empty result turned into a
-  confidently wrong one — reached this time by wrapping an unknown word in a
-  question. Measured across five corpus sizes, questions whose content is
-  invented returned **2.9 to 10.0 hits and were never silent** before, and are
-  now silent on every such query whose remaining words the graph does not
-  genuinely hold. Measured across five corpus sizes, question-shaped queries (recall,
+  `zarquon` returns nothing from the keyword arm, so *"What does zarquon
+  protect against?"* must not return three prose notes that share its phrasing.
+  That was the same conversion the JSON-schema finding names — a visibly empty
+  result turned into a confidently wrong one — reached this time by wrapping an
+  unknown word in a question.
+  **That refusal is the keyword arm's, and on an install with an embedding
+  provider it is not the whole answer**: `_search_vector` has no similarity
+  threshold — the ANN list is always `k` deep — so the vector arm answers the
+  query the keyword arm just refused, `k` rows deep, every hit carrying the
+  `vector` signal alone. Measured with the repo's own `HashEmbedder` on a 20-row
+  graph: `zarquon` and *"What does zarquon protect against?"* both come back
+  with **10 of 10 hits, none carrying `bm25`**. On the default install — no
+  provider — the refusal is the whole answer, which is the install
+  `tests/test_search.py` asserts it on; `tests/test_hybrid_search.py` asserts
+  what happens beside it when a provider exists. **No similarity floor was
+  added**, because a floor is a number nothing here can measure yet: it needs a
+  real embedding model over a real graph, since the test provider's similarity
+  *is* token overlap and every threshold measured against it would look free
+  while costing exactly the paraphrase recall the vector arm exists for.
+  Suppressing the fused list on the keyword arm's refusal has the same problem
+  from the other side and would contradict
+  `test_vector_only_hit_surfaces_with_vector_signal` directly. Carried to 5b-ii. Measured across five corpus sizes, questions whose content is
+  invented returned **4.8 / 5.1 / 5.9 / 7.9 mean hits and were never silent**
+  before — measured on the claim graph of `tests/test_search.py` repeated to 40,
+  72, 136 and 264 rows, twelve questions built around an invented subject — and
+  **six of the twelve are silent now, at every one of those sizes** (mean hits
+  0.7 / 1.2 / 2.2 / 4.2). **This rule closes half of that shape, not all of
+  it.** What the gate tests is "no content word *known*", not "no content word
+  that *discriminates*": ordinary English nouns and verbs stay on the content
+  side on purpose, so the six that still answer are the six whose *other*
+  content words — `fail`, `safe`, `store`, `long`, `node`, `space`, `first` —
+  the graph genuinely holds. A test asserts that six exactly, so this sentence
+  cannot drift from the code.
+  **Widening the gate to "no content word at or under the ubiquity ceiling" was
+  measured and rejected**, because it collides head-on with the ubiquity-first
+  relaxation above. On a single-subject graph at 38, 56, 120 and 308 rows it
+  takes *"What is kafka?"* from **30 hits to 0 at every size**. The surgical
+  variant — refuse only when an unknown content word sits beside an
+  over-ceiling one — keeps that question but takes `kafka concretoid` from 30
+  hits to 0, which is the E3 guarantee that a hallucinated term must not empty a
+  query, and it fires on `apple zarquon` inside a six-row read set too. Neither
+  variant closes **one extra** invented-subject question at any of those sizes
+  (silence stays 0.83 for all three gates at all four sizes). The two rules
+  cannot both be maximised; the ubiquity relaxation is worth more, because a
+  graph that is about one subject is the graph every graph starts as. Measured across five corpus sizes, question-shaped queries (recall,
   precision over the returned list): **47 rows 0.74/0.65 → 0.87/0.73** (and the
   zero-hit rate 0.19 → 0.00), 26 rows 0.79/0.63 → 0.88/0.65, 52 rows 0.73/0.57 →
   0.89/0.69, 78 rows 0.70/0.52 → 0.81/0.63, **312 rows 0.74/0.63 → 0.86/0.77**.
@@ -1651,7 +1852,18 @@ commands on a saved node for exactly this reason.
   `>=`): equal df is equal weight, each term is then exactly half, and `>=`
   admits either alone — the quorum silently becomes the bare OR it was chosen
   over. Measured on a 40-row graph with `kafka` and `postgres` both at df 6:
-  10 hits at precision 0.100 against 1 hit at 1.000. The strictness is **gated
+  10 hits at precision 0.100 against 1 hit at 1.000.
+  **A repeat wearing punctuation is still a repeat.** The dedup folded the raw
+  token while FTS5 (`porter unicode61`) tokenizes `kafka,` and `kafka`
+  identically, so the same word arrived as two terms carrying one word's
+  document frequency twice — enough to clear a bar half of itself. Measured on
+  the 40-row equal-df fixture: `kafka postgres` answered with the one node
+  carrying both and `kafka, kafka postgres` with **six**, the bare disjunction
+  the quorum was chosen over, restored by a comma. `_query_terms` and
+  `_is_function_word` now share one fold (`_bare_word`) — they had disagreed
+  about what "the same word" is, one stripping edge punctuation and the other
+  not. Pre-existing; the fallback re-ordering made it load-bearing.
+  The strictness is **gated
   on the two-term case**, because with four equal terms a blanket `>` moves the
   bar from two-of-four to three-of-four; gated, it is byte-identical to `>=` on
   every suite at every corpus size, since two real terms are rarely exactly

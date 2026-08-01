@@ -766,6 +766,111 @@ def test_the_word_a_query_is_about_is_not_dropped_for_being_everywhere(fresh_db)
     )
 
 
+#: Twelve questions built around a subject the graph has never heard of. Their
+#: *other* content words are ordinary English on purpose — `_QUERY_STOPWORDS`
+#: deliberately holds no `store`, `work`, `long`, `node` or `first` — so this
+#: suite measures the gate as it really is rather than as it reads.
+_INVENTED_SUBJECT_QUESTIONS = (
+    "What does zarquon protect against?",
+    "How does blorptide work?",
+    "What is a frimble?",
+    "Does quixolate replace vantrium?",
+    "What are the tradeoffs of snarfblat?",
+    "How do I configure gribblewatt?",
+    "What happens when plerkins fail?",
+    "Is thrumbolt safe to enable?",
+    "What does zarquon store?",
+    "How long does blorptide take?",
+    "What zarquon events arrive first?",
+    "Is frimble a node or a space?",
+)
+
+
+def test_the_refusal_closes_half_the_invented_subject_shape_and_the_number_is_the_claim(
+    fresh_db,
+):
+    """What the gate tests is *knownness*, not discrimination — measured.
+
+    `AGENTS.md` claims the refusal for "a query whose content words the graph
+    has simply never seen", and a reader takes that to cover every question
+    built around an invented subject. It does not. The gate fires only when
+    **no** content word of the query is in the index, and the questions people
+    actually type carry ordinary English nouns and verbs that a technical graph
+    really does hold — which `_QUERY_STOPWORDS`' own docstring defends keeping
+    on the content side, because `state`, `store` and `log` carry topic meaning
+    here.
+
+    So the honest number: **six of these twelve** answer with nothing, and the
+    six that still answer are the six whose non-invented content words the
+    graph genuinely holds. Measured stable at 40, 72, 136 and 264 rows (the
+    same fixture repeated), against 0 of 12 silent under the pre-`47c867e`
+    ordering. That count is the number `AGENTS.md` quotes, which is the whole
+    reason it is asserted exactly rather than as a floor: change
+    `_QUERY_STOPWORDS` or the ordering and this fails, and the prose has to be
+    re-derived rather than left to drift.
+    """
+    _seed_claim_graph()
+    _assert_function_words_survive_the_df_ceiling(fresh_db, "what", "does", "how")
+    answered = {
+        query: len(search.search(query, k=10, principal=owner()).hits)
+        for query in _INVENTED_SUBJECT_QUESTIONS
+    }
+    silent = {query for query, count in answered.items() if count == 0}
+    assert len(silent) == 6, f"AGENTS.md says six of twelve; measured {len(silent)}: {answered}"
+    # The six that survive do so through a content word the graph really holds,
+    # not through the question's phrasing: every one of them keeps answering
+    # when the invented subject is deleted from the query.
+    for query in set(answered) - silent:
+        without_subject = " ".join(
+            word for word in query.split() if not search._is_function_word(f'"{word}"')
+        )
+        assert search.search(without_subject, k=10, principal=owner()).hits, query
+
+
+def test_a_hallucinated_term_beside_the_subject_still_answers_on_a_single_subject_graph(
+    fresh_db,
+):
+    """The E3 prerequisite at the one shape a wider refusal gate would break.
+
+    A tempting reading of the rule is that it should fire on "no content word
+    that *discriminates*" rather than "no content word *known*", since a term
+    over the ubiquity ceiling separates nothing. On a graph about one subject
+    that reading takes the subject with it, and this is the test that says so:
+    `kafka` is over the ceiling here, `concretoid` is invented, and the query
+    still has to answer with the subject's rows.
+
+    Measured over 38, 56, 120 and 308 rows, rebinding `_compile_match` to each
+    variant: refusing when no content word is at or under the ceiling takes
+    `What is kafka?` from 30 hits to **0** at every size; refusing only when an
+    unknown content word sits beside an over-ceiling one keeps that but takes
+    `kafka concretoid` from 30 to **0**, which is the hallucinated-term
+    guarantee `test_a_term_the_graph_has_never_seen_does_not_empty_the_result`
+    exists for. Neither variant closes one extra invented-subject query —
+    silence stays at 0.83 for all three gates at all four sizes. They cost the
+    graph's own subject and buy nothing, so the gate stays knownness.
+    """
+    for index in range(30):
+        service.create_node(
+            type="claim",
+            title=f"Kafka note {index}",
+            content=f"Kafka retains the segment while the broker holds offset {index}.",
+            principal=owner(),
+        )
+    for index, text in enumerate(_QUESTION_PROSE):
+        service.create_node(
+            type="note", title=f"Loose notes {index}", content=text, principal=owner()
+        )
+    counts = _document_frequencies(fresh_db, "kafka")
+    rows = counts.pop("*rows*")
+    ceiling = max(1, int(rows * search._COMMON_TERM_DF_FRACTION))
+    assert counts["kafka"] > ceiling, "the fixture must put the subject over the ubiquity ceiling"
+    subject_rows = _ids(search.search("kafka", k=40, principal=owner()))
+    assert _ids(search.search("kafka concretoid", k=40, principal=owner())) == subject_rows
+    assert _ids(search.search("What does kafka do about zarquon?", k=40, principal=owner())) == (
+        subject_rows
+    )
+
+
 def test_a_term_only_in_an_unreadable_space_does_not_change_what_an_agent_sees(fresh_db):
     """The df probes must not answer questions about rows outside the read set.
 
@@ -831,14 +936,15 @@ def test_a_query_with_more_terms_than_the_cap_is_refused_as_a_caller_error(fresh
         search.search(" ".join(vocabulary[:501]), principal=owner())
 
 
-def test_two_terms_of_equal_weight_require_both(fresh_db):
-    """Equal document frequency makes each term exactly half, and `>=` takes one.
+def _seed_equal_df_pair():
+    """Seed a 40-row graph where `kafka` and `postgres` sit at the same df.
 
-    Two words in the same number of notes is ordinary on a young graph, and
-    there the quorum silently became the bare OR it was chosen over: measured
-    at precision 0.111 over the returned list against the 0.722 the rule is
-    defended at. The two-term case is the one shape where "half the weight" is
-    ambiguous, so it is the one the comparison has to be strict for.
+    One node carries both; five carry each alone; the rest carry neither. Equal
+    document frequency is what makes "half the weight" ambiguous for two terms,
+    so this is the fixture both of the tests below have to run against.
+
+    Returns:
+        The one node carrying both words.
     """
     for index in range(29):
         service.create_node(
@@ -860,16 +966,58 @@ def test_two_terms_of_equal_weight_require_both(fresh_db):
             content="A note about postgres vacuum and the dead row it reclaims.",
             principal=owner(),
         )
-    both = service.create_node(
+    return service.create_node(
         type="note",
         title="Together",
         content="Comparing kafka topics with postgres tables, and what each of them is for.",
         principal=owner(),
     )
+
+
+def test_two_terms_of_equal_weight_require_both(fresh_db):
+    """Equal document frequency makes each term exactly half, and `>=` takes one.
+
+    Two words in the same number of notes is ordinary on a young graph, and
+    there the quorum silently became the bare OR it was chosen over: measured
+    at precision 0.111 over the returned list against the 0.722 the rule is
+    defended at. The two-term case is the one shape where "half the weight" is
+    ambiguous, so it is the one the comparison has to be strict for.
+    """
+    both = _seed_equal_df_pair()
     counts = _document_frequencies(fresh_db, "kafka", "postgres")
     counts.pop("*rows*")
     assert counts["kafka"] == counts["postgres"], "the fixture must give the terms equal weight"
     assert _ids(search.search("kafka postgres", k=20, principal=owner())) == {both.id}
+
+
+def test_a_trailing_comma_does_not_buy_a_word_a_second_share_of_the_weight(fresh_db):
+    """The dedup has to fold what FTS5 folds, or the quorum is bought off.
+
+    `_query_terms` dedups so that typing a word twice cannot count its weight
+    twice — but it dedupped the *raw* token while FTS5 (`porter unicode61`)
+    tokenizes `kafka,` and `kafka` identically. So the same word wearing a
+    comma arrived as two terms carrying one word's document frequency twice,
+    which is enough to clear a bar half of itself: measured on this fixture,
+    `kafka postgres` answered with the one node carrying both and
+    `kafka, kafka postgres` with six — the bare disjunction the quorum was
+    chosen over, restored by a comma.
+
+    Trailing punctuation is not a hypothetical here: a question mark rides
+    along on the last word of every question, which is why
+    :func:`nodum.search._is_function_word` already stripped it before its own
+    lookup. The two functions disagreeing about what "the same word" is was
+    the whole of the defect, so they now share one helper.
+    """
+    both = _seed_equal_df_pair()
+    assert search._query_terms("kafka, kafka postgres") == ['"kafka,"', '"postgres"']
+    assert search._query_terms("do do?") == ['"do"']
+    # Inner punctuation is not trimmed, or `min.insync.replicas` stops being
+    # one term — the property `_is_function_word`'s own docstring names.
+    assert search._query_terms("min.insync.replicas") == ['"min.insync.replicas"']
+    plain = _ids(search.search("kafka postgres", k=20, principal=owner()))
+    assert plain == {both.id}
+    for query in ("kafka, kafka postgres", "kafka kafka? postgres", "Kafka. kafka postgres"):
+        assert _ids(search.search(query, k=20, principal=owner())) == plain, query
 
 
 def test_four_terms_of_equal_weight_still_only_need_half(fresh_db):

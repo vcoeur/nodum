@@ -109,9 +109,17 @@ including every parameter.
   query's inverse-document-frequency weight, counting **content words only** —
   ordinary English function words (`what`, `does`, `how`, `let`, …) are dropped
   first, so the words a question is *asked* with never outvote the word it is
-  *about*. A rare word earns a match and a common one costs nothing; the fix
-  for an empty result is a *rarer* word rather than a shorter query. A query
-  may carry at most 64 distinct terms.
+  *about*. A rare word earns a match and a common one costs nothing, so the fix
+  for an empty result is usually a *different* word rather than a shorter query
+  — but a **rarer** one only helps if the graph holds it. **A query the graph
+  knows no content word of matches nothing at all**, deliberately: `zarquon`
+  finds nothing, so *"What does zarquon protect against?"* answers with nothing
+  too, rather than with whatever notes happen to share its phrasing. In that
+  case the word to change is the one the question is *about*. (With an embedding
+  provider configured, the vector signal has no such rule and still returns its
+  nearest chunks — a result whose every hit shows only a `vector` signal is
+  telling you the keyword half found nothing.) A query may carry at most 64
+  distinct terms.
   `--nl` asks the model to rewrite the question into search terms first and adds
   a `rewrite` object saying what was asked on your behalf; it is a rewrite of
   the words only — every signal, filter and cap below it is unchanged — and with

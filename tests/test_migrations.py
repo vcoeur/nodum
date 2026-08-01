@@ -1201,16 +1201,127 @@ def test_a_half_applied_0015_is_repaired_without_re_adding_the_column_it_has(tmp
 def _stop_columns_without_the_check(conn):
     """Leave `cycles` carrying both stamps and no constraint over them.
 
-    The shape an earlier cut of `0015` produced — the three-column proposal
-    leaned on a boolean instead of the cross-column CHECK — reproduced by
-    dropping the constrained column and adding it back bare, which is also what
-    a human following a half-remembered version of the repair would do.
+    **Not a shape this repo has ever produced.** `0015` landed with both columns
+    and the CHECK attached and `nodum/migrations.py` has not changed since, so
+    unlike `0014` — genuinely amended in place while unreleased — no database
+    built from this history can record `0015` and lack the constraint. What the
+    check guards, and what this reproduces, is a file drifted by something
+    outside the migration runner: a hand-edited schema, an externally applied
+    migration, or a human following half of the repair. Dropping the constrained
+    column and adding it back bare is the shortest route to that state and is
+    also, precisely, what the last of those does.
     """
     conn.executescript(
         "ALTER TABLE cycles DROP COLUMN stop_requested_by;"
         "ALTER TABLE cycles ADD COLUMN stop_requested_by TEXT;"
     )
     conn.commit()
+
+
+def _rebuilt_with(conn, replacement):
+    """Rebuild `cycles` with `replacement` in place of `0015`'s `, <CONSTRAINT …>`.
+
+    The repair statement itself, with its one constraint swapped out — so the
+    table under test differs from a sound one in exactly that clause and in
+    nothing else. The leading comma goes with it, since a table whose last
+    column declaration is followed by nothing needs no separator.
+    """
+    conn.executescript(
+        db.CYCLE_STOP_CHECK_REBUILD_SQL.replace(f", {db.CYCLE_STOP_CHECK_SQL}", replacement)
+    )
+    conn.commit()
+
+
+def _half_stop_is_storable(conn, cycle_id):
+    """Can this file hold a time with no requester — the state the CHECK forbids?
+
+    Leaves the row behind either way, at whichever of the two states it reached,
+    so the caller can go on asking about the same file.
+    """
+    _insert_cycle(conn, cycle_id, "curative")
+    try:
+        conn.execute(
+            "UPDATE cycles SET stop_requested_at = datetime('now') WHERE id = ?", (cycle_id,)
+        )
+    except sqlite3.IntegrityError:
+        conn.commit()
+        return False
+    conn.commit()
+    return True
+
+
+def test_the_constraint_name_in_a_comment_does_not_satisfy_the_check(fresh_db):
+    """A check over stored DDL must not fail *open*, and by default it does.
+
+    SQLite keeps a `CREATE TABLE` verbatim, comments included, and the `cycles`
+    DDL this repo ships is heavily commented — so a substring search for the
+    constraint name is satisfied by a file that merely *mentions* it. That is
+    the one failure direction that costs something: the check reports a sound
+    schema, `init_db` returns `[]`, and the half-stop the constraint exists to
+    forbid goes straight in. `_table_sql` strips comments before anything
+    searches, and this is what says so.
+    """
+    conn = db.connect()
+    try:
+        _rebuilt_with(conn, f" /* {db.CYCLE_STOP_CHECK_SQL} */")
+        # The name really is in the schema SQLite stored, which is what the
+        # search used to be satisfied by...
+        stored = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'cycles'"
+        ).fetchone()["sql"]
+        assert db.CYCLE_STOP_CHECK_NAME in stored
+        # ...and nothing constrains the columns, so the drift is real.
+        assert _half_stop_is_storable(conn, "half") is True
+
+        assert db.CYCLE_STOP_CHECK_NAME not in db._table_sql(conn, "cycles")
+        problems = db._cycle_stop_problems(conn)
+        assert len(problems) == 1
+        assert db.CYCLE_STOP_CHECK_NAME in problems[0]
+        with pytest.raises(db.SchemaConsistencyError):
+            db.init_db(conn)
+    finally:
+        conn.close()
+
+
+def test_an_unnamed_check_that_enforces_the_rule_is_still_reported(fresh_db):
+    """Reported on purpose: the name is half of what `0015` guarantees.
+
+    SQLite prints a named constraint verbatim as `CHECK constraint failed:
+    <name>`, so the name is the sentence a human meets when the stop stamps
+    disagree — `0014`'s device, since `RAISE()` is trigger-only — and it is what
+    the rebuild puts back. A file enforcing the same rule anonymously enforces
+    the rule and does not carry the migration, so saying so is the right answer
+    and not a false alarm. The cost is bounded and in the safe direction: a human
+    reads a repair that turns out to change only the message.
+
+    Asserted rather than left implicit because the alternative reading — "this
+    check over-fires" — invites loosening it, and loosening a search over DDL is
+    how it starts failing open instead.
+    """
+    conn = db.connect()
+    try:
+        _rebuilt_with(conn, ", CHECK ((stop_requested_by IS NULL) = (stop_requested_at IS NULL))")
+        # It bites, so the file is not broken in the way the message describes.
+        assert _half_stop_is_storable(conn, "anonymous") is False
+        # And it is reported anyway, because the constraint `0015` records is a
+        # named one and this file has not got it.
+        problems = db._cycle_stop_problems(conn)
+        assert len(problems) == 1
+        assert db.CYCLE_STOP_CHECK_NAME in problems[0]
+
+        # The repair is a no-op for the rule and puts the name on, which is the
+        # whole of what it was missing.
+        conn.executescript(db.CYCLE_STOP_CHECK_REBUILD_SQL)
+        conn.commit()
+        assert db.init_db(conn) == []
+        assert _half_stop_is_storable(conn, "named") is False
+        with pytest.raises(sqlite3.IntegrityError, match=db.CYCLE_STOP_CHECK_NAME):
+            conn.execute(
+                "UPDATE cycles SET stop_requested_at = datetime('now') WHERE id = 'anonymous'"
+            )
+        conn.rollback()
+    finally:
+        conn.close()
 
 
 def test_the_stop_columns_without_their_check_are_drift_the_check_has_to_see(fresh_db):
@@ -1245,6 +1356,52 @@ def test_the_stop_columns_without_their_check_are_drift_the_check_has_to_see(fre
         conn.close()
 
 
+#: One `cycles` row with a distinct, non-NULL value in **every** column the
+#: table has, for the rebuild's "keeps every row" claim — which is a claim about
+#: all twelve and was asserted over five. `_insert_cycle` only ever fills four,
+#: so a rebuild that dropped `report` — every cycle's journal body — passed the
+#: whole suite. Keyed by column so the test can check it still covers the table.
+_EVERY_COLUMN_FILLED = {
+    "id": "stopped",
+    "trigger": "curative",
+    "triggered_by": "human:owner",
+    "scope": "research",
+    "dry_run": 1,
+    "status": "failed",
+    "report": '{"jobs": ["duplicates"], "detail": "the body of the journal entry"}',
+    "started_at": "2026-07-29 22:00:00",
+    "finished_at": "2026-07-30 01:30:00",
+    "rolled_back_by": "the-rollback",
+    "stop_requested_at": "2026-07-30 01:00:00",
+    "stop_requested_by": "human:owner",
+}
+
+
+def test_the_rebuilds_column_list_is_every_column_a_migrated_cycles_has(fresh_db):
+    """A column list written by hand is a data-loss bug the day a migration adds one.
+
+    `CYCLE_STOP_CHECK_REBUILD_SQL` builds its replacement table from
+    `db.CYCLES_COLUMNS` and copies the same list across, so the two halves of
+    the repair cannot disagree — but nothing inside the repair can know whether
+    that list is still the table. A column `0016` adds to `cycles` would be
+    dropped by it, **with its data**, in a statement a human is told to run
+    against their own graph, silently, with `init_db` returning `[]` afterwards
+    because no check looks for it.
+
+    This is the pin, and it fails on the commit that adds the column rather than
+    on the install that runs the repair.
+    """
+    conn = db.connect()
+    try:
+        live = [row["name"] for row in conn.execute("PRAGMA table_info(cycles)")]
+    finally:
+        conn.close()
+    assert live == [name for name, _ in db.CYCLES_COLUMNS], (
+        "a migration changed `cycles` and `db.CYCLES_COLUMNS` did not follow: the rebuild "
+        "printed by `_cycle_stop_problems` would drop the difference and its data"
+    )
+
+
 def test_the_missing_stop_check_is_refused_with_a_rebuild_that_keeps_every_row(fresh_db):
     """The remedy is this check's own, and putting a CHECK on is not adding a column.
 
@@ -1259,16 +1416,26 @@ def test_the_missing_stop_check_is_refused_with_a_rebuild_that_keeps_every_row(f
     The refusal is **followed** rather than pattern-matched: the statement it
     prints is executed verbatim, and afterwards the file passes init, still
     holds its rows, refuses the half-stop, and still serialises its cycles.
+
+    "Every row" is asserted over **every column**, which it was not: the row went
+    in through `_insert_cycle`, which fills four of the twelve, and the test then
+    looked at the two stop stamps. `scope`, `dry_run`, `report`, `started_at`,
+    `finished_at` and `rolled_back_by` were neither written nor read, so NULLing
+    `report` in the copy — destroying every cycle's journal body — passed here.
+    A row-preservation test is worth exactly the columns it populates.
     """
     conn = db.connect()
     try:
+        assert set(_EVERY_COLUMN_FILLED) == {name for name, _ in db.CYCLES_COLUMNS}
         # Stopped *after* the drift, which is the only order a real file can
         # have it in: a constraint-less schema is what the row was written on.
         _stop_columns_without_the_check(conn)
-        _insert_cycle(conn, "stopped", "manual", status="failed")
+        # `rolled_back_by` is a self-reference, so the row it names has to exist.
+        _insert_cycle(conn, "the-rollback", "rollback", status="completed")
+        columns = ", ".join(_EVERY_COLUMN_FILLED)
         conn.execute(
-            "UPDATE cycles SET stop_requested_at = '2026-07-30 01:00:00',"
-            " stop_requested_by = 'human:owner' WHERE id = 'stopped'"
+            f"INSERT INTO cycles ({columns}) VALUES ({', '.join('?' * len(_EVERY_COLUMN_FILLED))})",
+            tuple(_EVERY_COLUMN_FILLED.values()),
         )
         conn.commit()
 
@@ -1282,13 +1449,15 @@ def test_the_missing_stop_check_is_refused_with_a_rebuild_that_keeps_every_row(f
         conn.commit()
         assert db.init_db(conn) == []
 
-        # Every row came across, the recorded stop included — the journal has to
-        # go on saying who stopped that night.
+        # Every row came across, and every *column* of it — the recorded stop,
+        # the scope, the rehearsal flag, both timestamps, the rollback link, and
+        # the report, which is the whole readable body of a journal entry.
         row = conn.execute("SELECT * FROM cycles WHERE id = 'stopped'").fetchone()
-        assert (row["stop_requested_by"], row["stop_requested_at"]) == (
-            "human:owner",
-            "2026-07-30 01:00:00",
-        )
+        assert dict(row) == _EVERY_COLUMN_FILLED
+        assert {r["id"] for r in conn.execute("SELECT id FROM cycles")} == {
+            "stopped",
+            "the-rollback",
+        }
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
 
         # The constraint bites, by the name SQLite prints...

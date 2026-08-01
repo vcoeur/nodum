@@ -1408,6 +1408,53 @@ def test_a_dry_run_reports_the_delete_guards_it_used_to_call_clean(fresh_db):
     assert str(refused.value).endswith(blocked[space.id].reason)
 
 
+def test_a_blocked_dry_run_still_describes_the_reversal_it_says_cannot_run(fresh_db):
+    """The six lists answer "what is this rollback", not "would it go through".
+
+    Filling them from the plan bought the preflight its agreement with the run,
+    and it also made a combination nothing covered: `_planned_effects` walks the
+    payloads and never looks at `blockers` or `conflicts`, so a refused verdict
+    now says *"this would delete node X"* in the same object that says *"it
+    cannot, X has a child"*. That is the honest shape rather than a defect — a
+    blocked rollback is still a rollback with a description — but it is only
+    readable as a contradiction by a client that renders the six without
+    checking the two, so the model docstring says which to read first and this
+    pins the shape both statements are about.
+
+    Both refusals are covered, because they arrive by different routes: a
+    blocker is `UndoNotPossible` out of the guard, a conflict is
+    `RollbackConflict` off the plan.
+    """
+    blocked_cycle = service.open_cycle(trigger="manual", principal=owner())
+    with service.in_cycle(blocked_cycle.id):
+        page = service.create_node(type="page", title="P", principal=owner())
+    service.close_cycle(blocked_cycle.id, status="completed", report={}, principal=owner())
+    child = service.create_node(type="block", content="b", parent_id=page.id, principal=owner())
+
+    plan = service.rollback_cycle(blocked_cycle.id, dry_run=True, principal=owner())
+    # It describes the delete...
+    assert plan.deleted_nodes == [page.id]
+    # ...and refuses it, in the same response.
+    assert [blocker.row_id for blocker in plan.blockers] == [page.id]
+    with pytest.raises(UndoNotPossible):
+        service.rollback_cycle(blocked_cycle.id, principal=owner())
+    # The graph is untouched by either call — a preflight writes nothing and a
+    # refused rollback is all of it or none of it.
+    assert service.get_node(page.id, principal=owner()).id == page.id
+    assert service.get_node(child.id, principal=owner()).id == child.id
+
+    # The conflict half, which refuses for the other reason.
+    node = _node("Alpha")
+    conflicted = service.retype([node.id], "concept", principal=owner())
+    service.update_node(node.id, title="Edited after the cycle", principal=owner())
+
+    verdict = service.rollback_cycle(conflicted.cycle_id, dry_run=True, principal=owner())
+    assert verdict.restored_nodes == [node.id]
+    assert [conflict.row_id for conflict in verdict.conflicts] == [node.id]
+    with pytest.raises(RollbackConflict):
+        service.rollback_cycle(conflicted.cycle_id, principal=owner())
+
+
 def test_a_dry_run_does_not_call_the_cycles_own_rows_blockers(fresh_db):
     """A rollback reverses newest first, so what it deletes cannot block it.
 

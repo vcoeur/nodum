@@ -14,14 +14,29 @@
  * words — measured on a 312-node corpus, question-shaped queries went from
  * 85% returning nothing at all to 3%.
  *
- * **A query the graph knows no content word of still matches nothing**, and
- * that is why the advice below names a missing word rather than a missing
- * result. The drops relax in a fixed order — ubiquity first, because it is the
- * only one about cost rather than meaning — and function words are searched
- * only when the query has no content word at all. Otherwise *"What does
- * zarquon protect against?"* would answer with notes that share its phrasing
- * while `zarquon` alone correctly returns nothing, which is the empty result
- * turned into a confidently wrong one.
+ * **A query the graph knows no content word of still matches nothing in the
+ * keyword half**, and that is why the advice below names a missing word rather
+ * than a missing result. The drops relax in a fixed order — ubiquity first,
+ * because it is the only one about cost rather than meaning — and function
+ * words are searched only when the query has no content word at all.
+ * Otherwise *"What does zarquon protect against?"* would answer with notes
+ * that share its phrasing while `zarquon` alone correctly returns nothing,
+ * which is the empty result turned into a confidently wrong one.
+ *
+ * Two qualifiers, because this copy has been wrong once and the temptation is
+ * to state the rule wider than it holds:
+ *
+ * 1. **It is the keyword half's silence, not the server's.** The vector
+ *    signal has no similarity threshold, so on a graph with an embedding
+ *    provider that same query comes back full of vector-only hits and this
+ *    view never renders. The advice below is therefore written for the case
+ *    it is actually shown in — a genuinely empty result — and says nothing
+ *    about why the result was empty.
+ * 2. **"Knows no content word" means none at all**, not "none that
+ *    discriminates". Ordinary English nouns and verbs count as content words
+ *    on purpose, so a question wrapping an unknown subject still answers
+ *    whenever the graph happens to hold one of its other words: measured, six
+ *    of twelve such questions go silent and six do not.
  *
  * Which makes *"try fewer words"* close to the opposite of the right advice.
  * Under the old rule every extra word was another way to match nothing, so

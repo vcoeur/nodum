@@ -4385,8 +4385,21 @@ def _no_such_cycle(cycle_id: str) -> RecordNotFound:
     return RecordNotFound(f"consolidation cycle not found: {cycle_id}")
 
 
+def _find_cycle_row(conn: sqlite3.Connection, cycle_id: str) -> sqlite3.Row | None:
+    """The ``cycles`` row with this id, or ``None``.
+
+    One query, because there are two callers and they differ only in what they
+    do with a miss: :func:`_get_cycle_row` raises, and :func:`stop_requested`
+    has to fold the miss into a check it makes afterwards. That was two copies
+    of the ``SELECT`` for one round, which is the argument :func:`_no_such_cycle`
+    itself is written from — a filter added to one of them is a filter the other
+    silently does not have.
+    """
+    return conn.execute("SELECT * FROM cycles WHERE id = ?", (cycle_id,)).fetchone()
+
+
 def _get_cycle_row(conn: sqlite3.Connection, cycle_id: str) -> sqlite3.Row:
-    row = conn.execute("SELECT * FROM cycles WHERE id = ?", (cycle_id,)).fetchone()
+    row = _find_cycle_row(conn, cycle_id)
     if row is None:
         raise _no_such_cycle(cycle_id)
     return row
@@ -4791,9 +4804,15 @@ def request_stop(
 def _may_watch_a_cycle(row: sqlite3.Row, principal: Principal) -> bool:
     """May this principal ask whether the cycle in ``row`` was told to stop?
 
-    **The rule is: exactly what admitted the run.** A run is admitted over a
-    cycle in two different ways depending on the cycle, and this asks the
-    matching one rather than a third thing of its own.
+    **The rule is: what would have admitted *you* to run this cycle's
+    territory.** It is a question about the caller, not about the run — and the
+    difference is not a nicety. ``cycles`` records ``triggered_by``, who *asked*
+    for the run, and has no column at all for who is *running* it: the runner is
+    a principal minted inside :func:`nodum.consolidate._run_cycle` and never
+    written down. So "exactly what admitted this run" — which is how this was
+    first stated — is not a question this row can answer, and a check that
+    claimed to ask it would be describing a column that does not exist. What is
+    checkable is the admission rule itself, applied to whoever is asking.
 
     A **scoped** cycle is admitted by :func:`nodum.consolidate.
     _require_gardener_scope`, which asks only that the runner can *resolve* the
@@ -4804,26 +4823,45 @@ def _may_watch_a_cycle(row: sqlite3.Row, principal: Principal) -> bool:
     because nothing was ever wrong with it. Humans pass, as they pass every
     other check here.
 
+    **Caller-relative is wider than run-relative, and the width is the delta.**
+    Any agent holding *any* grant on space S can read the switch on every cycle
+    ever scoped to S — cycles a human opened, cycles another agent opened, runs
+    it has no part in. Concretely: the minimum grant set :func:`create_agent`
+    gives a new agent, ``read`` on ``meta`` — the least anything needs to resolve
+    a type — now watches every cycle scoped to ``meta``, and the parity set
+    ``0010`` backfilled onto the agents that predate it, ``meta: read`` plus
+    ``main: suggest``, watches every cycle over ``main`` too. ``require_review``
+    refused both, since neither level reaches ``EDIT``. It is a boolean per
+    cycle id and no id is reachable from anything an agent can call — cycle ids
+    are ``uuid4``, both journal reads are human-only, and no agent-facing model
+    carries one — but the width is real and stating a narrower rule than the code
+    enforces is how a later reader grants themselves the narrower one.
+
     **The scoped half is not the rule that shipped, and the one it replaces was
     wrong.** :func:`stop_requested` asked ``Store.require_review`` over
     :func:`_cycle_authority_spaces` for *both* cases — the identical check
     ``open_cycle`` and ``close_cycle`` ask — justified as *obeying a stop is
     closing the cycle, so a principal that could not close this one has no use
-    for the answer*. Both halves of that fail against a run this system
-    genuinely licenses. The runner does not close the cycle:
-    ``consolidate._run_cycle`` closes it as the **opener**, which for a
-    human-triggered run is the human, so the gardener never exercises the
-    authority the check was demanding of it. And a scoped run needs only to
-    resolve its scope, so a gardener holding ``read`` on a space is entitled to
-    consolidate it and was then refused the switch over its own run — a night
-    dying at the first provider call with ``GrantNotPermitted``, which is a kill
-    switch killing the run by being unreadable. A check on the far side of a
-    door must not be stricter than the door.
+    for the answer*. That justification is unsound on **both** triggers, in two
+    different ways, and the widening is right on both:
 
-    What the widened half gives away is one boolean about a run, over territory
-    the caller already holds a grant on, addressed by an id it must already have
-    been handed: cycle ids are ``uuid4`` and both journal reads are human-only,
-    so nothing an agent can call will name one for it.
+    * On a ``manual`` run the gardener never closes the cycle at all.
+      ``consolidate._run_cycle`` closes as the **opener**, and ``_opener``
+      resolves a human-triggered run's opener to the human — so the check was
+      demanding of the gardener an authority the gardener does not exercise.
+    * On a ``scheduled`` run the gardener *is* the opener and *does* close its
+      own cycle — but then ``open_cycle`` already required ``edit`` on the scope
+      before the run could start, so the check was re-asking a question the door
+      had already answered ``yes``. It could refuse nothing a scheduled run
+      would ever meet.
+
+    Either way the old check only ever bit where it was wrong: a scoped run
+    needs no more than to resolve its scope, so a gardener holding ``read`` on a
+    space is entitled to consolidate it and was then refused the switch over its
+    own run — a night dying at the first provider call with
+    ``GrantNotPermitted``, which is a kill switch killing the run by being
+    unreadable. A check on the far side of a door must not be stricter than the
+    door.
     """
     if principal.is_human:
         return True
@@ -4848,31 +4886,58 @@ def stop_requested(cycle_id: str, *, principal: Principal, path: str | Path | No
     single boolean about a run, discloses no node, no space and no count, and a
     runner that cannot ask whether it was told to stop cannot obey.
 
-    **What bounds it instead is** :func:`_may_watch_a_cycle` — exactly what
-    admitted the run over this cycle, which for a scoped one is the grant that
-    resolves its scope and no longer the authority to close it. That rule
-    changed here, and why is written where the rule is.
+    **What bounds it instead is** :func:`_may_watch_a_cycle` — the admission
+    rule for this cycle's territory, asked of whoever is calling, which for a
+    scoped cycle is the grant that resolves its scope and no longer the
+    authority to close it. That rule changed here, and why — along with how much
+    wider caller-relative is than run-relative — is written where the rule is.
 
-    **And the refusal is the fourth existence oracle this project has closed.**
-    The two answers this function used to give a principal it turned away —
-    ``RecordNotFound`` for an id that names nothing, ``GrantNotPermitted`` for a
-    cycle it may not watch — told those two cases apart, so anything holding a
-    single grant could probe a cycle id and learn whether it exists. Cycle ids
-    are unguessable and both journal reads are human-only, which bounds the
-    damage and does not close the class: the space-name check and the Q13
-    non-oracle rule are both settled the other way, and the rule they settle on
-    is that **the refusal is one sentence for both cases**. The ordering trick
-    the space-name check uses — ask the grant first, so the existence question
-    is never reached — is unavailable here, because the grant to ask for is
-    recorded *on the row*. So this takes ``_resolve_space``'s shape instead: one
-    refusal, the not-found one, echoing nothing back but the id the caller
-    supplied. A principal that may watch the cycle still gets the truthful
-    answer, and a human — unfiltered, as everywhere — is never told a cycle it
-    can see does not exist.
+    **And this refusal is no longer an existence oracle.** The two answers this
+    function used to give a principal it turned away — ``RecordNotFound`` for an
+    id that names nothing, ``GrantNotPermitted`` for a cycle it may not watch —
+    told those two cases apart, so anything holding a single grant could probe a
+    cycle id and learn whether it exists. Cycle ids are unguessable and both
+    journal reads are human-only, which bounds the damage and does not close the
+    class: the space-name check and the Q13 non-oracle rule are both settled the
+    other way, and the rule they settle on is that **the refusal is one sentence
+    for both cases**. The ordering trick the space-name check uses — ask the
+    grant first, so the existence question is never reached — is unavailable
+    here, because the grant to ask for is recorded *on the row*. So this takes
+    ``_resolve_space``'s shape instead: one refusal, the not-found one, echoing
+    nothing back but the id the caller supplied. A principal that may watch the
+    cycle still gets the truthful answer, and a human — unfiltered, as everywhere
+    — is never told a cycle it can see does not exist.
 
-    The recorded scope is used rather than a re-resolution of it, as
-    :func:`close_cycle` does, so a space archived mid-run cannot make its own
-    cycle unstoppable.
+    **It is closed here and nowhere else, and that is the claim.** It is not
+    "the class of cycle-id oracles, closed": :func:`close_cycle` takes a cycle
+    id, is not human-only, and still answers ``GrantNotPermitted`` for a cycle
+    the caller may not close against ``RecordNotFound`` for an id that names
+    nothing — the only one of the seven cycle-id surfaces that still tells them
+    apart. That is deliberate. ``close_cycle``'s refusal is the *same*
+    ``require_review`` :func:`open_cycle` raises, on the same spaces, and
+    ``open_cycle`` cannot be an oracle at all because it takes a scope and not an
+    id; collapsing one half of that pair would leave a principal that opened a
+    cycle and cannot close it reading *this cycle does not exist* about a row it
+    is holding open, and would falsify the symmetry
+    :meth:`~nodum.store.Store.require_review` documents. The exposure argument is
+    this function's own, unchanged — an unguessable id, no agent-facing model
+    carrying one — and it is an argument about reach, not a reason to widen the
+    collapse onto a write.
+
+    **What the collapse costs, said plainly.** The refusal a principal outside
+    the run now meets is ``consolidation cycle not found``, and that sentence
+    reaches a *legitimate* runner too. Grants are read when a principal is minted
+    (``auth._grant_set``, which drops grants on archived spaces), so a run whose
+    scope is archived under it keeps reading its switch — ``_run_cycle`` mints
+    the gardener once and holds it — while the **next** principal minted for that
+    cycle, in a later process or after a restart, is told its own cycle does not
+    exist. It used to be told it needed ``edit`` on the item's space, which at
+    least pointed at the cause. Both refusals are wrong for that reader; this one
+    is quieter about the thing an outsider must not learn, which is the trade
+    that was taken. The recorded scope is used rather than a re-resolution of it
+    (as :func:`close_cycle` does) so that an archived space does not make the
+    *lookup* fail on top of it — but it does not, and cannot, keep an archived
+    space's cycle readable by a re-minted runner.
 
     Args:
         cycle_id: The cycle to ask about.
@@ -4890,7 +4955,7 @@ def stop_requested(cycle_id: str, *, principal: Principal, path: str | Path | No
     """
     conn = _connect(path)
     try:
-        row = conn.execute("SELECT * FROM cycles WHERE id = ?", (cycle_id,)).fetchone()
+        row = _find_cycle_row(conn, cycle_id)
         if row is None or not _may_watch_a_cycle(row, principal):
             raise _no_such_cycle(cycle_id)
         return row["stop_requested_at"] is not None
@@ -5922,6 +5987,15 @@ class _RollbackEffects(NamedTuple):
             redirect = conn.execute(
                 "SELECT 1 FROM merge_redirects WHERE tombstone_id = ?", (after["id"],)
             ).fetchone()
+            # Defensive, and known to be: no test reaches the `None` arm and no
+            # cycle shape produces it — at every involution depth tried, the
+            # redirect is present exactly when `_applies_a_merge` is true, since
+            # the merge that wrote the payload wrote the redirect in the same
+            # transaction. The probe stays because this list is a *report* of
+            # rows removed and `_apply_rollback`'s DELETE removes none when
+            # there is nothing there; counting unconditionally would be the
+            # accounting claiming a removal that did not happen the first time
+            # anything does delete a redirect out from under a cycle.
             if redirect is not None:
                 self.redirects_removed.append(after["id"])
         if before is None:
