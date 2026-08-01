@@ -1985,14 +1985,54 @@ commands on a saved node for exactly this reason.
   the same hole re-opened the refusal — `**What** does zarquon protect against?`
   and `“What” …` answered with **8** prose notes where the undecorated question
   correctly answered with **0**. `_bare_word` is now every maximal run of
-  alphanumeric characters, lowercased — `unicode61`'s own rule — and is **sound
-  and incomplete** against `porter unicode61`: what it merges the tokenizer
-  merges (zero counterexamples over a 465-token probe, 107 880 pairs), and what
-  the tokenizer merges it may not. The residue is named, not hidden: `porter`
-  **stems**, so `retain retains postgres` still answers with **six** and still
-  buys one word two shares of the quorum's weight, and `unicode61` folds
-  **diacritics** (`café`/`cafe`). Both are pinned by tests that fail if either
-  is closed without rewriting this paragraph. `casefold()` was rejected for
+  alphanumeric characters, lowercased — `unicode61`'s own rule — and is
+  **incomplete, and sound on every script SQLite's case table has caught up
+  with**: what it merges the tokenizer merges (zero counterexamples over a
+  465-token probe, 107 880 pairs), and what the tokenizer merges it may not.
+  The soundness half is **not** an absolute, and the exception is a version skew
+  rather than a corner case: SQLite's fold table is frozen at the Unicode
+  version `fts5_unicode2.c` was written against, so a simple case mapping added
+  since folds in Python and does not fold in FTS5. Swept exhaustively over every
+  alphanumeric codepoint below U+30000 (133 808 of them) against a live table:
+  **417** fold groups Python merges and SQLite splits — Cherokee, Georgian
+  Mtavruli, Adlam, Osage, Warang Citi, Medefaidrin, and a tail of Latin, Greek
+  and Cyrillic letters — and `search("ᲓᲦᲔ დღე")` really does reach only the
+  Mtavruli row, the lowercase term the caller typed having been dropped as its
+  duplicate. Deseret (cased since Unicode 3.1) folds correctly on both sides, so
+  the axis is the table's vintage and not "non-ASCII" or "non-BMP". Blast radius
+  on this corpus is nil — nothing in ASCII, Latin-1 or any Western European
+  language is affected — so the fold is deliberately **not** changed: merging a
+  case pair SQLite refuses to merge is the more correct behaviour
+  linguistically, and it was the stated invariant that was wrong, not the code.
+  One pair per block is pinned as `_FOLD_UNSOUND` in `tests/test_search.py`,
+  with a sound control beside it, so SQLite catching up fails the test rather
+  than making this paragraph quietly stale.
+  The residue is named, not hidden, and the stemmer's half of it is the more
+  serious of the two. `porter` **stems**, and `_is_function_word` looks a
+  *character* fold up in `_QUERY_STOPWORDS` — so any word that stems onto a
+  stopword arrives at `_compile_match` as a **content** word while matching the
+  stopword's rows in the index, which **re-opens the refusal** exactly as a
+  decorated stopword used to: `known_content` is non-empty, `kept` is non-empty,
+  and the early return never fires. This is not exotic input — 167 of the 63 875
+  lowercase words in `/usr/share/dict/american-english` collide this way, and
+  the worst is the commonest verb a technical question carries, since `use`,
+  `used`, `using`, `uses` and `useful` all stem to `us`, which is in the list.
+  Measured: on a corpus saying the pronoun *us* in six rows, all five spellings
+  answer *"How is zarquon used?"* with those six rows and nothing else, and the
+  shipped claim fixture needs no help at all — *"What does zarquon doe?"*
+  answers with **8** hits, every one of them prose sharing only the question's
+  phrasing, where the undecorated question correctly answers with **0**. The
+  cheaper half is the dedup: `retain retains postgres` still answers with
+  **six** and still buys one word two shares of the quorum's weight. `unicode61`
+  folds **diacritics** (`café`/`cafe`) besides. All of it is pinned by tests
+  that fail if any of it is closed without rewriting this paragraph. Closing
+  the stemmer half needs a Python porter stemmer that agrees with SQLite's on
+  every word, and one that *disagrees* is worse than none; stemming
+  `_QUERY_STOPWORDS` at import would fix the lookup without a whole stemmer but
+  carries the same risk with the sign flipped — an over-merge there demotes a
+  real content word to a function word and refuses a query that should have
+  answered. A different error, not obviously a cheaper one, so both halves stay
+  open and both stay measured. `casefold()` was rejected for
   `lower()` (it merges `straße`/`strasse` and `ﬁle`/`file`, which the tokenizer
   keeps apart — unsound, and unsound loses a term the caller typed), and NFD
   diacritic-stripping was rejected too (SQLite's default `remove_diacritics=1`

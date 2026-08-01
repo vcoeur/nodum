@@ -181,25 +181,67 @@ def _bare_word(token: str) -> str:
     ``kafka,`` and ``kafka`` were one function-word question and two distinct
     quorum terms at the same time.
 
-    **The fold is sound and incomplete against ``porter unicode61``**, and the
-    asymmetry is deliberate, because the two directions of error cost different
-    things:
+    **The fold is incomplete against ``porter unicode61``, and sound on every
+    script SQLite's case table has caught up with**, and the asymmetry is
+    deliberate, because the two directions of error cost different things:
 
-    * *sound* — two tokens that fold alike always match the same rows. This is
-      the half that has to hold: :func:`_query_terms` keeps the first token of
+    * *sound* — two tokens that fold alike match the same rows. This is the
+      half that has to hold: :func:`_query_terms` keeps the first token of
       a fold group and drops the rest, so an unsound merge makes a term the
       caller typed **unreachable**. Measured at zero counterexamples over a
       465-token probe (107 880 pairs), and pinned in ``tests/test_search.py``
       against a live FTS5 table carrying the projector's own tokenizer.
+      It is **not** an absolute, and the exception is a version skew rather
+      than a corner case: SQLite's fold table is frozen at the Unicode version
+      it was written against, so a simple case mapping added after it folds
+      here and does not fold there. Swept exhaustively over every alphanumeric
+      codepoint below U+30000 (133 808 of them) against a live table, **417**
+      fold groups this merges and SQLite splits — Cherokee, Georgian Mtavruli,
+      Adlam, Osage, Warang Citi, Medefaidrin, and a tail of Latin, Greek and
+      Cyrillic letters — and ``search("ᲓᲦᲔ დღე")`` really does reach only the
+      Mtavruli spelling, the lowercase term the caller typed having been
+      dropped as its duplicate. Nothing in ASCII, Latin-1 or any Western
+      European language is affected, which is why the fold is left as it is:
+      merging a case pair SQLite refuses to merge is the more correct
+      behaviour linguistically, so it is the stated invariant that was wrong
+      and not the code. One pair per block is pinned as ``_FOLD_UNSOUND`` in
+      ``tests/test_search.py``, so if SQLite's table catches up this paragraph
+      fails rather than drifts.
     * *incomplete* — the tokenizer merges pairs this does not, because it also
       applies rules no character fold can reach: ``porter`` **stems**
       (``retain``/``retains``) and ``unicode61`` folds **diacritics**
-      (``café``/``cafe``). The consequence is named rather than hidden:
-      ``retain retains postgres`` still buys one word two shares of the
-      quorum's weight, which is the bypass the dedup exists to close, still
-      open on the stemmer. Closing it needs a Python porter stemmer that agrees
-      with SQLite's on every word — and one that *disagrees* is worse than
-      none, since a disagreement in the merging direction is unsound.
+      (``café``/``cafe``). The consequence is named rather than hidden, and the
+      stemmer's half of it is the more serious of the two:
+
+      - It **re-opens :func:`_compile_match`'s refusal.**
+        :func:`_is_function_word` looks this fold up in
+        :data:`_QUERY_STOPWORDS` and this fold is characters only, so a word
+        that *stems* onto a stopword arrives as a **content** word while
+        matching the stopword's rows in the index: ``known_content`` is
+        non-empty, ``kept`` is non-empty, and the early return never fires.
+        That is the decorated-stopword failure below with the decoration
+        replaced by an inflection, and it is not exotic input — 167 of the
+        63 875 lowercase words in ``/usr/share/dict/american-english`` collide
+        this way, the worst being the commonest verb a technical question
+        carries, since ``use``, ``used``, ``using``, ``uses`` and ``useful``
+        all stem to ``us``, which is in the list. Measured: on a corpus saying
+        the pronoun *us* in six rows, all five spellings answer *"How is
+        zarquon used?"* with those six rows and nothing else, and the shipped
+        test fixture needs no help at all — *"What does zarquon doe?"* answers
+        with **8** hits, every one of them prose sharing only the question's
+        phrasing, where the undecorated question correctly answers with none.
+      - It costs quorum weight: ``retain retains postgres`` still buys one word
+        two shares of the quorum's weight, which is the bypass the dedup exists
+        to close, still open on the stemmer.
+
+      Closing either needs a Python porter stemmer that agrees with SQLite's on
+      every word — and one that *disagrees* is worse than none, since a
+      disagreement in the merging direction is unsound. Stemming
+      :data:`_QUERY_STOPWORDS` at import would fix the lookup without a whole
+      stemmer, but it carries the same risk with the sign flipped: an
+      over-merge there demotes a real content word to a function word and
+      refuses a query that should have answered. That is a different error, not
+      obviously a cheaper one, so both halves stay open and both stay pinned.
 
     An earlier fold trimmed fifteen ASCII characters off the ends and
     ``casefold()``-ed. It was wrong in both directions and the enumeration was
@@ -289,11 +331,18 @@ def _is_function_word(term: str) -> bool:
     ``"against—"`` are all the same function word as ``against``. Getting that
     wrong is not cosmetic — a decorated stopword the fold misses becomes a
     *content* word carrying the plain word's real document frequency, which is
-    enough to keep :func:`_compile_match`'s refusal from ever firing.
+    enough to keep :func:`_compile_match`'s refusal from ever firing. The
+    lookup is by character fold and the tokenizer **stems**, so it is wrong
+    that way too, on every word that stems onto a stopword — see
+    :func:`_bare_word`, where the residue is measured.
 
-    A token holding inner punctuation folds to more than one word
-    (``min.insync.replicas`` → ``min insync replicas``) and so can never be a
-    function word: the list holds single words only.
+    A token that folds to more than one word can never be a function word: the
+    list holds single words only. Inner punctuation is the usual reason
+    (``min.insync.replicas`` → ``min insync replicas``) but not the only one —
+    ``İ`` (U+0130) is the single alphanumeric codepoint below U+30000 whose
+    ``lower()`` is two codepoints, so ``İstanbul`` folds to ``i stanbul`` with
+    no punctuation in it at all. The rule is stated over the fold's output
+    rather than over the token's characters because that covers both.
     """
     return _bare_word(term) in _QUERY_STOPWORDS
 

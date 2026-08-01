@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import threading
 
 import httpx
@@ -866,15 +867,20 @@ def test_the_refusal_closes_half_the_invented_subject_shape_and_the_number_is_th
     }
     silent = {query for query, hits in answered.items() if not hits}
     assert len(silent) == 6, f"AGENTS.md says six of twelve; measured {len(silent)}: {answered}"
-    # The six that survive do so through a content word the graph really holds
-    # and not through the question's phrasing — asserted by deleting the
-    # invented subject itself, which is the sharper form: the sub-query does
-    # not merely still answer, it answers with the **same ranked list**, so the
-    # invented word contributed nothing to the result at all. (An earlier
-    # version of this loop filtered out `_is_function_word` tokens instead,
-    # which keeps the invented subject — it is a content word — and so asserted
-    # only that the content words of a query that answered still answer, which
-    # the gate already guarantees.)
+    # Deleting the invented subject leaves the same ranked list. Read that for
+    # what it is — a **fixture guard**, not evidence about the gate. A term
+    # with `df == 0` is dropped before any weight is computed and `match` is
+    # built only from what survives, so `_compile_match` returns a
+    # bit-identical plan for the query and the sub-query; that holds on any
+    # corpus, for any word the corpus does not contain, and appending a
+    # brand-new invented word to an answering query returns the identical list
+    # too. What it *can* catch is the fixture going stale: if one of these
+    # "invented" subjects ever turns out to be in the corpus, the lists diverge
+    # and this reddens — worth pinning, because every assertion above reads
+    # them as unknown. (An earlier version of this loop filtered out
+    # `_is_function_word` tokens instead, which keeps the invented subject — it
+    # is a content word — and so asserted only that the content words of a
+    # query that answered still answer, which the gate already guarantees.)
     for query, invented in _INVENTED_SUBJECT_QUESTIONS:
         if query in silent:
             continue
@@ -1197,6 +1203,90 @@ def test_the_stemmer_is_the_one_bypass_left_and_it_is_measured(fresh_db):
     assert len(_ids(search.search("retain retains postgres", k=20, principal=owner()))) == 6
 
 
+#: Ordinary prose carrying the pronoun `us` — a `_QUERY_STOPWORDS` entry — and
+#: never the verb `use`. `porter` stems `use`, `used`, `using`, `uses` and
+#: `useful` all onto `us`, so these are the rows a question carrying any of
+#: those five spellings actually reaches, while `_is_function_word` reads every
+#: one of them as a content word.
+_STOPWORD_STEM_PROSE = (
+    "The point of writing it down is to give us the version we would say out loud.",
+    "None of this tells us which of the two we should reach for on a Tuesday.",
+    "What the trace gave us was a shape, not a cause, and that took another day.",
+    "It saves us the argument we would otherwise have twice a quarter.",
+    "The migration cost us an afternoon and bought us a decade.",
+    "Nobody has shown us a graph where the cheaper option loses.",
+)
+
+
+def test_the_stemmer_re_opens_the_refusal_and_not_only_the_dedup(fresh_db):
+    """The stemming residue's worse half, pinned open the way the dedup's is.
+
+    `test_the_stemmer_is_the_one_bypass_left_and_it_is_measured` names the
+    residue's cost as quorum weight. That is the cheaper half. `_bare_word` is
+    a *character* fold and `_is_function_word` looks its output up in
+    `_QUERY_STOPWORDS`, while FTS5 **stems** — so any word that stems onto a
+    stopword arrives at `_compile_match` as a **content** word while matching
+    the stopword's rows in the index. `known_content` is non-empty, `kept` is
+    non-empty, and the early return never fires.
+
+    That is, clause for clause, the failure
+    `test_a_decorated_question_word_does_not_re_open_the_refusal` exists to
+    prevent, with the decoration replaced by an inflection — and unlike a smart
+    quote, an inflection is what English *is*. Measured over the 63 875
+    lowercase words of `/usr/share/dict/american-english`, **167** of them
+    collide this way; the worst is the commonest verb a technical question
+    carries, since `use`, `used`, `using`, `uses` and `useful` all stem to
+    `us`, which is in the list.
+
+    Two shapes asserted here, both defeats:
+
+    * the shipped claim fixture needs no help at all. `doe` is not a stopword
+      and `does` is, `porter` stems both to `doe`, and *"What does zarquon
+      doe?"* answers with all **8** `Loose notes N` — verbatim what
+      `test_a_question_about_a_word_the_graph_has_never_seen_answers_with_nothing`
+      calls the harm, against **0** for the undecorated question;
+    * and on any corpus that says *us* in ordinary prose, all five spellings of
+      `use` answer with exactly the rows carrying the pronoun and never the
+      verb, for a subject the graph has never heard of.
+
+    This asserts the bypass is **open**, deliberately, which is the same
+    posture as `_FOLD_RESIDUE`: it is what makes `_bare_word`'s soundness
+    paragraph falsifiable on the half that costs the most, and it fails the
+    moment somebody closes it — at which point the prose is rewritten rather
+    than left stale. Closing it is not obviously free. Stemming
+    `_QUERY_STOPWORDS` at import would fix the lookup, but an over-merge there
+    demotes a real content word to a function word and refuses a query that
+    should have answered, which is the opposite error and not plainly cheaper.
+    """
+    _seed_claim_graph()
+    for index, text in enumerate(_STOPWORD_STEM_PROSE):
+        service.create_node(type="note", title=f"Prose {index}", content=text, principal=owner())
+    inflections = ("doe", "use", "used", "using", "uses", "useful")
+    counts = _document_frequencies(fresh_db, "does", "us", *inflections)
+    rows = counts.pop("*rows*")
+    ceiling = max(1, int(rows * search._COMMON_TERM_DF_FRACTION))
+    # The lookup is by character fold, so none of these is a function word…
+    assert not any(search._is_function_word(f'"{word}"') for word in inflections)
+    # …while the tokenizer stems each onto one that is, and hands it that
+    # word's real document frequency — under the ceiling, so nothing else drops
+    # it either. That is the whole mechanism, and the assertions below are its
+    # consequence.
+    assert search._is_function_word('"does"') and search._is_function_word('"us"')
+    assert counts["doe"] == counts["does"] == 8
+    assert {counts[word] for word in inflections if word != "doe"} == {counts["us"]} == {6}
+    assert max(counts.values()) <= ceiling, counts
+
+    # The refusal, working: the graph knows no content word of this question.
+    assert search.search("What does zarquon protect against?", k=20, principal=owner()).hits == []
+    # …and defeated by one inflection of a word already in `_QUERY_STOPWORDS`.
+    defeated = search.search("What does zarquon doe?", k=20, principal=owner()).hits
+    assert {hit.title for hit in defeated} == {f"Loose notes {index}" for index in range(8)}
+    pronoun_rows = {f"Prose {index}" for index in range(len(_STOPWORD_STEM_PROSE))}
+    for spelling in ("use", "used", "using", "uses", "useful"):
+        hits = search.search(f"How is zarquon {spelling}?", k=20, principal=owner()).hits
+        assert {hit.title for hit in hits} == pronoun_rows, spelling
+
+
 #: Tokens whose FTS5 row sets and `_bare_word` folds are compared pairwise
 #: below. Grouped by the axis each one probes, because the point of the set is
 #: coverage of the *ways* a fold can disagree with a tokenizer, not volume.
@@ -1226,6 +1316,13 @@ _FOLD_PROBE = (
     "min.insync.replicas",
     "min-insync-replicas",
     "mininsyncreplicas",
+    # …and the bare first word of that phrase, which is what makes the axis
+    # measurable at all: `c++`/`c` cannot, because both tokenize to the same
+    # single term, so there is nothing for the row-set comparison to disagree
+    # about. A fold keeping only the *first* alnum run merges
+    # `min.insync.replicas` into `min` while FTS5 keeps them apart, and left
+    # every test of these two files green until this token was added.
+    "min",
     "c++",
     "c",
     # The case axis. `casefold()` merged both of these pairs; the tokenizer
@@ -1238,20 +1335,63 @@ _FOLD_PROBE = (
     "retain",
     "retains",
     "retained",
-    # …and folds diacritics.
+    # …and folds diacritics — but only the ones its `remove_diacritics=1`
+    # default reaches, which is the whole reason NFD-stripping was rejected in
+    # `_bare_word`'s docstring. These four are that reason, made falsifiable:
+    # the tokenizer merges `ō` with `o` and keeps `ộ` and `ǭ` apart from both,
+    # because a *precomposed* codepoint carrying two diacritics is left alone.
+    # An NFD-stripping fold merges all four and is unsound on five of the six
+    # pairs; without these tokens it reddens only the residue list below, so
+    # the stated reason for the rejection went unpinned.
     "café",
     "cafe",
+    "o",
+    "ō",
+    "ộ",
+    "ǭ",
 )
 
 #: The complete list of probe pairs the tokenizer merges and `_bare_word` does
 #: not — the "incomplete" half of its claim, written out so that closing any of
 #: it fails this test rather than silently making the prose stale. Stemming
-#: (three pairs) and diacritic folding (one). Nothing else.
+#: (three pairs) and diacritic folding (two). Nothing else.
 _FOLD_RESIDUE = (
     ("retain", "retains"),
     ("retain", "retained"),
     ("retained", "retains"),
     ("cafe", "café"),
+    ("o", "ō"),
+)
+
+#: Pairs `_bare_word` merges and `porter unicode61` does **not** — the exact
+#: shape the soundness half says must not exist, and the reason `nodum/search.py`
+#: qualifies that claim instead of asserting it. SQLite's fold table is frozen
+#: at the Unicode version `fts5_unicode2.c` was written against, so every simple
+#: case mapping added since is a counterexample: swept over all 133 808
+#: alphanumeric codepoints below U+30000, 417 fold groups Python merges and
+#: SQLite splits. One representative per living script here, plus a Latin one
+#: for the tail, because the point is the *axis* and not the volume. Deseret
+#: (U+10400/U+10428, cased since Unicode 3.1) folds correctly on both sides, so
+#: this is a table-vintage limit and not a non-BMP one — it is the control
+#: below. Every one of these is asserted **unsound**, so SQLite catching up
+#: fails this test and the prose gets rewritten rather than left stale.
+_FOLD_UNSOUND = (
+    ("Ꭰ", "ꭰ"),  # Cherokee, cased in Unicode 8
+    ("ᲓᲦᲔ", "დღე"),  # Georgian Mtavruli, cased in Unicode 11
+    ("\U0001e900", "\U0001e922"),  # Adlam, Unicode 9
+    ("\U000104b0", "\U000104d8"),  # Osage, Unicode 9
+    ("\U000118a0", "\U000118c0"),  # Warang Citi, Unicode 7
+    ("\U00016e40", "\U00016e60"),  # Medefaidrin, Unicode 11
+    ("Ɡ", "ɡ"),  # LATIN CAPITAL LETTER SCRIPT G, cased in Unicode 8
+)
+
+#: Case pairs the fold and the tokenizer agree on, asserted beside
+#: `_FOLD_UNSOUND` so that "SQLite's table is behind" cannot be read as "SQLite
+#: does not case-fold outside ASCII". Deseret is the sharp one: non-BMP, and
+#: still sound, so the axis is the table's vintage and nothing else.
+_FOLD_SOUND_CONTROL = (
+    ("KAFKA", "kafka"),
+    ("\U00010400", "\U00010428"),  # Deseret, cased in Unicode 3.1
 )
 
 
@@ -1260,32 +1400,49 @@ def test_the_fold_merges_only_what_the_tokenizer_merges(fresh_db):
 
     The fold decides two things — whether two query tokens are one term, and
     whether a token is in `_QUERY_STOPWORDS` — and `nodum/search.py` documents
-    it as *sound and incomplete* against `porter unicode61`:
+    it as *incomplete, and sound on every script SQLite's case table has caught
+    up with*:
 
-    * **sound**: two tokens that fold alike always select the same rows. An
-      unsound merge is not a near miss, it makes a term the caller typed
-      unreachable — `_query_terms` keeps the first token of a fold group and
-      drops the rest.
+    * **sound**: two tokens that fold alike select the same rows. An unsound
+      merge is not a near miss, it makes a term the caller typed unreachable —
+      `_query_terms` keeps the first token of a fold group and drops the rest.
     * **incomplete**: the tokenizer merges pairs the fold does not, because
       the tokenizer also stems and folds diacritics and no character rule
       reaches that.
 
     Both halves are asserted here rather than reasoned about, and asserted
-    against a real FTS5 table carrying the *projector's own* tokenizer read out
-    of the live schema — so if `node_fts` is ever rebuilt with a different one,
-    this fails instead of quietly measuring the wrong engine. The residue is
-    listed exactly, not as a floor: widening the fold has to come with a
-    rewrite of the prose, and narrowing it back to a punctuation list explodes
-    this list by two orders of magnitude (measured: 10 688 pairs against 231
-    over a 465-token probe).
+    against a real FTS5 table carrying the *projector's own* tokenizer, read
+    out of the live schema and passed to the probe verbatim — so if `node_fts`
+    is ever rebuilt with a different one this fails instead of quietly
+    measuring the wrong engine. A substring check was not that guard: it passed
+    for `porter unicode61 remove_diacritics 2`, which merges `ộ` with `o` and
+    `ǭ` with `ō` and so moves the residue this test pins.
+
+    The residue is listed exactly, not as a floor: widening the fold has to
+    come with a rewrite of the prose, and narrowing it back to a punctuation
+    list explodes this list by two orders of magnitude (measured: 10 688 pairs
+    against 231 over a 465-token probe).
+
+    Soundness is asserted the same way, and that is the half whose *exceptions*
+    are named: `_FOLD_UNSOUND` holds one pair per script SQLite's fold table
+    predates, each asserted to be a real counterexample, with
+    `_FOLD_SOUND_CONTROL` beside it so the axis reads as table vintage rather
+    than as "non-ASCII" or "non-BMP". The blast radius on this corpus is nil
+    and the fold is deliberately not changed; what these pin is that the
+    docstring's qualification stays true of the SQLite it is running on.
     """
     conn = db.connect(fresh_db)
     try:
         db.init_db(conn)
         schema = conn.execute("SELECT sql FROM sqlite_master WHERE name = 'node_fts'").fetchone()
-        assert "porter unicode61" in schema["sql"], schema["sql"]
-        conn.execute("CREATE VIRTUAL TABLE temp.probe USING fts5(x, tokenize='porter unicode61')")
-        for rowid, token in enumerate(_FOLD_PROBE):
+        declared = re.search(r"tokenize\s*=\s*'([^']*)'", schema["sql"])
+        assert declared is not None, schema["sql"]
+        tokenizer = declared.group(1)
+        assert tokenizer == "porter unicode61", tokenizer
+        cased = (*_FOLD_UNSOUND, *_FOLD_SOUND_CONTROL)
+        probed = (*_FOLD_PROBE, *(token for pair in cased for token in pair))
+        conn.execute(f"CREATE VIRTUAL TABLE temp.probe USING fts5(x, tokenize='{tokenizer}')")
+        for rowid, token in enumerate(probed):
             conn.execute("INSERT INTO temp.probe(rowid, x) VALUES (?, ?)", (rowid, token))
         rows = {
             token: frozenset(
@@ -1295,7 +1452,7 @@ def test_the_fold_merges_only_what_the_tokenizer_merges(fresh_db):
                     ('"' + token.replace('"', '""') + '"',),
                 )
             )
-            for token in _FOLD_PROBE
+            for token in probed
         }
     finally:
         conn.close()
@@ -1315,6 +1472,23 @@ def test_the_fold_merges_only_what_the_tokenizer_merges(fresh_db):
         "the fold's incompleteness moved; `_bare_word`'s docstring names it as"
         f" stemming and diacritics only. measured: {sorted(incomplete)}"
     )
+    # The counterexamples, asserted as counterexamples. Each folds alike and
+    # matches different rows, which is precisely the unsoundness the assertion
+    # above forbids inside `_FOLD_PROBE` — the fold is not wrong here, the
+    # unqualified claim was.
+    still_unsound = [
+        (left, right)
+        for left, right in _FOLD_UNSOUND
+        if search._bare_word(left) == search._bare_word(right) and rows[left] != rows[right]
+    ]
+    assert still_unsound == list(_FOLD_UNSOUND), (
+        "SQLite's fold table has caught up with Python's on some of these, so"
+        " `_bare_word`'s soundness qualification has to be re-derived. still"
+        f" unsound: {still_unsound}"
+    )
+    for left, right in _FOLD_SOUND_CONTROL:
+        assert search._bare_word(left) == search._bare_word(right), (left, right)
+        assert rows[left] == rows[right], (left, right)
 
 
 def test_four_terms_of_equal_weight_still_only_need_half(fresh_db):
