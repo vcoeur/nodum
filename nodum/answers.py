@@ -285,6 +285,49 @@ MAX_REWRITE_TERMS = 8
 #: halve the context every answer is built from.
 REWRITE_OUTPUT_TOKENS = 2048
 
+#: Output tokens ``/ask`` reserves, **below** the run's blanket ceiling.
+#:
+#: The mirror of :data:`REWRITE_OUTPUT_TOKENS`, and it is a cap rather than a
+#: floor for the mirror reason: the rewrite's problem was too *little* room, and
+#: ``/ask``'s is reserving room it has never come close to using — out of a
+#: window its prompt is competing for, and out of a request budget it has to
+#: live inside. Passing a per-call number under the run's is what
+#: :data:`PROBE_OUTPUT_TOKENS` already does; what the rewrite refused was a
+#: number that would have *broken* the call.
+#:
+#: **Measured on the real ``ASK_TEMPLATE``, 24 samples over three
+#: configurations**, output tokens (thinking included, since it comes out of the
+#: same allowance):
+#:
+#: =========================================  =========  ==============
+#: configuration                              n          output min–max
+#: =========================================  =========  ==============
+#: ``deepseek-v4-flash`` at ``high``          8          60 – 343
+#: ``deepseek-v4-flash`` at ``low``           12         67 – **528**
+#: ``qwen3:8b`` on ollama (level withheld)    4          26 – 76
+#: =========================================  =========  ==============
+#:
+#: ``low`` is measured because that is where the worst reasoning excursion in
+#: this phase was recorded (2 177 tokens, on a five-note synthesis) and because
+#: nothing may size a ceiling from the configured level. On ``/ask``'s own prompt
+#: it peaked at 442 reasoning tokens; the answer itself is bounded by the
+#: template at four sentences.
+#:
+#: 2 048 is therefore 3.9x the worst sample, and it is chosen at that distance
+#: rather than closer for two reasons that are not margin-for-its-own-sake.
+#: It is the number ``AGENTS.md`` records as the measured cure for ``qwen3:8b``
+#: answering with an empty body, so nothing below it may be shipped to the local
+#: half. And on ollama's 4 096-token window it is **exactly what /ask already
+#: gets**: :data:`~nodum.llm.OUTPUT_RESERVATION_FRACTION` clamps the blanket
+#: 4 096 to 2 048 there, so this can regress no local install at all.
+#:
+#: What it buys is on every *other* window. On a 8 192-token one the reservation
+#: falls from 4 096 to 2 048 and the prompt gains half as much room again; on
+#: DeepSeek's it halves what each ``/ask`` charges the request budget, which is
+#: 8 000 tokens by default. The prompt-room complaint on a 4 096-token window is
+#: **not** this constant's to answer — the fraction binds there, not the ceiling.
+ASK_OUTPUT_TOKENS = 2048
+
 #: The reasoning level the query rewrite runs at, **pinned below the global
 #: default** (design: a level per call site, because the call sites do not want
 #: the same thing).
@@ -735,6 +778,18 @@ class ProviderStatus(BaseModel):
     #: cannot see the effect of is worse than no setting.
     thinking: str | None
     thinking_applied: bool
+    #: Why a configured ``NODUM_LLM_API_KEY`` is **not** being sent, or ``None``.
+    #:
+    #: The other thing a human can read back from their own environment and not
+    #: see the effect of, and this one is a credential. A key travels only to an
+    #: endpoint somebody named — ``NODUM_LLM_BASE_URL``, or a model id a shipped
+    #: profile serves — because a model id nobody profiled falls back to the
+    #: *local default*, and posting a vendor's bearer token to a host nodum
+    #: picked is a leak with no answering benefit. ``None`` is both "no key is
+    #: configured" and "the key is being sent"; a string means one is set and
+    #: was deliberately left behind, and names the endpoint it would have gone
+    #: to.
+    api_key_withheld: str | None
     used: agent.LLMReport
 
 
@@ -1190,7 +1245,13 @@ def _unsupported_numbers(answer: str, offered: list[Offered], *asked: str) -> li
 
 
 def _fit_prompt(
-    active: agent.AgentRun, template: str, offered: list[Offered], **fields: str
+    active: agent.AgentRun,
+    template: str,
+    offered: list[Offered],
+    *,
+    schema: dict[str, Any],
+    max_output_tokens: int,
+    **fields: str,
 ) -> tuple[list[Offered], agent.Message | None]:
     """Assemble the largest prompt that fits the model's window (E1).
 
@@ -1210,10 +1271,30 @@ def _fit_prompt(
     says nothing at all, does it **drop the worst-ranked note**. The estimate is
     the provider's own, so what is fitted is exactly what would be refused.
 
+    **The schema is not optional here**, and it has no default so that a new
+    call site cannot forget it. Under
+    :data:`~nodum.llm.STRUCTURED_JSON_OBJECT` the provider states the schema as
+    a system message, so it costs prompt tokens on the wire — 330 of them for
+    :data:`ASK_SCHEMA`, measured — and an estimate that does not include them is
+    an *under*-count, which is the one error this estimate may not have. Fitting
+    without it, at ``NODUM_LLM_CONTEXT_TOKENS=8192``: this returned a prompt it
+    sized at 4 068 against a 4 096-token ceiling, and
+    :meth:`nodum.agent.AgentRun.chat` then refused the same prompt at 4 398 —
+    ``/ask`` failing on a prompt its own fitter had just built to fit, on every
+    provider that took the ``json_object`` path.
+
     Args:
         active: The run, for the provider's estimate and the output reservation.
         template: The prompt template, with a ``{context}`` field.
         offered: What was retrieved, best first.
+        schema: The schema this prompt will be sent under — the same object the
+            matching :meth:`~nodum.agent.AgentRun.chat` call passes.
+        max_output_tokens: The ceiling that call will ask for. Also not
+            optional, and for the same reason the schema is not: the reservation
+            is what the prompt does **not** get, so a fitter measuring against
+            the run's blanket ceiling while the call asks for
+            :data:`ASK_OUTPUT_TOKENS` would be the same two-estimators bug one
+            number along.
         fields: The template's other fields.
 
     Returns:
@@ -1230,7 +1311,7 @@ def _fit_prompt(
     # the default ceiling was sized for a reasoning model, and every question
     # was refused as "too long for the window" on a provider that would have
     # answered it. See `agent.AgentRun.output_reservation`.
-    ceiling = window - active.output_reservation()
+    ceiling = window - active.output_reservation(max_output_tokens)
     items = list(offered)
     limit = MAX_CONTEXT_CHARS
     while items:
@@ -1238,7 +1319,7 @@ def _fit_prompt(
         message = agent.Message(
             role="user", content=template.format(context=_context_block(narrowed), **fields)
         )
-        if active.estimate_prompt_tokens([message]) <= ceiling:
+        if active.estimate_prompt_tokens([message], schema=schema) <= ceiling:
             return narrowed, message
         if limit > MIN_CONTEXT_CHARS:
             limit = max(MIN_CONTEXT_CHARS, limit // 2)
@@ -1483,7 +1564,12 @@ def ask(
     # Defused here and trusted as evidence at `_unsupported_numbers` below —
     # deliberately, and that docstring is where the argument is.
     offered, message = _fit_prompt(
-        active, ASK_TEMPLATE, retrieved, question=_neutralise_markers(question)
+        active,
+        ASK_TEMPLATE,
+        retrieved,
+        schema=ASK_SCHEMA,
+        max_output_tokens=ASK_OUTPUT_TOKENS,
+        question=_neutralise_markers(question),
     )
     considered = [item.node_id for item in offered]
     truncated_notes = [item.node_id for item in offered if item.truncated]
@@ -1506,7 +1592,12 @@ def ask(
         )
     calls_before = _charged_calls(active)
     try:
-        generation = active.chat([message], prompt_version=ASK_PROMPT_VERSION, schema=ASK_SCHEMA)
+        generation = active.chat(
+            [message],
+            prompt_version=ASK_PROMPT_VERSION,
+            schema=ASK_SCHEMA,
+            max_output_tokens=ASK_OUTPUT_TOKENS,
+        )
     except (agent.BudgetExhausted, agent.LLMError) as exc:
         # `considered` and `truncated_notes` are claims about what the model
         # saw. A ceiling that refused before the wire and a provider nothing
@@ -1693,7 +1784,19 @@ def summarize(
             used=active.report(),
         )
 
-    offered, message = _fit_prompt(active, SUMMARIZE_TEMPLATE, retrieved)
+    # The one call site that keeps the run's blanket ceiling, deliberately.
+    # `DEFAULT_MAX_OUTPUT_TOKENS` was sized against a *synthesis* worst case and
+    # this is the synthesis-shaped call on this surface, so a constant here
+    # would be a copy of that default free to drift from it — and unlike
+    # `/ask`'s, an operator who raises `NODUM_LLM_MAX_OUTPUT_TOKENS` for a
+    # six-sentence summary should get what they asked for.
+    offered, message = _fit_prompt(
+        active,
+        SUMMARIZE_TEMPLATE,
+        retrieved,
+        schema=SUMMARIZE_SCHEMA,
+        max_output_tokens=active.max_output_tokens,
+    )
     considered = [item.node_id for item in offered]
     truncated_notes = [item.node_id for item in offered if item.truncated]
     dropped = [item.node_id for item in retrieved[len(offered) :]]
@@ -2029,6 +2132,7 @@ def provider_status(*, principal: Principal, probe: bool = True) -> ProviderStat
         structured_output=active.structured_mode,
         thinking=active.thinking,
         thinking_applied=active.thinking_applied,
+        api_key_withheld=active.api_key_withheld,
         used=active.report(),
     )
     if not status.configured or not probe:

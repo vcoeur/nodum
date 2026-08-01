@@ -261,7 +261,7 @@ class VecProjector(Projector):
             reason = embeddings.unavailable_reason()
             raise RuntimeError(f"vec projector lost its provider: {reason}")
         self._delete(conn, node["id"])
-        texts = embeddings.chunk_text(embeddings.node_text(node))
+        texts = embeddings.node_chunks(node)
         if not texts:
             return
         for seq, (text, vector) in enumerate(zip(texts, provider.embed(texts), strict=True)):

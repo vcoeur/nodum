@@ -14,6 +14,7 @@ file while quietly leaving the grant model behind.
 from __future__ import annotations
 
 import ast
+import json
 import math
 import os
 import subprocess
@@ -27,6 +28,9 @@ from helpers import agent, owner
 
 from nodum import auth, consolidate, db, embeddings, service
 from nodum.store import GrantNotPermitted
+
+#: The labelled pairs the two cosine bars are set from (see their comments).
+CALIBRATION_FIXTURE = Path(__file__).parent / "fixtures" / "embedding_calibration.json"
 
 # ── Fixtures and helpers ──────────────────────────────────────────────────────
 
@@ -61,6 +65,44 @@ def _place(**angles: float) -> _PlacedEmbedder:
     provider = _PlacedEmbedder(angles)
     embeddings.set_provider(provider)
     return provider
+
+
+class _RecordingEmbedder:
+    """A provider that records every text it was handed, then answers constantly.
+
+    What it exists to catch is a *truncation*, which no test double can show by
+    its output: the real model has a 512-token window and silently drops
+    everything past it, so a node handed over whole is compared on its opening
+    pages with nothing in the vector to say so. The checkable form is therefore
+    the call itself — what the consolidation cycle asks the model to embed.
+    """
+
+    model_id = "test-recording-embedder"
+    dimensions = embeddings.EMBEDDING_DIMS
+
+    def __init__(self) -> None:
+        self.seen: list[str] = []
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        """Record the batch and return one fixed unit vector per text."""
+        self.seen.extend(texts)
+        return [[1.0] + [0.0] * (self.dimensions - 1) for _ in texts]
+
+
+def _at(cosine: float) -> float:
+    """The angle whose cosine against a marker-less text is ``cosine``.
+
+    Tests that mean "just above the link bar" say so in terms of the bar
+    itself. The two cosine bars are provisional and expected to be re-tuned
+    from ``tests/fixtures/embedding_calibration.json``; a hard-coded angle
+    would turn every re-tune into a test rewrite and, worse, would keep
+    passing while no longer testing the side of the bar it was written for.
+    """
+    return math.acos(cosine)
+
+
+#: Squarely between the two bars: related, definitely not the same thing.
+BETWEEN_THE_BARS = (consolidate.DUPLICATE_EMBEDDING_COSINE + consolidate.LINK_EMBEDDING_COSINE) / 2
 
 
 def _run(**kwargs):
@@ -356,9 +398,59 @@ def test_embedding_proximity_finds_a_duplicate_titles_cannot(fresh_db):
     assert edge.confidence == pytest.approx(math.cos(0.2), abs=1e-4)
 
 
+def test_the_cycle_embeds_a_long_node_in_chunks_never_whole(fresh_db):
+    """A node is never handed to the model whole, because the model would truncate it.
+
+    The cycle used to call `provider.embed` on each node's entire text, which
+    the projector never did — so one node had two different vectors depending
+    on which subsystem asked, and anything past the model's window contributed
+    to neither the duplicate signal nor `relates_to`. The abstraction job's
+    cohesion criterion would have clustered documents by their opening pages.
+    """
+    recorder = _RecordingEmbedder()
+    embeddings.set_provider(recorder)
+    words = [f"w{index}" for index in range(3 * embeddings.CHUNK_WORDS)]
+    words[-1] = "tailmarker"
+    _node("Long", content=" ".join(words))
+    _node("Other", content="short")
+
+    _run()
+
+    assert recorder.seen, "the cycle never embedded anything"
+    longest = max(len(text.split()) for text in recorder.seen)
+    assert longest <= embeddings.CHUNK_WORDS
+    # …and the far end of the node really did reach the model.
+    assert any("tailmarker" in text for text in recorder.seen)
+
+
+def test_the_cycles_chunks_are_exactly_the_projectors_chunks(fresh_db):
+    """Agreement is structural: both consumers call the same chunking function.
+
+    One cycle drives both of them — the pairwise jobs embed the node to compare
+    it, and housekeeping's catch-up runs the `vec` projector over the same node
+    — so the identical chunk list has to reach the model twice in one run. That
+    it appears twice *and is the same list both times* is the whole property.
+    """
+    recorder = _RecordingEmbedder()
+    embeddings.set_provider(recorder)
+    content = " ".join(f"w{index}" for index in range(3 * embeddings.CHUNK_WORDS))
+    node = _node("Long", content=content)
+
+    _run()
+
+    expected = embeddings.node_chunks({"title": node.title, "content": node.content})
+    assert len(expected) > 1
+    runs = [
+        index
+        for index in range(len(recorder.seen) - len(expected) + 1)
+        if recorder.seen[index : index + len(expected)] == expected
+    ]
+    assert len(runs) >= 2, "the cycle and the projector did not chunk this node alike"
+
+
 def test_a_merely_related_pair_is_not_a_duplicate_candidate(fresh_db):
     """The duplicate bar sits above the link bar, so one pair is one observation."""
-    _place(Alpha=0.0, Beta=0.5)  # cos(0.5) ≈ 0.878: related, not the same thing
+    _place(Alpha=0.0, Beta=_at(BETWEEN_THE_BARS))
     _node("Alpha")
     _node("Beta")
 
@@ -385,6 +477,112 @@ def test_a_scan_that_reaches_its_cap_says_so(fresh_db, monkeypatch):
 def test_the_duplicate_bar_sits_above_the_link_bar():
     """Pinned, because a pair between them would otherwise queue twice."""
     assert consolidate.DUPLICATE_EMBEDDING_COSINE > consolidate.LINK_EMBEDDING_COSINE
+
+
+def test_a_pair_over_both_bars_is_queued_once_as_the_duplicate_it_is(fresh_db):
+    """What actually stops one observation becoming two queue items.
+
+    It is not the ordering of the bars — every duplicate clears the link bar
+    too, by construction. It is that the duplicates job runs first and writes a
+    `duplicate_of` edge, which makes the pair *connected*, and link inference
+    skips connected pairs. Asserted here because the bars' comments used to
+    claim the ordering did this work, and a re-tune could quietly rely on it.
+    """
+    _place(Alpha=0.0, Beta=_at(0.99))  # far above both bars
+    _node("Alpha")
+    _node("Beta")
+
+    _run()
+
+    assert len(_duplicates()) == 1
+    assert _related() == []
+
+
+# ── Threshold calibration (tests/fixtures/embedding_calibration.json) ─────────
+
+
+def _calibration():
+    """The labelled pairs and their recorded cosines, grouped by band."""
+    document = json.loads(CALIBRATION_FIXTURE.read_text())
+    bands: dict[str, list[float]] = {}
+    for pair in document["pairs"]:
+        bands.setdefault(pair["band"], []).append(pair["cosine"])
+    return document, bands
+
+
+def test_the_calibration_fixture_covers_every_band_bilingually():
+    """A set that is only English, or only easy negatives, would prove nothing."""
+    document, bands = _calibration()
+    assert set(bands) == {"duplicate", "related", "same_area", "unrelated"}
+    assert all(len(values) >= 4 for values in bands.values())
+    languages = {pair["lang"] for pair in document["pairs"]}
+    assert languages == {"en", "fr", "en-fr"}
+    # Length is held constant across bands on purpose: a shorter negative would
+    # read as "further away" for a reason that has nothing to do with meaning.
+    widths = [pair["words"] for pair in document["pairs"]]
+    assert min(widths) >= 55
+    assert max(widths) <= 90
+
+
+def test_the_duplicate_bar_separates_duplicates_from_everything_else():
+    """The bar catches every labelled duplicate and nothing else at all."""
+    _, bands = _calibration()
+    bar = consolidate.DUPLICATE_EMBEDDING_COSINE
+
+    assert min(bands["duplicate"]) >= bar
+    for band in ("related", "same_area", "unrelated"):
+        assert max(bands[band]) < bar, band
+
+
+def test_the_link_bar_catches_related_pairs_and_never_unrelated_ones():
+    """Related pairs all fire; unrelated ones never do. Broad-area pairs may."""
+    _, bands = _calibration()
+    bar = consolidate.LINK_EMBEDDING_COSINE
+
+    assert min(bands["related"]) >= bar
+    assert max(bands["unrelated"]) < bar
+
+
+def test_both_bars_keep_the_stated_false_positive_asymmetry():
+    """The stance, pinned: a wrong proposal costs more than a missed one.
+
+    A missed duplicate is found next cycle; a wrong one is a queue item
+    somebody has to read and reject. So each bar sits high inside its empty
+    band — the room left below the weakest true positive is deliberately much
+    smaller than the room left above the strongest true negative. Without this
+    a future re-tune could centre the bars and quietly trade the stance away.
+    """
+    _, bands = _calibration()
+
+    for bar, positives, negatives in (
+        (
+            consolidate.DUPLICATE_EMBEDDING_COSINE,
+            bands["duplicate"],
+            bands["related"] + bands["same_area"] + bands["unrelated"],
+        ),
+        (consolidate.LINK_EMBEDDING_COSINE, bands["related"], bands["unrelated"]),
+    ):
+        false_positive_margin = bar - max(negatives)
+        false_negative_margin = min(positives) - bar
+        assert false_positive_margin > 0
+        assert false_negative_margin > 0
+        assert false_positive_margin > 2 * false_negative_margin
+
+
+def test_the_bars_are_marked_provisional_with_what_would_retune_them():
+    """These numbers are measured against 29 hand-written pairs, not a real graph.
+
+    The comment saying so is the only thing standing between "provisional" and
+    "load-bearing constant nobody dares touch", so it is asserted rather than
+    trusted.
+    """
+    source = Path(consolidate.__file__).read_text()
+    marker = source.index("DUPLICATE_EMBEDDING_COSINE = ")
+    preamble = source[:marker]
+
+    assert "PROVISIONAL" in preamble
+    assert "embedding_calibration.json" in preamble
+    assert "real graph with volume" in preamble
 
 
 def test_the_job_degrades_to_titles_when_no_model_is_present(fresh_db):
@@ -622,7 +820,7 @@ def test_a_pair_the_graph_already_connects_is_not_proposed_again(fresh_db):
 
 
 def test_embedding_proximity_proposes_a_link_on_its_own(fresh_db):
-    _place(Alpha=0.0, Beta=0.5)
+    _place(Alpha=0.0, Beta=_at(BETWEEN_THE_BARS))
     first, second = _node("Alpha"), _node("Beta")
 
     _run()
@@ -633,7 +831,7 @@ def test_embedding_proximity_proposes_a_link_on_its_own(fresh_db):
 
 
 def test_a_distant_pair_is_left_alone(fresh_db):
-    _place(Alpha=0.0, Beta=0.9)  # cos(0.9) ≈ 0.62, below the link bar
+    _place(Alpha=0.0, Beta=_at(consolidate.LINK_EMBEDDING_COSINE - 0.1))
     _node("Alpha")
     _node("Beta")
 

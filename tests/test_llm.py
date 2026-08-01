@@ -844,6 +844,49 @@ def test_every_way_a_provider_can_die_here_is_an_llm_error(wire):
     )
 
 
+@pytest.mark.parametrize(
+    ("base_url", "detail"),
+    [
+        ("api.deepseek.com/v1", "unknown url type"),
+        ("http://[bad/v1", "Invalid IPv6 URL"),
+    ],
+    ids=["no-scheme", "bad-ipv6"],
+)
+def test_an_unpostable_base_url_is_an_llm_error_and_never_a_value_error(
+    wire, base_url: str, detail: str
+):
+    """The hole the table above could not see, because it holds one base URL.
+
+    ``urllib.request.Request`` parses the URL **in its constructor**, so it is
+    the second thing in ``_post`` that raises on bad configuration rather than
+    on a bad network — and it was built one line *outside* the ``try``, where no
+    except clause could reach it. Driven: ``NODUM_LLM_BASE_URL=api.deepseek.com/v1``
+    gave ``ValueError: unknown url type`` and ``http://[bad/v1`` gave
+    ``ValueError: Invalid IPv6 URL``, both straight past every handler here.
+
+    That is the same shape ``IncompleteRead`` had one layer down, with the same
+    consequences: ``answers.ask`` catches ``(BudgetExhausted, LLMError)``, so a
+    malformed *configuration* surfaced as the traceback and the 400 kept for a
+    malformed *request*.
+
+    Resolution now refuses these spellings before a provider exists, so this
+    class can only be reached by constructing it directly — which is exactly why
+    the guard belongs here too: :class:`~nodum.llm.OpenAICompatProvider` is
+    public, takes any string, and ``LLMError`` is its total contract.
+    """
+    recorder = wire()
+    provider = _provider(base_url=base_url)
+    with pytest.raises(llm.ProviderUnavailable) as raised:
+        provider.chat([llm.Message(role="user", content="hi")], max_output_tokens=8, timeout=5.0)
+    assert base_url in str(raised.value), "the failure must name the endpoint that is wrong"
+    assert detail in str(raised.value)
+    assert raised.value.status is None, (
+        "a URL that was never sent has no HTTP status, so `_negotiate` must not "
+        "be able to read it as a capability signal"
+    )
+    assert recorder.requests == [], "nothing may reach the transport"
+
+
 def test_a_body_that_is_not_json_is_unavailable(wire):
     wire(b"<html>gateway timeout</html>")
     with pytest.raises(llm.ProviderUnavailable, match="not JSON"):
@@ -1879,16 +1922,76 @@ def test_a_base_url_that_does_not_parse_is_a_stranger_and_not_a_traceback(monkey
 
     The substring match it replaced could not fail on a malformed URL;
     ``urlsplit`` can — measured, ``ValueError("Invalid IPv6 URL")`` on
-    ``http://[bad/v1``. A typo in :data:`ENV_BASE_URL` must still resolve to a
-    provider that then fails against the endpoint the operator actually typed,
-    not to a traceback out of ``get_provider`` before anything is attempted.
+    ``http://[bad/v1``. So :func:`profile_for` answers "not a profiled endpoint"
+    rather than raising, and resolution goes on to have an opinion about the URL
+    in words rather than in a traceback out of ``get_provider``.
+
+    **What that opinion is changed**, and this test carries the new one: it used
+    to build a provider that failed against the endpoint the operator typed, and
+    the failure was a bare ``ValueError`` that no handler in this package
+    catches — see
+    :func:`test_an_unpostable_base_url_is_an_llm_error_and_never_a_value_error`.
+    Unusable *configuration* is now no provider with a reason, at resolution
+    time, exactly as an unparseable window already was.
     """
     assert llm.profile_for(model="deepseek-v4-flash", base_url="http://[bad/v1") is None
     monkeypatch.setenv(llm.ENV_MODEL, "deepseek-v4-flash")
     monkeypatch.setenv(llm.ENV_BASE_URL, "http://[bad/v1")
-    provider = llm.get_provider()
-    assert provider is not None
-    assert provider.provider_id == "http://[bad/v1"
+    assert llm.get_provider() is None
+    reason = llm.unavailable_reason()
+    assert reason is not None
+    assert llm.ENV_BASE_URL in reason
+    assert "Invalid IPv6 URL" in reason
+
+
+@pytest.mark.parametrize(
+    ("base_url", "detail"),
+    [
+        ("api.deepseek.com/v1", "unknown url type"),
+        ("http://[bad/v1", "Invalid IPv6 URL"),
+    ],
+    ids=["no-scheme", "bad-ipv6"],
+)
+def test_a_base_url_urllib_cannot_post_to_is_no_provider_with_a_reason(
+    monkeypatch, base_url: str, detail: str
+):
+    """Unusable configuration is an absence with a sentence, never a failed call.
+
+    Both spellings are driven rather than imagined:
+    ``NODUM_LLM_BASE_URL=api.deepseek.com/v1`` and
+    ``NODUM_LLM_BASE_URL=http://[bad/v1`` each raised out of
+    ``urllib.request.Request`` — which is *configuration* failing, not a
+    network. ``nodum llm status`` says "nothing here is an error", so this
+    belongs beside an unparseable ``NODUM_LLM_CONTEXT_TOKENS`` and an
+    unrecognised ``NODUM_LLM_THINKING``: no provider, a reason naming the
+    variable and the fix, and exit 0.
+
+    **The scheme is not guessed back in**, which is the decision this pins. A
+    repair would choose ``http`` or ``https`` for the operator, and that choice
+    decides whether ``NODUM_LLM_API_KEY`` crosses the network in clear text.
+    """
+    monkeypatch.setenv(llm.ENV_MODEL, "deepseek-v4-flash")
+    monkeypatch.setenv(llm.ENV_BASE_URL, base_url)
+    assert llm.get_provider() is None
+    reason = llm.unavailable_reason()
+    assert reason is not None
+    assert llm.ENV_BASE_URL in reason, "the reason must name the variable a human can act on"
+    assert detail in reason, "the reason must carry what urllib actually said"
+    assert llm.DEFAULT_BASE_URL in reason, "and an example of a spelling that works"
+
+
+def test_a_scheme_less_base_url_is_still_read_as_a_host_for_the_profile_match(monkeypatch):
+    """The two halves are deliberately not the same rule, so both are stated.
+
+    :func:`_hostname` is forgiving on purpose — it reads a host out of a
+    spelling nothing can POST to, so the refusal above can be about *that
+    endpoint* rather than about a string, and so
+    :func:`test_the_profiled_host_is_matched_however_the_url_is_spelled` keeps
+    matching every spelling of the one URL it exists to know. Refusing the same
+    spelling at resolution is a separate question with a separate answer.
+    """
+    assert llm.profile_for(model="anything-at-all", base_url="api.deepseek.com/v1") is not None
+    assert llm.base_url_problem("api.deepseek.com/v1") is not None
 
 
 def test_the_profiled_host_is_matched_however_the_url_is_spelled(monkeypatch):
@@ -2082,3 +2185,264 @@ def test_a_real_truncation_is_still_caught_after_the_overheads_are_excluded():
     )
     assert completion.context_filled is False, "the configured-window check is blind here"
     assert completion.prompt_truncated is True
+
+
+# ── A model name may not move a *credential* either ───────────────────────────
+#
+# The sibling of the section above, and the half it missed. That one stopped a
+# model name moving the *prompt* to another company's server. This one is the
+# mirror: the prompt correctly stayed local while the vendor's bearer token went
+# with it, because `_post` attached `NODUM_LLM_API_KEY` to whatever host
+# resolution happened to produce.
+
+
+def test_a_key_is_withheld_when_nothing_named_the_endpoint_it_would_go_to(monkeypatch):
+    """The leak, driven end to end before it was closed.
+
+    ``NODUM_LLM_MODEL`` naming a hosted model this ships no profile for — a
+    typo, a newer id — plus ``NODUM_LLM_API_KEY`` resolved to the **local
+    default**, and the key went there: captured on a throwaway listener as
+    ``Authorization: Bearer …``, ready to be read out of any local process's
+    logs. The prompt stayed on the machine; the credential did not stay with the
+    vendor.
+
+    The rule is that a key travels only to an endpoint *somebody named* — the
+    operator through ``NODUM_LLM_BASE_URL``, or the model id through a shipped
+    profile. ``http://localhost:11434/v1`` here was named by neither: this
+    module chose it.
+    """
+    monkeypatch.setenv(llm.ENV_MODEL, "deepseek-v4-flash-0711")
+    monkeypatch.setenv(llm.ENV_API_KEY, "sk-vendor-secret")
+    provider = llm.get_provider()
+    assert provider is not None
+    assert provider.provider_id == llm.DEFAULT_BASE_URL, "fixture is not the fallback case"
+
+    reason = llm.key_withheld_reason()
+    assert reason is not None, "a key that is not being sent must be said out loud"
+    assert llm.ENV_API_KEY in reason and llm.ENV_BASE_URL in reason
+    assert "sk-vendor-secret" not in reason, "the sentence about a secret may not carry it"
+
+
+def test_the_withheld_key_never_reaches_the_wire(wire, monkeypatch):
+    """Withheld at resolution, so there is no key to leak later.
+
+    Asserted on the transport rather than on the resolution, because that is
+    where the capture happened: the header is what a listener on the resolved
+    host reads.
+    """
+    monkeypatch.setenv(llm.ENV_MODEL, "deepseek-v4-flash-0711")
+    monkeypatch.setenv(llm.ENV_API_KEY, "sk-vendor-secret")
+    recorder = wire()
+    provider = llm.get_provider()
+    assert provider is not None
+    provider.chat([llm.Message(role="user", content="hi")], max_output_tokens=8, timeout=5.0)
+    assert recorder.requests[-1].get_header("Authorization") is None
+
+
+@pytest.mark.parametrize(
+    ("model", "base_url", "expected_host"),
+    [
+        ("deepseek-v4-flash", None, "https://api.deepseek.com/v1"),
+        ("any-model-at-all", "https://api.example.com/v1", "https://api.example.com/v1"),
+        ("qwen3:8b", "http://localhost:11434/v1", "http://localhost:11434/v1"),
+        ("gateway-model", "http://gw.lan:8080/v1", "http://gw.lan:8080/v1"),
+    ],
+    ids=["profiled-model-id", "remote-gateway", "named-local-default", "self-hosted-gateway"],
+)
+def test_a_named_endpoint_keeps_its_key(
+    wire, monkeypatch, model: str, base_url: str | None, expected_host: str
+):
+    """Every legitimate way to hold a key, and it must survive all of them.
+
+    The last two rows are the case the fix may not break, and they are the same
+    case: **many local gateways require a key.** One of them is on
+    ``localhost:11434`` itself, which is why the rule cannot be "no key goes to
+    localhost" — it is "no key goes to a host nodum picked". Naming that very
+    host in ``NODUM_LLM_BASE_URL`` is one variable, and it is the operator
+    saying the key belongs there.
+    """
+    monkeypatch.setenv(llm.ENV_MODEL, model)
+    monkeypatch.setenv(llm.ENV_API_KEY, "sk-configured")
+    if base_url is not None:
+        monkeypatch.setenv(llm.ENV_BASE_URL, base_url)
+    recorder = wire()
+    provider = llm.get_provider()
+    assert provider is not None
+    assert provider.provider_id == expected_host
+    assert llm.key_withheld_reason() is None
+
+    provider.chat([llm.Message(role="user", content="hi")], max_output_tokens=8, timeout=5.0)
+    assert recorder.requests[-1].get_header("Authorization") == "Bearer sk-configured"
+
+
+def test_no_key_configured_is_not_a_withheld_key(monkeypatch):
+    """``key_withheld_reason`` is about a key that exists and is being left
+    behind. An install with no key at all has nothing to report, and a sentence
+    there would send a human looking for a variable they never set."""
+    monkeypatch.setenv(llm.ENV_MODEL, "llama3.2:1b")
+    assert llm.get_provider() is not None
+    assert llm.key_withheld_reason() is None
+
+
+def test_a_forced_provider_reports_no_withheld_key():
+    """The test seam builds a provider from a base URL and a key together, so
+    the caller has named both and this module withheld nothing."""
+    llm.set_provider(_provider(api_key="sk-injected"))
+    assert llm.key_withheld_reason() is None
+    llm.set_provider(None, reason="off")
+    assert llm.key_withheld_reason() is None
+
+
+# ── The model name is trimmed once, where it is read ──────────────────────────
+
+
+def test_a_model_name_with_stray_whitespace_still_selects_its_profile(monkeypatch):
+    """``profile_for`` no longer strips, so the one strip left must be enough.
+
+    ``_resolve_default`` trims ``NODUM_LLM_MODEL`` before it does anything with
+    it, and a second trim inside ``profile_for`` was code no test could tell
+    from its absence. Removing it is only safe while *this* stays true — an
+    operator's ``export NODUM_LLM_MODEL="deepseek-v4-flash "`` still lands on the
+    profiled endpoint, and the provider is given the trimmed name.
+    """
+    monkeypatch.setenv(llm.ENV_MODEL, "  deepseek-v4-flash \n")
+    monkeypatch.setenv(llm.ENV_API_KEY, "sk-configured")
+    provider = llm.get_provider()
+    assert provider is not None
+    assert provider.model_id == "deepseek-v4-flash"
+    assert provider.provider_id == llm.DEEPSEEK_BASE_URL
+    assert provider.context_tokens == 1_000_000
+
+
+# ── A `usage` block that contradicts itself ───────────────────────────────────
+
+
+def test_reasoning_above_the_completion_is_clamped_and_said_out_loud(wire, caplog):
+    """``reasoning <= completion`` was claimed as an invariant and never checked.
+
+    :attr:`Completion.reasoning_tokens` documents itself as a **share** of
+    :attr:`Completion.output_tokens` — measured true on every
+    ``deepseek-v4-flash`` call — and :attr:`Completion.content_tokens` is the one
+    minus the other. A wire reporting ``completion_tokens: 50`` with
+    ``reasoning_tokens: 5000`` makes that difference ``0`` and prints a report in
+    which the thinking is larger than the output it is part of.
+
+    No budget moves either way: reasoning is correctly never summed into the
+    spend, and ``total_tokens`` here is still ``prompt + completion``. It is the
+    *report* that would be nonsense, which is why this clamps rather than
+    refuses — and logs, because a provider that has started saying this is worth
+    somebody knowing.
+    """
+    wire(_answer(prompt_tokens=10, completion_tokens=50, reasoning_tokens=5000))
+    with caplog.at_level("WARNING", logger="nodum.llm"):
+        completion = _provider().chat(
+            [llm.Message(role="user", content="hi")], max_output_tokens=8, timeout=5.0
+        )
+    assert completion.reasoning_tokens == 50, "reasoning may not exceed the output it is inside"
+    assert completion.content_tokens == 0
+    assert completion.total_tokens == 60, "the bill is unchanged — this was never a budget hole"
+    assert any("reasoning" in record.message for record in caplog.records), (
+        "a provider contradicting itself must be noticed, not smoothed"
+    )
+
+
+def test_reasoning_inside_the_completion_is_left_exactly_alone(wire, caplog):
+    """The control: the ordinary case must not be clamped, rounded or logged."""
+    wire(_answer(prompt_tokens=10, completion_tokens=1520, reasoning_tokens=1420))
+    with caplog.at_level("WARNING", logger="nodum.llm"):
+        completion = _provider().chat(
+            [llm.Message(role="user", content="hi")], max_output_tokens=2048, timeout=5.0
+        )
+    assert completion.reasoning_tokens == 1420
+    assert completion.content_tokens == 100
+    assert caplog.records == []
+
+
+def test_a_provider_that_disagrees_about_the_bill_is_noticed(wire, caplog):
+    """``usage.total_tokens`` was never read at all, which is two decisions in one.
+
+    Overriding it is right — :attr:`Completion.total_tokens` is what budgets are
+    denominated in and there may be one rule for it everywhere. *Not reading it*
+    is different: a provider that bills differently from the way this meters
+    could never be noticed, on any call, ever.
+    """
+    answer = _answer(prompt_tokens=100, completion_tokens=20)
+    answer["usage"]["total_tokens"] = 999
+    wire(answer)
+    with caplog.at_level("WARNING", logger="nodum.llm"):
+        completion = _provider().chat(
+            [llm.Message(role="user", content="hi")], max_output_tokens=8, timeout=5.0
+        )
+    assert completion.total_tokens == 120, "nodum's own arithmetic still decides the bill"
+    assert any("total_tokens" in record.message for record in caplog.records)
+
+
+def test_a_wire_that_carries_no_total_is_not_a_disagreement(wire, caplog):
+    """``0`` from :func:`_optional_count` means "the wire did not say" — the
+    ordinary ollama shape — and never "this provider claims the call was free"."""
+    answer = _answer(prompt_tokens=100, completion_tokens=20)
+    del answer["usage"]["total_tokens"]
+    wire(answer)
+    with caplog.at_level("WARNING", logger="nodum.llm"):
+        _provider().chat([llm.Message(role="user", content="hi")], max_output_tokens=8, timeout=5.0)
+    assert caplog.records == []
+
+
+# ── The 400 markers, from the side that must *not* match ──────────────────────
+
+
+@pytest.mark.parametrize(
+    "detail",
+    [
+        "Invalid schema for response_format.schema.properties[0]: expected an object",
+        "response_format.json_schema.name is required",
+        "your request had a malformed message array",
+    ],
+    ids=["schema-path", "field-path", "no-marker-at-all"],
+)
+def test_a_400_that_is_not_a_capability_statement_never_downgrades(monkeypatch, detail: str):
+    """The negative half of a matcher this module keeps deliberately blunt.
+
+    :data:`_STRUCTURED_REJECTIONS` is a substring list, so the boundary has to be
+    pinned from the outside or a later broadening swallows unrelated errors in
+    silence. The first two rows are the ones a plain ``"response_format" in
+    detail`` gets wrong: a server naming ``response_format.schema.properties``
+    has **parsed** the field and is validating what is inside it, which is proof
+    that it *serves* it and that the fault is nodum's own schema. Downgrading
+    there trades a loud, fixable "your schema is wrong" for an envelope quietly
+    weakened for the life of the process — the exact harm
+    :func:`test_a_non_capability_400_is_not_negotiated` exists to prevent,
+    reached through a message that happens to contain the marker.
+
+    All three must behave identically: one request, no re-send, the failure
+    reaching the caller, and the provider still believing in ``json_schema``.
+    """
+    recorder = _rejects_then(detail)
+    monkeypatch.setattr(urllib.request, "urlopen", recorder)
+    provider = _provider(structured_mode=llm.STRUCTURED_JSON_SCHEMA)
+    with pytest.raises(llm.ProviderUnavailable, match="400"):
+        provider.chat(
+            [llm.Message(role="user", content="hi")],
+            schema=SCHEMA,
+            max_output_tokens=512,
+            timeout=30.0,
+        )
+    assert len(recorder.requests) == 1, "this 400 was read as a capability signal and re-sent"
+    assert provider.structured_mode == llm.STRUCTURED_JSON_SCHEMA
+
+
+def test_the_measured_capability_400_still_downgrades(monkeypatch):
+    """Non-vacuity for the row above: the sharpening may not have turned the
+    negotiation off. ``deepseek-v4-flash``'s own sentence still has to work, or
+    every structured call on that provider is a hard failure out of the box."""
+    recorder = _rejects_then("This response_format type is unavailable now")
+    monkeypatch.setattr(urllib.request, "urlopen", recorder)
+    provider = _provider(structured_mode=llm.STRUCTURED_JSON_SCHEMA)
+    provider.chat(
+        [llm.Message(role="user", content="hi")],
+        schema=SCHEMA,
+        max_output_tokens=512,
+        timeout=30.0,
+    )
+    assert len(recorder.requests) == 2
+    assert provider.structured_mode == llm.STRUCTURED_JSON_OBJECT

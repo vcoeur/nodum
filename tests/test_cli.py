@@ -13,8 +13,8 @@ import typer
 from helpers import agent, owner, seed_space
 from typer.testing import CliRunner
 
+from nodum import auth, db, extract, llm, service
 from nodum import consolidate as consolidate_module
-from nodum import db, extract, llm, service
 from nodum.cli import app
 from nodum.migrations import GARDENER_AGENT_ID
 
@@ -1535,30 +1535,207 @@ def test_a_refused_rollback_prints_its_conflicts_as_one_json_object(fresh_db):
     assert preview["rollback_cycle_id"] is None
 
 
-def test_an_unknown_principal_is_one_readable_line_and_never_a_traceback(fresh_db):
-    """`--as` is evaluated in the argument list, before `_run` is even entered.
+#: Values for the required options a command parses before `--as` is looked at.
+#: None of them mean anything — the principal is refused first — they exist only
+#: to get past Click's own required-parameter check and reach the command body.
+_PLACEHOLDER_OPTIONS = {
+    "--type": "note",
+    "--reason": "why",
+    "--into": "n_survivor",
+    "--name": "placeholder",
+    "--mime": "text/plain",
+    "--size": "10",
+    "--password": "placeholder-password",
+}
 
-    That is why an unknown account used to print a full traceback: the
-    resolution sat outside the error boundary the command's own call goes
-    through. Phase 5a's verbs are all `--as`-taking, so the sweep covers them.
+#: Required arguments Click type-converts *before* the command body runs. A
+#: non-numeric placeholder for `diff a b` is a usage error (exit 2), which would
+#: hide the refusal this sweep is about behind Click's own complaint.
+_PLACEHOLDER_ARGUMENTS = {"a": "1", "b": "2"}
+
+#: Required arguments naming a file the command reads before it resolves `--as`.
+#: `edge create-batch` reports the missing file first — correctly, and through
+#: `_run` — so the sweep hands it a real one rather than asserting a different
+#: message for the one command whose reads come first.
+_FILE_ARGUMENTS = {"suggestions_file"}
+
+
+def _as_taking_invocations(suggestions_file: Path) -> dict[str, list[str]]:
+    """Every command in the tree declaring `--as`, as a runnable argv.
+
+    Enumerated from ``schema-dump`` rather than hand-listed, which is the whole
+    point of the sweep: a hand-list is a second copy of the command surface, and
+    the copy is what goes stale. The list this replaced named nine commands; the
+    CLI has sixty-four that take the option, and a tenth added tomorrow would
+    have joined the fifty-five nothing was checking.
     """
-    for command in (
-        ["node", "list"],
-        ["consolidate"],
-        ["cycle-list"],
-        ["cycle-get", "whatever"],
-        ["rollback", "whatever"],
-        ["merge-nodes", "a", "--into", "b"],
-        ["retype", "a", "--type", "note"],
-        ["supersede-edge", "a"],
-        ["bulk-relink", "--src", "a", "--to-type", "supports"],
-    ):
-        result = runner.invoke(app, [*command, "--as", "human:nope"])
 
-        assert result.exit_code == 1, command
-        assert result.stderr.splitlines() == ["unknown human account: nope"], command
-        assert result.stdout == "", command
-        assert "Traceback" not in result.output, command
+    def walk(prefix: list[str], commands: list[dict]):
+        for command in commands:
+            path = [*prefix, command["name"]]
+            subcommands = command.get("subcommands")
+            if subcommands:
+                yield from walk(path, subcommands)
+                continue
+            params = command["params"]
+            if not any(p["kind"] == "option" and "--as" in p["flags"] for p in params):
+                continue
+            argv = list(path)
+            for param in params:
+                if param["kind"] == "argument" and param["required"]:
+                    argv.append(
+                        str(suggestions_file)
+                        if param["name"] in _FILE_ARGUMENTS
+                        else _PLACEHOLDER_ARGUMENTS.get(param["name"], "placeholder")
+                    )
+                elif param["kind"] == "option" and param["required"]:
+                    flag = param["flags"][0]
+                    if flag == "--as":
+                        continue
+                    assert flag in _PLACEHOLDER_OPTIONS, (
+                        f"nodum {' '.join(path)} gained a required option {flag}; give it a "
+                        "placeholder so this sweep can still reach the refusal behind it"
+                    )
+                    argv += [flag, _PLACEHOLDER_OPTIONS[flag]]
+            yield " ".join(path), argv
+
+    return dict(walk([], _run_json("schema-dump")["commands"]))
+
+
+def _assert_is_the_contracts_refusal(result, expected_line: str, where: str) -> None:
+    """Assert the CLI's one failure shape: exit 1, one line on stderr, nothing escaped.
+
+    ``result.exception`` is what carries the weight. Asserting ``"Traceback" not
+    in result.output`` — the spelling used around this file — cannot fail under
+    ``CliRunner``: Typer prints its Rich traceback from ``sys.excepthook``, and
+    the runner catches the exception before any hook runs, so an escaped
+    ``KeyError`` and a clean refusal both come back with an empty stdout and
+    ``exit_code == 1``. The two are told apart only by whether what came back is
+    the ``SystemExit`` a ``typer.Exit`` becomes.
+    """
+    assert isinstance(result.exception, SystemExit), (
+        f"{where}: {result.exception!r} escaped the error boundary — "
+        "in a terminal that is the Rich traceback the contract forbids"
+    )
+    assert result.exit_code == 1, where
+    assert result.stdout == "", where
+    assert result.stderr.splitlines() == [expected_line], where
+
+
+def test_an_unknown_principal_is_one_readable_line_on_every_command_taking_as(fresh_db, tmp_path):
+    """`--as` is resolved in the argument list, before `_run` is even entered.
+
+    That is why an unknown account once printed a full traceback: the resolution
+    sat outside the error boundary the command's own call goes through, and
+    `_principal` routing *through* `_run` is what fixed it at every call site at
+    once, wherever in an argument list it sits.
+
+    The sweep is over the whole surface because the bug was never about one
+    command: it was about a position in a call, and any command written tomorrow
+    can take that position. Enumerating from `schema-dump` is what makes the
+    coverage total — a hand-list would have to be remembered.
+    """
+    suggestions = tmp_path / "suggestions.json"
+    suggestions.write_text("[]", encoding="utf-8")
+    invocations = _as_taking_invocations(suggestions)
+
+    # A recursion that quietly stops at the top level would leave the groups —
+    # `node`, `review`, `human`, `asset`, … — silently unswept, which is the
+    # shape of an enumeration bug that looks like a passing test.
+    assert {
+        "node list",
+        "edge create",
+        "review queue",
+        "human list",
+        "agent list",
+        "asset get",
+        "ingest file",
+        "llm status",
+        "consolidate",
+    } <= set(invocations), sorted(invocations)
+    assert len(invocations) >= 60, sorted(invocations)
+
+    for label, argv in invocations.items():
+        result = runner.invoke(app, [*argv, "--as", "human:nope"])
+
+        _assert_is_the_contracts_refusal(result, "unknown human account: nope", label)
+
+
+def test_the_error_boundary_does_not_launder_a_real_bug(fresh_db, monkeypatch):
+    """A defect must stay a defect; only what a caller can provoke is a message.
+
+    The tempting fix for a refused actor is a wider `except` around the call —
+    `LookupError` would catch `UnknownPrincipal` and read like a tidy
+    generalisation. It would also catch every `KeyError` raised by a genuine bug
+    beneath it, and turn each one into "unknown human account" with exit 1: a
+    command that silently reports a typo for a fault in the graph layer, on every
+    command taking `--as`. `RuntimeError` is the same trap one step along, and is
+    why `_expand_user` translates `Path.expanduser`'s at the argument it belongs
+    to rather than `_run` catching the class wholesale.
+
+    So the property is stated from the other side: these must **escape**.
+    """
+    for target_module, attribute, error in (
+        (auth, "owner_principal", KeyError("a bug in principal loading")),
+        (service, "list_nodes", KeyError("a bug in the read path")),
+        (service, "list_nodes", RuntimeError("a bug in the read path")),
+    ):
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                target_module,
+                attribute,
+                lambda *args, _error=error, **kwargs: (_ for _ in ()).throw(_error),
+            )
+
+            result = runner.invoke(app, ["node", "list", "--as", "owner"])
+
+            where = f"{attribute} raising {type(error).__name__}"
+            assert isinstance(result.exception, type(error)), f"{where}: {result.exception!r}"
+            assert result.stderr == "", f"{where}: a bug was rendered as a friendly message"
+
+
+def test_an_unreadable_directory_is_one_readable_line_not_a_traceback(fresh_db, tmp_path):
+    """`ingest file`'s path expansion is the same argument-list position, unswept.
+
+    `_ingest_sources` walks the directory arguments *beside* the command's own
+    `_run`, not through it, so `iterdir` on a directory the process may not read
+    climbed out as a `PermissionError` and printed the Rich traceback the
+    contract forbids — the identical mechanism `_principal` and `_read_content`
+    were each moved inside the boundary for, at the one call site left holding it.
+    """
+    blocked = tmp_path / "blocked"
+    (blocked / "sub").mkdir(parents=True)
+    blocked.chmod(0o000)
+    try:
+        result = runner.invoke(app, ["ingest", "file", str(blocked), "--as", "owner"])
+    finally:
+        # Restored whatever the assertions do: pytest cannot clean up a temp
+        # directory it is not allowed to list.
+        blocked.chmod(0o755)
+
+    _assert_is_the_contracts_refusal(result, f"Permission denied: {blocked}", "ingest file")
+
+
+def test_an_unresolvable_home_directory_is_one_readable_line_not_a_traceback(fresh_db):
+    """`Path.expanduser` raises `RuntimeError` for a `~user` that does not exist.
+
+    A typo in an argument, and the one error here that is *not* an `OSError`, so
+    it escaped the boundary even once the walk was routed through it. It is
+    translated to `ValueError` at the expansion rather than caught as
+    `RuntimeError` by `_run`, which would launder real bugs — the sibling test
+    above holds that line.
+    """
+    for argv in (
+        ["ingest", "file", "~nobodyhere12345/notes.md"],
+        ["ingest", "file", "~nobodyhere12345/a.md", "~nobodyhere12345/b.md"],
+    ):
+        result = runner.invoke(app, [*argv, "--as", "owner"])
+
+        _assert_is_the_contracts_refusal(
+            result,
+            f"cannot resolve the home directory in path: {argv[2]}",
+            " ".join(argv),
+        )
 
 
 def test_a_disabled_human_is_refused_the_same_way(fresh_db):
@@ -1944,6 +2121,10 @@ NOT_COMMANDS = frozenset(
         "no-store",  # a Cache-Control directive
         "off-only",  # a rung of the reasoning-capability ladder in `nodum.llm`
         "script-src",  # a CSP directive
+        # the systemd component whose `D /tmp …` rule empties the directory on
+        # boot — named in the docs as the reason the embedding cache must not
+        # default to temporary storage.
+        "systemd-tmpfiles",
     }
 )
 

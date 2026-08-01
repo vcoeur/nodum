@@ -223,6 +223,11 @@ degrades to BM25 + graph expansion. `NODUM_EMBED_MODEL` switches the model
 (default: `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`,
 384-dim, multilingual); a model change is a `projector rebuild vec`.
 
+The download is cached in `~/.local/share/nodum/models`, beside the database,
+and `NODUM_EMBED_CACHE` moves it. Point that at temporary storage and you will
+lose the model on the next reboot — after which search and the consolidation
+cycle quietly drop the vector signal until you re-run the download.
+
 ## How it works
 
 - **Everything is a node.** Pages, blocks, notes, claims, concepts, people,
@@ -663,7 +668,14 @@ degrades to BM25 + graph expansion. `NODUM_EMBED_MODEL` switches the model
   recognised when it is **exactly** a hosted model id and you have not named a
   `NODUM_LLM_BASE_URL` of your own: `deepseek-r1:8b` and friends are ollama
   models, so they stay on your local endpoint with your local window, and once
-  you point at a server yourself nothing moves the call off it. `NODUM_LLM_THINKING`
+  you point at a server yourself nothing moves the call off it. **Your key goes
+  only where you pointed it**: either you named the endpoint with
+  `NODUM_LLM_BASE_URL`, or your model name is exactly a hosted id nodum knows.
+  A model name it does not recognise falls back to the local endpoint — a host
+  nodum picked, not one you configured a key for — so the key is left behind
+  rather than posted there, and `nodum llm status` says so in
+  `api_key_withheld`. A local gateway that needs a key keeps it; naming it in
+  `NODUM_LLM_BASE_URL` is you saying the key belongs to it. `NODUM_LLM_THINKING`
   (`none`, `low`, `medium`, `high`; default `high`) sets how much a reasoning
   model may think — a value outside that set is refused with the list rather
   than passed on, and `nodum llm status` shows whether your endpoint actually

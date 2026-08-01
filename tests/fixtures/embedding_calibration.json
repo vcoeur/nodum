@@ -1,0 +1,308 @@
+{
+  "purpose": "Calibration set for the two cosine bars in nodum/consolidate.py (DUPLICATE_EMBEDDING_COSINE, LINK_EMBEDDING_COSINE). Every pair was labelled into a band by hand BEFORE any cosine was measured. Re-measure with scripts/measure_embedding_calibration.py after any change of model, of fastembed's pooling, or of CHUNK_WORDS, and re-tune the bars from the bands the new measurement produces.",
+  "model": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+  "model_source": "qdrant/paraphrase-multilingual-MiniLM-L12-v2-onnx-Q",
+  "dimensions": 384,
+  "measured_with": "fastembed 0.8.0",
+  "measured_through": "nodum.embeddings.node_vectors",
+  "pooling": "Mean over tokens, unnormalised: fastembed >=0.6 routes this model to PooledEmbedding. fastembed <=0.5.1 used normalize(hidden[:, 0]) — CLS — and warns about the change on load. nodum has required fastembed>=0.8.0 since the commit that introduced the vec projector, so every vector it has ever written is mean-pooled. `cosine_cls` records what each pair scores under the old pooling; it is kept only as evidence that the pooling change is NOT what put the bars above their bands (the duplicate band is 0.763-0.929 under mean and 0.772-0.952 under CLS, so a bar of 0.93 was wrong under both).",
+  "method": "Cosine between the two node-level vectors. Every text is 60-85 words a side so that length is not a variable between bands — a shorter negative would otherwise read as 'further away' for a reason unrelated to meaning.",
+  "bands": {
+    "duplicate": "the same fact, reworded — a human would merge these",
+    "related": "the same narrow topic, different facts — obviously worth a relates_to",
+    "same_area": "the same broad area, loose — a relates_to here is welcome, not required",
+    "unrelated": "different subjects — neither signal may ever fire"
+  },
+  "pairs": [
+    {
+      "id": "dup-en-backpressure",
+      "band": "duplicate",
+      "lang": "en",
+      "words": 77,
+      "cosine": 0.7911,
+      "cosine_cls": 0.7725,
+      "left": "The ingest queue applies backpressure by refusing new work once the in-flight count reaches sixty-four. Producers get a 429 and retry with exponential jitter rather than buffering locally, so memory stays flat under a burst. We chose the refusal over an unbounded in-memory queue after the March incident, where a four-hour producer spike drove the worker to eleven gigabytes of resident memory and the OOM killer took the whole container down with sixty thousand records still unwritten.",
+      "right": "Backpressure in the ingestion path is a hard cap: at sixty-four concurrent items the service stops accepting and returns 429, and callers back off with jittered exponential retry instead of queueing in their own memory. That keeps resident memory flat during a spike. The decision came out of the March outage, when a producer burst lasting four hours pushed the worker to eleven gigabytes, the kernel killed the container, and sixty thousand records were lost before the write."
+    },
+    {
+      "id": "dup-en-fractional-index",
+      "band": "duplicate",
+      "lang": "en",
+      "words": 75,
+      "cosine": 0.8538,
+      "cosine_cls": 0.8892,
+      "left": "Sibling ordering uses a fractional index rather than a dense integer position. Inserting between two children means averaging their two keys, which touches exactly one row instead of renumbering every sibling to the right. The cost is float precision: after roughly fifty consecutive insertions into the same gap the midpoint stops being representable, so a nightly job rebalances any gap that has narrowed past a threshold and spreads the affected run back out over the whole interval.",
+      "right": "Children are ordered by a fractional key, not by a contiguous integer rank. To place a node between two siblings you take the mean of their keys and write one row, where a dense ranking would have to renumber every following sibling. The trade-off is floating-point resolution: about fifty insertions into one gap exhaust it, and a scheduled nightly rebalance detects gaps below the minimum and redistributes that run evenly across the interval again."
+    },
+    {
+      "id": "dup-en-event-log",
+      "band": "duplicate",
+      "lang": "en",
+      "words": 80,
+      "cosine": 0.763,
+      "cosine_cls": 0.8559,
+      "left": "Every write goes into an append-only event log before it touches derived state. The projectors are pure consumers: they hold a checkpoint of the last sequence number they applied and can be dropped and rebuilt from event zero at any time. Nothing in the read path is authoritative, which is what makes a model change safe — swap the embedding model, reset the vector projector, and replay produces a consistent index without a migration or a backfill script of any kind.",
+      "right": "All mutations are written to an append-only log first, and derived indexes are built from it afterwards. Each projector records the highest event sequence it has consumed, so any projector can be reset to zero and replayed from scratch. No derived table is a source of truth. That is precisely why changing the embedding model is cheap: point at the new model, reset the vector projector, replay, and the index is coherent with no migration and no hand-written backfill."
+    },
+    {
+      "id": "dup-en-argon2",
+      "band": "duplicate",
+      "lang": "en",
+      "words": 76,
+      "cosine": 0.9168,
+      "cosine_cls": 0.9517,
+      "left": "Passwords are hashed with Argon2id at the library's default parameters, and the verify path rehashes whenever those parameters have moved. Raising the cost factor therefore upgrades every stored hash the next time its owner logs in, instead of forcing a reset campaign across the whole user table. The rehash happens inside the same request that verified the old hash, so there is no window in which the weaker hash is still the one on record for an active account.",
+      "right": "We store password hashes as Argon2id with the defaults the library ships, and verification transparently recomputes the hash when it sees stale parameters. That means increasing the cost only requires waiting for each user's next sign-in — no mass reset, no migration of the user table. Because the rehash is written in the request that already validated the old value, an active account never sits on the weaker parameters after a successful login."
+    },
+    {
+      "id": "dup-fr-retention",
+      "band": "duplicate",
+      "lang": "fr",
+      "words": 80,
+      "cosine": 0.929,
+      "cosine_cls": 0.9475,
+      "left": "Les journaux d'accès du reverse proxy sont conservés quatorze jours puis supprimés automatiquement par une tâche planifiée. L'adresse IP est tronquée sur son dernier octet dès l'écriture, donc la donnée brute n'existe jamais sur disque. Ce choix vient de la contrainte la plus stricte des trois sites hébergés derrière le même proxy : ils partagent un seul fichier de log, et une durée plus longue sur l'un imposerait cette durée aux deux autres sans qu'ils l'aient jamais annoncée.",
+      "right": "La rétention des logs d'accès du proxy inverse est fixée à quatorze jours, après quoi une tâche programmée les efface. Le dernier octet de l'adresse IP est coupé au moment de l'écriture, si bien que la valeur complète ne se retrouve jamais stockée. La raison est la règle la plus contraignante parmi les trois sites servis par ce proxy : le fichier de log étant commun, allonger la durée pour un seul l'imposerait aux autres sans qu'ils en aient fait la déclaration."
+    },
+    {
+      "id": "dup-fr-merge-humaine",
+      "band": "duplicate",
+      "lang": "fr",
+      "words": 73,
+      "cosine": 0.9052,
+      "cosine_cls": 0.9448,
+      "left": "La fusion de deux nœuds reste toujours une décision humaine dans cette version. Le cycle de consolidation ne fusionne rien : il propose une arête de type duplicate_of, qui atterrit à l'état proposé dans la file de revue existante, avec son diff et son bouton d'acceptation. Aucun nouveau type de proposition n'est inventé et la surface de revue ne grandit pas. Un candidat mal choisi coûte donc une ligne à lire, jamais une modification du graphe elle-même.",
+      "right": "Fusionner deux nœuds demande toujours l'accord d'un humain à ce stade. Le cycle n'exécute aucune fusion lui-même : il écrit une arête duplicate_of en état proposé, qui arrive dans la file de revue déjà en place avec son diff et son bouton d'acceptation. On n'ajoute donc ni type de proposition ni écran de revue supplémentaire, et une proposition erronée ne coûte qu'une ligne à relire, sans jamais toucher au graphe."
+    },
+    {
+      "id": "dup-fr-chunking",
+      "band": "duplicate",
+      "lang": "fr",
+      "words": 78,
+      "cosine": 0.8814,
+      "cosine_cls": 0.8981,
+      "left": "Le texte d'un nœud est découpé en fenêtres fixes de cinq cent douze mots avec un recouvrement d'environ quinze pour cent. Les mots tiennent lieu de jetons, ce qui évite d'embarquer un tokeniseur et reste suffisant pour classer des résultats à l'échelle d'une base personnelle. Chaque morceau enregistre le modèle qui l'a produit, si bien qu'un changement de modèle se voit dans la table et impose une reconstruction complète du projecteur vectoriel plutôt qu'une mise à jour partielle.",
+      "right": "On découpe le contenu d'un nœud en tranches de cinq cent douze mots qui se chevauchent sur quinze pour cent environ. Le découpage compte des mots séparés par des espaces au lieu de vrais jetons : aucune dépendance supplémentaire, et la précision suffit pour ordonner des résultats dans une base de connaissances personnelle. Le modèle utilisé est inscrit sur chaque tranche, donc en changer se lit directement dans la table et oblige à reconstruire entièrement le projecteur vectoriel."
+    },
+    {
+      "id": "dup-xl-backpressure",
+      "band": "duplicate",
+      "lang": "en-fr",
+      "words": 79,
+      "cosine": 0.8634,
+      "cosine_cls": 0.7952,
+      "left": "The ingest queue applies backpressure by refusing new work once the in-flight count reaches sixty-four. Producers get a 429 and retry with exponential jitter rather than buffering locally, so memory stays flat under a burst. We chose the refusal over an unbounded in-memory queue after the March incident, where a four-hour producer spike drove the worker to eleven gigabytes of resident memory and the OOM killer took the whole container down with sixty thousand records still unwritten.",
+      "right": "La file d'ingestion applique une contre-pression en refusant tout nouveau travail dès que le nombre d'éléments en vol atteint soixante-quatre. Les producteurs reçoivent un 429 et réessaient avec un délai exponentiel aléatoire au lieu de tamponner localement, ce qui garde la mémoire stable pendant une rafale. Ce refus a été préféré à une file mémoire non bornée après l'incident de mars, où une pointe de quatre heures a porté le worker à onze gigaoctets et le tueur OOM a arrêté le conteneur."
+    },
+    {
+      "id": "dup-xl-event-log",
+      "band": "duplicate",
+      "lang": "en-fr",
+      "words": 81,
+      "cosine": 0.7934,
+      "cosine_cls": 0.8499,
+      "left": "Every write goes into an append-only event log before it touches derived state. The projectors are pure consumers: they hold a checkpoint of the last sequence number they applied and can be dropped and rebuilt from event zero at any time. Nothing in the read path is authoritative, which is what makes a model change safe — swap the embedding model, reset the vector projector, and replay produces a consistent index without a migration or a backfill script of any kind.",
+      "right": "Chaque écriture entre dans un journal d'événements en ajout seul avant de toucher l'état dérivé. Les projecteurs sont de purs consommateurs : ils gardent un point de reprise du dernier numéro de séquence appliqué et peuvent être vidés puis reconstruits depuis l'événement zéro à tout moment. Rien dans le chemin de lecture ne fait autorité, et c'est ce qui rend un changement de modèle sûr : on remplace le modèle, on réinitialise le projecteur vectoriel, et la relecture produit un index cohérent."
+    },
+    {
+      "id": "dup-xl-retention",
+      "band": "duplicate",
+      "lang": "en-fr",
+      "words": 82,
+      "cosine": 0.8643,
+      "cosine_cls": 0.8351,
+      "left": "Reverse-proxy access logs are kept for fourteen days and then deleted by a scheduled job. The last octet of the IP address is truncated at write time, so the raw value never exists on disk at all. The choice follows the strictest of the three sites behind that proxy: they share a single log file, so a longer retention for one of them would silently impose that retention on the other two, which never declared it anywhere in their own published privacy pages.",
+      "right": "Les journaux d'accès du reverse proxy sont conservés quatorze jours puis supprimés par une tâche planifiée. Le dernier octet de l'adresse IP est tronqué au moment de l'écriture, donc la valeur brute n'existe jamais sur le disque. Ce choix suit le plus strict des trois sites derrière ce proxy : ils partagent un unique fichier de log, et une rétention plus longue pour l'un imposerait silencieusement cette durée aux deux autres, qui ne l'ont jamais déclarée dans leurs propres pages de confidentialité."
+    },
+    {
+      "id": "rel-en-queue-tuning",
+      "band": "related",
+      "lang": "en",
+      "words": 78,
+      "cosine": 0.5871,
+      "cosine_cls": 0.6437,
+      "left": "The ingest queue applies backpressure by refusing new work once the in-flight count reaches sixty-four. Producers get a 429 and retry with exponential jitter rather than buffering locally, so memory stays flat under a burst. We chose the refusal over an unbounded in-memory queue after the March incident, where a four-hour producer spike drove the worker to eleven gigabytes of resident memory and the OOM killer took the whole container down with sixty thousand records still unwritten.",
+      "right": "Worker concurrency on the ingestion path is set from the core count minus one and capped at eight. Above that the ONNX session threads contend and per-item latency rises faster than throughput improves. The benchmark on the four-core box showed sixteen workers running eleven percent slower end to end than four, with the extra time sitting entirely inside the model call rather than in the queue, which is why the cap is on workers and not on the queue depth."
+    },
+    {
+      "id": "rel-en-projector-pair",
+      "band": "related",
+      "lang": "en",
+      "words": 82,
+      "cosine": 0.4885,
+      "cosine_cls": 0.6802,
+      "left": "The vector projector re-embeds a node on every create, update and state transition, dropping the node's previous chunks first so that a shortened node never keeps stale tail chunks behind it. A rollback that reverses a create deletes the chunks and their vectors together, addressed by rowid, because the vec0 virtual table has no foreign key back to the chunk row and would otherwise keep orphan vectors that still answer a nearest neighbour query for a node that no longer exists.",
+      "right": "The full-text projector maintains the FTS5 index from the same node events, and joins in the extracted text of an asset only for the asset_ref node type. Joining on the asset hash alone handed every page of a document the whole document's text, which destroyed per-page precision — a word on page three ranked pages one, two and four just as strongly — and gave the source node its own text twice, double-weighting it in the BM25 score for no reason at all."
+    },
+    {
+      "id": "rel-en-search-arms",
+      "band": "related",
+      "lang": "en",
+      "words": 78,
+      "cosine": 0.4616,
+      "cosine_cls": 0.5653,
+      "left": "Hybrid search fuses a BM25 result list and a vector result list with reciprocal rank fusion, then expands one hop over the graph. Fusion works on rank rather than raw score because a BM25 score and a cosine distance are not on a comparable scale and normalising them against each other would invent a calibration nobody measured. The vector arm is always k deep, so a weak hit still contributes, just with a small reciprocal weight that rarely changes the top of the list.",
+      "right": "Graph expansion runs after fusion, never before it. Pulling neighbours in first would let a single strong hit drag its whole neighbourhood above documents that matched the query directly, which is how a tag page ends up outranking the note somebody actually wrote. Expanding afterwards keeps the fused ordering as the spine and appends the one-hop neighbourhood beneath it, marked with the signal that brought each row in so the result stays explainable."
+    },
+    {
+      "id": "rel-fr-seuils",
+      "band": "related",
+      "lang": "fr",
+      "words": 78,
+      "cosine": 0.4278,
+      "cosine_cls": 0.7072,
+      "left": "Le seuil de similarité de titre pour un doublon est fixé à 0,95, et cette valeur est dictée par les faux positifs juste en dessous : « Réunion 2026-07-01 » et « Réunion 2026-07-02 » obtiennent 0,944, « Chapitre 1 » et « Chapitre 2 » obtiennent 0,889. Les titres datés et numérotés sont les plus courants dans un graphe personnel et ne doivent jamais être proposés comme doublons l'un de l'autre, donc la barre est volontairement placée en haut de sa plage plausible.",
+      "right": "La co-citation exige au moins deux voisins communs avant de compter comme indice. Un seul voisin partagé est la forme normale d'un arbre documentaire, où chaque frère partage son parent, donc une barre à un proposerait une arête entre toutes les paires d'enfants de chaque page, c'est-à-dire une pile quadratique d'éléments de file engendrée par une structure que le graphe enregistre déjà. Les nœuds de degré supérieur à cinquante sont exclus comme concentrateurs."
+    },
+    {
+      "id": "rel-fr-auth",
+      "band": "related",
+      "lang": "fr",
+      "words": 70,
+      "cosine": 0.4552,
+      "cosine_cls": 0.5299,
+      "left": "Le cookie de session est signé, HttpOnly et SameSite=Lax, et il n'est marqué Secure que si le déploiement active explicitement l'option. En développement local tout passe en HTTP simple, et un cookie Secure ne serait tout bonnement jamais renvoyé par le navigateur, ce qui donnerait une boucle de connexion impossible à diagnostiquer pour quelqu'un qui découvre le projet. Le drapeau est donc une décision de déploiement et non une constante du code.",
+      "right": "Les mots de passe sont hachés en Argon2id avec les paramètres par défaut de la bibliothèque. Le chemin de vérification recalcule le hachage dès que ces paramètres ont changé, donc augmenter le coût met à niveau les empreintes stockées à la prochaine connexion de chaque compte, sans campagne de réinitialisation ni migration de la table. Le recalcul a lieu dans la requête qui vient de valider l'ancienne empreinte."
+    },
+    {
+      "id": "rel-xl-embeddings",
+      "band": "related",
+      "lang": "en-fr",
+      "words": 73,
+      "cosine": 0.4022,
+      "cosine_cls": 0.6214,
+      "left": "Node text is embedded in fixed windows of five hundred and twelve words with about fifteen percent overlap. Words stand in for tokens, which is dependency-free and close enough for ranking at personal-knowledge-base scale, and every chunk records the model that produced it so a model change is visible in the table itself rather than inferred. Changing the model is a full rebuild of the vector projector, never a partial update of the rows that happen to be stale.",
+      "right": "Le modèle d'embedding par défaut est multilingue, de dimension trois cent quatre-vingt-quatre, sous licence Apache 2.0, et présent dans le registre intégré de fastembed, ce qui évite toute inscription personnalisée. Changer de modèle impose une reconstruction complète du projecteur vectoriel, et un modèle d'une autre dimension exige d'abord une migration de la table, puisque la colonne vectorielle est créée à une largeur fixe au moment de la migration."
+    },
+    {
+      "id": "rel-xl-projector",
+      "band": "related",
+      "lang": "en-fr",
+      "words": 71,
+      "cosine": 0.521,
+      "cosine_cls": 0.629,
+      "left": "A projector holds a checkpoint of the highest event sequence it has applied, so runs are incremental and any projector can be reset and rebuilt from event zero independently of the others. The whole batch applies in one transaction, so a failure rolls back to the last committed checkpoint and replaying the same events is deterministic. An unavailable projector is a no-op whose checkpoint stays put, and its backlog is picked up once the blocker clears.",
+      "right": "Quand aucun fournisseur d'embedding n'est utilisable, le projecteur vectoriel se déclare indisponible : ses exécutions ne font rien, son point de reprise ne bouge pas, et la raison remonte dans l'état des projecteurs. La recherche retombe alors sur BM25 et l'expansion de graphe, sans rien casser. C'est la configuration la plus courante, celle d'une installation sans l'extra, et elle doit rester une réponse ordinaire plutôt qu'une exception."
+    },
+    {
+      "id": "area-en-graph-vs-http",
+      "band": "same_area",
+      "lang": "en",
+      "words": 72,
+      "cosine": 0.3675,
+      "cosine_cls": 0.5922,
+      "left": "A typed graph of Markdown-content nodes and typed edges lives in a single SQLite file, with node versions and an undo stack layered over the event log. Edges carry their own state, so a suggestion can sit proposed next to an asserted fact without polluting ordinary reads, and the review queue is simply a filter over that state rather than a separate table with its own lifecycle to keep in sync with the graph it describes.",
+      "right": "The HTTP layer is Starlette with a JSON envelope on every response: a data key on success, an error key carrying a stable machine code on failure, and never both at once. Status codes stay conventional so a proxy or a browser can reason about them without parsing bodies, and the machine code is what clients branch on, because prose messages are allowed to change and codes are not."
+    },
+    {
+      "id": "area-fr-graphe-vs-ui",
+      "band": "same_area",
+      "lang": "fr",
+      "words": 66,
+      "cosine": 0.3126,
+      "cosine_cls": 0.6243,
+      "left": "Le graphe typé stocke des nœuds au contenu Markdown et des arêtes typées dans un seul fichier SQLite, avec versions de nœud et pile d'annulation au-dessus du journal d'événements. L'état porté par l'arête permet à une suggestion de coexister avec un fait affirmé sans polluer les lectures ordinaires, et la file de revue n'est qu'un filtre sur cet état plutôt qu'une table séparée à maintenir cohérente.",
+      "right": "L'interface web est construite avec Vite puis empaquetée dans la roue Python au moment de la publication. Le bundle est ignoré par git parce que la construction vide le répertoire de sortie à chaque passage, et un fichier suivi y serait effacé à chaque build en laissant l'arbre de travail sale. Une page de repli explique que l'interface n'a pas été construite quand le répertoire est absent."
+    },
+    {
+      "id": "area-xl-search-vs-cli",
+      "band": "same_area",
+      "lang": "en-fr",
+      "words": 67,
+      "cosine": 0.1507,
+      "cosine_cls": 0.3803,
+      "left": "Hybrid search fuses a BM25 list and a vector list with reciprocal rank fusion, then expands one hop over the graph. Fusion uses rank rather than raw score because the two signals are not on a comparable scale, and normalising a BM25 score against a cosine distance would invent a calibration nobody has measured. Each returned row records which signal brought it in, so a surprising result can be explained afterwards.",
+      "right": "L'interface en ligne de commande n'émet que du JSON sur la sortie standard ; tout ce qui s'adresse à un humain part sur la sortie d'erreur, et le code de retour distingue une erreur d'usage d'une erreur d'exécution. Cette séparation est ce qui rend la commande utilisable dans un tube sans que le moindre message d'avertissement ne vienne casser l'analyse du flux par l'appelant."
+    },
+    {
+      "id": "area-en-storage-vs-legal",
+      "band": "same_area",
+      "lang": "en",
+      "words": 64,
+      "cosine": 0.4535,
+      "cosine_cls": 0.5863,
+      "left": "Content-addressed assets are stored by hash under a two-level fan-out directory, and the bytes are never event-logged because there is nothing to undo about immutable content. Extracted text lives beside them in a table the projector joins at projection time, which means text stored after a node was projected is not indexed until that node is projected again or the index is rebuilt from scratch.",
+      "right": "The declared data controller is a natural person rather than a company, and the published privacy pages deliberately omit retention durations except where one is already committed elsewhere. Publishing a duration creates an obligation that the shared infrastructure behind three sites cannot honour independently, so the strictest claim among them binds all of them whether or not the others meant to make it."
+    },
+    {
+      "id": "unrel-en-sourdough",
+      "band": "unrelated",
+      "lang": "en",
+      "words": 79,
+      "cosine": 0.3143,
+      "cosine_cls": 0.5077,
+      "left": "The ingest queue applies backpressure by refusing new work once the in-flight count reaches sixty-four. Producers get a 429 and retry with exponential jitter rather than buffering locally, so memory stays flat under a burst. We chose the refusal over an unbounded in-memory queue after the March incident, where a four-hour producer spike drove the worker to eleven gigabytes of resident memory and the OOM killer took the whole container down with sixty thousand records still unwritten.",
+      "right": "Rest the dough at room temperature for an hour before the first fold, then give it three more folds at forty-minute intervals. The final proof goes in the fridge overnight; a cold dough is far easier to score and the crumb comes out noticeably more open. We moved to the overnight retard after a summer of flat loaves, when the kitchen sat above twenty-eight degrees all afternoon and the bulk was finished long before anybody was ready to shape and bake."
+    },
+    {
+      "id": "unrel-fr-tomates",
+      "band": "unrelated",
+      "lang": "fr",
+      "words": 68,
+      "cosine": 0.144,
+      "cosine_cls": 0.5439,
+      "left": "La fusion de deux nœuds reste toujours une décision humaine dans cette version. Le cycle de consolidation ne fusionne rien : il propose une arête de type duplicate_of, qui atterrit à l'état proposé dans la file de revue existante, avec son diff et son bouton d'acceptation. Aucun nouveau type de proposition n'est inventé et la surface de revue ne grandit pas, donc un candidat erroné ne coûte qu'une ligne à lire.",
+      "right": "Les tomates greffées supportent mieux le mildiou mais demandent un tuteurage plus solide dès la mise en terre, parce que le porte-greffe pousse beaucoup plus vite que le pied franc. Un paillage épais limite les éclaboussures de terre sur les feuilles basses, qui sont la principale voie de contamination au début de l'été. On supprime les gourmands une fois par semaine, jamais par temps humide."
+    },
+    {
+      "id": "unrel-xl-quartet",
+      "band": "unrelated",
+      "lang": "en-fr",
+      "words": 68,
+      "cosine": 0.0661,
+      "cosine_cls": 0.3663,
+      "left": "Every write goes into an append-only event log before it touches derived state. The projectors are pure consumers: they hold a checkpoint of the last sequence number they applied and can be dropped and rebuilt from event zero at any time. Nothing in the read path is authoritative, which is what makes a model change safe — swap the model, reset the projector, and replay produces a consistent index.",
+      "right": "Le quatuor à cordes en fa majeur a été composé pendant l'été, à la campagne, et l'auteur en parlait comme d'une œuvre joyeuse écrite très vite. Le troisième mouvement cite une mélodie entendue chez un voisin et la transpose au violoncelle, une octave plus bas que dans l'esquisse conservée au carnet. La création publique n'eut lieu que deux ans plus tard, dans une salle à moitié vide."
+    },
+    {
+      "id": "unrel-en-weather",
+      "band": "unrelated",
+      "lang": "en",
+      "words": 67,
+      "cosine": -0.0503,
+      "cosine_cls": 0.3151,
+      "left": "Sibling ordering uses a fractional index rather than a dense integer position. Inserting between two children means averaging their two keys, which touches exactly one row instead of renumbering every sibling to the right. The cost is float precision: after roughly fifty consecutive insertions into the same gap the midpoint stops being representable, so a nightly job rebalances any gap that has narrowed past a threshold.",
+      "right": "The front is expected to clear by mid-morning, with a brisk north-westerly behind it and gusts to fifty kilometres an hour along the coast. Temperatures will fall through the afternoon and the first frost of the season is likely inland overnight. Growers on the plain have been advised to cover anything still standing, since the cold is forecast to hold for three nights before the wind turns south again."
+    },
+    {
+      "id": "unrel-fr-peinture",
+      "band": "unrelated",
+      "lang": "fr",
+      "words": 65,
+      "cosine": 0.0748,
+      "cosine_cls": 0.5411,
+      "left": "Le seuil de similarité de titre pour un doublon est fixé à 0,95, et cette valeur est dictée par les faux positifs juste en dessous : deux réunions datées de jours consécutifs obtiennent 0,944 et deux chapitres numérotés obtiennent 0,889. Les titres datés et numérotés sont les plus courants dans un graphe personnel et ne doivent jamais être proposés comme doublons l'un de l'autre.",
+      "right": "Le glacis se pose sur une couche parfaitement sèche, sinon le liant reprend la couche du dessous et le ton se trouble irrémédiablement. Trois voiles minces donnent une profondeur qu'une seule couche épaisse n'atteint jamais, et le temps de séchage entre deux passes dépend surtout de l'huile employée. Sur un fond absorbant, on encolle d'abord, faute de quoi la matière s'enfonce et le ton mat revient."
+    },
+    {
+      "id": "unrel-en-cycling",
+      "band": "unrelated",
+      "lang": "en",
+      "words": 68,
+      "cosine": 0.2903,
+      "cosine_cls": 0.3926,
+      "left": "Hybrid search fuses a BM25 result list and a vector result list with reciprocal rank fusion, then expands one hop over the graph. Fusion works on rank rather than raw score because a BM25 score and a cosine distance are not on a comparable scale. The vector arm is always k deep, so a weak hit still contributes, just with a small reciprocal weight that rarely changes the top of the list.",
+      "right": "Chain wear is measured with a gauge across twelve links, and past three-quarters of a percent the cassette starts wearing to match the stretched chain rather than the other way round. Replacing at half a percent costs one chain and saves the cassette; waiting until the shifting is visibly bad costs both, and on a worn chainring it costs three parts instead of two."
+    },
+    {
+      "id": "unrel-fr-comptabilite",
+      "band": "unrelated",
+      "lang": "fr",
+      "words": 60,
+      "cosine": 0.2787,
+      "cosine_cls": 0.4655,
+      "left": "Les journaux d'accès du reverse proxy sont conservés quatorze jours puis supprimés automatiquement par une tâche planifiée. L'adresse IP est tronquée sur son dernier octet dès l'écriture, donc la donnée brute n'existe jamais sur disque. Ce choix vient de la contrainte la plus stricte des trois sites hébergés derrière le même proxy, qui partagent un seul fichier de log.",
+      "right": "La facture doit porter la mention du régime de TVA applicable et le numéro d'ordre d'une série continue, sans quoi elle est refusée en cas de contrôle. Les acomptes se rattachent à l'exercice où la prestation est exécutée et non à celui de l'encaissement, ce qui change la date de rattachement pour tout chantier à cheval sur deux exercices comptables successifs."
+    },
+    {
+      "id": "unrel-xl-navigation",
+      "band": "unrelated",
+      "lang": "en-fr",
+      "words": 62,
+      "cosine": 0.1452,
+      "cosine_cls": 0.6035,
+      "left": "Passwords are hashed with Argon2id at the library's default parameters, and the verify path rehashes whenever those parameters have moved. Raising the cost factor therefore upgrades every stored hash the next time its owner logs in, instead of forcing a reset campaign across the whole user table. The rehash happens inside the same request that verified the old hash.",
+      "right": "Le relèvement au compas doit être corrigé de la déclinaison puis de la déviation propre au bateau avant d'être reporté sur la carte, et l'ordre des deux corrections n'est pas indifférent quand la route change beaucoup. Un amer pris trop près du travers donne une droite de position peu franche : on préfère deux amers séparés d'au moins trente degrés pour que le point soit net."
+    }
+  ]
+}

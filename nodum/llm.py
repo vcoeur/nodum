@@ -115,9 +115,35 @@ generalised to "no provider = smart features off"):
     :func:`profile_for` recognises the model id as one a shipped profile's
     endpoint serves. Setting it explicitly takes the *whole* decision: a profile
     then applies only where it is that same host, so no model name can move a
-    call off the endpoint the operator named.
+    call off the endpoint the operator named — and where that host *is* the
+    profiled one, the profile's window and modes still apply, because the
+    profile is a fact about the endpoint rather than a consolation for not
+    having named it.
+
+    **It must be a URL urllib can POST to, and a spelling that is not is no
+    provider with a reason** (:func:`base_url_problem`) — the same posture as an
+    unparseable ``NODUM_LLM_CONTEXT_TOKENS``. A scheme-less
+    ``api.deepseek.com/v1`` is not repaired into one, because choosing ``http``
+    or ``https`` on the operator's behalf decides whether ``NODUM_LLM_API_KEY``
+    crosses the network in clear text.
 ``NODUM_LLM_API_KEY``
     Bearer token. Optional — the local default needs none.
+
+    **It is sent only to an endpoint somebody named**: ``NODUM_LLM_BASE_URL``,
+    or a model id that is exactly one a shipped profile serves. A model id
+    nobody profiled falls back to :data:`DEFAULT_BASE_URL`, which is a host
+    *this module* chose — so the key is dropped at resolution time rather than
+    posted to it, and :func:`key_withheld_reason` says so in
+    ``nodum llm status``. A local gateway that requires a key keeps it by naming
+    itself in ``NODUM_LLM_BASE_URL``.
+``NODUM_LLM_THINKING``
+    The reasoning level, one of :data:`THINKING_LEVELS`, defaulting to
+    :data:`DEFAULT_THINKING`. A value outside the set is **no provider with a
+    reason** rather than a fallback: a level is a name the API validates, not a
+    number whose worst case is less work. Whether it reaches the endpoint at all
+    is a second fact — :attr:`OpenAICompatProvider.thinking_applied`, reported
+    beside it, because ollama accepts only ``none``. **Nothing may size an
+    output ceiling from it** (see :data:`DEFAULT_THINKING`).
 ``NODUM_LLM_CONTEXT_TOKENS``
     **The window the endpoint will actually serve**, defaulting to
     :data:`DEFAULT_CONTEXT_TOKENS`. This is not the model card's number: with
@@ -137,6 +163,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import logging
 import os
 import time
 import urllib.error
@@ -146,6 +173,13 @@ from collections.abc import Sequence
 from typing import Any, NamedTuple, Protocol
 
 from pydantic import BaseModel
+
+#: The one thing in this module that is neither a refusal nor a number a caller
+#: reads back. A provider whose own ``usage`` block contradicts itself is not a
+#: failure — nodum's arithmetic is authoritative and the call is still billed
+#: honestly — but silence is how a wire that has started reporting nonsense goes
+#: unnoticed for a release. See :meth:`OpenAICompatProvider._completion`.
+_log = logging.getLogger(__name__)
 
 #: Local default: what ``ollama serve`` exposes. Both halves of the provider
 #: talk this surface — see the module docstring for why there is only one class.
@@ -333,11 +367,33 @@ _MIN_TIMEOUT = 0.001
 #: response_format type is unavailable now``.
 _STRUCTURED_REJECTIONS = ("response_format",)
 
+#: What separates the field's *name* from a path **into** it. A 400 reading
+#: ``Invalid schema for response_format.schema.properties[0]`` names the same
+#: substring and means the opposite thing: the server parsed ``response_format``
+#: and is validating what is inside it, which is proof that it serves the field
+#: and that the fault is nodum's own schema.
+#:
+#: Downgrading on that would trade a loud, fixable "your schema is wrong" for an
+#: envelope quietly weakened for the life of the process — the exact harm
+#: ``test_a_non_capability_400_is_not_negotiated`` exists to prevent, reached
+#: through a message that happens to contain the marker. It is the one
+#: *sharpening* of a matcher this module keeps deliberately blunt, and it is
+#: still one-sided in the safe direction: a server that says
+#: ``response_format.type is unavailable`` is not negotiated, which is today's
+#: behaviour exactly — the ``ProviderUnavailable`` reaches the caller unchanged.
+_FIELD_PATH_SEPARATORS = (".", "[")
+
 #: Substrings that identify a 400 as "this endpoint does not take a graded
 #: reasoning level". Measured on ollama: ``"llama3.2:1b" does not support
 #: thinking`` for a model without thinking, and ``think value "low" is not
 #: supported for this model`` for ``qwen3:8b``, which has it — two different
 #: sentences from one server, which is why this is a list rather than a string.
+#:
+#: Matched as plain substrings, deliberately unlike :data:`_STRUCTURED_REJECTIONS`:
+#: two of the three are *sentences a server says* rather than field names, so
+#: the path guard in :func:`_names_field` would stop ``"llama3.2:1b" does not
+#: support thinking.`` matching over a full stop. ``reasoning_effort`` takes a
+#: bare string, so there is no path into it for a server to name.
 _THINKING_REJECTIONS = (
     "reasoning_effort",
     "does not support thinking",
@@ -730,11 +786,17 @@ DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
 #: Endpoints this ships knowing about, keyed by exact model id and by hostname.
 #:
 #: Deliberately tiny, and deliberately not a vendor registry: a profile earns
-#: its place by being an endpoint whose *defaults are wrong* otherwise. ollama
-#: is here because 4 096 and ``json_schema`` are already this module's defaults
-#: but ``graded_thinking`` is not — measured, it answers 400 to every graded
-#: level including on ``qwen3:8b``, which thinks. DeepSeek is here because all
-#: four differ from the defaults.
+#: its place by being an endpoint whose *defaults are wrong* otherwise. DeepSeek
+#: is the only row, because it is the only endpoint measured on which all four
+#: fields differ from this module's defaults.
+#:
+#: **ollama is not a row and does not need one.** Three of its four values are
+#: already the defaults here (4 096, ``json_schema``, its own base URL), and the
+#: fourth — it answers 400 to every graded reasoning level, including on
+#: ``qwen3:8b``, which thinks — is decided in :func:`_resolve_default` by
+#: comparing the resolved base URL against :data:`DEFAULT_BASE_URL`. A profile
+#: keyed on model ids could not have carried it anyway: ollama serves whatever
+#: the operator pulled, so there is no list of exact ids to match.
 #:
 #: A provider that is *not* recognised keeps the optimistic beliefs and
 #: negotiates them down on the first 400, so this table is an optimisation and
@@ -765,19 +827,67 @@ def _hostname(base_url: str) -> str:
     """The host a base URL names, lower-cased and without its port, or ``""``.
 
     A URL this cannot parse is ``""`` rather than an exception. Matching a
-    profile is an optimisation and a typo in :data:`ENV_BASE_URL` is the
-    operator's own endpoint to fix — measured, ``urlsplit`` raises
+    profile is an optimisation and it runs *before* :func:`base_url_problem`
+    refuses the same URL — measured, ``urlsplit`` raises
     ``ValueError("Invalid IPv6 URL")`` on ``http://[bad/v1``, and letting that
     out of here would turn a wrong URL into a traceback at *resolution* time,
-    before anything has tried to reach it.
+    ahead of the sentence that says what is wrong with it.
+
+    ``SplitResult.hostname`` lower-cases on its own (CPython's ``_hostinfo``),
+    so ``https://API.DeepSeek.com/v1`` arrives here already folded and nothing
+    folds it a second time —
+    :func:`test_the_profiled_host_is_matched_however_the_url_is_spelled` is what
+    holds that.
     """
     try:
         # A base URL with no scheme (`api.deepseek.com/v1`) parses as a bare
         # path, so it is given the authority marker before the host is read.
+        # This is deliberately more forgiving than `base_url_problem`: a host is
+        # readable out of a spelling nothing can POST to, and reading it is how
+        # the refusal can be about *that endpoint* rather than about a string.
         split = urllib.parse.urlsplit(base_url if "//" in base_url else f"//{base_url}")
-        return (split.hostname or "").casefold()
+        return split.hostname or ""
     except ValueError:
         return ""
+
+
+def _completions_url(base_url: str) -> str:
+    """The chat-completions URL a base URL names. One spelling, in one place."""
+    return f"{base_url.rstrip('/')}/chat/completions"
+
+
+def base_url_problem(base_url: str) -> str | None:
+    """Why ``urllib`` cannot POST to this base URL, or ``None`` when it can.
+
+    **The check is the operation itself**, not a heuristic about it:
+    ``urllib.request.Request`` parses the URL in its constructor and makes no
+    network call, so asking it to build the request this provider will really
+    send is exact — it accepts everything :meth:`OpenAICompatProvider._post`
+    would accept and refuses everything it would refuse, and it cannot
+    over-refuse a spelling that works.
+
+    Two spellings reach it, both driven rather than imagined:
+    ``api.deepseek.com/v1`` is ``ValueError: unknown url type`` (a base URL with
+    no scheme) and ``http://[bad/v1`` is ``ValueError: Invalid IPv6 URL``.
+
+    **A scheme-less base URL is refused here rather than repaired**, which is
+    the decision worth stating because :func:`_hostname` deliberately reads a
+    host out of one. Repairing it means choosing ``http`` or ``https`` on the
+    operator's behalf, and that is not a spelling detail: it decides whether
+    :data:`ENV_API_KEY` crosses the network in clear text. Guessing ``https``
+    breaks a local gateway, guessing ``http`` publishes a bearer token, and
+    neither is a guess this module is entitled to make from four characters that
+    are not there. So it is refused with the sentence that fixes it, exactly as
+    an unparseable :data:`ENV_CONTEXT_TOKENS` and an unrecognised
+    :data:`ENV_THINKING` already are: unusable configuration is *no provider
+    with a reason*, at resolution time, where ``nodum llm status`` prints it and
+    exits 0.
+    """
+    try:
+        urllib.request.Request(_completions_url(base_url), method="POST")
+    except ValueError as failure:
+        return str(failure)
+    return None
 
 
 def profile_for(*, model: str, base_url: str | None) -> ProviderProfile | None:
@@ -809,7 +919,9 @@ def profile_for(*, model: str, base_url: str | None) -> ProviderProfile | None:
     egress, and only one of those two is recoverable.
 
     Args:
-        model: :data:`ENV_MODEL`, as the operator typed it.
+        model: :data:`ENV_MODEL`, already stripped — :func:`_resolve_default`
+            is the one place that trims it, and trimming it a second time here
+            was code no test could distinguish from its absence.
         base_url: :data:`ENV_BASE_URL` if it was set, else ``None``. **Not** the
             resolved default — a profile may not match against a URL it supplied
             itself.
@@ -823,7 +935,7 @@ def profile_for(*, model: str, base_url: str | None) -> ProviderProfile | None:
         # then its window is that host's own.
         host = _hostname(base_url)
         return next((profile for profile in _PROFILES if host in profile.hosts), None)
-    name = model.strip().casefold()
+    name = model.casefold()
     return next((profile for profile in _PROFILES if name in profile.models), None)
 
 
@@ -847,6 +959,32 @@ def estimate_content_tokens(messages: Sequence[Message]) -> int:
     """
     return sum(
         estimate_tokens(message.role) + estimate_tokens(message.content) for message in messages
+    )
+
+
+def _names_field(detail: str, markers: Sequence[str]) -> bool:
+    """Does this 400 name one of these fields, rather than a path inside one?
+
+    The blunt half is :meth:`OpenAICompatProvider._negotiate`'s own argument: a
+    server's sentence is the only signal this wire carries, so the markers are
+    substrings and a false positive is a weaker request every endpoint accepts.
+
+    The sharp half is :data:`_FIELD_PATH_SEPARATORS`: a marker immediately
+    followed by ``.`` or ``[`` is the server *dereferencing* the field, which
+    means it accepted the field and is complaining about its contents. Those are
+    two opposite findings behind one substring, and only one of them is a
+    capability signal.
+
+    A message that dereferences a marker *anywhere* is read as a validation
+    error, even if it also names it bare somewhere else. That is the
+    conservative side of the same one-sidedness: the cost is one
+    :class:`ProviderUnavailable` reaching the caller, which is what would have
+    happened with no negotiation at all.
+    """
+    return any(
+        marker in detail
+        and not any(f"{marker}{separator}" in detail for separator in _FIELD_PATH_SEPARATORS)
+        for marker in markers
     )
 
 
@@ -1241,8 +1379,8 @@ class OpenAICompatProvider:
         if getattr(failure, "status", None) != 400:
             return False
         detail = str(failure).casefold()
-        if self._structured_mode == STRUCTURED_JSON_SCHEMA and any(
-            marker in detail for marker in _STRUCTURED_REJECTIONS
+        if self._structured_mode == STRUCTURED_JSON_SCHEMA and _names_field(
+            detail, _STRUCTURED_REJECTIONS
         ):
             self._structured_mode = STRUCTURED_JSON_OBJECT
             return True
@@ -1266,15 +1404,34 @@ class OpenAICompatProvider:
         headers = {"Content-Type": "application/json"}
         if self._api_key:
             headers["Authorization"] = f"Bearer {self._api_key}"
-        request = urllib.request.Request(
-            f"{self._base_url}/chat/completions",
-            data=json.dumps(payload).encode("utf-8"),
-            headers=headers,
-            method="POST",
-        )
         try:
+            # Built **inside** the try, and that placement is the whole fix.
+            # `Request.__init__` parses the URL, so it is the second thing here
+            # that raises on bad configuration rather than on a bad network —
+            # measured, `ValueError: unknown url type` for a scheme-less
+            # `api.deepseek.com/v1` and `ValueError: Invalid IPv6 URL` for
+            # `http://[bad/v1`. Constructed one line above the try, neither
+            # reached an except clause: they escaped `LLMError`, escaped the
+            # `(BudgetExhausted, LLMError)` handlers in `nodum.answers`, and
+            # turned a malformed *configuration* into the traceback and the 400
+            # reserved for a malformed *request*. Exactly the shape
+            # `IncompleteRead` had below, one layer earlier.
+            request = urllib.request.Request(
+                _completions_url(self._base_url),
+                data=json.dumps(payload).encode("utf-8"),
+                headers=headers,
+                method="POST",
+            )
             with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310
                 raw = response.read()
+        except ValueError as failure:
+            # No status: nothing was asked, so this is not a capability signal
+            # and `_negotiate` will not read it as one.
+            raise ProviderUnavailable(
+                f"provider at {self._base_url} is not a URL this can POST to ({failure}). "
+                f"Set {ENV_BASE_URL} to a full OpenAI-compatible root, scheme included "
+                f"(for example {DEFAULT_BASE_URL})"
+            ) from failure
         except urllib.error.HTTPError as failure:
             # Measured: an unknown model on a live server is an HTTP 404
             # carrying a JSON error body, in about a millisecond. The body is
@@ -1351,6 +1508,29 @@ class OpenAICompatProvider:
         ``completion_tokens_details`` block disappears rather than reporting
         zero. Treating their absence as an unreadable shape would make the one
         predictable reasoning setting the one that cannot be used.
+
+        **Two ways the block can be self-contradictory are checked here rather
+        than believed**, because both of them are arithmetic this module has
+        already stated as an invariant and neither can be checked one function
+        down, where only one number is in scope (:func:`_optional_count`):
+
+        - ``reasoning_tokens`` above ``completion_tokens``.
+          :attr:`Completion.reasoning_tokens` documents itself as a *share* of
+          the output — measured true on every ``deepseek-v4-flash`` call — and
+          :attr:`Completion.content_tokens` subtracts one from the other. A wire
+          reporting 5 000 reasoning inside 50 completion makes that difference
+          ``0`` and prints a report where the thinking is larger than the output
+          it is part of. No budget moves either way (reasoning is never summed
+          into the spend), so it is clamped rather than refused.
+        - ``usage.total_tokens`` disagreeing with ``prompt + completion``.
+          Overriding it is right — :attr:`Completion.total_tokens` is what
+          budgets are denominated in and it must be one rule everywhere — but
+          *not reading it at all* meant a provider that bills differently from
+          the way this meters could never be noticed.
+
+        Neither fails the call. Both are logged, which is the only thing in this
+        module that is: they are facts about the *provider*, actionable by
+        whoever operates it, and useless to the caller who wanted an answer.
         """
         try:
             choice = body["choices"][0]
@@ -1365,6 +1545,30 @@ class OpenAICompatProvider:
                 f"({type(failure).__name__}: {failure}); expected OpenAI-compatible "
                 f"choices[0].message.content plus a usage block"
             ) from failure
+        reasoning_tokens = _optional_count(
+            (usage.get("completion_tokens_details") or {}), "reasoning_tokens"
+        )
+        if reasoning_tokens > output_tokens:
+            _log.warning(
+                "provider at %s reported %d reasoning tokens inside %d completion tokens; "
+                "reasoning is a share of the completion, so it is clamped to it",
+                self._base_url,
+                reasoning_tokens,
+                output_tokens,
+            )
+            reasoning_tokens = output_tokens
+        # `0` is "the wire did not say" — the ordinary ollama shape — and not a
+        # provider claiming the call cost nothing.
+        reported_total = _optional_count(usage, "total_tokens")
+        if reported_total and reported_total != prompt_tokens + output_tokens:
+            _log.warning(
+                "provider at %s reported usage.total_tokens %d for %d prompt + %d completion "
+                "tokens; nodum bills prompt + completion, so the two disagree about this call",
+                self._base_url,
+                reported_total,
+                prompt_tokens,
+                output_tokens,
+            )
         return Completion(
             text=text if isinstance(text, str) else "",
             prompt_tokens=prompt_tokens,
@@ -1376,9 +1580,7 @@ class OpenAICompatProvider:
             latency_ms=latency_ms,
             prompt_estimate=estimate,
             prompt_content_estimate=content_estimate,
-            reasoning_tokens=_optional_count(
-                (usage.get("completion_tokens_details") or {}), "reasoning_tokens"
-            ),
+            reasoning_tokens=reasoning_tokens,
             cache_hit_tokens=_optional_count(usage, "prompt_cache_hit_tokens"),
             cache_miss_tokens=_optional_count(usage, "prompt_cache_miss_tokens"),
             structured_mode=structured_mode,
@@ -1394,6 +1596,7 @@ class OpenAICompatProvider:
 
 _provider: LLMProvider | None = None
 _unavailable_reason: str | None = None
+_key_withheld_reason: str | None = None
 _resolved = False
 
 
@@ -1410,9 +1613,9 @@ def get_provider() -> LLMProvider | None:
     surfaces as :class:`ProviderUnavailable` on the first call, in a
     millisecond — measured.
     """
-    global _provider, _unavailable_reason, _resolved
+    global _provider, _unavailable_reason, _key_withheld_reason, _resolved
     if not _resolved:
-        _provider, _unavailable_reason = _resolve_default()
+        _provider, _unavailable_reason, _key_withheld_reason = _resolve_default()
         _resolved = True
     return _provider
 
@@ -1423,6 +1626,22 @@ def unavailable_reason() -> str | None:
     return _unavailable_reason
 
 
+def key_withheld_reason() -> str | None:
+    """Return why :data:`ENV_API_KEY` is not being sent, or ``None``.
+
+    Shaped exactly like :func:`unavailable_reason`, and for the same reason: it
+    is a fact settled at *resolution* time, out of configuration alone, and a
+    caller must be able to read it without holding the provider (P3).
+
+    ``None`` covers both "no key was configured" and "the key is being sent";
+    a string means a key **is** configured and this deliberately did not attach
+    it. The distinction that matters to a human is the string, and it names the
+    endpoint the key would otherwise have gone to. See :func:`_resolve_default`.
+    """
+    get_provider()
+    return _key_withheld_reason
+
+
 def set_provider(provider: LLMProvider | None, *, reason: str | None = None) -> None:
     """Force the provider — the test and configuration seam.
 
@@ -1431,40 +1650,101 @@ def set_provider(provider: LLMProvider | None, *, reason: str | None = None) -> 
     (temperature-0 determinism is a local-backend property, not a contract), so
     every test that needs a completion injects one here.
     """
-    global _provider, _unavailable_reason, _resolved
+    global _provider, _unavailable_reason, _key_withheld_reason, _resolved
     _provider = provider
     _unavailable_reason = None if provider is not None else (reason or "no LLM provider configured")
+    # A forced provider was built by the caller, who named its endpoint and its
+    # key together; there is nothing for this module to have withheld.
+    _key_withheld_reason = None
     _resolved = True
 
 
 def reset_provider() -> None:
     """Drop the cached resolution; the next use re-resolves from scratch."""
-    global _provider, _unavailable_reason, _resolved
+    global _provider, _unavailable_reason, _key_withheld_reason, _resolved
     _provider = None
     _unavailable_reason = None
+    _key_withheld_reason = None
     _resolved = False
 
 
-def _resolve_default() -> tuple[LLMProvider | None, str | None]:
-    """Build the configured provider, or explain why there is none."""
+def _resolve_default() -> tuple[LLMProvider | None, str | None, str | None]:
+    """Build the configured provider, or explain why there is none.
+
+    Returns the provider, why there is none, and why a configured
+    :data:`ENV_API_KEY` was not given to it — at most one of the last two is
+    ever a string.
+
+    **The key travels only to an endpoint somebody named.** Two things can name
+    one: the operator, by setting :data:`ENV_BASE_URL`, or the model id, by
+    being exactly a hosted id a shipped profile serves. When neither did, the
+    base URL is :data:`DEFAULT_BASE_URL` — a host **this module chose**, not one
+    the key was configured for — and the key is dropped here rather than
+    attached in :meth:`OpenAICompatProvider._post`.
+
+    The hole that closes: ``NODUM_LLM_MODEL`` naming a hosted model this does
+    not recognise (a typo, a newer id) plus ``NODUM_LLM_API_KEY`` resolved to
+    ``http://localhost:11434/v1`` and sent the vendor's bearer token there.
+    Driven end to end: the prompt correctly stayed local and the credential did
+    not stay with the vendor — it arrived at a throwaway listener as
+    ``Authorization: Bearer …``, ready to be read out of any local process's
+    logs.
+
+    **Withheld, not refused**, because the local default needs no key: a stale
+    variable left over from an experiment must not stop a working local install,
+    and refusing would make it. And the case the fix may not break — a key
+    against a **self-hosted gateway** that requires one — is precisely the case
+    where the operator names ``NODUM_LLM_BASE_URL``, so it keeps its key by the
+    same rule.
+    """
     model = (os.environ.get(ENV_MODEL) or "").strip()
     if not model:
-        return None, (
-            f"no LLM provider configured (set {ENV_MODEL} to a model the endpoint serves; "
-            f"{ENV_BASE_URL} defaults to {DEFAULT_BASE_URL})"
+        return (
+            None,
+            (
+                f"no LLM provider configured (set {ENV_MODEL} to a model the endpoint serves; "
+                f"{ENV_BASE_URL} defaults to {DEFAULT_BASE_URL})"
+            ),
+            None,
         )
     configured_base = (os.environ.get(ENV_BASE_URL) or "").strip() or None
     profile = profile_for(model=model, base_url=configured_base)
     default_base = profile.base_url if profile is not None else DEFAULT_BASE_URL
     base_url = configured_base or default_base
+    problem = base_url_problem(base_url)
+    if problem is not None:
+        return (
+            None,
+            (
+                f"{ENV_BASE_URL}={base_url!r} is not a URL this can POST to ({problem}). "
+                f"Give it a full OpenAI-compatible root, scheme included — for example "
+                f"{DEFAULT_BASE_URL} or {DEEPSEEK_BASE_URL}"
+            ),
+            None,
+        )
     api_key = (os.environ.get(ENV_API_KEY) or "").strip() or None
+    key_withheld: str | None = None
+    if api_key is not None and configured_base is None and profile is None:
+        key_withheld = (
+            f"{ENV_API_KEY} is set and is not being sent: nothing named an endpoint for it. "
+            f"{ENV_MODEL}={model!r} is not a hosted model id this ships a profile for and "
+            f"{ENV_BASE_URL} is unset, so calls go to the local default {base_url} — a host "
+            f"the key was not configured for. Name the endpoint the key belongs to with "
+            f"{ENV_BASE_URL} (a local gateway that requires a key counts), or use the exact "
+            f"hosted model id"
+        )
+        api_key = None
     raw_context = (os.environ.get(ENV_CONTEXT_TOKENS) or "").strip()
     context_tokens = profile.context_tokens if profile is not None else DEFAULT_CONTEXT_TOKENS
     if raw_context:
         try:
             context_tokens = int(raw_context)
         except ValueError:
-            return None, (f"{ENV_CONTEXT_TOKENS}={raw_context!r} is not a whole number of tokens")
+            return (
+                None,
+                f"{ENV_CONTEXT_TOKENS}={raw_context!r} is not a whole number of tokens",
+                None,
+            )
     raw_thinking = (os.environ.get(ENV_THINKING) or "").strip().casefold()
     thinking = raw_thinking or DEFAULT_THINKING
     if thinking not in THINKING_LEVELS:
@@ -1477,9 +1757,13 @@ def _resolve_default() -> tuple[LLMProvider | None, str | None]:
         # nobody chose and reporting the level that was asked for. So an
         # unrecognised level is no provider at all, with a reason, exactly as
         # an unparseable context window already is.
-        return None, (
-            f"{ENV_THINKING}={raw_thinking!r} is not a reasoning level nodum accepts "
-            f"(one of: {', '.join(THINKING_LEVELS)})"
+        return (
+            None,
+            (
+                f"{ENV_THINKING}={raw_thinking!r} is not a reasoning level nodum accepts "
+                f"(one of: {', '.join(THINKING_LEVELS)})"
+            ),
+            None,
         )
     # ollama is the default endpoint and takes only `none`, so an unrecognised
     # provider on the default base URL starts out disbelieving graded levels
@@ -1502,5 +1786,5 @@ def _resolve_default() -> tuple[LLMProvider | None, str | None]:
             graded_thinking=graded_thinking,
         )
     except ValueError as failure:
-        return None, f"LLM provider configuration is unusable: {failure}"
-    return provider, None
+        return None, f"LLM provider configuration is unusable: {failure}", None
+    return provider, None, key_withheld
