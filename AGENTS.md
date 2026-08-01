@@ -1994,9 +1994,10 @@ commands on a saved node for exactly this reason.
   version `fts5_unicode2.c` was written against, so a simple case mapping added
   since folds in Python and does not fold in FTS5. Swept exhaustively over every
   alphanumeric codepoint below U+30000 (133 808 of them) against a live table:
-  **417** fold groups Python merges and SQLite splits — Cherokee, Georgian
-  Mtavruli, Adlam, Osage, Warang Citi, Medefaidrin, and a tail of Latin, Greek
-  and Cyrillic letters — and `search("ᲓᲦᲔ დღე")` really does reach only the
+  **417** fold groups Python merges and SQLite splits — Cherokee, Old Hungarian,
+  Vithkuqi, Georgian Mtavruli, Adlam, Garay, Osage, Warang Citi, Medefaidrin,
+  Glagolitic, and a tail of Latin, Greek and Cyrillic letters — and
+  `search("ᲓᲦᲔ დღე")` really does reach only the
   Mtavruli row, the lowercase term the caller typed having been dropped as its
   duplicate. Deseret (cased since Unicode 3.1) folds correctly on both sides, so
   the axis is the table's vintage and not "non-ASCII" or "non-BMP". Blast radius
@@ -2006,7 +2007,15 @@ commands on a saved node for exactly this reason.
   linguistically, and it was the stated invariant that was wrong, not the code.
   One pair per block is pinned as `_FOLD_UNSOUND` in `tests/test_search.py`,
   with a sound control beside it, so SQLite catching up fails the test rather
-  than making this paragraph quietly stale.
+  than making this paragraph quietly stale. **Both counts are a reading of two
+  moving tables and neither is a constant** — `_bare_word` calls `str.lower()`,
+  so the Python side moves with the interpreter's Unicode version just as the
+  SQLite side moves with its build. The figures above are CPython 3.14 against
+  SQLite 3.50.4; on CPython 3.12 and Unicode 15.0, **which is what CI runs**,
+  the identical sweep gives **390 of 128 804**. The pinned pairs are Unicode
+  7-to-11 mappings and hold identically on both, which is why the pin is a
+  test and the counts are only prose — a paragraph that replaced one unqualified
+  absolute should not quietly introduce two more.
   The residue is named, not hidden, and the stemmer's half of it is the more
   serious of the two. `porter` **stems**, and `_is_function_word` looks a
   *character* fold up in `_QUERY_STOPWORDS` — so any word that stems onto a
