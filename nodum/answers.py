@@ -285,10 +285,64 @@ MAX_REWRITE_TERMS = 8
 #: halve the context every answer is built from.
 REWRITE_OUTPUT_TOKENS = 2048
 
-#: Output tokens the reachability probe asks for. Sized to be cheap rather than
-#: useful: the probe's question is whether anything answers, and a live server
-#: hitting this ceiling answers it just as well as one that stops on its own.
-PROBE_OUTPUT_TOKENS = 8
+#: The reasoning level the query rewrite runs at, **pinned below the global
+#: default** (design: a level per call site, because the call sites do not want
+#: the same thing).
+#:
+#: Measured on ``deepseek-v4-flash``, four questions x three samples at each
+#: level, ceiling 2 048:
+#:
+#: ===========  ==================  ===============  ========
+#: level        reasoning min/max   output max       latency
+#: ===========  ==================  ===============  ========
+#: ``none``     0 / 0               51               1.25 s
+#: ``high``     44 / 1 174          1 225            4.27 s
+#: ===========  ==================  ===============  ========
+#:
+#: The terms were the same either way. What differs is that at the global
+#: default one call in twelve spent 1 174 tokens — 57 % of this call site's
+#: ceiling — thinking about an eight-term keyword expansion, with a 26x spread
+#: across samples; the same variance measured 2 177 reasoning tokens at another
+#: level on a different prompt, which is more than the ceiling. A rewrite that
+#: overran would be discarded by B3 and ``search --nl`` would be off again, for
+#: the third time, over an allowance nobody chose.
+#:
+#: At ``none`` the twelve samples were byte-identical per question, which is
+#: worth something on its own: the same question searches the same way twice.
+REWRITE_THINKING = agent.THINKING_NONE
+
+#: The reasoning level the reachability probe runs at. Pinned to ``none`` for a
+#: blunter reason than the rewrite's: at any graded level the probe **returns an
+#: empty body**. Measured, ``"ping"`` at the shipped ceiling — every one of the
+#: output tokens went to reasoning and none to content, at ``none`` /``low`` /
+#: ``medium`` / ``high`` alike above ``none``; at a 512-token ceiling ``low``
+#: spent 506 thinking and produced the two characters ``**``.
+#:
+#: A reachability check has nothing to reason about. This is the one call site
+#: where thinking cannot help and can only turn a healthy server into a report
+#: about a truncated answer, so do not "fix" the inconsistency with the global
+#: default.
+PROBE_THINKING = agent.THINKING_NONE
+
+#: What the reachability probe asks for. A **bounded** request, which is what
+#: makes a small ceiling honest.
+#:
+#: ``"ping"`` was not bounded: this model answers it with a paragraph — in
+#: Chinese, measured — so the probe hit its own ceiling on every call, was
+#: rescued by the ``OutputTruncated`` handler below, and reported ``failed_calls:
+#: 1`` on a perfectly healthy install. The one command whose job is to say
+#: whether the install is well is the one command that must not manufacture a
+#: failure to say it with.
+PROBE_PROMPT = "Reply with exactly one word: pong"
+
+#: Output tokens the reachability probe asks for. Still sized to be cheap rather
+#: than useful — a live server hitting this ceiling answers the reachability
+#: question just as well as one that stops on its own, and the handler below
+#: still treats that as reachable for any model chattier than the measurement.
+#: But 8 was below what *any* answer costs here, so it guaranteed the truncated
+#: path. Measured at :data:`PROBE_THINKING`: the bounded prompt above answers in
+#: **2** output tokens with ``finish_reason: "stop"``, six times out of six.
+PROBE_OUTPUT_TOKENS = 32
 
 
 ASK_TEMPLATE = """You answer questions from a personal knowledge graph.
@@ -656,7 +710,31 @@ class ProviderStatus(BaseModel):
     budget_tokens: int
     budget_seconds: float
     max_output_tokens: int
+    #: What :attr:`max_output_tokens` is actually worth against *this* window.
+    #: The reservation is capped at a share of the window
+    #: (:data:`nodum.llm.OUTPUT_RESERVATION_FRACTION`), so an operator who set
+    #: 4 096 against a 4 096-token ollama window is really getting 2 048 — and
+    #: the difference between the number they typed and the number that binds is
+    #: exactly the kind of thing a status command exists to show.
+    effective_max_output_tokens: int
     call_timeout: float
+    #: Which ``response_format`` this install's provider uses.
+    #:
+    #: **The one place a human can see that a schema is no longer enforced.**
+    #: Under ``json_schema`` the server's constrained decoding makes a string the
+    #: schema forbids unrepresentable — which is what the citation ``pattern``
+    #: in this module rests on. Under ``json_object`` the schema is a sentence in
+    #: the prompt and every constraint inside it is advice. 5b-i already recorded
+    #: that *schema validity was never truth*; this is weaker still, and a
+    #: downgrade nobody can see is a downgrade the next reader will trust.
+    structured_output: str | None
+    #: The configured reasoning level, and whether it reaches the endpoint.
+    #: ``thinking_applied: false`` is a knob doing nothing — ollama refuses every
+    #: graded level, so one is withheld there and the model runs at its own
+    #: default. A setting a human can read back from their environment and
+    #: cannot see the effect of is worse than no setting.
+    thinking: str | None
+    thinking_applied: bool
     used: agent.LLMReport
 
 
@@ -1147,7 +1225,12 @@ def _fit_prompt(
     window = active.context_tokens
     if window is None:
         return [], None
-    ceiling = window - active.max_output_tokens
+    # The provider's reservation, never `window - max_output_tokens` computed
+    # here: a second copy of that rule disagreed with the provider's the moment
+    # the default ceiling was sized for a reasoning model, and every question
+    # was refused as "too long for the window" on a provider that would have
+    # answered it. See `agent.AgentRun.output_reservation`.
+    ceiling = window - active.output_reservation()
     items = list(offered)
     limit = MAX_CONTEXT_CHARS
     while items:
@@ -1748,6 +1831,7 @@ def _rewrite_terms(
             prompt_version=REWRITE_PROMPT_VERSION,
             schema=REWRITE_SCHEMA,
             max_output_tokens=_rewrite_ceiling(active),
+            thinking=REWRITE_THINKING,
         )
     except (agent.BudgetExhausted, agent.LLMError) as exc:
         return [], _refusal_for(exc), active.report()
@@ -1940,7 +2024,11 @@ def provider_status(*, principal: Principal, probe: bool = True) -> ProviderStat
         budget_tokens=active.budget.tokens,
         budget_seconds=active.budget.seconds,
         max_output_tokens=active.max_output_tokens,
+        effective_max_output_tokens=active.output_reservation(),
         call_timeout=active.call_timeout,
+        structured_output=active.structured_mode,
+        thinking=active.thinking,
+        thinking_applied=active.thinking_applied,
         used=active.report(),
     )
     if not status.configured or not probe:
@@ -1951,9 +2039,10 @@ def provider_status(*, principal: Principal, probe: bool = True) -> ProviderStat
     started = time.monotonic()
     try:
         active.chat(
-            [agent.Message(role="user", content="ping")],
+            [agent.Message(role="user", content=PROBE_PROMPT)],
             prompt_version=ASK_PROMPT_VERSION,
             max_output_tokens=PROBE_OUTPUT_TOKENS,
+            thinking=PROBE_THINKING,
         )
         status.reachable = True
         status.detail = None
@@ -1987,4 +2076,17 @@ def provider_status(*, principal: Principal, probe: bool = True) -> ProviderStat
         status.detail = _refusal_for(exc)
     status.probe_ms = int((time.monotonic() - started) * 1000)
     status.used = active.report()
+    # Re-read after the probe, because capability negotiation happens on a real
+    # call and this is one. **Only this field**, and the asymmetry is deliberate
+    # rather than an oversight: the probe sends no schema, so it can never
+    # provoke the `response_format` 400 that downgrades `structured_output` —
+    # a re-read of that would be a branch no build can reach, which is exactly
+    # what `STOP_SWITCH_PENDING` was deleted for. `structured_output` is already
+    # current as of construction anyway, since the provider object is cached
+    # process-wide and carries any downgrade an earlier call discovered.
+    #
+    # The reasoning level is different: the probe *does* send `reasoning_effort`
+    # (pinned to `none`), so a server that refuses the field outright is
+    # discovered here and nowhere else on a `llm status` run.
+    status.thinking_applied = active.thinking_applied
     return status

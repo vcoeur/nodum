@@ -648,7 +648,22 @@ degrades to BM25 + graph expansion. `NODUM_EMBED_MODEL` switches the model
   reply, a spent budget — comes back as an ordinary result saying it could not
   answer and why. Configure it with `NODUM_LLM_MODEL` (unset means off, which is
   the default); it speaks any OpenAI-compatible endpoint, `ollama` on localhost
-  included.
+  included. A **recognised** model name brings its endpoint's settings with it,
+  so a hosted provider is two lines and not four:
+
+  ```sh
+  export NODUM_LLM_MODEL=deepseek-v4-flash
+  export NODUM_LLM_API_KEY=sk-…
+  ```
+
+  That is a working install — the base URL, the context window and the
+  structured-output mode come from the model name, and the one you would most
+  easily get wrong (the window) is the one that silently truncates prompts when
+  it is wrong. Anything you set yourself always wins. `NODUM_LLM_THINKING`
+  (`none`, `low`, `medium`, `high`; default `high`) sets how much a reasoning
+  model may think — a value outside that set is refused with the list rather
+  than passed on, and `nodum llm status` shows whether your endpoint actually
+  accepts it, since `ollama` takes only `none`.
 
 See [docs/architecture.md](docs/architecture.md) for the module map and
 [AGENTS.md](AGENTS.md) for contributor/agent workflow rules.

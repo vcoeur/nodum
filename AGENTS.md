@@ -1058,7 +1058,116 @@ commands on a saved node for exactly this reason.
   and a second door would be a second place with its own accounting.
   Configuration is `NODUM_LLM_MODEL` (**unset means no provider** — there is no
   guessed default), `NODUM_LLM_BASE_URL`, `NODUM_LLM_API_KEY`,
-  `NODUM_LLM_CONTEXT_TOKENS` (4096 by default, the measured local window).
+  `NODUM_LLM_CONTEXT_TOKENS` (4096 by default, the measured local window), and
+  `NODUM_LLM_THINKING`.
+- **Two things about the "one wire" are not universal, and each was found by a
+  live 400 rather than by reading a spec.** `response_format:
+  {"type": "json_schema"}` — ollama honours it, `deepseek-v4-flash` answers
+  `HTTP 400 "This response_format type is unavailable now"` and takes
+  `{"type": "json_object"}`. And `reasoning_effort` — DeepSeek takes a graded
+  level, **ollama takes only `none`**: `low` is `HTTP 400 "llama3.2:1b" does not
+  support thinking` on a model without thinking and `HTTP 400 think value "low"
+  is not supported for this model` on `qwen3:8b`, which *does* think. A graded
+  level sent unconditionally is therefore a 400 on every ollama call, i.e. the
+  whole local half.
+  Both are handled by **capability negotiation, not retry**: the request carries
+  the strongest form the provider still believes in, a **400** whose body names
+  the field downgrades that belief *on the instance*, and the call is re-sent
+  once under the weaker form, inside the **same** per-call timeout. Bounded at
+  three downgrades; only a 400 counts (a 5xx or a timeout says nothing about
+  capabilities and would otherwise cripple a healthy provider permanently);
+  matching is on the server's sentence, which is brittle **one-sidedly** — a
+  false positive is a weaker request every endpoint accepts, named in `llm
+  status`, and a false negative is exactly today's `ProviderUnavailable`.
+  The reasoning field is a **three-rung ladder**, not a boolean: `graded` →
+  `off-only` → `absent`. The third rung is not decoration — a server that
+  rejects unknown fields refuses `reasoning_effort: "none"` too, and a two-state
+  version sent `none` unconditionally and left such a server permanently
+  unusable. That was found by making `llm status` drive a real 400, not by
+  reasoning about it. Rungs are dropped **one at a time**, because "a graded
+  level was refused" is not evidence that `none` was, and `none` is the
+  documented cure for `qwen3:8b` returning an empty body.
+- **`json_object` is a real reduction in what a caller may assume, so it is
+  never silent.** Under `json_schema` the server's constrained decoding makes a
+  string the schema forbids *unrepresentable* — which is what `nodum.answers`'
+  citation `pattern` rests on. Under `json_object` the schema is a **sentence in
+  the prompt** and every constraint inside it is advice. 5b-i already recorded
+  that *schema validity was never truth*; this is weaker still. So the mode is
+  on `Completion.structured_mode`, on `AgentRun.structured_mode`, in
+  `LLMReport`, and in `nodum llm status`'s `structured_output`.
+  The injected instruction's **word "json" is load-bearing**: the endpoint
+  refuses `json_object` outright with `HTTP 400 "Prompt must contain the word
+  'json' in some form"` unless the prompt says it. It is inserted **after the
+  caller's leading system messages** and the schema is rendered with sorted
+  keys, both for prefix caching (below). And `estimate_prompt_tokens` takes the
+  schema, because under the fallback the schema costs prompt tokens and an
+  estimate that excluded them would under-count — the one failure it may not
+  have.
+- **`NODUM_LLM_THINKING` is `none`/`low`/`medium`/`high`, default `high`, and a
+  value outside that set is refused** — no provider, with a reason naming the
+  set, exactly as an unparseable `NODUM_LLM_CONTEXT_TOKENS` already is. This
+  deliberately parts company with `nodum.agent`'s "an unparseable value falls
+  back" rule: that rule is right for a *number*, where the fallback is a smaller
+  ceiling and less work. A level is a **name**, and the live API validates the
+  enum strictly, so a value passed through either 400s the request or runs under
+  a setting nobody chose while the report names the one that was asked for.
+  **The level name does not predict what a call costs, and `high` is the
+  cheapest of the graded three.** Measured on two five-note synthesis fixtures,
+  two samples each: `low` spent 743/905 and 2 177/797 reasoning tokens where
+  `high` spent 349/101 and 60/110 — eight points, both fixtures, same direction —
+  and `high` was also the fastest (5.4 s against `low`'s 26.9 s). On a one-word
+  prompt, `low` 639 against `high` 47. So **nothing may size an output ceiling
+  from the configured level**, and only `none` is predictable (measured exactly
+  0, every time). The field is **always sent** where the endpoint takes one,
+  because unset is not neutral: it measured 1 492 reasoning tokens on a fixture
+  where `none` measured 0. The quality evidence for preferring a graded level is
+  **thin and recorded as thin** — of two hard fixtures only one discriminated.
+- **The reasoning level is per call site over a global default**, because the
+  call sites do not want the same thing. `/ask` and `/summarize` take the
+  human's level, since deciding whether the retrieved context answers the
+  question is where a confident wrong answer is the recorded danger. The
+  **query rewrite is pinned to `none`**: measured over twelve samples at the
+  default it spent 44–1 174 reasoning tokens — 57 % of its own ceiling, a 26x
+  spread — for terms that did not change, where `none` was byte-identical per
+  question and 3.4x faster. The **reachability probe is pinned to `none`** for a
+  blunter reason: at any graded level it returns an **empty body**, every output
+  token going to thinking. Do not "fix" either inconsistency.
+- **The output reservation is a share of the window, not a flat subtraction**
+  (`OUTPUT_RESERVATION_FRACTION`, 0.5 — the rule `answers._rewrite_ceiling`
+  already used). The window holds prompt *and* answer on a server that shares one
+  KV cache, so the reservation is load-bearing on ollama; it stopped being
+  expressible as an absolute once the ceiling was sized for a reasoning model,
+  because 4 096 out of a 4 096-token window leaves the prompt nothing and the
+  same 4 096 out of 1 000 000 is a rounding error. **The clamped number is also
+  what is sent as `max_tokens`** — reserving less than the server is told it may
+  generate is the overrun the reservation exists to stop. Consequence for the
+  local half: `/ask` on ollama now fits its prompt into 2 048 tokens rather than
+  3 584. There is exactly **one** place this arithmetic lives
+  (`AgentRun.output_reservation`); `answers._fit_prompt` calls it rather than
+  recomputing, because a second copy disagreed the moment the default rose and
+  refused every question as "too long for the window".
+- **Out of the box means a model name and a key.** `profile_for` matches a
+  **model-name prefix** (and a base-URL host) against a tiny table of endpoints
+  this ships knowing about, supplying the base URL, the served window, the
+  structured mode and whether graded thinking is accepted. `NODUM_LLM_MODEL=
+  deepseek-v4-flash` plus `NODUM_LLM_API_KEY` is therefore a working install:
+  `https://api.deepseek.com/v1`, a 1 000 000-token window, `json_object` with no
+  rejected round trip, graded thinking on. Matching on the model name and not
+  only the URL is what makes that possible — with nothing else set there *is* no
+  base URL to match. Every field is a **default**: an explicitly set variable
+  always wins, so a profile decides nothing an operator has decided. A profile
+  earns its place only by being an endpoint whose defaults are otherwise wrong,
+  it is an **optimisation and never a gate** (an unprofiled provider starts
+  optimistic and negotiates down), and the ollama default is handled by the base
+  URL rather than a row: the local endpoint starts out disbelieving graded
+  levels instead of paying a 400 to learn it.
+- **`prompt_truncated` weighs only the bytes really sent**
+  (`estimate_content_tokens`), not the ~52 tokens of chat-template overhead the
+  *refusal's* estimate adds. On a long prompt the difference is noise; on a
+  33-byte one the overhead is 60 % of the estimate, and the check fired on a
+  completion the server had read whole — measured, `llm status` reported
+  `failed_calls: 1` on a healthy install, which is the one command that must not
+  manufacture a failure. Found by driving the live probe, not by inspection.
   **An over-long prompt is refused before the call, and that is the whole
   point.** Measured: 16 000 characters report 2 932 prompt tokens while 64 000
   and 70 000 both report **4 096** — the window filled, the rest was dropped,
@@ -1146,7 +1255,23 @@ commands on a saved node for exactly this reason.
   `agent:builtin-gardener` (the gardener made the write, the model is *how* —
   `agent:llama3.2:1b` would be an actor with no account and nothing to revoke);
   cost goes on the **cycle report** under `report["llm"]`, because cost is a
-  property of the run. This is **not** `chunks.model_id`'s mechanism (A3):
+  property of the run.
+  **A reasoning model's thinking is metered beside the spend, never inside it.**
+  `usage.completion_tokens_details.reasoning_tokens` is a *share* of
+  `completion_tokens` — measured, `total_tokens` is `prompt + completion` on
+  every call and reasoning never exceeds completion — so adding it to the total
+  would report a night as costing up to twice the bill. Omitting it is the other
+  failure: a job that spent 1 420 of 1 520 output tokens thinking reads exactly
+  like one that wrote 1 520 tokens of proposal, and only the first is one sample
+  from a `length` finish, which here is *no result*. So `reasoning_tokens` is on
+  `Completion`, `Generation`, `JobCost` and `LLMReport`, beside
+  `cache_hit_tokens`/`cache_miss_tokens` — the prefix cache is priced ~50x below
+  a miss, so a token total is not a cost without them. **At `reasoning_effort:
+  "none"` the whole `completion_tokens_details` block is absent from `usage`**
+  rather than reporting zero, so those three counters are read leniently while
+  `prompt_tokens`/`completion_tokens` stay strict: the first three are
+  decompositions of numbers already read, and losing one loses detail rather
+  than money. This is **not** `chunks.model_id`'s mechanism (A3):
   embeddings are derived and a model change is `projector rebuild vec`, while
   generated text cannot be regenerated by replaying the log — so do not later
   "unify" them into a `model_id` column on `nodes`. `prompt_version` (A2) is a
@@ -1253,7 +1378,20 @@ commands on a saved node for exactly this reason.
   **A value out of range falls back too, and where the range starts is the
   difference between a decision and a misconfiguration**: 0 on a budget is *off*
   and is the shipped cycle default, while `NODUM_LLM_MAX_OUTPUT_TOKENS=0` is
-  nothing anybody chose — it reached the provider as `ValueError:
+  nothing anybody chose
+  — **and its default is now 4 096, sized for a reasoning model.** 512 was
+  measured *below the floor at which anything works*: a ceiling sweep on one
+  synthesis prompt against `deepseek-v4-flash` was perfectly bimodal — 300/400/500
+  gave `length` and an unparseable body every run, 650 and above parsed every run
+  — so the shipped default made every call on that provider a B3 failure. 4 096 is
+  not "650 plus margin": the floor is not the number that matters, because
+  thinking comes out of the same ceiling and **cannot be predicted from anything
+  configured** (worst cases measured: 2 177 reasoning tokens on a synthesis,
+  1 174 on a one-line query rewrite, 1 277 total output for the single word
+  "ping", a 26x spread on repeats). It costs nothing where it is large —
+  DeepSeek's own max output is 384 000 — and against ollama's shared 4 096-token
+  window the proportional reservation lands it at 2 048, the number this file
+  already records as the measured cure for `qwen3:8b` — it reached the provider as `ValueError:
   max_output_tokens must be at least 1`, which this stack renders as a **400**,
   the client-error voice, on every `POST /api/ask` for a request that was
   perfectly well formed. So the reader takes a `minimum=`, and the output
@@ -2548,6 +2686,26 @@ Phase-1 decision log.
   `llm status` the single place in this system where something is spent and the
   caller cannot see it. `--no-probe` reports the configuration, spends nothing,
   and says `calls: 0` to prove it.
+  **The probe asks a bounded question at `reasoning_effort: "none"`, and both
+  halves of that are measured.** `"ping"` was not bounded — this model answers it
+  with a paragraph, in Chinese — so the probe hit its own ceiling on every call
+  and reported `failed_calls: 1` on a healthy install; and at any graded level it
+  returns an **empty body**, every output token spent thinking. `"Reply with
+  exactly one word: pong"` at `none` costs **2** output tokens and stops on its
+  own, six times out of six. `PROBE_OUTPUT_TOKENS` is 32 rather than 8 for the
+  same reason: 8 was below what any answer costs here, so the truncated path was
+  guaranteed rather than exceptional. The `OutputTruncated → reachable: true`
+  handler stays as the backstop for a chattier model.
+  **`llm status` is also where a downgrade becomes visible**: it reports
+  `structured_output` (`json_schema` or `json_object`), `thinking` with
+  `thinking_applied` beside it (`false` is a knob doing nothing — the ollama
+  case), and `effective_max_output_tokens`, which is what the configured ceiling
+  is really worth once the window's share caps it. It re-reads
+  `thinking_applied` after the probe because the probe *sends*
+  `reasoning_effort` and is the one call that can discover a refusal;
+  it deliberately does **not** re-read `structured_output`, because the probe
+  sends no schema and that branch would be unreachable — the same reason
+  `STOP_SWITCH_PENDING` was deleted.
 - **A `--dry-run` here answers "what would happen", and each one is precise
   about what it costs.** `consolidate --dry-run` still writes its journal entry,
   flagged, because the journal has to say which it was — and emits **no** event,

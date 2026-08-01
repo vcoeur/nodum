@@ -504,17 +504,35 @@ def _answer(
     prompt_tokens: int = 10,
     completion_tokens: int = 5,
     finish_reason: str = "stop",
+    reasoning_tokens: int | None = None,
+    cache_hit: int | None = None,
+    cache_miss: int | None = None,
 ) -> dict[str, Any]:
-    """The OpenAI-compatible shape, exactly as the live server returns it."""
+    """The OpenAI-compatible shape, exactly as a live server returns it.
+
+    The three optional blocks are **omitted when not asked for**, which is the
+    ollama shape and also ``deepseek-v4-flash``'s own shape at
+    ``reasoning_effort: "none"`` — measured, the whole
+    ``completion_tokens_details`` key disappears rather than reporting zero. A
+    builder that always emitted them could not express the absence, and the
+    absence is the case a defensive read gets wrong.
+    """
+    usage: dict[str, Any] = {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+    }
+    if reasoning_tokens is not None:
+        usage["completion_tokens_details"] = {"reasoning_tokens": reasoning_tokens}
+    if cache_hit is not None:
+        usage["prompt_cache_hit_tokens"] = cache_hit
+    if cache_miss is not None:
+        usage["prompt_cache_miss_tokens"] = cache_miss
     return {
         "choices": [
             {"message": {"role": "assistant", "content": text}, "finish_reason": finish_reason}
         ],
-        "usage": {
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": prompt_tokens + completion_tokens,
-        },
+        "usage": usage,
     }
 
 
@@ -586,11 +604,50 @@ def test_the_output_reservation_comes_out_of_the_window(wire):
     assert len(recorder.requests) == 1
 
 
-def test_an_output_reservation_that_fills_the_window_is_a_value_error(wire):
-    wire()
-    provider = _provider(context_tokens=100)
-    with pytest.raises(ValueError, match="leaves no room"):
-        provider.chat([llm.Message(role="user", content="hi")], max_output_tokens=100, timeout=5.0)
+def test_an_output_ceiling_that_would_fill_the_window_is_capped_at_a_share_of_it(wire):
+    """Was a ``ValueError``; is now a cap, and the change is the point.
+
+    A flat ``window - max_output_tokens`` meant the *absolute* output ceiling
+    decided how much prompt fitted, so one number had to suit a 4 096-token
+    ollama window and a 1 000 000-token remote one at the same time. It cannot:
+    the ceiling that a reasoning model needs (measured worst case 1 520 output
+    tokens on a five-note synthesis, 1 277 on a one-word prompt) is the whole of
+    the small window, and the same number against the large one reserves 0.4 %
+    and guards nothing.
+
+    So the reservation is a share — at most :data:`llm.OUTPUT_RESERVATION_FRACTION`
+    of the window — and the clamped number is what is **sent**, which is what
+    keeps it safe: the server is never told it may generate into space the
+    prompt was allowed to occupy.
+    """
+    recorder = wire()
+    # 200, not 100: the estimate charges 54 tokens of fixed template and role
+    # overhead before any content, so a 100-token window has no room for a
+    # prompt whatever the reservation does, and the row would pass for the
+    # wrong reason.
+    provider = _provider(context_tokens=200)
+    completion = provider.chat(
+        [llm.Message(role="user", content="hi")], max_output_tokens=200, timeout=5.0
+    )
+    assert provider.output_reservation(200) == 100
+    assert recorder.payload["max_tokens"] == 100, (
+        "the clamped reservation must also be the ceiling the server is given, or the "
+        "server may generate past what was reserved"
+    )
+    assert completion.output_ceiling == 100, "the completion must report the ceiling that bit"
+
+
+def test_a_ceiling_below_the_share_is_sent_untouched(wire):
+    """The cap only ever lowers, and only when the ask exceeds the share.
+
+    Without this row the test above passes on an implementation that always
+    reserved half the window and ignored the caller entirely.
+    """
+    recorder = wire()
+    provider = _provider(context_tokens=4096)
+    provider.chat([llm.Message(role="user", content="hi")], max_output_tokens=512, timeout=5.0)
+    assert provider.output_reservation(512) == 512
+    assert recorder.payload["max_tokens"] == 512
 
 
 def test_a_zero_output_ceiling_is_a_value_error(wire):
@@ -958,7 +1015,13 @@ def test_a_completion_with_no_recorded_estimate_claims_no_truncation():
 @pytest.fixture(autouse=True)
 def _clean_resolution(monkeypatch):
     """Every test starts with an unresolved provider and a clean environment."""
-    for name in (llm.ENV_MODEL, llm.ENV_BASE_URL, llm.ENV_API_KEY, llm.ENV_CONTEXT_TOKENS):
+    for name in (
+        llm.ENV_MODEL,
+        llm.ENV_BASE_URL,
+        llm.ENV_API_KEY,
+        llm.ENV_CONTEXT_TOKENS,
+        llm.ENV_THINKING,
+    ):
         monkeypatch.delenv(name, raising=False)
     llm.reset_provider()
     yield
@@ -1156,3 +1219,657 @@ def test_the_live_model_still_truncates_silently_when_the_window_is_misconfigure
     honest = llm.OpenAICompatProvider(model=model, context_tokens=real_window)
     with pytest.raises(llm.PromptTooLong):
         honest.chat(prompt, max_output_tokens=8, timeout=1.0)
+
+
+# ── Reasoning models: what `usage` carries, and what it costs ─────────────────
+#
+# Measured against `deepseek-v4-flash` over the live API, not reasoned about.
+# Three facts shape everything below:
+#
+#   1. `usage.completion_tokens_details.reasoning_tokens` is a **subset** of
+#      `completion_tokens`, never an addition — `total_tokens` is
+#      `prompt + completion` on every call measured.
+#   2. At `reasoning_effort: "none"` the whole `completion_tokens_details` block
+#      is **absent from `usage`**, so a reader that indexes into it raises on the
+#      one setting whose cost is predictable.
+#   3. Prompt caching is reported as `prompt_cache_hit_tokens` /
+#      `prompt_cache_miss_tokens`, and the two sum to `prompt_tokens`.
+
+
+def test_reasoning_tokens_come_off_the_wire_and_are_a_share_of_the_output(wire):
+    """A reasoning model's thinking is billed inside ``completion_tokens``.
+
+    So this is *not* added to :attr:`Completion.total_tokens` — doing that would
+    double-charge the one number budgets are denominated in. It is carried
+    separately because a night that spent 90 % of its output allowance thinking
+    and 10 % writing is a different night from one that wrote the whole time,
+    and the report is the only place a human can tell them apart.
+    """
+    recorder = wire(_answer(prompt_tokens=100, completion_tokens=80, reasoning_tokens=60))
+    completion = _provider().chat(
+        [llm.Message(role="user", content="hi")], max_output_tokens=512, timeout=5.0
+    )
+    assert completion.reasoning_tokens == 60
+    assert completion.output_tokens == 80, "reasoning must not be added to the output count"
+    assert completion.total_tokens == 180, "reasoning must not be double-charged"
+    assert recorder.payload["max_tokens"] == 512
+
+
+def test_a_usage_block_with_no_details_reports_zero_reasoning_rather_than_raising(wire):
+    """``reasoning_effort: "none"`` drops ``completion_tokens_details`` entirely.
+
+    Measured on the live API across nine independent calls: at ``none`` the key
+    is not present at all — not present-and-zero. A reader that indexed into it
+    would turn the one predictable setting into a ``ProviderUnavailable``.
+    """
+    answer = _answer(prompt_tokens=10, completion_tokens=5)
+    assert "completion_tokens_details" not in answer["usage"], "fixture built wrong"
+    wire(answer)
+    completion = _provider().chat(
+        [llm.Message(role="user", content="hi")], max_output_tokens=64, timeout=5.0
+    )
+    assert completion.reasoning_tokens == 0
+
+
+def test_the_prompt_cache_counters_come_off_the_wire(wire):
+    """Prompt caching is priced 50x cheaper and matches on prefix, so a report
+    that cannot say how much of a prompt was cached cannot say what a night cost."""
+    wire(_answer(prompt_tokens=154, completion_tokens=25, cache_hit=128, cache_miss=26))
+    completion = _provider().chat(
+        [llm.Message(role="user", content="hi")], max_output_tokens=64, timeout=5.0
+    )
+    assert (completion.cache_hit_tokens, completion.cache_miss_tokens) == (128, 26)
+    assert completion.cache_hit_tokens + completion.cache_miss_tokens == completion.prompt_tokens
+
+
+def test_a_wire_with_no_cache_counters_reports_zero(wire):
+    """ollama returns neither counter; absence is 0 hits, not an unreadable shape."""
+    answer = _answer()
+    assert "prompt_cache_hit_tokens" not in answer["usage"], "fixture built wrong"
+    wire(answer)
+    completion = _provider().chat(
+        [llm.Message(role="user", content="hi")], max_output_tokens=64, timeout=5.0
+    )
+    assert (completion.cache_hit_tokens, completion.cache_miss_tokens) == (0, 0)
+
+
+# ── Capability negotiation: json_schema → json_object ─────────────────────────
+
+
+def _rejects_then(detail: str, answer: dict[str, Any] | None = None):
+    """A wire that answers HTTP 400 once with ``detail``, then succeeds.
+
+    Built as *two scripted responses* rather than by asking the implementation
+    what it would send, because a fixture assembled from the code's own
+    predicates would only prove the grammar equals itself. ``detail`` is the
+    server's real sentence, copied from a live 400.
+    """
+
+    class _Negotiating:
+        def __init__(self) -> None:
+            self.requests: list[urllib.request.Request] = []
+            self.timeouts: list[float] = []
+            self.rejected_once = False
+
+        def __call__(self, request, timeout=None):
+            self.requests.append(request)
+            self.timeouts.append(timeout)
+            if not self.rejected_once:
+                self.rejected_once = True
+                failure = urllib.error.HTTPError(
+                    url="http://x/v1/chat/completions",
+                    code=400,
+                    msg="Bad Request",
+                    hdrs=None,
+                    fp=None,
+                )
+                body = json.dumps({"error": {"message": detail}}).encode()
+                failure.read = lambda: body  # type: ignore[method-assign]
+                raise failure
+            return _FakeResponse(json.dumps(answer or _answer()).encode())
+
+        @property
+        def payloads(self) -> list[dict[str, Any]]:
+            return [json.loads(request.data) for request in self.requests]
+
+    return _Negotiating()
+
+
+SCHEMA = {
+    "type": "object",
+    "properties": {"answer": {"type": "string"}, "cited": {"type": "array"}},
+    "required": ["answer", "cited"],
+}
+
+
+def test_a_provider_that_refuses_json_schema_falls_back_to_json_object(monkeypatch):
+    """Measured: ``deepseek-v4-flash`` answers ``HTTP 400 {"error":{"message":
+    "This response_format type is unavailable now"}}`` to a ``json_schema``
+    request and accepts ``json_object``.
+
+    Without the fallback every structured call on that provider — which is every
+    call ``/ask`` and ``/summarize`` make — is a hard failure out of the box.
+    """
+    recorder = _rejects_then("This response_format type is unavailable now")
+    monkeypatch.setattr(urllib.request, "urlopen", recorder)
+    provider = _provider(structured_mode=llm.STRUCTURED_JSON_SCHEMA)
+    completion = provider.chat(
+        [llm.Message(role="user", content="hi")],
+        schema=SCHEMA,
+        max_output_tokens=512,
+        timeout=30.0,
+    )
+    assert len(recorder.requests) == 2, "the call was not re-sent under the weaker form"
+    assert recorder.payloads[0]["response_format"]["type"] == llm.STRUCTURED_JSON_SCHEMA
+    assert recorder.payloads[1]["response_format"] == {"type": llm.STRUCTURED_JSON_OBJECT}
+    assert completion.structured_mode == llm.STRUCTURED_JSON_OBJECT
+
+
+def test_the_fallback_is_detected_once_and_remembered(monkeypatch):
+    """A failed round trip per call would double the cost of every call.
+
+    So the belief is downgraded **on the instance**: the second call goes
+    straight out under ``json_object`` with no rejected attempt at all.
+    """
+    recorder = _rejects_then("This response_format type is unavailable now")
+    monkeypatch.setattr(urllib.request, "urlopen", recorder)
+    provider = _provider(structured_mode=llm.STRUCTURED_JSON_SCHEMA)
+    prompt = [llm.Message(role="user", content="hi")]
+    provider.chat(prompt, schema=SCHEMA, max_output_tokens=512, timeout=30.0)
+    assert len(recorder.requests) == 2
+
+    provider.chat(prompt, schema=SCHEMA, max_output_tokens=512, timeout=30.0)
+    assert len(recorder.requests) == 3, "the second call paid the rejected round trip again"
+    assert recorder.payloads[2]["response_format"] == {"type": llm.STRUCTURED_JSON_OBJECT}
+    assert provider.structured_mode == llm.STRUCTURED_JSON_OBJECT
+
+
+def test_the_fallback_states_the_schema_in_the_prompt_and_says_the_word_json(monkeypatch):
+    """Two things at once, and the second is not decoration.
+
+    ``json_object`` fixes only that the body *is* an object, so every constraint
+    inside the schema has to be stated in words or it is not stated at all. And
+    the endpoint refuses the request outright unless the prompt contains the
+    word "json" — measured, ``HTTP 400 "Prompt must contain the word 'json' in
+    some form to use 'response_format' of type 'json_object'."`` — so a
+    fallback that stated the schema without that word would trade one 400 for
+    another.
+    """
+    recorder = _rejects_then("This response_format type is unavailable now")
+    monkeypatch.setattr(urllib.request, "urlopen", recorder)
+    provider = _provider(structured_mode=llm.STRUCTURED_JSON_SCHEMA)
+    provider.chat(
+        [llm.Message(role="user", content="hi")],
+        schema=SCHEMA,
+        max_output_tokens=512,
+        timeout=30.0,
+    )
+    sent = " ".join(message["content"] for message in recorder.payloads[1]["messages"])
+    assert "json" in sent.casefold(), "the request will be a 400 without the word"
+    assert '"cited"' in sent, "the schema itself never reached the model"
+    assert '"required"' in sent
+
+
+def test_the_schema_statement_goes_ahead_of_the_variable_content(monkeypatch):
+    """Prompt caching matches on a **prefix** and is priced ~50x cheaper, so the
+    stable block belongs at the front.
+
+    The instruction is inserted after the caller's leading system messages,
+    keeping instructions contiguous ahead of whatever varies per call — a
+    schema appended last would put a stable block behind a variable one and
+    shorten every cacheable prefix to nothing.
+    """
+    recorder = _rejects_then("This response_format type is unavailable now")
+    monkeypatch.setattr(urllib.request, "urlopen", recorder)
+    provider = _provider(structured_mode=llm.STRUCTURED_JSON_SCHEMA)
+    provider.chat(
+        [
+            llm.Message(role="system", content="STABLE INSTRUCTIONS"),
+            llm.Message(role="user", content="VARIABLE QUESTION"),
+        ],
+        schema=SCHEMA,
+        max_output_tokens=512,
+        timeout=30.0,
+    )
+    roles = [message["role"] for message in recorder.payloads[1]["messages"]]
+    contents = [message["content"] for message in recorder.payloads[1]["messages"]]
+    assert roles == ["system", "system", "user"]
+    assert contents[0] == "STABLE INSTRUCTIONS"
+    assert contents[2] == "VARIABLE QUESTION"
+
+
+def test_the_schema_statement_is_byte_stable_across_equivalent_schemas(monkeypatch):
+    """A prefix cache matches bytes. Two dicts meaning the same schema must
+    render the same, or every call is a cache miss for a reason nobody can see."""
+    provider = _provider(structured_mode=llm.STRUCTURED_JSON_OBJECT)
+    first = provider._outgoing(
+        [llm.Message(role="user", content="q")], {"type": "object", "properties": {}}
+    )
+    second = provider._outgoing(
+        [llm.Message(role="user", content="q")], {"properties": {}, "type": "object"}
+    )
+    assert first[0].content == second[0].content
+
+
+def test_the_prompt_estimate_includes_the_schema_it_will_state(monkeypatch):
+    """The estimate must bound what is actually sent.
+
+    Under the fallback the schema costs prompt tokens, so a caller that fitted
+    its context to an estimate excluding them would be refused by the very
+    check it fitted against — or worse, sent and truncated.
+    """
+    provider = _provider(structured_mode=llm.STRUCTURED_JSON_OBJECT)
+    prompt = [llm.Message(role="user", content="hi")]
+    bare = provider.estimate_prompt_tokens(prompt)
+    with_schema = provider.estimate_prompt_tokens(prompt, schema=SCHEMA)
+    assert with_schema > bare
+    assert with_schema >= bare + len(json.dumps(SCHEMA, sort_keys=True, separators=(",", ":")))
+
+
+def test_a_non_capability_400_is_not_negotiated(monkeypatch):
+    """A 400 that says nothing about a field is a caller error, not a downgrade.
+
+    Reading every 400 as "drop a feature" would let one malformed request
+    permanently weaken a provider for the life of the process.
+    """
+    recorder = _rejects_then("your request had a malformed message array")
+    monkeypatch.setattr(urllib.request, "urlopen", recorder)
+    provider = _provider(structured_mode=llm.STRUCTURED_JSON_SCHEMA)
+    with pytest.raises(llm.ProviderUnavailable, match="400"):
+        provider.chat(
+            [llm.Message(role="user", content="hi")],
+            schema=SCHEMA,
+            max_output_tokens=512,
+            timeout=30.0,
+        )
+    assert len(recorder.requests) == 1, "a caller error must not be re-sent"
+    assert provider.structured_mode == llm.STRUCTURED_JSON_SCHEMA
+
+
+@pytest.mark.parametrize(
+    "status",
+    [500, 502, 503, 429],
+    ids=["server-error", "bad-gateway", "unavailable", "rate-limited"],
+)
+def test_only_a_400_is_read_as_a_capability_signal(wire, status: int):
+    """A 5xx or a 429 is a bad minute, not a missing feature. Treating one as a
+    capability signal would cripple a healthy provider permanently, and — since
+    the belief is never re-raised — for the life of the process."""
+    failure = urllib.error.HTTPError(
+        url="http://x/v1/chat/completions", code=status, msg="nope", hdrs=None, fp=None
+    )
+    failure.read = lambda: b'{"error":{"message":"response_format is unavailable"}}'  # type: ignore[method-assign]
+    wire(raises=failure)
+    provider = _provider(structured_mode=llm.STRUCTURED_JSON_SCHEMA)
+    with pytest.raises(llm.ProviderUnavailable):
+        provider.chat(
+            [llm.Message(role="user", content="hi")],
+            schema=SCHEMA,
+            max_output_tokens=512,
+            timeout=30.0,
+        )
+    assert provider.structured_mode == llm.STRUCTURED_JSON_SCHEMA
+
+
+def test_the_negotiation_does_not_buy_a_second_full_timeout(monkeypatch):
+    """One call is one ceiling. A re-send charged its own full timeout would let
+    a downgrade double the wall clock the run's budget thought it had bought."""
+    recorder = _rejects_then("This response_format type is unavailable now")
+    monkeypatch.setattr(urllib.request, "urlopen", recorder)
+    _provider(structured_mode=llm.STRUCTURED_JSON_SCHEMA).chat(
+        [llm.Message(role="user", content="hi")],
+        schema=SCHEMA,
+        max_output_tokens=512,
+        timeout=30.0,
+    )
+    assert recorder.timeouts[0] == 30.0
+    assert recorder.timeouts[1] < 30.0, "the re-send was given a fresh ceiling"
+
+
+# ── The reasoning knob ────────────────────────────────────────────────────────
+
+
+def test_the_accepted_reasoning_levels_are_exactly_four():
+    """The set nodum exposes, pinned so a widening is a deliberate edit."""
+    assert llm.THINKING_LEVELS == ("none", "low", "medium", "high")
+    assert llm.DEFAULT_THINKING in llm.THINKING_LEVELS
+
+
+@pytest.mark.parametrize("level", ["none", "low", "medium", "high"])
+def test_every_accepted_level_resolves(monkeypatch, level: str):
+    monkeypatch.setenv(llm.ENV_MODEL, "deepseek-v4-flash")
+    monkeypatch.setenv(llm.ENV_THINKING, level)
+    provider = llm.get_provider()
+    assert provider is not None
+    assert provider.thinking == level
+
+
+@pytest.mark.parametrize(
+    "level",
+    ["max", "xhigh", "minimal", "off", "true", "HIGHER", "1", ""],
+    ids=["max", "xhigh", "minimal", "off", "true", "higher", "one", "empty-after-strip"],
+)
+def test_a_level_outside_the_accepted_set_is_no_provider_with_a_reason(monkeypatch, level: str):
+    """Refused, never passed through — and this is where the module parts
+    company with ``nodum.agent``'s "an unparseable value falls back" rule.
+
+    That rule is right for a *number*: the fallback is a smaller ceiling and the
+    worst case is less work. A reasoning level is a **name**, and a name this
+    endpoint does not know is not a slower call. The live API validates the enum
+    strictly (``unknown variant`` on a bogus value), so a value nodum passed
+    through would either 400 the request or — for a level the API knows and
+    nodum does not want — quietly run under a setting nobody chose while the
+    report named the level that was asked for.
+
+    The empty case is the exception and is *not* a refusal: an unset variable
+    means "use the default", which is the same thing every other setting here
+    means by absence.
+    """
+    monkeypatch.setenv(llm.ENV_MODEL, "deepseek-v4-flash")
+    monkeypatch.setenv(llm.ENV_THINKING, level)
+    if not level.strip():
+        assert llm.get_provider() is not None, "an unset knob is the default, not a refusal"
+        return
+    assert llm.get_provider() is None
+    reason = llm.unavailable_reason() or ""
+    assert llm.ENV_THINKING in reason
+    for accepted in llm.THINKING_LEVELS:
+        assert accepted in reason, "the refusal must name the set the caller may choose from"
+
+
+def test_the_level_is_always_sent_when_the_endpoint_takes_one(wire):
+    """Leaving ``reasoning_effort`` off is not neutral: unset measured 1 492
+    reasoning tokens on a fixture where ``none`` measured 0. So the field is
+    stated rather than omitted."""
+    recorder = wire()
+    _provider(thinking="high", graded_thinking=True).chat(
+        [llm.Message(role="user", content="hi")], max_output_tokens=512, timeout=5.0
+    )
+    assert recorder.payload["reasoning_effort"] == "high"
+
+
+def test_a_per_call_level_overrides_the_configured_one(wire):
+    recorder = wire()
+    _provider(thinking="high", graded_thinking=True).chat(
+        [llm.Message(role="user", content="hi")],
+        max_output_tokens=512,
+        timeout=5.0,
+        thinking=llm.THINKING_NONE,
+    )
+    assert recorder.payload["reasoning_effort"] == "none"
+
+
+def test_an_endpoint_that_takes_no_graded_level_still_gets_none(wire):
+    """``none`` is the one level every endpoint measured accepts.
+
+    ollama answers 400 to ``low``/``medium``/``high`` — including on
+    ``qwen3:8b``, which really does think — and 200 to ``none``. Withholding
+    ``none`` along with the rest would give up the one setting that fixes the
+    documented ``qwen3:8b`` failure, where a ``<think>`` block eats the whole
+    output ceiling and the body comes back empty.
+    """
+    recorder = wire()
+    _provider(thinking=llm.THINKING_NONE, graded_thinking=False).chat(
+        [llm.Message(role="user", content="hi")], max_output_tokens=512, timeout=5.0
+    )
+    assert recorder.payload["reasoning_effort"] == "none"
+
+
+def test_a_graded_level_is_withheld_from_an_endpoint_that_refuses_them(wire):
+    """The regression this exists to stop: a graded level sent unconditionally
+    is HTTP 400 on **every** ollama call, which is the whole local half."""
+    recorder = wire()
+    provider = _provider(thinking="high", graded_thinking=False)
+    provider.chat([llm.Message(role="user", content="hi")], max_output_tokens=512, timeout=5.0)
+    assert "reasoning_effort" not in recorder.payload
+    assert provider.thinking == "high", "the configured level is still what was asked for"
+    assert provider.thinking_applied is False, "and the run must be able to see it did nothing"
+
+
+@pytest.mark.parametrize(
+    "detail",
+    [
+        '"llama3.2:1b" does not support thinking',
+        'think value "low" is not supported for this model',
+        "reasoning_effort: unknown variant",
+    ],
+    ids=["ollama-no-thinking-model", "ollama-thinking-model", "unknown-variant"],
+)
+def test_a_provider_that_refuses_a_graded_level_is_negotiated_down(monkeypatch, detail: str):
+    """Three different sentences from two servers, all meaning one thing.
+
+    The first two are measured verbatim from ollama — one server, two messages,
+    depending on whether the model has thinking at all — which is why the match
+    is a list rather than a string.
+    """
+    recorder = _rejects_then(detail)
+    monkeypatch.setattr(urllib.request, "urlopen", recorder)
+    provider = _provider(thinking="high", graded_thinking=True)
+    provider.chat([llm.Message(role="user", content="hi")], max_output_tokens=512, timeout=30.0)
+    assert len(recorder.requests) == 2
+    assert recorder.payloads[0]["reasoning_effort"] == "high"
+    assert "reasoning_effort" not in recorder.payloads[1]
+    assert provider.thinking_applied is False
+
+
+def test_a_bad_level_passed_per_call_is_a_value_error(wire):
+    wire()
+    with pytest.raises(ValueError, match="thinking must be one of"):
+        _provider().chat(
+            [llm.Message(role="user", content="hi")],
+            max_output_tokens=512,
+            timeout=5.0,
+            thinking="max",
+        )
+
+
+# ── Out of the box ────────────────────────────────────────────────────────────
+
+
+def test_a_deepseek_model_name_alone_configures_the_whole_endpoint(monkeypatch):
+    """ "Nothing to configure but the key", stated as a test.
+
+    The four things that would otherwise have to be set by hand are all
+    measured facts about the endpoint rather than preferences — and the one an
+    operator is most likely to get wrong (the window) is the one that silently
+    re-opens the truncation hole this module is mostly about.
+    """
+    monkeypatch.setenv(llm.ENV_MODEL, "deepseek-v4-flash")
+    monkeypatch.setenv(llm.ENV_API_KEY, "sk-test")
+    provider = llm.get_provider()
+    assert provider is not None
+    assert provider.provider_id == llm.DEEPSEEK_BASE_URL
+    assert provider.context_tokens == 1_000_000
+    assert provider.structured_mode == llm.STRUCTURED_JSON_OBJECT, (
+        "a known-json_object endpoint must not pay a rejected round trip to learn it"
+    )
+    assert provider.thinking_applied is True
+    assert llm.unavailable_reason() is None
+
+
+def test_an_explicit_setting_always_beats_the_profile(monkeypatch):
+    """A profile supplies defaults and decides nothing an operator has decided."""
+    monkeypatch.setenv(llm.ENV_MODEL, "deepseek-v4-flash")
+    monkeypatch.setenv(llm.ENV_BASE_URL, "http://proxy.internal/v1")
+    monkeypatch.setenv(llm.ENV_CONTEXT_TOKENS, "8192")
+    provider = llm.get_provider()
+    assert provider is not None
+    assert provider.provider_id == "http://proxy.internal/v1"
+    assert provider.context_tokens == 8192
+
+
+def test_the_local_default_still_resolves_to_ollama_and_withholds_graded_levels(monkeypatch):
+    """The half that already worked must not regress.
+
+    ``llama3.2:1b`` with nothing else set is 5b-i's verified configuration. A
+    graded ``reasoning_effort`` sent there is HTTP 400 on every call, so the
+    default endpoint starts out disbelieving them rather than paying a 400 to
+    find out.
+    """
+    monkeypatch.setenv(llm.ENV_MODEL, "llama3.2:1b")
+    provider = llm.get_provider()
+    assert provider is not None
+    assert provider.provider_id == llm.DEFAULT_BASE_URL
+    assert provider.context_tokens == llm.DEFAULT_CONTEXT_TOKENS
+    assert provider.structured_mode == llm.STRUCTURED_JSON_SCHEMA
+    assert provider.thinking_applied is False
+
+
+def test_an_unknown_remote_provider_starts_optimistic(monkeypatch):
+    """A profile is an optimisation, never a gate: an endpoint nobody has
+    profiled gets the strongest form and negotiates down on the first 400."""
+    monkeypatch.setenv(llm.ENV_MODEL, "some-new-model")
+    monkeypatch.setenv(llm.ENV_BASE_URL, "https://api.example.com/v1")
+    provider = llm.get_provider()
+    assert provider is not None
+    assert provider.structured_mode == llm.STRUCTURED_JSON_SCHEMA
+    assert provider.thinking_applied is True
+
+
+def test_the_thinking_ladder_is_walked_one_rung_at_a_time(monkeypatch):
+    """``graded`` → ``off-only`` → ``absent``, and never two rungs at once.
+
+    An endpoint that refuses ``low`` may still take ``none`` — ollama does,
+    measured, and there ``none`` is the documented cure for ``qwen3:8b``
+    answering with an empty body. So the evidence "a graded level was refused"
+    may not be read as "the field is not understood": collapsing the ladder
+    would give up a working setting on the strength of a different refusal.
+    """
+    seen: list[Any] = []
+
+    class _AlwaysRefusesThinking:
+        def __init__(self) -> None:
+            self.requests: list[urllib.request.Request] = []
+
+        def __call__(self, request, timeout=None):
+            payload = json.loads(request.data)
+            self.requests.append(request)
+            seen.append(payload.get("reasoning_effort", "<absent>"))
+            if "reasoning_effort" in payload:
+                failure = urllib.error.HTTPError(
+                    url="http://x", code=400, msg="Bad", hdrs=None, fp=None
+                )
+                failure.read = lambda: b'{"error":{"message":"does not support thinking"}}'
+                raise failure
+            return _FakeResponse(json.dumps(_answer()).encode())
+
+    recorder = _AlwaysRefusesThinking()
+    monkeypatch.setattr(urllib.request, "urlopen", recorder)
+    provider = _provider(thinking="high", graded_thinking=True)
+    prompt = [llm.Message(role="user", content="hi")]
+    provider.chat(prompt, max_output_tokens=512, timeout=30.0)
+    # `high` is refused, so the graded level is withheld and this call — which
+    # asked for `high` — sends nothing.
+    assert seen == ["high", "<absent>"]
+    assert provider.thinking_applied is False
+
+    # **The rung that a collapsed ladder loses.** This is the ollama shape
+    # exactly: a global `high` that never lands, and a call site that pins
+    # `none`. `none` is still believed in, so it is still sent — and it is the
+    # one setting that fixes `qwen3:8b` returning an empty body. A downgrade
+    # straight to "the field is not understood" would have thrown it away on the
+    # evidence of a refusal that was only ever about a *graded* level.
+    seen.clear()
+    provider.chat(prompt, max_output_tokens=512, timeout=30.0, thinking=llm.THINKING_NONE)
+    assert seen[0] == "none", "the ladder dropped two rungs and lost a working setting"
+
+
+def test_an_endpoint_that_refuses_none_itself_stops_sending_the_field(monkeypatch):
+    """The rung a two-state boolean could not express.
+
+    A server that rejects unknown fields refuses ``reasoning_effort: "none"``
+    along with everything else. With only "graded or not", ``none`` was sent
+    unconditionally and such a server was permanently unusable — every call a
+    400, with the downgrade already spent. Found by driving the status probe,
+    which is the one call site that pins ``none``.
+    """
+    seen: list[Any] = []
+
+    class _RefusesTheFieldEntirely:
+        def __call__(self, request, timeout=None):
+            payload = json.loads(request.data)
+            seen.append(payload.get("reasoning_effort", "<absent>"))
+            if "reasoning_effort" in payload:
+                failure = urllib.error.HTTPError(
+                    url="http://x", code=400, msg="Bad", hdrs=None, fp=None
+                )
+                failure.read = lambda: b'{"error":{"message":"unknown field reasoning_effort"}}'
+                raise failure
+            return _FakeResponse(json.dumps(_answer()).encode())
+
+    monkeypatch.setattr(urllib.request, "urlopen", _RefusesTheFieldEntirely())
+    provider = _provider(thinking=llm.THINKING_NONE, graded_thinking=False)
+    completion = provider.chat(
+        [llm.Message(role="user", content="hi")], max_output_tokens=512, timeout=30.0
+    )
+    assert seen == ["none", "<absent>"], "the field was never withdrawn"
+    assert completion.text == "ok"
+    assert provider.thinking_applied is False
+
+
+def test_a_short_prompt_is_not_reported_truncated_by_its_own_overheads():
+    """A live false positive, found by driving ``nodum llm status``.
+
+    :func:`estimate_prompt_tokens` adds :data:`TEMPLATE_OVERHEAD_TOKENS` (32)
+    plus :data:`MESSAGE_OVERHEAD_TOKENS` (16) plus the role — about 52 tokens
+    that are *nodum's guess at a chat template*, not bytes anybody sent. On a
+    long prompt they vanish into the content. On a 33-byte prompt they are 60 %
+    of the estimate, so ``prompt_tokens * 6 < estimate`` fires on a completion
+    the server read in full: measured, the reachability probe came back with
+    ``prompt_tokens: 12`` against an 85-token estimate, was raised as
+    ``ContextOverflow``, and ``llm status`` reported ``failed_calls: 1`` on a
+    perfectly healthy install — the one command whose job is to say whether the
+    install is well.
+
+    The truncation check must therefore weigh only what was really sent. That
+    keeps the defence exactly as strong where it matters, because a truncation
+    worth catching is one that lost a *quarter of a long prompt*, and the
+    overheads are noise at that size.
+    """
+    prompt = [llm.Message(role="user", content="Reply with exactly one word: pong")]
+    estimate = llm.estimate_prompt_tokens(prompt)
+    content_only = llm.estimate_content_tokens(prompt)
+    # Non-vacuity: the overheads really do dominate at this size, so the row is
+    # about them and not about two numbers that happen to agree.
+    assert estimate > 2 * content_only, "fixture is not in the regime this test is about"
+
+    completion = llm.Completion(
+        text="pong",
+        prompt_tokens=12,
+        output_tokens=2,
+        finish_reason="stop",
+        model_id="m",
+        provider_id="p",
+        context_tokens=1_000_000,
+        latency_ms=1,
+        prompt_estimate=estimate,
+        prompt_content_estimate=content_only,
+    )
+    assert completion.prompt_truncated is False, (
+        "a short prompt was called truncated because of overheads nobody sent"
+    )
+
+
+def test_a_real_truncation_is_still_caught_after_the_overheads_are_excluded():
+    """The other side of the same change: the defence must not have been widened
+    into uselessness.
+
+    A 70 000-byte prompt reported back as 4 096 tokens is the measured silent
+    truncation this check exists for, and excluding ~52 tokens of overhead from a
+    70 000-token estimate cannot rescue it.
+    """
+    prompt = [llm.Message(role="user", content="x" * 70_000)]
+    completion = llm.Completion(
+        text="an answer from a prefix",
+        prompt_tokens=4096,
+        output_tokens=9,
+        finish_reason="stop",
+        model_id="m",
+        provider_id="p",
+        context_tokens=32768,
+        latency_ms=1,
+        prompt_estimate=llm.estimate_prompt_tokens(prompt),
+        prompt_content_estimate=llm.estimate_content_tokens(prompt),
+    )
+    assert completion.context_filled is False, "the configured-window check is blind here"
+    assert completion.prompt_truncated is True
