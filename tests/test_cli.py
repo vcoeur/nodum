@@ -1931,6 +1931,15 @@ NOT_COMMANDS = frozenset(
         "content-disposition",  # an HTTP response header
         "cross-space",  # prose
         "deepseek-v4-flash",  # a model name (NODUM_LLM_MODEL), not a verb
+        # ollama library model ids, named in the docs because they are the
+        # evidence for why `profile_for` matches an exact hosted id: each one
+        # shares the `deepseek-` prefix with a hosted API and is served locally.
+        "deepseek-coder",
+        "deepseek-coder-v2",
+        "deepseek-llm",
+        "deepseek-r1",
+        "deepseek-v2",
+        "deepseek-v3",
         "faster-whisper",  # the audio extra's package
         "no-store",  # a Cache-Control directive
         "off-only",  # a rung of the reasoning-capability ladder in `nodum.llm`

@@ -19,6 +19,7 @@ import ast
 import http.client
 import json
 import os
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -1296,26 +1297,39 @@ def test_a_wire_with_no_cache_counters_reports_zero(wire):
 # ── Capability negotiation: json_schema → json_object ─────────────────────────
 
 
-def _rejects_then(detail: str, answer: dict[str, Any] | None = None):
+def _rejects_then(
+    detail: str, answer: dict[str, Any] | None = None, *, first_attempt_seconds: float = 0.0
+):
     """A wire that answers HTTP 400 once with ``detail``, then succeeds.
 
     Built as *two scripted responses* rather than by asking the implementation
     what it would send, because a fixture assembled from the code's own
     predicates would only prove the grammar equals itself. ``detail`` is the
     server's real sentence, copied from a live 400.
+
+    ``first_attempt_seconds`` makes the refused attempt take real wall clock.
+    Without it every attempt returns in microseconds, and "the re-send is
+    charged what the first attempt spent" cannot be told apart from "the re-send
+    is charged an arbitrary shave off the ceiling" — the timeouts differ in the
+    fifth decimal either way. ``started_at`` records when each attempt was
+    handed to the transport, which is what turns the two into different numbers.
     """
 
     class _Negotiating:
         def __init__(self) -> None:
             self.requests: list[urllib.request.Request] = []
             self.timeouts: list[float] = []
+            self.started_at: list[float] = []
             self.rejected_once = False
 
         def __call__(self, request, timeout=None):
             self.requests.append(request)
             self.timeouts.append(timeout)
+            self.started_at.append(time.monotonic())
             if not self.rejected_once:
                 self.rejected_once = True
+                if first_attempt_seconds:
+                    time.sleep(first_attempt_seconds)
                 failure = urllib.error.HTTPError(
                     url="http://x/v1/chat/completions",
                     code=400,
@@ -1512,18 +1526,75 @@ def test_only_a_400_is_read_as_a_capability_signal(wire, status: int):
 
 
 def test_the_negotiation_does_not_buy_a_second_full_timeout(monkeypatch):
-    """One call is one ceiling. A re-send charged its own full timeout would let
-    a downgrade double the wall clock the run's budget thought it had bought."""
-    recorder = _rejects_then("This response_format type is unavailable now")
+    """One call is one ceiling — measured as **wall clock**, not as a smaller number.
+
+    The whole call must still finish inside the deadline the caller's ``timeout``
+    established, so what binds the re-send is *what is left of that deadline*,
+    not "something under 30". The distinction is the entire content of the
+    property: ``remaining = timeout - 0.001`` also produces a second timeout
+    under 30 and is exactly the bug — a downgrade arriving 29 seconds in would
+    then buy 29.999 more, doubling the wall clock the run's budget priced.
+
+    So the refused attempt is made to burn real time, and the assertion is that
+    the re-send's ceiling expires no later than the original deadline. That is
+    unsatisfiable for any rule that does not read the clock.
+    """
+    burned = 0.25
+    ceiling = 30.0
+    recorder = _rejects_then(
+        "This response_format type is unavailable now", first_attempt_seconds=burned
+    )
     monkeypatch.setattr(urllib.request, "urlopen", recorder)
     _provider(structured_mode=llm.STRUCTURED_JSON_SCHEMA).chat(
         [llm.Message(role="user", content="hi")],
         schema=SCHEMA,
         max_output_tokens=512,
-        timeout=30.0,
+        timeout=ceiling,
     )
-    assert recorder.timeouts[0] == 30.0
-    assert recorder.timeouts[1] < 30.0, "the re-send was given a fresh ceiling"
+    assert len(recorder.timeouts) == 2, "non-vacuity: there really was a re-send"
+    assert recorder.timeouts[0] == ceiling, "the first attempt gets the ceiling exactly"
+    # The whole call, worst case: the re-send's ceiling must expire no later
+    # than the deadline the first attempt's ceiling established. `slack` covers
+    # only the microseconds of payload arithmetic between `time.monotonic()` and
+    # the socket — three orders of magnitude below what `burned` moves, so it
+    # cannot hide the failure this is looking for.
+    slack = 0.05
+    deadline = recorder.started_at[0] + ceiling
+    assert recorder.started_at[1] + recorder.timeouts[1] <= deadline + slack, (
+        "the re-send may run past the one deadline the caller bought"
+    )
+    # The same property with no tolerance at all, since `burned` is known: the
+    # re-send is charged what the first attempt really spent, which a fixed
+    # shave off the ceiling cannot reproduce.
+    assert recorder.timeouts[1] <= ceiling - burned
+
+
+def test_a_negotiation_with_the_ceiling_already_spent_still_gets_a_positive_timeout(monkeypatch):
+    """The floor exists so ``urlopen`` is never handed 0, and 0 is not benign.
+
+    Measured against a live local server: ``timeout=0`` raises
+    ``URLError(BlockingIOError(115, 'Operation now in progress'))`` in under
+    10 ms — the socket goes non-blocking and the connect returns
+    ``EINPROGRESS`` — while the same POST at ``0.001`` raises
+    ``TimeoutError('timed out')``. It is ``timeout=None`` that blocks forever.
+    So 0 does not hang; it lies: ``_post`` reads a non-``TimeoutError``
+    ``URLError`` as :class:`ProviderUnavailable` "is not reachable", and a
+    downgrade that ran out of clock would report a healthy server as down
+    instead of naming the ceiling that bit.
+    """
+    recorder = _rejects_then(
+        "This response_format type is unavailable now", first_attempt_seconds=0.2
+    )
+    monkeypatch.setattr(urllib.request, "urlopen", recorder)
+    _provider(structured_mode=llm.STRUCTURED_JSON_SCHEMA).chat(
+        [llm.Message(role="user", content="hi")],
+        schema=SCHEMA,
+        max_output_tokens=512,
+        timeout=0.05,
+    )
+    # Non-vacuity: the deadline really had passed before the re-send.
+    assert recorder.started_at[1] - recorder.started_at[0] > 0.05
+    assert recorder.timeouts[1] == llm._MIN_TIMEOUT > 0
 
 
 # ── The reasoning knob ────────────────────────────────────────────────────────
@@ -1666,15 +1737,20 @@ def test_a_bad_level_passed_per_call_is_a_value_error(wire):
 # ── Out of the box ────────────────────────────────────────────────────────────
 
 
-def test_a_deepseek_model_name_alone_configures_the_whole_endpoint(monkeypatch):
+@pytest.mark.parametrize("model", ["deepseek-v4-flash", "deepseek-v4-pro"])
+def test_a_deepseek_model_name_alone_configures_the_whole_endpoint(monkeypatch, model: str):
     """ "Nothing to configure but the key", stated as a test.
 
     The four things that would otherwise have to be set by hand are all
     measured facts about the endpoint rather than preferences — and the one an
     operator is most likely to get wrong (the window) is the one that silently
     re-opens the truncation hole this module is mostly about.
+
+    Both ids are exercised because both are what ``GET
+    https://api.deepseek.com/models`` really lists, and the match is on that
+    list rather than on a name shape.
     """
-    monkeypatch.setenv(llm.ENV_MODEL, "deepseek-v4-flash")
+    monkeypatch.setenv(llm.ENV_MODEL, model)
     monkeypatch.setenv(llm.ENV_API_KEY, "sk-test")
     provider = llm.get_provider()
     assert provider is not None
@@ -1688,14 +1764,147 @@ def test_a_deepseek_model_name_alone_configures_the_whole_endpoint(monkeypatch):
 
 
 def test_an_explicit_setting_always_beats_the_profile(monkeypatch):
-    """A profile supplies defaults and decides nothing an operator has decided."""
+    """A profile supplies defaults and decides nothing an operator has decided.
+
+    Spelled at the profile's *own* host, so the profile really is in force and
+    the assertion is about an override rather than about an absence.
+    """
     monkeypatch.setenv(llm.ENV_MODEL, "deepseek-v4-flash")
-    monkeypatch.setenv(llm.ENV_BASE_URL, "http://proxy.internal/v1")
+    monkeypatch.setenv(llm.ENV_BASE_URL, "https://api.deepseek.com/v1")
     monkeypatch.setenv(llm.ENV_CONTEXT_TOKENS, "8192")
     provider = llm.get_provider()
     assert provider is not None
-    assert provider.provider_id == "http://proxy.internal/v1"
+    assert provider.provider_id == llm.DEEPSEEK_BASE_URL
     assert provider.context_tokens == 8192
+    # Non-vacuity: the profile matched, so 8192 displaced a real 1 000 000.
+    matched = llm.profile_for(model="deepseek-v4-flash", base_url="https://api.deepseek.com/v1")
+    assert matched is not None
+    assert matched.context_tokens == 1_000_000
+
+
+# ── A model name may not move a call to another company's server ──────────────
+#
+# `deepseek-` is a *prefix an ollama library model shares with a hosted API*,
+# which is the whole hazard: matching on it took a local install's prompts to
+# `https://api.deepseek.com/v1`.
+
+
+#: ollama library model ids that a `deepseek-` prefix match captured. Every one
+#: of these is pulled and served locally, with no key and no vendor account.
+LOCALLY_SERVED_DEEPSEEK_NAMES = (
+    "deepseek-r1:8b",
+    "deepseek-r1",
+    "deepseek-coder:6.7b",
+    "deepseek-coder-v2",
+    "deepseek-llm",
+    "deepseek-v2",
+    "deepseek-v3",
+    "deepseek-v3.1",
+)
+
+
+@pytest.mark.parametrize("model", LOCALLY_SERVED_DEEPSEEK_NAMES)
+def test_a_locally_served_model_name_never_selects_a_remote_endpoint(monkeypatch, model: str):
+    """The blocker: "run this locally" must not mean "POST it to a vendor".
+
+    Every name here is an **ollama library model**. Under the old prefix match,
+    ``NODUM_LLM_MODEL=deepseek-r1:8b`` with nothing else set resolved to
+    ``https://api.deepseek.com/v1`` — so an install whose only statement about
+    where to run was "the default endpoint" sent private graph text off the
+    machine whenever ``NODUM_LLM_API_KEY`` happened to be set (the README tells
+    operators to set one), and 401'd against a host nobody had configured when
+    it was not. The same configuration on the previous release ran against
+    local ollama.
+
+    A guessed *hosted* model id is not a symmetric mistake to a guessed local
+    one: the local guess costs a 404 the operator reads, and this one costs
+    egress they never see.
+    """
+    monkeypatch.setenv(llm.ENV_MODEL, model)
+    monkeypatch.setenv(llm.ENV_API_KEY, "sk-test")
+    provider = llm.get_provider()
+    assert provider is not None
+    assert provider.provider_id == llm.DEFAULT_BASE_URL
+    assert provider.context_tokens == llm.DEFAULT_CONTEXT_TOKENS
+    assert llm.profile_for(model=model, base_url=None) is None
+
+
+def test_an_explicit_local_endpoint_keeps_its_own_window(monkeypatch):
+    """A profile may not impose a window on a server the operator named.
+
+    The URL half of this already worked — an explicit :data:`ENV_BASE_URL` wins
+    — and that made the hole harder to see, not smaller: ``context_tokens``
+    still came from the profile, so a **1 000 000-token** belief was carried
+    against a server serving 4 096. The refusal is computed against that belief,
+    so nothing would have been refused, and the silent truncation this module is
+    mostly about was reopened by the very table written to close it.
+    """
+    monkeypatch.setenv(llm.ENV_MODEL, "deepseek-v4-flash")
+    monkeypatch.setenv(llm.ENV_BASE_URL, llm.DEFAULT_BASE_URL)
+    provider = llm.get_provider()
+    assert provider is not None
+    assert provider.provider_id == llm.DEFAULT_BASE_URL
+    assert provider.context_tokens == llm.DEFAULT_CONTEXT_TOKENS
+    # And the rest of the profile goes with it: this is ollama, which answers
+    # 400 to every graded level.
+    assert provider.thinking_applied is False
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "https://deepseek-gw.lan/v1",
+        "http://deepseek.internal:8080/v1",
+        "https://api.deepseek.com.evil.example/v1",
+    ],
+    ids=["prefixed-proxy", "internal-host", "suffixed-lookalike"],
+)
+def test_a_host_that_merely_contains_the_vendor_name_is_not_the_vendor(monkeypatch, base_url: str):
+    """Host matching is a parsed hostname, never a substring of a URL.
+
+    ``key in host`` handed the whole hosted profile — its window, its structured
+    mode, its graded thinking — to any endpoint whose URL happened to contain
+    the string, including a lookalike domain somebody else owns.
+    """
+    assert llm.profile_for(model="some-model", base_url=base_url) is None
+    monkeypatch.setenv(llm.ENV_MODEL, "some-model")
+    monkeypatch.setenv(llm.ENV_BASE_URL, base_url)
+    provider = llm.get_provider()
+    assert provider is not None
+    assert provider.context_tokens == llm.DEFAULT_CONTEXT_TOKENS
+
+
+def test_a_base_url_that_does_not_parse_is_a_stranger_and_not_a_traceback(monkeypatch):
+    """Reading a hostname is new work at resolution time, and it may not raise.
+
+    The substring match it replaced could not fail on a malformed URL;
+    ``urlsplit`` can — measured, ``ValueError("Invalid IPv6 URL")`` on
+    ``http://[bad/v1``. A typo in :data:`ENV_BASE_URL` must still resolve to a
+    provider that then fails against the endpoint the operator actually typed,
+    not to a traceback out of ``get_provider`` before anything is attempted.
+    """
+    assert llm.profile_for(model="deepseek-v4-flash", base_url="http://[bad/v1") is None
+    monkeypatch.setenv(llm.ENV_MODEL, "deepseek-v4-flash")
+    monkeypatch.setenv(llm.ENV_BASE_URL, "http://[bad/v1")
+    provider = llm.get_provider()
+    assert provider is not None
+    assert provider.provider_id == "http://[bad/v1"
+
+
+def test_the_profiled_host_is_matched_however_the_url_is_spelled(monkeypatch):
+    """The other side of the same rule: the endpoint really is the endpoint.
+
+    A hostname comparison must not be so strict that it misses the port-free,
+    scheme-free and path-varying spellings of the one URL it exists to know.
+    """
+    for spelling in (
+        "https://api.deepseek.com/v1",
+        "https://api.deepseek.com",
+        "https://API.DeepSeek.com/beta",
+        "https://api.deepseek.com:443/v1",
+        "api.deepseek.com/v1",
+    ):
+        assert llm.profile_for(model="anything-at-all", base_url=spelling) is not None, spelling
 
 
 def test_the_local_default_still_resolves_to_ollama_and_withholds_graded_levels(monkeypatch):

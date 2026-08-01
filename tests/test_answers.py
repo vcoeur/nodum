@@ -2439,8 +2439,7 @@ def test_a_probe_that_discovers_a_refused_reasoning_field_says_so(monkeypatch, g
 
     The probe sends ``reasoning_effort`` (pinned to ``none``), so a server that
     refuses the field at all is found here — and ``llm status`` is the command
-    an operator runs to find out. ``structured_output`` deliberately has no such
-    re-read: the probe sends no schema, so that branch would be unreachable.
+    an operator runs to find out.
     """
     sent: list[dict] = []
 
@@ -2502,3 +2501,82 @@ def test_a_probe_that_discovers_a_refused_reasoning_field_says_so(monkeypatch, g
     assert [("reasoning_effort" in payload) for payload in sent] == [True, True, False]
     assert status.thinking == "high", "the configured level is still what was asked for"
     assert status.thinking_applied is False, "and status must say it never arrived"
+
+
+def test_a_probe_that_downgrades_the_structured_mode_says_so(monkeypatch, graph):
+    """The probe *can* demote ``structured_output``, so the field is re-read.
+
+    Three places used to assert this branch was unreachable, on the argument
+    that the probe sends no schema and therefore cannot provoke the
+    ``response_format`` 400. The argument is about the **request**;
+    ``OpenAICompatProvider._negotiate`` decides on the **response**, and never
+    asks whether a schema was sent — any 400 whose body names ``response_format``
+    downgrades the belief. A gateway that answers that to a schema-less request
+    is all it takes, and the demotion then lasts the life of the process,
+    because the provider object is cached.
+
+    What that produced: one ``nodum llm status`` payload reporting
+    ``structured_output: "json_schema"`` directly above a ``used.structured_mode``
+    of ``"json_object"`` — the same payload disagreeing with itself — and every
+    later ``/ask`` in that ``nodum serve`` running under the weaker envelope
+    while the operator had just been shown the stronger one. Under
+    ``json_object`` the schema is a sentence in the prompt and its ``pattern``
+    stops being enforced by constrained decoding, so this is a real reduction
+    and not a label.
+    """
+    sent: list[dict] = []
+
+    def urlopen(request, timeout=None):
+        payload = json.loads(request.data)
+        sent.append(payload)
+        if len(sent) == 1:
+            failure = urllib.error.HTTPError(
+                url="http://x/v1/chat/completions", code=400, msg="Bad", hdrs=None, fp=None
+            )
+            failure.read = lambda: (
+                b'{"error":{"message":"response_format is not supported by this gateway"}}'
+            )
+            raise failure
+
+        class _Response:
+            status = 200
+
+            def read(self):
+                return json.dumps(
+                    {
+                        "choices": [
+                            {
+                                "message": {"role": "assistant", "content": "pong"},
+                                "finish_reason": "stop",
+                            }
+                        ],
+                        "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7},
+                    }
+                ).encode()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return None
+
+        return _Response()
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    llm.set_provider(
+        llm.OpenAICompatProvider(
+            model="some-model",
+            base_url="https://api.example.com/v1",
+            structured_mode=llm.STRUCTURED_JSON_SCHEMA,
+        )
+    )
+    status = answers.provider_status(principal=owner())
+    assert status.reachable is True, "the negotiated re-send answered"
+    # Non-vacuity, twice over: the probe really carried no `response_format`,
+    # and the downgrade really happened on the provider.
+    assert all("response_format" not in payload for payload in sent)
+    assert llm.get_provider().structured_mode == llm.STRUCTURED_JSON_OBJECT
+    assert status.structured_output == llm.STRUCTURED_JSON_OBJECT
+    # And the payload agrees with itself: `used` reads the provider after the
+    # call, so a stale `structured_output` showed up as a self-contradiction.
+    assert status.used.structured_mode == status.structured_output

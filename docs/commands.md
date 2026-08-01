@@ -191,7 +191,13 @@ does not resolve). With no provider configured the refusal names
   prompt is sent instead of refused, and the server answers from the part it
   read without saying so. A **recognised** model name (for example
   `deepseek-v4-flash`) supplies its endpoint's real window, so the setting you
-  are most likely to get wrong is one you need not set.
+  are most likely to get wrong is one you need not set. Recognition is an
+  **exact** match on a hosted model id, and only when you have not set
+  `NODUM_LLM_BASE_URL` yourself: a name that merely starts with `deepseek-`
+  (`deepseek-r1:8b` and the rest of the ollama library) is a local model and
+  stays on your local endpoint, and once you name a base URL that endpoint's own
+  defaults apply — no profile can give a window to a server you pointed
+  somewhere else.
   Three more fields say what your provider is really doing, as opposed to what
   you asked it for. **`structured_output`** is `json_schema` or `json_object`:
   under the first, the server's constrained decoding makes an answer the schema

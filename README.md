@@ -659,7 +659,11 @@ degrades to BM25 + graph expansion. `NODUM_EMBED_MODEL` switches the model
   That is a working install — the base URL, the context window and the
   structured-output mode come from the model name, and the one you would most
   easily get wrong (the window) is the one that silently truncates prompts when
-  it is wrong. Anything you set yourself always wins. `NODUM_LLM_THINKING`
+  it is wrong. Anything you set yourself always wins, and a model name is only
+  recognised when it is **exactly** a hosted model id and you have not named a
+  `NODUM_LLM_BASE_URL` of your own: `deepseek-r1:8b` and friends are ollama
+  models, so they stay on your local endpoint with your local window, and once
+  you point at a server yourself nothing moves the call off it. `NODUM_LLM_THINKING`
   (`none`, `low`, `medium`, `high`; default `high`) sets how much a reasoning
   model may think — a value outside that set is refused with the list rather
   than passed on, and `nodum llm status` shows whether your endpoint actually

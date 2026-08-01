@@ -2076,17 +2076,25 @@ def provider_status(*, principal: Principal, probe: bool = True) -> ProviderStat
         status.detail = _refusal_for(exc)
     status.probe_ms = int((time.monotonic() - started) * 1000)
     status.used = active.report()
-    # Re-read after the probe, because capability negotiation happens on a real
-    # call and this is one. **Only this field**, and the asymmetry is deliberate
-    # rather than an oversight: the probe sends no schema, so it can never
-    # provoke the `response_format` 400 that downgrades `structured_output` —
-    # a re-read of that would be a branch no build can reach, which is exactly
-    # what `STOP_SWITCH_PENDING` was deleted for. `structured_output` is already
-    # current as of construction anyway, since the provider object is cached
-    # process-wide and carries any downgrade an earlier call discovered.
+    # Re-read **both** negotiated beliefs after the probe, because capability
+    # negotiation happens on a real call and this is one.
     #
-    # The reasoning level is different: the probe *does* send `reasoning_effort`
-    # (pinned to `none`), so a server that refuses the field outright is
-    # discovered here and nowhere else on a `llm status` run.
+    # `thinking_applied` is the obvious one: the probe *sends*
+    # `reasoning_effort` (pinned to `none`), so a server that refuses the field
+    # outright is discovered here and nowhere else on a `llm status` run.
+    #
+    # `structured_output` is the one that used to be left stale, on the argument
+    # that the probe sends no schema and therefore cannot provoke the
+    # `response_format` 400. That argument was about the *request*, and the
+    # downgrade is decided by the *response*: `OpenAICompatProvider._negotiate`
+    # never asks whether a schema was sent — it reads any 400 whose body names
+    # `response_format`, which a gateway or a strict endpoint can answer to a
+    # request that carries none. When that happened the provider really was
+    # demoted to `json_object` for the life of the process, while this payload
+    # still announced `json_schema` — and every later `/ask` in that `nodum
+    # serve` ran under an envelope the operator had just been told was stronger.
+    # One status payload contradicting itself (`structured_output: "json_schema"`
+    # over `used.structured_mode: "json_object"`) was the visible symptom.
+    status.structured_output = active.structured_mode
     status.thinking_applied = active.thinking_applied
     return status

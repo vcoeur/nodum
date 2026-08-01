@@ -111,7 +111,11 @@ generalised to "no provider = smart features off"):
     features anywhere. There is no default, because a guessed model name is a
     404 on the first call rather than an honest absence at resolution time.
 ``NODUM_LLM_BASE_URL``
-    OpenAI-compatible base URL; defaults to :data:`DEFAULT_BASE_URL`.
+    OpenAI-compatible base URL; defaults to :data:`DEFAULT_BASE_URL` unless
+    :func:`profile_for` recognises the model id as one a shipped profile's
+    endpoint serves. Setting it explicitly takes the *whole* decision: a profile
+    then applies only where it is that same host, so no model name can move a
+    call off the endpoint the operator named.
 ``NODUM_LLM_API_KEY``
     Bearer token. Optional — the local default needs none.
 ``NODUM_LLM_CONTEXT_TOKENS``
@@ -136,6 +140,7 @@ import json
 import os
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Sequence
 from typing import Any, NamedTuple, Protocol
@@ -308,7 +313,19 @@ _MAX_NEGOTIATIONS = 3
 
 #: The floor on what is left of a per-call timeout for a re-send. A negotiation
 #: that arrived with the ceiling already spent still has to make its one request
-#: rather than passing 0 to ``urlopen``, which blocks forever.
+#: rather than passing 0 to ``urlopen``.
+#:
+#: 0 does **not** block forever — that is ``None``. Measured against a live
+#: local server: a POST at ``timeout=0`` raises ``URLError(BlockingIOError(115,
+#: 'Operation now in progress'))`` in under 10 ms, because the socket is put in
+#: non-blocking mode and the connect returns ``EINPROGRESS``; the same POST at
+#: ``0.001`` raises ``TimeoutError('timed out')``. That is worse than a timeout rather
+#: than better: :meth:`OpenAICompatProvider._post` reads a non-``TimeoutError``
+#: ``URLError`` as :class:`ProviderUnavailable` "is not reachable", so a
+#: negotiation that ran out of clock would report a healthy server as down
+#: instead of reporting the deadline that actually bit. A millisecond keeps the
+#: re-send on the blocking path, where an expired ceiling surfaces as
+#: :class:`ProviderTimeout` and names the ceiling.
 _MIN_TIMEOUT = 0.001
 
 #: Substrings that identify a 400 as "this endpoint does not serve that
@@ -687,6 +704,11 @@ class ProviderProfile(NamedTuple):
     this module is mostly about.
 
     Attributes:
+        models: The **exact** model ids this endpoint serves, which is what
+            selects the profile when no base URL is configured. Exact, never a
+            prefix — see :func:`profile_for`.
+        hosts: The hostnames that *are* this endpoint. Compared to a parsed
+            hostname, never as a substring of a URL.
         base_url: The endpoint, when :data:`ENV_BASE_URL` is unset.
         context_tokens: The window the endpoint really serves.
         structured_mode: Which ``response_format`` to try first, so a known
@@ -694,16 +716,18 @@ class ProviderProfile(NamedTuple):
         graded_thinking: Whether ``reasoning_effort`` above ``none`` is accepted.
     """
 
+    models: frozenset[str]
+    hosts: frozenset[str]
     base_url: str
     context_tokens: int
     structured_mode: str
     graded_thinking: bool
 
 
-#: The endpoint ``deepseek-*`` model names resolve to.
+#: The endpoint DeepSeek's own hosted model ids resolve to.
 DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
 
-#: Endpoints this ships knowing about, by a predicate over (model, base URL).
+#: Endpoints this ships knowing about, keyed by exact model id and by hostname.
 #:
 #: Deliberately tiny, and deliberately not a vendor registry: a profile earns
 #: its place by being an endpoint whose *defaults are wrong* otherwise. ollama
@@ -715,41 +739,92 @@ DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
 #: A provider that is *not* recognised keeps the optimistic beliefs and
 #: negotiates them down on the first 400, so this table is an optimisation and
 #: never a gate.
-_PROFILES: tuple[tuple[str, ProviderProfile], ...] = (
-    (
-        "deepseek",
-        ProviderProfile(
-            base_url=DEEPSEEK_BASE_URL,
-            # Measured on `deepseek-v4-flash`: a 1 000 000-token context and a
-            # 384 000-token max output, which are separate limits rather than
-            # one shared window — the reservation is harmless there and
-            # load-bearing on ollama, so it is kept for both.
-            context_tokens=1_000_000,
-            # Measured: `json_schema` is HTTP 400 "This response_format type is
-            # unavailable now"; `json_object` works.
-            structured_mode=STRUCTURED_JSON_OBJECT,
-            graded_thinking=True,
-        ),
+_PROFILES: tuple[ProviderProfile, ...] = (
+    ProviderProfile(
+        # The two ids `GET https://api.deepseek.com/models` really lists. A
+        # model id is an exact string and this list is short, so there is no
+        # reason to guess at one — and guessing is what made this dangerous;
+        # see `profile_for`.
+        models=frozenset({"deepseek-v4-flash", "deepseek-v4-pro"}),
+        hosts=frozenset({"api.deepseek.com"}),
+        base_url=DEEPSEEK_BASE_URL,
+        # Measured on `deepseek-v4-flash`: a 1 000 000-token context and a
+        # 384 000-token max output, which are separate limits rather than
+        # one shared window — the reservation is harmless there and
+        # load-bearing on ollama, so it is kept for both.
+        context_tokens=1_000_000,
+        # Measured: `json_schema` is HTTP 400 "This response_format type is
+        # unavailable now"; `json_object` works.
+        structured_mode=STRUCTURED_JSON_OBJECT,
+        graded_thinking=True,
     ),
 )
+
+
+def _hostname(base_url: str) -> str:
+    """The host a base URL names, lower-cased and without its port, or ``""``.
+
+    A URL this cannot parse is ``""`` rather than an exception. Matching a
+    profile is an optimisation and a typo in :data:`ENV_BASE_URL` is the
+    operator's own endpoint to fix — measured, ``urlsplit`` raises
+    ``ValueError("Invalid IPv6 URL")`` on ``http://[bad/v1``, and letting that
+    out of here would turn a wrong URL into a traceback at *resolution* time,
+    before anything has tried to reach it.
+    """
+    try:
+        # A base URL with no scheme (`api.deepseek.com/v1`) parses as a bare
+        # path, so it is given the authority marker before the host is read.
+        split = urllib.parse.urlsplit(base_url if "//" in base_url else f"//{base_url}")
+        return (split.hostname or "").casefold()
+    except ValueError:
+        return ""
 
 
 def profile_for(*, model: str, base_url: str | None) -> ProviderProfile | None:
     """The shipped profile for this model/endpoint pair, or ``None``.
 
-    Matched on the **model name prefix** rather than only on the URL, because
-    the model name is the thing an operator actually types: ``NODUM_LLM_MODEL=
-    deepseek-v4-flash`` with nothing else set is the "out of the box" case, and
-    at that point there is no base URL to match on. An explicitly configured
-    base URL pointing at the same host matches too, so an operator who spells
-    the endpoint out does not lose the rest of the profile.
+    **A configured base URL decides, and a model name only decides when there
+    is none.** That asymmetry is the whole of this function, and it is here
+    because the obvious alternative — match a ``deepseek-`` *prefix* on the
+    model name — sends a local install's prompts to a third party:
+
+    - ``deepseek-r1``, ``deepseek-coder``, ``deepseek-coder-v2``,
+      ``deepseek-llm``, ``deepseek-v2``, ``deepseek-v3`` and ``deepseek-v3.1``
+      are all **ollama library models**, run locally with no key. Under a prefix
+      match ``NODUM_LLM_MODEL=deepseek-r1:8b`` with no :data:`ENV_BASE_URL`
+      resolved to ``https://api.deepseek.com/v1`` — so a configuration that says
+      "run locally" POSTed private graph text to a vendor if a key happened to
+      be set, and 401'd against a host nobody configured if one did not.
+    - An explicit ``NODUM_LLM_BASE_URL=http://localhost:11434/v1`` won the
+      *URL* and still lost the *window*: :attr:`ProviderProfile.context_tokens`
+      came from the profile, so a 1 000 000-token belief was carried against a
+      server serving 4 096, which is exactly the silent-truncation hole the
+      profile exists to close.
+
+    So the match is on **exact** model ids (:attr:`ProviderProfile.models` — the
+    ids the vendor's own ``/models`` really lists) and on a **parsed hostname**
+    (:attr:`ProviderProfile.hosts`, never a substring: a proxy at
+    ``deepseek-gw.lan`` is not DeepSeek). A model name nobody profiled keeps the
+    local default and negotiates, which costs one 400; a wrong guess here costs
+    egress, and only one of those two is recoverable.
+
+    Args:
+        model: :data:`ENV_MODEL`, as the operator typed it.
+        base_url: :data:`ENV_BASE_URL` if it was set, else ``None``. **Not** the
+            resolved default — a profile may not match against a URL it supplied
+            itself.
+
+    Returns:
+        The profile whose endpoint this is, or ``None``.
     """
-    host = (base_url or "").casefold()
-    name = model.casefold()
-    for key, profile in _PROFILES:
-        if name.startswith(f"{key}-") or name == key or key in host:
-            return profile
-    return None
+    if base_url:
+        # The operator named the endpoint, so nothing but the endpoint decides:
+        # a profile applies only where it *is* the host being pointed at, and
+        # then its window is that host's own.
+        host = _hostname(base_url)
+        return next((profile for profile in _PROFILES if host in profile.hosts), None)
+    name = model.strip().casefold()
+    return next((profile for profile in _PROFILES if name in profile.models), None)
 
 
 def estimate_content_tokens(messages: Sequence[Message]) -> int:

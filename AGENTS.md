@@ -1146,11 +1146,11 @@ commands on a saved node for exactly this reason.
   (`AgentRun.output_reservation`); `answers._fit_prompt` calls it rather than
   recomputing, because a second copy disagreed the moment the default rose and
   refused every question as "too long for the window".
-- **Out of the box means a model name and a key.** `profile_for` matches a
-  **model-name prefix** (and a base-URL host) against a tiny table of endpoints
-  this ships knowing about, supplying the base URL, the served window, the
-  structured mode and whether graded thinking is accepted. `NODUM_LLM_MODEL=
-  deepseek-v4-flash` plus `NODUM_LLM_API_KEY` is therefore a working install:
+- **Out of the box means a model name and a key.** `profile_for` matches an
+  **exact model id** against a tiny table of endpoints this ships knowing about,
+  supplying the base URL, the served window, the structured mode and whether
+  graded thinking is accepted. `NODUM_LLM_MODEL=deepseek-v4-flash` plus
+  `NODUM_LLM_API_KEY` is therefore a working install:
   `https://api.deepseek.com/v1`, a 1 000 000-token window, `json_object` with no
   rejected round trip, graded thinking on. Matching on the model name and not
   only the URL is what makes that possible — with nothing else set there *is* no
@@ -1161,6 +1161,25 @@ commands on a saved node for exactly this reason.
   optimistic and negotiates down), and the ollama default is handled by the base
   URL rather than a row: the local endpoint starts out disbelieving graded
   levels instead of paying a 400 to learn it.
+- **A model name may not move a call to another company's server**, which is why
+  that match is exact and why a set `NODUM_LLM_BASE_URL` takes the *whole*
+  decision. Both looser rules had teeth. A `deepseek-` **prefix** also matches
+  `deepseek-r1`, `deepseek-coder`, `deepseek-coder-v2`, `deepseek-llm`,
+  `deepseek-v2`, `deepseek-v3` and `deepseek-v3.1` — **ollama library models**,
+  pulled and served locally — so `NODUM_LLM_MODEL=deepseek-r1:8b` with nothing
+  else set resolved to `https://api.deepseek.com/v1`: a configuration whose only
+  statement about where to run was "the default endpoint" POSTed private graph
+  text to a vendor whenever `NODUM_LLM_API_KEY` was also set, and 401'd against
+  a host nobody configured when it was not. And an explicit
+  `NODUM_LLM_BASE_URL=http://localhost:11434/v1` won the **URL** while the
+  profile still supplied `context_tokens`, carrying a 1 000 000-token belief
+  against a server serving 4 096 — the refusal is computed against that belief,
+  so nothing was refused and the silent truncation this module is mostly about
+  came back through the table written to close it. Host matching is a **parsed
+  hostname** against a set, never `key in url`: a proxy at `deepseek-gw.lan`, and
+  a lookalike at `api.deepseek.com.evil.example`, are not DeepSeek. The
+  asymmetry that settles the whole rule: a hosted id guessed wrong costs egress
+  nobody sees, and a local one guessed wrong costs a 404 the operator reads.
 - **`prompt_truncated` weighs only the bytes really sent**
   (`estimate_content_tokens`), not the ~52 tokens of chat-template overhead the
   *refusal's* estimate adds. On a long prompt the difference is noise; on a
@@ -2700,12 +2719,20 @@ Phase-1 decision log.
   `structured_output` (`json_schema` or `json_object`), `thinking` with
   `thinking_applied` beside it (`false` is a knob doing nothing — the ollama
   case), and `effective_max_output_tokens`, which is what the configured ceiling
-  is really worth once the window's share caps it. It re-reads
-  `thinking_applied` after the probe because the probe *sends*
-  `reasoning_effort` and is the one call that can discover a refusal;
-  it deliberately does **not** re-read `structured_output`, because the probe
-  sends no schema and that branch would be unreachable — the same reason
-  `STOP_SWITCH_PENDING` was deleted.
+  is really worth once the window's share caps it. It re-reads **both**
+  negotiated beliefs after the probe. `thinking_applied` because the probe
+  *sends* `reasoning_effort` and is the one call that can discover a refusal;
+  `structured_output` because the argument for leaving it stale — "the probe
+  sends no schema, so that branch is unreachable" — was about the **request**
+  while `_negotiate` decides on the **response**, and never asks whether a
+  schema was sent. Any 400 whose body names `response_format` downgrades the
+  belief, a gateway can answer that to a schema-less request, and the demotion
+  then lasts the life of the process because the provider is cached. The visible
+  failure was one status payload reporting `structured_output: "json_schema"`
+  directly above a `used.structured_mode` of `"json_object"`, with every later
+  `/ask` in that `nodum serve` running under the weaker envelope. **An
+  unreachable-branch claim is a claim about the code that decides, not about the
+  code that asks.**
 - **A `--dry-run` here answers "what would happen", and each one is precise
   about what it costs.** `consolidate --dry-run` still writes its journal entry,
   flagged, because the journal has to say which it was — and emits **no** event,
