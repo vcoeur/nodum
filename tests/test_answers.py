@@ -24,6 +24,7 @@ import os
 import random
 import re
 import unicodedata
+import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import NamedTuple
@@ -69,6 +70,8 @@ class FakeProvider:
 
     provider_id = "fake://provider"
     model_id = "fake-model"
+    thinking = llm.DEFAULT_THINKING
+    thinking_applied = True
 
     def __init__(
         self, *answers_: llm.Completion | BaseException, context_tokens: int = 4096
@@ -76,17 +79,33 @@ class FakeProvider:
         self.answers = list(answers_) or [_completion()]
         self.calls: list[dict] = []
         self.context_tokens = context_tokens
+        self.structured_mode = llm.STRUCTURED_JSON_SCHEMA
 
-    def estimate_prompt_tokens(self, messages) -> int:
+    def estimate_prompt_tokens(self, messages, *, schema=None) -> int:
         return llm.estimate_prompt_tokens(messages)
 
-    def chat(self, messages, *, schema=None, max_output_tokens, timeout) -> llm.Completion:
+    def output_reservation(self, max_output_tokens: int) -> int:
+        """The real provider's rule, because this stands in for a provider.
+
+        A fake that returned the ask unchanged would model an endpoint that does
+        not exist, and would hide the case this rule is for: the shipped output
+        ceiling is 4 096 and this fake's window is 4 096, so an unclamped
+        reservation leaves a prompt exactly no room and every question is
+        refused for a reason that has nothing to do with the question.
+        """
+        share = int(self.context_tokens * llm.OUTPUT_RESERVATION_FRACTION)
+        return max(1, min(max_output_tokens, share))
+
+    def chat(
+        self, messages, *, schema=None, max_output_tokens, timeout, thinking=None
+    ) -> llm.Completion:
         self.calls.append(
             {
                 "messages": list(messages),
                 "schema": schema,
                 "max_output_tokens": max_output_tokens,
                 "timeout": timeout,
+                "thinking": thinking,
             }
         )
         answer = self.answers[min(len(self.calls) - 1, len(self.answers) - 1)]
@@ -128,13 +147,16 @@ def graph(fresh_db):
     return {"compaction": first.id, "rebalance": second.id, "paper": third.id}
 
 
-def _run(*, tokens: int = 100_000) -> agent.AgentRun:
+def _run(*, tokens: int = 100_000, max_output_tokens: int | None = None) -> agent.AgentRun:
     """A request run with an explicit budget, so no environment reaches a test."""
-    return agent.for_request(
+    run = agent.for_request(
         purpose="test",
         principal=owner(),
         budget=agent.Budget(name="request:test", tokens=tokens, seconds=600.0),
     )
+    if max_output_tokens is not None:
+        run.max_output_tokens = max_output_tokens
+    return run
 
 
 # ── This module is a peer client too (P2/P3) ─────────────────────────────────
@@ -1584,13 +1606,21 @@ def test_the_prompt_carries_the_node_s_own_text_and_not_the_search_snippet(graph
 def test_a_context_too_wide_for_the_window_drops_the_worst_ranked_note(graph):
     """The measured failure this prevents: a 51 KB prompt and a 207 KB prompt
     both report 4 096 prompt tokens and the same wall time, with nothing in the
-    response saying half of it was never read."""
+    response saying half of it was never read.
+
+    The window is 2 600 rather than 1 800 because the output reservation is now
+    a *share* of it — the prompt gets half, not "everything but 512". The
+    property under test is unchanged (a prompt too wide is fitted, and what did
+    not fit is named); only the number at which it happens moved, because the
+    reservation stopped being an absolute that meant different things at
+    different window sizes.
+    """
     long_text = "compaction " * 400
     for _ in range(3):
         service.create_node(
             type="note", title="More compaction", content=long_text, principal=owner()
         )
-    provider = FakeProvider(_reply("x", ["1"]), context_tokens=1800)
+    provider = FakeProvider(_reply("x", ["1"]), context_tokens=2600)
     llm.set_provider(provider)
     result = answers.ask("compaction", principal=owner(), k=4, run=_run())
     assert len(provider.calls) == 1, "a fitted prompt is still one call"
@@ -1967,14 +1997,21 @@ def test_the_rewrite_reserves_room_for_a_reasoning_model_s_preamble(graph):
 
     So the rewrite takes a **floor**, not a cap: 2 048, the number measured to
     cure it, and never below whatever the human's own knob says.
+
+    **The shipped default no longer trips this**, since it is now 4 096 — above
+    the floor — so the run's own ceiling wins and the floor does nothing. That
+    is the floor working, not the floor becoming pointless: it still catches the
+    operator who lowers the knob, which is the case it was written for and the
+    only case that can still reach it. So the run is given an explicitly low
+    ceiling here rather than relying on a default that used to be low by
+    accident.
     """
     provider = FakeProvider(_completion(text=json.dumps({"terms": ["compacted"]})))
     llm.set_provider(provider)
-    run = _run()
+    run = _run(max_output_tokens=512)
     answers.natural_search("compacted topic", principal=owner(), run=run)
-    # Non-vacuity: the run really is at the shipped default, so the assertion
-    # below is about a raise and not about two numbers that happen to agree.
-    assert run.max_output_tokens == agent.DEFAULT_MAX_OUTPUT_TOKENS
+    # Non-vacuity: the run really is below the floor, so the assertion below is
+    # about a raise and not about two numbers that happen to agree.
     assert run.max_output_tokens < answers.REWRITE_OUTPUT_TOKENS
     assert provider.calls[0]["max_output_tokens"] == answers.REWRITE_OUTPUT_TOKENS
 
@@ -2262,3 +2299,284 @@ def test_a_live_model_meets_a_forged_marker_and_a_truncated_source(fresh_db, mon
         and not result.unsupported_numbers
         and not (result.unresolved and len(result.citations) == 1)
     )
+
+
+# ── A reasoning level per call site ───────────────────────────────────────────
+
+
+def test_the_reachability_probe_never_reasons(graph):
+    """The one call site where thinking can only hurt, and it is measured.
+
+    ``"ping"`` at the shipped ceiling returned an **empty body** at every graded
+    level — all eight output tokens went to reasoning and none to content — and
+    at a 512-token ceiling one level spent 506 thinking to produce two
+    characters. A reachability check has nothing to reason about, so it is
+    pinned to ``none`` regardless of the global default. Do not "fix" the
+    inconsistency.
+    """
+    provider = FakeProvider(_completion(text="pong"))
+    llm.set_provider(provider)
+    answers.provider_status(principal=owner())
+    assert provider.calls[0]["thinking"] == agent.THINKING_NONE
+    # Non-vacuity: the global default really is something else, so this is a pin
+    # and not two values that happen to agree.
+    assert llm.DEFAULT_THINKING != agent.THINKING_NONE
+
+
+def test_the_probe_asks_a_bounded_question_so_its_ceiling_is_honest(graph):
+    """``"ping"`` is answered here with a paragraph — in Chinese, measured — so
+    the probe hit its own ceiling every time and reported ``failed_calls: 1`` on
+    a healthy install. The one command whose job is to say whether the install is
+    well must not manufacture a failure to say it with."""
+    provider = FakeProvider(_completion(text="pong"))
+    llm.set_provider(provider)
+    status = answers.provider_status(principal=owner())
+    sent = provider.calls[0]["messages"][0].content
+    assert "one word" in sent, "an unbounded prompt makes the ceiling a coin toss"
+    assert answers.PROBE_OUTPUT_TOKENS >= 16, (
+        "8 was below what any answer costs on the measured provider, so the "
+        "truncated path was guaranteed rather than exceptional"
+    )
+    assert status.used.failed_calls == 0
+
+
+def test_the_query_rewrite_never_reasons(graph):
+    """Measured over twelve samples at the global default: reasoning ranged 44 to
+    1 174 tokens — 57 % of this call site's own ceiling — for terms that did not
+    change. At ``none`` the twelve were byte-identical per question, which is
+    also the right property for a *search*: the same question searches the same
+    way twice."""
+    provider = FakeProvider(_completion(text=json.dumps({"terms": ["compacted"]})))
+    llm.set_provider(provider)
+    answers.natural_search("compacted topic", principal=owner(), run=_run())
+    assert provider.calls[0]["thinking"] == agent.THINKING_NONE
+    assert llm.DEFAULT_THINKING != agent.THINKING_NONE
+
+
+def test_ask_runs_at_the_global_default_rather_than_a_pin(graph):
+    """The counterweight to the two pins above.
+
+    ``/ask`` is where model judgement actually matters — deciding whether the
+    retrieved context answers the question is the place a confident wrong answer
+    is the recorded danger — so it takes the human's configured level rather
+    than a number this module chose. Without this row the two pins above would
+    pass on an implementation that pinned ``none`` everywhere.
+    """
+    provider = FakeProvider(_reply("compaction keeps the latest value", ["1"]))
+    llm.set_provider(provider)
+    answers.ask("compaction", principal=owner(), run=_run())
+    assert provider.calls[0]["thinking"] is None, (
+        "/ask must defer to the provider's configured level, not pin one"
+    )
+
+
+# ── What `llm status` shows an operator ───────────────────────────────────────
+
+
+def test_status_names_the_structured_output_mode_in_force(graph):
+    """A drop to ``json_object`` is not a silent downgrade.
+
+    Under ``json_schema`` the server's constrained decoding makes a citation the
+    ``pattern`` forbids unrepresentable. Under ``json_object`` the schema is a
+    sentence in the prompt and the pattern is advice. 5b-i already recorded that
+    schema validity was never truth; this is weaker still, so it is named where
+    an operator looks.
+
+    Both paths are checked because they read the mode at different moments:
+    ``--no-probe`` reports the belief the install was built with, and a probing
+    run re-reads it afterwards because a real call is the only thing that can
+    *discover* a refusal. A test that exercised only the probing path passed
+    while the constructor had stopped reporting the mode at all — the re-read
+    covered for it — which is a defence hiding a hole rather than closing one.
+    """
+    provider = FakeProvider(_completion(text="pong"))
+    provider.structured_mode = llm.STRUCTURED_JSON_OBJECT
+    llm.set_provider(provider)
+
+    unprobed = answers.provider_status(principal=owner(), probe=False)
+    assert unprobed.structured_output == llm.STRUCTURED_JSON_OBJECT
+    assert unprobed.used.calls == 0, "non-vacuity: this row really did not call"
+
+    probed = answers.provider_status(principal=owner())
+    assert probed.structured_output == llm.STRUCTURED_JSON_OBJECT
+    assert probed.used.calls == 1, "non-vacuity: this row really did call"
+
+
+def test_status_names_the_reasoning_level_and_whether_it_lands(graph):
+    """A knob that silently does nothing is worse than one that is absent.
+
+    ollama refuses every graded level, so one configured against it is withheld
+    and the model runs at its own default — which measured as the *most*
+    expensive setting there is. The operator can read the level back from their
+    own environment; what they cannot see without this is that it never arrived.
+    """
+    provider = FakeProvider(_completion(text="pong"))
+    provider.thinking = "high"
+    provider.thinking_applied = False
+    llm.set_provider(provider)
+    status = answers.provider_status(principal=owner())
+    assert status.thinking == "high"
+    assert status.thinking_applied is False
+
+
+def test_status_reports_the_output_ceiling_that_actually_binds(graph):
+    """The number typed and the number that binds are different, and the gap is
+    exactly what a status command exists to show: the reservation is capped at a
+    share of the window, so 4 096 configured against a 4 096-token window is
+    really 2 048."""
+    provider = FakeProvider(_completion(text="pong"), context_tokens=4096)
+    llm.set_provider(provider)
+    status = answers.provider_status(principal=owner())
+    # Non-vacuity: the two really are different numbers here, so the assertion
+    # is about a cap and not about one value read twice.
+    assert status.max_output_tokens == agent.DEFAULT_MAX_OUTPUT_TOKENS == 4096
+    assert status.effective_max_output_tokens == 2048
+
+
+def test_a_probe_that_discovers_a_refused_reasoning_field_says_so(monkeypatch, graph):
+    """The one capability the probe can actually discover, driven through the
+    real provider and a real 400.
+
+    The probe sends ``reasoning_effort`` (pinned to ``none``), so a server that
+    refuses the field at all is found here — and ``llm status`` is the command
+    an operator runs to find out.
+    """
+    sent: list[dict] = []
+
+    def urlopen(request, timeout=None):
+        payload = json.loads(request.data)
+        sent.append(payload)
+        if "reasoning_effort" in payload:
+            failure = urllib.error.HTTPError(
+                url="http://x/v1/chat/completions", code=400, msg="Bad", hdrs=None, fp=None
+            )
+            failure.read = lambda: b'{"error":{"message":"does not support thinking"}}'
+            raise failure
+
+        class _Response:
+            status = 200
+
+            def read(self):
+                return json.dumps(
+                    {
+                        "choices": [
+                            {
+                                "message": {"role": "assistant", "content": "pong"},
+                                "finish_reason": "stop",
+                            }
+                        ],
+                        "usage": {
+                            "prompt_tokens": 5,
+                            "completion_tokens": 2,
+                            "total_tokens": 7,
+                        },
+                    }
+                ).encode()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return None
+
+        return _Response()
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    llm.set_provider(
+        llm.OpenAICompatProvider(
+            model="some-model",
+            base_url="https://api.example.com/v1",
+            thinking="high",
+            graded_thinking=True,
+        )
+    )
+    status = answers.provider_status(principal=owner())
+    assert status.reachable is True, "the negotiated re-send answered"
+    # Three requests, because the ladder is walked one rung at a time: graded →
+    # off-only (which still sends `reasoning_effort: "none"`, since the probe
+    # asked for `none` and every measured endpoint accepts it) → absent. A
+    # single-step downgrade would have given up `none` on ollama, where it is
+    # the documented cure for an empty body, on the evidence of a server that
+    # only refused a *graded* level.
+    assert [("reasoning_effort" in payload) for payload in sent] == [True, True, False]
+    assert status.thinking == "high", "the configured level is still what was asked for"
+    assert status.thinking_applied is False, "and status must say it never arrived"
+
+
+def test_a_probe_that_downgrades_the_structured_mode_says_so(monkeypatch, graph):
+    """The probe *can* demote ``structured_output``, so the field is re-read.
+
+    Three places used to assert this branch was unreachable, on the argument
+    that the probe sends no schema and therefore cannot provoke the
+    ``response_format`` 400. The argument is about the **request**;
+    ``OpenAICompatProvider._negotiate`` decides on the **response**, and never
+    asks whether a schema was sent — any 400 whose body names ``response_format``
+    downgrades the belief. A gateway that answers that to a schema-less request
+    is all it takes, and the demotion then lasts the life of the process,
+    because the provider object is cached.
+
+    What that produced: one ``nodum llm status`` payload reporting
+    ``structured_output: "json_schema"`` directly above a ``used.structured_mode``
+    of ``"json_object"`` — the same payload disagreeing with itself — and every
+    later ``/ask`` in that ``nodum serve`` running under the weaker envelope
+    while the operator had just been shown the stronger one. Under
+    ``json_object`` the schema is a sentence in the prompt and its ``pattern``
+    stops being enforced by constrained decoding, so this is a real reduction
+    and not a label.
+    """
+    sent: list[dict] = []
+
+    def urlopen(request, timeout=None):
+        payload = json.loads(request.data)
+        sent.append(payload)
+        if len(sent) == 1:
+            failure = urllib.error.HTTPError(
+                url="http://x/v1/chat/completions", code=400, msg="Bad", hdrs=None, fp=None
+            )
+            failure.read = lambda: (
+                b'{"error":{"message":"response_format is not supported by this gateway"}}'
+            )
+            raise failure
+
+        class _Response:
+            status = 200
+
+            def read(self):
+                return json.dumps(
+                    {
+                        "choices": [
+                            {
+                                "message": {"role": "assistant", "content": "pong"},
+                                "finish_reason": "stop",
+                            }
+                        ],
+                        "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7},
+                    }
+                ).encode()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return None
+
+        return _Response()
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    llm.set_provider(
+        llm.OpenAICompatProvider(
+            model="some-model",
+            base_url="https://api.example.com/v1",
+            structured_mode=llm.STRUCTURED_JSON_SCHEMA,
+        )
+    )
+    status = answers.provider_status(principal=owner())
+    assert status.reachable is True, "the negotiated re-send answered"
+    # Non-vacuity, twice over: the probe really carried no `response_format`,
+    # and the downgrade really happened on the provider.
+    assert all("response_format" not in payload for payload in sent)
+    assert llm.get_provider().structured_mode == llm.STRUCTURED_JSON_OBJECT
+    assert status.structured_output == llm.STRUCTURED_JSON_OBJECT
+    # And the payload agrees with itself: `used` reads the provider after the
+    # call, so a stale `structured_output` showed up as a self-contradiction.
+    assert status.used.structured_mode == status.structured_output

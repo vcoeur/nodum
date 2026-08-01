@@ -32,6 +32,9 @@ def _completion(
     output_tokens: int = 20,
     finish_reason: str = "stop",
     context_tokens: int = 4096,
+    reasoning_tokens: int = 0,
+    cache_hit_tokens: int = 0,
+    cache_miss_tokens: int = 0,
 ) -> llm.Completion:
     return llm.Completion(
         text=text,
@@ -42,6 +45,9 @@ def _completion(
         provider_id="fake://provider",
         context_tokens=context_tokens,
         latency_ms=7,
+        reasoning_tokens=reasoning_tokens,
+        cache_hit_tokens=cache_hit_tokens,
+        cache_miss_tokens=cache_miss_tokens,
     )
 
 
@@ -51,21 +57,34 @@ class FakeProvider:
     provider_id = "fake://provider"
     model_id = "fake-model"
     context_tokens = 4096
+    thinking = llm.DEFAULT_THINKING
+    thinking_applied = True
 
     def __init__(self, *answers: llm.Completion | BaseException) -> None:
         self.answers = list(answers) or [_completion()]
         self.calls: list[dict[str, Any]] = []
+        self.structured_mode = llm.STRUCTURED_JSON_SCHEMA
 
-    def estimate_prompt_tokens(self, messages) -> int:
+    def estimate_prompt_tokens(self, messages, *, schema=None) -> int:
         return llm.estimate_prompt_tokens(messages)
 
-    def chat(self, messages, *, schema=None, max_output_tokens, timeout) -> llm.Completion:
+    def output_reservation(self, max_output_tokens: int) -> int:
+        """The real provider's rule — a reservation capped at a share of the
+        window — because this stands in for a provider and an identity function
+        models an endpoint that does not exist."""
+        share = int(self.context_tokens * llm.OUTPUT_RESERVATION_FRACTION)
+        return max(1, min(max_output_tokens, share))
+
+    def chat(
+        self, messages, *, schema=None, max_output_tokens, timeout, thinking=None
+    ) -> llm.Completion:
         self.calls.append(
             {
                 "messages": list(messages),
                 "schema": schema,
                 "max_output_tokens": max_output_tokens,
                 "timeout": timeout,
+                "thinking": thinking,
             }
         )
         answer = self.answers[min(len(self.calls) - 1, len(self.answers) - 1)]
@@ -83,7 +102,13 @@ VERSION = agent.prompt_version("a template")
 @pytest.fixture(autouse=True)
 def _clean_provider(monkeypatch):
     """No provider resolves from the developer's environment, ever."""
-    for name in (llm.ENV_MODEL, llm.ENV_BASE_URL, llm.ENV_API_KEY, llm.ENV_CONTEXT_TOKENS):
+    for name in (
+        llm.ENV_MODEL,
+        llm.ENV_BASE_URL,
+        llm.ENV_API_KEY,
+        llm.ENV_CONTEXT_TOKENS,
+        llm.ENV_THINKING,
+    ):
         monkeypatch.delenv(name, raising=False)
     for name in (
         agent.ENV_CYCLE_BUDGET,
@@ -1104,7 +1129,7 @@ def test_the_run_answers_what_a_prompt_builder_needs_without_handing_over_the_pr
     """
     provider = FakeProvider()
     provider.context_tokens = 31_337
-    provider.estimate_prompt_tokens = lambda messages: 4_242
+    provider.estimate_prompt_tokens = lambda messages, *, schema=None: 4_242
     run = _run(provider=provider)
     assert run.context_tokens == 31_337
     assert run.estimate_prompt_tokens(PROMPT) == 4_242
@@ -1152,3 +1177,120 @@ def test_the_runtime_opens_no_connection_and_mints_no_principal():
         and node.attr.startswith("_")
     ]
     assert private == [], f"reaches into a private: {private}"
+
+
+# ── A reasoning model's cost is reported, not just charged ────────────────────
+
+
+def test_reasoning_tokens_reach_the_run_report_without_being_double_charged():
+    """The cost report has to say where the output allowance actually went.
+
+    Reasoning tokens are a **share** of ``completion_tokens`` on the wire
+    (measured on ``deepseek-v4-flash``: ``total_tokens`` is always
+    ``prompt + completion``, and ``reasoning_tokens`` never exceeds
+    ``completion_tokens``), so adding them to the total would report a night as
+    costing up to twice the bill. Leaving them out of the report entirely is the
+    other failure: a job that spent 1 420 of its 1 520 output tokens thinking
+    reads exactly like one that wrote 1 520 tokens of proposal, and only the
+    first is one sample away from returning nothing at all.
+    """
+    provider = FakeProvider(_completion(prompt_tokens=200, output_tokens=300, reasoning_tokens=250))
+    run = _run(provider=provider)
+    run.chat(PROMPT, prompt_version=VERSION)
+    report = run.report()
+    assert report.reasoning_tokens == 250
+    assert report.output_tokens == 300, "reasoning must stay inside the output count"
+    assert report.total_tokens == 500, "reasoning must not be added to the total"
+
+
+def test_the_cache_counters_reach_the_run_report():
+    """Priced ~50x apart, so a night's cost is not knowable without them."""
+    provider = FakeProvider(
+        _completion(prompt_tokens=154, output_tokens=25, cache_hit_tokens=128, cache_miss_tokens=26)
+    )
+    run = _run(provider=provider)
+    run.chat(PROMPT, prompt_version=VERSION)
+    report = run.report()
+    assert (report.cache_hit_tokens, report.cache_miss_tokens) == (128, 26)
+
+
+def test_reasoning_and_cache_are_reported_per_job_as_well_as_per_run():
+    """``per_job`` is the number a human checks a night against, job by job."""
+    provider = FakeProvider(
+        _completion(prompt_tokens=100, output_tokens=200, reasoning_tokens=180, cache_hit_tokens=40)
+    )
+    run = _run(provider=provider)
+    job = run.job("abstraction", share=0.5)
+    run.chat(PROMPT, prompt_version=VERSION, job=job)
+    costs = {cost.job: cost for cost in run.report().per_job}
+    assert costs["abstraction"].reasoning_tokens == 180
+    assert costs["abstraction"].cache_hit_tokens == 40
+
+
+def test_a_failed_call_still_reports_the_reasoning_it_burned():
+    """The case the accounting exists for.
+
+    A ``length`` finish is *no result* on this interface, and on a reasoning
+    model the overwhelmingly likely reason is that thinking ate the ceiling —
+    measured, ``'ping'`` at a graded level returned an **empty body** with every
+    one of its 8 output tokens spent reasoning. A report that dropped the
+    reasoning count on exactly the calls that failed would hide the cause of the
+    failure it is reporting.
+    """
+    provider = FakeProvider(
+        _completion(
+            prompt_tokens=100, output_tokens=512, reasoning_tokens=512, finish_reason="length"
+        )
+    )
+    run = _run(provider=provider)
+    with pytest.raises(agent.OutputTruncated):
+        run.chat(PROMPT, prompt_version=VERSION)
+    report = run.report()
+    assert report.failed_calls == 1
+    assert report.reasoning_tokens == 512, "a charged failure must report what it burned"
+    assert report.total_tokens == 612
+
+
+def test_a_generation_carries_the_reasoning_its_call_spent():
+    provider = FakeProvider(_completion(prompt_tokens=10, output_tokens=90, reasoning_tokens=60))
+    run = _run(provider=provider)
+    generation = run.chat(PROMPT, prompt_version=VERSION)
+    assert generation.reasoning_tokens == 60
+    assert generation.output_tokens == 90
+
+
+# ── The reasoning level is per call site, over a global default ───────────────
+
+
+def test_the_run_passes_its_thinking_level_through_to_the_provider():
+    provider = FakeProvider()
+    run = _run(provider=provider)
+    run.chat(PROMPT, prompt_version=VERSION)
+    assert provider.calls[-1]["thinking"] is None, (
+        "with nothing named the provider's own configured level must decide, not the run's"
+    )
+
+
+def test_a_call_site_may_pin_its_own_thinking_level():
+    """The call sites do not want the same thing, measured.
+
+    A reachability probe has nothing to reason about and spent 506 thinking
+    tokens returning an **empty body** when it was allowed to try; a query
+    rewrite is an 8-term keyword expansion that ran 3.4x faster and perfectly
+    deterministically at ``none``. An answer worth reviewing is the opposite
+    case. One global level cannot serve all of them.
+    """
+    provider = FakeProvider()
+    run = _run(provider=provider)
+    run.chat(PROMPT, prompt_version=VERSION, thinking=llm.THINKING_NONE)
+    assert provider.calls[-1]["thinking"] == llm.THINKING_NONE
+
+
+def test_the_run_reports_which_structured_mode_the_provider_will_use():
+    """A drop to ``json_object`` weakens what a caller may assume about the body,
+    so it has to be legible from the run rather than only from the provider the
+    run deliberately does not hand out."""
+    provider = FakeProvider()
+    provider.structured_mode = llm.STRUCTURED_JSON_OBJECT
+    run = _run(provider=provider)
+    assert run.structured_mode == llm.STRUCTURED_JSON_OBJECT

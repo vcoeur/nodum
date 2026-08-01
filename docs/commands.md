@@ -189,7 +189,27 @@ does not resolve). With no provider configured the refusal names
   that is `num_ctx` (`OLLAMA_CONTEXT_LENGTH`, 4096 unless you raise it),
   applied to every model it serves; setting this above it means an over-long
   prompt is sent instead of refused, and the server answers from the part it
-  read without saying so.
+  read without saying so. A **recognised** model name (for example
+  `deepseek-v4-flash`) supplies its endpoint's real window, so the setting you
+  are most likely to get wrong is one you need not set. Recognition is an
+  **exact** match on a hosted model id, and only when you have not set
+  `NODUM_LLM_BASE_URL` yourself: a name that merely starts with `deepseek-`
+  (`deepseek-r1:8b` and the rest of the ollama library) is a local model and
+  stays on your local endpoint, and once you name a base URL that endpoint's own
+  defaults apply — no profile can give a window to a server you pointed
+  somewhere else.
+  Three more fields say what your provider is really doing, as opposed to what
+  you asked it for. **`structured_output`** is `json_schema` or `json_object`:
+  under the first, the server's constrained decoding makes an answer the schema
+  forbids impossible to produce; under the second — which is what a provider
+  that refuses JSON schemas gets — the schema is only stated in the prompt, so
+  it is a request rather than a guarantee. **`thinking`** is your
+  `NODUM_LLM_THINKING` level, and **`thinking_applied`** says whether it reached
+  the endpoint at all: `ollama` accepts only `none`, so a graded level
+  configured against it is withheld and the model runs at its own default.
+  **`effective_max_output_tokens`** is what `NODUM_LLM_MAX_OUTPUT_TOKENS` is
+  worth against this window — never more than half of it, because the answer and
+  the prompt share the window on a server like `ollama`.
 
 ### History and state
 

@@ -1679,16 +1679,26 @@ class _FakeLLM:
     provider_id = "fake://provider"
     model_id = "fake-model"
     context_tokens = 4096
+    thinking = llm.DEFAULT_THINKING
+    thinking_applied = True
 
     def __init__(self, *replies) -> None:
         self.replies = list(replies)
         self.calls: list[dict] = []
+        self.structured_mode = llm.STRUCTURED_JSON_SCHEMA
 
-    def estimate_prompt_tokens(self, messages) -> int:
+    def estimate_prompt_tokens(self, messages, *, schema=None) -> int:
         return llm.estimate_prompt_tokens(messages)
 
-    def chat(self, messages, *, schema=None, max_output_tokens, timeout):
-        self.calls.append({"messages": list(messages), "schema": schema})
+    def output_reservation(self, max_output_tokens: int) -> int:
+        """The real provider's rule: a reservation capped at a share of the
+        window. An identity function here would model an endpoint that does not
+        exist, and would leave the prompt no room at the shipped ceiling."""
+        share = int(self.context_tokens * llm.OUTPUT_RESERVATION_FRACTION)
+        return max(1, min(max_output_tokens, share))
+
+    def chat(self, messages, *, schema=None, max_output_tokens, timeout, thinking=None):
+        self.calls.append({"messages": list(messages), "schema": schema, "thinking": thinking})
         reply = self.replies[min(len(self.calls) - 1, len(self.replies) - 1)]
         if isinstance(reply, BaseException):
             raise reply
@@ -1920,8 +1930,19 @@ NOT_COMMANDS = frozenset(
         "builtin-gardener",  # the internal agent's id (`nodum grant` takes it)
         "content-disposition",  # an HTTP response header
         "cross-space",  # prose
+        "deepseek-v4-flash",  # a model name (NODUM_LLM_MODEL), not a verb
+        # ollama library model ids, named in the docs because they are the
+        # evidence for why `profile_for` matches an exact hosted id: each one
+        # shares the `deepseek-` prefix with a hosted API and is served locally.
+        "deepseek-coder",
+        "deepseek-coder-v2",
+        "deepseek-llm",
+        "deepseek-r1",
+        "deepseek-v2",
+        "deepseek-v3",
         "faster-whisper",  # the audio extra's package
         "no-store",  # a Cache-Control directive
+        "off-only",  # a rung of the reasoning-capability ladder in `nodum.llm`
         "script-src",  # a CSP directive
     }
 )

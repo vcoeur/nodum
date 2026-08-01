@@ -151,6 +151,10 @@ from pydantic import BaseModel
 
 from nodum import llm, service
 from nodum.llm import (
+    STRUCTURED_JSON_OBJECT,
+    STRUCTURED_JSON_SCHEMA,
+    THINKING_LEVELS,
+    THINKING_NONE,
     Completion,
     ContextOverflow,
     LLMError,
@@ -163,6 +167,13 @@ from nodum.llm import (
 from nodum.principal import Principal
 
 __all__ = [
+    # Re-exported from `nodum.llm` so a peer client like `nodum.answers` can name
+    # a reasoning level or a structured-output mode without importing the
+    # provider module — the same reason `Message` and `Completion` are here.
+    "STRUCTURED_JSON_OBJECT",
+    "STRUCTURED_JSON_SCHEMA",
+    "THINKING_LEVELS",
+    "THINKING_NONE",
     "Budget",
     "BudgetExhausted",
     "Completion",
@@ -226,7 +237,35 @@ DEFAULT_CYCLE_SECONDS = 1800.0
 DEFAULT_REQUEST_BUDGET = 8000
 DEFAULT_REQUEST_SECONDS = 180.0
 DEFAULT_CALL_TIMEOUT = 120.0
-DEFAULT_MAX_OUTPUT_TOKENS = 512
+
+#: The per-call output ceiling, and it is sized for a **reasoning** model
+#: because that is what a remote provider now is.
+#:
+#: 512 was measured against ``deepseek-v4-flash`` as *below the floor at which
+#: anything works at all*: a ceiling sweep on one synthesis prompt was perfectly
+#: bimodal — 300, 400 and 500 gave ``finish_reason: "length"`` and an
+#: unparseable body on every run, 650 and above parsed on every run — so the
+#: shipped default turned every call on that provider into a B3 failure. There
+#: is no parseable-but-degraded band, which is what makes a ``length`` finish
+#: *no result* rather than a short one.
+#:
+#: 4 096 is not "650 plus margin", because the floor is not the number that
+#: matters. What matters is that **thinking is spent out of this same ceiling
+#: and its size cannot be predicted from anything the operator configures**:
+#: measured worst cases are 2 177 reasoning tokens at ``low`` on a five-note
+#: synthesis, 1 174 at ``high`` on a one-line query rewrite, and 1 277 total
+#: output for the single word "ping". Repeated identical calls varied 26x. So
+#: the ceiling is sized against the observed worst case (~2 200) with room for a
+#: full answer beneath it, not against the median.
+#:
+#: It costs nothing where it is large: DeepSeek's own maximum output is 384 000
+#: tokens. Against a small *shared* window — ollama's 4 096, where prompt and
+#: answer come out of one KV cache — it would have eaten the whole thing, which
+#: is why :data:`nodum.llm.OUTPUT_RESERVATION_FRACTION` caps what is actually
+#: reserved and sent at a share of the window. On ollama this number therefore
+#: lands at 2 048, which is the value ``AGENTS.md`` already records as the
+#: measured cure for ``qwen3:8b`` answering with an empty body.
+DEFAULT_MAX_OUTPUT_TOKENS = 4096
 
 #: What :attr:`LLMReport.stop_switch` says for a run wired to a cycle's row:
 #: this run reads ``0015``'s stamps and obeys them.
@@ -344,7 +383,11 @@ class Generation(BaseModel):
     generated_by: GeneratedBy
     prompt_tokens: int
     output_tokens: int
-    latency_ms: int
+    #: The share of :attr:`output_tokens` spent thinking rather than writing.
+    #: A caller sizing its own ceiling needs this and not the total: what has to
+    #: fit is the *content*, and the thinking is what pushes it out.
+    reasoning_tokens: int = 0
+    latency_ms: int = 0
 
 
 class SkippedItem(BaseModel):
@@ -376,7 +419,12 @@ class JobCost(BaseModel):
     failed_calls: int
     prompt_tokens: int
     output_tokens: int
-    exhausted: bool
+    #: The share of ``output_tokens`` this job spent thinking rather than
+    #: writing. Not additional to it — see :attr:`Budget.spent_reasoning_tokens`.
+    reasoning_tokens: int = 0
+    cache_hit_tokens: int = 0
+    cache_miss_tokens: int = 0
+    exhausted: bool = False
 
 
 class LLMReport(BaseModel):
@@ -411,10 +459,30 @@ class LLMReport(BaseModel):
     prompt_tokens: int
     output_tokens: int
     total_tokens: int
-    elapsed_seconds: float
-    exhausted: bool
-    stopped: bool
-    stop_switch: str
+    #: Thinking tokens, a **share of** :attr:`output_tokens` and not an addition
+    #: to :attr:`total_tokens`. A night that spent most of its output allowance
+    #: reasoning is a night one bad sample away from a run of ``length``
+    #: finishes, which on this interface are no result at all — and in
+    #: ``output_tokens`` alone that night is indistinguishable from a productive
+    #: one.
+    reasoning_tokens: int = 0
+    #: Prompt tokens served from the provider's prefix cache, and the ones that
+    #: were not. Reported because they are priced ~50x apart, so a total in
+    #: tokens is not a total in money without them.
+    cache_hit_tokens: int = 0
+    cache_miss_tokens: int = 0
+    elapsed_seconds: float = 0.0
+    exhausted: bool = False
+    stopped: bool = False
+    stop_switch: str = STOP_SWITCH_NONE
+    #: Which ``response_format`` this run's provider uses, and the reasoning
+    #: level it asks for. Both are properties of the *install* rather than of the
+    #: run, and both change what the caller may believe about a body it gets
+    #: back, so they ride with the cost rather than being discoverable only from
+    #: a provider object :class:`AgentRun` deliberately does not hand out.
+    structured_mode: str | None = None
+    thinking: str | None = None
+    thinking_applied: bool = True
     per_job: list[JobCost] = []
     skipped: list[SkippedItem] = []
 
@@ -448,6 +516,17 @@ class Budget:
     parent: Budget | None = None
     spent_prompt_tokens: int = 0
     spent_output_tokens: int = 0
+    #: Thinking tokens, accumulated **beside** the spend rather than inside it.
+    #: They are already counted in :attr:`spent_output_tokens` — a reasoning
+    #: model bills them as ``completion_tokens`` — so a ledger that added them
+    #: would report a night as costing up to twice the bill. Kept because the
+    #: split is the difference between "the output ceiling is generous" and "the
+    #: output ceiling is one excursion from returning nothing".
+    spent_reasoning_tokens: int = 0
+    #: Prompt tokens the provider's prefix cache served, priced ~50x below a
+    #: miss. Without them a token total cannot be turned into a cost at all.
+    cache_hit_tokens: int = 0
+    cache_miss_tokens: int = 0
     calls: int = 0
     failed_calls: int = 0
     started: float | None = None
@@ -595,6 +674,10 @@ class Budget:
         for budget in self.chain:
             budget.spent_prompt_tokens += completion.prompt_tokens
             budget.spent_output_tokens += completion.output_tokens
+            # Beside the spend, never added to it: already inside output_tokens.
+            budget.spent_reasoning_tokens += completion.reasoning_tokens
+            budget.cache_hit_tokens += completion.cache_hit_tokens
+            budget.cache_miss_tokens += completion.cache_miss_tokens
             budget.calls += 1
 
     def note_failure(self) -> None:
@@ -821,7 +904,39 @@ class AgentRun:
         """
         return self._provider.context_tokens if self._provider is not None else None
 
-    def estimate_prompt_tokens(self, messages: Sequence[Message]) -> int:
+    @property
+    def structured_mode(self) -> str | None:
+        """Which ``response_format`` a schema will be sent under, or ``None``.
+
+        Answered here for the same reason :attr:`context_tokens` is: a caller
+        that had to fetch the provider to read it could go on to call it (P3).
+        And it has to be readable, because a provider that fell back to
+        ``json_object`` enforces the schema's *envelope* and none of its
+        *contents* — a ``pattern`` that was a constraint under ``json_schema`` is
+        a sentence in the prompt under the fallback, and a caller trusting the
+        pattern needs to know which it got.
+        """
+        return self._provider.structured_mode if self._provider is not None else None
+
+    @property
+    def thinking(self) -> str | None:
+        """The reasoning level this run's provider asks for, or ``None``."""
+        return self._provider.thinking if self._provider is not None else None
+
+    @property
+    def thinking_applied(self) -> bool:
+        """Whether that level actually reaches the endpoint.
+
+        ``False`` is a configured knob doing nothing — ollama answers 400 to
+        every graded level, so one is withheld there and the model runs at its
+        own default. Silence about that would be a setting a human can read back
+        from their own environment and cannot see the effect of.
+        """
+        return self._provider.thinking_applied if self._provider is not None else True
+
+    def estimate_prompt_tokens(
+        self, messages: Sequence[Message], *, schema: dict[str, Any] | None = None
+    ) -> int:
         """The provider's own over-count of what these messages will cost.
 
         The other thing a prompt builder needs — and it must be the *provider's*
@@ -836,7 +951,27 @@ class AgentRun:
         """
         if self._provider is None:
             raise ProviderUnavailable(self.unavailable_reason or "no LLM provider configured")
-        return self._provider.estimate_prompt_tokens(messages)
+        return self._provider.estimate_prompt_tokens(messages, schema=schema)
+
+    def output_reservation(self, max_output_tokens: int | None = None) -> int:
+        """How much of the window a call will really keep back for its answer.
+
+        **The one place that arithmetic lives.** A caller fitting a prompt needs
+        the same number the provider will refuse against, and
+        ``window - max_output_tokens`` computed independently by the caller is a
+        second rule free to disagree — which it did the moment the default
+        ceiling was sized for a reasoning model: 4 096 subtracted from a
+        4 096-token window left a prompt exactly no room, so every ``/ask``
+        refused with "the question alone fills this model's context window" on a
+        provider that would have answered it.
+
+        Returns 0 with no provider, which is the same "there is no honest
+        number" posture :attr:`context_tokens` takes by answering ``None``.
+        """
+        ceiling = self.max_output_tokens if max_output_tokens is None else max_output_tokens
+        if self._provider is None:
+            return 0
+        return self._provider.output_reservation(ceiling)
 
     def generated_by(self, prompt_version_hash: str) -> GeneratedBy:
         """The provenance object for a write this run's text caused (A1)."""
@@ -907,6 +1042,7 @@ class AgentRun:
         item_id: str | None = None,
         max_output_tokens: int | None = None,
         timeout: float | None = None,
+        thinking: str | None = None,
     ) -> Generation:
         """Make one provider call, metered, bounded and attributable (P3).
 
@@ -935,6 +1071,14 @@ class AgentRun:
                 number that dropped.
             max_output_tokens: Per-call output ceiling; defaults to the run's.
             timeout: Per-call wall-clock ceiling; defaults to the run's.
+            thinking: Per-call-site reasoning level, overriding the global
+                :data:`~nodum.llm.ENV_THINKING` one. ``None`` leaves the global
+                default in force, which is what almost every call site wants.
+                The exceptions are measured rather than guessed: a reachability
+                probe returns an **empty body** at any graded level because
+                thinking eats its whole ceiling, and a query rewrite is an
+                8-term keyword expansion whose thinking varied 26x across twelve
+                samples for no change in the terms.
 
         Returns:
             A whole :class:`Generation`.
@@ -985,6 +1129,7 @@ class AgentRun:
                 schema=schema,
                 max_output_tokens=output_ceiling,
                 timeout=call_timeout,
+                thinking=thinking,
             )
         except PromptTooLong as failure:
             # Refused before the wire: no tokens spent, nothing to charge, and
@@ -1029,6 +1174,7 @@ class AgentRun:
             generated_by=self.generated_by(prompt_version),
             prompt_tokens=completion.prompt_tokens,
             output_tokens=completion.output_tokens,
+            reasoning_tokens=completion.reasoning_tokens,
             latency_ms=completion.latency_ms,
         )
 
@@ -1066,10 +1212,16 @@ class AgentRun:
             prompt_tokens=self.budget.spent_prompt_tokens,
             output_tokens=self.budget.spent_output_tokens,
             total_tokens=self.budget.spent_tokens,
+            reasoning_tokens=self.budget.spent_reasoning_tokens,
+            cache_hit_tokens=self.budget.cache_hit_tokens,
+            cache_miss_tokens=self.budget.cache_miss_tokens,
             elapsed_seconds=round(self.budget.elapsed_seconds, 3),
             exhausted=bool(self._ceilings_hit),
             stopped=self.stopped,
             stop_switch=self.stop_switch,
+            structured_mode=self.structured_mode,
+            thinking=self.thinking,
+            thinking_applied=self.thinking_applied,
             per_job=[
                 JobCost(
                     job=budget.name,
@@ -1078,6 +1230,9 @@ class AgentRun:
                     failed_calls=budget.failed_calls,
                     prompt_tokens=budget.spent_prompt_tokens,
                     output_tokens=budget.spent_output_tokens,
+                    reasoning_tokens=budget.spent_reasoning_tokens,
+                    cache_hit_tokens=budget.cache_hit_tokens,
+                    cache_miss_tokens=budget.cache_miss_tokens,
                     exhausted=budget.name in self._ceilings_hit,
                 )
                 for budget in self._jobs.values()
