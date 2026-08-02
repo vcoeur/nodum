@@ -1014,6 +1014,7 @@ def create_node(
     parent_id: str | None = None,
     props: dict[str, Any] | None = None,
     space: str | None = None,
+    landing: str | None = None,
     principal: Principal,
     path: str | Path | None = None,
 ) -> NodeOut:
@@ -1033,6 +1034,11 @@ def create_node(
             in the same space — the document tree does not cross spaces).
         props: Free-form JSON-object metadata.
         space: Target space id or name (default: the ``main`` space).
+        landing: The writer's own ceiling on the landing state (design §8.3 —
+            a grant is a ceiling, not a mandate): ``"proposed"`` files the
+            node for review even when the grant would have written it live.
+            It can only lower; asking for more than the grant allows is
+            refused (:func:`Store.cap_landing`).
         principal: Who is writing (default: the trusted-local owner).
         path: Explicit database path.
 
@@ -1040,7 +1046,9 @@ def create_node(
         The created node.
 
     Raises:
-        GrantNotPermitted: If the principal has no write grant on the space.
+        GrantNotPermitted: If the principal has no write grant on the space,
+            or ``landing`` asks for more than the grant allows.
+        ValueError: If ``landing`` is not a state a write can land in.
     """
     conn = _connect(path)
     try:
@@ -1060,7 +1068,7 @@ def create_node(
                     f"{parent['space_id']!r}, target is {target_space!r}"
                 )
         node_id = uuid.uuid4().hex
-        state = store.landing_state(target_space)
+        state = store.landing_state(target_space, landing)
         # A space is an ordinary node, so this is the path a raw
         # `node create --type space` takes past `create_space` — both space
         # rules have to sit here or that path is the way around them. After the

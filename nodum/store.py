@@ -91,20 +91,27 @@ class Store:
 
     # ── Writes ────────────────────────────────────────────────────────────
 
-    def landing_state(self, space_id: str | None) -> str:
+    def landing_state(self, space_id: str | None, landing: str | None = None) -> str:
         """The state a node create lands in on ``space_id`` (``active``/``proposed``).
 
+        Args:
+            landing: The writer's own ceiling on the result (see
+                :meth:`cap_landing`); ``None`` takes the grant's own level.
+
         Raises:
+            ValueError: If ``landing`` is not in :data:`LANDING_STATES`.
             GrantNotPermitted: If the principal may not write the space at all.
         """
         level = self.principal.level_on(space_id)
         if level >= EDIT:
-            return "active"
-        if level >= SUGGEST:
-            return "proposed"
-        raise GrantNotPermitted(
-            f"{self.principal.actor_string} has no write grant on space {space_id!r}"
-        )
+            granted = "active"
+        elif level >= SUGGEST:
+            granted = "proposed"
+        else:
+            raise GrantNotPermitted(
+                f"{self.principal.actor_string} has no write grant on space {space_id!r}"
+            )
+        return self.cap_landing(granted, landing)
 
     def edge_landing_state(
         self,

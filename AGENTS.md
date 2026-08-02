@@ -86,8 +86,8 @@ a live token-bearing account under the prefix), the **curative tier**
 (`merge_nodes`, `retype`, `supersede_edge`, `bulk_relink` — §8.2), **cycle
 rollback** (`service.rollback_cycle`, human-only and atomic), the **landing
 seam** (`store.cap_landing` plus a keyword-only `landing=` on `create_edge` /
-`propose_edges`: §8.3's grant-is-a-ceiling, which is what puts the gardener's
-inferences in the review queue), the **consolidation runner**
+`propose_edges` / `create_node`: §8.3's grant-is-a-ceiling, which is what puts
+the gardener's inferences in the review queue), the **consolidation runner**
 (`nodum.consolidate` — four deterministic jobs and five coherence metrics,
 running as a peer client over the public service API), the **nightly
 scheduler** (`nodum.scheduler`, one asyncio task in `nodum serve`'s lifespan,
@@ -529,8 +529,9 @@ commands on a saved node for exactly this reason.
   path no test can reach honestly. A pre-fix accept-then-reverse leaves its
   version on `applied`; putting it back is a `versions` UPDATE, not a mechanism.
   Finally, the **landing seam**: `Store.cap_landing` and a
-  keyword-only `landing=` on `create_edge`/`propose_edges` let a writer file
-  below its own grant (§8.3 — a grant is a **ceiling, not a mandate**). It only
+  keyword-only `landing=` on `create_edge`/`propose_edges`/`create_node` let a
+  writer file below its own grant (§8.3 — a grant is a **ceiling, not a
+  mandate**). It only
   ever lowers; asking to land *above* the grant is refused rather than quietly
   downgraded, because a caller that named a state and silently got another one
   has been told nothing.
