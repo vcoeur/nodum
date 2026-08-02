@@ -574,14 +574,15 @@ def test_space_admin_over_the_cli(fresh_db):
     assert created["type"] == "space"
     assert created["space_id"] == "meta"
     spaces = _run_json("space-list", "--as", "owner")
-    assert {s["title"] for s in spaces["spaces"]} == {"main", "meta", "sandbox"}
+    # `conventions` (migration 0016) is a real space, listed like any other.
+    assert {s["title"] for s in spaces["spaces"]} == {"main", "meta", "conventions", "sandbox"}
 
     renamed = _run_json("space-rename", "sandbox", "scratch", "--as", "owner")
     assert (renamed["id"], renamed["title"]) == (created["id"], "scratch")
 
     _run_json("space-archive", created["id"], "--as", "owner")
     spaces = _run_json("space-list", "--as", "owner")
-    assert {s["title"] for s in spaces["spaces"]} == {"main", "meta"}
+    assert {s["title"] for s in spaces["spaces"]} == {"main", "meta", "conventions"}
 
 
 def test_the_cli_inherits_the_space_guards_from_the_service(fresh_db):
@@ -622,6 +623,7 @@ def test_the_cli_inherits_the_space_guards_from_the_service(fresh_db):
     assert {s["title"] for s in _run_json("space-list", "--as", "owner")["spaces"]} == {
         "main",
         "meta",
+        "conventions",
         "research",
     }
     # Renaming a structural space is still fine — the id is what things depend on.

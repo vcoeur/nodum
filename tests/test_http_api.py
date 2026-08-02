@@ -3667,21 +3667,24 @@ def test_grants_grant_list_and_revoke(client, fresh_db):
 def test_spaces_lists_active_spaces_only(client, fresh_db):
     """The grant-admin space picker: active spaces, archived ones drop out."""
     seeded = _ok(client.get("/api/spaces"))
+    # `conventions` (migration 0016) is a real space, listed like any other.
     assert [(space["id"], space["type"]) for space in seeded["spaces"]] == [
         ("meta", "space"),
         ("main", "space"),
+        ("conventions", "space"),
     ]
 
     space = _ok(client.post("/api/spaces", json={"name": "scratch"}))
     assert [row["id"] for row in _ok(client.get("/api/spaces"))["spaces"]] == [
         "meta",
         "main",
+        "conventions",
         space["id"],
     ]
 
     service.transition(space["id"], "archive", principal=owner())
     remaining = _ok(client.get("/api/spaces"))
-    assert [row["id"] for row in remaining["spaces"]] == ["meta", "main"]
+    assert [row["id"] for row in remaining["spaces"]] == ["meta", "main", "conventions"]
 
 
 def test_a_structural_space_cannot_be_archived_over_http(client, fresh_db):
@@ -3697,7 +3700,11 @@ def test_a_structural_space_cannot_be_archived_over_http(client, fresh_db):
         assert "cannot archive the 'main' space" in refused.json()["error"]["message"]
 
     assert client.post("/api/spaces/meta/archive").status_code == 400
-    assert [row["id"] for row in _ok(client.get("/api/spaces"))["spaces"]] == ["meta", "main"]
+    assert [row["id"] for row in _ok(client.get("/api/spaces"))["spaces"]] == [
+        "meta",
+        "main",
+        "conventions",
+    ]
 
     # Rename stays allowed: it moves the title, not the id everything depends on.
     renamed = _ok(client.post("/api/spaces/main/rename", json={"name": "trunk"}))
@@ -3729,6 +3736,7 @@ def test_two_spaces_cannot_share_a_name_over_http(client, fresh_db):
     assert [row["title"] for row in _ok(client.get("/api/spaces"))["spaces"]] == [
         "meta",
         "main",
+        "conventions",
         "research",
         "draft",
     ]
@@ -3744,7 +3752,11 @@ def test_an_archived_space_keeps_its_name_and_the_refusal_says_so(client, fresh_
     """
     space = _ok(client.post("/api/spaces", json={"name": "research"}))
     _ok(client.post(f"/api/spaces/{space['id']}/archive"))
-    assert [row["id"] for row in _ok(client.get("/api/spaces"))["spaces"]] == ["meta", "main"]
+    assert [row["id"] for row in _ok(client.get("/api/spaces"))["spaces"]] == [
+        "meta",
+        "main",
+        "conventions",
+    ]
 
     refused = client.post("/api/spaces", json={"name": "research"})
     assert refused.status_code == 409
@@ -3757,6 +3769,7 @@ def test_an_archived_space_keeps_its_name_and_the_refusal_says_so(client, fresh_
     assert [row["id"] for row in _ok(client.get("/api/spaces"))["spaces"]] == [
         "meta",
         "main",
+        "conventions",
         space["id"],
     ]
 
@@ -3793,7 +3806,11 @@ def test_posting_a_space_typed_node_outside_meta_is_a_400(client, fresh_db):
 
     assert refused.status_code == 400
     assert "a space must live in the 'meta' space" in refused.json()["error"]["message"]
-    assert [row["id"] for row in _ok(client.get("/api/spaces"))["spaces"]] == ["meta", "main"]
+    assert [row["id"] for row in _ok(client.get("/api/spaces"))["spaces"]] == [
+        "meta",
+        "main",
+        "conventions",
+    ]
 
     # Aimed at meta it is an ordinary space create, exactly as `POST /api/spaces` is.
     landed = _ok(client.post("/api/nodes", json={"type": "space", "title": "s", "space": "meta"}))
@@ -3837,7 +3854,11 @@ def test_archiving_a_space_over_http_leaves_its_grant_inert_but_revocable(client
 
     _ok(client.post(f"/api/spaces/{space['id']}/archive"))
 
-    assert [row["id"] for row in _ok(client.get("/api/spaces"))["spaces"]] == ["meta", "main"]
+    assert [row["id"] for row in _ok(client.get("/api/spaces"))["spaces"]] == [
+        "meta",
+        "main",
+        "conventions",
+    ]
     held = _ok(client.get("/api/grants?agent=researcher"))["grants"]
     assert (space["id"], "edit") in {(row["space_id"], row["level"]) for row in held}
     # Granting more on it is refused rather than silently conferring nothing.
@@ -3894,7 +3915,11 @@ def test_the_space_lifecycle_round_trips_over_http(client, fresh_db):
 
     archived = _ok(client.post(f"/api/spaces/{space['id']}/archive"))
     assert archived["state"] == "archived"
-    assert [row["title"] for row in _ok(client.get("/api/spaces"))["spaces"]] == ["meta", "main"]
+    assert [row["title"] for row in _ok(client.get("/api/spaces"))["spaces"]] == [
+        "meta",
+        "main",
+        "conventions",
+    ]
     assert client.post("/api/spaces", json={}).status_code == 400
 
 

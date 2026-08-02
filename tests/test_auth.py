@@ -224,8 +224,9 @@ def test_internal_principal_loads_the_gardener_with_its_grants(fresh_db):
     # `read` on meta, `edit` on main — the shape every curating agent in this
     # suite holds. Consolidation only ever *reads* the type vocabulary; what
     # `edit` on meta bought was authority no job reaches (see
-    # `tests/test_migrations.py`).
-    assert principal.grants == {"meta": "read", "main": "edit"}
+    # `tests/test_migrations.py`). Migration `0016` adds `edit` on its own
+    # conventions space, as ordinary a row as the first two.
+    assert principal.grants == {"meta": "read", "main": "edit", "conventions": "edit"}
 
 
 def test_internal_principal_reads_grants_through_the_same_archived_space_filter(fresh_db):
@@ -258,7 +259,23 @@ def test_a_disabled_gardener_is_refused_rather_than_loaded(fresh_db):
     assert auth.internal_principal().id == GARDENER_AGENT_ID
 
 
-def test_an_absent_internal_agent_is_a_refusal_not_an_empty_principal(fresh_db):
+def test_an_absent_internal_agent_is_a_refusal_not_an_empty_principal(tmp_path, monkeypatch):
+    """An absent internal agent is a refusal, not an empty principal.
+
+    The database is built stopped at 0015: removing the gardener's grants is
+    part of the setup (the agent row cannot go while they reference it), and a
+    file recording `0016` with the gardener's `conventions` grant gone is drift
+    `_write_seam_problems` refuses at init — the consistency check would fire
+    before this test's own refusal could.
+    """
+    path = tmp_path / "at0015.db"
+    monkeypatch.setenv("NODUM_DB", str(path))
+    monkeypatch.setattr(
+        db,
+        "MIGRATIONS",
+        [entry for entry in db.MIGRATIONS if entry[0] != "0016_conventions_and_annotations"],
+    )
+    service.init()
     conn = db.connect()
     try:
         conn.execute("DELETE FROM grants WHERE agent_id = ?", (GARDENER_AGENT_ID,))
