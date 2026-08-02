@@ -1623,13 +1623,21 @@ def _proposal_signals(proposal: Any) -> list[str]:
     return signals if isinstance(signals, list) else []
 
 
-def _auto_accept_control(context: _Context) -> tuple[float | None, str | None]:
+def _auto_accept_control(
+    context: _Context,
+) -> tuple[float | None, str | None, tuple[str, object] | None]:
     """The ``conventions``-space note setting :data:`AUTO_ACCEPT_PROPS_KEY`.
 
     Read through the public surface (``list_nodes(space=…)``) so it answers
     the same on a scoped cycle, where ``context.nodes()`` would not reach the
-    conventions space. Returns ``(threshold, note id)``; ``(None, None)`` when
-    no non-archived conventions note carries a numeric ``auto_accept_above``.
+    conventions space. Returns ``(threshold, note id, malformed)``: the
+    threshold and the note carrying it when a non-archived conventions note
+    sets a numeric ``auto_accept_above`` — a numeric *string* counts, since a
+    human editing graph props writes ``"0.9"`` — else ``(None, None,
+    malformed)``, where ``malformed`` names the ``(note id, value)`` of the
+    first note whose value is not a number. The malformed value is reported
+    rather than silently ignored, because "no conventions-space note sets it"
+    would then be false.
     """
     notes = service.list_nodes(
         space=CONVENTIONS_SPACE_ID,
@@ -1637,13 +1645,24 @@ def _auto_accept_control(context: _Context) -> tuple[float | None, str | None]:
         limit=MAX_SCAN_NODES,
         path=context.path,
     )
+    malformed: tuple[str, object] | None = None
     for note in notes:
         if note.state == "archived":
             continue
-        threshold = note.props.get(AUTO_ACCEPT_PROPS_KEY)
-        if isinstance(threshold, (int, float)) and not isinstance(threshold, bool):
-            return float(threshold), note.id
-    return None, None
+        value = note.props.get(AUTO_ACCEPT_PROPS_KEY)
+        if isinstance(value, bool):
+            malformed = malformed or (note.id, value)
+            continue
+        if isinstance(value, (int, float)):
+            return float(value), note.id, None
+        if isinstance(value, str):
+            try:
+                return float(value), note.id, None
+            except ValueError:
+                malformed = malformed or (note.id, value)
+                continue
+        malformed = malformed or (note.id, value)
+    return None, None, malformed
 
 
 def _job_curation(context: _Context) -> JobOutcome:
@@ -1850,21 +1869,29 @@ def _job_curation(context: _Context) -> JobOutcome:
     outcome.detail["annotations"] = annotation_ids
 
     # §L3: auto-accept is a real interface, read and reported, and OFF.
-    threshold, control = _auto_accept_control(context)
+    threshold, control, malformed = _auto_accept_control(context)
     outcome.detail["auto_accept"] = {"enabled": False, "threshold": threshold}
-    if threshold is None:
-        outcome.notes.append(
-            f"auto-accept is off: no conventions-space note sets "
-            f"'{AUTO_ACCEPT_PROPS_KEY}', so this cycle only wrote conventions and "
-            "annotations — nothing was accepted on any proposer's rate"
-        )
-    else:
+    if threshold is not None:
         outcome.notes.append(
             f"auto-accept is off: conventions note {control} sets "
             f"'{AUTO_ACCEPT_PROPS_KEY}' to {threshold}, and the job read it — but the "
             "accept direction is not implemented (the measured evidence put its misses "
             "there), so nothing was accepted. Turning it on means implementing the accept "
             "path behind that threshold; it never gates on the proposer's own confidence"
+        )
+    elif malformed is not None:
+        malformed_id, malformed_value = malformed
+        outcome.notes.append(
+            f"auto-accept is off: conventions note {malformed_id} sets "
+            f"'{AUTO_ACCEPT_PROPS_KEY}' to {malformed_value!r}, which is not a number, "
+            "so it was ignored — this cycle only wrote conventions and annotations, and "
+            "nothing was accepted on any proposer's rate"
+        )
+    else:
+        outcome.notes.append(
+            f"auto-accept is off: no conventions-space note sets "
+            f"'{AUTO_ACCEPT_PROPS_KEY}', so this cycle only wrote conventions and "
+            "annotations — nothing was accepted on any proposer's rate"
         )
 
     if context.dry_run:

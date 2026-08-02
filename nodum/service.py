@@ -2512,7 +2512,7 @@ def annotate(
     if not isinstance(body, dict):
         raise ValueError("annotation body must be a JSON object")
     try:
-        encoded = json.dumps(body, ensure_ascii=False)
+        encoded = json.dumps(body, ensure_ascii=False, allow_nan=False)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"annotation body must be JSON-serialisable: {exc}") from None
     conn = _connect(path)
@@ -2547,8 +2547,10 @@ def annotate(
         written = _row_dict(
             conn.execute("SELECT * FROM annotations WHERE id = ?", (annotation_id,)).fetchone()
         )
-        conn.commit()
-        return AnnotationOut(
+        # The return value is built before the commit so a validation failure
+        # lands pre-commit: `finally: conn.close()` then rolls back the whole
+        # DELETE+INSERT pair, keeping "the row as written, or nothing" honest.
+        out = AnnotationOut(
             id=written["id"],
             target_kind=target_kind,
             target_id=str(written[target_column]),
@@ -2557,6 +2559,8 @@ def annotate(
             cycle_id=written["cycle_id"],
             created_at=written["created_at"],
         )
+        conn.commit()
+        return out
     finally:
         conn.close()
 
@@ -5032,7 +5036,7 @@ def request_stop(
     would buy seconds and cost a torn transaction.
 
     **What checks it today is one of those three points**: :meth:`nodum.agent.
-    AgentRun.chat`, immediately before a provider call. The four deterministic
+    AgentRun.chat`, immediately before a provider call. The five deterministic
     jobs in :mod:`nodum.consolidate` make no provider call and read this switch
     nowhere, so a stop recorded against one of those runs is kept on the row and
     the run finishes — the abstraction job (5b-ii's first) is the exception: it

@@ -96,6 +96,7 @@ function proposal(
     edge: null,
     version: null,
     context: {},
+    annotation: null,
   };
 }
 

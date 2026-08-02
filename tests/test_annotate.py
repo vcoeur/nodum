@@ -103,6 +103,29 @@ def test_annotate_rejects_a_non_json_body(fresh_db):
     assert _rows() == []
 
 
+def test_annotate_rejects_a_nan_body_before_any_write(fresh_db):
+    """NaN/Infinity pass ``json.dumps``' default ``allow_nan`` and would be
+    stored as literal invalid JSON no strict ``JSON.parse`` accepts — the
+    guard has to refuse them up front, like any other unserialisable value."""
+    node = service.create_node(type="note", title="Bot note", principal=owner())
+    with pytest.raises(ValueError, match="JSON"):
+        service.annotate("node", node.id, {"rate": float("nan")}, principal=owner())
+    assert _rows() == []
+
+
+def test_annotate_rejects_a_non_string_body_key_before_any_write(fresh_db):
+    """``json.dumps`` coerces a non-string key (``{1: "a"}`` serialises as
+    ``{"1": "a"}``), but the model's ``dict[str, Any]`` does not accept it —
+    so the failure must land before the commit, or the DELETE+INSERT pair
+    would persist a row the caller was told did not write."""
+    from pydantic import ValidationError
+
+    node = service.create_node(type="note", title="Bot note", principal=owner())
+    with pytest.raises(ValidationError):
+        service.annotate("node", node.id, {1: "a"}, principal=owner())
+    assert _rows() == []
+
+
 def test_an_annotation_is_cycle_stamped_when_written_in_a_cycle(fresh_db):
     """`annotate` reads the ambient cycle like `_emit` does, so a night's
     annotations roll back with the night."""

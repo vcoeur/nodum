@@ -1048,7 +1048,7 @@ def test_a_zero_budget_is_still_a_legitimate_setting(monkeypatch):
 def test_the_wall_clock_starts_at_the_first_call_and_not_when_the_run_is_built(monkeypatch):
     """``for_cycle`` is built when the cycle opens, and the LLM jobs run last.
 
-    With the clock started at construction, the four deterministic jobs' minutes
+    With the clock started at construction, the five deterministic jobs' minutes
     were charged to the LLM's wall-clock ceiling — a report saying the model
     spent time it never had, and a ceiling partly spent before the first prompt
     was built. On a slow graph that is the whole ceiling.

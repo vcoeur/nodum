@@ -99,11 +99,11 @@ filesystem with the graph.
 **consolidation cycle** groups a run of writes under one id, so `nodum rollback`
 can take the whole of it back — all of it, or none of it, and it refuses rather
 than clobbers when the graph has moved on. The **gardener** is an internal agent
-with ordinary grants that runs four deterministic jobs (duplicate candidates,
-link pruning and inference, housekeeping, a neglect report) plus the
-abstraction job — 5b-ii's first, which synthesizes a `concept` node from a
-dense, sized cluster of related notes when `NODUM_LLM_CYCLE_BUDGET` funds it —
-and files what it
+with ordinary grants that runs five deterministic jobs (duplicate candidates,
+link pruning and inference, queue curation, housekeeping, a neglect report)
+plus the abstraction job — 5b-ii's first, which synthesizes a `concept` node
+from a dense, sized cluster of related notes when `NODUM_LLM_CYCLE_BUDGET` funds
+it — and files what it
 infers in the review queue rather than asserting it. A **curative tier**
 (`merge-nodes`, `retype`, `supersede-edge`, `bulk-relink`) changes structure
 rather than adding to it, each operation inside a cycle. A **dream journal**

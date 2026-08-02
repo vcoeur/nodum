@@ -286,14 +286,15 @@ cycle quietly drop the vector signal until you re-run the download.
   is most needed and where it used to arrive as `storage error`. It holds no
   credential at all: it authenticates by being in-process, so there is nothing
   to present and nothing to steal, and the supported way to stop it is
-  `nodum agent disable builtin-gardener`. Its four deterministic jobs are
+  `nodum agent disable builtin-gardener`. Its five deterministic jobs are
   arithmetic over data
   the file already holds — duplicate candidates by title similarity and
   embedding cosine, exact-duplicate and dangling-edge pruning, `relates_to`
-  inference from embedding proximity and co-citation, a fractional-position
+  inference from embedding proximity and co-citation, per-proposer acceptance
+  rates filed as convention notes and queue annotations, a fractional-position
   check, embedding catch-up, and a report of what nobody has touched in ninety
   days. No model is involved in those, and it runs fine on a machine that has
-  none. The fifth job, **abstraction**, is 5b-ii's first and the deliberate
+  none. The one LLM job, **abstraction**, is 5b-ii's first and the deliberate
   exception: its selection is the same kind of arithmetic (dense, sized, fresh
   clusters of the `relates_to` graph, cohesive past the link bar), and the
   model — called only after the gates pass, and only when

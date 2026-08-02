@@ -655,7 +655,7 @@ class Budget:
 
         The clock belongs to the *model use*, not to the object. ``for_cycle``
         is built when the cycle opens and the LLM jobs run last, so a clock
-        started at construction charged the four deterministic jobs' minutes to
+        started at construction charged the five deterministic jobs' minutes to
         the LLM's ceiling: a report saying the model spent time it never had,
         and — on a slow graph — a ceiling largely spent before the first prompt
         was built. It reaches the whole chain because a child copies its

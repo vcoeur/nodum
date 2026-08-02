@@ -1,7 +1,7 @@
 """The consolidation runner: the deterministic jobs and the coherence metrics.
 
 Phase 5a, the near side of the LLM line (design §8.4/§8.5). What is tested here
-is the half of the gardener that is arithmetic: four deterministic jobs, the
+is the half of the gardener that is arithmetic: five deterministic jobs, the
 abstraction job's deterministic selection (5b-ii's first LLM job — the model
 writes the text and never decides *whether* to synthesize), five metrics, one
 cycle around all of it, and the rails that keep the internal agent a *peer
@@ -2427,6 +2427,80 @@ def test_a_set_auto_accept_control_is_read_and_still_off(fresh_db):
     assert proposal.id == pending.id
 
 
+def test_a_numeric_string_auto_accept_control_reads_as_the_number(fresh_db):
+    """A human editing graph props writes ``"0.9"``, not ``0.9`` — the control
+    has to read the same either way, or a set threshold is silently ignored."""
+    service.create_node(
+        type="note",
+        title="Curation control",
+        content="",
+        space="conventions",
+        props={"auto_accept_above": "0.9"},
+        principal=owner(),
+    )
+
+    outcome = _curation_outcome(_run(jobs=[consolidate.JOB_CURATION]).report)
+
+    assert outcome.detail["auto_accept"] == {"enabled": False, "threshold": 0.9}
+    assert any("sets 'auto_accept_above' to 0.9" in note for note in outcome.notes)
+
+
+def test_a_malformed_auto_accept_control_is_named_not_ignored(fresh_db):
+    """A value that is not a number cannot be a threshold — but the report has
+    to say the note set one, not that no conventions-space note sets it at all."""
+    control = service.create_node(
+        type="note",
+        title="Curation control",
+        content="",
+        space="conventions",
+        props={"auto_accept_above": "garbage"},
+        principal=owner(),
+    )
+
+    outcome = _curation_outcome(_run(jobs=[consolidate.JOB_CURATION]).report)
+
+    assert outcome.detail["auto_accept"] == {"enabled": False, "threshold": None}
+    assert any(control.id in note and "not a number" in note for note in outcome.notes)
+    assert not any("no conventions-space note sets" in note for note in outcome.notes)
+
+
+def test_the_curation_window_counts_a_row_exactly_at_the_edge(fresh_db, monkeypatch):
+    """The quarter is open past the boundary, not at it: ``> 90`` days skips a
+    row older than the window, and a row *exactly* at it still counts.
+
+    The `>` vs `>=` off-by-one is invisible in the copy and changes one row per
+    proposer — this pins it with a clock the run cannot disagree with and
+    timestamps written relative to it.
+    """
+    pinned = datetime(2026, 8, 2, 12, 0, 0, tzinfo=UTC)
+    monkeypatch.setattr(consolidate, "_utcnow", lambda: pinned)
+
+    proposer = agent("researcher")
+    alpha = _node("Alpha", type="concept")
+    beta = _node("Beta", type="concept")
+    at_the_edge = service.create_edge(alpha.id, beta.id, "supports", principal=proposer)
+    service.transition(at_the_edge.id, "accept", principal=owner())
+    past_it = service.create_edge(beta.id, alpha.id, "supports", principal=proposer)
+    service.transition(past_it.id, "reject", principal=owner())
+
+    conn = db.connect()
+    try:
+        for row_id, days in ((at_the_edge.id, 90), (past_it.id, 91)):
+            conn.execute(
+                "UPDATE edges SET created_at = ? WHERE id = ?",
+                ((pinned - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S"), row_id),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    outcome = _curation_outcome(_run(jobs=[consolidate.JOB_CURATION]).report)
+
+    (entry,) = [item for item in outcome.detail["acceptance"] if item["type"] == "supports"]
+    assert entry["accepted"] == 1
+    assert entry["rejected"] == 0
+
+
 def test_curation_dry_run_writes_nothing(fresh_db):
     """A rehearsal computes the rates and records what it would write."""
     proposer = agent("researcher")
@@ -2486,6 +2560,33 @@ def test_curation_reads_row_state_and_no_event_log():
         and node.value.id == "agent"
     ]
     assert agent_uses == [], "the curation job must not touch the model runtime"
+
+
+def test_the_curation_job_gates_nothing_on_confidence():
+    """§8.3's rail for the learned half: the proposer's own ``confidence`` is
+    echoed at most, never compared. The stop-switch rail confines by call
+    name; this one confines by data — no gating expression inside the curation
+    job may reference ``confidence`` at all, as a name or as the props key, so
+    a threshold crept into a comparison fails this test."""
+    module = _module_ast()
+    curation = next(
+        node
+        for node in module.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_job_curation"
+    )
+    gates = [
+        node.test for node in ast.walk(curation) if isinstance(node, (ast.If, ast.While, ast.IfExp))
+    ] + [node for node in ast.walk(curation) if isinstance(node, ast.Compare)]
+    referencing = [
+        ast.unparse(gate)
+        for gate in gates
+        for node in ast.walk(gate)
+        if (isinstance(node, ast.Name) and node.id == "confidence")
+        or (isinstance(node, ast.Constant) and node.value == "confidence")
+    ]
+    assert referencing == [], (
+        f"a gating expression in the curation job references `confidence`: {referencing}"
+    )
 
 
 # ── The structural rail: no service-layer bypass ─────────────────────────────
@@ -2599,9 +2700,10 @@ def test_the_deterministic_runner_consults_no_stop_switch_and_the_copy_says_so(
 
     ``nodum cycle-stop`` and ``POST /api/cycles/{id}/stop`` record an instruction
     the *run* is supposed to notice, and the only thing that notices one today is
-    :meth:`nodum.agent.AgentRun.chat`, before a provider call. The four
-    **deterministic** jobs make no provider call and no stop check — so a stop
-    asked for during one of their runs is recorded and that run finishes. The
+    :meth:`nodum.agent.AgentRun.chat`, before a provider call. The five
+    **deterministic** jobs — duplicates, links, curation, housekeeping, neglect
+    — make no provider call and no stop check, so a stop asked for during one of
+    their runs is recorded and that run finishes. The
     abstraction job (5b-ii's first) is the deliberate exception, and it is the
     thing the copy now names: it reaches the model through ``AgentRun.chat``,
     which is the stop check. Every surface says exactly that, and this is what

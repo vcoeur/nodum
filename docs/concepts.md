@@ -210,7 +210,7 @@ is minted once when a run starts, so a cycle already in flight finishes under
 the grants it began with. A cycle is minutes at most, and rolling it back takes
 back whatever it wrote in the meantime.
 
-Its four jobs are arithmetic over data the file already holds — no model is
+Its five jobs are arithmetic over data the file already holds — no model is
 involved in them, and a cycle runs fine on a machine that has none:
 
 - **Duplicate candidates** — normalised title equality, near-equality, and
@@ -220,6 +220,10 @@ involved in them, and a cycle runs fine on a machine that has none:
 - **Link maintenance** — the two prunings a machine can be right about (an exact
   duplicate edge, an edge incident to an archived node), then `relates_to`
   inference from embedding proximity and shared neighbours.
+- **Queue curation** — each proposer's acceptance rate over the last ninety
+  days, from row state only, recorded as a convention note in the
+  `conventions` space and one annotation per queue item. It never accepts and
+  never rejects.
 - **Housekeeping** — the fractional-position check, and embedding catch-up by
   running the `vec` projector rather than growing a second embedding path that
   could disagree with search.
@@ -227,7 +231,7 @@ involved in them, and a cycle runs fine on a machine that has none:
   and writes nothing. Age is arithmetic; deciding something has gone *stale* is
   judgement, and judgement is a later phase.
 
-The fifth job, **abstraction** (5b-ii's first), is the deliberate exception —
+The one LLM job, **abstraction** (5b-ii's first), is the deliberate exception —
 and it is cut to the same discipline. Its *selection* is the same kind of
 arithmetic: connected clusters of the `relates_to` graph that are dense enough
 (at least as many edges as members), sized right, not already synthesized, and

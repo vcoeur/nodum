@@ -1063,7 +1063,7 @@ export const STOP_ACTION_LABEL = "Stop this cycle";
  * What a stop actually gets, said in one place because four surfaces say it.
  *
  * `AgentRun.chat` checks the switch immediately before a provider call and that
- * is the only check that exists: the four deterministic consolidation jobs make
+ * is the only check that exists: the five deterministic consolidation jobs make
  * no provider call, so a stop recorded against one of those runs is kept on the
  * entry and the run finishes — to `completed`, if nothing else went wrong. The
  * abstraction job (5b-ii's first) is the exception: it reaches the model
@@ -1213,7 +1213,7 @@ export function stopRecord(cycle: CycleOut): { by: string; at: string } | null {
  *
  * The last line is the one that costs something to say and is said anyway.
  * `AgentRun.chat` checks the switch before every provider call, and that is the
- * only check that exists today: the four deterministic consolidation jobs make
+ * only check that exists today: the five deterministic consolidation jobs make
  * no provider call, so a stop recorded against one of those runs is kept and the
  * run finishes. Promising a wind-down that would not arrive is exactly the kind
  * of copy this file exists to prevent, and
