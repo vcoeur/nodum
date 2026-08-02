@@ -7,7 +7,7 @@ import json
 import pytest
 from helpers import owner
 
-from nodum import assets, db, projectors, search, service
+from nodum import assets, db, embeddings, projectors, search, service
 
 
 def _fts_rows(fresh_db):
@@ -67,6 +67,53 @@ def _statuses():
 def _runs(**kwargs):
     """Projector runs keyed by name."""
     return {run.name: run for run in projectors.run_projectors(**kwargs)}
+
+
+def _stored_chunks(fresh_db, node_id):
+    """The chunk texts the vec projector wrote for one node, in sequence order."""
+    conn = db.connect(fresh_db)
+    try:
+        rows = conn.execute(
+            "SELECT text FROM chunks WHERE node_id = ? ORDER BY seq", (node_id,)
+        ).fetchall()
+        return [row["text"] for row in rows]
+    finally:
+        conn.close()
+
+
+def test_the_projector_and_the_cycle_chunk_a_node_the_same_way(fresh_db, fake_embedder):
+    """The parity that stops a node having two different vectors.
+
+    The projector stores one vector per chunk (search wants the best chunk) and
+    the consolidation cycle needs one vector per node, so the two cannot store
+    the same thing — but they must *derive* from the same chunking. Before this
+    was fixed the cycle embedded the node's whole text in one call, so a node
+    longer than one window was compared on its opening window alone while the
+    projector held the whole of it.
+    """
+    content = " ".join(f"w{index}" for index in range(3 * embeddings.CHUNK_WORDS))
+    node = service.create_node(type="note", title="Long", content=content, principal=owner())
+    projectors.run_projectors(names=["vec"])
+
+    stored = _stored_chunks(fresh_db, node.id)
+    assert len(stored) > 1
+    assert stored == embeddings.node_chunks({"title": node.title, "content": node.content})
+
+
+def test_the_cycles_node_vector_is_recoverable_from_the_stored_chunks(fresh_db, fake_embedder):
+    """The node vector is a pure function of the projector's rows, not a rival embedding."""
+    content = " ".join(f"w{index}" for index in range(3 * embeddings.CHUNK_WORDS))
+    node = service.create_node(type="note", title="Long", content=content, principal=owner())
+    projectors.run_projectors(names=["vec"])
+
+    from_projector = embeddings._pool(
+        fake_embedder.embed(_stored_chunks(fresh_db, node.id)), fake_embedder.dimensions
+    )
+    (from_cycle,) = embeddings.node_vectors(
+        fake_embedder, [{"title": node.title, "content": node.content}]
+    )
+
+    assert from_cycle == pytest.approx(from_projector)
 
 
 def test_checkpoint_starts_at_zero_with_backlog(fresh_db):

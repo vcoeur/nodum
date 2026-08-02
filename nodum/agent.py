@@ -377,6 +377,13 @@ class Generation(BaseModel):
     its context could not answer with a schema-valid object claiming a
     citation it had not read. Validating ``text`` against what was actually
     retrieved is the caller's job, always, and nothing here does it.
+
+    **A default belongs on a field whose zero means "unknown", and nowhere
+    else.** :attr:`reasoning_tokens` keeps one because ``0`` there really is
+    ambiguous — the model did not think, or the wire did not say, and the two
+    are indistinguishable. :attr:`latency_ms` has none: it is measured around
+    every call this type is built from, ``Completion.latency_ms`` is itself
+    required, and ``0`` on a report would be the claim that a call took no time.
     """
 
     text: str
@@ -387,7 +394,7 @@ class Generation(BaseModel):
     #: A caller sizing its own ceiling needs this and not the total: what has to
     #: fit is the *content*, and the thinking is what pushes it out.
     reasoning_tokens: int = 0
-    latency_ms: int = 0
+    latency_ms: int
 
 
 class SkippedItem(BaseModel):
@@ -424,7 +431,11 @@ class JobCost(BaseModel):
     reasoning_tokens: int = 0
     cache_hit_tokens: int = 0
     cache_miss_tokens: int = 0
-    exhausted: bool = False
+    #: Whether a spending ceiling stopped this job. **Required**, like
+    #: :attr:`LLMReport.exhausted` and for the same reason: ``False`` is a claim
+    #: about the run, not an absence, and the only construction site always
+    #: knows the answer.
+    exhausted: bool
 
 
 class LLMReport(BaseModel):
@@ -471,10 +482,25 @@ class LLMReport(BaseModel):
     #: tokens is not a total in money without them.
     cache_hit_tokens: int = 0
     cache_miss_tokens: int = 0
-    elapsed_seconds: float = 0.0
-    exhausted: bool = False
-    stopped: bool = False
-    stop_switch: str = STOP_SWITCH_NONE
+    #: The four fields below carry **no default, deliberately**, and the rule
+    #: that separates them from the counters above is what a zero would *mean*.
+    #: ``reasoning_tokens`` and the cache counters are wire-optional and ``0``
+    #: there is honestly "the provider did not say". These four are answers this
+    #: run always has, and their zero values are assertions: that the night took
+    #: no time, that no ceiling stopped it, that nobody asked it to stop, and —
+    #: worst — that there was no stop row for anybody to stamp.
+    #:
+    #: :data:`STOP_SWITCH_NONE` is the one that made this worth changing. It is
+    #: an *affirmative claim* about a run's posture, and as a default it is the
+    #: claim a **cycle** run must never make: a future construction site that
+    #: forgot the field would file a report saying the kill switch was not there
+    #: on precisely the runs where it was. Pydantic imposes no
+    #: defaults-after-defaults ordering, so nothing but habit ever asked for
+    #: these.
+    elapsed_seconds: float
+    exhausted: bool
+    stopped: bool
+    stop_switch: str
     #: Which ``response_format`` this run's provider uses, and the reasoning
     #: level it asks for. Both are properties of the *install* rather than of the
     #: run, and both change what the caller may believe about a body it gets
@@ -854,6 +880,13 @@ class AgentRun:
         # caller legitimately needs is two numbers, and they are below.
         self._provider = llm.get_provider()
         self.unavailable_reason = llm.unavailable_reason()
+        #: Why a configured ``NODUM_LLM_API_KEY`` is not being sent, or ``None``.
+        #: Read here rather than from the provider for the reason every other
+        #: posture field is (P3): a caller that had to hold the provider to see
+        #: it could go on to call it. It is not a failure — the run works, the
+        #: local default needs no key — so it rides beside the configuration in
+        #: ``nodum llm status`` rather than in ``unavailable_reason``.
+        self.api_key_withheld = llm.key_withheld_reason()
         self.stopped = False
         self._jobs: dict[str, Budget] = {}
         self._skipped: list[SkippedItem] = []
@@ -1112,7 +1145,26 @@ class AgentRun:
             raise ProviderUnavailable(self.unavailable_reason or "no LLM provider configured")
 
         ledger.start()
-        needed = provider.estimate_prompt_tokens(messages) + output_ceiling
+        # Both halves of "what this call can cost" are the *provider's* numbers,
+        # and both used to be somebody else's:
+        #
+        # `schema=` was passed by no caller. Under `json_object` the provider
+        # states the schema as a system message, so a schema the caller will
+        # pass costs prompt tokens on the wire — 330 of them for
+        # `answers.ASK_SCHEMA`, measured — that a bare estimate cannot see. At
+        # `NODUM_LLM_CONTEXT_TOKENS=8192` the fitter in `nodum.answers` sized a
+        # prompt at 4 068 against a 4 096 ceiling and `chat` then refused the
+        # same prompt at 4 398: `/ask` refusing a prompt its own fitter had just
+        # built to fit.
+        #
+        # And the reservation is what the provider will really send as
+        # `max_tokens`, which is the ceiling capped at a share of the window —
+        # 2 048 of a 4 096-token one. Charging the uncapped 4 096 made the
+        # budget refuse up to 2 048 tokens per call early, on a worst case that
+        # could not happen.
+        needed = provider.estimate_prompt_tokens(
+            messages, schema=schema
+        ) + provider.output_reservation(output_ceiling)
         self._require_budget(ledger, needed, job=job, item_id=item_id)
 
         # Per-call ⊂ per-job ⊂ per-cycle holds for the clock too, and it did not:

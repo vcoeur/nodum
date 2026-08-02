@@ -170,15 +170,63 @@ RELATED_EDGE_TYPE = "relates_to"
 #: one is a queue item somebody has to read and reject.
 DUPLICATE_TITLE_RATIO = 0.95
 
-#: Cosine bar for a duplicate candidate when embeddings are available. It must
-#: stay above :data:`LINK_EMBEDDING_COSINE` — a pair at the duplicate bar would
-#: otherwise be proposed *both* as a duplicate and as merely related, which is
-#: two queue items for one observation. The exact value is the knob to tune from
-#: the queue's false-positive rate; nothing downstream depends on the number.
+#: Cosine bar for a duplicate candidate when embeddings are available.
+#:
+#: **KNOWN NOT TO FIRE, and deliberately left that way until it can be tuned on
+#: real content.** Both cosine bars were set before anyone had run the pinned
+#: model. At 0.93 this bar fires on **0 of 10** hand-labelled duplicates, so
+#: duplicate detection finds only duplicates already titled alike — precisely
+#: the case the embedding signal was added to answer.
+#:
+#: **The link bar is not dead in the same way, and the difference is the more
+#: expensive half.** At 0.80 it fires on 0 of 7 genuinely related pairs (the
+#: whole related band tops out at 0.587) but on **7 of those same 10
+#: duplicates**, whose band runs 0.763-0.929. So a near-duplicate worded
+#: differently is not missed — it is **mislabelled**, proposed as ``relates_to``
+#: by the weaker signal because the stronger one cannot reach it. Rejecting that
+#: proposal is the human saying "not merely related", which is not the same
+#: judgement as "not a duplicate", and nothing in the queue distinguishes them.
+#:
+#: Measured in ``tests/fixtures/embedding_calibration.json``: 29 bilingual FR+EN
+#: pairs, length-matched at 60-85 words a side, labelled by hand into four bands
+#: before any cosine was taken. Under the pinned model they land at duplicate
+#: 0.763-0.929, same narrow topic 0.402-0.587, same broad area 0.151-0.454,
+#: unrelated -0.050-0.314.
+#:
+#: **Replacements derived from that fixture alone were tried and reverted.** 0.72
+#: and 0.38 separate the fixture's bands cleanly and still fail on real content,
+#: measured on two corpora rather than one. Over a 200-node graph of real prose
+#: notes the link bar at 0.38 proposed **1 175** ``relates_to`` edges — 5.9 per
+#: node, against 5 at 0.80. Over 154 documents from a second, more homogeneous
+#: corpus, **35.2 % of all pairs** clear 0.38 (p99 = 0.694). A hand-built set of
+#: 29 pairs cannot see either number, because its pairs were chosen to
+#: demonstrate a separation, and a separation is not a false-positive rate.
+#:
+#: **So the replacements must come from a real corpus, measured for volume and
+#: precision rather than for separation**, with a test that embeds real text —
+#: the fixture tests only prove the constant still matches the fixture it was
+#: derived from. That is its own cycle, and it must land before the abstraction
+#: job, whose cohesion criterion reads these same vectors.
+#: ``scripts/measure_embedding_calibration.py`` and the fixture are kept as its
+#: starting point.
+#:
+#: This bar must stay above :data:`LINK_EMBEDDING_COSINE`: the two are read by
+#: different jobs, and a duplicate scoring *below* the link bar would be
+#: described as merely related by the weaker signal.
 DUPLICATE_EMBEDDING_COSINE = 0.93
 
 #: Cosine bar for an inferred ``relates_to`` edge: "these are about the same
 #: area", not "these are the same thing".
+#:
+#: Shipped value — see :data:`DUPLICATE_EMBEDDING_COSINE` for the measurement,
+#: why the fixture-derived 0.38 was reverted, and what re-tuning needs.
+#:
+#: **It fires, but not on what it is named for.** No genuinely related pair in
+#: the fixture reaches it — the related band tops out at 0.587 — while 7 of 10
+#: labelled *duplicates* clear it. So every embedding-driven ``relates_to``
+#: proposal at this bar is a duplicate wearing the wrong label, and the pairs
+#: this bar exists to find come only from co-citation, which is independent of
+#: the cosine and is what keeps the job useful meanwhile.
 LINK_EMBEDDING_COSINE = 0.80
 
 #: How many neighbours two nodes must share before co-citation is evidence.
@@ -466,6 +514,14 @@ class _Context:
     def vectors(self, nodes: list[NodeOut]) -> dict[str, list[float]] | None:
         """Embed these nodes, or return ``None`` when no provider is available.
 
+        One vector per node, produced by :func:`nodum.embeddings.node_vectors`
+        — the *same* chunking the ``vec`` projector indexes with, reduced to
+        the single vector a pairwise cosine needs. This job used to embed each
+        node's whole text in one call instead, which chunked nothing and so
+        silently truncated anything past the model's window: the same node had
+        one vector here and a different set in the projector, and a long node
+        was compared on its opening page alone.
+
         Never raises: an absent model is the *default* posture of an install
         without the ``embeddings`` extra, and a consolidation cycle that fell
         over because nobody downloaded a model would be a nightly job that
@@ -477,11 +533,10 @@ class _Context:
             return None
         missing = [node for node in nodes if node.id not in self._vectors]
         if missing:
-            texts = [
-                embeddings.node_text({"title": node.title, "content": node.content})
-                for node in missing
-            ]
-            for node, vector in zip(missing, provider.embed(texts), strict=True):
+            payloads = [{"title": node.title, "content": node.content} for node in missing]
+            for node, vector in zip(
+                missing, embeddings.node_vectors(provider, payloads), strict=True
+            ):
                 self._vectors[node.id] = vector
         return {node.id: self._vectors[node.id] for node in nodes}
 
@@ -617,8 +672,18 @@ def _job_links(context: _Context) -> JobOutcome:
     embedding proximity (:data:`LINK_EMBEDDING_COSINE`) and co-citation — two
     nodes with at least :data:`MIN_SHARED_NEIGHBOURS` neighbours in common,
     hubs excluded. Pruning runs first so co-citation counts are not inflated by
-    duplicate edges. A pair the graph already connects, in any type and any
-    non-archived state, is never proposed.
+    duplicate edges.
+
+    **Two suppressions, and the second is what makes the queue finite.** A pair
+    the graph already connects, in any type and any non-archived state, is never
+    proposed — and neither is a pair carrying an *archived* ``relates_to``,
+    because archiving is what rejecting does, and a proposal the human has
+    already refused must not come back the next night. The second read is scoped
+    to ``relates_to`` alone, so a pair whose ``duplicate_of`` proposal was
+    rejected can still be proposed as merely related: refusing "these are the
+    same thing" is not refusing "these are about the same area". That conversion
+    happens once and then settles, since the new read holds the replacement
+    down.
     """
     outcome = JobOutcome(name=JOB_LINKS)
     nodes = context.nodes()
@@ -703,6 +768,17 @@ def _infer_links(context: _Context, outcome: JobOutcome, active_ids: set[str]) -
     """Propose ``relates_to`` from embedding proximity and co-citation."""
     live = context.edges()
     connected = {_unordered(edge.src_id, edge.dst_id) for edge in live if edge.state != "archived"}
+    # A rejected proposal has to stay rejected. Rejecting archives the edge, so
+    # reading live edges alone drops the pair back out of `connected` and the
+    # next cycle proposes it again — a queue nobody can empty by working it.
+    # `_job_duplicates` never had the hole; it reads every state of its own edge
+    # type, and this mirrors it. Scoped to `relates_to` on purpose: some other
+    # edge type archived for its own reasons is not a judgement about
+    # relatedness, and reading every archived edge here would suppress proposals
+    # nobody ever refused.
+    connected |= {
+        _unordered(edge.src_id, edge.dst_id) for edge in context.typed_edges(RELATED_EDGE_TYPE)
+    }
     neighbours: dict[str, set[str]] = {}
     for edge in live:
         if edge.state != "active" or edge.src_id == edge.dst_id:

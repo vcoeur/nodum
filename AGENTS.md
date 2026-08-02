@@ -722,7 +722,7 @@ commands on a saved node for exactly this reason.
   rather than a back door with a name, and `tests/test_consolidate.py` asserts
   it over this file's **AST** so a refactor cannot quietly forget it. The jobs:
   `duplicate_candidates` (normalised-title equality, near-equality at 0.95, and
-  embedding cosine where a provider exists — it writes a `proposed`
+  embedding cosine at 0.93 where a provider exists — it writes a `proposed`
   `duplicate_of` edge and *never merges*, because D9 says a merge is always
   human-approved and a proposed edge is already a queue item with a diff and an
   accept button, so entity resolution needed no new proposal kind),
@@ -750,6 +750,33 @@ commands on a saved node for exactly this reason.
   computed, and the cycle closes `failed` with all of it. Determinism is a
   rule here: no randomness, one clock captured when the cycle opens, and every
   pair, group and list ordered before it is written.
+  **Both cosine bars are measured, and neither does its job.** They stand at
+  0.93 (duplicate) and 0.80 (`relates_to`), measured against
+  `tests/fixtures/embedding_calibration.json` — 29 hand-labelled bilingual FR+EN
+  pairs held at equal length so length is not a variable between bands. The
+  duplicate bar is simply dead: **0 of 10** labelled duplicates reach it, so
+  duplicate detection finds only duplicates already titled alike, precisely the
+  case the embedding signal was added to answer. **The link bar is the more
+  expensive half, and it is not dead — it is wrong.** No genuinely related pair
+  reaches it (that band tops out at 0.587) but **7 of those same 10 duplicates
+  do**, because the duplicate band runs 0.763-0.929 straight through it. So a
+  near-duplicate worded differently is not missed, it is **mislabelled**: filed
+  as `relates_to` by the weaker signal because the stronger one cannot reach it,
+  and a human rejecting it answers "not merely related" rather than "not a
+  duplicate". Nothing in the queue distinguishes the two.
+  **Replacements derived from that fixture alone (0.72 and 0.38) were tried and
+  reverted**: they separate the fixture's bands cleanly and still fail on real
+  content, measured on two corpora. Over a 200-node graph of real prose the link
+  bar at 0.38 proposed **1 175** `relates_to` edges, 5.9 per node against 5 at
+  0.80; over 154 documents of a second, more homogeneous corpus **35.2 % of all
+  pairs** clear 0.38. A set written to demonstrate a separation cannot measure a
+  false-positive rate. So the replacements must come from a
+  real corpus, scored for volume and precision rather than separation, with a
+  test that embeds real text; that is its own cycle and it must land before the
+  abstraction job, whose cohesion criterion reads the same vectors.
+  `scripts/measure_embedding_calibration.py` and the fixture are kept as its
+  starting point, and re-running it is required after any change of model, of
+  fastembed's pooling, or of `CHUNK_WORDS`.
   Three rules guard the run itself. **One cycle at a time, in the whole file —
   and the guard is a row, not a lock.** Migration `0014` carries a partial
   unique index over `cycles(status)` where `status = 'running' AND trigger IN
@@ -1032,11 +1059,42 @@ commands on a saved node for exactly this reason.
   model (`sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`,
   384-dim, multilingual, ONNX/CPU — no daemon, no API key) behind the
   optional `embeddings` extra. A model is never downloaded implicitly: the
-  provider resolves only from the local HF cache unless
+  provider resolves only from **nodum's own model cache** unless
   `NODUM_EMBED_DOWNLOAD=1` is set (first run fetches it).
   `NODUM_EMBED_MODEL` overrides the model name (a different dimensionality
   needs a new migration — the vec0 table is fixed at 384). Tests inject a
   deterministic hashing fake via `embeddings.set_provider`.
+  **The cache is nodum's, and `cache_dir` is always passed explicitly.**
+  `DEFAULT_CACHE_PATH` is `~/.local/share/nodum/models` — beside the database
+  and resolved the same way — overridable with `NODUM_EMBED_CACHE`. Leaving the
+  argument out is not a neutral default: fastembed falls back to
+  `<tempdir>/fastembed_cache`, and a system whose `systemd-tmpfiles` entry for
+  `/tmp` is type `D` empties it **on boot**, deleting the 241 MB download.
+  After that `get_provider()` returns `None`, the vector signal drops out of
+  search *and* consolidation with no error, and nothing re-fetches it because
+  the download is deliberately gated — it stays degraded until a human notices.
+  `~/.local/share` is spelled out rather than read from `XDG_DATA_HOME`
+  because `db.py` spells it out too; honouring the variable in one place only
+  would split the graph and the model that indexes it across different roots.
+  `unavailable_reason()` distinguishes a cache that was **never populated**
+  from one that held files and no longer does, because the second means
+  something deleted them and needs a different response.
+  **One definition of a node's chunks, one reduction to a node vector.**
+  `node_chunks(node)` (= `chunk_text(node_text(node))`) is the single
+  spelling of how a node is split, and both consumers start there: the `vec`
+  projector stores one vector per chunk because search retrieves the *best
+  chunk*, while `node_vectors(provider, nodes)` reduces the same chunks to
+  the one vector a pairwise comparison needs — the **L2-normalised mean** of
+  the chunk vectors, which is the model's own mean pooling applied one level
+  up, and the identity up to scale for a node that fits one window. The
+  node-level vector is therefore a pure function of the projector's rows rather
+  than a second, independently produced embedding. The consolidation cycle used
+  to embed each node's whole text in one call: it chunked nothing, so a node
+  past the model's 512-token window was silently truncated and compared on its
+  opening pages, and the same node had one vector there and a different set in
+  the projector. A node with no text at all reduces to the zero vector, which
+  is at cosine 0.0 from everything — two empty nodes are not each other's
+  duplicates.
 - **`nodum.llm`** — the LLM provider seam (Phase 5b, design P1), shaped
   deliberately like `nodum.embeddings`: a `Protocol`, a cached
   `get_provider()` → provider or `None`, an `unavailable_reason()`, and a
@@ -1059,7 +1117,36 @@ commands on a saved node for exactly this reason.
   Configuration is `NODUM_LLM_MODEL` (**unset means no provider** — there is no
   guessed default), `NODUM_LLM_BASE_URL`, `NODUM_LLM_API_KEY`,
   `NODUM_LLM_CONTEXT_TOKENS` (4096 by default, the measured local window), and
-  `NODUM_LLM_THINKING`.
+  `NODUM_LLM_THINKING` (one of `none`/`low`/`medium`/`high`, default `high`;
+  anything else is no provider with a reason).
+- **A base URL `urllib` cannot POST to is no provider with a reason**, settled
+  at resolution time like an unparseable window. `urllib.request.Request` parses
+  the URL **in its constructor**, so `api.deepseek.com/v1` is
+  `ValueError: unknown url type` and `http://[bad/v1` is
+  `ValueError: Invalid IPv6 URL` — both raised *outside* `_post`'s `try` and so
+  escaped `LLMError` entirely, exactly as `IncompleteRead` once did, reaching a
+  CLI traceback and the 400 kept for a malformed request. The construction moved
+  inside the `try` **and** the same check runs at resolve time
+  (`base_url_problem`). A missing scheme is **never guessed back in**: choosing
+  `http` or `https` decides whether the API key crosses the network in clear
+  text, and that is not a decision to make from four characters that are not
+  there. `profile_for`'s `_hostname` stays forgiving, deliberately — it reads a
+  host out of a spelling nothing can POST to so the refusal can name the
+  endpoint.
+- **A model name may not move a *credential* either.** `_post` attached
+  `NODUM_LLM_API_KEY` unconditionally, so a hosted model id nobody profiled (a
+  typo, a newer id) resolved to `DEFAULT_BASE_URL` and sent the vendor's bearer
+  token to `http://localhost:11434/v1` — driven end to end, the prompt correctly
+  stayed local and the credential arrived at a throwaway listener as
+  `Authorization: Bearer …`. The rule: **the key travels only to an endpoint
+  somebody named**, either the operator through `NODUM_LLM_BASE_URL` or the model
+  id through an exact profile match. Otherwise it is dropped at resolution time —
+  the provider never holds it — and `key_withheld_reason()` says so in `nodum llm
+  status` (`api_key_withheld`). Withheld rather than refused, because the local
+  default needs no key and a stale variable must not break a working install;
+  and a **self-hosted gateway that requires a key keeps it**, since naming it in
+  `NODUM_LLM_BASE_URL` is the operator saying the key belongs there. "No key to
+  localhost" would have been the wrong rule for exactly that reason.
 - **Two things about the "one wire" are not universal, and each was found by a
   live 400 rather than by reading a spec.** `response_format:
   {"type": "json_schema"}` — ollama honours it, `deepseek-v4-flash` answers
@@ -1079,6 +1166,16 @@ commands on a saved node for exactly this reason.
   matching is on the server's sentence, which is brittle **one-sidedly** — a
   false positive is a weaker request every endpoint accepts, named in `llm
   status`, and a false negative is exactly today's `ProviderUnavailable`.
+  The **one sharpening** of that matcher: a marker immediately followed by `.`
+  or `[` is not a capability signal. A 400 reading
+  `Invalid schema for response_format.schema.properties[0]` means the server
+  *parsed* `response_format` and is validating what is inside it, which proves
+  it serves the field and that the fault is nodum's own schema — downgrading
+  there trades a loud fixable error for an envelope quietly weakened for the
+  life of the process. `_THINKING_REJECTIONS` deliberately keeps plain substring
+  matching, because two of its three markers are sentences a server says
+  (`does not support thinking`) rather than field names, and the guard would
+  break them over a full stop.
   The reasoning field is a **three-rung ladder**, not a boolean: `graded` →
   `off-only` → `absent`. The third rung is not decoration — a server that
   rejects unknown fields refuses `reasoning_effort: "none"` too, and a two-state
@@ -1132,6 +1229,58 @@ commands on a saved node for exactly this reason.
   question and 3.4x faster. The **reachability probe is pinned to `none`** for a
   blunter reason: at any graded level it returns an **empty body**, every output
   token going to thinking. Do not "fix" either inconsistency.
+- **The output ceiling is per call site too**, on the same argument and with the
+  same shape. `/ask` reserves `ASK_OUTPUT_TOKENS` (2 048) rather than the
+  blanket 4 096: measured on the real `ASK_TEMPLATE` over **24 samples** —
+  `deepseek-v4-flash` at `high` (8, output 60–343), the same at `low` (12,
+  67–**528**, reasoning up to 442) and `qwen3:8b` on ollama with the level
+  withheld (4, 26–76) — the worst output was 528, and 2 048 is 3.9x that. It is
+  not sized closer, for two reasons: 2 048 is the number recorded below as the
+  cure for `qwen3:8b`'s empty body, and on ollama's 4 096-token window it is
+  **exactly what `/ask` already got**, since `OUTPUT_RESERVATION_FRACTION`
+  clamps the blanket ceiling there anyway. So it can regress no local install,
+  and what it buys is elsewhere: on a wider window the prompt gains the
+  difference, and on DeepSeek it halves what each `/ask` charges the 8 000-token
+  request budget. **The "halved prompt room" on a 4 096-token window is the
+  fraction's doing, not the ceiling's** — no per-call number above 2 048 can
+  change it. `/summarize` keeps the blanket ceiling, deliberately: that number
+  was sized against a *synthesis* worst case and this is the synthesis-shaped
+  call, so a constant here would be a copy free to drift, and an operator who
+  raises `NODUM_LLM_MAX_OUTPUT_TOKENS` for a six-sentence summary should get it.
+- **A call is charged the provider's own two numbers, and neither used to be.**
+  `AgentRun.chat` estimated the prompt **without the schema it was about to
+  send** — under `json_object` the schema is stated as a system message and
+  costs 330 prompt tokens for `ASK_SCHEMA`, measured — so at
+  `NODUM_LLM_CONTEXT_TOKENS=8192` `answers._fit_prompt` sized a prompt at 4 068
+  against a 4 096 ceiling and `chat` refused the same prompt at 4 398: `/ask`
+  failing on a prompt its own fitter had just built to fit. And it charged the
+  **unclamped** ceiling rather than `output_reservation(ceiling)`, which is what
+  will really be sent as `max_tokens` — 4 096 against 2 048 on a 4 096-token
+  window, so `BudgetExhausted` could fire up to 2 048 tokens per call early.
+  `_fit_prompt` now takes both the schema and the call site's ceiling, with no
+  defaults, so a new call site cannot forget either.
+- **A `usage` block that contradicts itself is clamped and logged, never
+  believed.** `reasoning_tokens` is documented as a *share* of
+  `completion_tokens` and nothing enforced it: a wire reporting 5 000 inside 50
+  makes `content_tokens` 0 and prints a report where the thinking is larger than
+  the output it is part of. No budget moves (reasoning is never summed into the
+  spend), so it is clamped. And `usage.total_tokens` was never read at all —
+  overriding it is right, since `Completion.total_tokens` is what budgets are
+  denominated in, but a provider disagreeing about the bill should be noticed.
+  Both go to `logging.getLogger("nodum.llm")` at WARNING, the only thing in that
+  module that is logged rather than raised or returned: they are facts about the
+  provider, actionable by whoever operates it and useless to the caller who
+  wanted an answer.
+- **In `LLMReport` and `JobCost`, a default belongs on a field whose zero means
+  *unknown* — and nowhere else.** `reasoning_tokens` and the cache counters keep
+  theirs (absent from every ollama response, and from DeepSeek's own at
+  `reasoning_effort: "none"`). `elapsed_seconds`, `exhausted`, `stopped`,
+  `stop_switch` and `Generation.latency_ms` are **required**: their zero values
+  are assertions, not absences, and `STOP_SWITCH_NONE` is the worst of them — an
+  affirmative claim ("this run is not a cycle and has no stop row") that a
+  future construction site omitting the field on a *cycle* run would file as the
+  opposite of the truth. Pydantic imposes no defaults-after-defaults ordering,
+  so nothing ever forced them.
 - **The output reservation is a share of the window, not a flat subtraction**
   (`OUTPUT_RESERVATION_FRACTION`, 0.5 — the rule `answers._rewrite_ceiling`
   already used). The window holds prompt *and* answer on a server that shares one
@@ -2530,7 +2679,24 @@ Phase-1 decision log.
   entered, which is how `edge create-batch /missing.json` and `node
   create|update --content-file /missing.md` printed a full Rich traceback while
   `asset register` and `ingest file` did not. `_principal` was moved inside
-  `_run` for the identical reason; new file-reading options follow both.
+  `_run` for the identical reason; new file-reading options follow both. The
+  last call site holding that position was `ingest file`'s **directory
+  expansion** — `_ingest_sources` walked the arguments beside the command's
+  `_run`, so `iterdir` on an unreadable folder was a traceback — and it now
+  reads through the boundary like everything else. The sweep proving a refused
+  `--as` is one line runs over **every** command declaring the option,
+  enumerated from `schema-dump`, because the bug was never about a command: it
+  was about a *position in a call*, and any command written tomorrow can take
+  it. A hand-list covered nine of sixty-four for three releases.
+- **Widening `_run`'s except list is not how a new error gets a message.** The
+  list is the set of things a *caller* can provoke; a class that also covers
+  defects would turn every future bug in these commands into a friendly
+  sentence and exit 1. `LookupError` would have caught `auth.UnknownPrincipal`
+  and every `KeyError` beneath it; `RuntimeError` would have caught
+  `Path.expanduser`'s and every genuine fault beside it. Both are translated at
+  the argument they belong to instead — `_expand_user` raises `ValueError` —
+  and `tests/test_cli.py` holds the line from the other side, asserting a
+  seeded `KeyError` and `RuntimeError` still **escape**.
 - `--set key=value` is repeatable; values are parsed as JSON with a raw-string
   fallback.
 - `--version` prints `nodum <version>` and exits 0; `schema-dump` prints the

@@ -60,13 +60,28 @@ class FakeProvider:
     thinking = llm.DEFAULT_THINKING
     thinking_applied = True
 
+    #: What a schema costs this fake in *prompt* tokens — the real provider's
+    #: ``json_object`` behaviour in miniature, where the schema is stated as a
+    #: system message and is therefore part of what the prompt costs. 330 is the
+    #: measured cost of ``answers.ASK_SCHEMA`` under that mode.
+    #:
+    #: A fake that ignored ``schema=`` could not tell a caller that passes it
+    #: from one that does not, which is exactly the defect: no production caller
+    #: passed it, and only tests did.
+    SCHEMA_TOKENS = 330
+
     def __init__(self, *answers: llm.Completion | BaseException) -> None:
         self.answers = list(answers) or [_completion()]
         self.calls: list[dict[str, Any]] = []
+        #: The ``schema`` argument of every estimate this provider was asked for.
+        self.estimates: list[dict[str, Any] | None] = []
         self.structured_mode = llm.STRUCTURED_JSON_SCHEMA
 
     def estimate_prompt_tokens(self, messages, *, schema=None) -> int:
-        return llm.estimate_prompt_tokens(messages)
+        self.estimates.append(schema)
+        return llm.estimate_prompt_tokens(messages) + (
+            self.SCHEMA_TOKENS if schema is not None else 0
+        )
 
     def output_reservation(self, max_output_tokens: int) -> int:
         """The real provider's rule — a reservation capped at a share of the
@@ -1294,3 +1309,163 @@ def test_the_run_reports_which_structured_mode_the_provider_will_use():
     provider.structured_mode = llm.STRUCTURED_JSON_OBJECT
     run = _run(provider=provider)
     assert run.structured_mode == llm.STRUCTURED_JSON_OBJECT
+
+
+# ── What a call is charged, and what the estimate is charged *for* ────────────
+
+
+def test_the_budget_estimate_includes_the_schema_the_call_will_send():
+    """``estimate_prompt_tokens(schema=…)`` existed and no production caller used it.
+
+    Under :data:`~nodum.llm.STRUCTURED_JSON_OBJECT` the provider states the
+    schema as a system message, so a schema costs **prompt** tokens — 330 of
+    them for ``answers.ASK_SCHEMA``, measured. ``chat`` passed the messages
+    alone, so the number the budget was checked against, and the number
+    ``nodum.answers`` fitted its context to, were both under-counts of the same
+    call. The provider's own refusal was computed on the full number, which is
+    how ``/ask`` came to refuse a prompt its own fitter had just built.
+    """
+    provider = FakeProvider()
+    run = _run(provider=provider)
+    schema = {"type": "object", "properties": {"answer": {"type": "string"}}}
+    run.chat(PROMPT, prompt_version=VERSION, schema=schema)
+    assert provider.estimates == [schema], (
+        "the budget was measured against a prompt without the schema the call sends"
+    )
+
+    provider = FakeProvider()
+    run = _run(provider=provider)
+    run.chat(PROMPT, prompt_version=VERSION)
+    assert provider.estimates == [None], "a call with no schema must not invent one"
+
+
+def test_a_schema_that_does_not_fit_the_budget_is_refused_for_the_right_number():
+    """And the under-count was not academic: it decides refusals.
+
+    The budget here holds the bare prompt plus the reservation with a little to
+    spare, and cannot hold the schema the call will also send. Charging the
+    estimate the caller passed no schema to would have let this call through and
+    overrun the ceiling by the schema's own cost.
+    """
+    provider = FakeProvider()
+    estimate = llm.estimate_prompt_tokens(PROMPT)
+    run = _run(provider=provider, tokens=estimate + 100 + 50)
+    run.chat(PROMPT, prompt_version=VERSION, max_output_tokens=100)
+    assert len(provider.calls) == 1, "the bare prompt fits — fixture is not vacuous"
+
+    provider = FakeProvider()
+    run = _run(provider=provider, tokens=estimate + 100 + 50)
+    with pytest.raises(agent.BudgetExhausted) as refusal:
+        run.chat(PROMPT, prompt_version=VERSION, max_output_tokens=100, schema={"type": "object"})
+    assert refusal.value.needed == estimate + FakeProvider.SCHEMA_TOKENS + 100
+    assert provider.calls == [], "nothing may be sent once the worst case does not fit"
+
+
+def test_the_budget_is_charged_the_reservation_the_provider_will_really_send():
+    """The worst case is what ``max_tokens`` will really be, not what was asked for.
+
+    :meth:`~nodum.llm.OpenAICompatProvider.output_reservation` caps the ceiling
+    at a share of the window and **sends the capped number**, so on a
+    4 096-token window the shipped 4 096-token ceiling is a 2 048-token request.
+    Charging the uncapped number made the budget refuse against a cost the
+    provider cannot incur — up to 2 048 tokens per call early, on the window
+    where a token budget is tightest.
+    """
+    provider = FakeProvider()
+    estimate = llm.estimate_prompt_tokens(PROMPT)
+    reservation = provider.output_reservation(agent.DEFAULT_MAX_OUTPUT_TOKENS)
+    assert reservation == 2048 < agent.DEFAULT_MAX_OUTPUT_TOKENS, (
+        "fixture is not the clamped regime this test is about"
+    )
+
+    # Exactly enough for the prompt and the reservation, and not for the ceiling.
+    run = _run(provider=provider, tokens=estimate + reservation)
+    run.chat(PROMPT, prompt_version=VERSION)
+    assert len(provider.calls) == 1, "a call the provider can afford was refused"
+    assert provider.calls[0]["max_output_tokens"] == agent.DEFAULT_MAX_OUTPUT_TOKENS, (
+        "the ceiling still travels whole; it is the provider that clamps it"
+    )
+
+
+def test_a_call_that_cannot_afford_its_reservation_is_still_refused():
+    """The other side: clamping the charge may not have removed the ceiling.
+
+    One token short of the prompt plus the reservation, and the refusal names
+    the reservation rather than the ceiling — the number that will really be
+    sent.
+    """
+    provider = FakeProvider()
+    estimate = llm.estimate_prompt_tokens(PROMPT)
+    reservation = provider.output_reservation(agent.DEFAULT_MAX_OUTPUT_TOKENS)
+    run = _run(provider=provider, tokens=estimate + reservation - 1)
+    with pytest.raises(agent.BudgetExhausted) as refusal:
+        run.chat(PROMPT, prompt_version=VERSION)
+    assert refusal.value.needed == estimate + reservation
+    assert provider.calls == []
+
+
+# ── A default belongs on a field whose zero means "unknown" ───────────────────
+
+
+@pytest.mark.parametrize(
+    ("model", "field"),
+    [
+        (agent.LLMReport, "elapsed_seconds"),
+        (agent.LLMReport, "exhausted"),
+        (agent.LLMReport, "stopped"),
+        (agent.LLMReport, "stop_switch"),
+        (agent.JobCost, "exhausted"),
+        (agent.Generation, "latency_ms"),
+    ],
+)
+def test_a_report_field_that_is_a_claim_carries_no_default(model: type, field: str):
+    """Six fields whose zero value is an assertion, not an absence.
+
+    Pydantic imposes no defaults-after-defaults ordering, so nothing ever forced
+    these — it is a dataclass reflex, and it is load-bearing in the wrong
+    direction. :data:`~nodum.agent.STOP_SWITCH_NONE` is the clearest: it is an
+    *affirmative claim* ("this run is not a cycle and has no stop row"), so a
+    future construction site that omitted it on a **cycle** run would file a
+    report saying the kill switch was not there on precisely the runs where it
+    was — and ``AGENTS.md`` says "no stop was requested" and "there was no stop
+    to request" are different facts.
+
+    The line, stated so it can be applied to the next field somebody adds: a
+    default belongs where the docstring gives the zero a meaning of its own.
+    ``reasoning_tokens`` and the cache counters keep theirs, because ``0`` there
+    honestly means "the provider did not say".
+    """
+    assert model.model_fields[field].is_required(), (
+        f"{model.__name__}.{field} has a default, and its default value is a claim"
+    )
+
+
+@pytest.mark.parametrize(
+    ("model", "field"),
+    [
+        (agent.LLMReport, "reasoning_tokens"),
+        (agent.LLMReport, "cache_hit_tokens"),
+        (agent.JobCost, "cache_miss_tokens"),
+        (agent.Generation, "reasoning_tokens"),
+    ],
+)
+def test_a_field_whose_zero_means_unknown_keeps_its_default(model: type, field: str):
+    """The other side of the same line, so the rule is not "no defaults".
+
+    These come off the wire and are simply absent on providers that report no
+    cache and at ``reasoning_effort: "none"``, where the whole
+    ``completion_tokens_details`` block disappears rather than reporting zero.
+    """
+    assert not model.model_fields[field].is_required()
+
+
+def test_the_report_still_carries_every_required_field_from_the_one_place_it_is_built():
+    """Non-vacuity: the change above must not have broken the only caller."""
+    run = _run(provider=FakeProvider(), tokens=10_000)
+    run.split({"a": 0.5})
+    run.chat(PROMPT, prompt_version=VERSION)
+    report = run.report()
+    assert report.stop_switch == agent.STOP_SWITCH_NONE
+    assert report.stopped is False and report.exhausted is False
+    assert report.elapsed_seconds >= 0.0
+    assert report.per_job[0].exhausted is False

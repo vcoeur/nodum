@@ -74,15 +74,30 @@ class FakeProvider:
     thinking_applied = True
 
     def __init__(
-        self, *answers_: llm.Completion | BaseException, context_tokens: int = 4096
+        self,
+        *answers_: llm.Completion | BaseException,
+        context_tokens: int = 4096,
+        schema_tokens: int = 0,
     ) -> None:
         self.answers = list(answers_) or [_completion()]
         self.calls: list[dict] = []
+        #: The ``schema`` argument of every estimate this provider was asked for.
+        self.estimates: list[dict | None] = []
         self.context_tokens = context_tokens
+        #: What a schema costs this fake in **prompt** tokens, modelling
+        #: :data:`~nodum.llm.STRUCTURED_JSON_OBJECT`, where the provider states
+        #: the schema as a system message so the schema really is part of what
+        #: the prompt costs. ``0`` — the default — is the ``json_schema`` case,
+        #: where it costs nothing and every existing fixture's arithmetic is
+        #: what it always was.
+        self.schema_tokens = schema_tokens
         self.structured_mode = llm.STRUCTURED_JSON_SCHEMA
 
     def estimate_prompt_tokens(self, messages, *, schema=None) -> int:
-        return llm.estimate_prompt_tokens(messages)
+        self.estimates.append(schema)
+        return llm.estimate_prompt_tokens(messages) + (
+            self.schema_tokens if schema is not None else 0
+        )
 
     def output_reservation(self, max_output_tokens: int) -> int:
         """The real provider's rule, because this stands in for a provider.
@@ -2580,3 +2595,261 @@ def test_a_probe_that_downgrades_the_structured_mode_says_so(monkeypatch, graph)
     # And the payload agrees with itself: `used` reads the provider after the
     # call, so a stale `structured_output` showed up as a self-contradiction.
     assert status.used.structured_mode == status.structured_output
+
+
+# ── The fitter and the call must be measuring the same prompt ────────────────
+
+
+def test_the_fitter_counts_the_schema_the_provider_will_state(graph):
+    """``/ask`` refused a prompt its own fitter had just built to fit.
+
+    Under :data:`~nodum.llm.STRUCTURED_JSON_OBJECT` the provider states the
+    schema as a system message, so :data:`~nodum.answers.ASK_SCHEMA` costs 330
+    prompt tokens on the wire — measured. ``_fit_prompt`` called
+    ``estimate_prompt_tokens`` with no schema at all, so it fitted a prompt to a
+    number 330 tokens under what the provider would count, and the provider's
+    own refusal is computed on the full one. Reproduced at
+    ``NODUM_LLM_CONTEXT_TOKENS=8192``: fitted at 4 068 against a 4 096-token
+    ceiling, refused at 4 398.
+
+    The fake charges the same 330 for a schema, which is what makes the two
+    numbers distinguishable here at all: a fake that ignored ``schema=`` could
+    not tell a caller that passes it from one that does not, which was the bug.
+    """
+    provider = FakeProvider(_reply("compaction keeps the latest value", ["1"]), schema_tokens=330)
+    llm.set_provider(provider)
+    answers.ask("compaction", principal=owner(), run=_run())
+    assert provider.estimates, "the fitter asked for no estimate at all"
+    assert all(estimate == answers.ASK_SCHEMA for estimate in provider.estimates), (
+        "the fitter measured a prompt without the schema the call would send"
+    )
+
+
+def test_the_summarize_fitter_counts_its_own_schema_too(graph):
+    """The second call site, so the fix is a rule and not one patched line."""
+    node_id = service.list_nodes(principal=owner())[0].id
+    provider = FakeProvider(_summary_reply("a summary", ["1"]), schema_tokens=330)
+    llm.set_provider(provider)
+    answers.summarize(node_id, principal=owner(), run=_run())
+    assert provider.estimates
+    assert all(estimate == answers.SUMMARIZE_SCHEMA for estimate in provider.estimates)
+
+
+def test_what_the_fitter_sends_fits_once_the_schema_is_counted(wide_graph):
+    """The under-count decided outcomes, not just numbers.
+
+    Here the whole context block fits the ceiling on the bare estimate and does
+    **not** fit once the schema is counted — which is the case that produced a
+    prompt the fitter declared to fit and the provider then refused as
+    ``PromptTooLong``. The fitter has both levers available (four notes, each
+    over ``MAX_CONTEXT_CHARS``), so the right outcome is a narrower prompt and
+    not a failure.
+    """
+    provider = FakeProvider(
+        _reply("compaction keeps the latest value", ["1"]),
+        context_tokens=8192,
+        schema_tokens=900,
+    )
+    llm.set_provider(provider)
+    answers.ask("compaction segment cleaner", principal=owner(), k=4, run=_run())
+    assert provider.calls, "nothing was sent, so this row proves nothing"
+
+    sent = provider.calls[0]["messages"][0].content
+    ceiling = provider.context_tokens - provider.output_reservation(answers.ASK_OUTPUT_TOKENS)
+    with_schema = provider.estimate_prompt_tokens(
+        [agent.Message(role="user", content=sent)], schema=answers.ASK_SCHEMA
+    )
+    assert with_schema <= ceiling, (
+        "what was sent does not fit what it was fitted to — the provider will refuse it"
+    )
+
+    # The control: the same graph, the same window, and a schema that costs
+    # nothing (`json_schema`, where it really is free). It fits more note text
+    # in, which is what proves the run above *paid* for its schema rather than
+    # coinciding with a prompt that was small anyway.
+    free = FakeProvider(
+        _reply("compaction keeps the latest value", ["1"]), context_tokens=8192, schema_tokens=0
+    )
+    llm.set_provider(free)
+    answers.ask("compaction segment cleaner", principal=owner(), k=4, run=_run())
+    assert len(free.calls[0]["messages"][0].content) > len(sent), (
+        "counting the schema cost the prompt no room at all, so it was not counted"
+    )
+
+
+# ── A ceiling per call site ──────────────────────────────────────────────────
+
+
+def test_ask_asks_for_its_own_measured_ceiling_rather_than_the_blanket_one(graph):
+    """``/ask``'s answer is four sentences and it was reserving 4 096 tokens.
+
+    Measured over 24 samples on the real template — ``deepseek-v4-flash`` at
+    ``high`` and at ``low``, and ``qwen3:8b`` on ollama — the worst output was
+    **528** tokens. :data:`~nodum.answers.ASK_OUTPUT_TOKENS` is 2 048, which is
+    3.9x that and is also the number ``AGENTS.md`` records as ``qwen3:8b``'s
+    cure, so nothing local can regress.
+    """
+    provider = FakeProvider(_reply("compaction keeps the latest value", ["1"]))
+    llm.set_provider(provider)
+    answers.ask("compaction", principal=owner(), run=_run())
+    assert provider.calls[0]["max_output_tokens"] == answers.ASK_OUTPUT_TOKENS
+    assert answers.ASK_OUTPUT_TOKENS < agent.DEFAULT_MAX_OUTPUT_TOKENS, (
+        "non-vacuity: this row is about a per-call-site number *below* the blanket one"
+    )
+
+
+def test_summarize_keeps_the_blanket_ceiling_it_was_sized_against(graph):
+    """The counterweight, and the reason it is not an oversight.
+
+    ``DEFAULT_MAX_OUTPUT_TOKENS`` was sized against a *synthesis* worst case,
+    and this is the synthesis-shaped call on this surface. A constant here would
+    be a copy of that default free to drift from it — and an operator who raises
+    ``NODUM_LLM_MAX_OUTPUT_TOKENS`` for a six-sentence summary should get what
+    they asked for.
+    """
+    node_id = service.list_nodes(principal=owner())[0].id
+    provider = FakeProvider(_summary_reply("a summary", ["1"]))
+    llm.set_provider(provider)
+    run = _run(max_output_tokens=7000)
+    answers.summarize(node_id, principal=owner(), run=run)
+    assert provider.calls[0]["max_output_tokens"] == 7000
+
+
+@pytest.fixture()
+def wide_graph(fresh_db):
+    """Four notes wide enough that the context block really has to be fitted.
+
+    Every note is over :data:`~nodum.answers.MAX_CONTEXT_CHARS`, so the fitter's
+    two levers both have somewhere to go and the size of the prompt it produces
+    is a *function of the ceiling* rather than of the graph.
+    """
+    principal = owner()
+    for index in range(4):
+        service.create_node(
+            type="note",
+            title=f"Compaction note {index}",
+            content=(
+                f"Compacted topic retention note {index}. " + f"compaction segment cleaner {index} "
+            )
+            * 60,
+            principal=principal,
+        )
+    return None
+
+
+def test_the_ask_fitter_reserves_what_the_ask_call_will_really_ask_for(wide_graph):
+    """Two estimators again, one number along.
+
+    The reservation is what the prompt does **not** get, so a fitter measuring
+    the run's blanket ceiling while the call asks for
+    :data:`~nodum.answers.ASK_OUTPUT_TOKENS` would hand a prompt less room than
+    it really has — the same class of bug as the schema, one number along, and
+    the same fix.
+
+    On a window wider than the blanket ceiling the two numbers differ, which is
+    what makes this observable at all: at 8 192 the blanket reserves 4 096 and
+    ``/ask`` reserves 2 048, so the prompt gains half as much room again — and
+    that room is measured here as **more note text actually sent**, not as an
+    argument passed.
+    """
+    provider = FakeProvider(_reply("compaction keeps the latest value", ["1"]), context_tokens=8192)
+    llm.set_provider(provider)
+    run = _run()
+    assert (run.output_reservation(), run.output_reservation(answers.ASK_OUTPUT_TOKENS)) == (
+        4096,
+        2048,
+    ), "fixture is not the regime this test is about"
+
+    result = answers.ask("compaction segment cleaner", principal=owner(), k=4, run=_run())
+    sent = provider.calls[0]["messages"][0].content
+    assert provider.calls[0]["max_output_tokens"] == answers.ASK_OUTPUT_TOKENS
+    # 4 096 tokens is what the blanket reservation would have left; the prompt
+    # really sent is above it, so it is a prompt the old ceiling could not have
+    # produced.
+    assert llm.estimate_tokens(sent) > 4096, (
+        "the fitter is still reserving the blanket ceiling, so the prompt lost "
+        "2 048 tokens of room it has"
+    )
+    assert len(result.considered) == 4, "and the extra room bought whole notes"
+
+
+# ── A key that is not being sent is said out loud ────────────────────────────
+
+
+def test_status_says_when_a_configured_key_is_being_withheld(fresh_db, monkeypatch):
+    """The other setting a human can read back from their environment and not
+    see the effect of — and this one is a credential.
+
+    ``NODUM_LLM_MODEL`` naming a hosted model nodum ships no profile for resolves
+    to the **local default**, and the vendor's bearer token used to go there.
+    Withholding it silently would be a second invisible setting, so ``llm
+    status`` names it beside ``thinking_applied``.
+    """
+    for name in (llm.ENV_MODEL, llm.ENV_BASE_URL, llm.ENV_API_KEY, llm.ENV_CONTEXT_TOKENS):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv(llm.ENV_MODEL, "deepseek-v4-flash-0711")
+    monkeypatch.setenv(llm.ENV_API_KEY, "sk-vendor-secret")
+    llm.reset_provider()
+
+    status = answers.provider_status(principal=owner(), probe=False)
+    assert status.configured is True, "a withheld key is not an unusable install"
+    assert status.api_key_withheld is not None
+    assert llm.ENV_BASE_URL in status.api_key_withheld
+    assert "sk-vendor-secret" not in status.api_key_withheld
+
+
+def test_a_probe_does_not_print_the_withheld_key_sentence_twice(fresh_db, monkeypatch):
+    """Two right decisions that collide on exactly one surface.
+
+    ``ProviderStatus`` carries the withheld-key sentence in its own field, and
+    the transport now appends it to a 401 so the failure explains itself
+    wherever it lands. Both are correct; on ``llm status --probe`` both are
+    true at once, and the first cut rendered the same 400-odd characters in
+    ``detail`` and in ``api_key_withheld``.
+
+    This is the suite's **first** test of the probe path, which is how the
+    duplication got through in the first place.
+    """
+    for name in (llm.ENV_MODEL, llm.ENV_BASE_URL, llm.ENV_API_KEY, llm.ENV_CONTEXT_TOKENS):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv(llm.ENV_MODEL, "deepseek-v4-flash-0711")
+    monkeypatch.setenv(llm.ENV_API_KEY, "sk-vendor-secret")
+    llm.reset_provider()
+
+    failure = urllib.error.HTTPError(
+        url="http://x/v1/chat/completions", code=401, msg="Unauthorized", hdrs=None, fp=None
+    )
+    failure.read = lambda: b'{"error":{"message":"authorization required"}}'  # type: ignore[method-assign]
+
+    def refuse(*_args, **_kwargs):
+        raise failure
+
+    monkeypatch.setattr(urllib.request, "urlopen", refuse)
+
+    status = answers.provider_status(principal=owner(), probe=True)
+
+    assert status.reachable is False
+    assert status.api_key_withheld is not None
+    assert status.detail is not None
+    assert status.api_key_withheld not in status.detail, "said once, in its own field"
+    assert "sk-vendor-secret" not in status.detail
+    # The whole of what this call said, not just the status code. Asserting
+    # `"401" in detail` alone survives a slice that eats the server's own
+    # message, because the code sits in the prefix the strip never touches.
+    assert status.detail.endswith(
+        'answered HTTP 401: {"error":{"message":"authorization required"}}'
+    )
+
+
+def test_status_says_nothing_when_the_key_is_going_where_it_was_configured(fresh_db, monkeypatch):
+    """Non-vacuity: the field must be empty on the ordinary install, or it is
+    a warning that fires every time and therefore says nothing."""
+    for name in (llm.ENV_MODEL, llm.ENV_BASE_URL, llm.ENV_API_KEY, llm.ENV_CONTEXT_TOKENS):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv(llm.ENV_MODEL, "any-model")
+    monkeypatch.setenv(llm.ENV_BASE_URL, "https://api.example.com/v1")
+    monkeypatch.setenv(llm.ENV_API_KEY, "sk-configured")
+    llm.reset_provider()
+
+    status = answers.provider_status(principal=owner(), probe=False)
+    assert status.api_key_withheld is None

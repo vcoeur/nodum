@@ -22,7 +22,13 @@ List-returning commands wrap their rows in a named key plus a `count`:
 Errors are always one line on stderr with exit 1 — never a traceback. That
 includes a missing file, whichever command reads one: `asset register
 /missing.png`, `ingest file /missing.pdf`, `edge create-batch /missing.json`,
-and `node create|update --content-file /missing.md`.
+and `node create|update --content-file /missing.md`. It covers the directory
+arguments too — a folder this process may not read, and a `~someone` whose home
+directory does not resolve, are each one line from `ingest file`.
+
+It also covers who you say you are: an account `--as` names that does not exist,
+or exists and is disabled, is the same one line and the same exit 1, on every
+command that takes the option.
 
 ## Conventions
 
@@ -195,9 +201,25 @@ does not resolve). With no provider configured the refusal names
   **exact** match on a hosted model id, and only when you have not set
   `NODUM_LLM_BASE_URL` yourself: a name that merely starts with `deepseek-`
   (`deepseek-r1:8b` and the rest of the ollama library) is a local model and
-  stays on your local endpoint, and once you name a base URL that endpoint's own
-  defaults apply — no profile can give a window to a server you pointed
-  somewhere else.
+  stays on your local endpoint. Once you name a base URL, **that URL decides
+  which profile applies, and a model name decides nothing**: point at
+  `https://api.deepseek.com/v1` and you still get DeepSeek's own window and
+  modes, because the profile is a fact about the endpoint; point anywhere else
+  and no model name can give that server a window it does not have.
+
+  `NODUM_LLM_BASE_URL` must be a URL that can be posted to, scheme included. A
+  scheme-less `api.deepseek.com/v1` is **not** repaired into one — choosing
+  `http` or `https` for you decides whether your `NODUM_LLM_API_KEY` crosses the
+  network in clear text — so it is reported the way an unusable setting always
+  is here: no provider, a `detail` naming the variable and the fix, and exit 0.
+
+  **Your key goes only to an endpoint you named.** Either you set
+  `NODUM_LLM_BASE_URL`, or your model name is exactly a hosted model id nodum
+  ships a profile for. A model id it does not recognise falls back to the local
+  default — a host nodum chose, not one you configured a key for — so the key is
+  left behind rather than posted there, and `api_key_withheld` says so with the
+  sentence that fixes it. A local gateway that requires a key keeps it: naming
+  that gateway in `NODUM_LLM_BASE_URL` is you saying the key belongs to it.
   Three more fields say what your provider is really doing, as opposed to what
   you asked it for. **`structured_output`** is `json_schema` or `json_object`:
   under the first, the server's constrained decoding makes an answer the schema
@@ -209,7 +231,11 @@ does not resolve). With no provider configured the refusal names
   configured against it is withheld and the model runs at its own default.
   **`effective_max_output_tokens`** is what `NODUM_LLM_MAX_OUTPUT_TOKENS` is
   worth against this window — never more than half of it, because the answer and
-  the prompt share the window on a server like `ollama`.
+  the prompt share the window on a server like `ollama`. It is the ceiling
+  `summarize` uses; `ask` reserves its own smaller number (2 048, measured
+  against a worst case of 528 output tokens over 24 samples) and the
+  reachability probe a smaller one again, because the call sites do not need the
+  same room.
 
 ### History and state
 

@@ -1013,6 +1013,22 @@ def asset_purge(
 # ── Ingestion ─────────────────────────────────────────────────────────────────
 
 
+def _expand_user(raw: str) -> Path:
+    """Expand a leading ``~`` in a path argument, as a refusal rather than a crash.
+
+    ``Path.expanduser`` raises ``RuntimeError`` for a ``~user`` it cannot
+    resolve (``~nobodyhere/notes.md``), which is a typo in an argument and not a
+    defect. It is translated to ``ValueError`` here — the one class :func:`_run`
+    already maps to the contract's single line — rather than by adding
+    ``RuntimeError`` to that except list, where it would launder every genuine
+    bug in these commands into a friendly message about a path.
+    """
+    try:
+        return Path(raw).expanduser()
+    except RuntimeError as exc:
+        raise ValueError(f"cannot resolve the home directory in path: {raw}") from exc
+
+
 def _files_in(directory: Path, *, recursive: bool) -> list[Path]:
     """Return the regular files inside ``directory``, sorted, dotfiles skipped.
 
@@ -1033,10 +1049,16 @@ def _files_in(directory: Path, *, recursive: bool) -> list[Path]:
 
 
 def _ingest_sources(paths: Sequence[str], *, recursive: bool) -> list[Path]:
-    """Expand the path arguments into the files a batch will ingest, in order."""
+    """Expand the path arguments into the files a batch will ingest, in order.
+
+    Called **through** :func:`_run`, for the reason :func:`_principal` and
+    :func:`_read_content` are: it touches the filesystem, and an unreadable
+    directory's ``PermissionError`` climbing out of ``iterdir`` here was a full
+    Rich traceback from outside the error boundary.
+    """
     found: list[Path] = []
     for raw in paths:
-        candidate = Path(raw).expanduser()
+        candidate = _expand_user(raw)
         if candidate.is_dir():
             found.extend(_files_in(candidate, recursive=recursive))
         else:
@@ -1084,7 +1106,7 @@ def ingest_file(
     rather than duplicated.
     """
     principal = _principal(as_human)
-    if len(paths) == 1 and not Path(paths[0]).expanduser().is_dir():
+    if len(paths) == 1 and not _run(_expand_user, paths[0]).is_dir():
         _emit(
             _run(
                 ingest.ingest_file,
@@ -1103,7 +1125,7 @@ def ingest_file(
             err=True,
         )
         raise typer.Exit(1)
-    sources = _ingest_sources(paths, recursive=recursive)
+    sources = _run(_ingest_sources, paths, recursive=recursive)
     if not sources:
         typer.echo(f"no files to ingest in {', '.join(paths)}", err=True)
         raise typer.Exit(1)
