@@ -763,33 +763,33 @@ commands on a saved node for exactly this reason.
   computed, and the cycle closes `failed` with all of it. Determinism is a
   rule here: no randomness, one clock captured when the cycle opens, and every
   pair, group and list ordered before it is written.
-  **Both cosine bars are measured, and neither does its job.** They stand at
-  0.93 (duplicate) and 0.80 (`relates_to`), measured against
-  `tests/fixtures/embedding_calibration.json` — 29 hand-labelled bilingual FR+EN
-  pairs held at equal length so length is not a variable between bands. The
-  duplicate bar is simply dead: **0 of 10** labelled duplicates reach it, so
-  duplicate detection finds only duplicates already titled alike, precisely the
-  case the embedding signal was added to answer. **The link bar is the more
-  expensive half, and it is not dead — it is wrong.** No genuinely related pair
-  reaches it (that band tops out at 0.587) but **7 of those same 10 duplicates
-  do**, because the duplicate band runs 0.763-0.929 straight through it. So a
-  near-duplicate worded differently is not missed, it is **mislabelled**: filed
-  as `relates_to` by the weaker signal because the stronger one cannot reach it,
-  and a human rejecting it answers "not merely related" rather than "not a
-  duplicate". Nothing in the queue distinguishes the two.
-  **Replacements derived from that fixture alone (0.72 and 0.38) were tried and
-  reverted**: they separate the fixture's bands cleanly and still fail on real
-  content, measured on two corpora. Over a 200-node graph of real prose the link
-  bar at 0.38 proposed **1 175** `relates_to` edges, 5.9 per node against 5 at
-  0.80; over 154 documents of a second, more homogeneous corpus **35.2 % of all
-  pairs** clear 0.38. A set written to demonstrate a separation cannot measure a
-  false-positive rate. So the replacements must come from a
-  real corpus, scored for volume and precision rather than separation, with a
-  test that embeds real text; that is its own cycle and it must land before the
-  abstraction job, whose cohesion criterion reads the same vectors.
-  `scripts/measure_embedding_calibration.py` and the fixture are kept as its
-  starting point, and re-running it is required after any change of model, of
-  fastembed's pooling, or of `CHUNK_WORDS`.
+  **Both cosine bars are measured, and the measurement set both.** They stand
+  at 0.93 (duplicate) and 0.60 (`relates_to`), chosen from
+  `scripts/measure_kasten_calibration.py`'s tables over a real corpus: 426
+  kasten prose notes (`note/` + `literature/`, frontmatter and wikilinks
+  stripped), sampled 200, scored for volume and precision rather than for
+  separation — the fixture-derived 0.72/0.38 pair separated
+  `tests/fixtures/embedding_calibration.json`'s bands cleanly and still failed
+  on real content, because a set written to demonstrate a separation cannot
+  measure a false-positive rate. At 0.80 the link bar measured **dead**: 0.04
+  `relates_to` per node, the gate's "5 at 0.80" reproduced. The reverted 0.38
+  measured as a **flood**: 5.9-6.4 per node, the gate's 1 175/200 reproduced.
+  At 0.60 it fires at **1.16 per node** with ~10 % precision against the
+  vault's own wikilinks as ground truth — which under-counts, since the 0.907
+  'Software architecture for developers' ↔ 'A Philosophy of Software Design'
+  pair is clearly same-area and not wikilinked — and the above-bar pairs are
+  genuinely same-area by inspection. The duplicate bar cannot do better on this
+  content: real duplicate candidates — the same-normalised-title pairs — score
+  0.28-0.55, overlapping the related band completely, so only exact copies
+  reach 0.93 and the title-normalisation signal is the real duplicate detector.
+  What the cosine pair still cannot express — a near-duplicate worded
+  differently clears the link bar and arrives as `relates_to`, and the queue
+  cannot tell "not merely related" from "not a duplicate" — is the
+  learned-curation cycle's job (§L1 annotations), not a bar. The fixture and
+  `scripts/measure_embedding_calibration.py` are kept as the drift set;
+  re-running `measure_kasten_calibration.py` is how a future re-tuning starts,
+  and is required after any change of model, of fastembed's pooling, or of
+  `CHUNK_WORDS`.
   Three rules guard the run itself. **One cycle at a time, in the whole file —
   and the guard is a row, not a lock.** Migration `0014` carries a partial
   unique index over `cycles(status)` where `status = 'running' AND trigger IN
