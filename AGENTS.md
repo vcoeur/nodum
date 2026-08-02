@@ -88,7 +88,12 @@ rollback** (`service.rollback_cycle`, human-only and atomic), the **landing
 seam** (`store.cap_landing` plus a keyword-only `landing=` on `create_edge` /
 `propose_edges` / `create_node`: §8.3's grant-is-a-ceiling, which is what puts
 the gardener's inferences in the review queue), the **consolidation runner**
-(`nodum.consolidate` — four deterministic jobs, the abstraction job (5b-ii's
+(`nodum.consolidate` — five deterministic jobs including **queue curation**
+(§L1–§L4: proposers' acceptance rates computed from row state, never the event
+log, and recorded as convention notes in the `conventions` space plus one
+`annotations` row per queue item — statistics and the record, never the
+judgement: nothing auto-accepts and nothing gates a write on the proposer's
+own `confidence`), the abstraction job (5b-ii's
 first, below), and five coherence metrics,
 running as a peer client over the public service API), the **nightly
 scheduler** (`nodum.scheduler`, one asyncio task in `nodum serve`'s lifespan,
@@ -107,7 +112,7 @@ research agent in design §3, and splitting prose into sentences would fill the
 review queue with noise instead of knowledge, so ingestion proposes sources and
 structure and stops; the **remaining LLM *jobs* of the gardener** — props
 migration on a retype, deciding that an untouched claim has gone *stale* rather
-than merely old, learned queue curation, and the two Q12 metrics that need a
+than merely old, and the two Q12 metrics that need a
 model — which Phase 5b-ii lands on top of 5b-i's runtime (`nodum.llm` +
 `nodum.agent`, below): the provider, the accounting, the budgets and the kill
 switch ship first, so the thing being observed arrives after the observability
@@ -123,10 +128,28 @@ rejecting it archives them — and the run's cost rides the cycle
 report under `report["llm"]`. Design Constraint 4 is unchanged and now
 structurally enforced — the model stays out of validation, the state machine
 and the projectors (`tests/test_llm.py` proves those modules cannot reach
-`nodum.llm` at all), and the four deterministic jobs of `nodum.consolidate`
+`nodum.llm` at all), and the five deterministic jobs of `nodum.consolidate`
 still run on a machine with no model present; the abstraction job is the
 deliberate exception, gated on the cycle budget (`NODUM_LLM_CYCLE_BUDGET`, off
-by default) and on a configured provider. Also not built: **Markdown Mirror** and any
+by default) and on a configured provider. **Learned queue curation is also
+built, and it is a deterministic job, not one of the LLM jobs**: the curation
+job (§L1–§L4) computes each proposer's acceptance rate from **row state** —
+`active`/`archived` rows and `applied`/`archived` versions over the last
+`CURATION_WINDOW_DAYS` (90) — and records the result twice: a convention note
+per `(proposer, edge type)` in the `conventions` space (the gardener's own,
+migration `0016`, where it holds `edit` alone), and one `annotations` row per
+queue item whose proposer has history on its type, written through
+`service.annotate` and read back on `ProposalOut.annotation`. It never accepts
+and never rejects — statistics and the record, not the judgement — and
+**nothing gates a write on the proposer's own `confidence`**. Auto-accept
+exists as a real interface and stays OFF at `null`: the job reads the
+well-known `auto_accept_above` props field off `conventions`-space notes, and
+even when a human sets one the accept direction stays conservative and
+unimplemented (the measured evidence put its misses there); the report says so
+and names what would turn it on. The window is measured from row `created_at`
+because row state records no decision time — the recorded deferral is a
+`reviewed_at` timestamp on the row, deliberately not added, and the `policies`
+table (dropped by migration 0010) stays dead. Also not built: **Markdown Mirror** and any
 whole-graph export (the only
 export that exists is the thin per-node snapshot,
 `GET /api/export/node/{id}?depth=`, which is `get_neighborhood` with a
@@ -375,7 +398,7 @@ commands on a saved node for exactly this reason.
   and no surface at all. The three verbs a `running` entry can meet are stop,
   abandon and rollback, and every surface states the difference rather than
   leaving a human to infer it from three similar buttons. What *obeys* a stop
-  today is `agent.AgentRun.chat`, immediately before a provider call; the four
+  today is `agent.AgentRun.chat`, immediately before a provider call; the five
   deterministic jobs in `nodum.consolidate` make none and read the switch
   nowhere, so a stop recorded against one of those runs is kept and the run
   finishes — the abstraction job is the exception: it reaches the model through
@@ -558,7 +581,12 @@ commands on a saved node for exactly this reason.
   queue item saying what a proposer's acceptance signal judged and at what
   rate, an **exclusive arc** (three typed nullable `ON DELETE CASCADE` target
   columns, a CHECK that exactly one is non-null) with **no direct read
-  surface** — written only by the learned-curation cycle, read only by
+  surface** — written only through `service.annotate` (the learned-curation
+  cycle's writer, gated like a review by `Store.require_review`, resolving the
+  target through the principal's read scope so it is no existence oracle, and
+  replacing rather than accumulating per target: the partial unique indexes
+  hold one annotation per item, and a later cycle's annotation supersedes the
+  earlier one), read only by
   `list_proposals`, which attaches it to a `ProposalOut` the store has already
   grant-filtered.
   Each public function opens its own short-lived connection
@@ -740,10 +768,10 @@ commands on a saved node for exactly this reason.
   free; the thread moved a total freeze to a slow read, which is the whole of
   what it bought.
 - **`nodum.consolidate`** — the consolidation runner (design §8.4/§8.5), and
-  everything on the near side of the LLM line: four deterministic jobs, the
+  everything on the near side of the LLM line: five deterministic jobs, the
   abstraction job (the deliberate exception, below), and five
   coherence metrics, with no provider, no generation and no judgement anywhere
-  in the deterministic four. **It is a peer client, not an insider** (§8.4 rule 1): every
+  in the deterministic five. **It is a peer client, not an insider** (§8.4 rule 1): every
   read and write goes through a public `nodum.service` function exactly as the
   MCP server's do — it opens no connection, imports no service private, and
   touches no table — which is what makes the gardener an agent with grants
@@ -758,7 +786,12 @@ commands on a saved node for exactly this reason.
   duplicate edge and an edge incident to an archived node, both on `active`
   edges only, since retiring a `proposed` edge is a review decision that belongs
   to the human — then `relates_to` inference from embedding proximity and
-  co-citation), `housekeeping` (D3's position rebalance, which is a **correct
+  co-citation), `curation` (§L1–§L4: proposers' acceptance rates from row
+  state — never the event log — filed as convention notes in the
+  `conventions` space and one `annotations` row per queue item via
+  `service.annotate`; statistics and the record, never the judgement: nothing
+  auto-accepts and nothing gates a write on the proposer's own
+  `confidence`), `housekeeping` (D3's position rebalance, which is a **correct
   no-op**: `create_node` is the only writer of `position` and writes
   `max + 1.0`, so no sibling set can converge on float precision until a
   reorder operation exists — the gap check is live, not decorative — plus D6
@@ -775,7 +808,7 @@ commands on a saved node for exactly this reason.
   opens no cycle because it is a diff a human is reading right now rather than a
   rehearsal of the nightly run. One job's failure never loses the others: its
   outcome carries the error, the rest still run, the after-metrics are still
-  computed, and the cycle closes `failed` with all of it.   `abstraction` is the fifth job and the deliberate exception to the no-model
+  computed, and the cycle closes `failed` with all of it.   `abstraction` is the one LLM job and the deliberate exception to the no-model
   rule — 5b-ii's first, cut to the same discipline the others run under:
   **the model never decides *whether* to synthesize, only what the text says.**
   The selection is deterministic arithmetic over data the file already holds —
@@ -1051,7 +1084,13 @@ commands on a saved node for exactly this reason.
   of who asked and when once one is on the row) and the rollback
   confirm — which is the only place a human
   meets a 409 with a `conflicts` list, so it has to render *both* ends of each
-  collision rather than a count. It reads the journal; it does not summarise
+  collision rather than a count. The journal also renders the curation job's
+  **acceptance section** (L4): per proposer, per type, the accepted/rejected
+  counts and the rate the job computed from row state, with a note that
+  deltas between cycles are the convention nodes' own versions' diff. The
+  review queue's cards render each item's **annotation** the same way — the
+  proposer's rate on the item's type plus the signals their own props named,
+  small and never as a judgement. It reads the journal; it does not summarise
   it, because the cycle report and the event list are two different records and
   neither is a substitute for the other. **No sentence on either journal screen
   carries a raw id or a server refusal it has not read**: the two refusals that
@@ -1517,7 +1556,7 @@ commands on a saved node for exactly this reason.
   the wall-clock check silently stops existing).
   **The wall clock starts at the first provider call, not at construction** —
   `for_cycle` is built when the cycle opens and the LLM jobs run last, so a
-  clock started in the constructor charged the four deterministic jobs' minutes
+  clock started in the constructor charged the five deterministic jobs' minutes
   to the LLM's ceiling and reported time the model never had. **The per-call
   timeout is clamped to what is left of it** (`min(call_timeout,
   ledger.remaining_seconds)`): the clock was checked before a call and never
@@ -1590,7 +1629,7 @@ commands on a saved node for exactly this reason.
   never to a string in a report written after the write already failed.
   **The human end is `nodum cycle-stop <id>`, `POST /api/cycles/{id}/stop`, and
   a confirm on the journal entry** — all three through `service.request_stop`.
-  What obeys a stop today is `AgentRun.chat`, before a provider call; the four
+  What obeys a stop today is `AgentRun.chat`, before a provider call; the five
   deterministic jobs in `nodum.consolidate` make none and check nothing, so a
   run of those finishes with the stop recorded on it. **Every surface says that
   rather than promising a wind-down that would not arrive**, and
@@ -2862,7 +2901,7 @@ Phase-1 decision log.
   a switch that raised on the second press would make a human doubt the first —
   and a cycle that has said how it ended is refused, since nothing is left to
   obey it. **What obeys a stop today is `AgentRun.chat`, before a provider
-  call**; the four deterministic jobs make none, so a run of those finishes with
+  call**; the five deterministic jobs make none, so a run of those finishes with
   the stop recorded on it — the abstraction job is the exception, checking
   through that same `AgentRun.chat` — and the help text, the docs and the
   browser confirm

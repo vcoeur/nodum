@@ -334,7 +334,11 @@ does not resolve). With no provider configured the refusal names
 ### Consolidation and the curative tier
 
 - `consolidate` — Run a consolidation cycle: the gardener's deterministic
-  jobs, the abstraction job (5b-ii's first — it synthesizes a `concept` node
+  jobs (including **queue curation** — each proposer's acceptance rate over the
+  last 90 days, computed from row state and recorded as a convention note in
+  the `conventions` space plus one annotation per queue item; it never accepts
+  or rejects, and nothing gates a write on the proposer's own confidence),
+  the abstraction job (5b-ii's first — it synthesizes a `concept` node
   from a dense, sized cluster of related notes, but only when
   `NODUM_LLM_CYCLE_BUDGET` funds it and a provider is configured), and the
   report. `--scope` confines it to one space, `--job` selects jobs

@@ -29,6 +29,7 @@ from nodum.migrations import BUILTIN_AGENT_PREFIX, MAIN_SPACE_ID, META_SPACE_ID
 from nodum.models import (
     AgentCreatedOut,
     AgentOut,
+    AnnotationOut,
     BatchTransitionOut,
     BulkRelinkOut,
     CycleOut,
@@ -2440,6 +2441,178 @@ def reject_proposals(
     agent's proposal any more than its own, outside its edit-granted spaces.
     """
     return _transition_many(ids, "reject", principal=principal, reason=reason, path=path)
+
+
+def annotate(
+    target_kind: str,
+    target_id: str | int,
+    body: dict[str, Any],
+    *,
+    principal: Principal,
+    path: str | Path | None = None,
+) -> AnnotationOut:
+    """Write one annotation on a node, edge, or version — replacing a prior one.
+
+    Migration 0016's table is the write seam's schema half (design §L1: one
+    annotation per queue item, saying what a proposer's acceptance signal
+    judged and at what rate) and this is the writer it shipped without: the
+    learned-curation cycle (5b-ii) files the annotations, and a human has no
+    reason to — the table is read only attached to a
+    :class:`~nodum.models.ProposalOut` the store has already grant-filtered.
+    An annotation is **derived judgement, not graph state**: it writes no
+    event-log row and no version, which is exactly why it cascades with its
+    target and can never be the reason a delete is refused
+    (:func:`_delete_blocker`).
+
+    The review gate is the review queue's own (:meth:`Store.require_review`):
+    a human, or ``edit`` on the item's space — the same authority accept and
+    reject ask for, because attaching the gardener's learned judgement to an
+    item is the kind of write that must stay in the hands of whoever reviews
+    that item. The read side answers *not found* for anything the principal
+    cannot see, identically to something that does not exist — an annotation
+    must not be an existence oracle, the Q13 shape every id-carrying write
+    follows.
+
+    The target resolves through the principal's read scope like a transition
+    row does: a node must be readable, an edge must have both endpoints
+    readable, and a version resolves through the node it belongs to.
+
+    Args:
+        target_kind: ``"node"``, ``"edge"``, or ``"version"`` — the
+            exclusive-arc column the row lands in.
+        target_id: The target's id; a version id is the ``versions`` row's
+            integer.
+        body: The annotation's JSON object — what was judged and at what rate
+            (e.g. ``{"rate": 0.92, "signals": [...], "counts": ...}``).
+        principal: Who is writing.
+        path: Explicit database path.
+
+    Returns:
+        The row as written, so the caller can report the annotation id.
+
+    Raises:
+        ValueError: If ``target_kind`` is not one of the three, or ``body`` is
+            not a JSON-serialisable object.
+        RecordNotFound: If the id resolves to no row the principal can read —
+            unreadable and nonexistent answer identically.
+        GrantNotPermitted: If the principal is not a human and holds no
+            ``edit`` grant on the item's space.
+
+    Note:
+        **Re-annotating replaces rather than accumulates.** The three partial
+        unique indexes hold one annotation per target, and ``INSERT OR REPLACE``
+        would not express that (it replaces on the primary key only) — so the
+        write is an explicit ``DELETE`` of any prior row on the same target
+        column followed by the ``INSERT``, in one connection and one commit. A
+        later cycle's annotation on the same queue item supersedes the earlier
+        one instead of piling up beside it.
+    """
+    if target_kind not in ("node", "edge", "version"):
+        raise ValueError(f"target_kind must be 'node', 'edge', or 'version', got {target_kind!r}")
+    if not isinstance(body, dict):
+        raise ValueError("annotation body must be a JSON object")
+    try:
+        encoded = json.dumps(body, ensure_ascii=False, allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"annotation body must be JSON-serialisable: {exc}") from None
+    conn = _connect(path)
+    try:
+        store = Store(conn, principal)
+        row = _resolve_annotatable(conn, store, target_kind, target_id)
+        store.require_review(_item_spaces(conn, target_kind, row), "annotate")
+        target_column = {
+            "node": "target_node_id",
+            "edge": "target_edge_id",
+            "version": "target_version_id",
+        }[target_kind]
+        # The replacement path: the unique index is per target column, so a
+        # second annotate deletes what the first wrote before inserting its own
+        # row. One connection and one commit keep the pair atomic.
+        conn.execute(f"DELETE FROM annotations WHERE {target_column} = ?", (target_id,))
+        annotation_id = uuid.uuid4().hex
+        conn.execute(
+            "INSERT INTO annotations (id, target_node_id, target_edge_id,"
+            " target_version_id, body, actor, cycle_id)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                annotation_id,
+                target_id if target_kind == "node" else None,
+                target_id if target_kind == "edge" else None,
+                target_id if target_kind == "version" else None,
+                encoded,
+                principal.actor_string,
+                _CURRENT_CYCLE.get(),
+            ),
+        )
+        written = _row_dict(
+            conn.execute("SELECT * FROM annotations WHERE id = ?", (annotation_id,)).fetchone()
+        )
+        # The return value is built before the commit so a validation failure
+        # lands pre-commit: `finally: conn.close()` then rolls back the whole
+        # DELETE+INSERT pair, keeping "the row as written, or nothing" honest.
+        out = AnnotationOut(
+            id=written["id"],
+            target_kind=target_kind,
+            target_id=str(written[target_column]),
+            body=body,
+            actor=written["actor"],
+            cycle_id=written["cycle_id"],
+            created_at=written["created_at"],
+        )
+        conn.commit()
+        return out
+    finally:
+        conn.close()
+
+
+def _resolve_annotatable(
+    conn: sqlite3.Connection,
+    store: Store,
+    target_kind: str,
+    target_id: str | int,
+) -> dict[str, Any]:
+    """Resolve an ``annotate`` target to a readable row, or answer *not found*.
+
+    The three kinds resolve through the same read rule a transition row uses —
+    a node must be in the principal's read set, an edge needs both endpoints
+    readable, a version resolves through its node — and an unreadable target
+    raises :class:`RecordNotFound` with the identical sentence a nonexistent
+    one does: an annotation must not be an existence oracle (Q13).
+    """
+    if target_kind == "node":
+        try:
+            row = _get_node_row(conn, str(target_id))
+        except NodeNotFound:
+            raise RecordNotFound(f"no readable node with id: {target_id}") from None
+        if not store.node_visible(row):
+            raise RecordNotFound(f"no readable node with id: {target_id}")
+        return _row_dict(row)
+    if target_kind == "edge":
+        try:
+            row = _get_edge_row(conn, str(target_id))
+        except EdgeNotFound:
+            raise RecordNotFound(f"no readable edge with id: {target_id}") from None
+        try:
+            src = _get_node_row(conn, row["src_id"])
+            dst = _get_node_row(conn, row["dst_id"])
+        except NodeNotFound:
+            # A dangling endpoint (an undo took the node back) is an edge with
+            # no readable scope: the edge_scope rule is *both* endpoints.
+            raise RecordNotFound(f"no readable edge with id: {target_id}") from None
+        if not store.node_visible(src) or not store.node_visible(dst):
+            raise RecordNotFound(f"no readable edge with id: {target_id}")
+        return _row_dict(row)
+    try:
+        row = _get_version_row(conn, int(target_id))
+    except (VersionNotFound, ValueError):
+        raise RecordNotFound(f"no readable version with id: {target_id}") from None
+    try:
+        node = _get_node_row(conn, row["node_id"])
+    except NodeNotFound:
+        raise RecordNotFound(f"no readable version with id: {target_id}") from None
+    if not store.node_visible(node):
+        raise RecordNotFound(f"no readable version with id: {target_id}")
+    return _row_dict(row)
 
 
 def _matching_ids(
@@ -4863,7 +5036,7 @@ def request_stop(
     would buy seconds and cost a torn transaction.
 
     **What checks it today is one of those three points**: :meth:`nodum.agent.
-    AgentRun.chat`, immediately before a provider call. The four deterministic
+    AgentRun.chat`, immediately before a provider call. The five deterministic
     jobs in :mod:`nodum.consolidate` make no provider call and read this switch
     nowhere, so a stop recorded against one of those runs is kept on the row and
     the run finishes — the abstraction job (5b-ii's first) is the exception: it

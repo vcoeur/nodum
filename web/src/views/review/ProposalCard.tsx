@@ -20,7 +20,7 @@
 
 import { NodeBadge } from "../../components";
 import type { SpaceName } from "../../components";
-import type { ProposalOut } from "../../api/types";
+import type { JsonObject, ProposalOut } from "../../api/types";
 import { formatAbsolute, formatRelative } from "../../lib";
 import { formatConfidence, formatProps, shortId, truncate } from "./format";
 import { edgeCrossing, proposalKind } from "./grouping";
@@ -157,6 +157,10 @@ export function ProposalCard({
 
       <p className="nd-rv-card__consequence">{acceptConsequence(proposal)}</p>
 
+      {proposal.annotation === null ? null : (
+        <AnnotationLine annotation={proposal.annotation} kind={proposal.kind} />
+      )}
+
       {expanded ? (
         <div className="nd-rv-card__body">
           {kind === "node" ? <NodeProposal proposal={proposal} /> : null}
@@ -193,6 +197,46 @@ function headline(proposal: ProposalOut): string {
     return refLabel(contextRef(proposal.context, "node"), proposal.version?.node_id ?? proposal.id);
   }
   return proposal.id;
+}
+
+/**
+ * The learned-curation annotation on this item: the proposer's acceptance rate
+ * on this item's type, and the signals their own props named.
+ *
+ * Rendered small and never as a judgement — the rate is the graph's measure of
+ * the proposer's record, which is exactly what a reviewer deciding on this
+ * item is entitled to; whether to act on it stays the reviewer's call.
+ */
+function AnnotationLine({ annotation, kind }: { annotation: JsonObject; kind: string }) {
+  const rate = typeof annotation.rate === "number" ? annotation.rate : null;
+  const signals = Array.isArray(annotation.signals)
+    ? annotation.signals.filter((signal): signal is string => typeof signal === "string")
+    : [];
+  const counts =
+    annotation.counts !== null && typeof annotation.counts === "object"
+      ? (annotation.counts as JsonObject)
+      : null;
+  const accepted = counts !== null && typeof counts.accepted === "number" ? counts.accepted : null;
+  const rejected =
+    counts !== null && typeof counts.rejected === "number" ? counts.rejected : null;
+  if (rate === null && accepted === null) return null;
+
+  const typeWord = kind === "edge" ? "edge type" : "node type";
+  const parts: string[] = [];
+  if (rate !== null) {
+    parts.push(`this proposer accepts at ${Math.round(rate * 100)} % on this ${typeWord}`);
+  }
+  if (accepted !== null && rejected !== null) {
+    parts.push(`${accepted} accepted, ${rejected} rejected`);
+  }
+  if (signals.length > 0) {
+    parts.push(`signals: ${signals.join(", ")}`);
+  }
+  return (
+    <p className="nd-meta nd-rv-card__annotation" title="Judged by the curation job from row state, over the last 90 days">
+      {parts.join(" · ")}
+    </p>
+  );
 }
 
 /** The one-line "what is in here" shown while a card is collapsed. */

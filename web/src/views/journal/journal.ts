@@ -425,6 +425,62 @@ export function readLlmReport(report: JsonObject | null | undefined): LlmReport 
   };
 }
 
+/**
+ * One acceptance rate the curation job computed — `detail["acceptance"]`'s
+ * row (L4).
+ *
+ * `kind` is the row state the rate was counted over — `edge` (an edge type),
+ * `node` or `version` (a node type, for node and update proposals) — and
+ * `rate` is accepted / (accepted + rejected), rounded by the runner to six
+ * decimals. Only pairs with history appear: a cold-start proposer has no row.
+ */
+export interface AcceptanceEntry {
+  proposer: string;
+  kind: string;
+  type: string;
+  accepted: number;
+  rejected: number;
+  rate: number;
+}
+
+/**
+ * Read the curation job's `detail["acceptance"]` — the per-(proposer, type)
+ * rates the cycle computed, as the delta basis the journal renders.
+ *
+ * Defensive like every read of this untyped-at-the-edges wire: a row missing
+ * a number reads as its zero, and a malformed entry is dropped rather than
+ * thrown, so a report written by a different runner can never crash the
+ * detail page.
+ *
+ * @param detail The curation job's `detail` blob.
+ */
+export function readAcceptance(detail: JsonObject | null | undefined): AcceptanceEntry[] {
+  if (!detail || typeof detail !== "object") return [];
+  const raw = detail.acceptance;
+  if (!Array.isArray(raw)) return [];
+  const entries: AcceptanceEntry[] = [];
+  for (const row of raw.filter(
+    (entry): entry is JsonObject => entry !== null && typeof entry === "object",
+  )) {
+    const proposer = stringAt(row, "proposer");
+    const kind = stringAt(row, "kind");
+    const type = stringAt(row, "type");
+    const accepted = numberAt(row, "accepted");
+    const rejected = numberAt(row, "rejected");
+    const rate = numberAt(row, "rate");
+    if (proposer === null || kind === null || type === null) continue;
+    entries.push({
+      proposer,
+      kind,
+      type,
+      accepted: accepted ?? 0,
+      rejected: rejected ?? 0,
+      rate: rate ?? 0,
+    });
+  }
+  return entries;
+}
+
 /* ------------------------------------------------------------------ */
 /* The journal sentence                                                 */
 /* ------------------------------------------------------------------ */
@@ -472,6 +528,22 @@ function jobClauses(job: JobReport, dryRun: boolean): string[] {
           ? `noted ${plural(neglected, "neglected node")}`
           : `noted ${plural(neglected, "node")} untouched for ${plural(days, "day")}`,
       );
+    }
+    return clauses;
+  }
+
+  if (job.name === "curation") {
+    // The curation job's two records are not both proposals: convention nodes
+    // are (and land in `proposed`), annotations are not — they are rows on the
+    // annotations table, so the count is the job's own `detail` in both modes
+    // (ids on a run, would-be entries on a rehearsal, same length either way).
+    const conventions = dryRun ? lengthAt(job.detail, "conventions") : job.proposed;
+    const annotated = lengthAt(job.detail, "annotations");
+    if (conventions > 0) {
+      clauses.push(`learned ${plural(conventions, "acceptance convention")}`);
+    }
+    if (annotated > 0) {
+      clauses.push(`annotated ${plural(annotated, "queue item")}`);
     }
     return clauses;
   }
@@ -991,7 +1063,7 @@ export const STOP_ACTION_LABEL = "Stop this cycle";
  * What a stop actually gets, said in one place because four surfaces say it.
  *
  * `AgentRun.chat` checks the switch immediately before a provider call and that
- * is the only check that exists: the four deterministic consolidation jobs make
+ * is the only check that exists: the five deterministic consolidation jobs make
  * no provider call, so a stop recorded against one of those runs is kept on the
  * entry and the run finishes — to `completed`, if nothing else went wrong. The
  * abstraction job (5b-ii's first) is the exception: it reaches the model
@@ -1141,7 +1213,7 @@ export function stopRecord(cycle: CycleOut): { by: string; at: string } | null {
  *
  * The last line is the one that costs something to say and is said anyway.
  * `AgentRun.chat` checks the switch before every provider call, and that is the
- * only check that exists today: the four deterministic consolidation jobs make
+ * only check that exists today: the five deterministic consolidation jobs make
  * no provider call, so a stop recorded against one of those runs is kept and the
  * run finishes. Promising a wind-down that would not arrive is exactly the kind
  * of copy this file exists to prevent, and

@@ -1,7 +1,7 @@
 """The consolidation runner: the deterministic jobs and the coherence metrics.
 
 Phase 5a, the near side of the LLM line (design §8.4/§8.5). What is tested here
-is the half of the gardener that is arithmetic: four deterministic jobs, the
+is the half of the gardener that is arithmetic: five deterministic jobs, the
 abstraction job's deterministic selection (5b-ii's first LLM job — the model
 writes the text and never decides *whether* to synthesize), five metrics, one
 cycle around all of it, and the rails that keep the internal agent a *peer
@@ -2263,6 +2263,332 @@ def test_the_journal_carries_the_llm_report(fresh_db, monkeypatch):
     assert result.report.llm == stored, "the typed half of the report is the same data"
 
 
+# ── The curation job (§L1–§L4: rates from row state, conventions + annotations) ──
+
+
+def _curation_outcome(report):
+    return _outcome(report, consolidate.JOB_CURATION)
+
+
+def test_curation_computes_a_rate_from_row_state(fresh_db):
+    """The rate is the graph's measure: accepted rows active, rejected archived."""
+    proposer = agent("researcher")
+    alpha = service.create_node(type="concept", title="Alpha", principal=owner())
+    beta = service.create_node(type="concept", title="Beta", principal=owner())
+    gamma = service.create_node(type="concept", title="Gamma", principal=owner())
+    accepted_one = service.create_edge(alpha.id, beta.id, "supports", principal=proposer)
+    accepted_two = service.create_edge(beta.id, gamma.id, "supports", principal=proposer)
+    rejected = service.create_edge(alpha.id, gamma.id, "supports", principal=proposer)
+    service.transition(accepted_one.id, "accept", principal=owner())
+    service.transition(accepted_two.id, "accept", principal=owner())
+    service.transition(rejected.id, "reject", reason="weak link", principal=owner())
+    pending = service.create_edge(gamma.id, alpha.id, "supports", principal=proposer)
+
+    outcome = _curation_outcome(_run(jobs=[consolidate.JOB_CURATION]).report)
+
+    (convention_id,) = outcome.proposed
+    convention = service.get_node(convention_id, principal=owner())
+    assert convention.props["proposer"] == "agent:researcher"
+    assert convention.props["edge_type"] == "supports"
+    assert convention.props["rate"] == pytest.approx(2 / 3)
+    assert convention.props["accepted"] == 2
+    assert convention.props["rejected"] == 1
+    assert convention.props["window_days"] == consolidate.CURATION_WINDOW_DAYS
+    assert convention.props["job"] == consolidate.JOB_CURATION
+
+    (proposal,) = [
+        entry for entry in service.list_proposals(principal=owner()) if entry.kind == "edge"
+    ]
+    assert proposal.id == pending.id
+    assert proposal.annotation == {
+        "rate": pytest.approx(2 / 3),
+        "signals": [],
+        "window_days": consolidate.CURATION_WINDOW_DAYS,
+        "counts": {"accepted": 2, "rejected": 1},
+    }
+    (entry,) = [
+        entry
+        for entry in outcome.detail["acceptance"]
+        if entry["kind"] == "edge" and entry["proposer"] == "agent:researcher"
+    ]
+    assert entry["type"] == "supports"
+    assert entry["accepted"] == 2 and entry["rejected"] == 1
+    assert entry["rate"] == pytest.approx(2 / 3)
+
+
+def test_update_proposals_carry_a_version_rate(fresh_db):
+    """An update's history is its versions: applied counts accepted, archived rejected."""
+    proposer = agent("researcher")
+    node = service.create_node(type="claim", title="Target", principal=owner())
+    accepted = service.update_node(node.id, content="v1", principal=proposer)
+    rejected = service.update_node(node.id, content="v2", principal=proposer)
+    service.transition(str(accepted.id), "accept", principal=owner())
+    service.transition(str(rejected.id), "reject", reason="wrong claim", principal=owner())
+    service.update_node(node.id, content="v3", principal=proposer)
+
+    outcome = _curation_outcome(_run(jobs=[consolidate.JOB_CURATION]).report)
+
+    (proposal,) = service.list_proposals(principal=owner())
+    assert proposal.kind == "update"
+    assert proposal.annotation["rate"] == pytest.approx(0.5)
+    assert proposal.annotation["counts"] == {"accepted": 1, "rejected": 1}
+    assert proposal.annotation["window_days"] == consolidate.CURATION_WINDOW_DAYS
+    (entry,) = [
+        entry
+        for entry in outcome.detail["acceptance"]
+        if entry["kind"] == "version" and entry["proposer"] == "agent:researcher"
+    ]
+    assert entry["type"] == "claim"
+    assert entry["accepted"] == 1 and entry["rejected"] == 1
+
+
+def test_curation_writes_a_convention_node_in_the_conventions_space(fresh_db):
+    """L2: an ordinary note in the gardener's own space, filed proposed."""
+    proposer = agent("researcher")
+    alpha = service.create_node(type="concept", title="Alpha", principal=owner())
+    beta = service.create_node(type="concept", title="Beta", principal=owner())
+    edge = service.create_edge(alpha.id, beta.id, "supports", principal=proposer)
+    service.transition(edge.id, "accept", principal=owner())
+
+    outcome = _curation_outcome(_run(jobs=[consolidate.JOB_CURATION]).report)
+
+    (convention_id,) = outcome.proposed
+    convention = service.get_node(convention_id, principal=owner())
+    assert convention.space_id == "conventions"
+    assert convention.type == "note"
+    assert convention.state == "proposed"
+    assert set(convention.props) == set(consolidate.CURATION_CONVENTION_PROPS)
+    assert convention.props["kind"] == "acceptance-rate"
+    assert convention.props["rate"] == pytest.approx(1.0)
+
+
+def test_a_proposer_with_no_history_gets_no_annotation(fresh_db):
+    """Cold start is conservative: before track records exist, the queue is
+    annotated by nobody — a proposal with no rate is a proposal like any other."""
+    proposer = agent("researcher")
+    service.create_node(type="note", title="First try", principal=proposer)
+
+    outcome = _curation_outcome(_run(jobs=[consolidate.JOB_CURATION]).report)
+
+    assert outcome.proposed == []
+    assert outcome.detail["annotations"] == []
+    (proposal,) = service.list_proposals(principal=owner())
+    assert proposal.annotation is None
+
+
+def test_auto_accept_is_off_by_default(fresh_db):
+    """No control set: the job writes its records and accepts nothing."""
+    proposer = agent("researcher")
+    alpha = service.create_node(type="concept", title="Alpha", principal=owner())
+    beta = service.create_node(type="concept", title="Beta", principal=owner())
+    accepted = service.create_edge(alpha.id, beta.id, "supports", principal=proposer)
+    service.transition(accepted.id, "accept", principal=owner())
+    pending = service.create_edge(beta.id, alpha.id, "supports", principal=proposer)
+
+    outcome = _curation_outcome(_run(jobs=[consolidate.JOB_CURATION]).report)
+
+    assert outcome.detail["auto_accept"] == {"enabled": False, "threshold": None}
+    assert outcome.applied == []
+    assert any("auto-accept is off" in note for note in outcome.notes)
+    assert any("nothing was accepted" in note for note in outcome.notes)
+    (proposal,) = [
+        entry for entry in service.list_proposals(principal=owner()) if entry.kind == "edge"
+    ]
+    assert proposal.id == pending.id
+    assert proposal.edge.state == "proposed"
+
+
+def test_a_set_auto_accept_control_is_read_and_still_off(fresh_db):
+    """The interface exists: a human-set threshold is read and acknowledged,
+    and the accept direction stays conservative — nothing accepts on a rate."""
+    proposer = agent("researcher")
+    alpha = service.create_node(type="concept", title="Alpha", principal=owner())
+    beta = service.create_node(type="concept", title="Beta", principal=owner())
+    accepted = service.create_edge(alpha.id, beta.id, "supports", principal=proposer)
+    service.transition(accepted.id, "accept", principal=owner())
+    pending = service.create_edge(beta.id, alpha.id, "supports", principal=proposer)
+    service.create_node(
+        type="note",
+        title="Curation control",
+        content="",
+        space="conventions",
+        props={"auto_accept_above": 0.9},
+        principal=owner(),
+    )
+
+    outcome = _curation_outcome(_run(jobs=[consolidate.JOB_CURATION]).report)
+
+    assert outcome.detail["auto_accept"] == {"enabled": False, "threshold": 0.9}
+    assert outcome.applied == []
+    assert any("auto_accept_above" in note for note in outcome.notes)
+    (proposal,) = [
+        entry for entry in service.list_proposals(principal=owner()) if entry.kind == "edge"
+    ]
+    assert proposal.id == pending.id
+
+
+def test_a_numeric_string_auto_accept_control_reads_as_the_number(fresh_db):
+    """A human editing graph props writes ``"0.9"``, not ``0.9`` — the control
+    has to read the same either way, or a set threshold is silently ignored."""
+    service.create_node(
+        type="note",
+        title="Curation control",
+        content="",
+        space="conventions",
+        props={"auto_accept_above": "0.9"},
+        principal=owner(),
+    )
+
+    outcome = _curation_outcome(_run(jobs=[consolidate.JOB_CURATION]).report)
+
+    assert outcome.detail["auto_accept"] == {"enabled": False, "threshold": 0.9}
+    assert any("sets 'auto_accept_above' to 0.9" in note for note in outcome.notes)
+
+
+def test_a_malformed_auto_accept_control_is_named_not_ignored(fresh_db):
+    """A value that is not a number cannot be a threshold — but the report has
+    to say the note set one, not that no conventions-space note sets it at all."""
+    control = service.create_node(
+        type="note",
+        title="Curation control",
+        content="",
+        space="conventions",
+        props={"auto_accept_above": "garbage"},
+        principal=owner(),
+    )
+
+    outcome = _curation_outcome(_run(jobs=[consolidate.JOB_CURATION]).report)
+
+    assert outcome.detail["auto_accept"] == {"enabled": False, "threshold": None}
+    assert any(control.id in note and "not a number" in note for note in outcome.notes)
+    assert not any("no conventions-space note sets" in note for note in outcome.notes)
+
+
+def test_the_curation_window_counts_a_row_exactly_at_the_edge(fresh_db, monkeypatch):
+    """The quarter is open past the boundary, not at it: ``> 90`` days skips a
+    row older than the window, and a row *exactly* at it still counts.
+
+    The `>` vs `>=` off-by-one is invisible in the copy and changes one row per
+    proposer — this pins it with a clock the run cannot disagree with and
+    timestamps written relative to it.
+    """
+    pinned = datetime(2026, 8, 2, 12, 0, 0, tzinfo=UTC)
+    monkeypatch.setattr(consolidate, "_utcnow", lambda: pinned)
+
+    proposer = agent("researcher")
+    alpha = _node("Alpha", type="concept")
+    beta = _node("Beta", type="concept")
+    at_the_edge = service.create_edge(alpha.id, beta.id, "supports", principal=proposer)
+    service.transition(at_the_edge.id, "accept", principal=owner())
+    past_it = service.create_edge(beta.id, alpha.id, "supports", principal=proposer)
+    service.transition(past_it.id, "reject", principal=owner())
+
+    conn = db.connect()
+    try:
+        for row_id, days in ((at_the_edge.id, 90), (past_it.id, 91)):
+            conn.execute(
+                "UPDATE edges SET created_at = ? WHERE id = ?",
+                ((pinned - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S"), row_id),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    outcome = _curation_outcome(_run(jobs=[consolidate.JOB_CURATION]).report)
+
+    (entry,) = [item for item in outcome.detail["acceptance"] if item["type"] == "supports"]
+    assert entry["accepted"] == 1
+    assert entry["rejected"] == 0
+
+
+def test_curation_dry_run_writes_nothing(fresh_db):
+    """A rehearsal computes the rates and records what it would write."""
+    proposer = agent("researcher")
+    alpha = service.create_node(type="concept", title="Alpha", principal=owner())
+    beta = service.create_node(type="concept", title="Beta", principal=owner())
+    accepted = service.create_edge(alpha.id, beta.id, "supports", principal=proposer)
+    service.transition(accepted.id, "accept", principal=owner())
+    service.create_edge(beta.id, alpha.id, "supports", principal=proposer)
+
+    outcome = _curation_outcome(_run(jobs=[consolidate.JOB_CURATION], dry_run=True).report)
+
+    assert outcome.proposed == []
+    (dry_annotation,) = outcome.detail["annotations"]
+    assert dry_annotation == {
+        "kind": "edge",
+        "id": dry_annotation["id"],
+        "rate": pytest.approx(1.0),
+        "dry_run": True,
+    }
+    assert outcome.detail["conventions"] == [
+        {
+            "node": None,
+            "proposer": "agent:researcher",
+            "edge_type": "supports",
+            "rate": pytest.approx(1.0),
+        }
+    ]
+    assert any(
+        "dry run: would write 1 convention node(s) and 1 annotation(s)" in note
+        for note in outcome.notes
+    )
+    assert service.list_nodes(space="conventions", principal=owner()) == []
+    assert service.list_proposals(principal=owner())[0].annotation is None
+
+
+def test_curation_reads_row_state_and_no_event_log():
+    """§L1's whole point: the job imports no agent runtime and reads no event
+    log — acceptance is computed from where the graph is now, never from what
+    happened (the gardener is `kind='internal'` and `list_events` refuses it)."""
+    module = _module_ast()
+    curation = next(
+        node
+        for node in module.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_job_curation"
+    )
+    calls = {
+        node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", "")
+        for node in ast.walk(curation)
+        if isinstance(node, ast.Call)
+    }
+    assert "list_events" not in calls
+    agent_uses = [
+        node
+        for node in ast.walk(curation)
+        if isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "agent"
+    ]
+    assert agent_uses == [], "the curation job must not touch the model runtime"
+
+
+def test_the_curation_job_gates_nothing_on_confidence():
+    """§8.3's rail for the learned half: the proposer's own ``confidence`` is
+    echoed at most, never compared. The stop-switch rail confines by call
+    name; this one confines by data — no gating expression inside the curation
+    job may reference ``confidence`` at all, as a name or as the props key, so
+    a threshold crept into a comparison fails this test."""
+    module = _module_ast()
+    curation = next(
+        node
+        for node in module.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_job_curation"
+    )
+    gates = [
+        node.test for node in ast.walk(curation) if isinstance(node, (ast.If, ast.While, ast.IfExp))
+    ] + [node for node in ast.walk(curation) if isinstance(node, ast.Compare)]
+    referencing = [
+        ast.unparse(gate)
+        for gate in gates
+        for node in ast.walk(gate)
+        if (isinstance(node, ast.Name) and node.id == "confidence")
+        or (isinstance(node, ast.Constant) and node.value == "confidence")
+    ]
+    assert referencing == [], (
+        f"a gating expression in the curation job references `confidence`: {referencing}"
+    )
+
+
 # ── The structural rail: no service-layer bypass ─────────────────────────────
 
 
@@ -2374,9 +2700,10 @@ def test_the_deterministic_runner_consults_no_stop_switch_and_the_copy_says_so(
 
     ``nodum cycle-stop`` and ``POST /api/cycles/{id}/stop`` record an instruction
     the *run* is supposed to notice, and the only thing that notices one today is
-    :meth:`nodum.agent.AgentRun.chat`, before a provider call. The four
-    **deterministic** jobs make no provider call and no stop check — so a stop
-    asked for during one of their runs is recorded and that run finishes. The
+    :meth:`nodum.agent.AgentRun.chat`, before a provider call. The five
+    **deterministic** jobs — duplicates, links, curation, housekeeping, neglect
+    — make no provider call and no stop check, so a stop asked for during one of
+    their runs is recorded and that run finishes. The
     abstraction job (5b-ii's first) is the deliberate exception, and it is the
     thing the copy now names: it reaches the model through ``AgentRun.chat``,
     which is the stop check. Every surface says exactly that, and this is what

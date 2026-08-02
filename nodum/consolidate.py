@@ -1,9 +1,9 @@
 """The consolidation runner — the gardener's jobs (design §8.4/§8.5).
 
 Phase 5 was cut at the LLM line, and this module is everything on the near side
-of it: the four deterministic jobs a cycle can run with arithmetic over data
+of it: the five deterministic jobs a cycle can run with arithmetic over data
 the file already holds, and the five coherence metrics they are measured by.
-There is no provider, no generation, and no judgement in those four — design
+There is no provider, no generation, and no judgement in those five — design
 Constraint 4 keeps the LLM out of validation, the state machine and the
 projectors, and they run on a machine with no model present.
 
@@ -149,6 +149,13 @@ JOB_NEGLECT = "neglect_report"
 #: one concept they have in common. The model never decides *whether* to
 #: synthesize, only what the text says.
 JOB_ABSTRACTION = "abstraction"
+
+#: Queue curation (§L1–§L4) — the learned half of §8.3, computed from **row
+#: state**: a proposer's historical acceptance rate on each type they write,
+#: filed as convention notes in the ``conventions`` space and one annotation
+#: per queue item. Deterministic — no model call, nothing gated on the
+#: proposer's own ``confidence``, and (by default) nothing accepted.
+JOB_CURATION = "curation"
 
 
 # ── Edge types the jobs write ─────────────────────────────────────────────────
@@ -344,6 +351,44 @@ MAX_COCITATION_DEGREE = 50
 #: going unread over a holiday, short enough that a year-old claim is caught. The
 #: job writes nothing, so the cost of a wrong bar is a line in a report.
 NEGLECT_DAYS = 90
+
+#: How far back a proposer's acceptance record reaches (§L1). A quarter, the
+#: same horizon as :data:`NEGLECT_DAYS`: long enough that a rate is a record
+#: rather than a mood, short enough that a proposer who changed is re-learned
+#: within a year. A rolling window, so a rate never stops updating as the
+#: proposer's history ages out.
+CURATION_WINDOW_DAYS = 90
+
+#: The ``conventions`` space (migration 0016): the gardener's own workspace,
+#: where convention notes are ordinary ``note`` nodes the cycle writes like
+#: anything else (L2), with the gardener holding ``edit`` on it alone. The
+#: space node's id is literally ``conventions`` — the migration's reserved
+#: name.
+CONVENTIONS_SPACE_ID = "conventions"
+
+#: The typed props schema of a convention node (§L2) — the keys, and nothing
+#: else, so a reader of the ``conventions`` space knows what each note claims.
+#: ``kind`` is always ``"acceptance-rate"`` (a future convention kind would
+#: not silently share the schema), ``rate`` is :func:`_rate`'s rounded
+#: quotient, and ``computed_at`` is the run's own clock
+#: (:func:`_utcnow`), so a stale note says when it stopped being fresh.
+CURATION_CONVENTION_PROPS = (
+    "job",
+    "kind",
+    "proposer",
+    "edge_type",
+    "rate",
+    "accepted",
+    "rejected",
+    "window_days",
+    "computed_at",
+)
+
+#: The well-known props field that would turn auto-accept on (§L3). Read from
+#: a ``note`` node in the ``conventions`` space: when the field is a number,
+#: the interface exists; the accept direction stays OFF regardless — see
+#: :func:`_job_curation` for why, and what would turn it on.
+AUTO_ACCEPT_PROPS_KEY = "auto_accept_above"
 
 #: Below this gap two siblings' fractional positions are close enough that
 #: further insertion between them would run into float precision — the condition
@@ -1468,11 +1513,401 @@ def _job_abstraction(context: _Context) -> JobOutcome:
         context.llm_report = run.report()
 
 
+# ── Job 6: learned queue curation (§L1–§L4 — statistics and the record, never
+#    the judgement) ────────────────────────────────────────────────────────────
+
+
+def _acceptance_counts(
+    rows: list[Any],
+    *,
+    proposer_key: str,
+    type_key: str,
+    accepted_states: tuple[str, ...],
+    rejected_states: tuple[str, ...],
+    now: datetime,
+) -> dict[tuple[str, str], tuple[int, int]]:
+    """Per ``(proposer, type)`` accepted/rejected counts over row state.
+
+    The window is measured from ``created_at`` — the **row's** creation
+    timestamp, which is all row state records. The decision time of an accept
+    or reject lives only in the event log, which the gardener
+    (:func:`nodum.service.list_events`) refuses to read, so "the last quarter
+    of a proposer's record" is the quarter of rows created then; a row the
+    proposer filed this week and a human decided years later both count as
+    fresh by their creation date. Accepted and rejected are the two terminal
+    states, so a ``proposed`` row is history still in flight and counts for
+    neither side.
+    """
+    counts: dict[tuple[str, str], tuple[int, int]] = {}
+    for row in rows:
+        if _age_days(row.created_at, now) > CURATION_WINDOW_DAYS:
+            continue
+        accepted = row.state in accepted_states
+        rejected = row.state in rejected_states
+        if not accepted and not rejected:
+            continue
+        key = (getattr(row, proposer_key), getattr(row, type_key))
+        current = counts.get(key, (0, 0))
+        counts[key] = (current[0] + 1, current[1]) if accepted else (current[0], current[1] + 1)
+    return counts
+
+
+def _version_counts(
+    context: _Context, update_types: set[str]
+) -> dict[tuple[str, str], tuple[int, int]]:
+    """Per ``(actor, node type)`` applied/archived counts, from the versions of
+    the in-scope nodes of the targeted types.
+
+    There is no bulk version read on the public surface — :func:`nodum.service.history`
+    is per node, the only version listing there is — so the read is one
+    :func:`nodum.service.history` call per in-scope node of a type the queue's
+    update proposals target, bounded by the node scan
+    (:data:`MAX_SCAN_NODES`) the context already caps. ``applied`` is the
+    accepted state of a proposed version and ``archived`` the rejected one
+    (:func:`nodum.service._transition_version`).
+    """
+    counts: dict[tuple[str, str], tuple[int, int]] = {}
+    if not update_types:
+        return counts
+    for node in context.nodes():
+        if node.type not in update_types:
+            continue
+        for version in service.history(node.id, principal=context.principal, path=context.path):
+            if _age_days(version.created_at, context.now) > CURATION_WINDOW_DAYS:
+                continue
+            if version.state not in ("applied", "archived"):
+                continue
+            key = (version.actor, node.type)
+            current = counts.get(key, (0, 0))
+            counts[key] = (
+                (current[0] + 1, current[1])
+                if version.state == "applied"
+                else (current[0], current[1] + 1)
+            )
+    return counts
+
+
+def _rate_entries(
+    counts: dict[tuple[str, str], tuple[int, int]], kind: str
+) -> list[dict[str, Any]]:
+    """One ``detail["acceptance"]`` entry per counted ``(proposer, type)`` pair.
+
+    Only pairs with history — a pair with none is a cold start, which has no
+    rate to report. Sorted by ``(proposer, kind, type)`` so a run is
+    deterministic.
+    """
+    entries = []
+    for (proposer, item_type), (accepted, rejected) in counts.items():
+        entries.append(
+            {
+                "proposer": proposer,
+                "kind": kind,
+                "type": item_type,
+                "accepted": accepted,
+                "rejected": rejected,
+                "rate": _rate(accepted, accepted + rejected),
+            }
+        )
+    return sorted(entries, key=lambda entry: (entry["proposer"], entry["kind"], entry["type"]))
+
+
+def _proposal_signals(proposal: Any) -> list[str]:
+    """The signals a proposal's own props named — the ones its annotation echoes.
+
+    The proposer's judgement is their own props (``props.signals`` for the
+    link and duplicate jobs, for instance); the annotation repeats those
+    signals so the reviewer sees what fired, never a number the job invented.
+    """
+    row = proposal.node or proposal.edge or proposal.version
+    signals = row.props.get("signals") if row is not None else None
+    return signals if isinstance(signals, list) else []
+
+
+def _auto_accept_control(
+    context: _Context,
+) -> tuple[float | None, str | None, tuple[str, object] | None]:
+    """The ``conventions``-space note setting :data:`AUTO_ACCEPT_PROPS_KEY`.
+
+    Read through the public surface (``list_nodes(space=…)``) so it answers
+    the same on a scoped cycle, where ``context.nodes()`` would not reach the
+    conventions space. Returns ``(threshold, note id, malformed)``: the
+    threshold and the note carrying it when a non-archived conventions note
+    sets a numeric ``auto_accept_above`` — a numeric *string* counts, since a
+    human editing graph props writes ``"0.9"`` — else ``(None, None,
+    malformed)``, where ``malformed`` names the ``(note id, value)`` of the
+    first note whose value is not a number. The malformed value is reported
+    rather than silently ignored, because "no conventions-space note sets it"
+    would then be false.
+    """
+    notes = service.list_nodes(
+        space=CONVENTIONS_SPACE_ID,
+        principal=context.principal,
+        limit=MAX_SCAN_NODES,
+        path=context.path,
+    )
+    malformed: tuple[str, object] | None = None
+    for note in notes:
+        if note.state == "archived":
+            continue
+        value = note.props.get(AUTO_ACCEPT_PROPS_KEY)
+        if isinstance(value, bool):
+            malformed = malformed or (note.id, value)
+            continue
+        if isinstance(value, (int, float)):
+            return float(value), note.id, None
+        if isinstance(value, str):
+            try:
+                return float(value), note.id, None
+            except ValueError:
+                malformed = malformed or (note.id, value)
+                continue
+        malformed = malformed or (note.id, value)
+    return None, None, malformed
+
+
+def _job_curation(context: _Context) -> JobOutcome:
+    """Compute proposers' acceptance rates from row state, and record them (§L1–§L4).
+
+    **Statistics and the record, not the judgement.** This job never accepts
+    and never rejects: it reads the review queue and the graph's row state,
+    works out, per ``(proposer, type)``, how often that proposer's proposals
+    were accepted against how often they were rejected — ``active`` vs
+    ``archived`` rows, ``applied`` vs ``archived`` versions — over the last
+    :data:`CURATION_WINDOW_DAYS`, and writes two records of the result:
+
+    - **A convention node (L2)** — one ``note`` node in the
+      :data:`CONVENTIONS_SPACE_ID` space per ``(proposer, edge_type)`` with
+      history, filed ``proposed`` through the landing seam, carrying exactly
+      :data:`CURATION_CONVENTION_PROPS` (proposer, edge_type, rate, accepted,
+      rejected, window_days, computed_at, plus the job and kind tags).
+    - **A per-item annotation (§L1)** — one ``annotations`` row per queue item
+      whose proposer has history on the item's type, whose body says the rate,
+      the counts, the window, and the signals the proposal's own props named.
+      A proposer with no history on that type gets **no** annotation: the §L1
+      shape needs a rate, and a cold start has none.
+
+    **Row state, never the event log.** The gardener is ``kind="internal"``
+    and :func:`nodum.service.list_events` refuses it, which is the design's
+    whole point: acceptance is read from where the graph is now, not from what
+    happened. The window is measured from row ``created_at`` — the decision
+    time of an accept lives only in the log, so the quarter is a quarter of
+    rows created then (see :func:`_acceptance_counts`). A row in the
+    ``proposed`` state is history still in flight and counts for neither side.
+
+    **Nothing gates a write on ``confidence``.** The proposer's own
+    self-reported ``confidence`` (edge props, the D6 seam) is indicative data
+    that triggers nothing hardcoded (§8.3): the rate here is the graph's
+    measure of the proposer, and the signals echoed into an annotation are
+    the proposer's own props repeated, not a score.
+
+    **Auto-accept exists as an interface and stays OFF.** The job reads the
+    well-known :data:`AUTO_ACCEPT_PROPS_KEY` field off ``conventions``-space
+    notes; a numeric value is acknowledged in the report, and **nothing is
+    accepted either way** — the accept direction is not implemented, because
+    the design's measured 2/4 score put both misses in the accept direction
+    and the safe default is OFF. What would turn it on is a deliberate
+    implementation of the accept path behind that threshold — and even then,
+    nothing may gate on the proposer's own ``confidence``.
+
+    A dry run computes everything and writes nothing, saying in a note what it
+    would have written. ``outcome.truncated`` mirrors the context's edge-scan
+    flag and the queue's own cap (one past the cap is fetched so "exactly at"
+    and "past" stay distinct). ``outcome.detail["acceptance"]`` is the
+    per-(proposer, type) rate list the journal's acceptance section renders
+    (§L4) — the delta basis, with no second copy stored: deltas compose from
+    the convention nodes' own versions.
+    """
+    outcome = JobOutcome(name=JOB_CURATION)
+    proposals = service.list_proposals(
+        principal=context.principal, limit=MAX_SCAN_NODES + 1, path=context.path
+    )
+    if len(proposals) > MAX_SCAN_NODES:
+        outcome.truncated = True
+        outcome.notes.append(
+            f"the review queue exceeds {MAX_SCAN_NODES} proposals: the oldest "
+            f"{MAX_SCAN_NODES} were curated, the rest wait for a later cycle"
+        )
+        proposals = proposals[:MAX_SCAN_NODES]
+    if context.scope is not None:
+        proposals = [
+            proposal for proposal in proposals if context.scope in _proposal_space_ids(proposal)
+        ]
+    outcome.examined = len(proposals)
+
+    # Row state, read once and shared across proposers. Nodes and edges carry
+    # their creator and type on the row; versions are read per node of the
+    # types the queue's update proposals target (see `_version_counts`).
+    edge_counts = _acceptance_counts(
+        context.edges(),
+        proposer_key="created_by",
+        type_key="type",
+        accepted_states=("active",),
+        rejected_states=("archived",),
+        now=context.now,
+    )
+    node_counts = _acceptance_counts(
+        context.nodes(),
+        proposer_key="created_by",
+        type_key="type",
+        accepted_states=("active",),
+        rejected_states=("archived",),
+        now=context.now,
+    )
+    update_types = {proposal.type for proposal in proposals if proposal.kind == "update"}
+    version_counts = _version_counts(context, update_types)
+    outcome.detail["acceptance"] = (
+        _rate_entries(edge_counts, "edge")
+        + _rate_entries(node_counts, "node")
+        + _rate_entries(version_counts, "version")
+    )
+    if context.truncated:
+        outcome.truncated = True
+        outcome.notes.append(
+            f"an edge scan hit MAX_SCAN_EDGES: reads above the {MAX_SCAN_EDGES}-edge cap "
+            "drop the newest rows, so an acceptance rate may have missed the freshest "
+            "history"
+        )
+
+    # L2: one convention node per (proposer, edge_type) with history. Written
+    # every cycle — each node is that cycle's snapshot of the rolling rate,
+    # and the acceptance section's deltas compose from their versions.
+    convention_entries: list[dict[str, Any]] = []
+    for proposer, edge_type in sorted(edge_counts):
+        accepted, rejected = edge_counts[(proposer, edge_type)]
+        rate = _rate(accepted, accepted + rejected)
+        props = {
+            "job": JOB_CURATION,
+            "kind": "acceptance-rate",
+            "proposer": proposer,
+            "edge_type": edge_type,
+            "rate": rate,
+            "accepted": accepted,
+            "rejected": rejected,
+            "window_days": CURATION_WINDOW_DAYS,
+            "computed_at": context.now.isoformat(),
+        }
+        title = (
+            f"{proposer} on {edge_type}: {rate:.0%} accepted "
+            f"({accepted}/{accepted + rejected} in {CURATION_WINDOW_DAYS} days)"
+        )
+        content = (
+            f"{proposer} has {accepted} accepted and {rejected} rejected {edge_type} "
+            f"edge(s) in the last {CURATION_WINDOW_DAYS} days — an acceptance rate of "
+            f"{rate:.1%}. Computed by the curation job from row state; nothing here "
+            "accepts or rejects."
+        )
+        if context.dry_run:
+            convention_entries.append(
+                {"node": None, "proposer": proposer, "edge_type": edge_type, "rate": rate}
+            )
+            continue
+        try:
+            node = service.create_node(
+                type="note",
+                title=title,
+                content=content,
+                space=CONVENTIONS_SPACE_ID,
+                landing=SUGGESTION_LANDING,
+                props=props,
+                principal=context.principal,
+                path=context.path,
+            )
+            outcome.proposed.append(node.id)
+            convention_entries.append(
+                {"node": node.id, "proposer": proposer, "edge_type": edge_type, "rate": rate}
+            )
+        except (GrantNotPermitted, service.TypeNotFound, ValueError) as refusal:
+            # A revoked conventions grant costs one skipped line and not the
+            # job — the same per-item tolerance every other job's writes have.
+            outcome.skipped.append(
+                {"id": f"convention:{proposer}@{edge_type}", "reason": str(refusal)}
+            )
+    outcome.detail["conventions"] = convention_entries
+
+    # §L1: one annotation per queue item whose proposer has history on its
+    # type. Cold start (no history) means no annotation.
+    annotation_ids: list[Any] = []
+    would_annotate = 0
+    for proposal in proposals:
+        if proposal.kind == "node":
+            counts = node_counts.get((proposal.created_by, proposal.type))
+            target_kind = "node"
+        elif proposal.kind == "edge":
+            counts = edge_counts.get((proposal.created_by, proposal.type))
+            target_kind = "edge"
+        else:
+            counts = version_counts.get((proposal.created_by, proposal.type))
+            target_kind = "version"
+        if counts is None:
+            continue
+        accepted, rejected = counts
+        if accepted + rejected == 0:
+            continue
+        body = {
+            "rate": _rate(accepted, accepted + rejected),
+            "signals": _proposal_signals(proposal),
+            "window_days": CURATION_WINDOW_DAYS,
+            "counts": {"accepted": accepted, "rejected": rejected},
+        }
+        if context.dry_run:
+            would_annotate += 1
+            annotation_ids.append(
+                {"kind": target_kind, "id": proposal.id, "rate": body["rate"], "dry_run": True}
+            )
+            continue
+        try:
+            annotation = service.annotate(
+                target_kind,
+                int(proposal.id) if target_kind == "version" else proposal.id,
+                body,
+                principal=context.principal,
+                path=context.path,
+            )
+            annotation_ids.append(annotation.id)
+        except (GrantNotPermitted, service.RecordNotFound, ValueError) as refusal:
+            outcome.skipped.append({"id": proposal.id, "reason": f"annotation refused: {refusal}"})
+    outcome.detail["annotations"] = annotation_ids
+
+    # §L3: auto-accept is a real interface, read and reported, and OFF.
+    threshold, control, malformed = _auto_accept_control(context)
+    outcome.detail["auto_accept"] = {"enabled": False, "threshold": threshold}
+    if threshold is not None:
+        outcome.notes.append(
+            f"auto-accept is off: conventions note {control} sets "
+            f"'{AUTO_ACCEPT_PROPS_KEY}' to {threshold}, and the job read it — but the "
+            "accept direction is not implemented (the measured evidence put its misses "
+            "there), so nothing was accepted. Turning it on means implementing the accept "
+            "path behind that threshold; it never gates on the proposer's own confidence"
+        )
+    elif malformed is not None:
+        malformed_id, malformed_value = malformed
+        outcome.notes.append(
+            f"auto-accept is off: conventions note {malformed_id} sets "
+            f"'{AUTO_ACCEPT_PROPS_KEY}' to {malformed_value!r}, which is not a number, "
+            "so it was ignored — this cycle only wrote conventions and annotations, and "
+            "nothing was accepted on any proposer's rate"
+        )
+    else:
+        outcome.notes.append(
+            f"auto-accept is off: no conventions-space note sets "
+            f"'{AUTO_ACCEPT_PROPS_KEY}', so this cycle only wrote conventions and "
+            "annotations — nothing was accepted on any proposer's rate"
+        )
+
+    if context.dry_run:
+        outcome.notes.append(
+            f"dry run: would write {len(convention_entries)} convention node(s) and "
+            f"{would_annotate} annotation(s)"
+        )
+    return outcome
+
+
 #: The jobs, in run order. ``jobs=`` selects a subset by these names.
 JOBS = {
     JOB_DUPLICATES: _job_duplicates,
     JOB_LINKS: _job_links,
     JOB_ABSTRACTION: _job_abstraction,
+    JOB_CURATION: _job_curation,
     JOB_HOUSEKEEPING: _job_housekeeping,
     JOB_NEGLECT: _job_neglect,
 }

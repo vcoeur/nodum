@@ -188,6 +188,10 @@ export interface SearchResult {
  * `context` carries what a reviewer needs beyond the row itself — for an edge,
  * the source/target node ids and titles; for a node, its parent's id/title; for
  * an update, the current node's id/title/content.
+ *
+ * `annotation` is the parsed `annotations.body` JSON for this item — what the
+ * learned-curation cycle judged about its proposer (`rate`, `signals`,
+ * `window_days`, `counts`) — or `null` when the item has none.
  */
 export interface ProposalOut {
   kind: string;
@@ -199,6 +203,7 @@ export interface ProposalOut {
   edge: EdgeOut | null;
   version: VersionOut | null;
   context: JsonObject;
+  annotation: JsonObject | null;
 }
 
 /** One id a batch transition could not process, with the reason. */

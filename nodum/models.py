@@ -235,6 +235,27 @@ class ProposalOut(BaseModel):
     annotation: dict[str, Any] | None = None
 
 
+class AnnotationOut(BaseModel):
+    """The ``annotations`` row as written, returned so the cycle can report it.
+
+    ``target_kind`` is the resolved kind (``node``, ``edge``, or ``version``)
+    and ``target_id`` the row the exclusive-arc column names. This is the
+    writer's receipt — the id lands in a cycle report, and the body is echoed
+    so the caller can record what it judged — not a query interface: there is
+    no read surface beyond :attr:`ProposalOut.annotation`, which
+    :func:`nodum.service.list_proposals` attaches only to rows the store has
+    already grant-filtered.
+    """
+
+    id: str
+    target_kind: str
+    target_id: str
+    body: dict[str, Any]
+    actor: str
+    cycle_id: str | None
+    created_at: str
+
+
 class TransitionFailure(BaseModel):
     """One id a batch transition could not process, with the reason."""
 
