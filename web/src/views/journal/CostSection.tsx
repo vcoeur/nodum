@@ -3,11 +3,14 @@
  * abstraction job's run (A1) — shown in the journal beside the coherence
  * metrics.
  *
- * Rendered only when a report is present, so this section never draws a table
- * of dashes for a cycle that made no model call. Two absences are kept in two
- * voices, exactly as the runtime reports them (B3): a provider that is not
- * configured is `available: false` with a reason — a stable fact about this
- * install, true until somebody configures one — while a budget that ran out is
+ * Rendered whenever a report is present, which includes a cycle whose LLM job
+ * never reached a call: the run files its report even when the budget or the
+ * provider kept it from spending, so the section draws the table with
+ * "Enabled: off" for a budget-gated night rather than a row of dashes for a
+ * cycle that made no model call. Two absences are kept in two voices, exactly
+ * as the runtime reports them (B3): a provider that is not configured is
+ * `available: false` with a reason — a stable fact about this install, true
+ * until somebody configures one — while a budget that ran out is
  * `exhausted: true`, a fact about this one run, false again tomorrow. Neither
  * is a failure and neither is coloured like one.
  *

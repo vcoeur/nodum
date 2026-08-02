@@ -1872,6 +1872,27 @@ def test_the_cohesion_bar_is_the_calibrated_link_bar_reused():
     assert consolidate.ABSTRACTION_COHESION_COSINE == consolidate.LINK_EMBEDDING_COSINE
 
 
+def test_a_cluster_above_the_maximum_is_skipped(fresh_db):
+    """Eleven members is several concepts pretending to be one — the size
+    gate's upper bound fires before any model call.
+
+    The component is a dense ring of eleven notes (eleven ``relates_to``
+    edges, so the graph half of the density gate would pass); it is the size
+    gate, and only it, that refuses.
+    """
+    _place(Alpha=0.0)
+    members = [_node(f"Alpha {index}") for index in range(11)]
+    for first, second in zip(members, members[1:] + members[:1], strict=False):
+        _relates(first.id, second.id)
+
+    outcome = _abstraction_outcome(_run(jobs=[consolidate.JOB_ABSTRACTION]).report)
+
+    assert outcome.detail["clusters_eligible"] == 0
+    (skip,) = outcome.skipped
+    assert skip["id"] == ",".join(sorted(node.id for node in members))
+    assert "above the 10-member maximum" in skip["reason"]
+
+
 # ── The abstraction job's write half (S2: the model call) ─────────────────────
 
 
@@ -1979,7 +2000,7 @@ def test_abstraction_with_a_budget_synthesizes_a_proposed_concept(fresh_db, monk
     outcome = _abstraction_outcome(_run(jobs=[consolidate.JOB_ABSTRACTION]).report)
 
     assert len(provider.calls) == 1
-    (concept_id,) = outcome.proposed
+    (concept_id,) = [entry["node"] for entry in outcome.detail["synthesized"]]
     concept = service.get_node(concept_id, principal=owner())
     assert concept.type == "concept"
     assert concept.state == "proposed"
@@ -1997,7 +2018,11 @@ def test_abstraction_with_a_budget_synthesizes_a_proposed_concept(fresh_db, monk
     assert {edge.state for edge in edges} == {"proposed"}
     assert {edge.dst_id for edge in edges} == {first.id, second.id, third.id}
     assert all(edge.props.get("job") == consolidate.JOB_ABSTRACTION for edge in edges)
-    assert outcome.applied == [edge.id for edge in edges]
+    # The whole unit is proposed: the concept and its membership edges. This
+    # job only proposes, so `applied` stays empty — a reader must not be told
+    # "changed N rows" for three proposals.
+    assert outcome.applied == []
+    assert sorted(outcome.proposed) == sorted([concept_id, *[edge.id for edge in edges]])
     assert [entry["node"] for entry in outcome.detail["synthesized"]] == [concept_id]
 
 
@@ -2135,6 +2160,82 @@ def test_a_malformed_model_body_is_a_job_error_not_a_write(fresh_db, monkeypatch
     assert "not JSON" in failure.error
     assert result.report.jobs[0].proposed == []
     assert service.list_edges(type=consolidate.DERIVED_FROM_EDGE_TYPE, principal=owner()) == []
+
+
+def test_an_empty_model_body_is_a_job_error_not_a_write(fresh_db, monkeypatch):
+    """Schema-valid but empty strings are a refusal to answer, not a node.
+
+    ``{"title": "", "content": ""}`` parses and satisfies the schema, and it
+    would write an empty node nobody asked for — the job errors instead, and
+    nothing is written.
+    """
+    monkeypatch.setenv(agent_runtime.ENV_CYCLE_BUDGET, "100000")
+    provider = _FakeLLM(_completion(json.dumps({"title": "", "content": ""})))
+    llm.set_provider(provider)
+    _dense_fresh_cluster()
+
+    result = _run(jobs=[consolidate.JOB_ABSTRACTION])
+
+    assert result.cycle.status == "failed"
+    (failure,) = result.report.failed
+    assert failure.job == consolidate.JOB_ABSTRACTION
+    assert "empty" in failure.error
+    assert result.report.jobs[0].proposed == []
+    assert service.list_nodes(type="concept", principal=owner()) == []
+    assert service.list_edges(type=consolidate.DERIVED_FROM_EDGE_TYPE, principal=owner()) == []
+
+
+def test_a_scoped_cycle_lands_the_concept_in_the_scope(fresh_db, monkeypatch):
+    """The concept belongs with its members: a scoped cycle writes it in the
+    scope, and its ``derived_from`` edges stay in-scope — the whole unit
+    waits in review together. An unscoped cycle lands in ``main`` as before.
+    """
+    monkeypatch.setenv(agent_runtime.ENV_CYCLE_BUDGET, "100000")
+    provider = _FakeLLM(_completion('{"title": "Alpha matters", "content": "The shared core."}'))
+    llm.set_provider(provider)
+    space = service.create_space("research", principal=owner())
+    service.grant("builtin-gardener", "research", "edit", principal=owner())
+    _place(Alpha=0.0)
+    first, second, third = (
+        service.create_node(type="claim", title="Alpha one", space="research", principal=owner()),
+        service.create_node(type="claim", title="Alpha two", space="research", principal=owner()),
+        service.create_node(type="claim", title="Alpha three", space="research", principal=owner()),
+    )
+    _relates(first.id, second.id)
+    _relates(second.id, third.id)
+    _relates(third.id, first.id)
+
+    result = _run(scope="research", jobs=[consolidate.JOB_ABSTRACTION])
+
+    outcome = _abstraction_outcome(result.report)
+    assert outcome.detail["clusters_eligible"] == 1
+    (concept_id,) = [entry["node"] for entry in outcome.detail["synthesized"]]
+    concept = service.get_node(concept_id, principal=owner())
+    assert concept.space_id == space.id
+    edges = service.list_edges(
+        node_id=concept_id, type=consolidate.DERIVED_FROM_EDGE_TYPE, principal=owner()
+    )
+    assert {edge.dst_id for edge in edges} == {first.id, second.id, third.id}
+
+
+def test_the_member_char_bound_fits_the_minimum_cluster_in_the_default_window():
+    """SF-6: 3 × ``ABSTRACTION_MEMBER_CHARS`` plus the template must fit the
+    default window after the output reservation.
+
+    Otherwise every default install degrades to ``PromptTooLong`` and the
+    bound's comment — "sized so the minimum 3-member cluster fits" — lies.
+    """
+    window = llm.DEFAULT_CONTEXT_TOKENS
+    allowance = window - int(window * llm.OUTPUT_RESERVATION_FRACTION)
+    content = "x" * consolidate.ABSTRACTION_MEMBER_CHARS
+    rendered = consolidate.ABSTRACTION_PROMPT.format(
+        members="\n".join(
+            f"- **{title}**: {content}" for title in ("Alpha one", "Beta two", "Gamma three")
+        )
+    )
+    estimate = llm.estimate_prompt_tokens([llm.Message(role="user", content=rendered)])
+
+    assert estimate <= allowance
 
 
 def test_the_journal_carries_the_llm_report(fresh_db, monkeypatch):

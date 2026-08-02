@@ -273,10 +273,20 @@ MAX_CLUSTERS_PER_CYCLE = 5
 
 #: How many characters of each member's content the synthesis prompt carries.
 #: The model does not need the member whole to say what several members share,
-#: and a 10-member cluster of long notes would otherwise blow a small window —
-#: the provider refuses over-long prompts itself, but the bound belongs in the
-#: render, where the refusal is a last resort rather than the ordinary path.
-ABSTRACTION_MEMBER_CHARS = 2000
+#: and a ten-member cluster of long notes would otherwise blow a small window.
+#: Sized so the **minimum 3-member cluster fits the default window** — the
+#: assumption the bound is measured against: a 4 096-token window
+#: (:data:`nodum.llm.DEFAULT_CONTEXT_TOKENS`) halves for the output
+#: reservation, leaving ~2 048 tokens of prompt room; the 570-byte template
+#: plus message wrapping leaves ~1 470 bytes for the members, and 3 × 400
+#: ASCII characters fits inside with room for short titles (the prompt asks
+#: for "short and descriptive" ones). The estimator
+#: (:func:`nodum.llm.estimate_tokens`) counts UTF-8 bytes, so non-ASCII
+#: content costs more and is *refused* rather than truncated — safe, and
+#: itemised. Larger clusters degrade to :class:`nodum.agent.PromptTooLong`
+#: and a per-cluster skip with a note, which is the honest path for a
+#: ten-member cluster at this bound, not a failure.
+ABSTRACTION_MEMBER_CHARS = 400
 
 #: The synthesis prompt template. Deterministic framing only: the gates are
 #: named as already decided, and the model is asked for the text — what these
@@ -1177,10 +1187,11 @@ def _cluster_components(
 def _render_abstraction_prompt(members: list[NodeOut]) -> str:
     """The synthesis prompt for one cluster, from :data:`ABSTRACTION_PROMPT`.
 
-    Each member's content is capped at :data:`ABSTRACTION_MEMBER_CHARS`: the
-    model does not need the member whole to say what several members share, and
-    a ten-member cluster of long notes would otherwise blow a small window —
-    the provider's own refusal is the backstop, not the ordinary path.
+    Each member's content is capped at :data:`ABSTRACTION_MEMBER_CHARS`,
+    sized so a minimum 3-member cluster fits the default window with the
+    template and the output reservation; a larger cluster degrades to the
+    provider's :class:`~nodum.agent.PromptTooLong` refusal and a per-cluster
+    skip, which is the honest path for a ten-member cluster of long notes.
     """
     rendered = "\n".join(
         f"- **{node.title or '(untitled)'}**: {(node.content or '')[:ABSTRACTION_MEMBER_CHARS]}"
@@ -1196,6 +1207,11 @@ def _decode_abstraction_body(text: str, item_id: str) -> dict[str, str]:
     ``response_format`` answers with prose, which is a job error here, never a
     write. Mirrors :func:`nodum.answers._decode`'s shape for the same reason:
     a body that fails to parse must not become a node nobody asked for.
+
+    Schema-valid-but-false substance is the design's accepted stance, but
+    empty strings are a refusal to answer: a body whose title or content is
+    blank after stripping would write an empty node, which is a write nobody
+    asked for either.
     """
     try:
         body = json.loads(text)
@@ -1212,7 +1228,13 @@ def _decode_abstraction_body(text: str, item_id: str) -> dict[str, str]:
             f"the abstraction model body for {item_id} is not a {{title, content}} "
             f"object: {str(body)[:120]!r}"
         )
-    return {"title": body["title"], "content": body["content"]}
+    title, content = body["title"], body["content"]
+    if not title.strip() or not content.strip():
+        raise ValueError(
+            f"the abstraction model body for {item_id} is an empty {{title, content}} "
+            f"object: {str(body)[:120]!r}"
+        )
+    return {"title": title, "content": content}
 
 
 def _job_abstraction(context: _Context) -> JobOutcome:
@@ -1250,7 +1272,10 @@ def _job_abstraction(context: _Context) -> JobOutcome:
     provider — and the model's ``{title, content}`` is the *only* thing the
     gates did not decide. The write files the concept node ``proposed`` with
     ``props.synthesized`` (the freshness gate's own record) plus one
-    ``derived_from`` edge per member, and a dry run still pays for the model
+    ``derived_from`` edge per member — in the cycle's scope when there is one
+    (the concept belongs with its members, and the whole unit waits in review
+    together), and in ``main`` — the default write target — on an unscoped
+    cycle, as before. A dry run still pays for the model
     calls (B4) while writing nothing. A body that fails to parse is a job
     error, not a write; a ceiling or a stop behave as the runtime documents
     them. The run's :meth:`nodum.agent.AgentRun.report` is filed into the
@@ -1297,7 +1322,10 @@ def _job_abstraction(context: _Context) -> JobOutcome:
         selected = [nodes_by_id[member] for member in members]
         vectors = context.vectors(selected)
         if vectors is None:
-            outcome.skipped = []
+            # The size and density skips already recorded stay: the "did not
+            # run" note explains why no cluster was considered, and wiping the
+            # list would throw away the skips a reader has to see to know what
+            # would otherwise have been eligible.
             outcome.notes.append(
                 f"no embedding provider ({embeddings.unavailable_reason()}): "
                 "abstraction cannot compute cohesion and did not run"
@@ -1386,6 +1414,7 @@ def _job_abstraction(context: _Context) -> JobOutcome:
                 title=body["title"],
                 content=body["content"],
                 landing=SUGGESTION_LANDING,
+                space=context.scope,
                 props={
                     "synthesized": True,
                     "members": members,
@@ -1395,6 +1424,8 @@ def _job_abstraction(context: _Context) -> JobOutcome:
                 principal=context.principal,
                 path=context.path,
             )
+            # The whole unit is proposed: the concept *and* its membership
+            # edges. `outcome.applied` stays empty — this job only proposes.
             outcome.proposed.append(node.id)
             for member in members:
                 try:
@@ -1407,7 +1438,7 @@ def _job_abstraction(context: _Context) -> JobOutcome:
                         principal=context.principal,
                         path=context.path,
                     )
-                    outcome.applied.append(edge.id)
+                    outcome.proposed.append(edge.id)
                 except (
                     GrantNotPermitted,
                     service.NodeNotFound,
