@@ -402,7 +402,13 @@ def test_rename_and_archive_round_trip_by_name_or_id(fresh_db):
 
     archived = service.archive_space(space.id, principal=owner())
     assert archived.state == "archived"
-    assert [row.title for row in service.list_spaces(principal=owner())] == ["meta", "main"]
+    # `conventions` (migration 0016) is a real space like any other, created
+    # after the two bootstrap ones.
+    assert [row.title for row in service.list_spaces(principal=owner())] == [
+        "meta",
+        "main",
+        "conventions",
+    ]
     # An archived space has left the vocabulary: it no longer resolves at all.
     with pytest.raises(TypeNotFound):
         service.create_node(type="note", title="n", space="reference", principal=owner())

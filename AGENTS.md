@@ -544,8 +544,9 @@ commands on a saved node for exactly this reason.
   queue item saying what a proposer's acceptance signal judged and at what
   rate, an **exclusive arc** (three typed nullable `ON DELETE CASCADE` target
   columns, a CHECK that exactly one is non-null) with **no direct read
-  surface** — written only by the learned-curation cycle, and read only
-  attached to a `ProposalOut` the store has already grant-filtered.
+  surface** — written only by the learned-curation cycle, read only by
+  `list_proposals`, which attaches it to a `ProposalOut` the store has already
+  grant-filtered.
   Each public function opens its own short-lived connection
   (applying pending migrations idempotently) and commits. New behaviour and
   validation go here first; adapters must not add behaviour the service lacks.
