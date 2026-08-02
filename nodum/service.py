@@ -2453,7 +2453,11 @@ def _delete_blocker(
     The five, in the order a caller most likely meets them: ``nodes.parent_id``
     (children), ``nodes.space_id`` (a space's occupants), ``merge_redirects``
     (a node merged away, or merged into), ``grants.space_id`` (agents granted on
-    a space) and ``nodes.type_id`` (nodes typed by a type node).
+    a space) and ``nodes.type_id`` (nodes typed by a type node). The sixth
+    foreign key into ``nodes(id)`` — ``annotations.target_node_id`` (migration
+    0016) — is deliberately not here: it cascades, because an annotation is
+    derived judgement and can never be the reason a node's undo is refused
+    (which is what its ``cycle_id`` already implies).
 
     Args:
         conn: The open connection.

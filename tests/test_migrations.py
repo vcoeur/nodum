@@ -16,6 +16,7 @@ from nodum.migrations import (
     SEED_EDGE_TYPES,
     SEED_NODE_TYPES,
 )
+from nodum.principal import EDIT
 
 CORE_TABLES = {
     "nodes",
@@ -276,6 +277,7 @@ def test_0012_applies_to_a_populated_database_already_at_0011(tmp_path, monkeypa
             "0013_unique_space_titles",
             "0014_cycles_and_gardener",
             "0015_cycle_stop_switch",
+            "0016_conventions_and_annotations",
         ]
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
         conn.execute(
@@ -393,6 +395,7 @@ def test_0013_applies_to_a_populated_database_holding_duplicate_space_titles(tmp
             "0013_unique_space_titles",
             "0014_cycles_and_gardener",
             "0015_cycle_stop_switch",
+            "0016_conventions_and_annotations",
         ]
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
         titles = dict(
@@ -468,6 +471,7 @@ def test_0013_finds_a_free_name_when_the_deduping_rename_would_itself_collide(
             "0013_unique_space_titles",
             "0014_cycles_and_gardener",
             "0015_cycle_stop_switch",
+            "0016_conventions_and_annotations",
         ]
         titles = dict(
             conn.execute("SELECT id, title FROM nodes WHERE id LIKE 'sp-%' ORDER BY id").fetchall()
@@ -517,6 +521,7 @@ def test_0013_deduplicates_a_title_that_is_another_spaces_id(tmp_path, monkeypat
             "0013_unique_space_titles",
             "0014_cycles_and_gardener",
             "0015_cycle_stop_switch",
+            "0016_conventions_and_annotations",
         ]
         titles = dict(
             conn.execute("SELECT id, title FROM nodes WHERE id LIKE 'sp-%' ORDER BY id").fetchall()
@@ -795,7 +800,9 @@ def test_0014_seeds_the_gardener_with_read_on_meta_and_edit_on_main(fresh_db):
                 "SELECT space_id, level FROM grants WHERE agent_id = ?", (GARDENER_AGENT_ID,)
             ).fetchall()
         )
-        assert levels == {"meta": "read", "main": "edit"}
+        # `0016` adds the third row: `edit` on the conventions space, the
+        # gardener's own workspace (a revocable grant like the other two).
+        assert levels == {"meta": "read", "main": "edit", "conventions": "edit"}
     finally:
         conn.close()
 
@@ -811,7 +818,11 @@ def test_0014_applies_to_a_populated_database_already_at_0013(tmp_path, monkeypa
     monkeypatch.setattr(db, "MIGRATIONS", MIGRATIONS)
     conn = db.connect()
     try:
-        assert db.init_db(conn) == ["0014_cycles_and_gardener", "0015_cycle_stop_switch"]
+        assert db.init_db(conn) == [
+            "0014_cycles_and_gardener",
+            "0015_cycle_stop_switch",
+            "0016_conventions_and_annotations",
+        ]
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
         conn.execute(
             "INSERT INTO cycles (id, trigger, triggered_by, scope, status)"
@@ -933,7 +944,11 @@ def test_0014_lets_an_ordinary_agent_id_through(tmp_path, monkeypatch):
     monkeypatch.setattr(db, "MIGRATIONS", MIGRATIONS)
     conn = db.connect()
     try:
-        assert db.init_db(conn) == ["0014_cycles_and_gardener", "0015_cycle_stop_switch"]
+        assert db.init_db(conn) == [
+            "0014_cycles_and_gardener",
+            "0015_cycle_stop_switch",
+            "0016_conventions_and_annotations",
+        ]
     finally:
         conn.close()
 
@@ -1062,7 +1077,7 @@ def test_0015_applies_to_a_populated_database_already_at_0014(tmp_path, monkeypa
     monkeypatch.setattr(db, "MIGRATIONS", MIGRATIONS)
     conn = db.connect()
     try:
-        assert db.init_db(conn) == ["0015_cycle_stop_switch"]
+        assert db.init_db(conn) == ["0015_cycle_stop_switch", "0016_conventions_and_annotations"]
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
     finally:
         conn.close()
@@ -1146,7 +1161,9 @@ def test_the_missing_stop_columns_are_refused_with_the_statements_that_add_them(
             assert statement in message
             conn.executescript(statement)
         conn.commit()
-        assert db.init_db(conn) == []
+        # The file was stopped at 0014, so the repair clears the last obstacle
+        # and 0016 applies like any later migration.
+        assert db.init_db(conn) == ["0016_conventions_and_annotations"]
 
         # And the repaired file enforces the coherence the CHECK exists for, so
         # a statement carrying only the right column *names* would not pass.
@@ -1194,7 +1211,9 @@ def test_a_half_applied_0015_is_repaired_without_re_adding_the_column_it_has(tmp
 
         conn.executescript(db.CYCLE_STOP_COLUMN_SQL[1][1])
         conn.commit()
-        assert db.init_db(conn) == []
+        # The file was stopped at 0014, so the repair clears the last obstacle
+        # and 0016 applies like any later migration.
+        assert db.init_db(conn) == ["0016_conventions_and_annotations"]
     finally:
         conn.close()
 
@@ -2171,6 +2190,187 @@ def test_a_constraint_name_a_renderer_already_broke_still_answers_to_the_name(fr
         assert db._cycle_stop_problems(conn) == []
         assert db.init_db(conn) == []
         assert {row["id"] for row in conn.execute("SELECT id FROM cycles")} == {"kept", "half"}
+    finally:
+        conn.close()
+
+
+# ── 0016: the conventions space and the annotations table ─────────────────────
+
+
+def _at_0015(tmp_path, monkeypatch, filename):
+    """Build a populated database stopped at ``0015``, and return its path."""
+    path = tmp_path / filename
+    monkeypatch.setenv("NODUM_DB", str(path))
+    monkeypatch.setattr(db, "MIGRATIONS", _prefix_through("0015_cycle_stop_switch"))
+    service.init()
+    return path
+
+
+def test_0016_applies_to_a_populated_database_already_at_0015(tmp_path, monkeypatch):
+    """The upgrade path, not just the fresh-file one: 0015 is where v0.8 users are."""
+    _at_0015(tmp_path, monkeypatch, "at0015.db")
+    node = service.create_node(type="note", title="before the upgrade", principal=owner())
+
+    monkeypatch.setattr(db, "MIGRATIONS", MIGRATIONS)
+    conn = db.connect()
+    try:
+        assert db.init_db(conn) == ["0016_conventions_and_annotations"]
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+    finally:
+        conn.close()
+
+    # The conventions space resolves, and the gardener holds `edit` on it — the
+    # grant that makes the workspace actually writeable by the cycle.
+    assert service.resolve_space_id("conventions", principal=owner()) == "conventions"
+    assert auth.internal_principal().level_on("conventions") == EDIT
+    # And the graph the upgrade ran over is untouched.
+    assert service.get_node(node.id, principal=owner()).title == "before the upgrade"
+
+
+def test_0016_refuses_to_upgrade_when_a_space_named_conventions_exists(tmp_path, monkeypatch):
+    """The reserved-name guard refuses the collision readably rather than as a bare UNIQUE error."""
+    _at_0015(tmp_path, monkeypatch, "taken-space.db")
+    conn = db.connect()
+    try:
+        conn.execute(
+            "INSERT INTO nodes (id, space_id, type_id, title, created_by)"
+            " VALUES ('user-space', 'meta', 'space', 'conventions', 'human:owner')"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    monkeypatch.setattr(db, "MIGRATIONS", MIGRATIONS)
+    conn = db.connect()
+    try:
+        with pytest.raises(sqlite3.IntegrityError, match="conventions") as refusal:
+            db.init_db(conn)
+        assert "rename or remove it" in str(refusal.value)
+        # Refused, not half-done: the migration's row is not recorded.
+        assert "0016_conventions_and_annotations" not in db.applied_migrations(conn)
+    finally:
+        conn.close()
+
+
+def test_0016_refuses_to_upgrade_when_a_node_id_conventions_exists(tmp_path, monkeypatch):
+    """A raw node whose *id* is `conventions` collides on the primary key instead."""
+    _at_0015(tmp_path, monkeypatch, "taken-id.db")
+    conn = db.connect()
+    try:
+        conn.execute(
+            "INSERT INTO nodes (id, space_id, type_id, title, created_by)"
+            " VALUES ('conventions', 'main', 'note', 'my notes', 'human:owner')"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    monkeypatch.setattr(db, "MIGRATIONS", MIGRATIONS)
+    conn = db.connect()
+    try:
+        with pytest.raises(sqlite3.IntegrityError, match="conventions"):
+            db.init_db(conn)
+        assert "0016_conventions_and_annotations" not in db.applied_migrations(conn)
+    finally:
+        conn.close()
+
+
+def test_annotations_are_an_exclusive_arc(fresh_db):
+    """One annotation per queue item, targeting exactly one of the three tables.
+
+    The exclusive arc is this schema's own idiom (`url_tokens` before it):
+    three typed nullable target columns, a CHECK that exactly one is non-null,
+    and a partial unique index per column so re-annotating on a later cycle
+    replaces rather than accumulates.
+    """
+    node = service.create_node(type="note", title="target", principal=owner())
+    version_id = 41  # an explicit id, as the lookup keys on INTEGER versions.id
+    conn = db.connect()
+    try:
+        conn.execute(
+            "INSERT INTO versions (id, node_id, title, content, props, actor, event_seq)"
+            " VALUES (?, ?, 'v', 'c', '{}', 'human:owner', 999)",
+            (version_id, node.id),
+        )
+        base = (
+            "INSERT INTO annotations (id, target_node_id, target_edge_id,"
+            " target_version_id, body, actor)"
+        )
+        conn.execute(
+            f"{base} VALUES ('a1', ?, NULL, NULL, '{{\"rate\": 0.9}}', 'agent:builtin-gardener')",
+            (node.id,),
+        )
+        # (a) a row with no target is refused by the CHECK...
+        with pytest.raises(sqlite3.IntegrityError, match="CHECK"):
+            conn.execute(
+                f"{base} VALUES ('a2', NULL, NULL, NULL, '{{}}', 'agent:builtin-gardener')"
+            )
+        # (b) ...and so is one naming two targets.
+        with pytest.raises(sqlite3.IntegrityError, match="CHECK"):
+            conn.execute(
+                f"{base} VALUES ('a3', ?, NULL, ?, '{{}}', 'agent:builtin-gardener')",
+                (node.id, version_id),
+            )
+        # (c) the version column is INTEGER: the row is found by the number and
+        # by its string spelling alike.
+        conn.execute(
+            f"{base} VALUES ('a4', NULL, NULL, ?, '{{\"rate\": 0.5}}', 'agent:builtin-gardener')",
+            (version_id,),
+        )
+        for probe in (version_id, str(version_id)):
+            row = conn.execute(
+                "SELECT body FROM annotations WHERE target_version_id = ?", (probe,)
+            ).fetchone()
+            assert row is not None
+        # (d) the partial unique index refuses a second annotation on the same target.
+        with pytest.raises(sqlite3.IntegrityError, match="UNIQUE"):
+            conn.execute(
+                f"{base} VALUES ('a5', ?, NULL, NULL, '{{}}', 'agent:builtin-gardener')",
+                (node.id,),
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="UNIQUE"):
+            conn.execute(
+                f"{base} VALUES ('a6', NULL, NULL, ?, '{{}}', 'agent:builtin-gardener')",
+                (version_id,),
+            )
+        # (e) the foreign keys cascade: an undone version and an undone node take
+        # their annotations with them.
+        conn.execute("DELETE FROM versions WHERE node_id = ?", (node.id,))
+        conn.execute("DELETE FROM nodes WHERE id = ?", (node.id,))
+        conn.commit()
+        assert conn.execute("SELECT 1 FROM annotations WHERE id = 'a1'").fetchone() is None
+        assert conn.execute("SELECT 1 FROM annotations WHERE id = 'a4'").fetchone() is None
+    finally:
+        conn.close()
+
+
+def test_a_database_recorded_at_0016_without_the_table_is_refused(tmp_path, monkeypatch):
+    """Every recorded migration with a checkable guarantee has a check (Q13 S6).
+
+    The drift is the shape the check exists for: a file that records 0016 and
+    lacks the table would die deep inside `list_proposals` with `no such table:
+    annotations` the first time an item's annotation is looked up — nothing in
+    the runtime catches it first. The refusal names the table and the statement
+    that puts it back, in place rather than by deleting the graph.
+    """
+    _at_0015(tmp_path, monkeypatch, "stale.db")
+    conn = db.connect()
+    try:
+        conn.execute(
+            "INSERT INTO schema_migrations (name) VALUES ('0016_conventions_and_annotations')"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    monkeypatch.setattr(db, "MIGRATIONS", MIGRATIONS)
+    conn = db.connect()
+    try:
+        with pytest.raises(db.SchemaConsistencyError, match="annotations") as refused:
+            db.init_db(conn)
+        message = str(refused.value)
+        assert "delete the database file" not in message, "it told a human to bin their graph"
+        assert db.ANNOTATIONS_TABLE_SQL in message
     finally:
         conn.close()
 

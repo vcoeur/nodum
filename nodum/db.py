@@ -9,7 +9,7 @@ from pathlib import Path
 
 import sqlite_vec
 
-from nodum.migrations import MIGRATIONS
+from nodum.migrations import GARDENER_AGENT_ID, MIGRATIONS
 
 #: Environment variable overriding the database path.
 ENV_DB_VAR = "NODUM_DB"
@@ -509,6 +509,76 @@ _REPAIR_THE_STOP_SWITCH = (
     "loses nothing. Re-run 'nodum init' afterwards: it says what is left to do."
 )
 
+#: ``0016``'s annotations table and its three partial unique indexes, as the
+#: statements that create them. Kept next to the check that looks for the table
+#: so the refusal prints the cure rather than a shape of the cure — the table
+#: is an addition nothing derives from what the file holds, so the cure is
+#: re-running the migration's own statements (like ``0015``'s ``ALTER``s, and
+#: unlike the delete-the-file remedy the first four checks share). Written
+#: pre-wrapped for :data:`_SQL_WIDTH`'s reason: this SQL reaches a human inside
+#: a refusal, and a renderer re-wraps any line it cannot fit.
+ANNOTATIONS_TABLE_SQL = (
+    "CREATE TABLE annotations (\n"
+    "    id                TEXT PRIMARY KEY,\n"
+    "    target_node_id    TEXT    REFERENCES nodes(id)\n"
+    "                                 ON DELETE CASCADE,\n"
+    "    target_edge_id    TEXT    REFERENCES edges(id)\n"
+    "                                 ON DELETE CASCADE,\n"
+    "    target_version_id INTEGER REFERENCES versions(id)\n"
+    "                                 ON DELETE CASCADE,\n"
+    "    body              TEXT NOT NULL,\n"
+    "    actor             TEXT NOT NULL,\n"
+    "    cycle_id          TEXT REFERENCES cycles(id),\n"
+    "    created_at        TEXT NOT NULL DEFAULT\n"
+    "                      (datetime('now')),\n"
+    "    CHECK ((target_node_id IS NOT NULL)\n"
+    "         + (target_edge_id IS NOT NULL)\n"
+    "         + (target_version_id IS NOT NULL) = 1)\n"
+    ");\n"
+    "CREATE UNIQUE INDEX idx_annotations_node\n"
+    "    ON annotations(target_node_id)\n"
+    "    WHERE target_node_id IS NOT NULL;\n"
+    "CREATE UNIQUE INDEX idx_annotations_edge\n"
+    "    ON annotations(target_edge_id)\n"
+    "    WHERE target_edge_id IS NOT NULL;\n"
+    "CREATE UNIQUE INDEX idx_annotations_version\n"
+    "    ON annotations(target_version_id)\n"
+    "    WHERE target_version_id IS NOT NULL;"
+)
+
+#: The id of ``0016``'s conventions space — the gardener's own workspace, and
+#: the one space every learned-curation write names. It is a constant here
+#: because the consistency check asks about it twice.
+CONVENTIONS_SPACE_ID = "conventions"
+
+#: ``0016``'s space node, as the statement that creates it — the repair for a
+#: file recording the migration that lacks the space. Written pre-wrapped for
+#: :data:`_SQL_WIDTH`'s reason, like :data:`ANNOTATIONS_TABLE_SQL`.
+CONVENTIONS_SPACE_SQL = (
+    "INSERT INTO nodes\n"
+    "(id, space_id, type_id, title, props, state, created_by)\n"
+    "VALUES ('conventions', 'meta', 'space', 'conventions',\n"
+    "        '{}', 'active', 'system');"
+)
+
+#: ``0016``'s grant row, as the statement that creates it — the repair for a
+#: file recording the migration that lacks the gardener's ``edit`` on the
+#: conventions space. Written pre-wrapped for :data:`_SQL_WIDTH`'s reason.
+CONVENTIONS_GRANT_SQL = (
+    "INSERT INTO grants (agent_id, space_id, level)\n"
+    "VALUES ('builtin-gardener', 'conventions', 'edit');"
+)
+
+#: The remedy for ``0016``'s drift: three additions, none derivable from what
+#: the file holds, so each problem names the migration's own statement that
+#: puts it back — repaired in place like ``0015``, never by deleting a graph.
+_REPAIR_THE_WRITE_SEAM = (
+    "No data is lost and nothing has to be derived: every missing piece is an addition "
+    "with no back-fill, and the statement that creates it is the migration's own. Run the "
+    "statement each problem above names, in the order printed and exactly as printed, then "
+    "re-run 'nodum init' afterwards: it says what is left to do."
+)
+
 
 def _verify_schema_consistency(conn: sqlite3.Connection) -> None:
     """Refuse a database whose live schema contradicts its recorded migrations.
@@ -545,6 +615,7 @@ def _verify_schema_consistency(conn: sqlite3.Connection) -> None:
         ("0011_actor_strings", _actor_string_problems, _RECREATE_THE_FILE),
         ("0014_cycles_and_gardener", _cycles_problems, _CREATE_THE_CYCLES_INDEX),
         ("0015_cycle_stop_switch", _cycle_stop_problems, _REPAIR_THE_STOP_SWITCH),
+        ("0016_conventions_and_annotations", _write_seam_problems, _REPAIR_THE_WRITE_SEAM),
     ):
         if name not in recorded:
             continue
@@ -837,6 +908,50 @@ def _parked_copy_problem(conn: sqlite3.Connection) -> str:
         f"the first place. Clear them in the copy, then insert again:\n"
         f"{_CLEAR_PARKED_HALF_STOP_SQL}"
     )
+
+
+def _write_seam_problems(conn: sqlite3.Connection) -> list[str]:
+    """0016 guarantees the annotations table, the conventions space, and its grant.
+
+    Three additions, each checkable on its own. The ``annotations`` table is
+    the one the runtime meets as a bare drift — a file recording ``0016``
+    without it fails ``list_proposals`` with ``no such table: annotations`` the
+    first time an item's annotation is looked up — while a missing space node
+    fails a gardener job scoped to ``conventions`` with ``space not found`` and
+    a missing grant silently lands that job's writes ``proposed`` instead of
+    the workspace they were designed for. None of the three is derivable from
+    what the file holds, so each problem names the migration's own statement
+    that puts it back (:data:`ANNOTATIONS_TABLE_SQL` and the two INSERTs).
+    """
+    problems: list[str] = []
+    if "annotations" not in _tables(conn):
+        problems.append(
+            "table 'annotations' is missing (a proposal listing would die on "
+            f"'no such table') — repair:\n{ANNOTATIONS_TABLE_SQL}"
+        )
+    if (
+        conn.execute(
+            "SELECT 1 FROM nodes WHERE id = ? AND type_id = 'space'",
+            (CONVENTIONS_SPACE_ID,),
+        ).fetchone()
+        is None
+    ):
+        problems.append(
+            f"space node {CONVENTIONS_SPACE_ID!r} is missing (a gardener job "
+            f"scoped to it would not resolve) — repair:\n{CONVENTIONS_SPACE_SQL}"
+        )
+    if (
+        conn.execute(
+            "SELECT 1 FROM grants WHERE agent_id = ? AND space_id = ?",
+            (GARDENER_AGENT_ID, CONVENTIONS_SPACE_ID),
+        ).fetchone()
+        is None
+    ):
+        problems.append(
+            f"the gardener's 'edit' grant on {CONVENTIONS_SPACE_ID!r} is missing "
+            f"(its writes would land 'proposed' instead) — repair:\n{CONVENTIONS_GRANT_SQL}"
+        )
+    return problems
 
 
 def init_db(conn: sqlite3.Connection) -> list[str]:

@@ -230,6 +230,41 @@ def test_removing_the_redirect_lets_the_tombstones_create_be_undone_again(fresh_
         service.get_node(duplicate.id, principal=owner())
 
 
+def test_an_annotation_never_blocks_undo(fresh_db):
+    """An annotation is derived judgement, so it can never refuse a node's undo.
+
+    Migration 0016's `annotations.target_node_id` is the one foreign key into
+    `nodes(id)` deliberately absent from `_delete_blocker` — it cascades — so
+    an undone create takes its annotation with it instead of standing in the
+    way, which is what the annotation's `cycle_id` already implies: the cycle
+    that wrote the night's annotations rolls back with them.
+    """
+    node = _node("Annotated")
+    conn = db.connect()
+    try:
+        conn.execute(
+            "INSERT INTO annotations (id, target_node_id, target_edge_id,"
+            " target_version_id, body, actor)"
+            " VALUES ('a1', ?, NULL, NULL, '{\"rate\": 0.9}',"
+            " 'agent:builtin-gardener')",
+            (node.id,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    service.undo(_seq_of("node.create", row_id=node.id), principal=owner())
+
+    conn = db.connect()
+    try:
+        remaining = conn.execute("SELECT 1 FROM annotations WHERE id = 'a1'").fetchone()
+    finally:
+        conn.close()
+    assert remaining is None
+    with pytest.raises(NodeNotFound):
+        service.get_node(node.id, principal=owner())
+
+
 def test_a_retype_comes_back(fresh_db):
     node = _node("Alpha")
     before = _graph()

@@ -534,7 +534,18 @@ commands on a saved node for exactly this reason.
   mandate**). It only
   ever lowers; asking to land *above* the grant is refused rather than quietly
   downgraded, because a caller that named a state and silently got another one
-  has been told nothing.
+  has been told nothing. Migration `0016` adds the write seam's other half:
+  the **conventions space** — the gardener's own workspace (§L2), where
+  convention notes are ordinary `note` nodes written by the cycle, with the
+  gardener holding `edit` on it **alone**, as an ordinary revocable grant row
+  (restoring `edit` on `meta` was rejected because 5a's live pass proved it
+  buys renaming `main` and archiving the `note` type, after which a human
+  cannot write a note) — and the **annotations table** (§L1): one row per
+  queue item saying what a proposer's acceptance signal judged and at what
+  rate, an **exclusive arc** (three typed nullable `ON DELETE CASCADE` target
+  columns, a CHECK that exactly one is non-null) with **no direct read
+  surface** — written only by the learned-curation cycle, and read only
+  attached to a `ProposalOut` the store has already grant-filtered.
   Each public function opens its own short-lived connection
   (applying pending migrations idempotently) and commits. New behaviour and
   validation go here first; adapters must not add behaviour the service lacks.
