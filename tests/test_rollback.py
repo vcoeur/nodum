@@ -265,6 +265,40 @@ def test_an_annotation_never_blocks_undo(fresh_db):
         service.get_node(node.id, principal=owner())
 
 
+def test_an_annotation_on_an_edge_never_blocks_undo(fresh_db):
+    """The edge leg of the annotation cascade: an undone edge.create takes its
+    annotation with it, exactly as an undone node create does.
+
+    `annotations.target_edge_id` is the same derived-judgement cascade as
+    `target_node_id`, so the edge's create is undoable with the annotation
+    standing — the row goes with the edge, and the undo is never refused.
+    """
+    src, dst = _node("A"), _node("B")
+    edge = service.create_edge(src.id, dst.id, "supports", principal=owner())
+    conn = db.connect()
+    try:
+        conn.execute(
+            "INSERT INTO annotations (id, target_node_id, target_edge_id,"
+            " target_version_id, body, actor)"
+            " VALUES ('a2', NULL, ?, NULL, '{\"rate\": 0.7}',"
+            " 'agent:builtin-gardener')",
+            (edge.id,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    service.undo(_seq_of("edge.create", row_id=edge.id), principal=owner())
+
+    conn = db.connect()
+    try:
+        remaining = conn.execute("SELECT 1 FROM annotations WHERE id = 'a2'").fetchone()
+    finally:
+        conn.close()
+    assert remaining is None
+    assert edge.id not in {row["id"] for row in _rows("edges")}
+
+
 def test_a_retype_comes_back(fresh_db):
     node = _node("Alpha")
     before = _graph()

@@ -2344,6 +2344,28 @@ def test_annotations_are_an_exclusive_arc(fresh_db):
         conn.close()
 
 
+def test_deleting_an_edge_takes_its_annotation_with_it(fresh_db):
+    """The exclusive arc's edge leg cascades like the node and version legs do."""
+    src = service.create_node(type="note", title="src", principal=owner())
+    dst = service.create_node(type="note", title="dst", principal=owner())
+    edge = service.create_edge(src.id, dst.id, "mentions", principal=owner())
+    conn = db.connect()
+    try:
+        conn.execute(
+            "INSERT INTO annotations (id, target_node_id, target_edge_id,"
+            " target_version_id, body, actor)"
+            " VALUES ('a7', NULL, ?, NULL, '{\"rate\": 0.8}',"
+            " 'agent:builtin-gardener')",
+            (edge.id,),
+        )
+        assert conn.execute("SELECT 1 FROM annotations WHERE id = 'a7'").fetchone() is not None
+        conn.execute("DELETE FROM edges WHERE id = ?", (edge.id,))
+        conn.commit()
+        assert conn.execute("SELECT 1 FROM annotations WHERE id = 'a7'").fetchone() is None
+    finally:
+        conn.close()
+
+
 def test_a_database_recorded_at_0016_without_the_table_is_refused(tmp_path, monkeypatch):
     """Every recorded migration with a checkable guarantee has a check (Q13 S6).
 
@@ -2371,6 +2393,85 @@ def test_a_database_recorded_at_0016_without_the_table_is_refused(tmp_path, monk
         message = str(refused.value)
         assert "delete the database file" not in message, "it told a human to bin their graph"
         assert db.ANNOTATIONS_TABLE_SQL in message
+    finally:
+        conn.close()
+
+
+def test_a_database_recorded_at_0016_without_the_conventions_space_is_refused(
+    tmp_path, monkeypatch
+):
+    """The space-node half of the write-seam check is pinned, not just the table.
+
+    The table test proves the table check fires; this proves the space check
+    fires on its own — the table and the grant both exist, only the space node
+    is gone. A database recording 0016 without it would fail a gardener job
+    scoped to `conventions` with `space not found`.
+    """
+    _at_0015(tmp_path, monkeypatch, "stale.db")
+    conn = db.connect()
+    try:
+        conn.execute(
+            "INSERT INTO schema_migrations (name) VALUES ('0016_conventions_and_annotations')"
+        )
+        conn.executescript(db.ANNOTATIONS_TABLE_SQL)
+        conn.execute(db.CONVENTIONS_SPACE_SQL)
+        conn.execute(db.CONVENTIONS_GRANT_SQL)
+        conn.commit()
+        # The grant's `space_id` foreign key forbids the delete under normal
+        # enforcement — the drift is exactly what a writer with FKs off leaves
+        # behind, so take it back off for the delete.
+        conn.execute("PRAGMA foreign_keys = OFF")
+        conn.execute("DELETE FROM nodes WHERE id = ?", (db.CONVENTIONS_SPACE_ID,))
+        conn.commit()
+    finally:
+        conn.close()
+
+    monkeypatch.setattr(db, "MIGRATIONS", MIGRATIONS)
+    conn = db.connect()
+    try:
+        with pytest.raises(db.SchemaConsistencyError, match="conventions") as refused:
+            db.init_db(conn)
+        message = str(refused.value)
+        # The migration's own name carries "annotations", so pin the *table
+        # check* by its phrasing: it must not have fired — the table exists.
+        assert "table 'annotations' is missing" not in message
+        assert db.CONVENTIONS_SPACE_SQL in message
+    finally:
+        conn.close()
+
+
+def test_a_database_recorded_at_0016_without_the_gardener_grant_is_refused(tmp_path, monkeypatch):
+    """The grant-row half of the write-seam check is pinned, not just the table.
+
+    Table and space node both exist; only the gardener's `edit` row on
+    `conventions` is gone. A database recording 0016 without it would silently
+    land the gardener's conventions writes `proposed` instead of the workspace
+    they were designed for.
+    """
+    _at_0015(tmp_path, monkeypatch, "stale.db")
+    conn = db.connect()
+    try:
+        conn.execute(
+            "INSERT INTO schema_migrations (name) VALUES ('0016_conventions_and_annotations')"
+        )
+        conn.executescript(db.ANNOTATIONS_TABLE_SQL)
+        conn.execute(db.CONVENTIONS_SPACE_SQL)
+        conn.execute(
+            "DELETE FROM grants WHERE agent_id = ? AND space_id = ?",
+            (db.GARDENER_AGENT_ID, db.CONVENTIONS_SPACE_ID),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    monkeypatch.setattr(db, "MIGRATIONS", MIGRATIONS)
+    conn = db.connect()
+    try:
+        with pytest.raises(db.SchemaConsistencyError, match="edit") as refused:
+            db.init_db(conn)
+        message = str(refused.value)
+        assert "conventions" in message
+        assert db.CONVENTIONS_GRANT_SQL in message
     finally:
         conn.close()
 
