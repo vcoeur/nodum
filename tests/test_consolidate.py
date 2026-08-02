@@ -550,37 +550,27 @@ def test_the_calibration_fixture_covers_every_band_bilingually():
     assert max(widths) <= 90
 
 
-def test_the_duplicate_bar_is_dead_and_the_link_bar_mislabels_duplicates():
-    """The open defect, pinned rather than left to a comment — and it is two
-    defects, not the one it was first written as.
+def test_the_link_bar_fires_on_the_duplicate_band_which_is_the_judgement_the_queue_cannot_make():
+    """The honest shape of the mislabel: every fixture duplicate clears the link bar.
 
-    No labelled duplicate reaches the duplicate bar, so that signal cannot fire
-    at all. The link bar is not dead in the same way and the difference costs
-    more: no genuinely related pair reaches it either, but **most labelled
-    duplicates do**, because the duplicate band runs 0.763-0.929 straight
-    through it. So an embedding-driven ``relates_to`` proposal at these bars is
-    a near-duplicate wearing the wrong label, and the human rejecting it is
-    answering "not merely related", which is not the question the duplicate
-    signal would have asked.
+    With the link bar measured at 0.60 on real content, all 10 labelled
+    duplicates (0.763-0.929) are proposed as ``relates_to`` — a near-duplicate
+    worded differently is not missed, it arrives under the weaker label. The
+    queue cannot tell "not merely related" from "not a duplicate": that
+    distinction is a judgement about the *pairs*, which is the learned-curation
+    cycle's job (§L1 annotations), not a bar any cosine signal can draw on this
+    content — real duplicate candidates score 0.28-0.55, overlapping the
+    related band completely.
 
-    The first version of this test asserted only the two "nothing fires" halves
-    while being named for a claim its body never checked — the anti-pattern this
-    file has the worst record on, caught here by the second review round.
-
-    **This test is meant to die.** Re-tuning the bars on real content breaks it,
-    and that failure is the reminder to delete it.
+    The test this replaces asserted the same shape as a defect with a
+    hand-pinned count (``len(straddling) == 7``), which broke the moment the
+    bars were measured; the shape itself is the point, so it is asserted from
+    the constants.
     """
     _, bands = _calibration()
 
+    assert all(cosine >= consolidate.LINK_EMBEDDING_COSINE for cosine in bands["duplicate"])
     assert max(bands["duplicate"]) < consolidate.DUPLICATE_EMBEDDING_COSINE
-    assert max(bands["related"]) < consolidate.LINK_EMBEDDING_COSINE
-    straddling = [
-        cosine for cosine in bands["duplicate"] if cosine >= consolidate.LINK_EMBEDDING_COSINE
-    ]
-    assert len(straddling) == 7, (
-        "the duplicate band straddles the link bar: these are proposed as "
-        "relates_to because the duplicate signal cannot reach them"
-    )
 
 
 def test_the_fixture_separates_its_own_bands_and_still_cannot_set_a_bar():
@@ -602,20 +592,104 @@ def test_the_fixture_separates_its_own_bands_and_still_cannot_set_a_bar():
     assert max(bands["related"]) < min(bands["duplicate"])
 
 
-def test_the_bars_record_the_defect_and_what_would_close_it():
+def test_the_bars_record_their_measurement_and_the_invariant():
     """The comment is load-bearing, so it is asserted rather than trusted.
 
-    Without it these are two ordinary-looking constants that quietly do
-    nothing, and the next reader re-derives the same wrong number from the same
-    fixture.
+    Without it these are two ordinary-looking constants whose values only a
+    real-corpus measurement explains — a bar fitted to the fixture cannot
+    measure a false-positive rate, and the next reader must be told that the
+    numbers are the measured ones, not a second guess at the fixture.
     """
     source = Path(consolidate.__file__).read_text()
     marker = source.index("DUPLICATE_EMBEDDING_COSINE = ")
     preamble = source[:marker]
 
-    assert "KNOWN NOT TO FIRE" in preamble
-    assert "embedding_calibration.json" in preamble
     assert "real corpus" in preamble
+    assert "measure_kasten_calibration" in preamble
+    assert "must stay above" in preamble
+
+
+@pytest.mark.skipif(
+    os.environ.get("NODUM_RUN_SLOW") != "1",
+    reason="real-model smoke test: set NODUM_RUN_SLOW=1 (downloads the model once)",
+)
+def test_real_embeddings_fire_the_measured_link_bar():
+    """The test that actually embeds text — the thing the fixture tests cannot do.
+
+    The fixture tests read recorded cosines and never embed, which is exactly
+    why they could not see the flood: a bar fitted to 29 hand-labelled pairs
+    says nothing about a false-positive rate on real content. This test drives
+    the pinned model through :func:`nodum.embeddings.node_vectors` — the same
+    call the consolidation cycle makes — over real prose: pairs reused from the
+    calibration fixture (whose recorded cosines it must reproduce within a
+    margin, since the point is the bar's *behaviour* and not the fourth
+    decimal) plus clearly same-area pairs of its own construction. The measured
+    link bar at 0.60 fires on genuinely related content and rejects the junk
+    the gate cited.
+    """
+    embeddings.reset_provider()
+    provider = embeddings.get_provider()
+    if provider is None:
+        pytest.skip(f"no embedding provider: {embeddings.unavailable_reason()}")
+
+    document = json.loads(CALIBRATION_FIXTURE.read_text())
+    recorded = {pair["id"]: pair for pair in document["pairs"]}
+    # Same-area pairs from the fixture's duplicate band (0.763-0.929, all far
+    # above the 0.60 link bar) and junk from its unrelated band (max 0.314).
+    reused = [
+        "dup-en-backpressure",
+        "dup-fr-retention",
+        "dup-en-fractional-index",
+        "unrel-en-sourdough",
+        "unrel-fr-tomates",
+    ]
+    own_pairs = [
+        (
+            "Software architecture is mostly taught as a catalogue of patterns, but the "
+            "working knowledge is the trade-offs: where a layered design buys "
+            "changeability and where it buys latency, when an event bus is decoupling "
+            "and when it is a second database. A developer who can argue those "
+            "trade-offs on a real codebase understands architecture; one who can name "
+            "twenty patterns has learned a vocabulary.",
+            "Software architecture is usually presented as a catalogue of patterns, but "
+            "the real knowledge is the trade-offs: when a layered design buys "
+            "changeability and when it buys latency, when an event bus decouples and "
+            "when it is just a second database. A developer who can argue those "
+            "trade-offs on a real codebase understands architecture; one who can name "
+            "twenty patterns has only learned a vocabulary.",
+        ),
+        (
+            "A personal knowledge base only earns its keep when retrieval is faster than "
+            "memory. The failure mode is the collector's archive: notes saved for later, "
+            "filed under categories that seemed sensible at the time, and never linked to "
+            "anything that would bring them back. Links and indexes are what make a note "
+            "findable, and they are also what connect it to the question that needs it.",
+            "A knowledge base pays off only when finding a note is faster than remembering "
+            "it. The failure mode is the collector's archive: notes put aside for later, "
+            "filed under categories that made sense at the time, and never linked to "
+            "anything that would bring them back. Links and indexes are what make a note "
+            "findable, and they are also what connect it to the question that needs it.",
+        ),
+    ]
+
+    def cosine_of(left: str, right: str) -> float:
+        first, second = embeddings.node_vectors(
+            provider,
+            [{"title": None, "content": left}, {"title": None, "content": right}],
+        )
+        return consolidate._cosine(first, second)
+
+    for pair_id in reused:
+        pair = recorded[pair_id]
+        measured = cosine_of(pair["left"], pair["right"])
+        assert measured == pytest.approx(pair["cosine"], abs=0.02), pair_id
+        if pair["band"] == "duplicate":
+            assert measured >= consolidate.LINK_EMBEDDING_COSINE, pair_id
+        else:
+            assert measured < consolidate.LINK_EMBEDDING_COSINE, pair_id
+
+    for left, right in own_pairs:
+        assert cosine_of(left, right) >= consolidate.LINK_EMBEDDING_COSINE
 
 
 def test_the_job_degrades_to_titles_when_no_model_is_present(fresh_db):
