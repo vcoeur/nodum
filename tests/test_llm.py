@@ -2560,16 +2560,18 @@ def test_a_wire_that_carries_no_total_is_not_a_disagreement(wire, caplog):
 def test_a_400_that_is_not_a_capability_statement_never_downgrades(monkeypatch, detail: str):
     """The negative half of a matcher this module keeps deliberately blunt.
 
-    :data:`_STRUCTURED_REJECTIONS` is a substring list, so the boundary has to be
-    pinned from the outside or a later broadening swallows unrelated errors in
-    silence. The first two rows are the ones a plain ``"response_format" in
-    detail`` gets wrong: a server naming ``response_format.schema.properties``
-    has **parsed** the field and is validating what is inside it, which is proof
-    that it *serves* it and that the fault is nodum's own schema. Downgrading
-    there trades a loud, fixable "your schema is wrong" for an envelope quietly
-    weakened for the life of the process — the exact harm
+    :data:`_STRUCTURED_REJECTIONS` is a substring list, so the boundary has to
+    be pinned from the outside or a later broadening swallows unrelated errors
+    in silence. The first row is the one a plain ``"response_format" in
+    detail`` gets wrong: ``Invalid schema for response_format.schema.properties``
+    says the server has **parsed** the field and is validating what is inside
+    it, which is proof that it *serves* it and that the fault is nodum's own
+    schema. Downgrading there trades a loud, fixable "your schema is wrong" for
+    an envelope quietly weakened for the life of the process — the exact harm
     :func:`test_a_non_capability_400_is_not_negotiated` exists to prevent,
-    reached through a message that happens to contain the marker.
+    reached through a message that happens to contain the marker. The second
+    row is the sharpening property stated from this side: a dotted path with no
+    reason words behind it decides nothing at all.
 
     All three must behave identically: one request, no re-send, the failure
     reaching the caller, and the provider still believing in ``json_schema``.
@@ -2602,4 +2604,47 @@ def test_the_measured_capability_400_still_downgrades(monkeypatch):
         timeout=30.0,
     )
     assert len(recorder.requests) == 2
+    assert provider.structured_mode == llm.STRUCTURED_JSON_OBJECT
+
+
+@pytest.mark.parametrize(
+    "detail",
+    [
+        # The sharpening in the downgrade direction: the dotted path used to
+        # read as "the server parsed the field" and block the downgrade. The
+        # reason words say the opposite — "is unavailable" is a capability
+        # rejection even when the sentence carries a path.
+        "response_format.type is unavailable",
+        # The case the old punctuation rule refused forever: the bracketed
+        # path meant "do not downgrade" whatever the server said. The reason
+        # words — "not supported" — say the endpoint does not serve the field,
+        # so it now downgrades. The bare phrase is shared with ollama's
+        # *thinking* sentence (`think value "low" is not supported`), which is
+        # exactly why the matcher requires the sentence to name the field.
+        "response_format[type] not supported",
+    ],
+    ids=["path-plus-unavailable", "bracketed-not-supported"],
+)
+def test_a_capability_400_is_negotiated_by_its_reason_words(monkeypatch, detail: str):
+    """The positive half of the reason-word matcher, driven from the outside.
+
+    :data:`_STRUCTURED_REJECTIONS` is a substring list, so the boundary has to
+    be pinned from the outside or a later narrowing swallows a real capability
+    rejection in silence. Both rows are the ones the old punctuation rule got
+    wrong: it read the ``.`` and ``[`` after the field name as "the server
+    dereferenced the field" and refused to downgrade, even though the words
+    around the path are a capability rejection. Only the reason words decide
+    now — a dotted or bracketed field path alone decides neither way, and the
+    guard must not have turned the punctuation into a veto.
+    """
+    recorder = _rejects_then(detail)
+    monkeypatch.setattr(urllib.request, "urlopen", recorder)
+    provider = _provider(structured_mode=llm.STRUCTURED_JSON_SCHEMA)
+    provider.chat(
+        [llm.Message(role="user", content="hi")],
+        schema=SCHEMA,
+        max_output_tokens=512,
+        timeout=30.0,
+    )
+    assert len(recorder.requests) == 2, "the 400 was not read as a capability signal"
     assert provider.structured_mode == llm.STRUCTURED_JSON_OBJECT

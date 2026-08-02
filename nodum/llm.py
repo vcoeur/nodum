@@ -362,36 +362,50 @@ _MAX_NEGOTIATIONS = 3
 #: :class:`ProviderTimeout` and names the ceiling.
 _MIN_TIMEOUT = 0.001
 
-#: Substrings that identify a 400 as "this endpoint does not serve that
-#: ``response_format``". Measured on ``deepseek-v4-flash``: ``This
-#: response_format type is unavailable now``.
-_STRUCTURED_REJECTIONS = ("response_format",)
+#: The field the structured negotiation is about. A capability sentence must
+#: name it for this guard to act at all: a bare reason phrase is shared with
+#: the *thinking* negotiation (ollama's measured ``think value "low" is not
+#: supported for this model`` carries ``not supported`` and means something
+#: else entirely), so the subject has to be there too.
+_STRUCTURED_FIELD = "response_format"
 
-#: What separates the field's *name* from a path **into** it. A 400 reading
-#: ``Invalid schema for response_format.schema.properties[0]`` names the same
-#: substring and means the opposite thing: the server parsed ``response_format``
-#: and is validating what is inside it, which is proof that it serves the field
-#: and that the fault is nodum's own schema.
+#: Substrings that identify a 400 as "this endpoint does not serve that
+#: ``response_format``" — a genuine capability rejection, which IS downgraded.
+#: Measured on ``deepseek-v4-flash``: ``This response_format type is
+#: unavailable now``. ``not supported`` is the same family of sentence, and it
+#: carries the case the old punctuation rule refused forever:
+#: ``response_format[type] not supported`` is a capability rejection wearing a
+#: bracketed path, and the path is no longer what decides.
+_STRUCTURED_REJECTIONS = ("is unavailable", "not supported")
+
+#: Substrings that identify a 400 as "the server parsed the field and is
+#: validating what is inside it" — proof that it serves the field, so the
+#: fault is nodum's own schema and the envelope must NOT be weakened.
+#: Measured: ``Invalid schema for response_format.schema.properties[0]``.
+#: Matched before :data:`_STRUCTURED_REJECTIONS`, so a message naming both is
+#: read as a validation error — the conservative side of the same
+#: one-sidedness the block below states.
+_STRUCTURED_SCHEMA_FAULTS = ("invalid schema for",)
+
+#: Why the structured guard matches **reason words** rather than the
+#: punctuation that used to stand in for them. The old matcher read a ``.`` or
+#: ``[`` right after the field name as "the server dereferenced the field"
+#: and refused to downgrade on it; but a path is only ever a proxy for what
+#: the sentence actually says. The honest signal is the words:
+#: ``Invalid schema for`` means the server parsed the field and is validating
+#: what is inside it, ``is unavailable`` means it does not serve it. A
+#: dotted/bracketed field path alone decides neither way —
+#: ``response_format.type is unavailable`` is a capability rejection and
+#: ``response_format.json_schema.name is required`` is a validation error,
+#: and only the words around them say which.
 #:
-#: Downgrading on that would trade a loud, fixable "your schema is wrong" for an
-#: envelope quietly weakened for the life of the process — the exact harm
-#: ``test_a_non_capability_400_is_not_negotiated`` exists to prevent, reached
-#: through a message that happens to contain the marker. It is the one
-#: *sharpening* of a matcher this module keeps deliberately blunt.
-#:
-#: **It is a real behaviour change, not a preservation.** Driven on both
-#: revisions: ``response_format.type is unavailable`` and
-#: ``response_format[type] not supported`` were negotiated before this guard and
-#: are not now. No endpoint anyone has measured says either — the sentence
-#: DeepSeek really returns carries no path — but an OpenAI-compatible server
-#: wording its genuine capability rejection with a dotted or bracketed path will
-#: now never downgrade, and structured output fails against it permanently
-#: instead of once. The separator is only a proxy for "the server dereferenced
-#: the field"; the honest signal is the reason words (``Invalid schema for``
-#: against ``is unavailable``), not the punctuation. Kept because the failure it
-#: prevents is by far the commoner one, and re-matching on reason words is
-#: follow-up work rather than something to do on this branch.
-_FIELD_PATH_SEPARATORS = (".", "[")
+#: The trade is the same one this module keeps deliberately blunt elsewhere.
+#: The false-positive side is a weaker request every endpoint accepts, and
+#: ``nodum llm status`` says the fallback is in use; the false-negative side
+#: is today's ``ProviderUnavailable`` reaching the caller unchanged. Downgrading
+#: on a schema fault is the one harm both directions are pinned against: it
+#: would trade a loud, fixable "your schema is wrong" for an envelope quietly
+#: weakened for the life of the process.
 
 #: Substrings that identify a 400 as "this endpoint does not take a graded
 #: reasoning level". Measured on ollama: ``"llama3.2:1b" does not support
@@ -399,11 +413,12 @@ _FIELD_PATH_SEPARATORS = (".", "[")
 #: supported for this model`` for ``qwen3:8b``, which has it — two different
 #: sentences from one server, which is why this is a list rather than a string.
 #:
-#: Matched as plain substrings, deliberately unlike :data:`_STRUCTURED_REJECTIONS`:
-#: two of the three are *sentences a server says* rather than field names, so
-#: the path guard in :func:`_names_field` would stop ``"llama3.2:1b" does not
-#: support thinking.`` matching over a full stop. ``reasoning_effort`` takes a
-#: bare string, so there is no path into it for a server to name.
+#: Matched as plain substrings, deliberately unlike the structured guard:
+#: two of the three are *sentences a server says* rather than field names, and
+#: there is no "parsed the field" half for them — ``reasoning_effort`` takes a
+#: bare string, so a server has nothing inside it to validate, and a sentence
+#: naming it is always a refusal rather than a complaint about nodum's own
+#: schema.
 _THINKING_REJECTIONS = (
     "reasoning_effort",
     "does not support thinking",
@@ -990,36 +1005,40 @@ def estimate_content_tokens(messages: Sequence[Message]) -> int:
     )
 
 
-def _names_field(detail: str, markers: Sequence[str]) -> bool:
-    """Does this 400 name one of these fields, rather than a path inside one?
+def _is_structured_rejection(detail: str) -> bool:
+    """Does this 400 say the endpoint does not serve ``response_format``?
 
     The blunt half is :meth:`OpenAICompatProvider._negotiate`'s own argument: a
     server's sentence is the only signal this wire carries, so the markers are
     substrings and a false positive is a weaker request every endpoint accepts.
 
-    The sharp half is :data:`_FIELD_PATH_SEPARATORS`: a marker immediately
-    followed by ``.`` or ``[`` is the server *dereferencing* the field, which
-    means it accepted the field and is complaining about its contents. Those are
-    two opposite findings behind one substring, and only one of them is a
-    capability signal.
+    The sharp half is the reason words, not the punctuation that used to stand
+    in for them (:data:`_STRUCTURED_SCHEMA_FAULTS` against
+    :data:`_STRUCTURED_REJECTIONS`): a sentence saying the server *parsed the
+    field* and is validating what is inside it means it serves it, and the
+    fault is nodum's own schema — the opposite finding behind the same
+    substring, and only one of them is a capability signal. The sentence must
+    also name :data:`_STRUCTURED_FIELD`: a bare reason phrase is shared with
+    the thinking negotiation, and a sentence about a different field is not a
+    statement about this one.
 
-    A message that dereferences a marker *anywhere* is read as a validation
-    error, even if it also names it bare somewhere else. That is the
-    conservative side of the same one-sidedness — but **the cost is not one
-    refusal, it is one per call.** Returning ``False`` means nothing downgrades,
-    so ``_structured_mode`` is never lowered (it is only lowered where this
-    guard passes), and a provider cached for the life of the process re-sends
-    the same rejected envelope every time. For a genuine schema fault that is
-    exactly right: the loud failure is the fixable one. For a server whose real
-    capability rejection happens to carry a dotted or bracketed path it is
-    permanent, and that is the trade :data:`_FIELD_PATH_SEPARATORS` records —
+    A message carrying a schema-fault reason *anywhere* is read as a
+    validation error, even if it also names a capability reason somewhere
+    else. That is the conservative side of the same one-sidedness — but **the
+    cost is not one refusal, it is one per call.** Returning ``False`` means
+    nothing downgrades, so ``_structured_mode`` is never lowered (it is only
+    lowered where this guard passes), and a provider cached for the life of the
+    process re-sends the same rejected envelope every time. For a genuine
+    schema fault that is exactly right: the loud failure is the fixable one.
+    For a server whose real capability rejection happens to use words outside
+    both lists it is permanent, and that is the trade the two lists record —
     stated there and here in the same terms, because it was once stated in two
     places in two different ways.
     """
-    return any(
-        marker in detail
-        and not any(f"{marker}{separator}" in detail for separator in _FIELD_PATH_SEPARATORS)
-        for marker in markers
+    if any(fault in detail for fault in _STRUCTURED_SCHEMA_FAULTS):
+        return False
+    return _STRUCTURED_FIELD in detail and any(
+        marker in detail for marker in _STRUCTURED_REJECTIONS
     )
 
 
@@ -1414,9 +1433,7 @@ class OpenAICompatProvider:
         if getattr(failure, "status", None) != 400:
             return False
         detail = str(failure).casefold()
-        if self._structured_mode == STRUCTURED_JSON_SCHEMA and _names_field(
-            detail, _STRUCTURED_REJECTIONS
-        ):
+        if self._structured_mode == STRUCTURED_JSON_SCHEMA and _is_structured_rejection(detail):
             self._structured_mode = STRUCTURED_JSON_OBJECT
             return True
         if self._thinking_wire != _WIRE_ABSENT and any(
