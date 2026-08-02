@@ -29,7 +29,8 @@ from helpers import agent, owner
 from nodum import auth, consolidate, db, embeddings, service
 from nodum.store import GrantNotPermitted
 
-#: The labelled pairs the two cosine bars are set from (see their comments).
+#: The labelled pairs the two cosine bars are measured *against* — not set from,
+#: which is the distinction the reverted 0.72/0.38 pair was built on missing.
 CALIBRATION_FIXTURE = Path(__file__).parent / "fixtures" / "embedding_calibration.json"
 
 # ── Fixtures and helpers ──────────────────────────────────────────────────────
@@ -549,15 +550,22 @@ def test_the_calibration_fixture_covers_every_band_bilingually():
     assert max(widths) <= 90
 
 
-def test_neither_shipped_bar_can_fire_on_the_content_it_exists_to_catch():
-    """The open defect, pinned rather than left to a comment.
+def test_the_duplicate_bar_is_dead_and_the_link_bar_mislabels_duplicates():
+    """The open defect, pinned rather than left to a comment — and it is two
+    defects, not the one it was first written as.
 
-    Every labelled duplicate scores below the duplicate bar and every labelled
-    related pair below the link bar, so neither embedding signal can fire at
-    all: duplicate detection finds only duplicates already titled alike, which
-    is the one case the embedding signal was added to answer. The fix needs a
-    real corpus and belongs to its own cycle, and a constant nobody can see is
-    broken is a constant nobody fixes.
+    No labelled duplicate reaches the duplicate bar, so that signal cannot fire
+    at all. The link bar is not dead in the same way and the difference costs
+    more: no genuinely related pair reaches it either, but **most labelled
+    duplicates do**, because the duplicate band runs 0.763-0.929 straight
+    through it. So an embedding-driven ``relates_to`` proposal at these bars is
+    a near-duplicate wearing the wrong label, and the human rejecting it is
+    answering "not merely related", which is not the question the duplicate
+    signal would have asked.
+
+    The first version of this test asserted only the two "nothing fires" halves
+    while being named for a claim its body never checked — the anti-pattern this
+    file has the worst record on, caught here by the second review round.
 
     **This test is meant to die.** Re-tuning the bars on real content breaks it,
     and that failure is the reminder to delete it.
@@ -566,6 +574,13 @@ def test_neither_shipped_bar_can_fire_on_the_content_it_exists_to_catch():
 
     assert max(bands["duplicate"]) < consolidate.DUPLICATE_EMBEDDING_COSINE
     assert max(bands["related"]) < consolidate.LINK_EMBEDDING_COSINE
+    straddling = [
+        cosine for cosine in bands["duplicate"] if cosine >= consolidate.LINK_EMBEDDING_COSINE
+    ]
+    assert len(straddling) == 7, (
+        "the duplicate band straddles the link bar: these are proposed as "
+        "relates_to because the duplicate signal cannot reach them"
+    )
 
 
 def test_the_fixture_separates_its_own_bands_and_still_cannot_set_a_bar():

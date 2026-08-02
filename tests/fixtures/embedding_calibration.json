@@ -1,5 +1,5 @@
 {
-  "purpose": "Calibration set for the two cosine bars in nodum/consolidate.py (DUPLICATE_EMBEDDING_COSINE, LINK_EMBEDDING_COSINE). Every pair was labelled into a band by hand BEFORE any cosine was measured. Re-measure with scripts/measure_embedding_calibration.py after any change of model, of fastembed's pooling, or of CHUNK_WORDS, and re-tune the bars from the bands the new measurement produces.",
+  "purpose": "Drift set for the pinned embedding model, and the record of why the two cosine bars in nodum/consolidate.py cannot be set from it. Every pair was labelled into a band by hand BEFORE any cosine was measured. Re-measure with scripts/measure_embedding_calibration.py after any change of model, of fastembed's pooling, or of CHUNK_WORDS. DO NOT re-tune the bars from these bands: values derived that way (0.72, 0.38) were tried and reverted, because pairs written to demonstrate a separation cannot measure a false-positive rate. Setting a bar needs a real corpus scored for volume and precision.",
   "model": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
   "model_source": "qdrant/paraphrase-multilingual-MiniLM-L12-v2-onnx-Q",
   "dimensions": 384,

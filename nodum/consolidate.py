@@ -174,11 +174,18 @@ DUPLICATE_TITLE_RATIO = 0.95
 #:
 #: **KNOWN NOT TO FIRE, and deliberately left that way until it can be tuned on
 #: real content.** Both cosine bars were set before anyone had run the pinned
-#: model, and both sit above the band they exist to catch: at 0.93 the duplicate
-#: signal fires on 0 of 10 hand-labelled duplicates and at 0.80 the
-#: ``relates_to`` signal fires on 0 of 7 obviously related pairs. So duplicate
-#: detection finds only duplicates that are already titled alike — precisely the
-#: case the embedding signal was added to answer.
+#: model. At 0.93 this bar fires on **0 of 10** hand-labelled duplicates, so
+#: duplicate detection finds only duplicates already titled alike — precisely
+#: the case the embedding signal was added to answer.
+#:
+#: **The link bar is not dead in the same way, and the difference is the more
+#: expensive half.** At 0.80 it fires on 0 of 7 genuinely related pairs (the
+#: whole related band tops out at 0.587) but on **7 of those same 10
+#: duplicates**, whose band runs 0.763-0.929. So a near-duplicate worded
+#: differently is not missed — it is **mislabelled**, proposed as ``relates_to``
+#: by the weaker signal because the stronger one cannot reach it. Rejecting that
+#: proposal is the human saying "not merely related", which is not the same
+#: judgement as "not a duplicate", and nothing in the queue distinguishes them.
 #:
 #: Measured in ``tests/fixtures/embedding_calibration.json``: 29 bilingual FR+EN
 #: pairs, length-matched at 60-85 words a side, labelled by hand into four bands
@@ -187,11 +194,13 @@ DUPLICATE_TITLE_RATIO = 0.95
 #: unrelated -0.050-0.314.
 #:
 #: **Replacements derived from that fixture alone were tried and reverted.** 0.72
-#: and 0.38 separate the fixture's bands cleanly and still fail on real content:
-#: over a 200-node graph of real prose notes the link bar proposed 1 175
-#: ``relates_to`` edges — 5.9 per node, against 5 at 0.80 — and 35.2 % of all
-#: pairs in a homogeneous corpus clear 0.38. A hand-built set of 29 pairs cannot
-#: see that, because its pairs were chosen to demonstrate a separation.
+#: and 0.38 separate the fixture's bands cleanly and still fail on real content,
+#: measured on two corpora rather than one. Over a 200-node graph of real prose
+#: notes the link bar at 0.38 proposed **1 175** ``relates_to`` edges — 5.9 per
+#: node, against 5 at 0.80. Over 154 documents from a second, more homogeneous
+#: corpus, **35.2 % of all pairs** clear 0.38 (p99 = 0.694). A hand-built set of
+#: 29 pairs cannot see either number, because its pairs were chosen to
+#: demonstrate a separation, and a separation is not a false-positive rate.
 #:
 #: **So the replacements must come from a real corpus, measured for volume and
 #: precision rather than for separation**, with a test that embeds real text —
@@ -209,11 +218,15 @@ DUPLICATE_EMBEDDING_COSINE = 0.93
 #: Cosine bar for an inferred ``relates_to`` edge: "these are about the same
 #: area", not "these are the same thing".
 #:
-#: Shipped value, known not to fire — see :data:`DUPLICATE_EMBEDDING_COSINE` for
-#: the measurement, why the fixture-derived 0.38 was reverted, and what re-tuning
-#: it needs. Co-citation is the independent signal carrying this job meanwhile,
-#: which is why the graph still grows ``relates_to`` edges at a bar nothing
-#: clears.
+#: Shipped value — see :data:`DUPLICATE_EMBEDDING_COSINE` for the measurement,
+#: why the fixture-derived 0.38 was reverted, and what re-tuning needs.
+#:
+#: **It fires, but not on what it is named for.** No genuinely related pair in
+#: the fixture reaches it — the related band tops out at 0.587 — while 7 of 10
+#: labelled *duplicates* clear it. So every embedding-driven ``relates_to``
+#: proposal at this bar is a duplicate wearing the wrong label, and the pairs
+#: this bar exists to find come only from co-citation, which is independent of
+#: the cosine and is what keeps the job useful meanwhile.
 LINK_EMBEDDING_COSINE = 0.80
 
 #: How many neighbours two nodes must share before co-citation is evidence.
@@ -659,8 +672,18 @@ def _job_links(context: _Context) -> JobOutcome:
     embedding proximity (:data:`LINK_EMBEDDING_COSINE`) and co-citation — two
     nodes with at least :data:`MIN_SHARED_NEIGHBOURS` neighbours in common,
     hubs excluded. Pruning runs first so co-citation counts are not inflated by
-    duplicate edges. A pair the graph already connects, in any type and any
-    non-archived state, is never proposed.
+    duplicate edges.
+
+    **Two suppressions, and the second is what makes the queue finite.** A pair
+    the graph already connects, in any type and any non-archived state, is never
+    proposed — and neither is a pair carrying an *archived* ``relates_to``,
+    because archiving is what rejecting does, and a proposal the human has
+    already refused must not come back the next night. The second read is scoped
+    to ``relates_to`` alone, so a pair whose ``duplicate_of`` proposal was
+    rejected can still be proposed as merely related: refusing "these are the
+    same thing" is not refusing "these are about the same area". That conversion
+    happens once and then settles, since the new read holds the replacement
+    down.
     """
     outcome = JobOutcome(name=JOB_LINKS)
     nodes = context.nodes()

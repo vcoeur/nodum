@@ -2798,6 +2798,44 @@ def test_status_says_when_a_configured_key_is_being_withheld(fresh_db, monkeypat
     assert "sk-vendor-secret" not in status.api_key_withheld
 
 
+def test_a_probe_does_not_print_the_withheld_key_sentence_twice(fresh_db, monkeypatch):
+    """Two right decisions that collide on exactly one surface.
+
+    ``ProviderStatus`` carries the withheld-key sentence in its own field, and
+    the transport now appends it to a 401 so the failure explains itself
+    wherever it lands. Both are correct; on ``llm status --probe`` both are
+    true at once, and the first cut rendered the same 400-odd characters in
+    ``detail`` and in ``api_key_withheld``.
+
+    This is the suite's **first** test of the probe path, which is how the
+    duplication got through in the first place.
+    """
+    for name in (llm.ENV_MODEL, llm.ENV_BASE_URL, llm.ENV_API_KEY, llm.ENV_CONTEXT_TOKENS):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv(llm.ENV_MODEL, "deepseek-v4-flash-0711")
+    monkeypatch.setenv(llm.ENV_API_KEY, "sk-vendor-secret")
+    llm.reset_provider()
+
+    failure = urllib.error.HTTPError(
+        url="http://x/v1/chat/completions", code=401, msg="Unauthorized", hdrs=None, fp=None
+    )
+    failure.read = lambda: b'{"error":{"message":"authorization required"}}'  # type: ignore[method-assign]
+
+    def refuse(*_args, **_kwargs):
+        raise failure
+
+    monkeypatch.setattr(urllib.request, "urlopen", refuse)
+
+    status = answers.provider_status(principal=owner(), probe=True)
+
+    assert status.reachable is False
+    assert status.api_key_withheld is not None
+    assert status.detail is not None
+    assert "401" in status.detail, "detail still says what happened on this call"
+    assert status.api_key_withheld not in status.detail, "said once, in its own field"
+    assert "sk-vendor-secret" not in status.detail
+
+
 def test_status_says_nothing_when_the_key_is_going_where_it_was_configured(fresh_db, monkeypatch):
     """Non-vacuity: the field must be empty on the ordinary install, or it is
     a warning that fires every time and therefore says nothing."""

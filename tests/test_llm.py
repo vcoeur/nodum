@@ -2306,6 +2306,41 @@ def test_a_401_says_the_key_was_withheld_rather_than_leaving_it_to_llm_status(wi
     assert "sk-vendor-secret" not in str(raised.value), "still no secret in a message"
 
 
+@pytest.mark.parametrize(
+    ("code", "carries_reason"),
+    [(401, True), (403, True), (400, False), (404, False), (429, False), (500, False)],
+    ids=["401", "403", "400", "404", "429", "500"],
+)
+def test_only_an_auth_status_carries_the_withheld_key_sentence(
+    wire, monkeypatch, code: int, carries_reason: bool
+):
+    """The status gate is the part of that fix that keeps it honest.
+
+    Withholding the key explains a 401 and a 403 and nothing else. A 404 is the
+    measured commonest misconfiguration — an unknown model id — and hanging a
+    447-character paragraph about credentials off it sends the operator to the
+    wrong variable. Parametrised in both directions on purpose: widening the
+    gate to every status fails the four negatives, narrowing it to ``{401}``
+    fails the 403, and neither was caught by anything before this.
+    """
+    monkeypatch.setenv(llm.ENV_MODEL, "deepseek-v4-flash-0711")
+    monkeypatch.setenv(llm.ENV_API_KEY, "sk-vendor-secret")
+    failure = urllib.error.HTTPError(
+        url="http://x/v1/chat/completions", code=code, msg="nope", hdrs=None, fp=None
+    )
+    failure.read = lambda: b'{"error":{"message":"nope"}}'  # type: ignore[method-assign]
+    wire(raises=failure)
+    provider = llm.get_provider()
+    assert provider is not None
+    reason = llm.key_withheld_reason()
+    assert reason is not None, "fixture is not the withheld case"
+
+    with pytest.raises(llm.ProviderUnavailable) as raised:
+        provider.chat([llm.Message(role="user", content="hi")], max_output_tokens=8, timeout=5.0)
+
+    assert (reason in str(raised.value)) is carries_reason
+
+
 def test_a_bad_default_endpoint_is_not_blamed_on_a_variable_nobody_set(monkeypatch):
     """The refusal names whatever produced the URL, not always the env var.
 
@@ -2322,8 +2357,12 @@ def test_a_bad_default_endpoint_is_not_blamed_on_a_variable_nobody_set(monkeypat
     assert llm.get_provider() is None
     reason = llm.unavailable_reason()
     assert reason is not None
-    assert "the default endpoint" in reason
-    assert f"{llm.ENV_BASE_URL}='localhost" not in reason
+    # Read the whole sentence, not just the label: the first cut of this branch
+    # passed a substring check while rendering "Give it a full …" with nothing
+    # for "it" to refer to, and dropping the one variable the operator can set.
+    assert reason.startswith("the endpoint this resolved to, 'localhost/v1',")
+    assert f"{llm.ENV_BASE_URL}='localhost" not in reason, "not the operator's variable"
+    assert f"Override it with {llm.ENV_BASE_URL}" in reason, "must still name the way out"
 
 
 def test_no_key_configured_is_not_a_withheld_key(monkeypatch):

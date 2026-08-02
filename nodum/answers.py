@@ -2172,7 +2172,16 @@ def provider_status(*, principal: Principal, probe: bool = True) -> ProviderStat
         )
     except agent.ProviderUnavailable as exc:
         status.reachable = False
-        status.detail = _refusal_for(exc)
+        detail = _refusal_for(exc)
+        # `_post` appends the withheld-key sentence to a 401/403 so the failure
+        # explains itself wherever it surfaces — but this surface already
+        # carries that sentence in its own field, and printing both renders the
+        # same 400-odd characters twice. The structured field wins; `detail`
+        # keeps only what is about this call.
+        suffix = f". {status.api_key_withheld}"
+        if status.api_key_withheld and detail.endswith(suffix):
+            detail = detail[: -len(suffix)]
+        status.detail = detail
     except (agent.PromptTooLong, agent.BudgetExhausted) as exc:
         # Neither reached the wire, so neither says anything about the server.
         # `reachable` stays None rather than becoming False: this is a local

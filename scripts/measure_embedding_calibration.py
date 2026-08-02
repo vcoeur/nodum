@@ -1,11 +1,19 @@
 """Re-measure the embedding calibration fixture against the real model.
 
-The two cosine bars in :mod:`nodum.consolidate` are set from
-``tests/fixtures/embedding_calibration.json``: bilingual pairs labelled into
-four bands by hand, with the cosine the pinned model gives each one. Those
+``tests/fixtures/embedding_calibration.json`` holds bilingual pairs labelled
+into four bands by hand, with the cosine the pinned model gives each one. Those
 cosines are a property of the model, the pooling fastembed applies to it, and
 the chunking in :mod:`nodum.embeddings` — change any of the three and the bands
-move, which is what makes the bars re-tunable rather than folklore.
+move, which is why this script exists.
+
+**The two cosine bars in :mod:`nodum.consolidate` are NOT set from this file.**
+They are the shipped values; bars derived from these bands alone were tried at
+0.72/0.38 and reverted, because a set written to demonstrate a separation
+cannot measure a false-positive rate — on real content 0.38 proposed 5.9
+``relates_to`` edges per node. What this fixture is good for is detecting
+*drift*: whether the model still scores its own labelled pairs where it used
+to. Setting a bar needs a real corpus scored for volume and precision. See the
+comments on :data:`nodum.consolidate.DUPLICATE_EMBEDDING_COSINE`.
 
 Run it after such a change::
 
@@ -14,10 +22,10 @@ Run it after such a change::
 
 Without ``--write`` it only reports: the band table, where the current bars
 fall inside it, and any pair whose cosine has drifted from the recorded value.
-With ``--write`` it updates the recorded cosines in place, and the new band
-table is what the bars should then be re-derived from — the script deliberately
-does not pick thresholds for you, because the choice is a false-positive stance
-and not an optimisation.
+With ``--write`` it updates the recorded cosines in place. It deliberately does
+not pick thresholds, and the refreshed band table is **not** a licence to
+re-derive them from it — that is exactly the method that produced the reverted
+pair.
 
 Needs the ``embeddings`` extra and the model in the local cache (one-time
 ``NODUM_EMBED_DOWNLOAD=1``); it exits non-zero with the reason if either is
@@ -113,11 +121,19 @@ def main() -> int:
     weakest_duplicate = min(
         v for pair, v in zip(pairs, measured, strict=True) if pair["band"] == "duplicate"
     )
-    false_positive_margin = consolidate.DUPLICATE_EMBEDDING_COSINE - highest_non_duplicate
-    false_negative_margin = weakest_duplicate - consolidate.DUPLICATE_EMBEDDING_COSINE
+    above_negatives = consolidate.DUPLICATE_EMBEDDING_COSINE - highest_non_duplicate
+    below_positives = weakest_duplicate - consolidate.DUPLICATE_EMBEDDING_COSINE
+    # `below_positives` goes negative when the bar sits above the band it exists
+    # to catch, which is exactly where the shipped bar is. The wording has to
+    # follow the sign: written assuming the bar lands inside the gap, this line
+    # rendered "--0.167 below the weakest duplicate" for a bar 0.167 above it.
+    room = (
+        f"{below_positives:.3f} below the weakest duplicate"
+        if below_positives >= 0
+        else f"{-below_positives:.3f} ABOVE the weakest duplicate, so it cannot fire"
+    )
     print(
-        f"  duplicate bar margins: +{false_positive_margin:.3f} above the strongest "
-        f"non-duplicate, -{false_negative_margin:.3f} below the weakest duplicate"
+        f"  duplicate bar margins: {above_negatives:.3f} above the strongest non-duplicate, {room}"
     )
 
     if drifted:
@@ -133,7 +149,8 @@ def main() -> int:
         FIXTURE.write_text(json.dumps(document, indent=2, ensure_ascii=False) + "\n")
         print(f"\nwrote {FIXTURE}")
         print(
-            "re-derive the two bars from the band table above — see their comments for the stance"
+            "this refreshes drift only — do not re-derive the bars from these bands; "
+            "see their comments in nodum/consolidate.py"
         )
     return 1 if drifted and not arguments.write else 0
 

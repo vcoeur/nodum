@@ -750,19 +750,27 @@ commands on a saved node for exactly this reason.
   computed, and the cycle closes `failed` with all of it. Determinism is a
   rule here: no randomness, one clock captured when the cycle opens, and every
   pair, group and list ordered before it is written.
-  **Both cosine bars are measured, and both are known not to fire.** They stand
-  at 0.93 (duplicate) and 0.80 (`relates_to`) — above the bands they exist to
-  catch, so *neither* embedding signal can fire at all, and duplicate detection
-  finds only duplicates already titled alike: precisely the case the embedding
-  signal was added to answer. Measured in
-  `tests/fixtures/embedding_calibration.json`, 29 hand-labelled bilingual FR+EN
-  pairs held at equal length so length is not a variable between bands.
+  **Both cosine bars are measured, and neither does its job.** They stand at
+  0.93 (duplicate) and 0.80 (`relates_to`), measured against
+  `tests/fixtures/embedding_calibration.json` — 29 hand-labelled bilingual FR+EN
+  pairs held at equal length so length is not a variable between bands. The
+  duplicate bar is simply dead: **0 of 10** labelled duplicates reach it, so
+  duplicate detection finds only duplicates already titled alike, precisely the
+  case the embedding signal was added to answer. **The link bar is the more
+  expensive half, and it is not dead — it is wrong.** No genuinely related pair
+  reaches it (that band tops out at 0.587) but **7 of those same 10 duplicates
+  do**, because the duplicate band runs 0.763-0.929 straight through it. So a
+  near-duplicate worded differently is not missed, it is **mislabelled**: filed
+  as `relates_to` by the weaker signal because the stronger one cannot reach it,
+  and a human rejecting it answers "not merely related" rather than "not a
+  duplicate". Nothing in the queue distinguishes the two.
   **Replacements derived from that fixture alone (0.72 and 0.38) were tried and
   reverted**: they separate the fixture's bands cleanly and still fail on real
-  content, where the link bar proposed 1 175 `relates_to` edges over a 200-node
-  graph of real prose — 5.9 per node against 5 at 0.80 — and 35.2 % of all pairs
-  in a homogeneous corpus clear 0.38. A set written to demonstrate a separation
-  cannot measure a false-positive rate. So the replacements must come from a
+  content, measured on two corpora. Over a 200-node graph of real prose the link
+  bar at 0.38 proposed **1 175** `relates_to` edges, 5.9 per node against 5 at
+  0.80; over 154 documents of a second, more homogeneous corpus **35.2 % of all
+  pairs** clear 0.38. A set written to demonstrate a separation cannot measure a
+  false-positive rate. So the replacements must come from a
   real corpus, scored for volume and precision rather than separation, with a
   test that embeds real text; that is its own cycle and it must land before the
   abstraction job, whose cohesion criterion reads the same vectors.

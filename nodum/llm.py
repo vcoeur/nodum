@@ -987,9 +987,16 @@ def _names_field(detail: str, markers: Sequence[str]) -> bool:
 
     A message that dereferences a marker *anywhere* is read as a validation
     error, even if it also names it bare somewhere else. That is the
-    conservative side of the same one-sidedness: the cost is one
-    :class:`ProviderUnavailable` reaching the caller, which is what would have
-    happened with no negotiation at all.
+    conservative side of the same one-sidedness — but **the cost is not one
+    refusal, it is one per call.** Returning ``False`` means nothing downgrades,
+    so ``_structured_mode`` is never lowered (it is only lowered where this
+    guard passes), and a provider cached for the life of the process re-sends
+    the same rejected envelope every time. For a genuine schema fault that is
+    exactly right: the loud failure is the fixable one. For a server whose real
+    capability rejection happens to carry a dotted or bracketed path it is
+    permanent, and that is the trade :data:`_FIELD_PATH_SEPARATORS` records —
+    stated there and here in the same terms, because it was once stated in two
+    places in two different ways.
     """
     return any(
         marker in detail
@@ -1738,19 +1745,23 @@ def _resolve_default() -> tuple[LLMProvider | None, str | None, str | None]:
                 # Attribute the URL to whatever actually produced it. Only
                 # `configured_base` came from the operator; naming ENV_BASE_URL
                 # for a profile's URL or the shipped default would send them to
-                # edit a variable they never set. Unreachable while both shipped
-                # constants parse — which is exactly how long a wrong sentence
-                # here would go unnoticed, so it is written right rather than
-                # argued away.
-                f"{ENV_BASE_URL}={base_url!r}"
+                # edit a variable they never set. But **both branches still name
+                # ENV_BASE_URL as the way out**, because when the bad URL is one
+                # of ours the operator cannot edit it — overriding is their only
+                # move, and the first cut of this branch dropped that name and
+                # left "Give it" with nothing to refer to. Unreachable while both
+                # shipped constants parse, which is exactly how long a wrong
+                # sentence here would go unnoticed.
+                f"{ENV_BASE_URL}={base_url!r} is not a URL this can POST to ({problem}). "
+                f"Set it to a full OpenAI-compatible root, scheme included"
                 if configured_base is not None
-                else f"the default endpoint {base_url!r}"
+                else (
+                    f"the endpoint this resolved to, {base_url!r}, is not a URL it can POST to "
+                    f"({problem}). Override it with {ENV_BASE_URL}, set to a full "
+                    f"OpenAI-compatible root, scheme included"
+                )
             )
-            + (
-                f" is not a URL this can POST to ({problem}). "
-                f"Give it a full OpenAI-compatible root, scheme included — for example "
-                f"{DEFAULT_BASE_URL} or {DEEPSEEK_BASE_URL}"
-            ),
+            + f" — for example {DEFAULT_BASE_URL} or {DEEPSEEK_BASE_URL}",
             None,
         )
     api_key = (os.environ.get(ENV_API_KEY) or "").strip() or None
