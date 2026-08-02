@@ -1,7 +1,9 @@
 """The consolidation runner: the deterministic jobs and the coherence metrics.
 
 Phase 5a, the near side of the LLM line (design §8.4/§8.5). What is tested here
-is the half of the gardener that is arithmetic: four jobs, five metrics, one
+is the half of the gardener that is arithmetic: four deterministic jobs, the
+abstraction job's deterministic selection (5b-ii's first LLM job — the model
+writes the text and never decides *whether* to synthesize), five metrics, one
 cycle around all of it, and the rails that keep the internal agent a *peer
 client* — every write through the public service API, every event stamped with
 the cycle, every one of them attributed to ``agent:builtin-gardener``.
@@ -1683,12 +1685,153 @@ def test_no_job_at_all_still_produces_a_metrics_snapshot(fresh_db):
     assert set(report.metrics) == {"before", "after"}
 
 
+# ── The abstraction job's deterministic half (5b-ii: gates only, no model) ────
+
+
+def _relates(first, second):
+    """An active ``relates_to`` edge between two nodes, by id."""
+    return service.create_edge(first, second, consolidate.RELATED_EDGE_TYPE, principal=owner())
+
+
+def _abstraction_outcome(report):
+    return _outcome(report, consolidate.JOB_ABSTRACTION)
+
+
+def test_abstraction_needs_a_provider_and_says_so(fresh_db):
+    """Cohesion is the job's one vector signal, so there is no degraded mode.
+
+    The other jobs fall back to a deterministic half when the embedding provider
+    is absent; this job has none — a dense, sized, fresh cluster exists and the
+    cohesion gate simply cannot be computed, so the job no-ops and says so,
+    exactly like their degraded postures report their own absence.
+    """
+    first, second, third = _node("Alpha"), _node("Beta"), _node("Gamma")
+    _relates(first.id, second.id)
+    _relates(second.id, third.id)
+    _relates(third.id, first.id)
+
+    outcome = _abstraction_outcome(_run(jobs=[consolidate.JOB_ABSTRACTION]).report)
+
+    assert outcome.error is None
+    assert outcome.proposed == []
+    assert any("no embedding provider" in note for note in outcome.notes)
+    assert any("did not run" in note for note in outcome.notes)
+
+
+def test_a_dense_sized_fresh_cluster_is_eligible(fresh_db):
+    """One cycle's worth of edges and one shared area make a synthesis candidate."""
+    _place(Alpha=0.0, Beta=1.0, Gamma=2.0)
+    first, second, third = (
+        _node("Alpha one"),
+        _node("Alpha two"),
+        _node("Alpha three"),
+    )
+    _relates(first.id, second.id)
+    _relates(second.id, third.id)
+    _relates(third.id, first.id)
+
+    outcome = _abstraction_outcome(_run(jobs=[consolidate.JOB_ABSTRACTION]).report)
+
+    assert outcome.detail["clusters_eligible"] == 1
+    assert outcome.detail["clusters_considered"] == 1
+    assert outcome.detail["eligible_clusters"] == [sorted([first.id, second.id, third.id])]
+    assert outcome.skipped == []
+
+
+def test_a_chain_is_not_dense(fresh_db):
+    """Four members in a line have three edges — average degree below 2.
+
+    The vectors are cohesive and the size gate passes, so it is the graph half
+    of the density gate and only that half that refuses the cluster.
+    """
+    _place(Alpha=0.0)
+    first, second, third, fourth = (
+        _node("Alpha one"),
+        _node("Alpha two"),
+        _node("Alpha three"),
+        _node("Alpha four"),
+    )
+    _relates(first.id, second.id)
+    _relates(second.id, third.id)
+    _relates(third.id, fourth.id)
+
+    outcome = _abstraction_outcome(_run(jobs=[consolidate.JOB_ABSTRACTION]).report)
+
+    assert outcome.detail["clusters_eligible"] == 0
+    (skip,) = outcome.skipped
+    assert skip["id"] == ",".join(sorted([first.id, second.id, third.id, fourth.id]))
+    assert "not dense" in skip["reason"]
+
+
+def test_a_synthesized_member_is_not_resynthesized(fresh_db):
+    """Both halves of the freshness gate: the member's own flag, or a
+    ``derived_from`` edge from a synthesized node."""
+    _place(Alpha=0.0)
+    flagged = _node("Alpha one", props={"synthesized": True})
+    second, third = _node("Alpha two"), _node("Alpha three")
+    _relates(flagged.id, second.id)
+    _relates(second.id, third.id)
+    _relates(third.id, flagged.id)
+
+    ancestor = _node("Beta one", props={"synthesized": True})
+    member, other = _node("Beta two"), _node("Beta three")
+    _relates(member.id, other.id)
+    _relates(other.id, ancestor.id)
+    _relates(ancestor.id, member.id)
+    service.create_edge(
+        ancestor.id, member.id, consolidate.DERIVED_FROM_EDGE_TYPE, principal=owner()
+    )
+
+    outcome = _abstraction_outcome(_run(jobs=[consolidate.JOB_ABSTRACTION]).report)
+
+    assert outcome.detail["clusters_eligible"] == 0
+    assert sorted(skip["reason"] for skip in outcome.skipped) == [
+        "member is already part of a synthesis",
+        "member is already part of a synthesis",
+    ]
+
+
+def test_an_over_cap_graph_reports_the_overflow(fresh_db, monkeypatch):
+    """Eligible clusters beyond the per-cycle cap are reported, never dropped."""
+    monkeypatch.setattr(consolidate, "MAX_CLUSTERS_PER_CYCLE", 2)
+    _place(Alpha=0.0, Beta=1.0, Gamma=2.0)
+    for marker in ("Alpha", "Beta", "Gamma"):
+        first, second, third = (
+            _node(f"{marker} one"),
+            _node(f"{marker} two"),
+            _node(f"{marker} three"),
+        )
+        _relates(first.id, second.id)
+        _relates(second.id, third.id)
+        _relates(third.id, first.id)
+
+    outcome = _abstraction_outcome(_run(jobs=[consolidate.JOB_ABSTRACTION]).report)
+
+    assert outcome.detail["clusters_eligible"] == 3
+    assert outcome.detail["clusters_considered"] == 2
+    assert any("cap" in note for note in outcome.notes)
+
+
+def test_a_sized_cluster_below_the_minimum_is_skipped(fresh_db):
+    """A pair is a link, not a synthesis — the size gate fires before any model call."""
+    first, second = _node("Alpha one"), _node("Alpha two")
+    _relates(first.id, second.id)
+
+    outcome = _abstraction_outcome(_run(jobs=[consolidate.JOB_ABSTRACTION]).report)
+
+    assert outcome.detail["clusters_eligible"] == 0
+    (skip,) = outcome.skipped
+    assert "below the" in skip["reason"]
+
+
 # ── The structural rail: no service-layer bypass ─────────────────────────────
 
 
 #: Everything :mod:`nodum.consolidate` is allowed to import out of the package.
-#: A new entry here is a decision somebody has to make on purpose.
+#: A new entry here is a decision somebody has to make on purpose. ``nodum.agent``
+#: joined with the abstraction job — the model call goes through its one door.
 ALLOWED_NODUM_IMPORTS = {
+    "nodum.agent",
     "nodum.auth",
     "nodum.embeddings",
     "nodum.migrations",
@@ -1792,32 +1935,71 @@ def test_the_deterministic_runner_consults_no_stop_switch_and_the_copy_says_so(
 
     ``nodum cycle-stop`` and ``POST /api/cycles/{id}/stop`` record an instruction
     the *run* is supposed to notice, and the only thing that notices one today is
-    :meth:`nodum.agent.AgentRun.chat`, before a provider call. These four jobs
-    make no provider call and no stop check — the jobs that check between jobs
-    and between items are 5b-ii's — so a stop asked for during a deterministic
-    cycle is recorded and that run finishes. Every surface says exactly that, and
-    this is what keeps the sentence honest: when 5b-ii wires a check in here, this
-    test fails and the copy it names has to be rewritten rather than quietly
-    becoming an understatement.
+    :meth:`nodum.agent.AgentRun.chat`, before a provider call. The four
+    **deterministic** jobs make no provider call and no stop check — so a stop
+    asked for during one of their runs is recorded and that run finishes. The
+    abstraction job (5b-ii's first) is the deliberate exception, and it is the
+    thing the copy now names: it reaches the model through ``AgentRun.chat``,
+    which is the stop check. Every surface says exactly that, and this is what
+    keeps the sentence honest: a stop-consulting call that lands in a
+    deterministic job fails this test, and the copy it names has to be rewritten
+    rather than quietly becoming an understatement.
 
     Both halves are asserted, because neither alone is the claim. The AST half
-    catches a check added anywhere in the module; the behavioural half proves the
-    run really does complete, since a check could be added through a helper this
-    file does not name.
+    confines every stop-consulting call site to the abstraction job's own
+    function; the behavioural half proves the run really does complete, since a
+    check could be added through a helper this file does not name.
     """
-    reached = {
-        node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", "")
-        for node in ast.walk(_module_ast())
+    module = _module_ast()
+    abstraction = next(
+        node
+        for node in module.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_job_abstraction"
+    )
+
+    def inside_abstraction(node: ast.AST) -> bool:
+        return abstraction.lineno <= node.lineno <= (abstraction.end_lineno or abstraction.lineno)
+
+    # Every call that consults the switch — the service read itself, the wiring
+    # helper, the runtime's own check, the runtime's construction, and the one
+    # door that checks first — must live inside the abstraction job. The
+    # `agent.prompt_version` module-level constant is excluded from the `agent`
+    # use check below: it is computed once at import time from the template
+    # string and consults nothing.
+    consulting = {"stop_requested", "cycle_stop_check", "check_stop", "for_cycle", "chat"}
+    offside = [
+        node
+        for node in ast.walk(module)
         if isinstance(node, ast.Call)
-    }
-    assert "stop_requested" not in reached
-    assert "cycle_stop_check" not in reached
-    assert "check_stop" not in reached
-    assert "nodum.agent" not in _imported_modules()
+        and (
+            node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", "")
+        )
+        in consulting
+        and not inside_abstraction(node)
+    ]
+    assert offside == [], (
+        "a stop-consulting call sits outside the abstraction job: "
+        f"{[ast.unparse(call) for call in offside]}"
+    )
+
+    agent_uses = [
+        node
+        for node in ast.walk(module)
+        if isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "agent"
+        and node.attr != "prompt_version"
+    ]
+    offside_uses = [use for use in agent_uses if not inside_abstraction(use)]
+    assert offside_uses == [], (
+        f"`agent` is used outside the abstraction job: {[ast.unparse(use) for use in offside_uses]}"
+    )
 
     # And in the run itself. The switch is hit from *inside* the cycle — the
     # only moment anybody hits one — by a job standing where the real first job
-    # stands, and every job after it still runs to completion.
+    # stands, and every job after it still runs to completion. The abstraction
+    # job is in that list: with no provider and no budget it no-ops, so a run
+    # containing it completes exactly as a deterministic one does.
     human = owner()
 
     def stopper(context):

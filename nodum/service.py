@@ -4809,8 +4809,9 @@ def request_stop(
     AgentRun.chat`, immediately before a provider call. The four deterministic
     jobs in :mod:`nodum.consolidate` make no provider call and read this switch
     nowhere, so a stop recorded against one of those runs is kept on the row and
-    the run finishes — the between-jobs and between-items checks belong to the
-    LLM jobs 5b-ii lands on that runtime. Every human surface says so rather than
+    the run finishes — the abstraction job (5b-ii's first) is the exception: it
+    reaches the model through ``AgentRun.chat``, so it obeys a stop recorded
+    against its own run. Every human surface says so rather than
     promising a wind-down that would not arrive, and
     ``test_the_deterministic_runner_consults_no_stop_switch_and_the_copy_says_so``
     is what makes that copy fail when it stops being true.
