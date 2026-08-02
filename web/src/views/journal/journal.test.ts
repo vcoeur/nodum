@@ -72,6 +72,7 @@ import {
   metricRows,
   nameIdsIn,
   noMetricsNote,
+  readAcceptance,
   readConsolidationReport,
   readOperationReport,
   referencedNodeIds,
@@ -365,6 +366,30 @@ describe("readConsolidationReport", () => {
   });
 });
 
+describe("readAcceptance", () => {
+  it("reads the curation job's per-(proposer, type) rates", () => {
+    const detail: JsonObject = {
+      acceptance: [
+        { proposer: "agent:researcher", kind: "edge", type: "supports", accepted: 2, rejected: 1, rate: 0.666667 },
+      ],
+    };
+    expect(readAcceptance(detail)).toEqual([
+      { proposer: "agent:researcher", kind: "edge", type: "supports", accepted: 2, rejected: 1, rate: 0.666667 },
+    ]);
+  });
+
+  it("is empty for a job that carried no acceptance list", () => {
+    // A cycle that ran no curation job — or one whose scan found no history —
+    // has no `acceptance` key at all, and a malformed row must be dropped
+    // rather than thrown, exactly as the rest of this untyped wire is read.
+    expect(readAcceptance({})).toEqual([]);
+    expect(readAcceptance({ acceptance: [{ proposer: "agent:researcher", rate: "half" }, null] })).toEqual(
+      [],
+    );
+    expect(readAcceptance(null)).toEqual([]);
+  });
+});
+
 describe("readOperationReport", () => {
   it("reads a one-op report by its name", () => {
     const parsed = readOperationReport({ op: "rollback_cycle", rolled_back: "abc", reversed: 3 });
@@ -444,6 +469,35 @@ describe("cycleWork", () => {
     const neglect = [job("neglect_report", { detail: { neglected_count: 7, threshold_days: 90 } })];
     expect(cycleWork(cycle({ report: report(neglect) }))).toBe(
       "Noted 7 nodes untouched for 90 days.",
+    );
+  });
+
+  it("says what the curation job learned and annotated", () => {
+    // Convention nodes are proposals (they land in `proposed`); annotations
+    // are rows on the annotations table, so their count comes from the job's
+    // `detail` in both modes — the same shape on a rehearsal, whose lists are
+    // empty by construction.
+    const curated = [
+      job("curation", {
+        proposed: ids(1),
+        detail: { acceptance: [], annotations: ["a1"], conventions: [] },
+      }),
+    ];
+    expect(cycleWork(cycle({ report: report(curated) }))).toBe(
+      "Learned 1 acceptance convention and annotated 1 queue item.",
+    );
+    const rehearsed = [
+      job("curation", {
+        proposed: [],
+        detail: {
+          acceptance: [],
+          annotations: [{ kind: "edge", id: EDGE_ID, rate: 0.666667, dry_run: true }],
+          conventions: [{ node: null, proposer: "agent:researcher", edge_type: "supports", rate: 0.666667 }],
+        },
+      }),
+    ];
+    expect(cycleWork(cycle({ dry_run: true, report: report(rehearsed, { dry_run: true }) }))).toBe(
+      "Would have learned 1 acceptance convention and annotated 1 queue item.",
     );
   });
 
