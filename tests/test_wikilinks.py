@@ -152,6 +152,52 @@ def test_agent_create_materializes_a_proposed_edge(fresh_db):
     assert service.get_neighborhood(target.id, depth=1, principal=owner()).edges == []
 
 
+def test_an_edit_grant_filing_a_node_proposed_files_its_links_proposed_too(fresh_db):
+    """The landing seam reaches the wikilinks: a `proposed` filing files its
+    mentions `proposed` too, so rejecting the node leaves no live edge."""
+    curator = agent("curator", grants={"meta": "read", "main": "edit"})
+    target = service.create_node(type="concept", title="Target", principal=owner())
+    source = service.create_node(
+        type="note", title="S", content="See [[Target]].", landing="proposed", principal=curator
+    )
+    assert source.state == "proposed"
+    (edge,) = service.list_edges(
+        node_id=source.id, type="mentions", state="proposed", principal=owner()
+    )
+    assert edge.dst_id == target.id
+    # Rejection leaves no live edge — the mention stays `proposed` in the
+    # queue, never `active`.
+    service.reject_proposals([source.id], reason="not wanted", principal=owner())
+    assert _mentions(source.id) == []
+
+
+def test_an_edit_grant_filing_active_keeps_links_live(fresh_db):
+    """`landing="active"` on an edit grant is the normal path, unchanged: node
+    and mentions both land live (the ceiling never lowers it by accident)."""
+    curator = agent("curator", grants={"meta": "read", "main": "edit"})
+    target = service.create_node(type="concept", title="Target", principal=owner())
+    source = service.create_node(
+        type="note", title="S", content="See [[Target]].", landing="active", principal=curator
+    )
+    assert source.state == "active"
+    (edge,) = _mentions(source.id)
+    assert edge.dst_id == target.id
+
+
+def test_a_suggest_grant_filing_proposed_keeps_links_proposed(fresh_db):
+    """The threading must not widen the suggest path: a suggest-grant writer
+    filing `proposed` still files its mentions `proposed`, not live."""
+    proposer = agent("proposer")  # default grants: meta read, main suggest
+    target = service.create_node(type="concept", title="Target", principal=owner())
+    source = service.create_node(
+        type="note", title="S", content="See [[Target]].", landing="proposed", principal=proposer
+    )
+    assert source.state == "proposed"
+    (edge,) = _mentions_in(source.id, "proposed")
+    assert edge.dst_id == target.id
+    assert _mentions_in(source.id, "active") == []
+
+
 def test_agent_mentions_edge_is_a_propose_event(fresh_db):
     service.create_node(type="concept", title="C", principal=owner())
     service.create_node(type="note", title="S", content="[[C]]", principal=agent(AGENT))

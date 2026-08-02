@@ -776,6 +776,7 @@ def _materialize_mentions(
     actor: str,
     store: Store,
     cycle_id: str | None = None,
+    landing: str | None = None,
 ) -> None:
     """Sync a node's ``[[wikilinks]]`` with its pending/active ``mentions`` edges.
 
@@ -786,9 +787,13 @@ def _materialize_mentions(
     A materialised edge lands in the state the writer's grants allow on both
     endpoint spaces (``active`` on edit, ``proposed`` on suggest); a target
     the writer may not link to — unreadable, or under-granted — is skipped
-    rather than failing the write (:func:`Store.edge_landing_state`). A
-    pending edge goes live when a reviewer accepts the proposing node
-    (:func:`_activate_pending_mentions`) or the edge itself.
+    rather than failing the write (:func:`Store.edge_landing_state`). The
+    caller's own ``landing`` ceiling is applied on top
+    (:func:`Store.cap_landing`), so a writer filing a node ``proposed`` files
+    its mentions ``proposed`` too — the node and its links wait in review
+    together; accepting the node sweeps the links live, rejecting it leaves
+    none. A pending edge goes live when a reviewer accepts the proposing
+    node (:func:`_activate_pending_mentions`) or the edge itself.
 
     **Archival is authority-gated the same way** (Q13 review B2): an existing
     edge is only retired when the writer holds ``edit`` on *both* endpoint
@@ -804,7 +809,7 @@ def _materialize_mentions(
     node = dict(node_row)
     targets = set(WIKILINK_RE.findall(node["content"] or ""))
     resolved: set[str] = set()
-    landing: dict[str, str] = {}
+    edge_landing: dict[str, str] = {}
     for target in targets:
         dst = _resolve_wikilink(conn, target, store)
         if dst is None or dst == node["id"]:
@@ -813,7 +818,9 @@ def _materialize_mentions(
             "space_id"
         ]
         try:
-            landing[dst] = store.edge_landing_state(node["space_id"], dst_space, META_SPACE_ID)
+            edge_landing[dst] = store.edge_landing_state(
+                node["space_id"], dst_space, META_SPACE_ID, landing
+            )
         except GrantNotPermitted:
             continue  # no grant to link there — the wikilink is skipped, not fatal
         resolved.add(dst)
@@ -836,7 +843,7 @@ def _materialize_mentions(
             props={},
             confidence=None,
             actor=actor,
-            state=landing[dst_id],
+            state=edge_landing[dst_id],
             cycle_id=cycle_id,
         )
     for dst_id, edge in current_by_dst.items():
@@ -1109,7 +1116,7 @@ def create_node(
         node = _row_dict(_get_node_row(conn, node_id))
         seq = _emit(conn, actor, f"node.{_create_op(state)}", {"before": None, "after": node})
         _write_version(conn, node, actor, seq)
-        _materialize_mentions(conn, node, actor, store)
+        _materialize_mentions(conn, node, actor, store, landing=landing)
         conn.commit()
         return _node_out(node)
     finally:
