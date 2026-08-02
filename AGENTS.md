@@ -1227,9 +1227,13 @@ commands on a saved node for exactly this reason.
   (`base_url_problem`). A missing scheme is **never guessed back in**: choosing
   `http` or `https` decides whether the API key crosses the network in clear
   text, and that is not a decision to make from four characters that are not
-  there. `profile_for`'s `_hostname` stays forgiving, deliberately — it reads a
-  host out of a spelling nothing can POST to so the refusal can name the
-  endpoint.
+  there. A **wrong** scheme is refused the same way, like a scheme-less one:
+  urllib accepts `localhost:11434/v1` (urlsplit reads `localhost` as a scheme)
+  and the registered `ftp`/`file` types, so once the constructor succeeds the
+  parsed scheme must still be `http` or `https` — anything else is no provider
+  with a reason at resolution. `profile_for`'s `_hostname` stays forgiving,
+  deliberately — it reads a host out of a spelling nothing can POST to so the
+  refusal can name the endpoint.
 - **A model name may not move a *credential* either.** `_post` attached
   `NODUM_LLM_API_KEY` unconditionally, so a hosted model id nobody profiled (a
   typo, a newer id) resolved to `DEFAULT_BASE_URL` and sent the vendor's bearer
@@ -1263,12 +1267,16 @@ commands on a saved node for exactly this reason.
   matching is on the server's sentence, which is brittle **one-sidedly** — a
   false positive is a weaker request every endpoint accepts, named in `llm
   status`, and a false negative is exactly today's `ProviderUnavailable`.
-  The **one sharpening** of that matcher: a marker immediately followed by `.`
-  or `[` is not a capability signal. A 400 reading
-  `Invalid schema for response_format.schema.properties[0]` means the server
+  The **one sharpening** of that matcher is reason words, not the punctuation
+  that used to stand in for them: `Invalid schema for` means the server
   *parsed* `response_format` and is validating what is inside it, which proves
-  it serves the field and that the fault is nodum's own schema — downgrading
-  there trades a loud fixable error for an envelope quietly weakened for the
+  it serves the field and that the fault is nodum's own schema — never
+  downgrade there. `is unavailable` / `not supported` naming `response_format`
+  mean a genuine capability rejection, which does downgrade; a dotted or
+  bracketed field path alone decides neither way. A message naming both a
+  schema fault and a rejection word is read as a validation error — the
+  conservative side, where a false negative is exactly today's
+  `ProviderUnavailable` and a false positive weakens every request for the
   life of the process. `_THINKING_REJECTIONS` deliberately keeps plain substring
   matching, because two of its three markers are sentences a server says
   (`does not support thinking`) rather than field names, and the guard would
@@ -2990,9 +2998,11 @@ Phase-1 decision log.
   `structured_output` because the argument for leaving it stale — "the probe
   sends no schema, so that branch is unreachable" — was about the **request**
   while `_negotiate` decides on the **response**, and never asks whether a
-  schema was sent. Any 400 whose body names `response_format` downgrades the
-  belief, a gateway can answer that to a schema-less request, and the demotion
-  then lasts the life of the process because the provider is cached. The visible
+  schema was sent. Any 400 whose body names `response_format` **and a reason
+  word** (`is unavailable` / `not supported` — the field name alone does not
+  downgrade) demotes the belief, a gateway can answer that to a schema-less
+  request, and the demotion then lasts the life of the process because the
+  provider is cached. The visible
   failure was one status payload reporting `structured_output: "json_schema"`
   directly above a `used.structured_mode` of `"json_object"`, with every later
   `/ask` in that `nodum serve` running under the weaker envelope. **An

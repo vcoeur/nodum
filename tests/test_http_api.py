@@ -2416,6 +2416,153 @@ def test_a_capability_url_is_the_one_write_a_cross_origin_page_may_reach(client,
     assert refused.json()["error"]["type"] == "CrossOriginRequest"
 
 
+def test_upload_original_does_not_ingest_when_disconnected(client, fresh_db):
+    """A client that hangs up mid-upload spends the token and changes nothing.
+
+    The token is spent by the attempt — ``urls.consume`` runs first, by design
+    — but ingestion is the step that writes, and it must not run for a client
+    nobody is listening to: the bytes would become an asset and a subgraph
+    while the one party that could read the outcome is gone, and the retry
+    (which has to re-mint anyway) would find its document already described.
+
+    The disconnect is driven for real, not monkeypatched: the app is called
+    the way the ASGI server calls it, with a receive channel whose last
+    message is ``http.disconnect`` — exactly what Starlette's
+    ``Request.is_disconnected`` reads. Under the ``httpx.ASGITransport`` the
+    rest of this file drives, the disconnect is not expressible: its
+    ``receive`` only answers with body chunks and then waits for the response,
+    so this one test drives the app directly.
+    """
+    payload = b"Vercingetorix basin hydrology"
+    grant = _mint_upload(client, "hydrology.txt", len(payload))["grant"]
+
+    sent: list[dict] = []
+    messages = iter(
+        [
+            {"type": "http.request", "body": payload, "more_body": True},
+            {"type": "http.request", "body": b"", "more_body": False},
+            {"type": "http.disconnect"},
+        ]
+    )
+
+    async def receive() -> dict:
+        return next(messages)
+
+    async def send(message: dict) -> None:
+        sent.append(message)
+
+    async def run() -> None:
+        await client.app(
+            {
+                "type": "http",
+                "asgi": {"version": "3.0"},
+                "http_version": "1.1",
+                "method": "PUT",
+                "scheme": "http",
+                "path": f"/api/uploads/{grant['token']}",
+                "raw_path": f"/api/uploads/{grant['token']}".encode(),
+                "query_string": b"",
+                "headers": [
+                    (b"host", b"127.0.0.1:8600"),
+                    (b"content-length", str(len(payload)).encode()),
+                ],
+                "server": ("127.0.0.1", 8600),
+                "client": ("127.0.0.1", 12345),
+                "root_path": "",
+            },
+            receive,
+            send,
+        )
+
+    asyncio.run(run())
+
+    status = next(message["status"] for message in sent if message["type"] == "http.response.start")
+    assert status == 499, sent
+    # The token is spent by the attempt: putting the same URL again is refused.
+    again = Client(client.app).put(grant["url"], guard=False, content=payload)
+    assert again.status_code == 400, again.text
+    assert again.json()["error"]["type"] == "TokenInvalid"
+    # And nothing was ingested: no asset, no describing node, no edges.
+    assert assets.list_assets(principal=owner()) == []
+    assert service.list_nodes(type="source", principal=owner()) == []
+    assert service.list_edges(principal=owner()) == []
+
+
+def test_upload_original_does_not_ingest_when_disconnected_before_the_pipeline(client, fresh_db):
+    """The second disconnect check is pinned: a client that vanishes during
+    the type sniff spends the token and changes nothing.
+
+    The route checks :meth:`Request.is_disconnected` twice — once the body
+    stream has finished, and once more before
+    :func:`nodum.ingest.ingest_upload`, because the type policy between them
+    reads and analyses the file and a client can vanish during that window.
+    The test above delivers the disconnect as the third receive message, so
+    the *first* check consumes it and never proves the second one exists.
+    This variant delivers it as the fourth: the third message stands for the
+    channel when the first check runs (a client still there — Starlette's
+    ``is_disconnected`` discards any non-disconnect message), and the
+    disconnect arrives only after the sniff, so the second check is the one
+    that has to catch it. Removing that check leaves this test red: the
+    ingest would run for nobody and the graph would be written.
+    """
+    payload = b"Vercingetorix basin hydrology"
+    grant = _mint_upload(client, "hydrology.txt", len(payload))["grant"]
+
+    sent: list[dict] = []
+    messages = iter(
+        [
+            {"type": "http.request", "body": payload, "more_body": True},
+            {"type": "http.request", "body": b"", "more_body": False},
+            # What the first check sees: a client still talking, not a
+            # disconnect. Consumed and discarded by ``is_disconnected``.
+            {"type": "http.request", "body": b"", "more_body": False},
+            {"type": "http.disconnect"},
+        ]
+    )
+
+    async def receive() -> dict:
+        return next(messages)
+
+    async def send(message: dict) -> None:
+        sent.append(message)
+
+    async def run() -> None:
+        await client.app(
+            {
+                "type": "http",
+                "asgi": {"version": "3.0"},
+                "http_version": "1.1",
+                "method": "PUT",
+                "scheme": "http",
+                "path": f"/api/uploads/{grant['token']}",
+                "raw_path": f"/api/uploads/{grant['token']}".encode(),
+                "query_string": b"",
+                "headers": [
+                    (b"host", b"127.0.0.1:8600"),
+                    (b"content-length", str(len(payload)).encode()),
+                ],
+                "server": ("127.0.0.1", 8600),
+                "client": ("127.0.0.1", 12345),
+                "root_path": "",
+            },
+            receive,
+            send,
+        )
+
+    asyncio.run(run())
+
+    status = next(message["status"] for message in sent if message["type"] == "http.response.start")
+    assert status == 499, sent
+    # The token is spent by the attempt: putting the same URL again is refused.
+    again = Client(client.app).put(grant["url"], guard=False, content=payload)
+    assert again.status_code == 400, again.text
+    assert again.json()["error"]["type"] == "TokenInvalid"
+    # And nothing was ingested: no asset, no describing node, no edges.
+    assert assets.list_assets(principal=owner()) == []
+    assert service.list_nodes(type="source", principal=owner()) == []
+    assert service.list_edges(principal=owner()) == []
+
+
 def test_an_upload_request_that_declares_nonsense_is_a_400_not_a_500(client, fresh_db):
     """The body's three required fields, and the two optional ones, are typed.
 

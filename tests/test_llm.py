@@ -1949,22 +1949,27 @@ def test_a_base_url_that_does_not_parse_is_a_stranger_and_not_a_traceback(monkey
     [
         ("api.deepseek.com/v1", "unknown url type"),
         ("http://[bad/v1", "Invalid IPv6 URL"),
+        ("localhost:11434/v1", "localhost"),
     ],
-    ids=["no-scheme", "bad-ipv6"],
+    ids=["no-scheme", "bad-ipv6", "scheme-localhost"],
 )
 def test_a_base_url_urllib_cannot_post_to_is_no_provider_with_a_reason(
     monkeypatch, base_url: str, detail: str
 ):
     """Unusable configuration is an absence with a sentence, never a failed call.
 
-    Both spellings are driven rather than imagined:
+    Three spellings are driven rather than imagined:
     ``NODUM_LLM_BASE_URL=api.deepseek.com/v1`` and
     ``NODUM_LLM_BASE_URL=http://[bad/v1`` each raised out of
     ``urllib.request.Request`` — which is *configuration* failing, not a
-    network. ``nodum llm status`` says "nothing here is an error", so this
-    belongs beside an unparseable ``NODUM_LLM_CONTEXT_TOKENS`` and an
-    unrecognised ``NODUM_LLM_THINKING``: no provider, a reason naming the
-    variable and the fix, and exit 0.
+    network. The third, ``NODUM_LLM_BASE_URL=localhost:11434/v1``, parses
+    (urlsplit reads ``localhost`` as a scheme), so urllib never objects — it
+    used to resolve into a provider that failed at call time as
+    ``ProviderUnavailable``, and it is now refused by the scheme check the
+    constructor is followed by. ``nodum llm status`` says "nothing here is an
+    error", so this belongs beside an unparseable ``NODUM_LLM_CONTEXT_TOKENS``
+    and an unrecognised ``NODUM_LLM_THINKING``: no provider, a reason naming
+    the variable and the fix, and exit 0.
 
     **The scheme is not guessed back in**, which is the decision this pins. A
     repair would choose ``http`` or ``https`` for the operator, and that choice
@@ -1997,6 +2002,34 @@ def test_a_scheme_less_base_url_is_still_read_as_a_host_for_the_profile_match(mo
     """
     assert llm.profile_for(model="anything-at-all", base_url="api.deepseek.com/v1") is not None
     assert llm.base_url_problem("api.deepseek.com/v1") is not None
+
+
+@pytest.mark.parametrize(
+    ("base_url", "fixed"),
+    [
+        ("localhost:11434/v1", "http://localhost:11434/v1"),
+        ("ftp://host/v1", None),
+        ("file:///x", None),
+    ],
+    ids=["scheme-localhost", "scheme-ftp", "scheme-file"],
+)
+def test_a_base_url_whose_scheme_is_not_http_is_refused(base_url: str, fixed: str | None):
+    """``localhost:11434/v1`` is the spelling that slipped past the constructor.
+
+    ``urllib.request.Request`` accepts it — urlsplit reads ``localhost`` as a
+    scheme — so the refusal has to come from a check the constructor does not
+    provide: after it succeeds, the parsed scheme must be ``http`` or
+    ``https``. ``ftp`` and ``file`` are registered urllib types it is equally
+    happy to parse, and this provider would no more POST a chat completion to
+    an FTP server than to a host named ``localhost``. Each is refused as
+    configuration, with a reason naming the URL, at resolution time — before
+    any provider exists to fail as ``ProviderUnavailable`` at call time.
+    """
+    problem = llm.base_url_problem(base_url)
+    assert problem is not None
+    assert base_url in problem, "the refusal must name the URL that is wrong"
+    if fixed is not None:
+        assert llm.base_url_problem(fixed) is None, "the fix is additive: a real scheme parses"
 
 
 def test_the_profiled_host_is_matched_however_the_url_is_spelled(monkeypatch):
@@ -2521,22 +2554,32 @@ def test_a_wire_that_carries_no_total_is_not_a_disagreement(wire, caplog):
         "Invalid schema for response_format.schema.properties[0]: expected an object",
         "response_format.json_schema.name is required",
         "your request had a malformed message array",
+        # The conservative direction, pinned: a message naming both a schema
+        # fault and a capability rejection is read as "the server parsed the
+        # field" because that is the side where a mistake is expensive — a
+        # false negative is today's ProviderUnavailable, a false positive
+        # weakens every request for the life of the process. The schema-fault
+        # list is matched first in `_is_structured_rejection`; a reordering
+        # that let the "is unavailable" half downgrade fails this row.
+        "Invalid schema for response_format.schema.properties is unavailable",
     ],
-    ids=["schema-path", "field-path", "no-marker-at-all"],
+    ids=["schema-path", "field-path", "no-marker-at-all", "both-words"],
 )
 def test_a_400_that_is_not_a_capability_statement_never_downgrades(monkeypatch, detail: str):
     """The negative half of a matcher this module keeps deliberately blunt.
 
-    :data:`_STRUCTURED_REJECTIONS` is a substring list, so the boundary has to be
-    pinned from the outside or a later broadening swallows unrelated errors in
-    silence. The first two rows are the ones a plain ``"response_format" in
-    detail`` gets wrong: a server naming ``response_format.schema.properties``
-    has **parsed** the field and is validating what is inside it, which is proof
-    that it *serves* it and that the fault is nodum's own schema. Downgrading
-    there trades a loud, fixable "your schema is wrong" for an envelope quietly
-    weakened for the life of the process — the exact harm
+    :data:`_STRUCTURED_REJECTIONS` is a substring list, so the boundary has to
+    be pinned from the outside or a later broadening swallows unrelated errors
+    in silence. The first row is the one a plain ``"response_format" in
+    detail`` gets wrong: ``Invalid schema for response_format.schema.properties``
+    says the server has **parsed** the field and is validating what is inside
+    it, which is proof that it *serves* it and that the fault is nodum's own
+    schema. Downgrading there trades a loud, fixable "your schema is wrong" for
+    an envelope quietly weakened for the life of the process — the exact harm
     :func:`test_a_non_capability_400_is_not_negotiated` exists to prevent,
-    reached through a message that happens to contain the marker.
+    reached through a message that happens to contain the marker. The second
+    row is the sharpening property stated from this side: a dotted path with no
+    reason words behind it decides nothing at all.
 
     All three must behave identically: one request, no re-send, the failure
     reaching the caller, and the provider still believing in ``json_schema``.
@@ -2569,4 +2612,47 @@ def test_the_measured_capability_400_still_downgrades(monkeypatch):
         timeout=30.0,
     )
     assert len(recorder.requests) == 2
+    assert provider.structured_mode == llm.STRUCTURED_JSON_OBJECT
+
+
+@pytest.mark.parametrize(
+    "detail",
+    [
+        # The sharpening in the downgrade direction: the dotted path used to
+        # read as "the server parsed the field" and block the downgrade. The
+        # reason words say the opposite — "is unavailable" is a capability
+        # rejection even when the sentence carries a path.
+        "response_format.type is unavailable",
+        # The case the old punctuation rule refused forever: the bracketed
+        # path meant "do not downgrade" whatever the server said. The reason
+        # words — "not supported" — say the endpoint does not serve the field,
+        # so it now downgrades. The bare phrase is shared with ollama's
+        # *thinking* sentence (`think value "low" is not supported`), which is
+        # exactly why the matcher requires the sentence to name the field.
+        "response_format[type] not supported",
+    ],
+    ids=["path-plus-unavailable", "bracketed-not-supported"],
+)
+def test_a_capability_400_is_negotiated_by_its_reason_words(monkeypatch, detail: str):
+    """The positive half of the reason-word matcher, driven from the outside.
+
+    :data:`_STRUCTURED_REJECTIONS` is a substring list, so the boundary has to
+    be pinned from the outside or a later narrowing swallows a real capability
+    rejection in silence. Both rows are the ones the old punctuation rule got
+    wrong: it read the ``.`` and ``[`` after the field name as "the server
+    dereferenced the field" and refused to downgrade, even though the words
+    around the path are a capability rejection. Only the reason words decide
+    now — a dotted or bracketed field path alone decides neither way, and the
+    guard must not have turned the punctuation into a veto.
+    """
+    recorder = _rejects_then(detail)
+    monkeypatch.setattr(urllib.request, "urlopen", recorder)
+    provider = _provider(structured_mode=llm.STRUCTURED_JSON_SCHEMA)
+    provider.chat(
+        [llm.Message(role="user", content="hi")],
+        schema=SCHEMA,
+        max_output_tokens=512,
+        timeout=30.0,
+    )
+    assert len(recorder.requests) == 2, "the 400 was not read as a capability signal"
     assert provider.structured_mode == llm.STRUCTURED_JSON_OBJECT

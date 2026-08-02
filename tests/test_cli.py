@@ -272,7 +272,7 @@ def test_asset_register_missing_file_exits_1(fresh_db, tmp_path):
     result = runner.invoke(app, ["asset", "register", str(tmp_path / "missing.png")])
     assert result.exit_code == 1
     assert "missing.png" in result.stderr
-    assert "Traceback" not in result.stderr
+    assert isinstance(result.exception, SystemExit)
 
 
 def test_every_command_that_reads_a_file_reports_a_missing_one_in_one_line(fresh_db, tmp_path):
@@ -301,7 +301,7 @@ def test_every_command_that_reads_a_file_reports_a_missing_one_in_one_line(fresh
 
         assert result.exit_code == 1, command
         assert "missing." in result.stderr, command
-        assert "Traceback" not in result.output, command
+        assert isinstance(result.exception, SystemExit), command
         assert result.stdout == "", command
 
 
@@ -327,7 +327,7 @@ def test_locked_database_exits_1(fresh_db, monkeypatch):
 
     assert result.exit_code == 1
     assert "database is locked" in result.stderr
-    assert "Traceback" not in result.stderr
+    assert isinstance(result.exception, SystemExit)
 
 
 def test_search(fresh_db):
@@ -589,36 +589,49 @@ def test_the_cli_inherits_the_space_guards_from_the_service(fresh_db):
     """Neither guard is a screen's job: the CLI has no screen and needs both."""
     _run_json("space-create", "research", "--as", "owner")
 
-    for command in (
-        ["space-archive", "main", "--as", "owner"],
-        ["space-archive", "meta", "--as", "owner"],
+    for command, expected in (
+        (["space-archive", "main", "--as", "owner"], "cannot archive the 'main' space"),
+        (["space-archive", "meta", "--as", "owner"], "cannot archive the 'meta' space"),
         # The generic node archive reaches the same row, so it is the same hole.
-        ["archive", "main", "--as", "owner"],
+        (["archive", "main", "--as", "owner"], "cannot archive the 'main' space"),
         # And one name per space, whichever command spells the write.
-        ["space-create", "research", "--as", "owner"],
-        ["space-rename", "research", "main", "--as", "owner"],
-        ["node", "create", "--type", "space", "--title", "research", "--as", "owner"],
+        (["space-create", "research", "--as", "owner"], "a space already answers to 'research'"),
+        (
+            ["space-rename", "research", "main", "--as", "owner"],
+            "a space already answers to 'main'",
+        ),
+        (
+            ["node", "create", "--type", "space", "--title", "research", "--as", "owner"],
+            "a space must live in the 'meta' space",
+        ),
         # A space belongs in meta; the generic create is the path that could
         # put one anywhere else, and `--space` defaults to `main`.
-        ["node", "create", "--type", "space", "--title", "elsewhere", "--as", "owner"],
+        (
+            ["node", "create", "--type", "space", "--title", "elsewhere", "--as", "owner"],
+            "a space must live in the 'meta' space",
+        ),
         # fmt: off
-        [
-            "node",
-            "create",
-            "--type",
-            "space",
-            "--title",
-            "elsewhere",
-            "--space",
-            "main",
-            "--as",
-            "owner",
-        ],
+        (
+            [
+                "node",
+                "create",
+                "--type",
+                "space",
+                "--title",
+                "elsewhere",
+                "--space",
+                "main",
+                "--as",
+                "owner",
+            ],
+            "a space must live in the 'meta' space",
+        ),
         # fmt: on
     ):
         result = runner.invoke(app, command)
         assert result.exit_code == 1, command
-        assert "Traceback" not in result.output
+        assert expected in result.stderr, command
+        assert isinstance(result.exception, SystemExit), command
 
     assert {s["title"] for s in _run_json("space-list", "--as", "owner")["spaces"]} == {
         "main",
@@ -644,7 +657,7 @@ def test_an_archived_space_keeps_its_name_on_the_cli_too(fresh_db):
     refused = runner.invoke(app, ["space-create", "research", "--as", "owner"])
     assert refused.exit_code == 1
     assert "archived space already answers to 'research'" in refused.output
-    assert "Traceback" not in refused.output
+    assert isinstance(refused.exception, SystemExit)
 
     # Freeing it is a node-title update, and then the name is available again.
     _run_json("node", "update", created["id"], "--title", "research-2025", "--as", "owner")
@@ -673,7 +686,7 @@ def test_a_grant_on_an_archived_space_is_inert_and_still_revocable_on_the_cli(fr
     refused = runner.invoke(app, ["grant", "researcher", "research", "read", "--as", "owner"])
     assert refused.exit_code == 1
     assert "cannot grant on the archived space" in refused.output
-    assert "Traceback" not in refused.output
+    assert isinstance(refused.exception, SystemExit)
 
     # And it can be revoked, by the space's name as well as by its id.
     _run_json("revoke", "researcher", "research", "--as", "owner")
@@ -839,7 +852,7 @@ def test_asset_rendition_rejects_a_malformed_page_profile(fresh_db, tmp_path):
     )
     assert result.exit_code == 1
     assert "unknown rendition profile" in result.stderr
-    assert "Traceback" not in result.stderr
+    assert isinstance(result.exception, SystemExit)
 
 
 # ── Capability URLs ──────────────────────────────────────────────────────────
@@ -872,7 +885,7 @@ def test_asset_download_url_for_an_unknown_asset_exits_1(fresh_db):
     result = runner.invoke(app, ["asset", "download-url", "nope", "--as", "owner"])
     assert result.exit_code == 1
     assert "asset not found" in result.stderr
-    assert "Traceback" not in result.stderr
+    assert isinstance(result.exception, SystemExit)
 
 
 def test_asset_upload_url_dedups_a_hash_already_stored(fresh_db, tmp_path):
@@ -1008,7 +1021,7 @@ def test_a_failing_path_does_not_lose_the_batch_successes(fresh_db, tmp_path):
     assert payload["ingestions"][0]["asset"]["original_name"] == "good.txt"
     assert "missing.txt" in result.stderr
     assert "not a file" in result.stderr
-    assert "Traceback" not in result.stderr
+    assert isinstance(result.exception, SystemExit)
     # The success is really in the graph, not just in the envelope.
     assert _run_json("node", "list", "--type", "source")["count"] == 1
 
@@ -1039,7 +1052,7 @@ def test_ingest_file_missing_path_exits_1(fresh_db, tmp_path):
     result = runner.invoke(app, ["ingest", "file", str(tmp_path / "missing.txt"), "--as", "owner"])
     assert result.exit_code == 1
     assert "not a file" in result.stderr
-    assert "Traceback" not in result.stderr
+    assert isinstance(result.exception, SystemExit)
 
 
 class _CannedHandler(BaseHTTPRequestHandler):
@@ -1089,7 +1102,7 @@ def test_ingest_url_bad_scheme_exits_1(fresh_db):
     result = runner.invoke(app, ["ingest", "url", "file:///etc/passwd", "--as", "owner"])
     assert result.exit_code == 1
     assert "ingest_url takes" in result.stderr
-    assert "Traceback" not in result.stderr
+    assert isinstance(result.exception, SystemExit)
 
 
 def test_ingest_handlers_lists_every_handler_with_its_availability(fresh_db):
@@ -1222,7 +1235,7 @@ def test_cycle_abandon_refuses_a_cycle_that_already_ended(fresh_db):
 
     assert result.exit_code == 1
     assert "already completed, not running" in result.stderr
-    assert "Traceback" not in result.output
+    assert isinstance(result.exception, SystemExit)
     assert _run_json("cycle-get", finished["id"])["status"] == "completed"
 
 
@@ -1287,7 +1300,7 @@ def test_cycle_stop_refuses_a_cycle_that_already_ended(fresh_db):
     assert result.exit_code == 1
     assert "already completed, not running" in result.stderr
     assert "a stop is an instruction to a live run" in result.stderr
-    assert "Traceback" not in result.output
+    assert isinstance(result.exception, SystemExit)
     assert _run_json("cycle-get", finished["id"])["stop_requested"] is False
     # And the refused stop closed nothing: the row still says how it really ended.
     assert _run_json("cycle-get", finished["id"])["report"]["jobs"] != []
@@ -1316,7 +1329,7 @@ def test_merge_nodes_over_the_cli(fresh_db):
     refused = runner.invoke(app, ["undo", str(stamped["seq"]), "--as", "owner"])
     assert refused.exit_code == 1
     assert "Roll the cycle back instead." in refused.stderr
-    assert "Traceback" not in refused.output
+    assert isinstance(refused.exception, SystemExit)
 
 
 def test_retype_over_the_cli_and_its_per_item_failures(fresh_db):
@@ -1342,7 +1355,7 @@ def test_retype_over_the_cli_and_its_per_item_failures(fresh_db):
     # The reason is on stderr too: an exit code of 1 with a silent stderr breaks
     # the other half of the contract.
     assert "failed missing:" in result.stderr
-    assert "Traceback" not in result.output
+    assert isinstance(result.exception, SystemExit)
     # The success still landed — that is what "never loses its successes" means.
     assert _run_json("node", "get", node["id"])["type"] == "note"
 
@@ -1361,7 +1374,7 @@ def test_a_retype_that_changed_nothing_does_not_exit_zero(fresh_db):
     assert payload["transitioned"] == []
     assert [failure["id"] for failure in payload["failed"]] == ["main"]
     assert "failed main:" in result.stderr
-    assert "Traceback" not in result.output
+    assert isinstance(result.exception, SystemExit)
     # The cycle is still in the journal, and still says it changed nothing.
     assert _run_json("events", "--cycle", payload["cycle_id"])["events"] == []
 
@@ -1435,7 +1448,7 @@ def test_a_bulk_relink_that_refused_an_edge_does_not_exit_zero(fresh_db):
     assert relinked["changes"] == []
     assert [failure["id"] for failure in relinked["skipped"]] == [moving["id"]]
     assert f"failed {moving['id']}:" in result.stderr
-    assert "Traceback" not in result.output
+    assert isinstance(result.exception, SystemExit)
 
     # And the annotation is not a failure: a run whose only non-change is
     # `unchanged` accomplished exactly what was asked and exits 0.
@@ -1512,7 +1525,7 @@ def test_a_refused_rollback_prints_its_conflicts_as_one_json_object(fresh_db):
     result = runner.invoke(app, ["rollback", retyped["cycle_id"], "--as", "owner"])
 
     assert result.exit_code == 1
-    assert "Traceback" not in result.output
+    assert isinstance(result.exception, SystemExit)
     assert "cannot roll back cycle" in result.stderr
     refusal = json.loads(result.stdout)["error"]
     assert refusal["type"] == "RollbackConflict"
@@ -1749,7 +1762,7 @@ def test_a_disabled_human_is_refused_the_same_way(fresh_db):
 
     assert result.exit_code == 1
     assert result.stderr.splitlines() == [f"human account is disabled: {alice['id']}"]
-    assert "Traceback" not in result.output
+    assert isinstance(result.exception, SystemExit)
 
 
 def test_consolidate_is_refused_on_a_scope_the_gardener_holds_nothing_on(fresh_db):
@@ -1774,7 +1787,7 @@ def test_consolidate_is_refused_on_a_scope_the_gardener_holds_nothing_on(fresh_d
     assert result.exit_code == 1
     assert "nodum grant builtin-gardener research edit" in result.stderr
     assert "unknown space" not in result.stderr
-    assert "Traceback" not in result.output
+    assert isinstance(result.exception, SystemExit)
     journal = _run_json("cycle-list")["cycles"][0]
     assert journal["status"] == "failed"
     assert "unknown space" not in journal["report"]["failed"][0]["error"]
@@ -1788,7 +1801,7 @@ def test_consolidate_stops_when_the_gardener_is_disabled(fresh_db):
 
     assert result.exit_code == 1
     assert result.stderr.splitlines() == [f"agent account is disabled: {GARDENER_AGENT_ID}"]
-    assert "Traceback" not in result.output
+    assert isinstance(result.exception, SystemExit)
 
 
 def test_every_curative_refusal_is_one_line_and_never_a_traceback(fresh_db):
@@ -1809,7 +1822,7 @@ def test_every_curative_refusal_is_one_line_and_never_a_traceback(fresh_db):
 
         assert result.exit_code == 1, command
         assert expected in result.stderr, command
-        assert "Traceback" not in result.output, command
+        assert isinstance(result.exception, SystemExit), command
 
 
 def test_version_flag_short_circuits():

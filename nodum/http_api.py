@@ -2344,6 +2344,19 @@ def create_app(
         policy refuses to do everywhere else (an install without the ``pdf``
         extra still admits a PDF). The decompression-bomb guard is about danger
         rather than capability, so it applies here as on every route.
+
+        **A client that hangs up mid-upload is answered with 499, and the graph
+        is not modified for it.** The disconnect rule: the token is spent by
+        the attempt — ``urls.consume`` ran first — but the ingest only runs
+        for a client still listening. The body may have arrived in full (all
+        its chunks reached the spool file) while the client that sent them is
+        already gone, so the route checks :meth:`Request.is_disconnected`
+        twice: once the body stream has finished, and once more before
+        :func:`nodum.ingest.ingest_upload`, because the type policy between
+        them reads and analyses the file and a client can vanish during that
+        window too. An ingest nobody is listening for is a graph change with
+        no party able to read its outcome — and the retry, which must re-mint
+        anyway, would find its document already described.
         """
         row = urls.consume(request.path_params["token"], kind="upload", path=db_path)
         max_bytes = row["max_bytes"]
@@ -2359,6 +2372,8 @@ def create_app(
                             f"this upload grant is for {max_bytes} bytes and the body is larger"
                         )
                     handle.write(chunk)
+            if await request.is_disconnected():
+                raise ClientDisconnect()
             _refuse_unsupported_upload(
                 spooled,
                 original_name,
@@ -2369,6 +2384,8 @@ def create_app(
                 pixel_limit=None,
                 cli_hint=True,
             )
+            if await request.is_disconnected():
+                raise ClientDisconnect()
             result = ingest.ingest_upload(row, spooled, path=db_path)
         return EnvelopeResponse(envelope(result))
 
