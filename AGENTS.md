@@ -88,7 +88,8 @@ rollback** (`service.rollback_cycle`, human-only and atomic), the **landing
 seam** (`store.cap_landing` plus a keyword-only `landing=` on `create_edge` /
 `propose_edges` / `create_node`: §8.3's grant-is-a-ceiling, which is what puts
 the gardener's inferences in the review queue), the **consolidation runner**
-(`nodum.consolidate` — four deterministic jobs and five coherence metrics,
+(`nodum.consolidate` — four deterministic jobs, the abstraction job (5b-ii's
+first, below), and five coherence metrics,
 running as a peer client over the public service API), the **nightly
 scheduler** (`nodum.scheduler`, one asyncio task in `nodum serve`'s lifespan,
 **off unless `NODUM_CONSOLIDATE_AT` is set**), and the **dream-journal view**
@@ -104,17 +105,26 @@ proposals**, which moved to Phase 5b deliberately rather than being forgotten �
 deciding that a sentence *is* a claim is a judgement call and belongs to the
 research agent in design §3, and splitting prose into sentences would fill the
 review queue with noise instead of knowledge, so ingestion proposes sources and
-structure and stops; the **LLM *jobs* of the gardener** — props migration on a
-retype, deciding that an untouched claim has gone *stale* rather than merely
-old, the abstraction job, learned queue curation, and the two Q12 metrics that
-need it — which Phase 5b-ii lands on top of 5b-i's runtime (`nodum.llm` +
+structure and stops; the **remaining LLM *jobs* of the gardener** — props
+migration on a retype, deciding that an untouched claim has gone *stale* rather
+than merely old, learned queue curation, and the two Q12 metrics that need a
+model — which Phase 5b-ii lands on top of 5b-i's runtime (`nodum.llm` +
 `nodum.agent`, below): the provider, the accounting, the budgets and the kill
 switch ship first, so the thing being observed arrives after the observability
-and can be judged rather than trusted. Design Constraint 4 is unchanged and now
+and can be judged rather than trusted. **The abstraction job is the first of
+them and has landed.** Its selection is fully deterministic — dense, sized, not
+already synthesized, all computed before any model call — and the model writes
+the synthesis text and nothing else: it never decides *whether* to synthesize,
+only what the text says. The write files a `concept` node `proposed` with
+`props.synthesized` and one `derived_from` edge per member, through the same
+landing seam as every other inference, and the run's cost rides the cycle
+report under `report["llm"]`. Design Constraint 4 is unchanged and now
 structurally enforced — the model stays out of validation, the state machine
 and the projectors (`tests/test_llm.py` proves those modules cannot reach
-`nodum.llm` at all), and every line of `nodum.consolidate` still runs on a
-machine with no model present. Also not built: **Markdown Mirror** and any
+`nodum.llm` at all), and the four deterministic jobs of `nodum.consolidate`
+still run on a machine with no model present; the abstraction job is the
+deliberate exception, gated on the cycle budget (`NODUM_LLM_CYCLE_BUDGET`, off
+by default) and on a configured provider. Also not built: **Markdown Mirror** and any
 whole-graph export (the only
 export that exists is the thin per-node snapshot,
 `GET /api/export/node/{id}?depth=`, which is `get_neighborhood` with a
@@ -366,7 +376,9 @@ commands on a saved node for exactly this reason.
   today is `agent.AgentRun.chat`, immediately before a provider call; the four
   deterministic jobs in `nodum.consolidate` make none and read the switch
   nowhere, so a stop recorded against one of those runs is kept and the run
-  finishes — which every surface says, rather than promising a wind-down that
+  finishes — the abstraction job is the exception: it reaches the model through
+  `AgentRun.chat`, so a stop recorded against its own run is obeyed at the next
+  call. Every surface says exactly that, rather than promising a wind-down that
   would not arrive.
   The stamp itself is `in_cycle`, a `ContextVar` that
   `_emit` reads, so a cycle's writes go through the *ordinary* public functions
@@ -726,9 +738,10 @@ commands on a saved node for exactly this reason.
   free; the thread moved a total freeze to a slow read, which is the whole of
   what it bought.
 - **`nodum.consolidate`** — the consolidation runner (design §8.4/§8.5), and
-  everything on the near side of the LLM line: four deterministic jobs and five
+  everything on the near side of the LLM line: four deterministic jobs, the
+  abstraction job (the deliberate exception, below), and five
   coherence metrics, with no provider, no generation and no judgement anywhere
-  in the module. **It is a peer client, not an insider** (§8.4 rule 1): every
+  in the deterministic four. **It is a peer client, not an insider** (§8.4 rule 1): every
   read and write goes through a public `nodum.service` function exactly as the
   MCP server's do — it opens no connection, imports no service private, and
   touches no table — which is what makes the gardener an agent with grants
@@ -760,7 +773,31 @@ commands on a saved node for exactly this reason.
   opens no cycle because it is a diff a human is reading right now rather than a
   rehearsal of the nightly run. One job's failure never loses the others: its
   outcome carries the error, the rest still run, the after-metrics are still
-  computed, and the cycle closes `failed` with all of it. Determinism is a
+  computed, and the cycle closes `failed` with all of it.   `abstraction` is the fifth job and the deliberate exception to the no-model
+  rule — 5b-ii's first, cut to the same discipline the others run under:
+  **the model never decides *whether* to synthesize, only what the text says.**
+  The selection is deterministic arithmetic over data the file already holds —
+  connected components of the active `relates_to` graph, gated on size
+  (`MIN_CLUSTER_MEMBERS` 3 to `MAX_CLUSTER_MEMBERS` 10), density (at least as
+  many internal edges as members — one cycle, not a chain), freshness (no
+  member carries `props.synthesized`, and no member is the target of an active
+  `derived_from` edge from a node that does), and cohesion (mean pairwise
+  cosine at or above the *reused* link bar `LINK_EMBEDDING_COSINE` — the
+  calibrated same-area bar is the cohesion bar), capped at
+  `MAX_CLUSTERS_PER_CYCLE` with overflow reported. Only then does it call the
+  model, through `nodum.agent.for_cycle` — gated first on the cycle budget
+  (`NODUM_LLM_CYCLE_BUDGET`, off by default) and on a configured provider —
+  and the model's `{title, content}` is the only thing the gates did not
+  decide. The write files a `concept` node `proposed` with `props.synthesized`
+  (the freshness gate's own record, which is what the review queue's badge
+  reads) plus `props.members` and the `generated_by` provenance, and one
+  `derived_from` edge per member; a dry run still pays for the model calls (B4)
+  and writes nothing; a malformed body is a job error, never a write; and the
+  run's cost rides the cycle report under `report["llm"]`, which the dream
+  journal's Cost section renders. D8's follow-up — detecting that a synthesis
+  has gone stale and superseding it — is deliberately not built: deciding that
+  a concept no longer represents its members is judgement of the same kind the
+  neglect job refuses, and it is cycle-5-adjacent. Determinism is a
   rule here: no randomness, one clock captured when the cycle opens, and every
   pair, group and list ordered before it is written.
   **Both cosine bars are measured, and the measurement set both.** They stand
@@ -2822,7 +2859,9 @@ Phase-1 decision log.
   and a cycle that has said how it ended is refused, since nothing is left to
   obey it. **What obeys a stop today is `AgentRun.chat`, before a provider
   call**; the four deterministic jobs make none, so a run of those finishes with
-  the stop recorded on it, and the help text, the docs and the browser confirm
+  the stop recorded on it — the abstraction job is the exception, checking
+  through that same `AgentRun.chat` — and the help text, the docs and the
+  browser confirm
   all say so rather than promising a wind-down that would not arrive),
   `rollback <cycle-id> [--dry-run]`,
   `merge-nodes <ids…> --into <id>`, `retype <ids…> --type <t>`,

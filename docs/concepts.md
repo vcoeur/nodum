@@ -211,7 +211,7 @@ the grants it began with. A cycle is minutes at most, and rolling it back takes
 back whatever it wrote in the meantime.
 
 Its four jobs are arithmetic over data the file already holds — no model is
-involved, and a cycle runs fine on a machine that has none:
+involved in them, and a cycle runs fine on a machine that has none:
 
 - **Duplicate candidates** — normalised title equality, near-equality, and
   embedding cosine where a provider exists. It writes a `proposed`
@@ -226,6 +226,17 @@ involved, and a cycle runs fine on a machine that has none:
 - **Neglect report** — names the active nodes nobody has touched in ninety days,
   and writes nothing. Age is arithmetic; deciding something has gone *stale* is
   judgement, and judgement is a later phase.
+
+The fifth job, **abstraction** (5b-ii's first), is the deliberate exception —
+and it is cut to the same discipline. Its *selection* is the same kind of
+arithmetic: connected clusters of the `relates_to` graph that are dense enough
+(at least as many edges as members), sized right, not already synthesized, and
+mutually cohesive past the same bar the link job uses. The model is called only
+after all of that, and it writes the text and nothing else — it never decides
+*whether* to synthesize, only what the synthesis says. The write files a
+`concept` node `proposed` with `props.synthesized` and one `derived_from` edge
+per member, and it happens only when `NODUM_LLM_CYCLE_BUDGET` funds the cycle
+and a provider is configured — unset means the job reports that it did not run.
 
 Everything it infers is filed `proposed`, even though its grant would let it
 write live — a suggestion nobody reviews is not a suggestion.

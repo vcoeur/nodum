@@ -286,13 +286,20 @@ cycle quietly drop the vector signal until you re-run the download.
   is most needed and where it used to arrive as `storage error`. It holds no
   credential at all: it authenticates by being in-process, so there is nothing
   to present and nothing to steal, and the supported way to stop it is
-  `nodum agent disable builtin-gardener`. Its four jobs are arithmetic over data
+  `nodum agent disable builtin-gardener`. Its four deterministic jobs are
+  arithmetic over data
   the file already holds — duplicate candidates by title similarity and
   embedding cosine, exact-duplicate and dangling-edge pruning, `relates_to`
   inference from embedding proximity and co-citation, a fractional-position
   check, embedding catch-up, and a report of what nobody has touched in ninety
-  days. No model is involved anywhere, and it runs fine on a machine that has
-  none. **It proposes; it never merges.** A duplicate becomes a `proposed`
+  days. No model is involved in those, and it runs fine on a machine that has
+  none. The fifth job, **abstraction**, is 5b-ii's first and the deliberate
+  exception: its selection is the same kind of arithmetic (dense, sized, fresh
+  clusters of the `relates_to` graph, cohesive past the link bar), and the
+  model — called only after the gates pass, and only when
+  `NODUM_LLM_CYCLE_BUDGET` funds it — writes the synthesis text and nothing
+  else, filed `proposed` with `props.synthesized` and one `derived_from` edge
+  per member. **It proposes; it never merges.** A duplicate becomes a `proposed`
   `duplicate_of` edge in the review queue — which already has a diff and an
   accept button — because a merge is always human-approved. Everything it infers
   is filed `proposed` even though its grant would let it write live: a grant is

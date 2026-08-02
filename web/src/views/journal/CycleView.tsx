@@ -28,6 +28,7 @@ import type { CycleDetailOut, CycleOut, RollbackOut } from "../../api/types";
 import { describeFailure, formatTimestamp, formatTimestampLong } from "../../lib";
 import type { FailureDescription } from "../../lib";
 import { AbandonDialog } from "./AbandonDialog";
+import { CostSection } from "./CostSection";
 import { CycleBadges } from "./CycleBadges";
 import { EventDiff } from "./EventDiff";
 import { MetricTable } from "./MetricTable";
@@ -47,6 +48,7 @@ import {
   emptyEventsNote,
   noMetricsNote,
   readConsolidationReport,
+  readLlmReport,
   rollbackAvailability,
   rollbackOutcome,
   RUNNING_ACTIONS_HINT,
@@ -218,6 +220,10 @@ export default function CycleView() {
   const caveats = cycleCaveats(cycle);
   const failures = cycleFailures(cycle, scope);
   const report = readConsolidationReport(cycle.report);
+  // The cost object the abstraction job's run filed under `report["llm"]` (A1).
+  // `null` means no LLM job ran, which is the ordinary cycle — so the section
+  // renders nothing rather than a table of dashes.
+  const llm = readLlmReport(cycle.report);
   // The service's fourth rollback refusal — "wrote no graph events" — is not
   // decidable from the cycle row, but it *is* decidable from this page's own
   // event list: `undo`'s own rule is that a `node.*`/`edge.*` event has a graph
@@ -365,6 +371,8 @@ export default function CycleView() {
       {report === null ? null : <JobReports report={report} scope={scope} />}
 
       <MetricTable metrics={metrics} noneNote={noMetricsNote(cycle)} />
+
+      {llm === null ? null : <CostSection report={llm} />}
 
       <EventDiff
         changes={changes}

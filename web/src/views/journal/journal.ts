@@ -350,6 +350,81 @@ export function readOperationReport(
   };
 }
 
+/** `cycles.report["llm"]` — what a run's model use cost, and what it did not reach. */
+export interface LlmReport {
+  /** Whether the run was funded — a provider *and* a non-zero budget. */
+  enabled: boolean;
+  /** Whether a provider was configured at all. */
+  available: boolean;
+  /** Why not, when no provider was configured — a stable fact about the install. */
+  unavailableReason: string | null;
+  provider: string | null;
+  modelId: string | null;
+  budgetTokens: number;
+  budgetSeconds: number;
+  calls: number;
+  /** Calls that produced no usable result — a timeout, a cut-off body. */
+  failedCalls: number;
+  promptTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  /** The share of `outputTokens` spent thinking rather than writing. */
+  reasoningTokens: number;
+  elapsedSeconds: number;
+  /** Whether a spending ceiling stopped the work — a fact about this run. */
+  exhausted: boolean;
+  /** Whether a stop was asked for and the run noticed it. */
+  stopped: boolean;
+  /** One entry per job the run declared a budget for, including one that never called. */
+  perJob: { job: string; calls: number; promptTokens: number; outputTokens: number }[];
+}
+
+/**
+ * Read `cycles.report["llm"]` — the cost object the abstraction job's run filed
+ * under `agent.REPORT_KEY` (A1) — or null when the cycle's report has none.
+ *
+ * A cycle with no LLM job ran files no `llm` key at all; the wire type is
+ * `dict | None`, so every field is checked rather than assumed, exactly as
+ * {@link readConsolidationReport} reads its own blob.
+ *
+ * @param report `CycleOut.report`.
+ */
+export function readLlmReport(report: JsonObject | null | undefined): LlmReport | null {
+  if (!report || typeof report !== "object") return null;
+  const raw = report.llm;
+  if (raw === null || typeof raw !== "object") return null;
+  const llm = raw as JsonObject;
+  const perJob = Array.isArray(llm.per_job)
+    ? llm.per_job
+        .filter((entry): entry is JsonObject => entry !== null && typeof entry === "object")
+        .map((entry) => ({
+          job: stringAt(entry, "job") ?? "unnamed job",
+          calls: numberAt(entry, "calls") ?? 0,
+          promptTokens: numberAt(entry, "prompt_tokens") ?? 0,
+          outputTokens: numberAt(entry, "output_tokens") ?? 0,
+        }))
+    : [];
+  return {
+    enabled: llm.enabled === true,
+    available: llm.available === true,
+    unavailableReason: stringAt(llm, "unavailable_reason"),
+    provider: stringAt(llm, "provider"),
+    modelId: stringAt(llm, "model_id"),
+    budgetTokens: numberAt(llm, "budget_tokens") ?? 0,
+    budgetSeconds: numberAt(llm, "budget_seconds") ?? 0,
+    calls: numberAt(llm, "calls") ?? 0,
+    failedCalls: numberAt(llm, "failed_calls") ?? 0,
+    promptTokens: numberAt(llm, "prompt_tokens") ?? 0,
+    outputTokens: numberAt(llm, "output_tokens") ?? 0,
+    totalTokens: numberAt(llm, "total_tokens") ?? 0,
+    reasoningTokens: numberAt(llm, "reasoning_tokens") ?? 0,
+    elapsedSeconds: numberAt(llm, "elapsed_seconds") ?? 0,
+    exhausted: llm.exhausted === true,
+    stopped: llm.stopped === true,
+    perJob,
+  };
+}
+
 /* ------------------------------------------------------------------ */
 /* The journal sentence                                                 */
 /* ------------------------------------------------------------------ */
@@ -918,7 +993,10 @@ export const STOP_ACTION_LABEL = "Stop this cycle";
  * `AgentRun.chat` checks the switch immediately before a provider call and that
  * is the only check that exists: the four deterministic consolidation jobs make
  * no provider call, so a stop recorded against one of those runs is kept on the
- * entry and the run finishes — to `completed`, if nothing else went wrong.
+ * entry and the run finishes — to `completed`, if nothing else went wrong. The
+ * abstraction job (5b-ii's first) is the exception: it reaches the model
+ * through that same `AgentRun.chat`, so a stop recorded against its own run is
+ * obeyed at the next call.
  *
  * **Three of the four places a human met this control said otherwise**, and each
  * said it in its own words: the button's tooltip offered to *"ask this run to
@@ -929,7 +1007,9 @@ export const STOP_ACTION_LABEL = "Stop this cycle";
  * the copy was wrong, which is this whole defect class: the fix is the sentence,
  * not a check wired into the deterministic jobs (that is 5b-ii, and
  * `tests/test_consolidate.py::test_the_deterministic_runner_consults_no_stop_
- * switch_and_the_copy_says_so` is what will fail the day it lands).
+ * switch_and_the_copy_says_so` is what failed the day the abstraction job
+ * landed — its docstring says exactly that, and the test now names the
+ * exception instead).
  *
  * One exported constant rather than four wordings, for the reason
  * {@link STOP_ACTION_LABEL} is one: a caveat repeated in four voices is a caveat
