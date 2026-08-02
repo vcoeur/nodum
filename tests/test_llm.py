@@ -2554,8 +2554,16 @@ def test_a_wire_that_carries_no_total_is_not_a_disagreement(wire, caplog):
         "Invalid schema for response_format.schema.properties[0]: expected an object",
         "response_format.json_schema.name is required",
         "your request had a malformed message array",
+        # The conservative direction, pinned: a message naming both a schema
+        # fault and a capability rejection is read as "the server parsed the
+        # field" because that is the side where a mistake is expensive — a
+        # false negative is today's ProviderUnavailable, a false positive
+        # weakens every request for the life of the process. The schema-fault
+        # list is matched first in `_is_structured_rejection`; a reordering
+        # that let the "is unavailable" half downgrade fails this row.
+        "Invalid schema for response_format.schema.properties is unavailable",
     ],
-    ids=["schema-path", "field-path", "no-marker-at-all"],
+    ids=["schema-path", "field-path", "no-marker-at-all", "both-words"],
 )
 def test_a_400_that_is_not_a_capability_statement_never_downgrades(monkeypatch, detail: str):
     """The negative half of a matcher this module keeps deliberately blunt.
