@@ -912,6 +912,57 @@ def _activate_pending_mentions(
         _set_edge_state(conn, edge, "active", "accept", actor)
 
 
+def _settle_synthesis_edges(
+    conn: sqlite3.Connection, node: dict[str, Any], action: str, actor: str, store: Store
+) -> None:
+    """Settle a reviewed synthesis's own ``derived_from`` edges with the node.
+
+    The abstraction job files a synthesized concept and its ``derived_from``
+    edges as **one unit**: the edges are proposals of the same decision, so
+    the reviewer's single action settles both halves. Accepting the concept
+    brings its pending edges to ``active`` — the synthesis is decided, and
+    its members are now protected by a live membership fact; rejecting it
+    archives them, because a rejected concept's membership edges are
+    meaningless and must not linger as orphaned proposals or protect their
+    members. This is the ``derived_from`` parallel of
+    :func:`_activate_pending_mentions`, and it shares the same two scoping
+    rules: only the edges the node's own author wrote are settled
+    (``created_by`` match — an unrelated agent's pending edge out of the same
+    node stays in the queue on its own merits), and each edge is gated on the
+    reviewer's own authority over both endpoint spaces. Each transition is
+    its own event, attributed to the reviewer.
+
+    A node that is not a synthesis (``props.synthesized`` falsy) is a no-op —
+    ordinary nodes carry no ``derived_from`` edges of their own, and the
+    helper must not settle anyone else's.
+    """
+    props = json.loads(node.get("props") or "{}")
+    if not props.get("synthesized"):
+        return
+    rows = conn.execute(
+        """
+        SELECT * FROM edges
+        WHERE src_id = ? AND type_id = 'derived_from' AND state != 'archived' AND created_by = ?
+        ORDER BY created_at, rowid
+        """,
+        (node["id"], node["created_by"]),
+    ).fetchall()
+    for row in rows:
+        edge = _row_dict(row)
+        # A proposed edge leaves `proposed`, so its op is `reject`, not
+        # `archive` — the state machine allows only one of the two (the same
+        # state-picked action `_materialize_mentions`'s retirement uses).
+        retiring = action != "accept"
+        edge_action = "reject" if retiring and edge["state"] == "proposed" else "archive"
+        try:
+            store.require_review(
+                _item_spaces(conn, "edge", edge), edge_action if retiring else "accept"
+            )
+        except GrantNotPermitted:
+            continue
+        _set_edge_state(conn, edge, "archived" if retiring else "active", edge_action, actor)
+
+
 # ── Internal edge writers (shared by public ops and wikilink materialisation) ─
 
 
@@ -1914,6 +1965,12 @@ def _transition_row(
         _write_version(conn, after, actor, seq)
         if action == "accept":
             _activate_pending_mentions(conn, after, actor, store)
+        if action in ("accept", "reject"):
+            # A synthesis is decided together with its members: the concept's
+            # own `derived_from` edges settle with it (active on accept,
+            # archived on reject), exactly as its wikilink mentions sweep on
+            # accept. No-op for any node without `props.synthesized`.
+            _settle_synthesis_edges(conn, after, action, actor, store)
         return kind, after
     return kind, _set_edge_state(conn, before, to_state, action, actor, reason=reason)
 

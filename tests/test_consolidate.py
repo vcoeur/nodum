@@ -1767,7 +1767,13 @@ def test_a_chain_is_not_dense(fresh_db):
 
 def test_a_synthesized_member_is_not_resynthesized(fresh_db):
     """Both halves of the freshness gate: the member's own flag, or a
-    ``derived_from`` edge from a synthesized node."""
+    ``derived_from`` edge from a synthesized node.
+
+    The ancestor edge is filed ``proposed`` — the state the job writes it in —
+    because the gate has to protect members of a synthesis that is still
+    waiting in the review queue, not only one already accepted (whose edges
+    are ``active``).
+    """
     _place(Alpha=0.0)
     flagged = _node("Alpha one", props={"synthesized": True})
     second, third = _node("Alpha two"), _node("Alpha three")
@@ -1781,7 +1787,11 @@ def test_a_synthesized_member_is_not_resynthesized(fresh_db):
     _relates(other.id, ancestor.id)
     _relates(ancestor.id, member.id)
     service.create_edge(
-        ancestor.id, member.id, consolidate.DERIVED_FROM_EDGE_TYPE, principal=owner()
+        ancestor.id,
+        member.id,
+        consolidate.DERIVED_FROM_EDGE_TYPE,
+        landing="proposed",
+        principal=owner(),
     )
 
     outcome = _abstraction_outcome(_run(jobs=[consolidate.JOB_ABSTRACTION]).report)
@@ -1824,6 +1834,42 @@ def test_a_sized_cluster_below_the_minimum_is_skipped(fresh_db):
     assert outcome.detail["clusters_eligible"] == 0
     (skip,) = outcome.skipped
     assert "below the" in skip["reason"]
+
+
+def test_a_non_cohesive_cluster_is_skipped(fresh_db):
+    """A dense, sized, fresh cluster whose members are not mutually similar is
+    refused by the cohesion gate — the mean pairwise cosine below the bar.
+
+    The members sit at widely separated placed angles, so the mean pairwise
+    cosine is negative while the graph half and the size gate would both have
+    admitted the cluster: it is the vector half, and only it, that refuses.
+    """
+    _place(Alpha=0.0, Beta=math.radians(80), Gamma=math.radians(160))
+    first, second, third = (
+        _node("Alpha one"),
+        _node("Beta two"),
+        _node("Gamma three"),
+    )
+    _relates(first.id, second.id)
+    _relates(second.id, third.id)
+    _relates(third.id, first.id)
+
+    outcome = _abstraction_outcome(_run(jobs=[consolidate.JOB_ABSTRACTION]).report)
+
+    assert outcome.detail["clusters_eligible"] == 0
+    (skip,) = outcome.skipped
+    assert skip["id"] == ",".join(sorted([first.id, second.id, third.id]))
+    assert "not cohesive" in skip["reason"]
+
+
+def test_the_cohesion_bar_is_the_calibrated_link_bar_reused():
+    """The cohesion bar is the measured link bar, reused rather than invented.
+
+    Pinned so a future re-tune of the cohesion bar separately from the link
+    bar fails loudly and forces the comment on
+    :data:`consolidate.ABSTRACTION_COHESION_COSINE` to be reconsidered.
+    """
+    assert consolidate.ABSTRACTION_COHESION_COSINE == consolidate.LINK_EMBEDDING_COSINE
 
 
 # ── The abstraction job's write half (S2: the model call) ─────────────────────
@@ -1953,6 +1999,103 @@ def test_abstraction_with_a_budget_synthesizes_a_proposed_concept(fresh_db, monk
     assert all(edge.props.get("job") == consolidate.JOB_ABSTRACTION for edge in edges)
     assert outcome.applied == [edge.id for edge in edges]
     assert [entry["node"] for entry in outcome.detail["synthesized"]] == [concept_id]
+
+
+def test_accepting_a_synthesis_activates_its_derived_from_edges_and_blocks_resynthesis(
+    fresh_db, monkeypatch
+):
+    """Accepting a synthesis is deciding its members too.
+
+    The concept's ``derived_from`` edges go ``active`` with the node (the
+    service settles them, exactly as it sweeps wikilink mentions), so the
+    accepted synthesis protects its members: the next cycle must not
+    re-synthesize the same cluster.
+    """
+    monkeypatch.setenv(agent_runtime.ENV_CYCLE_BUDGET, "100000")
+    provider = _FakeLLM(_completion('{"title": "Alpha matters", "content": "The shared core."}'))
+    llm.set_provider(provider)
+    first, second, third = _dense_fresh_cluster()
+    del first, second, third
+
+    first_run = _run(jobs=[consolidate.JOB_ABSTRACTION])
+    first_outcome = _abstraction_outcome(first_run.report)
+    (concept_id,) = [entry["node"] for entry in first_outcome.detail["synthesized"]]
+    edges = service.list_edges(
+        node_id=concept_id, type=consolidate.DERIVED_FROM_EDGE_TYPE, principal=owner()
+    )
+    assert {edge.state for edge in edges} == {"proposed"}
+
+    service.transition(concept_id, "accept", principal=owner())
+
+    accepted = service.list_edges(
+        node_id=concept_id, type=consolidate.DERIVED_FROM_EDGE_TYPE, principal=owner()
+    )
+    assert {edge.state for edge in accepted} == {"active"}
+
+    second_run = _run(jobs=[consolidate.JOB_ABSTRACTION])
+    second_outcome = _abstraction_outcome(second_run.report)
+    assert second_outcome.detail["clusters_eligible"] == 0
+    assert any("already part of a synthesis" in skip["reason"] for skip in second_outcome.skipped)
+    assert len(provider.calls) == 1, "an accepted synthesis must not be re-synthesized"
+
+
+def test_a_pending_synthesis_protects_its_members_too(fresh_db, monkeypatch):
+    """A synthesis waiting in review protects its members as well.
+
+    The freshness gate reads non-archived ``derived_from`` edges, so the
+    ``proposed`` edges of a synthesis still in the queue keep its cluster from
+    being proposed again next cycle — the duplicate-proposal shape.
+    """
+    monkeypatch.setenv(agent_runtime.ENV_CYCLE_BUDGET, "100000")
+    provider = _FakeLLM(_completion('{"title": "Alpha matters", "content": "The shared core."}'))
+    llm.set_provider(provider)
+    _dense_fresh_cluster()
+
+    first_run = _run(jobs=[consolidate.JOB_ABSTRACTION])
+    assert _abstraction_outcome(first_run.report).detail["clusters_eligible"] == 1
+    assert len(provider.calls) == 1
+
+    second_run = _run(jobs=[consolidate.JOB_ABSTRACTION])
+    second_outcome = _abstraction_outcome(second_run.report)
+
+    assert second_outcome.detail["clusters_eligible"] == 0
+    assert any("already part of a synthesis" in skip["reason"] for skip in second_outcome.skipped)
+    assert len(provider.calls) == 1, "a pending synthesis must not be re-proposed"
+
+
+def test_rejecting_a_synthesis_frees_its_members(fresh_db, monkeypatch):
+    """Rejecting a synthesis archives its membership edges with the concept.
+
+    A rejected concept's ``derived_from`` edges are meaningless — they must
+    not linger as orphaned proposals or protect their members — and the next
+    cycle must consider the cluster eligible again.
+    """
+    monkeypatch.setenv(agent_runtime.ENV_CYCLE_BUDGET, "100000")
+    provider = _FakeLLM(
+        _completion('{"title": "Alpha matters", "content": "The shared core."}'),
+        _completion('{"title": "Alpha matters again", "content": "The shared core again."}'),
+    )
+    llm.set_provider(provider)
+    first, second, third = _dense_fresh_cluster()
+    del first, second, third
+
+    first_run = _run(jobs=[consolidate.JOB_ABSTRACTION])
+    (concept_id,) = [
+        entry["node"] for entry in _abstraction_outcome(first_run.report).detail["synthesized"]
+    ]
+    service.transition(concept_id, "reject", principal=owner())
+
+    edges = service.list_edges(
+        node_id=concept_id, type=consolidate.DERIVED_FROM_EDGE_TYPE, principal=owner()
+    )
+    assert len(edges) == 3
+    assert {edge.state for edge in edges} == {"archived"}
+
+    second_run = _run(jobs=[consolidate.JOB_ABSTRACTION])
+    second_outcome = _abstraction_outcome(second_run.report)
+
+    assert second_outcome.detail["clusters_eligible"] == 1
+    assert len(provider.calls) == 2, "a rejected synthesis frees its members"
 
 
 def test_abstraction_dry_run_calls_the_model_and_writes_nothing(fresh_db, monkeypatch):

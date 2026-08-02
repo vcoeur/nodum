@@ -1103,16 +1103,17 @@ def _mean_pairwise_cosine(vectors: dict[str, list[float]], members: list[str]) -
 
 
 def _cluster_components(
-    context: _Context, nodes_by_id: dict[str, NodeOut], in_scope: set[str]
+    context: _Context, in_scope: set[str]
 ) -> tuple[list[EdgeOut], list[list[str]], set[str]]:
     """The active ``relates_to`` graph among in-scope nodes, as components.
 
     Returns the related edges, the connected components (each sorted, and the
     list itself in id order — the sort that makes a run deterministic), and the
-    set of node ids that are already members of a synthesis (the ``dst`` of an
-    active ``derived_from`` edge from a node whose ``props.synthesized`` is
-    truthy — read in the *active* state because an archived concept has been
-    rejected and its members are free again).
+    set of node ids that are already members of a synthesis (the ``dst`` of a
+    non-archived ``derived_from`` edge from a synthesized node — non-archived
+    because a *pending* synthesis's ``proposed`` edges protect its members
+    too, and only a rejected concept — whose edges the service archives with
+    it — frees them again).
 
     A node with no ``relates_to`` edge is not a cluster — it is not a member of
     any component, and it is not reported as one; reporting every orphan's
@@ -1128,13 +1129,25 @@ def _cluster_components(
         and edge.src_id in in_scope
         and edge.dst_id in in_scope
     ]
+    # Non-archived, not just active: an *accepted* synthesis's edges are now
+    # active (the service settles them with the concept), but a *pending*
+    # synthesis's edges are `proposed` and must protect their members too —
+    # proposing the same cluster again while a synthesis of it waits in the
+    # queue is the duplicate-proposal shape. Only an *archived* edge (a
+    # rejected synthesis, whose edges the service archives with the concept)
+    # frees the members. The src is matched against the synthesized nodes in
+    # every non-archived state — a pending concept is `proposed`, not
+    # `active` — and that check is also what tells a synthesis's edge from
+    # ingestion's provenance ``derived_from`` edges.
+    synthesized_nodes = {
+        node.id
+        for node in context.nodes()
+        if node.state != "archived" and bool(node.props.get("synthesized"))
+    }
     synthesized_ancestors = {
         edge.dst_id
-        for edge in active
-        if edge.type == DERIVED_FROM_EDGE_TYPE
-        and edge.src_id in in_scope
-        and edge.dst_id in in_scope
-        and bool(nodes_by_id[edge.src_id].props.get("synthesized"))
+        for edge in context.typed_edges(DERIVED_FROM_EDGE_TYPE)
+        if edge.state != "archived" and edge.src_id in synthesized_nodes and edge.dst_id in in_scope
     }
     adjacency: dict[str, set[str]] = {}
     for edge in related:
@@ -1217,10 +1230,11 @@ def _job_abstraction(context: _Context) -> JobOutcome:
        ``relates_to`` edges as members: average degree ≥ 2, which is one
        cycle rather than a chain.
     3. **Not already synthesized** — no member carries truthy
-       ``props["synthesized"]``, and no member is the target of an active
-       ``derived_from`` edge from a node that does. A rejected synthesis
-       archives its concept node, which frees its members: an archived
-       ``derived_from`` is not read.
+       ``props["synthesized"]``, and no member is the target of a non-archived
+       ``derived_from`` edge from a node that does. A synthesis is decided
+       together with its members: accepting the concept activates its edges,
+       rejecting it archives them — so a *pending* synthesis (``proposed``
+       edges) protects its members too, and only a rejected one frees them.
     4. **Dense, vector half** — the mean pairwise cosine among the members is
        at least :data:`ABSTRACTION_COHESION_COSINE` (the calibrated link bar,
        reused rather than invented). This is why the job needs the embedding
@@ -1248,7 +1262,7 @@ def _job_abstraction(context: _Context) -> JobOutcome:
     in_scope = set(nodes_by_id)
     outcome.examined = len(nodes)
 
-    related, components, synthesized_ancestors = _cluster_components(context, nodes_by_id, in_scope)
+    related, components, synthesized_ancestors = _cluster_components(context, in_scope)
 
     eligible: list[list[str]] = []
     for members in components:

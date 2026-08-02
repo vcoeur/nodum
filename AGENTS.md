@@ -117,7 +117,9 @@ already synthesized, all computed before any model call — and the model writes
 the synthesis text and nothing else: it never decides *whether* to synthesize,
 only what the text says. The write files a `concept` node `proposed` with
 `props.synthesized` and one `derived_from` edge per member, through the same
-landing seam as every other inference, and the run's cost rides the cycle
+landing seam as every other inference; a synthesis is decided together with
+its members — accepting the concept activates its `derived_from` edges,
+rejecting it archives them — and the run's cost rides the cycle
 report under `report["llm"]`. Design Constraint 4 is unchanged and now
 structurally enforced — the model stays out of validation, the state machine
 and the projectors (`tests/test_llm.py` proves those modules cannot reach
@@ -780,8 +782,10 @@ commands on a saved node for exactly this reason.
   connected components of the active `relates_to` graph, gated on size
   (`MIN_CLUSTER_MEMBERS` 3 to `MAX_CLUSTER_MEMBERS` 10), density (at least as
   many internal edges as members — one cycle, not a chain), freshness (no
-  member carries `props.synthesized`, and no member is the target of an active
-  `derived_from` edge from a node that does), and cohesion (mean pairwise
+  member carries `props.synthesized`, and no member is the target of a
+  non-archived `derived_from` edge from a node that does — a *pending*
+  synthesis protects its members too, and only a rejected one frees them),
+  and cohesion (mean pairwise
   cosine at or above the *reused* link bar `LINK_EMBEDDING_COSINE` — the
   calibrated same-area bar is the cohesion bar), capped at
   `MAX_CLUSTERS_PER_CYCLE` with overflow reported. Only then does it call the
