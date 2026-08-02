@@ -475,6 +475,67 @@ def test_a_scan_that_reaches_its_cap_says_so(fresh_db, monkeypatch):
     assert any("quadratic" in note for note in outcome.notes)
 
 
+def test_an_edge_scan_past_the_cap_is_reported_not_silent(fresh_db, monkeypatch):
+    """A read that returns the full cap says so rather than pretending to be complete.
+
+    ``list_edges`` orders oldest-first, so an over-cap graph drops the *newest*
+    rows — exactly the freshly rejected edges a suppression read exists to see.
+    The links job's outcome carries the flag and a note, and the cycle report
+    carries one too, because the metrics read under-counts ``duplicate_candidates``
+    the same way.
+    """
+    monkeypatch.setattr(consolidate, "MAX_SCAN_EDGES", 50)
+    nodes = [_node(f"Node {index}") for index in range(61)]
+    for first, second in zip(nodes, nodes[1:], strict=False):
+        _edge(first.id, second.id)
+
+    result = _run(jobs=[consolidate.JOB_LINKS])
+    outcome = _outcome(result.report, consolidate.JOB_LINKS)
+
+    assert outcome.truncated is True
+    assert any("MAX_SCAN_EDGES" in note for note in outcome.notes)
+    assert any("MAX_SCAN_EDGES" in note for note in result.report.notes)
+    assert any("duplicate_candidates" in note for note in result.report.notes)
+
+
+def test_the_duplicates_job_reports_the_cap_too(fresh_db, monkeypatch):
+    """``_job_duplicates``' suppression read is capped the same way and says so."""
+    monkeypatch.setattr(consolidate, "MAX_SCAN_EDGES", 50)
+    hub = _node("Hub")
+    for index in range(51):
+        _edge(hub.id, _node(f"Spoke {index}").id, consolidate.DUPLICATE_EDGE_TYPE)
+
+    outcome = _outcome(_run(jobs=[consolidate.JOB_DUPLICATES]).report, consolidate.JOB_DUPLICATES)
+
+    assert outcome.truncated is True
+    assert any("MAX_SCAN_EDGES" in note for note in outcome.notes)
+    assert any("rejected pair could be re-proposed" in note for note in outcome.notes)
+
+
+def test_a_rejected_relates_to_pair_is_not_reproposed_under_the_cap(fresh_db, monkeypatch):
+    """The suppression read must hold below the cap — the guarantee the flag protects.
+
+    Rejecting archives the ``relates_to`` edge, and the next cycle reads every
+    state of the type to keep the pair out of the queue. This is the guarantee
+    that silently stops holding the moment the edge count passes
+    :data:`MAX_SCAN_EDGES` — which is exactly why a read at the cap is reported
+    rather than silent.
+    """
+    monkeypatch.setattr(consolidate, "MAX_SCAN_EDGES", 50)
+    _place(Alpha=0.0, Beta=_at(BETWEEN_THE_BARS))
+    _node("Alpha")
+    _node("Beta")
+
+    _run()
+    (proposal,) = _related()
+    service.reject_proposals([proposal.id], reason="not actually related", principal=owner())
+    assert _edge_state(proposal.id) == "archived"
+
+    _run()
+
+    assert [edge.id for edge in _related()] == [proposal.id]
+
+
 def test_the_duplicate_bar_sits_above_the_link_bar():
     """Pinned, because a pair between them would otherwise queue twice."""
     assert consolidate.DUPLICATE_EMBEDDING_COSINE > consolidate.LINK_EMBEDDING_COSINE

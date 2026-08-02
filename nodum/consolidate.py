@@ -336,6 +336,7 @@ class ConsolidationReport(BaseModel):
     jobs: list[JobOutcome]
     metrics: dict[str, dict[str, float]]
     failed: list[JobFailure] = []
+    notes: list[str] = []
 
 
 class ConsolidationOut(BaseModel):
@@ -472,6 +473,11 @@ class _Context:
     path: str | Path | None
     now: datetime
     _vectors: dict[str, list[float]] = field(default_factory=dict)
+    #: Set by :meth:`edges` / :meth:`typed_edges` when a read returns the full
+    #: :data:`MAX_SCAN_EDGES` cap — SQLite may have more behind it, so every
+    #: consumer must be able to say the read was truncated. Sticky: one capped
+    #: read anywhere in the run flags the whole run.
+    truncated: bool = False
 
     def nodes(self, *, state: str | None = None) -> list[NodeOut]:
         """Curatable nodes in scope, oldest first, capped at :data:`MAX_SCAN_NODES`."""
@@ -488,17 +494,30 @@ class _Context:
         """Readable edges, oldest first, capped at :data:`MAX_SCAN_EDGES`.
 
         Not narrowed by ``scope`` here — :func:`nodum.service.list_edges` takes
-        no space filter — so callers intersect with a node-id set instead.
+        no space filter — so callers intersect with a node-id set instead. When
+        the read returns the full cap, the context's ``truncated`` flag is set:
+        ``list_edges`` orders oldest-first, so an over-cap graph drops the
+        *newest* rows — which are exactly the freshly rejected edges a
+        suppression read exists to see.
         """
-        return service.list_edges(
+        rows = service.list_edges(
             state=state, principal=self.principal, limit=MAX_SCAN_EDGES, path=self.path
         )
+        self.truncated = self.truncated or len(rows) >= MAX_SCAN_EDGES
+        return rows
 
     def typed_edges(self, edge_type: str) -> list[EdgeOut]:
-        """Every edge of one type, in every state."""
-        return service.list_edges(
+        """Edges of one type, in every state — up to :data:`MAX_SCAN_EDGES`.
+
+        Oldest first, so above the cap the *newest* rows are the ones dropped,
+        the freshly rejected ones a suppression read exists to see. Sets the
+        context's ``truncated`` flag when the read hits the cap.
+        """
+        rows = service.list_edges(
             type=edge_type, principal=self.principal, limit=MAX_SCAN_EDGES, path=self.path
         )
+        self.truncated = self.truncated or len(rows) >= MAX_SCAN_EDGES
+        return rows
 
     def vectors(self, nodes: list[NodeOut]) -> dict[str, list[float]] | None:
         """Embed these nodes, or return ``None`` when no provider is available.
@@ -581,6 +600,12 @@ def _job_duplicates(context: _Context) -> JobOutcome:
     known = {
         _unordered(edge.src_id, edge.dst_id) for edge in context.typed_edges(DUPLICATE_EDGE_TYPE)
     }
+    if context.truncated:
+        outcome.truncated = True
+        outcome.notes.append(
+            f"duplicate_of scan hit MAX_SCAN_EDGES: pairs beyond the {MAX_SCAN_EDGES}-edge "
+            "cap were not checked, so a rejected pair could be re-proposed"
+        )
     matched: dict[tuple[str, str], tuple[list[str], float]] = {}
     for index, older in enumerate(candidates):
         for newer in candidates[index + 1 :]:
@@ -768,6 +793,12 @@ def _infer_links(context: _Context, outcome: JobOutcome, active_ids: set[str]) -
     connected |= {
         _unordered(edge.src_id, edge.dst_id) for edge in context.typed_edges(RELATED_EDGE_TYPE)
     }
+    if context.truncated:
+        outcome.truncated = True
+        outcome.notes.append(
+            f"relates_to scan hit MAX_SCAN_EDGES: the archived-edge suppression read was "
+            f"capped, so a rejected pair could be re-proposed beyond the {MAX_SCAN_EDGES}-edge cap"
+        )
     neighbours: dict[str, set[str]] = {}
     for edge in live:
         if edge.state != "active" or edge.src_id == edge.dst_id:
@@ -1240,7 +1271,13 @@ def _run_cycle(
 
 
 def _run_jobs(context: _Context, cycle: CycleOut, selected: list[str]) -> ConsolidationReport:
-    """Snapshot the metrics, run each job in isolation, snapshot them again."""
+    """Snapshot the metrics, run each job in isolation, snapshot them again.
+
+    The report picks up the context's truncation flag: when any edge scan hit
+    :data:`MAX_SCAN_EDGES` during the run, ``notes`` names the consequence for
+    ``duplicate_candidates`` (an under-count) — a job's own outcome already
+    says it for its own read.
+    """
     before = _metrics(context)
     outcomes: list[JobOutcome] = []
     failed: list[JobFailure] = []
@@ -1255,10 +1292,17 @@ def _run_jobs(context: _Context, cycle: CycleOut, selected: list[str]) -> Consol
             outcomes.append(JobOutcome(name=name, error=message))
             failed.append(JobFailure(job=name, error=message))
     after = _metrics(context)
+    report_notes: list[str] = []
+    if context.truncated:
+        report_notes.append(
+            f"an edge scan hit MAX_SCAN_EDGES: duplicate_candidates under-counts pairs "
+            f"beyond the {MAX_SCAN_EDGES}-edge cap"
+        )
     return ConsolidationReport(
         scope=cycle.scope,
         dry_run=cycle.dry_run,
         jobs=outcomes,
         metrics={"before": before, "after": after},
         failed=failed,
+        notes=report_notes,
     )
