@@ -1949,22 +1949,27 @@ def test_a_base_url_that_does_not_parse_is_a_stranger_and_not_a_traceback(monkey
     [
         ("api.deepseek.com/v1", "unknown url type"),
         ("http://[bad/v1", "Invalid IPv6 URL"),
+        ("localhost:11434/v1", "localhost"),
     ],
-    ids=["no-scheme", "bad-ipv6"],
+    ids=["no-scheme", "bad-ipv6", "scheme-localhost"],
 )
 def test_a_base_url_urllib_cannot_post_to_is_no_provider_with_a_reason(
     monkeypatch, base_url: str, detail: str
 ):
     """Unusable configuration is an absence with a sentence, never a failed call.
 
-    Both spellings are driven rather than imagined:
+    Three spellings are driven rather than imagined:
     ``NODUM_LLM_BASE_URL=api.deepseek.com/v1`` and
     ``NODUM_LLM_BASE_URL=http://[bad/v1`` each raised out of
     ``urllib.request.Request`` — which is *configuration* failing, not a
-    network. ``nodum llm status`` says "nothing here is an error", so this
-    belongs beside an unparseable ``NODUM_LLM_CONTEXT_TOKENS`` and an
-    unrecognised ``NODUM_LLM_THINKING``: no provider, a reason naming the
-    variable and the fix, and exit 0.
+    network. The third, ``NODUM_LLM_BASE_URL=localhost:11434/v1``, parses
+    (urlsplit reads ``localhost`` as a scheme), so urllib never objects — it
+    used to resolve into a provider that failed at call time as
+    ``ProviderUnavailable``, and it is now refused by the scheme check the
+    constructor is followed by. ``nodum llm status`` says "nothing here is an
+    error", so this belongs beside an unparseable ``NODUM_LLM_CONTEXT_TOKENS``
+    and an unrecognised ``NODUM_LLM_THINKING``: no provider, a reason naming
+    the variable and the fix, and exit 0.
 
     **The scheme is not guessed back in**, which is the decision this pins. A
     repair would choose ``http`` or ``https`` for the operator, and that choice
@@ -1997,6 +2002,34 @@ def test_a_scheme_less_base_url_is_still_read_as_a_host_for_the_profile_match(mo
     """
     assert llm.profile_for(model="anything-at-all", base_url="api.deepseek.com/v1") is not None
     assert llm.base_url_problem("api.deepseek.com/v1") is not None
+
+
+@pytest.mark.parametrize(
+    ("base_url", "fixed"),
+    [
+        ("localhost:11434/v1", "http://localhost:11434/v1"),
+        ("ftp://host/v1", None),
+        ("file:///x", None),
+    ],
+    ids=["scheme-localhost", "scheme-ftp", "scheme-file"],
+)
+def test_a_base_url_whose_scheme_is_not_http_is_refused(base_url: str, fixed: str | None):
+    """``localhost:11434/v1`` is the spelling that slipped past the constructor.
+
+    ``urllib.request.Request`` accepts it — urlsplit reads ``localhost`` as a
+    scheme — so the refusal has to come from a check the constructor does not
+    provide: after it succeeds, the parsed scheme must be ``http`` or
+    ``https``. ``ftp`` and ``file`` are registered urllib types it is equally
+    happy to parse, and this provider would no more POST a chat completion to
+    an FTP server than to a host named ``localhost``. Each is refused as
+    configuration, with a reason naming the URL, at resolution time — before
+    any provider exists to fail as ``ProviderUnavailable`` at call time.
+    """
+    problem = llm.base_url_problem(base_url)
+    assert problem is not None
+    assert base_url in problem, "the refusal must name the URL that is wrong"
+    if fixed is not None:
+        assert llm.base_url_problem(fixed) is None, "the fix is additive: a real scheme parses"
 
 
 def test_the_profiled_host_is_matched_however_the_url_is_spelled(monkeypatch):

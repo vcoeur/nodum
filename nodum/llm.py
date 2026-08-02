@@ -872,13 +872,21 @@ def base_url_problem(base_url: str) -> str | None:
     **The check is the operation itself**, not a heuristic about it:
     ``urllib.request.Request`` parses the URL in its constructor and makes no
     network call, so asking it to build the request this provider will really
-    send is exact — it accepts everything :meth:`OpenAICompatProvider._post`
-    would accept and refuses everything it would refuse, and it cannot
-    over-refuse a spelling that works.
+    send is exact about what *urllib* accepts — it cannot over-refuse a
+    spelling that works. One exactness needs a second, because urllib accepts
+    more than this class ever sends a completion to: ``localhost:11434/v1``
+    parses (urlsplit reads ``localhost`` as a scheme), and ``ftp``/``file``
+    are registered urllib types. So once the constructor succeeds, the scheme
+    is read back off the parsed URL and anything but ``http``/``https`` is
+    refused the same way as the constructor's own failures — a wrong scheme
+    must surface as *no provider with a reason* at resolution time, not as a
+    ``ProviderUnavailable`` after a provider was built.
 
-    Two spellings reach it, both driven rather than imagined:
+    Three spellings reach it, all driven rather than imagined:
     ``api.deepseek.com/v1`` is ``ValueError: unknown url type`` (a base URL with
-    no scheme) and ``http://[bad/v1`` is ``ValueError: Invalid IPv6 URL``.
+    no scheme), ``http://[bad/v1`` is ``ValueError: Invalid IPv6 URL``, and
+    ``localhost:11434/v1`` is refused by the scheme check — urllib accepts the
+    URL and only the scheme test knows it is not one this provider can POST to.
 
     **A scheme-less base URL is refused here rather than repaired**, which is
     the decision worth stating because :func:`_hostname` deliberately reads a
@@ -897,6 +905,16 @@ def base_url_problem(base_url: str) -> str | None:
         urllib.request.Request(_completions_url(base_url), method="POST")
     except ValueError as failure:
         return str(failure)
+    # The constructor is exact about urllib; this is the provider's own
+    # boundary. urllib accepts ftp and file as registered types, and reads
+    # `localhost:11434/v1` as scheme `localhost` — none of those is an
+    # endpoint this class POSTs a chat completion to.
+    split = urllib.parse.urlsplit(_completions_url(base_url))
+    if split.scheme not in ("http", "https"):
+        return (
+            f"{base_url!r} has scheme {split.scheme!r}, which is not http or https — "
+            f"this provider only POSTs to those two"
+        )
     return None
 
 
