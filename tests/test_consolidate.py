@@ -24,11 +24,13 @@ import sys
 import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import pytest
 from helpers import agent, owner
 
-from nodum import auth, consolidate, db, embeddings, service
+from nodum import agent as agent_runtime
+from nodum import auth, consolidate, db, embeddings, llm, service
 from nodum.store import GrantNotPermitted
 
 #: The labelled pairs the two cosine bars are measured *against* — not set from,
@@ -1824,6 +1826,199 @@ def test_a_sized_cluster_below_the_minimum_is_skipped(fresh_db):
     assert "below the" in skip["reason"]
 
 
+# ── The abstraction job's write half (S2: the model call) ─────────────────────
+
+
+def _completion(text: str, *, prompt_tokens: int = 100, output_tokens: int = 40) -> llm.Completion:
+    """One whole fake completion, shaped like ``test_agent.py``'s."""
+    return llm.Completion(
+        text=text,
+        prompt_tokens=prompt_tokens,
+        output_tokens=output_tokens,
+        finish_reason="stop",
+        model_id="fake-model",
+        provider_id="fake://provider",
+        context_tokens=4096,
+        latency_ms=7,
+    )
+
+
+class _FakeLLM:
+    """A provider that replays what it was given and records every call.
+
+    Modeled on ``test_agent.py``'s ``FakeProvider``, cut to what the job needs:
+    the call shape, and a body per call. The ``estimate`` is the module's own
+    over-count without the schema's measured 330 tokens — exactness does not
+    matter here, because the budget is sized so nothing refuses.
+    """
+
+    provider_id = "fake://provider"
+    model_id = "fake-model"
+    context_tokens = 4096
+    thinking = llm.DEFAULT_THINKING
+    thinking_applied = True
+    structured_mode = llm.STRUCTURED_JSON_SCHEMA
+
+    def __init__(self, *answers: llm.Completion) -> None:
+        self.answers = list(answers)
+        self.calls: list[dict[str, Any]] = []
+
+    def estimate_prompt_tokens(self, messages, *, schema=None) -> int:
+        return llm.estimate_prompt_tokens(messages)
+
+    def output_reservation(self, max_output_tokens: int) -> int:
+        return max(1, min(max_output_tokens, 2048))
+
+    def chat(
+        self, messages, *, schema=None, max_output_tokens, timeout, thinking=None
+    ) -> llm.Completion:
+        self.calls.append(
+            {
+                "messages": list(messages),
+                "schema": schema,
+                "max_output_tokens": max_output_tokens,
+                "timeout": timeout,
+                "thinking": thinking,
+            }
+        )
+        return self.answers[min(len(self.calls) - 1, len(self.answers) - 1)]
+
+
+def _dense_fresh_cluster():
+    """Three active notes in a triangle, cohesive at the placed angle."""
+    _place(Alpha=0.0)
+    first, second, third = (
+        _node("Alpha one"),
+        _node("Alpha two"),
+        _node("Alpha three"),
+    )
+    _relates(first.id, second.id)
+    _relates(second.id, third.id)
+    _relates(third.id, first.id)
+    return first, second, third
+
+
+def test_abstraction_with_no_budget_noops_and_says_so(fresh_db, monkeypatch):
+    """K2 level 1: an unset budget means the LLM jobs do not run.
+
+    The deterministic selection still ran — it costs nothing — and only the
+    model spend is gated, which is the whole point of the separation.
+    """
+    monkeypatch.delenv(agent_runtime.ENV_CYCLE_BUDGET, raising=False)
+    provider = _FakeLLM(_completion('{"title": "x", "content": "y"}'))
+    llm.set_provider(provider)
+    _dense_fresh_cluster()
+
+    outcome = _abstraction_outcome(_run(jobs=[consolidate.JOB_ABSTRACTION]).report)
+
+    assert outcome.detail["clusters_eligible"] == 1
+    assert outcome.proposed == []
+    assert any("NODUM_LLM_CYCLE_BUDGET is 0" in note for note in outcome.notes)
+    assert provider.calls == [], "no budget must mean no provider call"
+
+
+def test_abstraction_with_a_budget_synthesizes_a_proposed_concept(fresh_db, monkeypatch):
+    """S2: the model writes the text, the job writes the concept and its edges.
+
+    The write goes through the public service API exactly like every other
+    job's — visible to ``service.get_node``, filed ``proposed``, carrying the
+    freshness gate's own record (``props.synthesized``) and the provenance.
+    """
+    monkeypatch.setenv(agent_runtime.ENV_CYCLE_BUDGET, "100000")
+    body = {"title": "Alpha matters", "content": "What the Alpha notes share."}
+    provider = _FakeLLM(_completion(json.dumps(body)))
+    llm.set_provider(provider)
+    first, second, third = _dense_fresh_cluster()
+
+    outcome = _abstraction_outcome(_run(jobs=[consolidate.JOB_ABSTRACTION]).report)
+
+    assert len(provider.calls) == 1
+    (concept_id,) = outcome.proposed
+    concept = service.get_node(concept_id, principal=owner())
+    assert concept.type == "concept"
+    assert concept.state == "proposed"
+    assert concept.title == "Alpha matters"
+    assert concept.content == "What the Alpha notes share."
+    assert concept.props["synthesized"] is True
+    assert concept.props["members"] == sorted([first.id, second.id, third.id])
+    assert concept.props["job"] == consolidate.JOB_ABSTRACTION
+    assert concept.props["generated_by"]["model_id"] == "fake-model"
+    assert concept.props["generated_by"]["prompt_version"] == consolidate.ABSTRACTION_PROMPT_VERSION
+    edges = service.list_edges(
+        node_id=concept_id, type=consolidate.DERIVED_FROM_EDGE_TYPE, principal=owner()
+    )
+    assert len(edges) == 3
+    assert {edge.state for edge in edges} == {"proposed"}
+    assert {edge.dst_id for edge in edges} == {first.id, second.id, third.id}
+    assert all(edge.props.get("job") == consolidate.JOB_ABSTRACTION for edge in edges)
+    assert outcome.applied == [edge.id for edge in edges]
+    assert [entry["node"] for entry in outcome.detail["synthesized"]] == [concept_id]
+
+
+def test_abstraction_dry_run_calls_the_model_and_writes_nothing(fresh_db, monkeypatch):
+    """B4: a rehearsal pays for the expensive half — the model is called, nothing written."""
+    monkeypatch.setenv(agent_runtime.ENV_CYCLE_BUDGET, "100000")
+    provider = _FakeLLM(_completion('{"title": "t", "content": "c"}'))
+    llm.set_provider(provider)
+    first, second, third = _dense_fresh_cluster()
+    del first, second, third
+    before = len(service.list_nodes(principal=owner()))
+
+    outcome = _abstraction_outcome(_run(jobs=[consolidate.JOB_ABSTRACTION], dry_run=True).report)
+
+    assert len(provider.calls) == 1, "B4: the dry run must cost what the run costs"
+    assert outcome.proposed == []
+    assert outcome.applied == []
+    assert [entry["dry_run"] for entry in outcome.detail["synthesized"]] == [True]
+    assert any(
+        "dry run: would synthesize 1 concept(s) from 3 member(s)" in note for note in outcome.notes
+    )
+    assert len(service.list_nodes(principal=owner())) == before
+    assert service.list_edges(type=consolidate.DERIVED_FROM_EDGE_TYPE, principal=owner()) == []
+
+
+def test_a_malformed_model_body_is_a_job_error_not_a_write(fresh_db, monkeypatch):
+    """A body that fails to parse is a job error — the cycle closes failed."""
+    monkeypatch.setenv(agent_runtime.ENV_CYCLE_BUDGET, "100000")
+    provider = _FakeLLM(_completion("this is not json"))
+    llm.set_provider(provider)
+    _dense_fresh_cluster()
+
+    result = _run(jobs=[consolidate.JOB_ABSTRACTION])
+
+    assert result.cycle.status == "failed"
+    (failure,) = result.report.failed
+    assert failure.job == consolidate.JOB_ABSTRACTION
+    assert "not JSON" in failure.error
+    assert result.report.jobs[0].proposed == []
+    assert service.list_edges(type=consolidate.DERIVED_FROM_EDGE_TYPE, principal=owner()) == []
+
+
+def test_the_journal_carries_the_llm_report(fresh_db, monkeypatch):
+    """A1: cost rides the cycle report under ``agent.REPORT_KEY``."""
+    monkeypatch.setenv(agent_runtime.ENV_CYCLE_BUDGET, "100000")
+    provider = _FakeLLM(
+        _completion('{"title": "t", "content": "c"}', prompt_tokens=321, output_tokens=45)
+    )
+    llm.set_provider(provider)
+    _dense_fresh_cluster()
+
+    result = _run(jobs=[consolidate.JOB_ABSTRACTION])
+
+    stored = result.cycle.report[agent_runtime.REPORT_KEY]
+    assert stored["calls"] == 1
+    assert stored["failed_calls"] == 0
+    assert stored["prompt_tokens"] == 321
+    assert stored["output_tokens"] == 45
+    assert stored["total_tokens"] == 366
+    assert stored["provider"] == "fake://provider"
+    assert stored["model_id"] == "fake-model"
+    (per_job,) = stored["per_job"]
+    assert per_job["job"] == consolidate.JOB_ABSTRACTION
+    assert per_job["calls"] == 1
+    assert result.report.llm == stored, "the typed half of the report is the same data"
+
+
 # ── The structural rail: no service-layer bypass ─────────────────────────────
 
 
@@ -1962,10 +2157,11 @@ def test_the_deterministic_runner_consults_no_stop_switch_and_the_copy_says_so(
 
     # Every call that consults the switch — the service read itself, the wiring
     # helper, the runtime's own check, the runtime's construction, and the one
-    # door that checks first — must live inside the abstraction job. The
-    # `agent.prompt_version` module-level constant is excluded from the `agent`
-    # use check below: it is computed once at import time from the template
-    # string and consults nothing.
+    # door that checks first — must live inside the abstraction job. The two
+    # module-level uses of the `agent` name are excluded from the use check
+    # below: `agent.prompt_version` is computed once at import time from the
+    # template string and consults nothing, and `agent.LLMReport` is the type
+    # of the context's report slot — an annotation rather than a call.
     consulting = {"stop_requested", "cycle_stop_check", "check_stop", "for_cycle", "chat"}
     offside = [
         node
@@ -1988,7 +2184,7 @@ def test_the_deterministic_runner_consults_no_stop_switch_and_the_copy_says_so(
         if isinstance(node, ast.Attribute)
         and isinstance(node.value, ast.Name)
         and node.value.id == "agent"
-        and node.attr != "prompt_version"
+        and node.attr not in {"prompt_version", "LLMReport"}
     ]
     offside_uses = [use for use in agent_uses if not inside_abstraction(use)]
     assert offside_uses == [], (

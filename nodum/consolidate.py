@@ -105,6 +105,7 @@ from __future__ import annotations
 
 import difflib
 import itertools
+import json
 import math
 import unicodedata
 from dataclasses import dataclass, field
@@ -432,6 +433,11 @@ class ConsolidationReport(BaseModel):
     metrics: dict[str, dict[str, float]]
     failed: list[JobFailure] = []
     notes: list[str] = []
+    #: ``report["llm"]`` — :meth:`nodum.agent.AgentRun.report` of the run the
+    #: abstraction job drove, as JSON, or ``None`` when no LLM job ran. Filed by
+    #: :func:`_run_jobs` from the context (not returned from the job) so
+    #: :data:`JOBS` keeps its one signature.
+    llm: dict[str, Any] | None = None
 
 
 class ConsolidationOut(BaseModel):
@@ -560,6 +566,9 @@ class _Context:
     asked, which is what makes "who acted" answerable from the event log alone.
     ``scope`` is the *resolved* space id the cycle recorded (or ``None`` for the
     whole file), so every read narrows the same way the journal says it did.
+    ``cycle_id`` is the open cycle's id — the only thing the abstraction job
+    needs from the runner beyond the public reads, because the model runtime
+    (:func:`nodum.agent.for_cycle`) is wired to that row's kill switch.
     """
 
     principal: Principal
@@ -567,6 +576,7 @@ class _Context:
     dry_run: bool
     path: str | Path | None
     now: datetime
+    cycle_id: str
     _vectors: dict[str, list[float]] = field(default_factory=dict)
     #: Set by :meth:`edges` / :meth:`typed_edges` when a read returns *more
     #: than* :data:`MAX_SCAN_EDGES` rows (each fetches one past the cap so
@@ -574,6 +584,11 @@ class _Context:
     #: Sticky: one capped read anywhere in the run flags the whole run, so a
     #: consumer knows an edge read dropped rows but not *which* read did.
     truncated: bool = False
+    #: The :class:`~nodum.agent.LLMReport` of the run the abstraction job
+    #: drove, filed into the cycle's report under :data:`nodum.agent.REPORT_KEY`
+    #: by :func:`_run_jobs`. Read here rather than returned from the job so
+    #: :data:`JOBS` keeps its one signature.
+    llm_report: agent.LLMReport | None = None
 
     def nodes(self, *, state: str | None = None) -> list[NodeOut]:
         """Curatable nodes in scope, oldest first, capped at :data:`MAX_SCAN_NODES`."""
@@ -1146,6 +1161,47 @@ def _cluster_components(
     return related, components, synthesized_ancestors
 
 
+def _render_abstraction_prompt(members: list[NodeOut]) -> str:
+    """The synthesis prompt for one cluster, from :data:`ABSTRACTION_PROMPT`.
+
+    Each member's content is capped at :data:`ABSTRACTION_MEMBER_CHARS`: the
+    model does not need the member whole to say what several members share, and
+    a ten-member cluster of long notes would otherwise blow a small window —
+    the provider's own refusal is the backstop, not the ordinary path.
+    """
+    rendered = "\n".join(
+        f"- **{node.title or '(untitled)'}**: {(node.content or '')[:ABSTRACTION_MEMBER_CHARS]}"
+        for node in members
+    )
+    return ABSTRACTION_PROMPT.format(members=rendered)
+
+
+def _decode_abstraction_body(text: str, item_id: str) -> dict[str, str]:
+    """Read the model's reply as the ``{title, content}`` the schema asked for.
+
+    A schema makes this reliable and not certain — a provider that ignores
+    ``response_format`` answers with prose, which is a job error here, never a
+    write. Mirrors :func:`nodum.answers._decode`'s shape for the same reason:
+    a body that fails to parse must not become a node nobody asked for.
+    """
+    try:
+        body = json.loads(text)
+    except (ValueError, TypeError):
+        raise ValueError(
+            f"the abstraction model body for {item_id} is not JSON: {text[:120]!r}"
+        ) from None
+    if (
+        not isinstance(body, dict)
+        or not isinstance(body.get("title"), str)
+        or not isinstance(body.get("content"), str)
+    ):
+        raise ValueError(
+            f"the abstraction model body for {item_id} is not a {{title, content}} "
+            f"object: {str(body)[:120]!r}"
+        )
+    return {"title": body["title"], "content": body["content"]}
+
+
 def _job_abstraction(context: _Context) -> JobOutcome:
     """Find the clusters worth synthesizing, and write the synthesis (5b-ii).
 
@@ -1173,10 +1229,18 @@ def _job_abstraction(context: _Context) -> JobOutcome:
        mode to fall back to.
 
     Eligible clusters are capped at :data:`MAX_CLUSTERS_PER_CYCLE`, sorted by
-    their member-id tuple; overflow is reported in a note, never silent. The
-    write half — the model call and the ``derived_from`` edges — lands in the
-    next commit; this one ships the selection and a placeholder note that says
-    so.
+    their member-id tuple; overflow is reported in a note, never silent. For
+    each considered cluster the job then calls the model through
+    :func:`nodum.agent.for_cycle` — gated first on the cycle budget
+    (:data:`nodum.agent.ENV_CYCLE_BUDGET`, off by default) and on a configured
+    provider — and the model's ``{title, content}`` is the *only* thing the
+    gates did not decide. The write files the concept node ``proposed`` with
+    ``props.synthesized`` (the freshness gate's own record) plus one
+    ``derived_from`` edge per member, and a dry run still pays for the model
+    calls (B4) while writing nothing. A body that fails to parse is a job
+    error, not a write; a ceiling or a stop behave as the runtime documents
+    them. The run's :meth:`nodum.agent.AgentRun.report` is filed into the
+    cycle's report under :data:`nodum.agent.REPORT_KEY` by :func:`_run_jobs`.
     """
     outcome = JobOutcome(name=JOB_ABSTRACTION)
     nodes = context.nodes(state="active")
@@ -1250,11 +1314,113 @@ def _job_abstraction(context: _Context) -> JobOutcome:
     outcome.detail["clusters_considered"] = len(considered)
     outcome.detail["eligible_clusters"] = considered
     outcome.skipped = outcome.skipped[:MAX_REPORTED_ITEMS]
-    outcome.notes.append(
-        "the write half is not here yet: the next commit calls the model through "
-        "`AgentRun.chat` for each eligible cluster and files the synthesis `proposed`"
-    )
-    return outcome
+
+    # The write half. The deterministic selection above already ran whatever
+    # this half decides — the gates cost nothing, the model spend is what is
+    # gated.
+    run = agent.for_cycle(cycle_id=context.cycle_id, principal=context.principal, path=context.path)
+    try:
+        if run.budget.tokens <= 0:
+            outcome.notes.append("NODUM_LLM_CYCLE_BUDGET is 0: the abstraction job did not run")
+            return outcome
+        if not run.available:
+            outcome.notes.append(
+                f"no LLM provider ({run.unavailable_reason}): the abstraction job did not run"
+            )
+            return outcome
+        job_budget = run.job(JOB_ABSTRACTION, share=1.0)
+        outcome.detail["synthesized"] = []
+        synthesized_count = 0
+        member_count = 0
+        for members in considered:
+            item_id = "cluster:" + "-".join(members)
+            prompt = _render_abstraction_prompt([nodes_by_id[member] for member in members])
+            try:
+                generation = run.chat(
+                    [agent.Message(role="user", content=prompt)],
+                    prompt_version=ABSTRACTION_PROMPT_VERSION,
+                    schema=ABSTRACTION_SCHEMA,
+                    job=job_budget,
+                    item_id=item_id,
+                )
+            except agent.CycleStopped:
+                raise
+            except agent.BudgetExhausted:
+                # The run's report carries the exhausted flag and the itemised
+                # skip; the job is not a failure, the ceiling stopped the work.
+                break
+            except agent.PromptTooLong:
+                outcome.skipped.append(
+                    {"id": item_id, "reason": "the prompt does not fit the model's window"}
+                )
+                continue
+            body = _decode_abstraction_body(generation.text, item_id)
+            synthesized_count += 1
+            member_count += len(members)
+            if context.dry_run:
+                outcome.detail["synthesized"].append(
+                    {
+                        "node": None,
+                        "members": members,
+                        "title": body["title"],
+                        "dry_run": True,
+                    }
+                )
+                continue
+            node = service.create_node(
+                type="concept",
+                title=body["title"],
+                content=body["content"],
+                landing=SUGGESTION_LANDING,
+                props={
+                    "synthesized": True,
+                    "members": members,
+                    "job": JOB_ABSTRACTION,
+                    **generation.generated_by.as_props(),
+                },
+                principal=context.principal,
+                path=context.path,
+            )
+            outcome.proposed.append(node.id)
+            for member in members:
+                try:
+                    edge = service.create_edge(
+                        node.id,
+                        member,
+                        DERIVED_FROM_EDGE_TYPE,
+                        landing=SUGGESTION_LANDING,
+                        props={"job": JOB_ABSTRACTION},
+                        principal=context.principal,
+                        path=context.path,
+                    )
+                    outcome.applied.append(edge.id)
+                except (
+                    GrantNotPermitted,
+                    service.NodeNotFound,
+                    service.TypeNotFound,
+                    ValueError,
+                ) as refusal:
+                    # A cross-space member the gardener may not write costs one
+                    # skipped line and not the synthesis.
+                    outcome.skipped.append({"id": f"{node.id}->{member}", "reason": str(refusal)})
+            outcome.detail["synthesized"].append(
+                {"node": node.id, "members": members, "title": body["title"]}
+            )
+        if context.dry_run and synthesized_count:
+            outcome.notes.append(
+                f"dry run: would synthesize {synthesized_count} concept(s) from "
+                f"{member_count} member(s)"
+            )
+        outcome.detail["cost"] = {
+            "calls": run.budget.calls,
+            "failed_calls": run.budget.failed_calls,
+            "prompt_tokens": run.budget.spent_prompt_tokens,
+            "output_tokens": run.budget.spent_output_tokens,
+            "total_tokens": run.budget.spent_tokens,
+        }
+        return outcome
+    finally:
+        context.llm_report = run.report()
 
 
 #: The jobs, in run order. ``jobs=`` selects a subset by these names.
@@ -1532,7 +1698,12 @@ def _run_cycle(
         trigger=trigger, scope=scope, dry_run=dry_run, principal=opener, path=path
     )
     context = _Context(
-        principal=gardener, scope=cycle.scope, dry_run=dry_run, path=path, now=_utcnow()
+        principal=gardener,
+        scope=cycle.scope,
+        dry_run=dry_run,
+        path=path,
+        now=_utcnow(),
+        cycle_id=cycle.id,
     )
     try:
         _require_gardener_scope(scope, cycle, gardener, path)
@@ -1604,4 +1775,5 @@ def _run_jobs(context: _Context, cycle: CycleOut, selected: list[str]) -> Consol
         metrics={"before": before, "after": after},
         failed=failed,
         notes=report_notes,
+        llm=context.llm_report.model_dump(mode="json") if context.llm_report is not None else None,
     )
