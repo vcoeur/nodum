@@ -952,6 +952,87 @@ ALTER TABLE cycles ADD COLUMN stop_requested_by TEXT
 """
 
 
+CONVENTIONS_AND_ANNOTATIONS_DDL = """
+-- The conventions space and the annotations table (Phase 5b, design §L2).
+--
+-- `conventions` is the gardener's own workspace: convention nodes are ordinary
+-- `note` nodes living here, written by the cycle like anything else (L2). The
+-- gardener holds `edit` on it **alone** — restoring `edit` on `meta` was
+-- rejected because 5a's live pass proved it buys the ability to rename `main`
+-- and archive the `note` type, after which a human cannot write a note. The
+-- grant is an ordinary row, like 0014's: `nodum revoke builtin-gardener
+-- conventions` turns the whole feature off with the command that was already
+-- there.
+--
+-- **A space named `conventions` already existing refuses the upgrade.**
+-- `idx_space_title` (0013) is unique over space titles in every state, so the
+-- INSERT below would otherwise die on a bare `UNIQUE constraint failed` —
+-- the exact failure shape this repo's migrations exist to refuse readably.
+-- The device is 0014's reserved-prefix abort: a CHECK whose **name** is the
+-- message SQLite prints. It also catches a raw node whose *id* is
+-- `conventions`, which would collide on the primary key instead.
+CREATE TABLE _conventions_reserved (
+    taken TEXT,
+    CONSTRAINT
+"a node id or space title 'conventions' already exists: rename or remove it, then re-run"
+    CHECK (taken IS NULL)
+);
+INSERT INTO _conventions_reserved (taken)
+SELECT id FROM nodes
+WHERE id = 'conventions' OR (type_id = 'space' AND title = 'conventions');
+DROP TABLE _conventions_reserved;
+
+INSERT INTO nodes (id, space_id, type_id, title, props, state, created_by)
+VALUES ('conventions', 'meta', 'space', 'conventions', '{}', 'active', 'system');
+
+INSERT INTO grants (agent_id, space_id, level)
+VALUES ('builtin-gardener', 'conventions', 'edit');
+
+-- The annotations table: one per queue item, saying what a proposer's
+-- acceptance signal judged and at what rate (design §L1 — "one annotation per
+-- queue item saying this proposer accepts at 92 % on this edge type; these two
+-- signals fired"). Written by the learned-curation cycle (5b-ii), never by a
+-- human; read only attached to a `ProposalOut` the store has already filtered.
+--
+-- It is an **exclusive arc**, this schema's own idiom (`url_tokens`): three
+-- typed nullable columns with real `ON DELETE CASCADE` foreign keys and a
+-- `CHECK` that exactly one is non-null. `(target_kind, target_id)` was the
+-- first-cut shape and was corrected 2026-08-02 — addressing three tables does
+-- not require being untyped, and the orphan cost of the untyped shape is real
+-- because `service._delete_created_row` hard-deletes edges and versions on the
+-- undo path. `target_kind` drops out entirely: the non-null column *is* the
+-- kind. `target_version_id` is INTEGER because `versions.id` is.
+--
+-- Three partial unique indexes replace one composite, holding the same rule:
+-- the design says *one* annotation per queue item, so re-annotating on a later
+-- cycle replaces rather than accumulates.
+--
+-- `cycle_id` points at the cycle that wrote the night's annotations, so they
+-- roll back with it — 5a's atomic rollback still has to learn this table.
+CREATE TABLE annotations (
+    id                TEXT PRIMARY KEY,   -- uuid4().hex, like every generated id
+    target_node_id    TEXT    REFERENCES nodes(id)    ON DELETE CASCADE,
+    target_edge_id    TEXT    REFERENCES edges(id)    ON DELETE CASCADE,
+    target_version_id INTEGER REFERENCES versions(id) ON DELETE CASCADE,
+    body              TEXT NOT NULL,      -- JSON: the rate, and which signals fired
+    actor             TEXT NOT NULL,
+    cycle_id          TEXT REFERENCES cycles(id),
+    created_at        TEXT NOT NULL DEFAULT (datetime('now')),
+    CHECK ((target_node_id IS NOT NULL) + (target_edge_id IS NOT NULL)
+         + (target_version_id IS NOT NULL) = 1)
+);
+CREATE UNIQUE INDEX idx_annotations_node
+    ON annotations(target_node_id)
+    WHERE target_node_id IS NOT NULL;
+CREATE UNIQUE INDEX idx_annotations_edge
+    ON annotations(target_edge_id)
+    WHERE target_edge_id IS NOT NULL;
+CREATE UNIQUE INDEX idx_annotations_version
+    ON annotations(target_version_id)
+    WHERE target_version_id IS NOT NULL;
+"""
+
+
 #: Ordered (name, SQL) migrations. Append-only — never edit a shipped entry.
 MIGRATIONS: list[tuple[str, str]] = [
     ("0001_core", CORE_DDL),
@@ -969,4 +1050,5 @@ MIGRATIONS: list[tuple[str, str]] = [
     ("0013_unique_space_titles", UNIQUE_SPACE_TITLES_DDL),
     ("0014_cycles_and_gardener", CYCLES_AND_GARDENER_DDL),
     ("0015_cycle_stop_switch", CYCLE_STOP_SWITCH_DDL),
+    ("0016_conventions_and_annotations", CONVENTIONS_AND_ANNOTATIONS_DDL),
 ]

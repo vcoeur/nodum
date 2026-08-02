@@ -776,6 +776,7 @@ def _materialize_mentions(
     actor: str,
     store: Store,
     cycle_id: str | None = None,
+    landing: str | None = None,
 ) -> None:
     """Sync a node's ``[[wikilinks]]`` with its pending/active ``mentions`` edges.
 
@@ -786,9 +787,13 @@ def _materialize_mentions(
     A materialised edge lands in the state the writer's grants allow on both
     endpoint spaces (``active`` on edit, ``proposed`` on suggest); a target
     the writer may not link to — unreadable, or under-granted — is skipped
-    rather than failing the write (:func:`Store.edge_landing_state`). A
-    pending edge goes live when a reviewer accepts the proposing node
-    (:func:`_activate_pending_mentions`) or the edge itself.
+    rather than failing the write (:func:`Store.edge_landing_state`). The
+    caller's own ``landing`` ceiling is applied on top
+    (:func:`Store.cap_landing`), so a writer filing a node ``proposed`` files
+    its mentions ``proposed`` too — the node and its links wait in review
+    together; accepting the node sweeps the links live, rejecting it leaves
+    none. A pending edge goes live when a reviewer accepts the proposing
+    node (:func:`_activate_pending_mentions`) or the edge itself.
 
     **Archival is authority-gated the same way** (Q13 review B2): an existing
     edge is only retired when the writer holds ``edit`` on *both* endpoint
@@ -804,7 +809,7 @@ def _materialize_mentions(
     node = dict(node_row)
     targets = set(WIKILINK_RE.findall(node["content"] or ""))
     resolved: set[str] = set()
-    landing: dict[str, str] = {}
+    edge_landing: dict[str, str] = {}
     for target in targets:
         dst = _resolve_wikilink(conn, target, store)
         if dst is None or dst == node["id"]:
@@ -813,7 +818,9 @@ def _materialize_mentions(
             "space_id"
         ]
         try:
-            landing[dst] = store.edge_landing_state(node["space_id"], dst_space, META_SPACE_ID)
+            edge_landing[dst] = store.edge_landing_state(
+                node["space_id"], dst_space, META_SPACE_ID, landing
+            )
         except GrantNotPermitted:
             continue  # no grant to link there — the wikilink is skipped, not fatal
         resolved.add(dst)
@@ -836,7 +843,7 @@ def _materialize_mentions(
             props={},
             confidence=None,
             actor=actor,
-            state=landing[dst_id],
+            state=edge_landing[dst_id],
             cycle_id=cycle_id,
         )
     for dst_id, edge in current_by_dst.items():
@@ -1014,6 +1021,7 @@ def create_node(
     parent_id: str | None = None,
     props: dict[str, Any] | None = None,
     space: str | None = None,
+    landing: str | None = None,
     principal: Principal,
     path: str | Path | None = None,
 ) -> NodeOut:
@@ -1033,6 +1041,11 @@ def create_node(
             in the same space — the document tree does not cross spaces).
         props: Free-form JSON-object metadata.
         space: Target space id or name (default: the ``main`` space).
+        landing: The writer's own ceiling on the landing state (design §8.3 —
+            a grant is a ceiling, not a mandate): ``"proposed"`` files the
+            node for review even when the grant would have written it live.
+            It can only lower; asking for more than the grant allows is
+            refused (:func:`Store.cap_landing`).
         principal: Who is writing (default: the trusted-local owner).
         path: Explicit database path.
 
@@ -1040,7 +1053,9 @@ def create_node(
         The created node.
 
     Raises:
-        GrantNotPermitted: If the principal has no write grant on the space.
+        GrantNotPermitted: If the principal has no write grant on the space,
+            or ``landing`` asks for more than the grant allows.
+        ValueError: If ``landing`` is not a state a write can land in.
     """
     conn = _connect(path)
     try:
@@ -1060,7 +1075,7 @@ def create_node(
                     f"{parent['space_id']!r}, target is {target_space!r}"
                 )
         node_id = uuid.uuid4().hex
-        state = store.landing_state(target_space)
+        state = store.landing_state(target_space, landing)
         # A space is an ordinary node, so this is the path a raw
         # `node create --type space` takes past `create_space` — both space
         # rules have to sit here or that path is the way around them. After the
@@ -1101,7 +1116,7 @@ def create_node(
         node = _row_dict(_get_node_row(conn, node_id))
         seq = _emit(conn, actor, f"node.{_create_op(state)}", {"before": None, "after": node})
         _write_version(conn, node, actor, seq)
-        _materialize_mentions(conn, node, actor, store)
+        _materialize_mentions(conn, node, actor, store, landing=landing)
         conn.commit()
         return _node_out(node)
     finally:
@@ -2147,6 +2162,57 @@ def _update_context(conn: sqlite3.Connection, version: dict[str, Any]) -> dict[s
     return {"node": _node_ref(conn, version["node_id"])}
 
 
+def _annotations_by_target(
+    conn: sqlite3.Connection,
+    *,
+    node_ids: list[str],
+    edge_ids: list[str],
+    version_ids: list[int],
+) -> tuple[dict[str, Any], dict[str, Any], dict[int, Any]]:
+    """The annotations on one proposal listing, as one ``{target: body}`` map per kind.
+
+    The three target columns are separate columns, so a listing reads one
+    ``IN`` clause per kind — node, edge, update — and migration 0016's partial
+    unique indexes guarantee at most one row per target, which is what makes
+    the result a map rather than a list. Bodies are the table's JSON, parsed
+    here because :class:`ProposalOut.annotation` carries them as dicts; the
+    version map is keyed by int because ``target_version_id`` is INTEGER.
+    Empty id lists are skipped — SQLite has no ``IN ()``.
+    """
+    node_map, edge_map, version_map = {}, {}, {}
+    if node_ids:
+        placeholders = ",".join("?" * len(node_ids))
+        node_map = {
+            row["target_id"]: json.loads(row["body"])
+            for row in conn.execute(
+                f"SELECT target_node_id AS target_id, body FROM annotations"
+                f" WHERE target_node_id IN ({placeholders})",
+                node_ids,
+            ).fetchall()
+        }
+    if edge_ids:
+        placeholders = ",".join("?" * len(edge_ids))
+        edge_map = {
+            row["target_id"]: json.loads(row["body"])
+            for row in conn.execute(
+                f"SELECT target_edge_id AS target_id, body FROM annotations"
+                f" WHERE target_edge_id IN ({placeholders})",
+                edge_ids,
+            ).fetchall()
+        }
+    if version_ids:
+        placeholders = ",".join("?" * len(version_ids))
+        version_map = {
+            row["target_id"]: json.loads(row["body"])
+            for row in conn.execute(
+                f"SELECT target_version_id AS target_id, body FROM annotations"
+                f" WHERE target_version_id IN ({placeholders})",
+                version_ids,
+            ).fetchall()
+        }
+    return node_map, edge_map, version_map
+
+
 def list_proposals(
     *,
     created_by: str | None = None,
@@ -2172,7 +2238,10 @@ def list_proposals(
 
     Returns:
         Proposals with reviewer context (edge endpoints, node parent, or the
-        node an update targets).
+        node an update targets). Each also carries its ``annotation`` — the
+        parsed body of its ``annotations`` row (migration 0016), what a
+        proposer's acceptance signal judged and at what rate — when the
+        learned-curation cycle has written one.
 
     Raises:
         ValueError: If ``kind`` is not one of the three, or ``limit`` is below
@@ -2196,6 +2265,12 @@ def list_proposals(
             created_before=created_before,
             created_after=created_after,
         )[:limit]
+        node_annotations, edge_annotations, version_annotations = _annotations_by_target(
+            conn,
+            node_ids=[row["id"] for row_kind, row in rows if row_kind == "node"],
+            edge_ids=[row["id"] for row_kind, row in rows if row_kind == "edge"],
+            version_ids=[int(row["id"]) for row_kind, row in rows if row_kind == "update"],
+        )
         proposals = []
         for row_kind, row in rows:
             data = _row_dict(row)
@@ -2209,6 +2284,7 @@ def list_proposals(
                         created_at=data["created_at"],
                         node=_node_out(data),
                         context=_node_context(conn, data),
+                        annotation=node_annotations.get(data["id"]),
                     )
                 )
             elif row_kind == "edge":
@@ -2221,6 +2297,7 @@ def list_proposals(
                         created_at=data["created_at"],
                         edge=_edge_out(data),
                         context=_edge_context(conn, data),
+                        annotation=edge_annotations.get(data["id"]),
                     )
                 )
             else:
@@ -2233,6 +2310,7 @@ def list_proposals(
                         created_at=data["created_at"],
                         version=_version_out(data),
                         context=_update_context(conn, data),
+                        annotation=version_annotations.get(int(data["id"])),
                     )
                 )
         return proposals
@@ -2445,7 +2523,11 @@ def _delete_blocker(
     The five, in the order a caller most likely meets them: ``nodes.parent_id``
     (children), ``nodes.space_id`` (a space's occupants), ``merge_redirects``
     (a node merged away, or merged into), ``grants.space_id`` (agents granted on
-    a space) and ``nodes.type_id`` (nodes typed by a type node).
+    a space) and ``nodes.type_id`` (nodes typed by a type node). The sixth
+    foreign key into ``nodes(id)`` — ``annotations.target_node_id`` (migration
+    0016) — is deliberately not here: it cascades, because an annotation is
+    derived judgement and can never be the reason a node's undo is refused
+    (which is what its ``cycle_id`` already implies).
 
     Args:
         conn: The open connection.

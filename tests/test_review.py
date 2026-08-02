@@ -107,6 +107,99 @@ def test_accepted_proposals_leave_the_queue(fresh_db):
     assert [p.id for p in service.list_proposals(principal=owner())] == [edge.id]
 
 
+# ── The annotation slot: what a proposer's acceptance signal judged (§L1) ─────
+
+
+def _annotate(annotation_id, *, node=None, edge=None, version=None, body="{}"):
+    """Raw-insert one annotation row: 0016's table has no service writer.
+
+    Exactly one of the targets is given — the CHECK is on the table, so a
+    fixture that names two would itself be refused.
+    """
+    conn = db.connect()
+    try:
+        conn.execute(
+            "INSERT INTO annotations (id, target_node_id, target_edge_id,"
+            " target_version_id, body, actor)"
+            " VALUES (?, ?, ?, ?, ?, 'agent:builtin-gardener')",
+            (annotation_id, node, edge, version, body),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_a_node_proposal_carries_its_annotation_parsed(fresh_db):
+    """The slot is the parsed body, attached only to the item it judges."""
+    annotated = service.create_node(type="note", title="Annotated", principal=agent("researcher"))
+    plain = service.create_node(type="note", title="Plain", principal=agent("researcher"))
+    _annotate("a1", node=annotated.id, body='{"rate": 0.92}')
+
+    by_id = {p.id: p for p in service.list_proposals(principal=owner())}
+
+    assert by_id[annotated.id].annotation == {"rate": 0.92}
+    # A proposal nobody annotated reports None rather than omitting the key.
+    assert by_id[plain.id].annotation is None
+
+
+def test_each_kind_resolves_its_own_target_column(fresh_db):
+    """Distinct bodies per kind, so a cross-column mix-up fails loudly."""
+    a = service.create_node(type="concept", title="Alpha", principal=owner())
+    b = service.create_node(type="concept", title="Beta", principal=owner())
+    node = service.create_node(type="note", title="Node", principal=agent("researcher"))
+    edge = service.create_edge(a.id, b.id, "supports", principal=agent("researcher"))
+    update = service.update_node(a.id, content="revised", principal=agent("researcher"))
+
+    _annotate("a-node", node=node.id, body='{"kind": "node"}')
+    _annotate("a-edge", edge=edge.id, body='{"kind": "edge"}')
+    _annotate("a-update", version=update.id, body='{"kind": "update"}')
+
+    by_kind = {p.kind: p for p in service.list_proposals(principal=owner())}
+
+    assert by_kind["node"].annotation == {"kind": "node"}
+    assert by_kind["edge"].annotation == {"kind": "edge"}
+    assert by_kind["update"].annotation == {"kind": "update"}
+
+
+def test_an_annotation_never_leaks_through_grant_filtering(fresh_db):
+    """The slot rides a row the store has already filtered, so it cannot leak.
+
+    The annotation's only read path is `list_proposals`, which scopes rows by
+    the caller's grant set first — so a proposal in an unreadable space is
+    absent wholesale, annotation included, rather than present with the slot
+    stripped (which would itself be a leak: it would confirm the row exists).
+    """
+    seed_space("b")
+    hidden = service.create_node(
+        type="note",
+        title="Hidden",
+        space="b",
+        principal=agent("researcher", grants={"meta": "read", "b": "suggest"}),
+    )
+    _annotate("a1", node=hidden.id, body='{"rate": 0.9}')
+
+    outsider = agent("outsider", grants={"meta": "read", "main": "read"})
+    assert service.list_proposals(principal=outsider) == []
+    # The owner sees the row and its annotation.
+    (proposal,) = service.list_proposals(principal=owner())
+    assert proposal.annotation == {"rate": 0.9}
+
+
+def test_no_annotations_means_the_slot_is_none_for_every_kind(fresh_db):
+    """A graph the learned-curation cycle has never run over has nothing to show."""
+    a = service.create_node(type="concept", title="Alpha", principal=owner())
+    b = service.create_node(type="concept", title="Beta", principal=owner())
+    researcher = agent("researcher")
+    service.create_node(type="note", title="Node", principal=researcher)
+    service.create_edge(a.id, b.id, "supports", principal=researcher)
+    service.update_node(a.id, content="revised", principal=researcher)
+
+    proposals = service.list_proposals(principal=owner())
+
+    assert {p.kind for p in proposals} == {"node", "edge", "update"}
+    assert all(p.annotation is None for p in proposals)
+
+
 # ── Every proposal reports a space, which is what D4 groups the queue by ──────
 
 

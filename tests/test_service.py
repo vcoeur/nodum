@@ -252,6 +252,57 @@ def test_a_landing_state_a_write_cannot_land_in_is_refused_once(fresh_db):
         )
 
 
+def test_an_edit_grant_may_file_a_node_proposed_instead(fresh_db):
+    """§8.3's self-governing writer, on the node path: writes it is unsure of wait."""
+    curator = agent("curator", grants={"meta": "read", "main": "edit"})
+
+    node = service.create_node(type="note", title="Draft", landing="proposed", principal=curator)
+
+    assert node.state == "proposed"
+    # And it is in the queue, which is the whole point of asking for it.
+    assert [item.id for item in service.list_proposals(principal=owner())] == [node.id]
+
+
+def test_a_human_may_file_a_node_proposed_too(fresh_db):
+    """No human special case: a human is `edit` everywhere, so the same ceiling applies."""
+    node = service.create_node(type="note", title="Draft", landing="proposed", principal=owner())
+
+    assert node.state == "proposed"
+
+
+def test_asking_a_node_to_land_active_on_a_suggest_grant_is_refused(fresh_db):
+    """The seam only ever lowers — it is never a way around the grant."""
+    proposer = agent("proposer", grants={"meta": "read", "main": "suggest"})
+
+    with pytest.raises(GrantNotPermitted, match="ceiling on the grant"):
+        service.create_node(type="note", title="Draft", landing="active", principal=proposer)
+
+    assert service.list_nodes(principal=owner()) == []
+
+
+def test_a_suggest_grant_lands_a_node_proposed_whatever_it_asks_for(fresh_db):
+    """The ceiling property: no argument value can raise where a write lands."""
+    proposer = agent("proposer", grants={"meta": "read", "main": "suggest"})
+
+    for landing in (None, "proposed"):
+        node = service.create_node(type="note", title="Draft", landing=landing, principal=proposer)
+        assert node.state == "proposed"
+
+
+def test_landing_active_under_an_edit_grant_is_the_node_default_said_out_loud(fresh_db):
+    curator = agent("curator", grants={"meta": "read", "main": "edit"})
+
+    node = service.create_node(type="note", title="Live", landing="active", principal=curator)
+
+    assert node.state == "active"
+
+
+def test_a_landing_state_a_node_cannot_land_in_is_refused(fresh_db):
+    """`archived` is not a landing state, and the node path says so like the edge path."""
+    with pytest.raises(ValueError, match="landing must be one of"):
+        service.create_node(type="note", title="Draft", landing="archived", principal=owner())
+
+
 def test_accept_reject_archive_transitions(fresh_db):
     node = service.create_node(type="note", title="p", principal=agent("x"))
     assert node.state == "proposed"
@@ -351,7 +402,13 @@ def test_rename_and_archive_round_trip_by_name_or_id(fresh_db):
 
     archived = service.archive_space(space.id, principal=owner())
     assert archived.state == "archived"
-    assert [row.title for row in service.list_spaces(principal=owner())] == ["meta", "main"]
+    # `conventions` (migration 0016) is a real space like any other, created
+    # after the two bootstrap ones.
+    assert [row.title for row in service.list_spaces(principal=owner())] == [
+        "meta",
+        "main",
+        "conventions",
+    ]
     # An archived space has left the vocabulary: it no longer resolves at all.
     with pytest.raises(TypeNotFound):
         service.create_node(type="note", title="n", space="reference", principal=owner())

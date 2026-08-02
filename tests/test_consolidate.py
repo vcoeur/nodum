@@ -744,8 +744,14 @@ def test_a_full_cycle_completes_on_read_over_meta(fresh_db):
     meta is used for is resolving a type — which is a READ. What the extra level
     bought was latent authority no job reaches: creating spaces, renaming `main`,
     and archiving the `note` type, after which a *human* is blocked too.
+    (Migration `0016`'s `conventions: edit` is the gardener's own workspace,
+    not the type vocabulary.)
     """
-    assert auth.internal_principal().grants == {"meta": "read", "main": "edit"}
+    assert auth.internal_principal().grants == {
+        "meta": "read",
+        "main": "edit",
+        "conventions": "edit",
+    }
     _node("Alpha")
     _node("Alpha")
     first, second = _node("First"), _node("Second")

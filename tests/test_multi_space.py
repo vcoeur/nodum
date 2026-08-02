@@ -685,7 +685,13 @@ def test_archiving_a_space_keeps_its_name_reserved(fresh_db):
         service.create_node(type="space", title="b", space="meta", principal=owner())
     # Nothing was created, and the archived row is still archived.
     assert service.get_node("b", principal=owner()).state == "archived"
-    assert [space.id for space in service.list_spaces(principal=owner())] == ["meta", "main", "c"]
+    # `conventions` (migration 0016) is a real space, listed like any other.
+    assert [space.id for space in service.list_spaces(principal=owner())] == [
+        "meta",
+        "main",
+        "conventions",
+        "c",
+    ]
 
 
 def test_undoing_an_archive_restores_the_space_it_retired(fresh_db):
@@ -826,8 +832,9 @@ def test_a_space_cannot_be_created_outside_meta(fresh_db):
 
     # Nothing was created, and aiming at meta still works — this is a rule about
     # where a space lands, not a ban on the generic path.
+    # (`conventions` from migration 0016 lists between the seeded and the made.)
     listed = [space.id for space in service.list_spaces(principal=owner())]
-    assert listed == ["meta", "main", "b", "c"]
+    assert listed == ["meta", "main", "conventions", "b", "c"]
     landed = service.create_node(type="space", title="scratch", space="meta", principal=owner())
     assert landed.space_id == "meta"
     assert service.resolve_space_id("scratch", principal=owner()) == landed.id

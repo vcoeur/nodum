@@ -216,7 +216,11 @@ class ProposalOut(BaseModel):
     and the space is what lets the review queue group by space (human-UI D4):
     a proposed node states its own, and an edge or an update would otherwise
     state none. A referenced node that no longer resolves comes back as ``{id}``
-    alone, so read the other two as optional.
+    alone, so read the other two as optional. ``annotation`` is the parsed
+    ``annotations.body`` JSON for this queue item — what a proposer's
+    acceptance signal judged and at what rate — attached only to rows
+    :func:`nodum.service.list_proposals` has already grant-filtered; ``None``
+    when the item has none.
     """
 
     kind: str
@@ -228,6 +232,7 @@ class ProposalOut(BaseModel):
     edge: EdgeOut | None = None
     version: VersionOut | None = None
     context: dict[str, Any] = {}
+    annotation: dict[str, Any] | None = None
 
 
 class TransitionFailure(BaseModel):
