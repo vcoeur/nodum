@@ -172,43 +172,27 @@ DUPLICATE_TITLE_RATIO = 0.95
 
 #: Cosine bar for a duplicate candidate when embeddings are available.
 #:
-#: **KNOWN NOT TO FIRE, and deliberately left that way until it can be tuned on
-#: real content.** Both cosine bars were set before anyone had run the pinned
-#: model. At 0.93 this bar fires on **0 of 10** hand-labelled duplicates, so
-#: duplicate detection finds only duplicates already titled alike — precisely
-#: the case the embedding signal was added to answer.
-#:
-#: **The link bar is not dead in the same way, and the difference is the more
-#: expensive half.** At 0.80 it fires on 0 of 7 genuinely related pairs (the
-#: whole related band tops out at 0.587) but on **7 of those same 10
-#: duplicates**, whose band runs 0.763-0.929. So a near-duplicate worded
-#: differently is not missed — it is **mislabelled**, proposed as ``relates_to``
-#: by the weaker signal because the stronger one cannot reach it. Rejecting that
-#: proposal is the human saying "not merely related", which is not the same
-#: judgement as "not a duplicate", and nothing in the queue distinguishes them.
-#:
-#: Measured in ``tests/fixtures/embedding_calibration.json``: 29 bilingual FR+EN
-#: pairs, length-matched at 60-85 words a side, labelled by hand into four bands
-#: before any cosine was taken. Under the pinned model they land at duplicate
-#: 0.763-0.929, same narrow topic 0.402-0.587, same broad area 0.151-0.454,
-#: unrelated -0.050-0.314.
-#:
-#: **Replacements derived from that fixture alone were tried and reverted.** 0.72
-#: and 0.38 separate the fixture's bands cleanly and still fail on real content,
-#: measured on two corpora rather than one. Over a 200-node graph of real prose
-#: notes the link bar at 0.38 proposed **1 175** ``relates_to`` edges — 5.9 per
-#: node, against 5 at 0.80. Over 154 documents from a second, more homogeneous
-#: corpus, **35.2 % of all pairs** clear 0.38 (p99 = 0.694). A hand-built set of
-#: 29 pairs cannot see either number, because its pairs were chosen to
-#: demonstrate a separation, and a separation is not a false-positive rate.
-#:
-#: **So the replacements must come from a real corpus, measured for volume and
-#: precision rather than for separation**, with a test that embeds real text —
-#: the fixture tests only prove the constant still matches the fixture it was
-#: derived from. That is its own cycle, and it must land before the abstraction
-#: job, whose cohesion criterion reads these same vectors.
-#: ``scripts/measure_embedding_calibration.py`` and the fixture are kept as its
-#: starting point.
+#: **Measured on a real corpus, and the measurement says this signal cannot
+#: draw the bar.** The calibration corpus is 426 kasten prose notes
+#: (``note/`` + ``literature/``, frontmatter and wikilinks stripped), scored on
+#: 2026-08-02 by ``scripts/measure_kasten_calibration.py`` for volume and
+#: precision rather than for band separation — the fixture-derived 0.72/0.38
+#: pair separated the fixture's bands cleanly and still flooded on real
+#: content, because a hand-built set that demonstrates a separation cannot
+#: measure a false-positive rate. On that corpus real duplicate candidates —
+#: the same-normalised-title pairs — scored **0.28-0.55**, overlapping the
+#: related band completely, so no cosine bar can separate duplicates from
+#: related on this content; only exact copies reach 1.000. That band is a
+#: calibration-time observation, date-stamped here: the script now prints a
+#: duplicate-candidate table, and on a corpus with no same-title groups it
+#: reports the honest zero — the claim then rests on the measurement above and
+#: re-running the script on a corpus that has such pairs is how it is
+#: re-verified. The title-normalisation signal (:data:`DUPLICATE_TITLE_RATIO`)
+#: is the real duplicate detector, and this bar stays where only exact copies
+#: clear it (0.93). What it cannot express — a near-duplicate worded
+#: differently clearing the *link* bar and arriving as ``relates_to`` — is
+#: judgement for the learned-curation cycle (§L1 annotations), not a bar this
+#: signal can draw.
 #:
 #: This bar must stay above :data:`LINK_EMBEDDING_COSINE`: the two are read by
 #: different jobs, and a duplicate scoring *below* the link bar would be
@@ -218,16 +202,29 @@ DUPLICATE_EMBEDDING_COSINE = 0.93
 #: Cosine bar for an inferred ``relates_to`` edge: "these are about the same
 #: area", not "these are the same thing".
 #:
-#: Shipped value — see :data:`DUPLICATE_EMBEDDING_COSINE` for the measurement,
-#: why the fixture-derived 0.38 was reverted, and what re-tuning needs.
+#: **Measured on real content, not chosen from the fixture.** Measured
+#: 2026-08-02 on the 426-note calibration corpus (kasten ``note/`` +
+#: ``literature/``, frontmatter and wikilinks stripped, sampled 200) by
+#: ``scripts/measure_kasten_calibration.py`` — the committed script reproduces
+#: the method, and re-running it is how a drift is detected. The vault is a
+#: live corpus (423 prose notes today), so re-runs land close to but not
+#: exactly on the numbers below; see :data:`DUPLICATE_EMBEDDING_COSINE` for
+#: why the fixture cannot set a bar.
 #:
-#: **It fires, but not on what it is named for.** No genuinely related pair in
-#: the fixture reaches it — the related band tops out at 0.587 — while 7 of 10
-#: labelled *duplicates* clear it. So every embedding-driven ``relates_to``
-#: proposal at this bar is a duplicate wearing the wrong label, and the pairs
-#: this bar exists to find come only from co-citation, which is independent of
-#: the cosine and is what keeps the job useful meanwhile.
-LINK_EMBEDDING_COSINE = 0.80
+#: The shipped 0.80 measured **dead**: 0.04 ``relates_to`` per node on real
+#: content, the gate's "5 at 0.80" reproduced. The reverted 0.38 measured as a
+#: **flood**: 5.9-6.4 per node, the gate's 1 175/200 reproduced. At 0.60 the
+#: bar fires at **~1.1-1.2 ``relates_to`` per node with ~6-10 % precision**
+#: against the vault's own wikilinks as ground truth — the precision swings
+#: with which linked pairs land in the 200-note sample, and it under-counts,
+#: since the 0.907 'Software architecture for developers' ↔ 'A Philosophy of
+#: Software Design' pair is clearly same-area and not wikilinked — and the
+#: above-bar pairs are genuinely same-area by inspection.
+#:
+#: It must stay below :data:`DUPLICATE_EMBEDDING_COSINE`: the two are read by
+#: different jobs, and a pair between the bars is merely related, never the
+#: same thing.
+LINK_EMBEDDING_COSINE = 0.60
 
 #: How many neighbours two nodes must share before co-citation is evidence.
 #:
@@ -347,6 +344,7 @@ class ConsolidationReport(BaseModel):
     jobs: list[JobOutcome]
     metrics: dict[str, dict[str, float]]
     failed: list[JobFailure] = []
+    notes: list[str] = []
 
 
 class ConsolidationOut(BaseModel):
@@ -483,6 +481,12 @@ class _Context:
     path: str | Path | None
     now: datetime
     _vectors: dict[str, list[float]] = field(default_factory=dict)
+    #: Set by :meth:`edges` / :meth:`typed_edges` when a read returns *more
+    #: than* :data:`MAX_SCAN_EDGES` rows (each fetches one past the cap so
+    #: "exactly at the cap" — nothing dropped — and "past it" are distinct).
+    #: Sticky: one capped read anywhere in the run flags the whole run, so a
+    #: consumer knows an edge read dropped rows but not *which* read did.
+    truncated: bool = False
 
     def nodes(self, *, state: str | None = None) -> list[NodeOut]:
         """Curatable nodes in scope, oldest first, capped at :data:`MAX_SCAN_NODES`."""
@@ -499,17 +503,38 @@ class _Context:
         """Readable edges, oldest first, capped at :data:`MAX_SCAN_EDGES`.
 
         Not narrowed by ``scope`` here — :func:`nodum.service.list_edges` takes
-        no space filter — so callers intersect with a node-id set instead.
+        no space filter — so callers intersect with a node-id set instead. One
+        row past the cap is fetched so a graph with *exactly* the cap's worth
+        of edges (nothing dropped) is not flagged, while an over-cap graph —
+        ``list_edges`` orders oldest-first, so it drops the *newest* rows, the
+        freshly rejected edges a suppression read exists to see — sets the
+        context's ``truncated`` flag.
         """
-        return service.list_edges(
-            state=state, principal=self.principal, limit=MAX_SCAN_EDGES, path=self.path
+        rows = service.list_edges(
+            state=state,
+            principal=self.principal,
+            limit=MAX_SCAN_EDGES + 1,
+            path=self.path,
         )
+        self.truncated = self.truncated or len(rows) > MAX_SCAN_EDGES
+        return rows[:MAX_SCAN_EDGES]
 
     def typed_edges(self, edge_type: str) -> list[EdgeOut]:
-        """Every edge of one type, in every state."""
-        return service.list_edges(
-            type=edge_type, principal=self.principal, limit=MAX_SCAN_EDGES, path=self.path
+        """Edges of one type, in every state — up to :data:`MAX_SCAN_EDGES`.
+
+        Oldest first, so above the cap the *newest* rows are the ones dropped,
+        the freshly rejected ones a suppression read exists to see. Like
+        :meth:`edges`, one row past the cap is fetched so the flag means
+        "rows were dropped", not "the cap was exactly reached".
+        """
+        rows = service.list_edges(
+            type=edge_type,
+            principal=self.principal,
+            limit=MAX_SCAN_EDGES + 1,
+            path=self.path,
         )
+        self.truncated = self.truncated or len(rows) > MAX_SCAN_EDGES
+        return rows[:MAX_SCAN_EDGES]
 
     def vectors(self, nodes: list[NodeOut]) -> dict[str, list[float]] | None:
         """Embed these nodes, or return ``None`` when no provider is available.
@@ -592,6 +617,13 @@ def _job_duplicates(context: _Context) -> JobOutcome:
     known = {
         _unordered(edge.src_id, edge.dst_id) for edge in context.typed_edges(DUPLICATE_EDGE_TYPE)
     }
+    if context.truncated:
+        outcome.truncated = True
+        outcome.notes.append(
+            f"an edge scan hit MAX_SCAN_EDGES: reads above the {MAX_SCAN_EDGES}-edge "
+            "cap drop the newest rows, so the duplicate_of suppression read may have "
+            "missed edges — a rejected pair could be re-proposed"
+        )
     matched: dict[tuple[str, str], tuple[list[str], float]] = {}
     for index, older in enumerate(candidates):
         for newer in candidates[index + 1 :]:
@@ -779,6 +811,13 @@ def _infer_links(context: _Context, outcome: JobOutcome, active_ids: set[str]) -
     connected |= {
         _unordered(edge.src_id, edge.dst_id) for edge in context.typed_edges(RELATED_EDGE_TYPE)
     }
+    if context.truncated:
+        outcome.truncated = True
+        outcome.notes.append(
+            f"an edge scan hit MAX_SCAN_EDGES: reads above the {MAX_SCAN_EDGES}-edge "
+            "cap drop the newest rows, so the relates_to suppression read may have "
+            "missed edges — a rejected pair could be re-proposed"
+        )
     neighbours: dict[str, set[str]] = {}
     for edge in live:
         if edge.state != "active" or edge.src_id == edge.dst_id:
@@ -1251,7 +1290,14 @@ def _run_cycle(
 
 
 def _run_jobs(context: _Context, cycle: CycleOut, selected: list[str]) -> ConsolidationReport:
-    """Snapshot the metrics, run each job in isolation, snapshot them again."""
+    """Snapshot the metrics, run each job in isolation, snapshot them again.
+
+    The report picks up the context's truncation flag: when an edge scan
+    returned more than :data:`MAX_SCAN_EDGES` rows during the run, ``notes``
+    says the metric reads may have missed edges — the flag is sticky, so it
+    cannot say *which* read dropped rows, only that some edge read did. A
+    job's own outcome already says it for its own read.
+    """
     before = _metrics(context)
     outcomes: list[JobOutcome] = []
     failed: list[JobFailure] = []
@@ -1266,10 +1312,19 @@ def _run_jobs(context: _Context, cycle: CycleOut, selected: list[str]) -> Consol
             outcomes.append(JobOutcome(name=name, error=message))
             failed.append(JobFailure(job=name, error=message))
     after = _metrics(context)
+    report_notes: list[str] = []
+    if context.truncated:
+        report_notes.append(
+            f"an edge scan hit MAX_SCAN_EDGES: reads above the {MAX_SCAN_EDGES}-edge "
+            "cap drop the newest rows, so a suppression or metric read may have "
+            "missed edges — a rejected pair could be re-proposed and "
+            "duplicate_candidates may under-count"
+        )
     return ConsolidationReport(
         scope=cycle.scope,
         dry_run=cycle.dry_run,
         jobs=outcomes,
         metrics={"before": before, "after": after},
         failed=failed,
+        notes=report_notes,
     )
