@@ -5,20 +5,27 @@ hand-labelled pairs were written to demonstrate a separation, and a separation
 is not a false-positive rate (the 0.72/0.38 pair derived from it was tried on
 real content and reverted). This script is the real-corpus measurement the
 replacement came from — the numbers it prints are what the current bars in
-:mod:`nodum.consolidate` were chosen from, and re-running it is how a future
-re-tuning starts (change the model, fastembed's pooling, or ``CHUNK_WORDS`` and
-the tables move).
+:mod:`nodum.consolidate` were chosen from (measured 2026-08-02), and
+re-running it is how a future re-tuning starts or a drift is detected (change
+the model, fastembed's pooling, or ``CHUNK_WORDS`` and the tables move).
 
 It loads the kasten vault's prose (``note/`` + ``literature/``, frontmatter
 and wikilinks stripped, at least 300 characters), samples 200 notes, embeds
 them through :func:`nodum.embeddings.node_vectors` — the same call the
-consolidation cycle makes — and prints two tables:
+consolidation cycle makes — and prints three tables:
 
 * **volume** — ``relates_to`` proposals per node (pairs at or above the bar,
   divided by the number of sampled nodes) at 0.38/0.55/0.60/0.65/0.80;
 * **precision** — against the vault's own wikilinks as ground truth (two notes
   are related iff one links the other by title/stem), at
-  0.45/0.50/0.55/0.60/0.65/0.70.
+  0.45/0.50/0.55/0.60/0.65/0.70;
+* **duplicate candidates** — same-normalised-title groups across the *whole*
+  corpus (the duplicate job's own grouping, see
+  :func:`nodum.consolidate._title_key`), embedded and scored, with the
+  distribution of the pairs' cosines. A corpus with no such group prints the
+  honest zero; the 0.28-0.55 band the duplicate bar's comment cites is the
+  2026-08-02 calibration-time measurement, and this table is how it is
+  re-verified on a corpus that has such pairs.
 
 On the corpus this measures, the link bar at 0.60 fires at about 1.2
 ``relates_to`` proposals per node with ~10 % precision by wikilink ground
@@ -36,7 +43,8 @@ Run it with::
 
 It needs the ``embeddings`` extra and the model in the local cache; it exits
 non-zero with the reason if either is missing. 200 sampled notes keep a run to
-about a minute — the whole vault is deliberately never embedded by default.
+about a minute — the whole vault is deliberately never embedded by default
+(only the notes in same-title groups are embedded beyond the sample).
 """
 
 from __future__ import annotations
@@ -46,6 +54,7 @@ import math
 import random
 import re
 import sys
+import unicodedata
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -80,6 +89,30 @@ _MARKER_PREFIX_RE = re.compile(r"^[^\w]+")
 def _normalise(text: str) -> str:
     """The comparison form of a title or link target: casefolded, collapsed."""
     return " ".join(text.casefold().split())
+
+
+def title_key(title: str | None) -> str:
+    """The job's comparison form of a title — the duplicate group key.
+
+    NFC, case-folded, punctuation flattened to a space, whitespace collapsed:
+    the exact key :func:`nodum.consolidate._title_key` groups
+    same-normalised-title pairs by, kept in step by hand rather than imported
+    because this script is the method's documentation.
+    """
+    folded = unicodedata.normalize("NFC", unicodedata.normalize("NFC", title or "").casefold())
+    flattened = "".join(char if char.isalnum() or char.isspace() else " " for char in folded)
+    return " ".join(flattened.split())
+
+
+def _median(values: list[float]) -> float:
+    """Median of a sorted-able list; 0.0 when empty."""
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[middle]
+    return (ordered[middle - 1] + ordered[middle]) / 2
 
 
 def _title(stem: str) -> str:
@@ -216,6 +249,47 @@ def main() -> int:
         true = sum(1 for pair in above if pair in related)
         precision = true / len(above) if above else 0.0
         print(f"{bar:<6} {len(above):>7} {true:>6} {precision:>10.1%}")
+
+    # The duplicate-candidate band, over the *whole* corpus (not the sample):
+    # a pair is a duplicate candidate or it is not, and same-title groups are
+    # rare enough that the whole-corpus grouping costs nothing. Only the notes
+    # inside those groups are embedded, so a corpus with no such group embeds
+    # nothing beyond the sample.
+    groups: dict[str, list[dict]] = {}
+    for note in notes:
+        groups.setdefault(title_key(note["title"]), []).append(note)
+    same_title = [members for members in groups.values() if len(members) > 1]
+    print("\nduplicate candidates — same-normalised-title pairs across the whole corpus:")
+    if not same_title:
+        print(
+            "0 same-title groups in today's corpus: the 0.28-0.55 band the duplicate "
+            "bar's comment cites is the 2026-08-02 calibration-time measurement, and "
+            "re-running this script on a corpus that has such pairs is how it is re-verified"
+        )
+    else:
+        group_cosines: list[tuple[tuple[str, str], float]] = []
+        for group in same_title:
+            vectors = embeddings.node_vectors(
+                provider,
+                [{"title": None, "content": member["content"]} for member in group],
+            )
+            for first in range(len(group)):
+                for second in range(first + 1, len(group)):
+                    group_cosines.append(
+                        (
+                            tuple(sorted((group[first]["title"], group[second]["title"]))),
+                            cosine(vectors[first], vectors[second]),
+                        )
+                    )
+        for titles, value in group_cosines:
+            print(f"  {titles[0]!r} <-> {titles[1]!r}: {value:.3f}")
+        values = [value for _, value in group_cosines]
+        print(
+            f"min {min(values):.3f} / median {_median(values):.3f} / max {max(values):.3f}; "
+            f"{sum(1 for value in values if value >= consolidate.DUPLICATE_EMBEDDING_COSINE)} "
+            f"pair(s) at or above the duplicate bar "
+            f"({consolidate.DUPLICATE_EMBEDDING_COSINE})"
+        )
 
     print(
         f"\nbars in force: duplicate={consolidate.DUPLICATE_EMBEDDING_COSINE} "

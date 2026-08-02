@@ -765,31 +765,35 @@ commands on a saved node for exactly this reason.
   pair, group and list ordered before it is written.
   **Both cosine bars are measured, and the measurement set both.** They stand
   at 0.93 (duplicate) and 0.60 (`relates_to`), chosen from
-  `scripts/measure_kasten_calibration.py`'s tables over a real corpus: 426
-  kasten prose notes (`note/` + `literature/`, frontmatter and wikilinks
-  stripped), sampled 200, scored for volume and precision rather than for
-  separation — the fixture-derived 0.72/0.38 pair separated
-  `tests/fixtures/embedding_calibration.json`'s bands cleanly and still failed
-  on real content, because a set written to demonstrate a separation cannot
-  measure a false-positive rate. At 0.80 the link bar measured **dead**: 0.04
-  `relates_to` per node, the gate's "5 at 0.80" reproduced. The reverted 0.38
-  measured as a **flood**: 5.9-6.4 per node, the gate's 1 175/200 reproduced.
-  At 0.60 it fires at **1.16 per node** with ~10 % precision against the
-  vault's own wikilinks as ground truth — which under-counts, since the 0.907
+  `scripts/measure_kasten_calibration.py`'s tables over a real corpus,
+  measured 2026-08-02 on 426 kasten prose notes (`note/` + `literature/`,
+  frontmatter and wikilinks stripped), sampled 200, scored for volume and
+  precision rather than for separation — the fixture-derived 0.72/0.38 pair
+  separated `tests/fixtures/embedding_calibration.json`'s bands cleanly and
+  still failed on real content, because a set written to demonstrate a
+  separation cannot measure a false-positive rate. At 0.80 the link bar
+  measured **dead**: 0.04 `relates_to` per node, the gate's "5 at 0.80"
+  reproduced. The reverted 0.38 measured as a **flood**: 5.9-6.4 per node,
+  the gate's 1 175/200 reproduced. At 0.60 it fires at **~1.1-1.2
+  `relates_to` per node with ~6-10 % precision** against the vault's own
+  wikilinks as ground truth — the precision swings with which linked pairs
+  land in the 200-note sample, and it under-counts, since the 0.907
   'Software architecture for developers' ↔ 'A Philosophy of Software Design'
   pair is clearly same-area and not wikilinked — and the above-bar pairs are
-  genuinely same-area by inspection. The duplicate bar cannot do better on this
-  content: real duplicate candidates — the same-normalised-title pairs — score
-  0.28-0.55, overlapping the related band completely, so only exact copies
-  reach 0.93 and the title-normalisation signal is the real duplicate detector.
+  genuinely same-area by inspection. The duplicate bar cannot do better on
+  this content: at calibration time real duplicate candidates — the
+  same-normalised-title pairs — scored 0.28-0.55, overlapping the related band
+  completely, so only exact copies reach 0.93 and the title-normalisation
+  signal is the real duplicate detector (the script now prints that band over
+  the whole corpus, and the honest table is how the claim is re-verified).
   What the cosine pair still cannot express — a near-duplicate worded
   differently clears the link bar and arrives as `relates_to`, and the queue
   cannot tell "not merely related" from "not a duplicate" — is the
-  learned-curation cycle's job (§L1 annotations), not a bar. The fixture and
-  `scripts/measure_embedding_calibration.py` are kept as the drift set;
-  re-running `measure_kasten_calibration.py` is how a future re-tuning starts,
-  and is required after any change of model, of fastembed's pooling, or of
-  `CHUNK_WORDS`.
+  learned-curation cycle's job (§L1 annotations), not a bar. The vault is a
+  live corpus, so the numbers above drift (423 prose notes today): the
+  committed script reproduces the method, and re-running it is how a drift is
+  detected and a re-tuning starts — a re-run is required after any change of
+  model, of fastembed's pooling, or of `CHUNK_WORDS`.
   Three rules guard the run itself. **One cycle at a time, in the whole file —
   and the guard is a row, not a lock.** Migration `0014` carries a partial
   unique index over `cycles(status)` where `status = 'running' AND trigger IN

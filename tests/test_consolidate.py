@@ -94,10 +94,11 @@ def _at(cosine: float) -> float:
     """The angle whose cosine against a marker-less text is ``cosine``.
 
     Tests that mean "just above the link bar" say so in terms of the bar
-    itself. The two cosine bars are known not to fire and will be re-tuned on a
-    real corpus in a later cycle; a hard-coded angle
-    would turn every re-tune into a test rewrite and, worse, would keep
-    passing while no longer testing the side of the bar it was written for.
+    itself. The link bar is measured at 0.60 on real content and the duplicate
+    bar stays at 0.93 — the invariant pinned below — so a test that writes a
+    hard-coded angle would turn every re-tune into a rewrite and, worse, would
+    keep passing while no longer testing the side of the bar it was written
+    for.
     """
     return math.acos(cosine)
 
@@ -476,13 +477,12 @@ def test_a_scan_that_reaches_its_cap_says_so(fresh_db, monkeypatch):
 
 
 def test_an_edge_scan_past_the_cap_is_reported_not_silent(fresh_db, monkeypatch):
-    """A read that returns the full cap says so rather than pretending to be complete.
+    """A read that returns more than the cap says so rather than pretending to be complete.
 
     ``list_edges`` orders oldest-first, so an over-cap graph drops the *newest*
     rows — exactly the freshly rejected edges a suppression read exists to see.
     The links job's outcome carries the flag and a note, and the cycle report
-    carries one too, because the metrics read under-counts ``duplicate_candidates``
-    the same way.
+    carries one too, because a metric read may have missed edges the same way.
     """
     monkeypatch.setattr(consolidate, "MAX_SCAN_EDGES", 50)
     nodes = [_node(f"Node {index}") for index in range(61)]
@@ -495,7 +495,31 @@ def test_an_edge_scan_past_the_cap_is_reported_not_silent(fresh_db, monkeypatch)
     assert outcome.truncated is True
     assert any("MAX_SCAN_EDGES" in note for note in outcome.notes)
     assert any("MAX_SCAN_EDGES" in note for note in result.report.notes)
+    # The report says what the sticky flag actually knows — an edge read hit
+    # the cap, so a metric read *may* have missed edges — never that a
+    # specific under-count happened.
+    assert any("may have missed edges" in note for note in result.report.notes)
     assert any("duplicate_candidates" in note for note in result.report.notes)
+
+
+def test_a_graph_with_exactly_the_cap_edges_is_not_truncated(fresh_db, monkeypatch):
+    """The flag means "rows were dropped", not "the cap was exactly reached".
+
+    The reads fetch one row past :data:`MAX_SCAN_EDGES` to tell the two apart:
+    a graph with exactly the cap's worth of edges drops nothing, so the run
+    must not report a truncation it did not suffer.
+    """
+    monkeypatch.setattr(consolidate, "MAX_SCAN_EDGES", 50)
+    nodes = [_node(f"Node {index}") for index in range(51)]
+    for first, second in zip(nodes, nodes[1:], strict=False):
+        _edge(first.id, second.id)
+
+    result = _run(jobs=[consolidate.JOB_LINKS])
+    outcome = _outcome(result.report, consolidate.JOB_LINKS)
+
+    assert outcome.truncated is False
+    assert not any("MAX_SCAN_EDGES" in note for note in outcome.notes)
+    assert result.report.notes == []
 
 
 def test_the_duplicates_job_reports_the_cap_too(fresh_db, monkeypatch):
@@ -668,6 +692,15 @@ def test_the_bars_record_their_measurement_and_the_invariant():
     assert "real corpus" in preamble
     assert "measure_kasten_calibration" in preamble
     assert "must stay above" in preamble
+    # The measured values themselves, pinned hard. A regression to the reverted
+    # flood bar (0.38 — 5.9-6.4 relates_to per node on the calibration corpus)
+    # must fail loudly here, because nothing else in the suite catches that
+    # direction: the invariant only catches the link bar crossing the
+    # duplicate bar, and the fixture band only catches the high side. Both were
+    # measured by scripts/measure_kasten_calibration.py on the 426-note
+    # calibration corpus on 2026-08-02.
+    assert pytest.approx(0.60) == consolidate.LINK_EMBEDDING_COSINE
+    assert pytest.approx(0.93) == consolidate.DUPLICATE_EMBEDDING_COSINE
 
 
 @pytest.mark.skipif(
@@ -696,13 +729,18 @@ def test_real_embeddings_fire_the_measured_link_bar():
     document = json.loads(CALIBRATION_FIXTURE.read_text())
     recorded = {pair["id"]: pair for pair in document["pairs"]}
     # Same-area pairs from the fixture's duplicate band (0.763-0.929, all far
-    # above the 0.60 link bar) and junk from its unrelated band (max 0.314).
+    # above the 0.60 link bar), junk from its unrelated band (max 0.314), and
+    # one pair from the related band (0.521) scoring *between the reverted
+    # flood bar and the measured bar*: at 0.38 it fires, at 0.60 it must not,
+    # so a regression to the flood value fails this test behaviourally and not
+    # only on the pinned constant.
     reused = [
         "dup-en-backpressure",
         "dup-fr-retention",
         "dup-en-fractional-index",
         "unrel-en-sourdough",
         "unrel-fr-tomates",
+        "rel-xl-projector",
     ]
     own_pairs = [
         (
