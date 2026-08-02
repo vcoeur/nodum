@@ -1978,6 +1978,11 @@ def test_a_base_url_urllib_cannot_post_to_is_no_provider_with_a_reason(
     assert llm.ENV_BASE_URL in reason, "the reason must name the variable a human can act on"
     assert detail in reason, "the reason must carry what urllib actually said"
     assert llm.DEFAULT_BASE_URL in reason, "and an example of a spelling that works"
+    # The instruction, not only the names around it. This branch and the
+    # default-endpoint one are now written separately, and the example clause
+    # is appended outside both — so grepping for the variable and the example
+    # leaves the sentence between them free to say anything at all.
+    assert "Set it to a full OpenAI-compatible root, scheme included" in reason
 
 
 def test_a_scheme_less_base_url_is_still_read_as_a_host_for_the_profile_match(monkeypatch):
@@ -2339,6 +2344,35 @@ def test_only_an_auth_status_carries_the_withheld_key_sentence(
         provider.chat([llm.Message(role="user", content="hi")], max_output_tokens=8, timeout=5.0)
 
     assert (reason in str(raised.value)) is carries_reason
+
+
+def test_a_401_with_nothing_withheld_says_nothing_about_keys(wire, monkeypatch):
+    """The other conjunct of the same guard, which the status parametrisation
+    cannot reach.
+
+    Those six cases all assert the withheld precondition, so the
+    ``is not None`` half is never entered false and deleting it passes the
+    whole suite — the mutant appends a literal ``". None"`` to every 401. An
+    ordinary keyless install meets a 401 whenever somebody puts a gateway in
+    front of ollama, and there is nothing to explain, so nothing is said.
+    """
+    for name in (llm.ENV_BASE_URL, llm.ENV_API_KEY):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv(llm.ENV_MODEL, "llama3.2:1b")
+    failure = urllib.error.HTTPError(
+        url="http://x/v1/chat/completions", code=401, msg="Unauthorized", hdrs=None, fp=None
+    )
+    failure.read = lambda: b'{"error":{"message":"invalid api key"}}'  # type: ignore[method-assign]
+    wire(raises=failure)
+    provider = llm.get_provider()
+    assert provider is not None
+    assert llm.key_withheld_reason() is None, "fixture is not the nothing-withheld case"
+
+    with pytest.raises(llm.ProviderUnavailable) as raised:
+        provider.chat([llm.Message(role="user", content="hi")], max_output_tokens=8, timeout=5.0)
+
+    assert not str(raised.value).endswith(". None")
+    assert str(raised.value).endswith('{"error":{"message":"invalid api key"}}')
 
 
 def test_a_bad_default_endpoint_is_not_blamed_on_a_variable_nobody_set(monkeypatch):

@@ -2831,9 +2831,14 @@ def test_a_probe_does_not_print_the_withheld_key_sentence_twice(fresh_db, monkey
     assert status.reachable is False
     assert status.api_key_withheld is not None
     assert status.detail is not None
-    assert "401" in status.detail, "detail still says what happened on this call"
     assert status.api_key_withheld not in status.detail, "said once, in its own field"
     assert "sk-vendor-secret" not in status.detail
+    # The whole of what this call said, not just the status code. Asserting
+    # `"401" in detail` alone survives a slice that eats the server's own
+    # message, because the code sits in the prefix the strip never touches.
+    assert status.detail.endswith(
+        'answered HTTP 401: {"error":{"message":"authorization required"}}'
+    )
 
 
 def test_status_says_nothing_when_the_key_is_going_where_it_was_configured(fresh_db, monkeypatch):
