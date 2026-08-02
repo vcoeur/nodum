@@ -131,8 +131,12 @@ who can close the tab.
 which checks first, so any run that reaches a model is stoppable. The four
 *deterministic* consolidation jobs in :mod:`nodum.consolidate` make no provider
 call and no stop check, so a stop recorded against one of those runs is kept in
-the journal and that run finishes on its own — the LLM jobs that check between
-jobs and between items are 5b-ii's, landing on this runtime. The human surfaces
+the journal and that run finishes on its own — the abstraction job (5b-ii's
+first) is the exception, and it is the thing this paragraph now names: it
+consults the switch through ``AgentRun.chat``, which is exactly the per-call
+check described above. The between-jobs and between-items checks are the later
+5b-ii jobs'.
+ The human surfaces
 say so rather than promising a stop that would not arrive.
 """
 

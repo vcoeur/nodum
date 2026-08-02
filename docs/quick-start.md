@@ -137,8 +137,11 @@ nodum grant researcher main edit --as owner
 ## Let the graph tend itself
 
 A consolidation cycle runs the gardener's deterministic jobs — duplicate
-candidates, link pruning and inference, housekeeping, a neglect report — and
-files what it finds in the review queue rather than asserting it. Rehearse one
+candidates, link pruning and inference, housekeeping, a neglect report — plus,
+when `NODUM_LLM_CYCLE_BUDGET` funds it, the abstraction job: a `concept` node
+synthesized from a dense cluster of related notes, the model writing the text
+of a proposal the gates already decided to make. Everything it finds is
+filed in the review queue rather than asserted. Rehearse one
 first; a dry run writes its journal entry and no event at all:
 
 ```sh

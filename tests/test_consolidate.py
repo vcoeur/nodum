@@ -1,7 +1,9 @@
 """The consolidation runner: the deterministic jobs and the coherence metrics.
 
 Phase 5a, the near side of the LLM line (design §8.4/§8.5). What is tested here
-is the half of the gardener that is arithmetic: four jobs, five metrics, one
+is the half of the gardener that is arithmetic: four deterministic jobs, the
+abstraction job's deterministic selection (5b-ii's first LLM job — the model
+writes the text and never decides *whether* to synthesize), five metrics, one
 cycle around all of it, and the rails that keep the internal agent a *peer
 client* — every write through the public service API, every event stamped with
 the cycle, every one of them attributed to ``agent:builtin-gardener``.
@@ -22,11 +24,13 @@ import sys
 import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import pytest
 from helpers import agent, owner
 
-from nodum import auth, consolidate, db, embeddings, service
+from nodum import agent as agent_runtime
+from nodum import auth, consolidate, db, embeddings, llm, service
 from nodum.store import GrantNotPermitted
 
 #: The labelled pairs the two cosine bars are measured *against* — not set from,
@@ -1683,12 +1687,590 @@ def test_no_job_at_all_still_produces_a_metrics_snapshot(fresh_db):
     assert set(report.metrics) == {"before", "after"}
 
 
+# ── The abstraction job's deterministic half (5b-ii: gates only, no model) ────
+
+
+def _relates(first, second):
+    """An active ``relates_to`` edge between two nodes, by id."""
+    return service.create_edge(first, second, consolidate.RELATED_EDGE_TYPE, principal=owner())
+
+
+def _abstraction_outcome(report):
+    return _outcome(report, consolidate.JOB_ABSTRACTION)
+
+
+def test_abstraction_needs_a_provider_and_says_so(fresh_db):
+    """Cohesion is the job's one vector signal, so there is no degraded mode.
+
+    The other jobs fall back to a deterministic half when the embedding provider
+    is absent; this job has none — a dense, sized, fresh cluster exists and the
+    cohesion gate simply cannot be computed, so the job no-ops and says so,
+    exactly like their degraded postures report their own absence.
+    """
+    first, second, third = _node("Alpha"), _node("Beta"), _node("Gamma")
+    _relates(first.id, second.id)
+    _relates(second.id, third.id)
+    _relates(third.id, first.id)
+
+    outcome = _abstraction_outcome(_run(jobs=[consolidate.JOB_ABSTRACTION]).report)
+
+    assert outcome.error is None
+    assert outcome.proposed == []
+    assert any("no embedding provider" in note for note in outcome.notes)
+    assert any("did not run" in note for note in outcome.notes)
+
+
+def test_a_dense_sized_fresh_cluster_is_eligible(fresh_db):
+    """One cycle's worth of edges and one shared area make a synthesis candidate."""
+    _place(Alpha=0.0, Beta=1.0, Gamma=2.0)
+    first, second, third = (
+        _node("Alpha one"),
+        _node("Alpha two"),
+        _node("Alpha three"),
+    )
+    _relates(first.id, second.id)
+    _relates(second.id, third.id)
+    _relates(third.id, first.id)
+
+    outcome = _abstraction_outcome(_run(jobs=[consolidate.JOB_ABSTRACTION]).report)
+
+    assert outcome.detail["clusters_eligible"] == 1
+    assert outcome.detail["clusters_considered"] == 1
+    assert outcome.detail["eligible_clusters"] == [sorted([first.id, second.id, third.id])]
+    assert outcome.skipped == []
+
+
+def test_a_chain_is_not_dense(fresh_db):
+    """Four members in a line have three edges — average degree below 2.
+
+    The vectors are cohesive and the size gate passes, so it is the graph half
+    of the density gate and only that half that refuses the cluster.
+    """
+    _place(Alpha=0.0)
+    first, second, third, fourth = (
+        _node("Alpha one"),
+        _node("Alpha two"),
+        _node("Alpha three"),
+        _node("Alpha four"),
+    )
+    _relates(first.id, second.id)
+    _relates(second.id, third.id)
+    _relates(third.id, fourth.id)
+
+    outcome = _abstraction_outcome(_run(jobs=[consolidate.JOB_ABSTRACTION]).report)
+
+    assert outcome.detail["clusters_eligible"] == 0
+    (skip,) = outcome.skipped
+    assert skip["id"] == ",".join(sorted([first.id, second.id, third.id, fourth.id]))
+    assert "not dense" in skip["reason"]
+
+
+def test_a_synthesized_member_is_not_resynthesized(fresh_db):
+    """Both halves of the freshness gate: the member's own flag, or a
+    ``derived_from`` edge from a synthesized node.
+
+    The ancestor edge is filed ``proposed`` — the state the job writes it in —
+    because the gate has to protect members of a synthesis that is still
+    waiting in the review queue, not only one already accepted (whose edges
+    are ``active``).
+    """
+    _place(Alpha=0.0)
+    flagged = _node("Alpha one", props={"synthesized": True})
+    second, third = _node("Alpha two"), _node("Alpha three")
+    _relates(flagged.id, second.id)
+    _relates(second.id, third.id)
+    _relates(third.id, flagged.id)
+
+    ancestor = _node("Beta one", props={"synthesized": True})
+    member, other = _node("Beta two"), _node("Beta three")
+    _relates(member.id, other.id)
+    _relates(other.id, ancestor.id)
+    _relates(ancestor.id, member.id)
+    service.create_edge(
+        ancestor.id,
+        member.id,
+        consolidate.DERIVED_FROM_EDGE_TYPE,
+        landing="proposed",
+        principal=owner(),
+    )
+
+    outcome = _abstraction_outcome(_run(jobs=[consolidate.JOB_ABSTRACTION]).report)
+
+    assert outcome.detail["clusters_eligible"] == 0
+    assert sorted(skip["reason"] for skip in outcome.skipped) == [
+        "member is already part of a synthesis",
+        "member is already part of a synthesis",
+    ]
+
+
+def test_an_over_cap_graph_reports_the_overflow(fresh_db, monkeypatch):
+    """Eligible clusters beyond the per-cycle cap are reported, never dropped."""
+    monkeypatch.setattr(consolidate, "MAX_CLUSTERS_PER_CYCLE", 2)
+    _place(Alpha=0.0, Beta=1.0, Gamma=2.0)
+    for marker in ("Alpha", "Beta", "Gamma"):
+        first, second, third = (
+            _node(f"{marker} one"),
+            _node(f"{marker} two"),
+            _node(f"{marker} three"),
+        )
+        _relates(first.id, second.id)
+        _relates(second.id, third.id)
+        _relates(third.id, first.id)
+
+    outcome = _abstraction_outcome(_run(jobs=[consolidate.JOB_ABSTRACTION]).report)
+
+    assert outcome.detail["clusters_eligible"] == 3
+    assert outcome.detail["clusters_considered"] == 2
+    assert any("cap" in note for note in outcome.notes)
+
+
+def test_a_sized_cluster_below_the_minimum_is_skipped(fresh_db):
+    """A pair is a link, not a synthesis — the size gate fires before any model call."""
+    first, second = _node("Alpha one"), _node("Alpha two")
+    _relates(first.id, second.id)
+
+    outcome = _abstraction_outcome(_run(jobs=[consolidate.JOB_ABSTRACTION]).report)
+
+    assert outcome.detail["clusters_eligible"] == 0
+    (skip,) = outcome.skipped
+    assert "below the" in skip["reason"]
+
+
+def test_a_non_cohesive_cluster_is_skipped(fresh_db):
+    """A dense, sized, fresh cluster whose members are not mutually similar is
+    refused by the cohesion gate — the mean pairwise cosine below the bar.
+
+    The members sit at widely separated placed angles, so the mean pairwise
+    cosine is negative while the graph half and the size gate would both have
+    admitted the cluster: it is the vector half, and only it, that refuses.
+    """
+    _place(Alpha=0.0, Beta=math.radians(80), Gamma=math.radians(160))
+    first, second, third = (
+        _node("Alpha one"),
+        _node("Beta two"),
+        _node("Gamma three"),
+    )
+    _relates(first.id, second.id)
+    _relates(second.id, third.id)
+    _relates(third.id, first.id)
+
+    outcome = _abstraction_outcome(_run(jobs=[consolidate.JOB_ABSTRACTION]).report)
+
+    assert outcome.detail["clusters_eligible"] == 0
+    (skip,) = outcome.skipped
+    assert skip["id"] == ",".join(sorted([first.id, second.id, third.id]))
+    assert "not cohesive" in skip["reason"]
+
+
+def test_the_cohesion_bar_is_the_calibrated_link_bar_reused():
+    """The cohesion bar is the measured link bar, reused rather than invented.
+
+    Pinned so a future re-tune of the cohesion bar separately from the link
+    bar fails loudly and forces the comment on
+    :data:`consolidate.ABSTRACTION_COHESION_COSINE` to be reconsidered.
+    """
+    assert consolidate.ABSTRACTION_COHESION_COSINE == consolidate.LINK_EMBEDDING_COSINE
+
+
+def test_a_cluster_above_the_maximum_is_skipped(fresh_db):
+    """Eleven members is several concepts pretending to be one — the size
+    gate's upper bound fires before any model call.
+
+    The component is a dense ring of eleven notes (eleven ``relates_to``
+    edges, so the graph half of the density gate would pass); it is the size
+    gate, and only it, that refuses.
+    """
+    _place(Alpha=0.0)
+    members = [_node(f"Alpha {index}") for index in range(11)]
+    for first, second in zip(members, members[1:] + members[:1], strict=False):
+        _relates(first.id, second.id)
+
+    outcome = _abstraction_outcome(_run(jobs=[consolidate.JOB_ABSTRACTION]).report)
+
+    assert outcome.detail["clusters_eligible"] == 0
+    (skip,) = outcome.skipped
+    assert skip["id"] == ",".join(sorted(node.id for node in members))
+    assert "above the 10-member maximum" in skip["reason"]
+
+
+# ── The abstraction job's write half (S2: the model call) ─────────────────────
+
+
+def _completion(text: str, *, prompt_tokens: int = 100, output_tokens: int = 40) -> llm.Completion:
+    """One whole fake completion, shaped like ``test_agent.py``'s."""
+    return llm.Completion(
+        text=text,
+        prompt_tokens=prompt_tokens,
+        output_tokens=output_tokens,
+        finish_reason="stop",
+        model_id="fake-model",
+        provider_id="fake://provider",
+        context_tokens=4096,
+        latency_ms=7,
+    )
+
+
+class _FakeLLM:
+    """A provider that replays what it was given and records every call.
+
+    Modeled on ``test_agent.py``'s ``FakeProvider``, cut to what the job needs:
+    the call shape, and a body per call. The ``estimate`` is the module's own
+    over-count without the schema's measured 330 tokens — exactness does not
+    matter here, because the budget is sized so nothing refuses.
+    """
+
+    provider_id = "fake://provider"
+    model_id = "fake-model"
+    context_tokens = 4096
+    thinking = llm.DEFAULT_THINKING
+    thinking_applied = True
+    structured_mode = llm.STRUCTURED_JSON_SCHEMA
+
+    def __init__(self, *answers: llm.Completion) -> None:
+        self.answers = list(answers)
+        self.calls: list[dict[str, Any]] = []
+
+    def estimate_prompt_tokens(self, messages, *, schema=None) -> int:
+        return llm.estimate_prompt_tokens(messages)
+
+    def output_reservation(self, max_output_tokens: int) -> int:
+        return max(1, min(max_output_tokens, 2048))
+
+    def chat(
+        self, messages, *, schema=None, max_output_tokens, timeout, thinking=None
+    ) -> llm.Completion:
+        self.calls.append(
+            {
+                "messages": list(messages),
+                "schema": schema,
+                "max_output_tokens": max_output_tokens,
+                "timeout": timeout,
+                "thinking": thinking,
+            }
+        )
+        return self.answers[min(len(self.calls) - 1, len(self.answers) - 1)]
+
+
+def _dense_fresh_cluster():
+    """Three active notes in a triangle, cohesive at the placed angle."""
+    _place(Alpha=0.0)
+    first, second, third = (
+        _node("Alpha one"),
+        _node("Alpha two"),
+        _node("Alpha three"),
+    )
+    _relates(first.id, second.id)
+    _relates(second.id, third.id)
+    _relates(third.id, first.id)
+    return first, second, third
+
+
+def test_abstraction_with_no_budget_noops_and_says_so(fresh_db, monkeypatch):
+    """K2 level 1: an unset budget means the LLM jobs do not run.
+
+    The deterministic selection still ran — it costs nothing — and only the
+    model spend is gated, which is the whole point of the separation.
+    """
+    monkeypatch.delenv(agent_runtime.ENV_CYCLE_BUDGET, raising=False)
+    provider = _FakeLLM(_completion('{"title": "x", "content": "y"}'))
+    llm.set_provider(provider)
+    _dense_fresh_cluster()
+
+    outcome = _abstraction_outcome(_run(jobs=[consolidate.JOB_ABSTRACTION]).report)
+
+    assert outcome.detail["clusters_eligible"] == 1
+    assert outcome.proposed == []
+    assert any("NODUM_LLM_CYCLE_BUDGET is 0" in note for note in outcome.notes)
+    assert provider.calls == [], "no budget must mean no provider call"
+
+
+def test_abstraction_with_a_budget_synthesizes_a_proposed_concept(fresh_db, monkeypatch):
+    """S2: the model writes the text, the job writes the concept and its edges.
+
+    The write goes through the public service API exactly like every other
+    job's — visible to ``service.get_node``, filed ``proposed``, carrying the
+    freshness gate's own record (``props.synthesized``) and the provenance.
+    """
+    monkeypatch.setenv(agent_runtime.ENV_CYCLE_BUDGET, "100000")
+    body = {"title": "Alpha matters", "content": "What the Alpha notes share."}
+    provider = _FakeLLM(_completion(json.dumps(body)))
+    llm.set_provider(provider)
+    first, second, third = _dense_fresh_cluster()
+
+    outcome = _abstraction_outcome(_run(jobs=[consolidate.JOB_ABSTRACTION]).report)
+
+    assert len(provider.calls) == 1
+    (concept_id,) = [entry["node"] for entry in outcome.detail["synthesized"]]
+    concept = service.get_node(concept_id, principal=owner())
+    assert concept.type == "concept"
+    assert concept.state == "proposed"
+    assert concept.title == "Alpha matters"
+    assert concept.content == "What the Alpha notes share."
+    assert concept.props["synthesized"] is True
+    assert concept.props["members"] == sorted([first.id, second.id, third.id])
+    assert concept.props["job"] == consolidate.JOB_ABSTRACTION
+    assert concept.props["generated_by"]["model_id"] == "fake-model"
+    assert concept.props["generated_by"]["prompt_version"] == consolidate.ABSTRACTION_PROMPT_VERSION
+    edges = service.list_edges(
+        node_id=concept_id, type=consolidate.DERIVED_FROM_EDGE_TYPE, principal=owner()
+    )
+    assert len(edges) == 3
+    assert {edge.state for edge in edges} == {"proposed"}
+    assert {edge.dst_id for edge in edges} == {first.id, second.id, third.id}
+    assert all(edge.props.get("job") == consolidate.JOB_ABSTRACTION for edge in edges)
+    # The whole unit is proposed: the concept and its membership edges. This
+    # job only proposes, so `applied` stays empty — a reader must not be told
+    # "changed N rows" for three proposals.
+    assert outcome.applied == []
+    assert sorted(outcome.proposed) == sorted([concept_id, *[edge.id for edge in edges]])
+    assert [entry["node"] for entry in outcome.detail["synthesized"]] == [concept_id]
+
+
+def test_accepting_a_synthesis_activates_its_derived_from_edges_and_blocks_resynthesis(
+    fresh_db, monkeypatch
+):
+    """Accepting a synthesis is deciding its members too.
+
+    The concept's ``derived_from`` edges go ``active`` with the node (the
+    service settles them, exactly as it sweeps wikilink mentions), so the
+    accepted synthesis protects its members: the next cycle must not
+    re-synthesize the same cluster.
+    """
+    monkeypatch.setenv(agent_runtime.ENV_CYCLE_BUDGET, "100000")
+    provider = _FakeLLM(_completion('{"title": "Alpha matters", "content": "The shared core."}'))
+    llm.set_provider(provider)
+    first, second, third = _dense_fresh_cluster()
+    del first, second, third
+
+    first_run = _run(jobs=[consolidate.JOB_ABSTRACTION])
+    first_outcome = _abstraction_outcome(first_run.report)
+    (concept_id,) = [entry["node"] for entry in first_outcome.detail["synthesized"]]
+    edges = service.list_edges(
+        node_id=concept_id, type=consolidate.DERIVED_FROM_EDGE_TYPE, principal=owner()
+    )
+    assert {edge.state for edge in edges} == {"proposed"}
+
+    service.transition(concept_id, "accept", principal=owner())
+
+    accepted = service.list_edges(
+        node_id=concept_id, type=consolidate.DERIVED_FROM_EDGE_TYPE, principal=owner()
+    )
+    assert {edge.state for edge in accepted} == {"active"}
+
+    second_run = _run(jobs=[consolidate.JOB_ABSTRACTION])
+    second_outcome = _abstraction_outcome(second_run.report)
+    assert second_outcome.detail["clusters_eligible"] == 0
+    assert any("already part of a synthesis" in skip["reason"] for skip in second_outcome.skipped)
+    assert len(provider.calls) == 1, "an accepted synthesis must not be re-synthesized"
+
+
+def test_a_pending_synthesis_protects_its_members_too(fresh_db, monkeypatch):
+    """A synthesis waiting in review protects its members as well.
+
+    The freshness gate reads non-archived ``derived_from`` edges, so the
+    ``proposed`` edges of a synthesis still in the queue keep its cluster from
+    being proposed again next cycle — the duplicate-proposal shape.
+    """
+    monkeypatch.setenv(agent_runtime.ENV_CYCLE_BUDGET, "100000")
+    provider = _FakeLLM(_completion('{"title": "Alpha matters", "content": "The shared core."}'))
+    llm.set_provider(provider)
+    _dense_fresh_cluster()
+
+    first_run = _run(jobs=[consolidate.JOB_ABSTRACTION])
+    assert _abstraction_outcome(first_run.report).detail["clusters_eligible"] == 1
+    assert len(provider.calls) == 1
+
+    second_run = _run(jobs=[consolidate.JOB_ABSTRACTION])
+    second_outcome = _abstraction_outcome(second_run.report)
+
+    assert second_outcome.detail["clusters_eligible"] == 0
+    assert any("already part of a synthesis" in skip["reason"] for skip in second_outcome.skipped)
+    assert len(provider.calls) == 1, "a pending synthesis must not be re-proposed"
+
+
+def test_rejecting_a_synthesis_frees_its_members(fresh_db, monkeypatch):
+    """Rejecting a synthesis archives its membership edges with the concept.
+
+    A rejected concept's ``derived_from`` edges are meaningless — they must
+    not linger as orphaned proposals or protect their members — and the next
+    cycle must consider the cluster eligible again.
+    """
+    monkeypatch.setenv(agent_runtime.ENV_CYCLE_BUDGET, "100000")
+    provider = _FakeLLM(
+        _completion('{"title": "Alpha matters", "content": "The shared core."}'),
+        _completion('{"title": "Alpha matters again", "content": "The shared core again."}'),
+    )
+    llm.set_provider(provider)
+    first, second, third = _dense_fresh_cluster()
+    del first, second, third
+
+    first_run = _run(jobs=[consolidate.JOB_ABSTRACTION])
+    (concept_id,) = [
+        entry["node"] for entry in _abstraction_outcome(first_run.report).detail["synthesized"]
+    ]
+    service.transition(concept_id, "reject", principal=owner())
+
+    edges = service.list_edges(
+        node_id=concept_id, type=consolidate.DERIVED_FROM_EDGE_TYPE, principal=owner()
+    )
+    assert len(edges) == 3
+    assert {edge.state for edge in edges} == {"archived"}
+
+    second_run = _run(jobs=[consolidate.JOB_ABSTRACTION])
+    second_outcome = _abstraction_outcome(second_run.report)
+
+    assert second_outcome.detail["clusters_eligible"] == 1
+    assert len(provider.calls) == 2, "a rejected synthesis frees its members"
+
+
+def test_abstraction_dry_run_calls_the_model_and_writes_nothing(fresh_db, monkeypatch):
+    """B4: a rehearsal pays for the expensive half — the model is called, nothing written."""
+    monkeypatch.setenv(agent_runtime.ENV_CYCLE_BUDGET, "100000")
+    provider = _FakeLLM(_completion('{"title": "t", "content": "c"}'))
+    llm.set_provider(provider)
+    first, second, third = _dense_fresh_cluster()
+    del first, second, third
+    before = len(service.list_nodes(principal=owner()))
+
+    outcome = _abstraction_outcome(_run(jobs=[consolidate.JOB_ABSTRACTION], dry_run=True).report)
+
+    assert len(provider.calls) == 1, "B4: the dry run must cost what the run costs"
+    assert outcome.proposed == []
+    assert outcome.applied == []
+    assert [entry["dry_run"] for entry in outcome.detail["synthesized"]] == [True]
+    assert any(
+        "dry run: would synthesize 1 concept(s) from 3 member(s)" in note for note in outcome.notes
+    )
+    assert len(service.list_nodes(principal=owner())) == before
+    assert service.list_edges(type=consolidate.DERIVED_FROM_EDGE_TYPE, principal=owner()) == []
+
+
+def test_a_malformed_model_body_is_a_job_error_not_a_write(fresh_db, monkeypatch):
+    """A body that fails to parse is a job error — the cycle closes failed."""
+    monkeypatch.setenv(agent_runtime.ENV_CYCLE_BUDGET, "100000")
+    provider = _FakeLLM(_completion("this is not json"))
+    llm.set_provider(provider)
+    _dense_fresh_cluster()
+
+    result = _run(jobs=[consolidate.JOB_ABSTRACTION])
+
+    assert result.cycle.status == "failed"
+    (failure,) = result.report.failed
+    assert failure.job == consolidate.JOB_ABSTRACTION
+    assert "not JSON" in failure.error
+    assert result.report.jobs[0].proposed == []
+    assert service.list_edges(type=consolidate.DERIVED_FROM_EDGE_TYPE, principal=owner()) == []
+
+
+def test_an_empty_model_body_is_a_job_error_not_a_write(fresh_db, monkeypatch):
+    """Schema-valid but empty strings are a refusal to answer, not a node.
+
+    ``{"title": "", "content": ""}`` parses and satisfies the schema, and it
+    would write an empty node nobody asked for — the job errors instead, and
+    nothing is written.
+    """
+    monkeypatch.setenv(agent_runtime.ENV_CYCLE_BUDGET, "100000")
+    provider = _FakeLLM(_completion(json.dumps({"title": "", "content": ""})))
+    llm.set_provider(provider)
+    _dense_fresh_cluster()
+
+    result = _run(jobs=[consolidate.JOB_ABSTRACTION])
+
+    assert result.cycle.status == "failed"
+    (failure,) = result.report.failed
+    assert failure.job == consolidate.JOB_ABSTRACTION
+    assert "empty" in failure.error
+    assert result.report.jobs[0].proposed == []
+    assert service.list_nodes(type="concept", principal=owner()) == []
+    assert service.list_edges(type=consolidate.DERIVED_FROM_EDGE_TYPE, principal=owner()) == []
+
+
+def test_a_scoped_cycle_lands_the_concept_in_the_scope(fresh_db, monkeypatch):
+    """The concept belongs with its members: a scoped cycle writes it in the
+    scope, and its ``derived_from`` edges stay in-scope — the whole unit
+    waits in review together. An unscoped cycle lands in ``main`` as before.
+    """
+    monkeypatch.setenv(agent_runtime.ENV_CYCLE_BUDGET, "100000")
+    provider = _FakeLLM(_completion('{"title": "Alpha matters", "content": "The shared core."}'))
+    llm.set_provider(provider)
+    space = service.create_space("research", principal=owner())
+    service.grant("builtin-gardener", "research", "edit", principal=owner())
+    _place(Alpha=0.0)
+    first, second, third = (
+        service.create_node(type="claim", title="Alpha one", space="research", principal=owner()),
+        service.create_node(type="claim", title="Alpha two", space="research", principal=owner()),
+        service.create_node(type="claim", title="Alpha three", space="research", principal=owner()),
+    )
+    _relates(first.id, second.id)
+    _relates(second.id, third.id)
+    _relates(third.id, first.id)
+
+    result = _run(scope="research", jobs=[consolidate.JOB_ABSTRACTION])
+
+    outcome = _abstraction_outcome(result.report)
+    assert outcome.detail["clusters_eligible"] == 1
+    (concept_id,) = [entry["node"] for entry in outcome.detail["synthesized"]]
+    concept = service.get_node(concept_id, principal=owner())
+    assert concept.space_id == space.id
+    edges = service.list_edges(
+        node_id=concept_id, type=consolidate.DERIVED_FROM_EDGE_TYPE, principal=owner()
+    )
+    assert {edge.dst_id for edge in edges} == {first.id, second.id, third.id}
+
+
+def test_the_member_char_bound_fits_the_minimum_cluster_in_the_default_window():
+    """SF-6: 3 × ``ABSTRACTION_MEMBER_CHARS`` plus the template must fit the
+    default window after the output reservation.
+
+    Otherwise every default install degrades to ``PromptTooLong`` and the
+    bound's comment — "sized so the minimum 3-member cluster fits" — lies.
+    """
+    window = llm.DEFAULT_CONTEXT_TOKENS
+    allowance = window - int(window * llm.OUTPUT_RESERVATION_FRACTION)
+    content = "x" * consolidate.ABSTRACTION_MEMBER_CHARS
+    rendered = consolidate.ABSTRACTION_PROMPT.format(
+        members="\n".join(
+            f"- **{title}**: {content}" for title in ("Alpha one", "Beta two", "Gamma three")
+        )
+    )
+    estimate = llm.estimate_prompt_tokens([llm.Message(role="user", content=rendered)])
+
+    assert estimate <= allowance
+
+
+def test_the_journal_carries_the_llm_report(fresh_db, monkeypatch):
+    """A1: cost rides the cycle report under ``agent.REPORT_KEY``."""
+    monkeypatch.setenv(agent_runtime.ENV_CYCLE_BUDGET, "100000")
+    provider = _FakeLLM(
+        _completion('{"title": "t", "content": "c"}', prompt_tokens=321, output_tokens=45)
+    )
+    llm.set_provider(provider)
+    _dense_fresh_cluster()
+
+    result = _run(jobs=[consolidate.JOB_ABSTRACTION])
+
+    stored = result.cycle.report[agent_runtime.REPORT_KEY]
+    assert stored["calls"] == 1
+    assert stored["failed_calls"] == 0
+    assert stored["prompt_tokens"] == 321
+    assert stored["output_tokens"] == 45
+    assert stored["total_tokens"] == 366
+    assert stored["provider"] == "fake://provider"
+    assert stored["model_id"] == "fake-model"
+    (per_job,) = stored["per_job"]
+    assert per_job["job"] == consolidate.JOB_ABSTRACTION
+    assert per_job["calls"] == 1
+    assert result.report.llm == stored, "the typed half of the report is the same data"
+
+
 # ── The structural rail: no service-layer bypass ─────────────────────────────
 
 
 #: Everything :mod:`nodum.consolidate` is allowed to import out of the package.
-#: A new entry here is a decision somebody has to make on purpose.
+#: A new entry here is a decision somebody has to make on purpose. ``nodum.agent``
+#: joined with the abstraction job — the model call goes through its one door.
 ALLOWED_NODUM_IMPORTS = {
+    "nodum.agent",
     "nodum.auth",
     "nodum.embeddings",
     "nodum.migrations",
@@ -1792,32 +2374,72 @@ def test_the_deterministic_runner_consults_no_stop_switch_and_the_copy_says_so(
 
     ``nodum cycle-stop`` and ``POST /api/cycles/{id}/stop`` record an instruction
     the *run* is supposed to notice, and the only thing that notices one today is
-    :meth:`nodum.agent.AgentRun.chat`, before a provider call. These four jobs
-    make no provider call and no stop check — the jobs that check between jobs
-    and between items are 5b-ii's — so a stop asked for during a deterministic
-    cycle is recorded and that run finishes. Every surface says exactly that, and
-    this is what keeps the sentence honest: when 5b-ii wires a check in here, this
-    test fails and the copy it names has to be rewritten rather than quietly
-    becoming an understatement.
+    :meth:`nodum.agent.AgentRun.chat`, before a provider call. The four
+    **deterministic** jobs make no provider call and no stop check — so a stop
+    asked for during one of their runs is recorded and that run finishes. The
+    abstraction job (5b-ii's first) is the deliberate exception, and it is the
+    thing the copy now names: it reaches the model through ``AgentRun.chat``,
+    which is the stop check. Every surface says exactly that, and this is what
+    keeps the sentence honest: a stop-consulting call that lands in a
+    deterministic job fails this test, and the copy it names has to be rewritten
+    rather than quietly becoming an understatement.
 
     Both halves are asserted, because neither alone is the claim. The AST half
-    catches a check added anywhere in the module; the behavioural half proves the
-    run really does complete, since a check could be added through a helper this
-    file does not name.
+    confines every stop-consulting call site to the abstraction job's own
+    function; the behavioural half proves the run really does complete, since a
+    check could be added through a helper this file does not name.
     """
-    reached = {
-        node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", "")
-        for node in ast.walk(_module_ast())
+    module = _module_ast()
+    abstraction = next(
+        node
+        for node in module.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_job_abstraction"
+    )
+
+    def inside_abstraction(node: ast.AST) -> bool:
+        return abstraction.lineno <= node.lineno <= (abstraction.end_lineno or abstraction.lineno)
+
+    # Every call that consults the switch — the service read itself, the wiring
+    # helper, the runtime's own check, the runtime's construction, and the one
+    # door that checks first — must live inside the abstraction job. The two
+    # module-level uses of the `agent` name are excluded from the use check
+    # below: `agent.prompt_version` is computed once at import time from the
+    # template string and consults nothing, and `agent.LLMReport` is the type
+    # of the context's report slot — an annotation rather than a call.
+    consulting = {"stop_requested", "cycle_stop_check", "check_stop", "for_cycle", "chat"}
+    offside = [
+        node
+        for node in ast.walk(module)
         if isinstance(node, ast.Call)
-    }
-    assert "stop_requested" not in reached
-    assert "cycle_stop_check" not in reached
-    assert "check_stop" not in reached
-    assert "nodum.agent" not in _imported_modules()
+        and (
+            node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", "")
+        )
+        in consulting
+        and not inside_abstraction(node)
+    ]
+    assert offside == [], (
+        "a stop-consulting call sits outside the abstraction job: "
+        f"{[ast.unparse(call) for call in offside]}"
+    )
+
+    agent_uses = [
+        node
+        for node in ast.walk(module)
+        if isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "agent"
+        and node.attr not in {"prompt_version", "LLMReport"}
+    ]
+    offside_uses = [use for use in agent_uses if not inside_abstraction(use)]
+    assert offside_uses == [], (
+        f"`agent` is used outside the abstraction job: {[ast.unparse(use) for use in offside_uses]}"
+    )
 
     # And in the run itself. The switch is hit from *inside* the cycle — the
     # only moment anybody hits one — by a job standing where the real first job
-    # stands, and every job after it still runs to completion.
+    # stands, and every job after it still runs to completion. The abstraction
+    # job is in that list: with no provider and no budget it no-ops, so a run
+    # containing it completes exactly as a deterministic one does.
     human = owner()
 
     def stopper(context):

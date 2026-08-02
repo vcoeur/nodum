@@ -1,11 +1,20 @@
-"""The consolidation runner — the gardener's deterministic jobs (design §8.4/§8.5).
+"""The consolidation runner — the gardener's jobs (design §8.4/§8.5).
 
 Phase 5 was cut at the LLM line, and this module is everything on the near side
-of it: the four jobs a cycle can run with arithmetic over data the file already
-holds, and the five coherence metrics they are measured by. There is no
-provider, no generation, and no judgement here — design Constraint 4 keeps the
-LLM out of validation, the state machine and the projectors, and the whole of
-this module runs on a machine with no model present.
+of it: the four deterministic jobs a cycle can run with arithmetic over data
+the file already holds, and the five coherence metrics they are measured by.
+There is no provider, no generation, and no judgement in those four — design
+Constraint 4 keeps the LLM out of validation, the state machine and the
+projectors, and they run on a machine with no model present.
+
+**The abstraction job (5b-ii's first) is the deliberate exception.** Its
+selection is exactly as deterministic as the other four — dense, sized, not
+already synthesized, all computed before any model call — and the model writes
+the text and nothing but the text: it never decides *whether* to synthesize,
+only what the synthesis says. The call goes through :mod:`nodum.agent`'s one
+door (:meth:`nodum.agent.AgentRun.chat`, which is what consults the kill
+switch), and the writes land through the same public :mod:`nodum.service`
+functions as every other job's, proposed for review like any inference.
 
 **The internal agent is a peer client (§8.4 rule 1).** Every read and every
 write goes through a public :mod:`nodum.service` function, exactly as the MCP
@@ -96,6 +105,7 @@ from __future__ import annotations
 
 import difflib
 import itertools
+import json
 import math
 import unicodedata
 from dataclasses import dataclass, field
@@ -105,7 +115,7 @@ from typing import Any
 
 from pydantic import BaseModel
 
-from nodum import auth, embeddings, projectors, service
+from nodum import agent, auth, embeddings, projectors, service
 from nodum.migrations import GARDENER_AGENT_ID, META_SPACE_ID
 from nodum.models import CycleOut, EdgeOut, NodeOut
 from nodum.principal import Principal
@@ -134,6 +144,12 @@ JOB_HOUSEKEEPING = "housekeeping"
 #: judgement, and judgement is 5b.
 JOB_NEGLECT = "neglect_report"
 
+#: Concept synthesis — 5b-ii's first LLM job. The deterministic gates select
+#: the clusters (dense, sized, not already synthesized); the model writes the
+#: one concept they have in common. The model never decides *whether* to
+#: synthesize, only what the text says.
+JOB_ABSTRACTION = "abstraction"
+
 
 # ── Edge types the jobs write ─────────────────────────────────────────────────
 
@@ -153,6 +169,12 @@ SUGGESTION_LANDING = "proposed"
 #: that one supports, cites, or is part of the other, and ``relates_to`` is the
 #: seeded symmetric type that says exactly that much. No type node is invented.
 RELATED_EDGE_TYPE = "relates_to"
+
+#: What a synthesis's concept node claims of its members. Seeded in migration
+#: ``0001`` and already used by ingestion (:data:`nodum.ingest.PROVENANCE_EDGE`)
+#: for provenance; here it is what makes "part of this synthesis" a graph fact
+#: rather than a prop, so the review queue and a later supersede can see it.
+DERIVED_FROM_EDGE_TYPE = "derived_from"
 
 
 # ── Thresholds ────────────────────────────────────────────────────────────────
@@ -225,6 +247,82 @@ DUPLICATE_EMBEDDING_COSINE = 0.93
 #: different jobs, and a pair between the bars is merely related, never the
 #: same thing.
 LINK_EMBEDDING_COSINE = 0.60
+
+#: The cohesion bar the abstraction job's clusters must clear — **reused, not
+#: invented**: the calibrated same-area bar is the cohesion bar. A cluster is
+#: cohesive when its members are at least as mutually related as the link bar
+#: requires, and nothing about "about the same area" changes when the pair is
+#: part of a cluster rather than the start of one. This is why the job needs
+#: the embedding provider — cohesion is its one vector signal, and there is no
+#: degraded mode to fall back to.
+ABSTRACTION_COHESION_COSINE = LINK_EMBEDDING_COSINE
+
+#: Smallest cluster the abstraction job will consider. Two notes are a pair,
+#: which the link job already expresses as a ``relates_to`` edge; a synthesis
+#: is what several notes have in common, and "several" starts at three.
+MIN_CLUSTER_MEMBERS = 3
+
+#: Largest cluster one synthesis may absorb. A ten-member cluster is already a
+#: long prompt; a larger one is several concepts pretending to be one.
+MAX_CLUSTER_MEMBERS = 10
+
+#: How many clusters one cycle may synthesize, whatever the file holds. The
+#: model spend is what is capped — selection stays complete and the overflow
+#: is reported, never silent.
+MAX_CLUSTERS_PER_CYCLE = 5
+
+#: How many characters of each member's content the synthesis prompt carries.
+#: The model does not need the member whole to say what several members share,
+#: and a ten-member cluster of long notes would otherwise blow a small window.
+#: Sized so the **minimum 3-member cluster fits the default window** — the
+#: assumption the bound is measured against: a 4 096-token window
+#: (:data:`nodum.llm.DEFAULT_CONTEXT_TOKENS`) halves for the output
+#: reservation, leaving ~2 048 tokens of prompt room; the 570-byte template
+#: plus message wrapping leaves ~1 470 bytes for the members, and 3 × 400
+#: ASCII characters fits inside with room for short titles (the prompt asks
+#: for "short and descriptive" ones). The estimator
+#: (:func:`nodum.llm.estimate_tokens`) counts UTF-8 bytes, so non-ASCII
+#: content costs more and is *refused* rather than truncated — safe, and
+#: itemised. Larger clusters degrade to :class:`nodum.agent.PromptTooLong`
+#: and a per-cluster skip with a note, which is the honest path for a
+#: ten-member cluster at this bound, not a failure.
+ABSTRACTION_MEMBER_CHARS = 400
+
+#: The synthesis prompt template. Deterministic framing only: the gates are
+#: named as already decided, and the model is asked for the text — what these
+#: notes have in common — and nothing else.
+ABSTRACTION_PROMPT = """You are the gardener's abstraction job. A deterministic pass has
+already decided that the notes below belong together and are not already part of a
+synthesis; your job is the text and nothing but the text.
+
+Write the one concept note that synthesizes what these notes have in common. Do not
+invent claims none of them make, and do not carry over anything that is true of only
+one member. The title is short and descriptive; the content is a few sentences of
+Markdown.
+
+Members:
+{members}
+
+Reply as JSON with exactly two keys: "title" (a string) and "content" (a string)."""
+
+#: The structured-output envelope for :data:`ABSTRACTION_PROMPT`. It fixes the
+#: shape and proves nothing about the content: the model can still answer
+#: {title, content} that none of the members support, so the caller validates
+#: the body parses and the *members* stay the deterministic half's record.
+ABSTRACTION_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "title": {"type": "string"},
+        "content": {"type": "string"},
+    },
+    "required": ["title", "content"],
+    "additionalProperties": False,
+}
+
+#: :func:`nodum.agent.prompt_version` of :data:`ABSTRACTION_PROMPT` (A2),
+#: computed once at import time so it changes when and only when the template
+#: does.
+ABSTRACTION_PROMPT_VERSION = agent.prompt_version(ABSTRACTION_PROMPT)
 
 #: How many neighbours two nodes must share before co-citation is evidence.
 #:
@@ -345,6 +443,11 @@ class ConsolidationReport(BaseModel):
     metrics: dict[str, dict[str, float]]
     failed: list[JobFailure] = []
     notes: list[str] = []
+    #: ``report["llm"]`` — :meth:`nodum.agent.AgentRun.report` of the run the
+    #: abstraction job drove, as JSON, or ``None`` when no LLM job ran. Filed by
+    #: :func:`_run_jobs` from the context (not returned from the job) so
+    #: :data:`JOBS` keeps its one signature.
+    llm: dict[str, Any] | None = None
 
 
 class ConsolidationOut(BaseModel):
@@ -473,6 +576,9 @@ class _Context:
     asked, which is what makes "who acted" answerable from the event log alone.
     ``scope`` is the *resolved* space id the cycle recorded (or ``None`` for the
     whole file), so every read narrows the same way the journal says it did.
+    ``cycle_id`` is the open cycle's id — the only thing the abstraction job
+    needs from the runner beyond the public reads, because the model runtime
+    (:func:`nodum.agent.for_cycle`) is wired to that row's kill switch.
     """
 
     principal: Principal
@@ -480,6 +586,7 @@ class _Context:
     dry_run: bool
     path: str | Path | None
     now: datetime
+    cycle_id: str
     _vectors: dict[str, list[float]] = field(default_factory=dict)
     #: Set by :meth:`edges` / :meth:`typed_edges` when a read returns *more
     #: than* :data:`MAX_SCAN_EDGES` rows (each fetches one past the cap so
@@ -487,6 +594,11 @@ class _Context:
     #: Sticky: one capped read anywhere in the run flags the whole run, so a
     #: consumer knows an edge read dropped rows but not *which* read did.
     truncated: bool = False
+    #: The :class:`~nodum.agent.LLMReport` of the run the abstraction job
+    #: drove, filed into the cycle's report under :data:`nodum.agent.REPORT_KEY`
+    #: by :func:`_run_jobs`. Read here rather than returned from the job so
+    #: :data:`JOBS` keeps its one signature.
+    llm_report: agent.LLMReport | None = None
 
     def nodes(self, *, state: str | None = None) -> list[NodeOut]:
         """Curatable nodes in scope, oldest first, capped at :data:`MAX_SCAN_NODES`."""
@@ -981,10 +1093,386 @@ def _job_neglect(context: _Context) -> JobOutcome:
     return outcome
 
 
+# ── Job 5: abstraction (5b-ii's first — gates deterministic, text from the model) ─
+
+
+def _mean_pairwise_cosine(vectors: dict[str, list[float]], members: list[str]) -> float:
+    """The mean cosine over every pair of a cluster; 0.0 for a two-member one.
+
+    The gate is *mean*, not minimum: a cluster is a body of related notes, and
+    one weaker pair among several strong ones is ordinary shape, not a hole.
+    """
+    values = [
+        _cosine(vectors[first], vectors[second])
+        for index, first in enumerate(members)
+        for second in members[index + 1 :]
+    ]
+    if not values:
+        return 0.0
+    return sum(values) / len(values)
+
+
+def _cluster_components(
+    context: _Context, in_scope: set[str]
+) -> tuple[list[EdgeOut], list[list[str]], set[str]]:
+    """The active ``relates_to`` graph among in-scope nodes, as components.
+
+    Returns the related edges, the connected components (each sorted, and the
+    list itself in id order — the sort that makes a run deterministic), and the
+    set of node ids that are already members of a synthesis (the ``dst`` of a
+    non-archived ``derived_from`` edge from a synthesized node — non-archived
+    because a *pending* synthesis's ``proposed`` edges protect its members
+    too, and only a rejected concept — whose edges the service archives with
+    it — frees them again).
+
+    A node with no ``relates_to`` edge is not a cluster — it is not a member of
+    any component, and it is not reported as one; reporting every orphan's
+    one-member "component" would drown the report in the commonest shape there
+    is.
+    """
+    active = context.edges(state="active")
+    related = [
+        edge
+        for edge in active
+        if edge.type == RELATED_EDGE_TYPE
+        and edge.src_id != edge.dst_id
+        and edge.src_id in in_scope
+        and edge.dst_id in in_scope
+    ]
+    # Non-archived, not just active: an *accepted* synthesis's edges are now
+    # active (the service settles them with the concept), but a *pending*
+    # synthesis's edges are `proposed` and must protect their members too —
+    # proposing the same cluster again while a synthesis of it waits in the
+    # queue is the duplicate-proposal shape. Only an *archived* edge (a
+    # rejected synthesis, whose edges the service archives with the concept)
+    # frees the members. The src is matched against the synthesized nodes in
+    # every non-archived state — a pending concept is `proposed`, not
+    # `active` — and that check is also what tells a synthesis's edge from
+    # ingestion's provenance ``derived_from`` edges.
+    synthesized_nodes = {
+        node.id
+        for node in context.nodes()
+        if node.state != "archived" and bool(node.props.get("synthesized"))
+    }
+    synthesized_ancestors = {
+        edge.dst_id
+        for edge in context.typed_edges(DERIVED_FROM_EDGE_TYPE)
+        if edge.state != "archived" and edge.src_id in synthesized_nodes and edge.dst_id in in_scope
+    }
+    adjacency: dict[str, set[str]] = {}
+    for edge in related:
+        adjacency.setdefault(edge.src_id, set()).add(edge.dst_id)
+        adjacency.setdefault(edge.dst_id, set()).add(edge.src_id)
+
+    components: list[list[str]] = []
+    seen: set[str] = set()
+    for start in sorted(in_scope):
+        if start in seen or start not in adjacency:
+            continue
+        stack = [start]
+        seen.add(start)
+        members: list[str] = []
+        while stack:
+            current = stack.pop()
+            members.append(current)
+            for neighbour in sorted(adjacency.get(current, ())):
+                if neighbour in seen or neighbour not in in_scope:
+                    continue
+                seen.add(neighbour)
+                stack.append(neighbour)
+        components.append(sorted(members))
+    return related, components, synthesized_ancestors
+
+
+def _render_abstraction_prompt(members: list[NodeOut]) -> str:
+    """The synthesis prompt for one cluster, from :data:`ABSTRACTION_PROMPT`.
+
+    Each member's content is capped at :data:`ABSTRACTION_MEMBER_CHARS`,
+    sized so a minimum 3-member cluster fits the default window with the
+    template and the output reservation; a larger cluster degrades to the
+    provider's :class:`~nodum.agent.PromptTooLong` refusal and a per-cluster
+    skip, which is the honest path for a ten-member cluster of long notes.
+    """
+    rendered = "\n".join(
+        f"- **{node.title or '(untitled)'}**: {(node.content or '')[:ABSTRACTION_MEMBER_CHARS]}"
+        for node in members
+    )
+    return ABSTRACTION_PROMPT.format(members=rendered)
+
+
+def _decode_abstraction_body(text: str, item_id: str) -> dict[str, str]:
+    """Read the model's reply as the ``{title, content}`` the schema asked for.
+
+    A schema makes this reliable and not certain — a provider that ignores
+    ``response_format`` answers with prose, which is a job error here, never a
+    write. Mirrors :func:`nodum.answers._decode`'s shape for the same reason:
+    a body that fails to parse must not become a node nobody asked for.
+
+    Schema-valid-but-false substance is the design's accepted stance, but
+    empty strings are a refusal to answer: a body whose title or content is
+    blank after stripping would write an empty node, which is a write nobody
+    asked for either.
+    """
+    try:
+        body = json.loads(text)
+    except (ValueError, TypeError):
+        raise ValueError(
+            f"the abstraction model body for {item_id} is not JSON: {text[:120]!r}"
+        ) from None
+    if (
+        not isinstance(body, dict)
+        or not isinstance(body.get("title"), str)
+        or not isinstance(body.get("content"), str)
+    ):
+        raise ValueError(
+            f"the abstraction model body for {item_id} is not a {{title, content}} "
+            f"object: {str(body)[:120]!r}"
+        )
+    title, content = body["title"], body["content"]
+    if not title.strip() or not content.strip():
+        raise ValueError(
+            f"the abstraction model body for {item_id} is an empty {{title, content}} "
+            f"object: {str(body)[:120]!r}"
+        )
+    return {"title": title, "content": content}
+
+
+def _job_abstraction(context: _Context) -> JobOutcome:
+    """Find the clusters worth synthesizing, and write the synthesis (5b-ii).
+
+    **The model never decides *whether* to synthesize — only what the text
+    says.** Every gate below is arithmetic over data the file already holds,
+    and all of it runs before any model call. A component is eligible when
+    four gates hold:
+
+    1. **Sized** — at least :data:`MIN_CLUSTER_MEMBERS` members and at most
+       :data:`MAX_CLUSTER_MEMBERS` (a two-member pair is the link job's
+       ``relates_to`` edge, not a synthesis).
+    2. **Dense, graph half** — at least as many internal active
+       ``relates_to`` edges as members: average degree ≥ 2, which is one
+       cycle rather than a chain.
+    3. **Not already synthesized** — no member carries truthy
+       ``props["synthesized"]``, and no member is the target of a non-archived
+       ``derived_from`` edge from a node that does. A synthesis is decided
+       together with its members: accepting the concept activates its edges,
+       rejecting it archives them — so a *pending* synthesis (``proposed``
+       edges) protects its members too, and only a rejected one frees them.
+    4. **Dense, vector half** — the mean pairwise cosine among the members is
+       at least :data:`ABSTRACTION_COHESION_COSINE` (the calibrated link bar,
+       reused rather than invented). This is why the job needs the embedding
+       provider, and why it **no-ops** rather than degrading when none is
+       present: cohesion is its one vector signal, so there is no degraded
+       mode to fall back to.
+
+    Eligible clusters are capped at :data:`MAX_CLUSTERS_PER_CYCLE`, sorted by
+    their member-id tuple; overflow is reported in a note, never silent. For
+    each considered cluster the job then calls the model through
+    :func:`nodum.agent.for_cycle` — gated first on the cycle budget
+    (:data:`nodum.agent.ENV_CYCLE_BUDGET`, off by default) and on a configured
+    provider — and the model's ``{title, content}`` is the *only* thing the
+    gates did not decide. The write files the concept node ``proposed`` with
+    ``props.synthesized`` (the freshness gate's own record) plus one
+    ``derived_from`` edge per member — in the cycle's scope when there is one
+    (the concept belongs with its members, and the whole unit waits in review
+    together), and in ``main`` — the default write target — on an unscoped
+    cycle, as before. A dry run still pays for the model
+    calls (B4) while writing nothing. A body that fails to parse is a job
+    error, not a write; a ceiling or a stop behave as the runtime documents
+    them. The run's :meth:`nodum.agent.AgentRun.report` is filed into the
+    cycle's report under :data:`nodum.agent.REPORT_KEY` by :func:`_run_jobs`.
+    """
+    outcome = JobOutcome(name=JOB_ABSTRACTION)
+    nodes = context.nodes(state="active")
+    nodes_by_id = {node.id: node for node in nodes}
+    in_scope = set(nodes_by_id)
+    outcome.examined = len(nodes)
+
+    related, components, synthesized_ancestors = _cluster_components(context, in_scope)
+
+    eligible: list[list[str]] = []
+    for members in components:
+        count = len(members)
+        if count < MIN_CLUSTER_MEMBERS or count > MAX_CLUSTER_MEMBERS:
+            reason = (
+                f"{count} members is below the {MIN_CLUSTER_MEMBERS}-member minimum"
+                if count < MIN_CLUSTER_MEMBERS
+                else f"{count} members is above the {MAX_CLUSTER_MEMBERS}-member maximum"
+            )
+            outcome.skipped.append({"id": ",".join(members), "reason": reason})
+            continue
+        internal = sum(1 for edge in related if edge.src_id in members and edge.dst_id in members)
+        if internal < count:
+            outcome.skipped.append(
+                {
+                    "id": ",".join(members),
+                    "reason": (
+                        f"not dense: {internal} relates_to edge(s) among {count} members — "
+                        "a cluster needs at least one cycle, not a chain"
+                    ),
+                }
+            )
+            continue
+        if any(bool(nodes_by_id[member].props.get("synthesized")) for member in members) or any(
+            member in synthesized_ancestors for member in members
+        ):
+            outcome.skipped.append(
+                {"id": ",".join(members), "reason": "member is already part of a synthesis"}
+            )
+            continue
+        selected = [nodes_by_id[member] for member in members]
+        vectors = context.vectors(selected)
+        if vectors is None:
+            # The size and density skips already recorded stay: the "did not
+            # run" note explains why no cluster was considered, and wiping the
+            # list would throw away the skips a reader has to see to know what
+            # would otherwise have been eligible.
+            outcome.notes.append(
+                f"no embedding provider ({embeddings.unavailable_reason()}): "
+                "abstraction cannot compute cohesion and did not run"
+            )
+            return outcome
+        mean_cosine = _mean_pairwise_cosine(vectors, members)
+        if mean_cosine < ABSTRACTION_COHESION_COSINE:
+            outcome.skipped.append(
+                {
+                    "id": ",".join(members),
+                    "reason": (
+                        f"not cohesive: mean pairwise cosine {mean_cosine:.4f} is below the "
+                        f"{ABSTRACTION_COHESION_COSINE:g} bar"
+                    ),
+                }
+            )
+            continue
+        eligible.append(members)
+
+    eligible.sort()
+    outcome.detail["clusters_eligible"] = len(eligible)
+    if len(eligible) > MAX_CLUSTERS_PER_CYCLE:
+        outcome.notes.append(
+            f"{len(eligible) - MAX_CLUSTERS_PER_CYCLE} more eligible cluster(s) beyond the "
+            f"{MAX_CLUSTERS_PER_CYCLE}-cluster cap were not considered"
+        )
+    considered = eligible[:MAX_CLUSTERS_PER_CYCLE]
+    outcome.detail["clusters_considered"] = len(considered)
+    outcome.detail["eligible_clusters"] = considered
+    outcome.skipped = outcome.skipped[:MAX_REPORTED_ITEMS]
+
+    # The write half. The deterministic selection above already ran whatever
+    # this half decides — the gates cost nothing, the model spend is what is
+    # gated.
+    run = agent.for_cycle(cycle_id=context.cycle_id, principal=context.principal, path=context.path)
+    try:
+        if run.budget.tokens <= 0:
+            outcome.notes.append("NODUM_LLM_CYCLE_BUDGET is 0: the abstraction job did not run")
+            return outcome
+        if not run.available:
+            outcome.notes.append(
+                f"no LLM provider ({run.unavailable_reason}): the abstraction job did not run"
+            )
+            return outcome
+        job_budget = run.job(JOB_ABSTRACTION, share=1.0)
+        outcome.detail["synthesized"] = []
+        synthesized_count = 0
+        member_count = 0
+        for members in considered:
+            item_id = "cluster:" + "-".join(members)
+            prompt = _render_abstraction_prompt([nodes_by_id[member] for member in members])
+            try:
+                generation = run.chat(
+                    [agent.Message(role="user", content=prompt)],
+                    prompt_version=ABSTRACTION_PROMPT_VERSION,
+                    schema=ABSTRACTION_SCHEMA,
+                    job=job_budget,
+                    item_id=item_id,
+                )
+            except agent.CycleStopped:
+                raise
+            except agent.BudgetExhausted:
+                # The run's report carries the exhausted flag and the itemised
+                # skip; the job is not a failure, the ceiling stopped the work.
+                break
+            except agent.PromptTooLong:
+                outcome.skipped.append(
+                    {"id": item_id, "reason": "the prompt does not fit the model's window"}
+                )
+                continue
+            body = _decode_abstraction_body(generation.text, item_id)
+            synthesized_count += 1
+            member_count += len(members)
+            if context.dry_run:
+                outcome.detail["synthesized"].append(
+                    {
+                        "node": None,
+                        "members": members,
+                        "title": body["title"],
+                        "dry_run": True,
+                    }
+                )
+                continue
+            node = service.create_node(
+                type="concept",
+                title=body["title"],
+                content=body["content"],
+                landing=SUGGESTION_LANDING,
+                space=context.scope,
+                props={
+                    "synthesized": True,
+                    "members": members,
+                    "job": JOB_ABSTRACTION,
+                    **generation.generated_by.as_props(),
+                },
+                principal=context.principal,
+                path=context.path,
+            )
+            # The whole unit is proposed: the concept *and* its membership
+            # edges. `outcome.applied` stays empty — this job only proposes.
+            outcome.proposed.append(node.id)
+            for member in members:
+                try:
+                    edge = service.create_edge(
+                        node.id,
+                        member,
+                        DERIVED_FROM_EDGE_TYPE,
+                        landing=SUGGESTION_LANDING,
+                        props={"job": JOB_ABSTRACTION},
+                        principal=context.principal,
+                        path=context.path,
+                    )
+                    outcome.proposed.append(edge.id)
+                except (
+                    GrantNotPermitted,
+                    service.NodeNotFound,
+                    service.TypeNotFound,
+                    ValueError,
+                ) as refusal:
+                    # A cross-space member the gardener may not write costs one
+                    # skipped line and not the synthesis.
+                    outcome.skipped.append({"id": f"{node.id}->{member}", "reason": str(refusal)})
+            outcome.detail["synthesized"].append(
+                {"node": node.id, "members": members, "title": body["title"]}
+            )
+        if context.dry_run and synthesized_count:
+            outcome.notes.append(
+                f"dry run: would synthesize {synthesized_count} concept(s) from "
+                f"{member_count} member(s)"
+            )
+        outcome.detail["cost"] = {
+            "calls": run.budget.calls,
+            "failed_calls": run.budget.failed_calls,
+            "prompt_tokens": run.budget.spent_prompt_tokens,
+            "output_tokens": run.budget.spent_output_tokens,
+            "total_tokens": run.budget.spent_tokens,
+        }
+        return outcome
+    finally:
+        context.llm_report = run.report()
+
+
 #: The jobs, in run order. ``jobs=`` selects a subset by these names.
 JOBS = {
     JOB_DUPLICATES: _job_duplicates,
     JOB_LINKS: _job_links,
+    JOB_ABSTRACTION: _job_abstraction,
     JOB_HOUSEKEEPING: _job_housekeeping,
     JOB_NEGLECT: _job_neglect,
 }
@@ -1255,7 +1743,12 @@ def _run_cycle(
         trigger=trigger, scope=scope, dry_run=dry_run, principal=opener, path=path
     )
     context = _Context(
-        principal=gardener, scope=cycle.scope, dry_run=dry_run, path=path, now=_utcnow()
+        principal=gardener,
+        scope=cycle.scope,
+        dry_run=dry_run,
+        path=path,
+        now=_utcnow(),
+        cycle_id=cycle.id,
     )
     try:
         _require_gardener_scope(scope, cycle, gardener, path)
@@ -1327,4 +1820,5 @@ def _run_jobs(context: _Context, cycle: CycleOut, selected: list[str]) -> Consol
         metrics={"before": before, "after": after},
         failed=failed,
         notes=report_notes,
+        llm=context.llm_report.model_dump(mode="json") if context.llm_report is not None else None,
     )

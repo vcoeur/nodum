@@ -333,8 +333,11 @@ does not resolve). With no provider configured the refusal names
 
 ### Consolidation and the curative tier
 
-- `consolidate` — Run a consolidation cycle: the gardener's four deterministic
-  jobs, and its report. `--scope` confines it to one space, `--job` selects jobs
+- `consolidate` — Run a consolidation cycle: the gardener's deterministic
+  jobs, the abstraction job (5b-ii's first — it synthesizes a `concept` node
+  from a dense, sized cluster of related notes, but only when
+  `NODUM_LLM_CYCLE_BUDGET` funds it and a provider is configured), and the
+  report. `--scope` confines it to one space, `--job` selects jobs
   (repeatable; default is all of them, in order), `--dry-run` computes
   everything and emits **no** event at all.
 - `cycle-list` — List cycles, newest first: the dream journal. Human-only.
@@ -404,7 +407,8 @@ stopping and undoing are two decisions, and a switch that did both would make
 `cycle-stop` records an instruction; what obeys it is the run. Today the only
 check is the one immediately before a model call, so a run of the **four
 deterministic jobs** — which make none — finishes even after you stop it, with
-the stop kept on the entry. The switch is worth having now because it is the
+the stop kept on the entry; the abstraction job is the exception, checking
+through that same model call. The switch is worth having now because it is the
 model-spending half it was built to bound, and the entry says who asked and when
 whichever way the run ended.
 

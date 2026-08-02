@@ -98,6 +98,14 @@ export function ProposalCard({
             <span className={`nd-rv-kind nd-rv-kind--${kind ?? "unknown"}`}>
               {kind === "update" ? "version update" : (kind ?? proposal.kind)}
             </span>
+            {proposal.node?.props?.synthesized === true ? (
+              <span
+                className="nd-badge nd-badge--proposed"
+                title="Synthesized by the gardener's abstraction job: the title and content were generated from the members it names, and accepting files them as a concept"
+              >
+                synthesized
+              </span>
+            ) : null}
             {crossing ? (
               <span
                 className="nd-rv-kind nd-rv-kind--crossing"
