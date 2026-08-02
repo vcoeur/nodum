@@ -93,8 +93,8 @@ def _at(cosine: float) -> float:
     """The angle whose cosine against a marker-less text is ``cosine``.
 
     Tests that mean "just above the link bar" say so in terms of the bar
-    itself. The two cosine bars are provisional and expected to be re-tuned
-    from ``tests/fixtures/embedding_calibration.json``; a hard-coded angle
+    itself. The two cosine bars are known not to fire and will be re-tuned on a
+    real corpus in a later cycle; a hard-coded angle
     would turn every re-tune into a test rewrite and, worse, would keep
     passing while no longer testing the side of the bar it was written for.
     """
@@ -498,6 +498,31 @@ def test_a_pair_over_both_bars_is_queued_once_as_the_duplicate_it_is(fresh_db):
     assert _related() == []
 
 
+def test_a_rejected_link_is_not_proposed_again_next_cycle(fresh_db):
+    """A queue a human works has to get shorter.
+
+    Rejecting archives the edge, and link inference used to read only live
+    edges — so the pair fell back out of the `connected` set and the next cycle
+    proposed it again, unchanged and forever. The duplicates job never had the
+    hole because it reads every state of its own edge type; this is the same
+    read on `relates_to`.
+    """
+    _place(Alpha=0.0, Beta=_at(BETWEEN_THE_BARS))
+    _node("Alpha")
+    _node("Beta")
+
+    _run()
+    (proposal,) = _related()
+    assert proposal.state == "proposed"
+
+    service.reject_proposals([proposal.id], reason="not actually related", principal=owner())
+    assert _edge_state(proposal.id) == "archived"
+
+    _run()
+
+    assert [edge.id for edge in _related()] == [proposal.id]
+
+
 # ── Threshold calibration (tests/fixtures/embedding_calibration.json) ─────────
 
 
@@ -524,65 +549,58 @@ def test_the_calibration_fixture_covers_every_band_bilingually():
     assert max(widths) <= 90
 
 
-def test_the_duplicate_bar_separates_duplicates_from_everything_else():
-    """The bar catches every labelled duplicate and nothing else at all."""
-    _, bands = _calibration()
-    bar = consolidate.DUPLICATE_EMBEDDING_COSINE
+def test_neither_shipped_bar_can_fire_on_the_content_it_exists_to_catch():
+    """The open defect, pinned rather than left to a comment.
 
-    assert min(bands["duplicate"]) >= bar
-    for band in ("related", "same_area", "unrelated"):
-        assert max(bands[band]) < bar, band
+    Every labelled duplicate scores below the duplicate bar and every labelled
+    related pair below the link bar, so neither embedding signal can fire at
+    all: duplicate detection finds only duplicates already titled alike, which
+    is the one case the embedding signal was added to answer. The fix needs a
+    real corpus and belongs to its own cycle, and a constant nobody can see is
+    broken is a constant nobody fixes.
 
-
-def test_the_link_bar_catches_related_pairs_and_never_unrelated_ones():
-    """Related pairs all fire; unrelated ones never do. Broad-area pairs may."""
-    _, bands = _calibration()
-    bar = consolidate.LINK_EMBEDDING_COSINE
-
-    assert min(bands["related"]) >= bar
-    assert max(bands["unrelated"]) < bar
-
-
-def test_both_bars_keep_the_stated_false_positive_asymmetry():
-    """The stance, pinned: a wrong proposal costs more than a missed one.
-
-    A missed duplicate is found next cycle; a wrong one is a queue item
-    somebody has to read and reject. So each bar sits high inside its empty
-    band — the room left below the weakest true positive is deliberately much
-    smaller than the room left above the strongest true negative. Without this
-    a future re-tune could centre the bars and quietly trade the stance away.
+    **This test is meant to die.** Re-tuning the bars on real content breaks it,
+    and that failure is the reminder to delete it.
     """
     _, bands = _calibration()
 
-    for bar, positives, negatives in (
-        (
-            consolidate.DUPLICATE_EMBEDDING_COSINE,
-            bands["duplicate"],
-            bands["related"] + bands["same_area"] + bands["unrelated"],
-        ),
-        (consolidate.LINK_EMBEDDING_COSINE, bands["related"], bands["unrelated"]),
-    ):
-        false_positive_margin = bar - max(negatives)
-        false_negative_margin = min(positives) - bar
-        assert false_positive_margin > 0
-        assert false_negative_margin > 0
-        assert false_positive_margin > 2 * false_negative_margin
+    assert max(bands["duplicate"]) < consolidate.DUPLICATE_EMBEDDING_COSINE
+    assert max(bands["related"]) < consolidate.LINK_EMBEDDING_COSINE
 
 
-def test_the_bars_are_marked_provisional_with_what_would_retune_them():
-    """These numbers are measured against 29 hand-written pairs, not a real graph.
+def test_the_fixture_separates_its_own_bands_and_still_cannot_set_a_bar():
+    """Why the fixture-derived 0.72 / 0.38 were measured, tried and reverted.
 
-    The comment saying so is the only thing standing between "provisional" and
-    "load-bearing constant nobody dares touch", so it is asserted rather than
-    trusted.
+    The bands really are cleanly ordered — that is what the set was built to
+    show, and it is exactly why it cannot set a bar. Its pairs were written to
+    demonstrate a separation, so a value dropped into the gap between two bands
+    is fitted to 29 hand-written examples. Against a real 200-node graph the
+    same 0.38 proposed 1 175 ``relates_to`` edges, 5.9 per node, where the
+    shipped bar proposes 5; 35.2 % of all pairs in a homogeneous prose corpus
+    clear it. Pinned so the next attempt does not repeat the method — a
+    replacement bar has to be measured for volume and precision on real text,
+    not for separation on this file.
+    """
+    _, bands = _calibration()
+
+    assert max(bands["unrelated"]) < min(bands["related"])
+    assert max(bands["related"]) < min(bands["duplicate"])
+
+
+def test_the_bars_record_the_defect_and_what_would_close_it():
+    """The comment is load-bearing, so it is asserted rather than trusted.
+
+    Without it these are two ordinary-looking constants that quietly do
+    nothing, and the next reader re-derives the same wrong number from the same
+    fixture.
     """
     source = Path(consolidate.__file__).read_text()
     marker = source.index("DUPLICATE_EMBEDDING_COSINE = ")
     preamble = source[:marker]
 
-    assert "PROVISIONAL" in preamble
+    assert "KNOWN NOT TO FIRE" in preamble
     assert "embedding_calibration.json" in preamble
-    assert "real graph with volume" in preamble
+    assert "real corpus" in preamble
 
 
 def test_the_job_degrades_to_titles_when_no_model_is_present(fresh_db):

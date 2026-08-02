@@ -226,8 +226,9 @@ def node_vectors(provider: EmbeddingProvider, nodes: list[dict[str, Any]]) -> li
     The mean is unweighted, which slightly over-weights a short trailing
     chunk; that is a rounding error next to dropping the tail entirely. For a
     node that fits one window — nearly all of them at :data:`CHUNK_WORDS` —
-    the reduction is the identity, so thresholds calibrated on ordinary notes
-    stay valid.
+    the reduction is the identity up to scale, since :func:`_pool`
+    L2-normalises what it returns; cosine is scale-free, so thresholds
+    calibrated on ordinary notes stay valid.
 
     Args:
         provider: The provider to embed with (its ``dimensions`` sizes the

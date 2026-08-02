@@ -2275,6 +2275,57 @@ def test_a_named_endpoint_keeps_its_key(
     assert recorder.requests[-1].get_header("Authorization") == "Bearer sk-configured"
 
 
+def test_a_401_says_the_key_was_withheld_rather_than_leaving_it_to_llm_status(wire, monkeypatch):
+    """The configuration this fix can break, made legible where it breaks.
+
+    A local gateway that legitimately requires a key, reached on the default
+    base URL: withholding is still right — nothing named an endpoint for that
+    key — but the call now 401s, and the sentence explaining why lived only in
+    ``nodum llm status``. An operator meeting a bare 401 reads it as a wrong
+    key and goes looking in the wrong place.
+    """
+    monkeypatch.setenv(llm.ENV_MODEL, "deepseek-v4-flash-0711")
+    monkeypatch.setenv(llm.ENV_API_KEY, "sk-vendor-secret")
+    failure = urllib.error.HTTPError(
+        url="http://x/v1/chat/completions",
+        code=401,
+        msg="Unauthorized",
+        hdrs=None,
+        fp=None,
+    )
+    failure.read = lambda: b'{"error":{"message":"authorization required"}}'  # type: ignore[method-assign]
+    wire(raises=failure)
+    provider = llm.get_provider()
+    assert provider is not None
+    assert llm.key_withheld_reason() is not None, "fixture is not the withheld case"
+
+    with pytest.raises(llm.ProviderUnavailable) as raised:
+        provider.chat([llm.Message(role="user", content="hi")], max_output_tokens=8, timeout=5.0)
+
+    assert llm.ENV_BASE_URL in str(raised.value), "the failure must name the way out"
+    assert "sk-vendor-secret" not in str(raised.value), "still no secret in a message"
+
+
+def test_a_bad_default_endpoint_is_not_blamed_on_a_variable_nobody_set(monkeypatch):
+    """The refusal names whatever produced the URL, not always the env var.
+
+    Only an operator-set ``NODUM_LLM_BASE_URL`` is the operator's to fix;
+    blaming it for a profile's URL or the shipped default sends them to edit
+    something they never set. Reached by breaking the default on purpose, since
+    both shipped constants parse — which is how long a wrong sentence here
+    would otherwise go unnoticed.
+    """
+    monkeypatch.setattr(llm, "DEFAULT_BASE_URL", "localhost/v1")
+    monkeypatch.setenv(llm.ENV_MODEL, "llama3.2:1b")
+    monkeypatch.delenv(llm.ENV_BASE_URL, raising=False)
+
+    assert llm.get_provider() is None
+    reason = llm.unavailable_reason()
+    assert reason is not None
+    assert "the default endpoint" in reason
+    assert f"{llm.ENV_BASE_URL}='localhost" not in reason
+
+
 def test_no_key_configured_is_not_a_withheld_key(monkeypatch):
     """``key_withheld_reason`` is about a key that exists and is being left
     behind. An install with no key at all has nothing to report, and a sentence

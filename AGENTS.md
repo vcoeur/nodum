@@ -722,7 +722,7 @@ commands on a saved node for exactly this reason.
   rather than a back door with a name, and `tests/test_consolidate.py` asserts
   it over this file's **AST** so a refactor cannot quietly forget it. The jobs:
   `duplicate_candidates` (normalised-title equality, near-equality at 0.95, and
-  embedding cosine at 0.72 where a provider exists — it writes a `proposed`
+  embedding cosine at 0.93 where a provider exists — it writes a `proposed`
   `duplicate_of` edge and *never merges*, because D9 says a merge is always
   human-approved and a proposed edge is already a queue item with a diff and an
   accept button, so entity resolution needed no new proposal kind),
@@ -750,22 +750,25 @@ commands on a saved node for exactly this reason.
   computed, and the cycle closes `failed` with all of it. Determinism is a
   rule here: no randomness, one clock captured when the cycle opens, and every
   pair, group and list ordered before it is written.
-  **Both cosine bars are measured, and both are provisional.** They shipped at
-  0.93 (duplicate) and 0.80 (`relates_to`) — above the bands they existed to
-  catch, so *neither* embedding signal could fire at all, and duplicate
-  detection found only duplicates that were already titled alike: precisely the
-  case the embedding signal was added to answer. v0.8.2 sets them to **0.72**
-  and **0.38** from `tests/fixtures/embedding_calibration.json`, 29
-  hand-labelled bilingual FR+EN pairs held at equal length so length is not a
-  variable between bands. Each bar sits high inside the empty band between its
-  positives and its negatives, keeping `DUPLICATE_TITLE_RATIO`'s stance — a
-  missed duplicate is found next cycle, a wrong one is a queue item somebody
-  has to read and reject — so the room below the weakest true positive is
-  deliberately a third of the room above the strongest true negative.
-  Re-measure with `scripts/measure_embedding_calibration.py` after any change
-  of model, of fastembed's pooling, or of `CHUNK_WORDS`; what would justify
-  re-tuning outright is a real graph with volume, which is what the hand-built
-  set stands in for.
+  **Both cosine bars are measured, and both are known not to fire.** They stand
+  at 0.93 (duplicate) and 0.80 (`relates_to`) — above the bands they exist to
+  catch, so *neither* embedding signal can fire at all, and duplicate detection
+  finds only duplicates already titled alike: precisely the case the embedding
+  signal was added to answer. Measured in
+  `tests/fixtures/embedding_calibration.json`, 29 hand-labelled bilingual FR+EN
+  pairs held at equal length so length is not a variable between bands.
+  **Replacements derived from that fixture alone (0.72 and 0.38) were tried and
+  reverted**: they separate the fixture's bands cleanly and still fail on real
+  content, where the link bar proposed 1 175 `relates_to` edges over a 200-node
+  graph of real prose — 5.9 per node against 5 at 0.80 — and 35.2 % of all pairs
+  in a homogeneous corpus clear 0.38. A set written to demonstrate a separation
+  cannot measure a false-positive rate. So the replacements must come from a
+  real corpus, scored for volume and precision rather than separation, with a
+  test that embeds real text; that is its own cycle and it must land before the
+  abstraction job, whose cohesion criterion reads the same vectors.
+  `scripts/measure_embedding_calibration.py` and the fixture are kept as its
+  starting point, and re-running it is required after any change of model, of
+  fastembed's pooling, or of `CHUNK_WORDS`.
   Three rules guard the run itself. **One cycle at a time, in the whole file —
   and the guard is a row, not a lock.** Migration `0014` carries a partial
   unique index over `cycles(status)` where `status = 'running' AND trigger IN
@@ -1075,10 +1078,10 @@ commands on a saved node for exactly this reason.
   chunk*, while `node_vectors(provider, nodes)` reduces the same chunks to
   the one vector a pairwise comparison needs — the **L2-normalised mean** of
   the chunk vectors, which is the model's own mean pooling applied one level
-  up, and the identity for a node that fits one window. The node-level vector
-  is therefore a pure function of the projector's rows rather than a second,
-  independently produced embedding. Before v0.8.2 the consolidation cycle
-  embedded each node's whole text in one call: it chunked nothing, so a node
+  up, and the identity up to scale for a node that fits one window. The
+  node-level vector is therefore a pure function of the projector's rows rather
+  than a second, independently produced embedding. The consolidation cycle used
+  to embed each node's whole text in one call: it chunked nothing, so a node
   past the model's 512-token window was silently truncated and compared on its
   opening pages, and the same node had one vector there and a different set in
   the projector. A node with no text at all reduces to the zero vector, which

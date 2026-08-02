@@ -172,54 +172,49 @@ DUPLICATE_TITLE_RATIO = 0.95
 
 #: Cosine bar for a duplicate candidate when embeddings are available.
 #:
-#: **PROVISIONAL** — measured, not tuned. Both cosine bars were set before
-#: anyone had run the pinned model, and both sat above the band they existed to
-#: catch: at 0.93 the duplicate signal fired on 0 of 10 hand-labelled
-#: duplicates and at 0.80 the ``relates_to`` signal fired on 0 of 7 obviously
-#: related pairs, so *neither* embedding signal could fire at all. Duplicate
-#: detection was finding only duplicates that were already titled alike —
-#: precisely the case the embedding signal was added to answer.
+#: **KNOWN NOT TO FIRE, and deliberately left that way until it can be tuned on
+#: real content.** Both cosine bars were set before anyone had run the pinned
+#: model, and both sit above the band they exist to catch: at 0.93 the duplicate
+#: signal fires on 0 of 10 hand-labelled duplicates and at 0.80 the
+#: ``relates_to`` signal fires on 0 of 7 obviously related pairs. So duplicate
+#: detection finds only duplicates that are already titled alike — precisely the
+#: case the embedding signal was added to answer.
 #:
-#: The values below come from ``tests/fixtures/embedding_calibration.json``: 29
-#: bilingual FR+EN pairs, length-matched at 60-85 words a side, labelled by
-#: hand into four bands before any cosine was measured. Under the pinned model
-#: the bands land at duplicate 0.763-0.929, same narrow topic 0.402-0.587, same
-#: broad area 0.151-0.454, unrelated -0.050-0.314.
+#: Measured in ``tests/fixtures/embedding_calibration.json``: 29 bilingual FR+EN
+#: pairs, length-matched at 60-85 words a side, labelled by hand into four bands
+#: before any cosine was taken. Under the pinned model they land at duplicate
+#: 0.763-0.929, same narrow topic 0.402-0.587, same broad area 0.151-0.454,
+#: unrelated -0.050-0.314.
 #:
-#: 0.72 sits in the empty band between duplicates (from 0.763) and merely
-#: related pairs (to 0.587), placed high in it on purpose — the same asymmetry
-#: :data:`DUPLICATE_TITLE_RATIO` is set by. A missed duplicate is found next
-#: cycle; a wrong one is a queue item somebody has to read and reject. So the
-#: margin below the weakest true duplicate (0.043) is deliberately a third of
-#: the margin above the strongest non-duplicate (0.133).
+#: **Replacements derived from that fixture alone were tried and reverted.** 0.72
+#: and 0.38 separate the fixture's bands cleanly and still fail on real content:
+#: over a 200-node graph of real prose notes the link bar proposed 1 175
+#: ``relates_to`` edges — 5.9 per node, against 5 at 0.80 — and 35.2 % of all
+#: pairs in a homogeneous corpus clear 0.38. A hand-built set of 29 pairs cannot
+#: see that, because its pairs were chosen to demonstrate a separation.
 #:
-#: It must also stay above :data:`LINK_EMBEDDING_COSINE`: the two bars are read
-#: by different jobs, and a duplicate that scored *below* the link bar would be
+#: **So the replacements must come from a real corpus, measured for volume and
+#: precision rather than for separation**, with a test that embeds real text —
+#: the fixture tests only prove the constant still matches the fixture it was
+#: derived from. That is its own cycle, and it must land before the abstraction
+#: job, whose cohesion criterion reads these same vectors.
+#: ``scripts/measure_embedding_calibration.py`` and the fixture are kept as its
+#: starting point.
+#:
+#: This bar must stay above :data:`LINK_EMBEDDING_COSINE`: the two are read by
+#: different jobs, and a duplicate scoring *below* the link bar would be
 #: described as merely related by the weaker signal.
-#:
-#: **What would justify re-tuning:** a real graph with volume. This set is
-#: hand-written because the only real graph available holds 37 nodes, 4 of them
-#: longer than 200 characters — not enough to tune on. Re-measure against the
-#: queue's own accept/reject record once there is one, and re-run the fixture
-#: after any change of model, of fastembed's pooling, or of :data:`nodum.
-#: embeddings.CHUNK_WORDS`.
-DUPLICATE_EMBEDDING_COSINE = 0.72
+DUPLICATE_EMBEDDING_COSINE = 0.93
 
 #: Cosine bar for an inferred ``relates_to`` edge: "these are about the same
 #: area", not "these are the same thing".
 #:
-#: **PROVISIONAL**, from the same fixture and the same stance. 0.38 sits in the
-#: empty band between unrelated pairs (to 0.314) and pairs on the same narrow
-#: topic (from 0.402), again high in it: 0.066 of margin above the strongest
-#: unrelated pair against 0.022 below the weakest related one. It fires on 7 of
-#: 7 related pairs, 1 of 4 same-broad-area pairs, and 0 of 8 unrelated ones.
-#:
-#: The band here is a third as wide as the duplicate band's, which is the
-#: honest limit of this signal: "about the same area" is close to the model's
-#: noise floor at node length, and only the strongest broad-area pairs clear
-#: the bar. Co-citation is the independent signal that catches the rest, which
-#: is why this bar may be set to miss rather than to guess.
-LINK_EMBEDDING_COSINE = 0.38
+#: Shipped value, known not to fire — see :data:`DUPLICATE_EMBEDDING_COSINE` for
+#: the measurement, why the fixture-derived 0.38 was reverted, and what re-tuning
+#: it needs. Co-citation is the independent signal carrying this job meanwhile,
+#: which is why the graph still grows ``relates_to`` edges at a bar nothing
+#: clears.
+LINK_EMBEDDING_COSINE = 0.80
 
 #: How many neighbours two nodes must share before co-citation is evidence.
 #:
@@ -750,6 +745,17 @@ def _infer_links(context: _Context, outcome: JobOutcome, active_ids: set[str]) -
     """Propose ``relates_to`` from embedding proximity and co-citation."""
     live = context.edges()
     connected = {_unordered(edge.src_id, edge.dst_id) for edge in live if edge.state != "archived"}
+    # A rejected proposal has to stay rejected. Rejecting archives the edge, so
+    # reading live edges alone drops the pair back out of `connected` and the
+    # next cycle proposes it again — a queue nobody can empty by working it.
+    # `_job_duplicates` never had the hole; it reads every state of its own edge
+    # type, and this mirrors it. Scoped to `relates_to` on purpose: some other
+    # edge type archived for its own reasons is not a judgement about
+    # relatedness, and reading every archived edge here would suppress proposals
+    # nobody ever refused.
+    connected |= {
+        _unordered(edge.src_id, edge.dst_id) for edge in context.typed_edges(RELATED_EDGE_TYPE)
+    }
     neighbours: dict[str, set[str]] = {}
     for edge in live:
         if edge.state != "active" or edge.src_id == edge.dst_id:

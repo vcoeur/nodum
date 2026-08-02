@@ -377,10 +377,20 @@ _STRUCTURED_REJECTIONS = ("response_format",)
 #: envelope quietly weakened for the life of the process — the exact harm
 #: ``test_a_non_capability_400_is_not_negotiated`` exists to prevent, reached
 #: through a message that happens to contain the marker. It is the one
-#: *sharpening* of a matcher this module keeps deliberately blunt, and it is
-#: still one-sided in the safe direction: a server that says
-#: ``response_format.type is unavailable`` is not negotiated, which is today's
-#: behaviour exactly — the ``ProviderUnavailable`` reaches the caller unchanged.
+#: *sharpening* of a matcher this module keeps deliberately blunt.
+#:
+#: **It is a real behaviour change, not a preservation.** Driven on both
+#: revisions: ``response_format.type is unavailable`` and
+#: ``response_format[type] not supported`` were negotiated before this guard and
+#: are not now. No endpoint anyone has measured says either — the sentence
+#: DeepSeek really returns carries no path — but an OpenAI-compatible server
+#: wording its genuine capability rejection with a dotted or bracketed path will
+#: now never downgrade, and structured output fails against it permanently
+#: instead of once. The separator is only a proxy for "the server dereferenced
+#: the field"; the honest signal is the reason words (``Invalid schema for``
+#: against ``is unavailable``), not the punctuation. Kept because the failure it
+#: prevents is by far the commoner one, and re-matching on reason words is
+#: follow-up work rather than something to do on this branch.
 _FIELD_PATH_SEPARATORS = (".", "[")
 
 #: Substrings that identify a 400 as "this endpoint does not take a graded
@@ -1438,8 +1448,17 @@ class OpenAICompatProvider:
             # the only thing that says *which* misconfiguration it was, so a
             # slice of it goes in the message.
             detail = failure.read().decode("utf-8", "replace")[:200]
+            # The one rejection this module causes itself. Withholding the key
+            # is right — it stops a stale variable reaching a host nobody named
+            # — but a local gateway that legitimately requires a key then 401s
+            # on the default base URL, and nothing in the failure said why, so
+            # the operator reads it as "my key is wrong". `llm status` carried
+            # the answer; the failure that needed it did not.
+            withheld = ""
+            if failure.code in {401, 403} and _key_withheld_reason is not None:
+                withheld = f". {_key_withheld_reason}"
             raise ProviderUnavailable(
-                f"provider at {self._base_url} answered HTTP {failure.code}: {detail}",
+                f"provider at {self._base_url} answered HTTP {failure.code}: {detail}{withheld}",
                 status=failure.code,
             ) from failure
         except TimeoutError as failure:
@@ -1716,7 +1735,19 @@ def _resolve_default() -> tuple[LLMProvider | None, str | None, str | None]:
         return (
             None,
             (
-                f"{ENV_BASE_URL}={base_url!r} is not a URL this can POST to ({problem}). "
+                # Attribute the URL to whatever actually produced it. Only
+                # `configured_base` came from the operator; naming ENV_BASE_URL
+                # for a profile's URL or the shipped default would send them to
+                # edit a variable they never set. Unreachable while both shipped
+                # constants parse — which is exactly how long a wrong sentence
+                # here would go unnoticed, so it is written right rather than
+                # argued away.
+                f"{ENV_BASE_URL}={base_url!r}"
+                if configured_base is not None
+                else f"the default endpoint {base_url!r}"
+            )
+            + (
+                f" is not a URL this can POST to ({problem}). "
                 f"Give it a full OpenAI-compatible root, scheme included — for example "
                 f"{DEFAULT_BASE_URL} or {DEEPSEEK_BASE_URL}"
             ),
