@@ -27,7 +27,7 @@ from nodum.assets import AssetNotFound, AssetSourceChanged, AssetTooLarge, Unsup
 from nodum.cli_schema import build_cli_schema
 from nodum.db import ENV_DB_VAR
 from nodum.envelope import envelope, list_envelope, render_json
-from nodum.models import RollbackOut, TransitionFailure
+from nodum.models import ItemFailure, RollbackOut, TransitionFailure
 from nodum.principal import Principal
 from nodum.service import (
     EventNotFound,
@@ -116,7 +116,7 @@ def _emit_list(key: str, results: Sequence[BaseModel]) -> None:
     _print_json(list_envelope(key, results))
 
 
-def _emit_batch(result: BaseModel, failures: Sequence[TransitionFailure]) -> None:
+def _emit_batch(result: BaseModel, failures: Sequence[TransitionFailure | ItemFailure]) -> None:
     """Print a batch result, name each per-item failure on stderr, exit 1 if any failed.
 
     ``ingest file``'s rule, and it is the same rule for the same reason. A batch
@@ -140,11 +140,15 @@ def _emit_batch(result: BaseModel, failures: Sequence[TransitionFailure]) -> Non
             is what let ``bulk-relink`` join this rule at all. Its **dry run**
             passes nothing here on purpose — a rehearsal's ``skipped`` is a
             prediction, nothing was attempted and nothing was lost, so exit 1
-            would report a failure that has not happened.
+            would report a failure that has not happened. ``edge create-batch``
+            is the one list keyed by input index rather than id — an
+            :class:`ItemFailure` names ``index`` — and that index is what the
+            stderr line names there.
     """
     _emit(result)
     for failure in failures:
-        typer.echo(f"  failed {failure.id}: {failure.error}", err=True)
+        label = failure.id if isinstance(failure, TransitionFailure) else failure.index
+        typer.echo(f"  failed {label}: {failure.error}", err=True)
     if failures:
         raise typer.Exit(1)
 
@@ -440,7 +444,13 @@ def edge_create_batch(
     ),
     as_human: str = AS_OPTION,
 ) -> None:
-    """Propose a batch of edges; bad suggestions are reported, not fatal."""
+    """Propose a batch of edges; bad suggestions are reported, not fatal.
+
+    The batch rule: the envelope is printed whatever happened, each refused
+    suggestion is named on stderr by its input index, and the exit code is 1 if
+    any suggestion failed — a run that wrote nothing must not report success to
+    a script that only reads the code.
+    """
     # Through `_run`, so a missing or unreadable file is the contract's one line
     # on stderr rather than a Rich traceback — the same reason `_read_content`
     # and `_principal` read through it.
@@ -453,7 +463,8 @@ def edge_create_batch(
     if not isinstance(suggestions, list):
         typer.echo("expected a JSON array of edge suggestions", err=True)
         raise typer.Exit(1)
-    _emit(_run(service.propose_edges, suggestions, principal=_principal(as_human)))
+    result = _run(service.propose_edges, suggestions, principal=_principal(as_human))
+    _emit_batch(result, result.failed)
 
 
 @app.command()
@@ -1354,8 +1365,15 @@ def review_accept(
     ids: list[str] = typer.Argument(..., help="Node, edge, or proposed-version ids to accept."),
     as_human: str = AS_OPTION,
 ) -> None:
-    """Accept proposals by id (proposed → active); bad ids are reported, not fatal."""
-    _emit(_run(service.accept_proposals, ids, principal=_principal(as_human)))
+    """Accept proposals by id (proposed → active); bad ids are reported, not fatal.
+
+    The batch rule: the envelope is printed whatever happened, each refused id
+    is named on stderr, and the exit code is 1 if any id was skipped — a run
+    that accomplished nothing must not report success to a script that only
+    reads the code.
+    """
+    result = _run(service.accept_proposals, ids, principal=_principal(as_human))
+    _emit_batch(result, result.failed)
 
 
 @review_app.command("reject")
@@ -1364,8 +1382,14 @@ def review_reject(
     reason: str = typer.Option(..., "--reason", help="Recorded in every reject event."),
     as_human: str = AS_OPTION,
 ) -> None:
-    """Reject proposals by id (proposed → archived); bad ids are reported, not fatal."""
-    _emit(_run(service.reject_proposals, ids, reason=reason, principal=_principal(as_human)))
+    """Reject proposals by id (proposed → archived); bad ids are reported, not fatal.
+
+    The reason is recorded in every reject event's payload. The batch rule: the
+    envelope is printed whatever happened, each refused id is named on stderr,
+    and the exit code is 1 if any id was skipped.
+    """
+    result = _run(service.reject_proposals, ids, reason=reason, principal=_principal(as_human))
+    _emit_batch(result, result.failed)
 
 
 @review_app.command("accept-all")
@@ -1377,18 +1401,22 @@ def review_accept_all(
     created_after: str | None = CREATED_AFTER_OPTION,
     as_human: str = AS_OPTION,
 ) -> None:
-    """Accept every proposal matching the filters (e.g. one agent's whole run)."""
-    _emit(
-        _run(
-            service.accept_matching,
-            created_by=created_by,
-            type=type,
-            kind=kind,
-            created_before=created_before,
-            created_after=created_after,
-            principal=_principal(as_human),
-        )
+    """Accept every proposal matching the filters (e.g. one agent's whole run).
+
+    Each match transitions with its own event. The batch rule: the envelope is
+    printed whatever happened, each refused id is named on stderr, and the exit
+    code is 1 if any proposal was skipped.
+    """
+    result = _run(
+        service.accept_matching,
+        created_by=created_by,
+        type=type,
+        kind=kind,
+        created_before=created_before,
+        created_after=created_after,
+        principal=_principal(as_human),
     )
+    _emit_batch(result, result.failed)
 
 
 @review_app.command("reject-all")
@@ -1401,19 +1429,23 @@ def review_reject_all(
     created_after: str | None = CREATED_AFTER_OPTION,
     as_human: str = AS_OPTION,
 ) -> None:
-    """Reject every proposal matching the filters, recording the reason."""
-    _emit(
-        _run(
-            service.reject_matching,
-            reason=reason,
-            created_by=created_by,
-            type=type,
-            kind=kind,
-            created_before=created_before,
-            created_after=created_after,
-            principal=_principal(as_human),
-        )
+    """Reject every proposal matching the filters, recording the reason.
+
+    Each match transitions with its own event carrying the reason. The batch
+    rule: the envelope is printed whatever happened, each refused id is named
+    on stderr, and the exit code is 1 if any proposal was skipped.
+    """
+    result = _run(
+        service.reject_matching,
+        reason=reason,
+        created_by=created_by,
+        type=type,
+        kind=kind,
+        created_before=created_before,
+        created_after=created_after,
+        principal=_principal(as_human),
     )
+    _emit_batch(result, result.failed)
 
 
 # ── Accounts, grants, and spaces (Q13) ────────────────────────────────────────

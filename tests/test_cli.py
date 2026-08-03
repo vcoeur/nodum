@@ -437,14 +437,45 @@ def test_edge_create_batch_from_stdin(fresh_db):
     suggestions = json.dumps(
         [
             {"src": a["id"], "dst": b["id"], "edge_type": "relates_to"},
-            {"src": a["id"], "dst": "missing", "edge_type": "supports"},
+            {"src": a["id"], "dst": b["id"], "edge_type": "supports"},
         ]
     )
     result = runner.invoke(app, ["edge", "create-batch", "-", "--as", "owner"], input=suggestions)
     assert result.exit_code == 0, result.output
     outcome = json.loads(result.stdout)
-    assert outcome["created"][0]["state"] == "active"
-    assert outcome["failed"][0]["index"] == 1
+    assert [edge["state"] for edge in outcome["created"]] == ["active", "active"]
+    assert outcome["failed"] == []
+
+
+def test_an_edge_create_batch_that_wrote_nothing_does_not_exit_zero(fresh_db):
+    """`edge create-batch`'s half of the batch rule: refusals buy exit 1.
+
+    `retype`'s defect, the batch-edge surface: the envelope reported every
+    suggestion in `failed[]` and the command still exited **0** — the one thing
+    a script reads. `ingest file`'s rule applies here too: a run that wrote
+    nothing must not report success. The identifier on the stderr line is the
+    input index, not an id — that is all a suggestion has.
+    """
+    a = _run_json("node", "create", "--type", "concept", "--title", "A")
+    b = _run_json("node", "create", "--type", "concept", "--title", "B")
+    suggestions = json.dumps(
+        [
+            {"src": a["id"], "dst": "missing", "edge_type": "supports"},
+            {"src": "also-missing", "dst": b["id"], "edge_type": "relates_to"},
+        ]
+    )
+    result = runner.invoke(app, ["edge", "create-batch", "-", "--as", "owner"], input=suggestions)
+
+    assert result.exit_code == 1
+    outcome = json.loads(result.stdout)
+    assert outcome["created"] == []
+    assert [failure["index"] for failure in outcome["failed"]] == [0, 1]
+    # The index is the name on stderr, and the reason rides along beside it.
+    assert "failed 0:" in result.stderr
+    assert "failed 1:" in result.stderr
+    assert isinstance(result.exception, SystemExit)
+    # The graph wrote nothing at all.
+    assert _run_json("edge", "list")["count"] == 0
 
 
 def test_search_date_filters(fresh_db):
@@ -494,6 +525,32 @@ def test_agent_update_proposes_and_review_accepts(fresh_db):
     accepted = _run_json("accept", str(version.id))
     assert accepted["state"] == "applied"
     assert _run_json("node", "get", note["id"])["content"] == "bot rewrite"
+
+
+def test_review_accept_applies_and_a_refused_batch_does_not_exit_zero(fresh_db):
+    """`review accept`'s half of the batch rule: refusals buy exit 1.
+
+    The single-id `accept` fails loudly through `_run`, but the batch surface
+    reported its refusals in `failed[]` and still exited **0** — `ingest file`'s
+    rule, which every batch command follows: the envelope is printed whatever
+    happened, each refused id is named on stderr, and a run that accomplished
+    nothing must not report success to a script that only reads the code.
+    """
+    proposal = service.create_node(type="note", title="Bot note", principal=agent("researcher"))
+    assert proposal.state == "proposed"
+
+    accepted = _run_json("review", "accept", proposal.id)
+    assert accepted["transitioned"] == [proposal.id]
+    assert accepted["failed"] == []
+    assert _run_json("node", "get", proposal.id)["state"] == "active"
+
+    refused = runner.invoke(app, ["review", "accept", "no-such-proposal", "--as", "owner"])
+    assert refused.exit_code == 1
+    payload = json.loads(refused.stdout)
+    assert payload["transitioned"] == []
+    assert [failure["id"] for failure in payload["failed"]] == ["no-such-proposal"]
+    assert "failed no-such-proposal:" in refused.stderr
+    assert isinstance(refused.exception, SystemExit)
 
 
 # ── mcp serve: the actor is validated before anything is served ───────────────
