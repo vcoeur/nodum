@@ -2894,6 +2894,70 @@ def test_search_and_link_suggestions(client, fresh_db):
     assert client.get("/api/links/suggest?prefix=a&limit=0").status_code == 400
 
 
+def test_state_param_absent_is_the_service_default():
+    """B7: ``_state_param`` returns the service default for an absent parameter
+    and ``None`` only for an explicit ``any`` — absent must not mean "every
+    state" the way it did when ``None`` reached the service."""
+    from starlette.datastructures import QueryParams
+
+    param = http_api._state_param
+    assert param(QueryParams("")) == "active"
+    assert param(QueryParams("q=zebra")) == "active"
+    assert param(QueryParams("state=active")) == "active"
+    assert param(QueryParams("state=proposed")) == "proposed"
+    assert param(QueryParams("state=archived")) == "archived"
+    assert param(QueryParams("state=any")) is None
+
+
+def test_search_defaults_to_active_until_state_any_is_said(client, fresh_db):
+    """B7: a bare ``GET /api/search`` must not include proposed or archived rows.
+
+    The HTTP surface used to hand ``state=None`` to the service for an absent
+    parameter — the service's "every state" — where the CLI and the MCP server
+    both default to ``active``. Absent is now the CLI's default, and ``any`` is
+    the explicit opt-in to every state, exactly as on the other surfaces.
+    """
+    proposed = service.create_node(
+        type="note", title="Zebra proposed", content="zebra stripes", principal=agent(AGENT)
+    )
+    archived = service.create_node(
+        type="note", title="Zebra archived", content="zebra hooves", principal=owner()
+    )
+    service.transition(archived.id, "archive", principal=owner())
+    active = service.create_node(
+        type="note", title="Zebra active", content="zebra mane", principal=owner()
+    )
+
+    assert service.get_node(proposed.id, principal=owner()).state == "proposed"
+    assert service.get_node(archived.id, principal=owner()).state == "archived"
+
+    default_hits = _ok(client.get("/api/search?q=zebra"))["hits"]
+    assert [hit["node_id"] for hit in default_hits] == [active.id]
+
+    active_hits = _ok(client.get("/api/search?q=zebra&state=active"))["hits"]
+    assert [hit["node_id"] for hit in active_hits] == [active.id]
+
+    every_hits = _ok(client.get("/api/search?q=zebra&state=any"))["hits"]
+    assert {hit["node_id"] for hit in every_hits} == {proposed.id, archived.id, active.id}
+
+
+def test_nl_search_keeps_the_active_default(client, fresh_db):
+    """B7: the rewrite branch shares ``_search_filters`` with the plain branch,
+    so it keeps the same state default — one fixed source, two call sites."""
+    proposed = service.create_node(
+        type="note", title="Zebra proposed", content="zebra stripes", principal=agent(AGENT)
+    )
+    active = service.create_node(
+        type="note", title="Zebra active", content="zebra mane", principal=owner()
+    )
+    llm.set_provider(_FakeLLM(_fake_completion({"terms": ["zebra"]})))
+
+    body = _ok(client.get("/api/search?q=zebra+stripes&nl=1"))
+
+    assert proposed.id not in {hit["node_id"] for hit in body["hits"]}
+    assert [hit["node_id"] for hit in body["hits"]] == [active.id]
+
+
 def test_graph_subgraph_and_path(client, fresh_db):
     hub = service.create_node(type="concept", title="Hub", principal=owner())
     leaves = [

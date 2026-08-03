@@ -1375,9 +1375,18 @@ def _list_param(params: QueryParams, *names: str) -> list[str] | None:
 
 
 def _state_param(params: QueryParams, name: str = "state") -> str | None:
-    """Read a search state filter, mapping the CLI's ``any`` to "no filter"."""
+    """Read a search state filter for a service call.
+
+    Absent → the service default ``"active"``; ``"any"`` → ``None`` (the
+    service's "no filter", meaning every state); any other value → that
+    value. An absent parameter must not become ``None`` — that would silently
+    widen a default search to every state, where the CLI's ``--state`` and the
+    MCP server's ``filters.state`` both default to ``active``.
+    """
     state = params.get(name)
-    return None if state in (None, "any") else state
+    if state is None:
+        return "active"
+    return None if state == "any" else state
 
 
 def _proposal_filters(source: Any) -> dict[str, Any]:
