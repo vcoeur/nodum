@@ -1169,8 +1169,11 @@ def create_node(
         seq = _emit(conn, actor, f"node.{_create_op(state)}", {"before": None, "after": node})
         _write_version(conn, node, actor, seq)
         _materialize_mentions(conn, node, actor, store, landing=landing)
+        # The return value is built before the commit so a validation failure
+        # lands pre-commit: `finally: conn.close()` then rolls back the write.
+        out = _node_out(node)
         conn.commit()
-        return _node_out(node)
+        return out
     finally:
         conn.close()
 
@@ -1284,8 +1287,11 @@ def update_node(
                 ),
             )
             version = _row_dict(_get_version_row(conn, int(cur.lastrowid)))
+            # The return value is built before the commit so a validation
+            # failure lands pre-commit: `finally: conn.close()` then rolls back.
+            out = _version_out(version)
             conn.commit()
-            return _version_out(version)
+            return out
         conn.execute(
             """
             UPDATE nodes
@@ -1299,8 +1305,11 @@ def update_node(
         _write_version(conn, after, actor, seq)
         if content is not _UNSET:
             _materialize_mentions(conn, after, actor, store)
+        # The return value is built before the commit so a validation failure
+        # lands pre-commit: `finally: conn.close()` then rolls back the write.
+        out = _node_out(after)
         conn.commit()
-        return _node_out(after)
+        return out
     finally:
         conn.close()
 
@@ -1692,8 +1701,11 @@ def create_edge(
             actor=principal.actor_string,
             store=store,
         )
+        # The return value is built before the commit so a validation failure
+        # lands pre-commit: `finally: conn.close()` then rolls back the write.
+        out = _edge_out(row)
         conn.commit()
-        return _edge_out(row)
+        return out
     finally:
         conn.close()
 
@@ -2016,12 +2028,16 @@ def transition(
         kind, after = _transition_row(
             conn, record_id, action, principal.actor_string, store, reason=reason
         )
-        conn.commit()
+        # The return value is built before the commit so a validation failure
+        # lands pre-commit: `finally: conn.close()` then rolls back the write.
         if kind == "node":
-            return _node_out(after)
-        if kind == "version":
-            return _version_out(after)
-        return _edge_out(after)
+            out = _node_out(after)
+        elif kind == "version":
+            out = _version_out(after)
+        else:
+            out = _edge_out(after)
+        conn.commit()
+        return out
     finally:
         conn.close()
 

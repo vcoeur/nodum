@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import ast
 import inspect
+import json
 
 import pytest
 from helpers import OWNER_ACTOR, agent, owner
+from pydantic import ValidationError
 
-from nodum import auth, search, service
+from nodum import auth, db, search, service
 from nodum.migrations import GARDENER_AGENT_ID
 from nodum.service import (
     EdgeNotFound,
@@ -658,3 +660,98 @@ def test_a_missing_agent_is_named_the_same_way_on_every_path_that_looks_one_up(f
             call()
         assert str(missing.value) == "agent not found: nope"
         assert "agents row" not in str(missing.value)
+
+
+# ── Commit-before-validate (B3): a response model that fails to build must ────
+# ── never leave the write committed ───────────────────────────────────────────
+
+
+def _count_rows(table: str) -> int:
+    """Row count for one table, read straight from the database file."""
+    conn = db.connect()
+    try:
+        return conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+    finally:
+        conn.close()
+
+
+def _corrupt_props(record_id: str, *, table: str = "nodes") -> None:
+    """Write a props value ``props: dict`` models reject, as an older buggy
+    release would have left it: a JSON array survives ``json.dumps``."""
+    conn = db.connect()
+    try:
+        conn.execute(
+            f"UPDATE {table} SET props = ? WHERE id = ?",
+            (json.dumps(["a", "b"]), record_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_create_node_bad_props_raises_without_committing(fresh_db):
+    """A props shape `NodeOut` rejects must fail pre-commit, or the bad row
+    bricks every later `list_nodes` on the space (the reviewer repro: the
+    commit landed first, then the response model raised forever after)."""
+    before = (_count_rows("nodes"), _count_rows("versions"), _count_rows("events"))
+    with pytest.raises(ValidationError):
+        service.create_node(type="note", title="bad", props=["a", "b"], principal=owner())
+    # The space still lists — the row, event, and version were all rolled back.
+    assert service.list_nodes(principal=owner()) == []
+    assert (_count_rows("nodes"), _count_rows("versions"), _count_rows("events")) == before
+
+
+def test_update_node_bad_props_raises_without_committing_human_path(fresh_db):
+    """The apply path: a bad `props` update must fail pre-commit, leaving the
+    node, its version history, and the event log exactly as they were."""
+    node = service.create_node(type="note", title="t", props={"k": 1}, principal=owner())
+    before = (_count_rows("versions"), _count_rows("events"))
+    with pytest.raises(ValidationError):
+        service.update_node(node.id, props=["a", "b"], principal=owner())
+    # Nothing was committed: the stored row still holds the old, valid props.
+    assert service.get_node(node.id, principal=owner()).props == {"k": 1}
+    assert service.get_node(node.id, principal=owner()).title == "t"
+    assert (_count_rows("versions"), _count_rows("events")) == before
+
+
+def test_update_node_bad_props_raises_without_committing_agent_path(fresh_db):
+    """The propose path: an agent's proposed update that fails to model must
+    not leave a `version.propose` event or a proposed version behind."""
+    node = service.create_node(type="note", title="t", principal=owner())
+    before = (_count_rows("versions"), _count_rows("events"))
+    with pytest.raises(ValidationError):
+        service.update_node(node.id, props=["a", "b"], principal=agent("researcher"))
+    assert (_count_rows("versions"), _count_rows("events")) == before
+    # The node itself is untouched, and the review queue holds nothing new.
+    assert service.get_node(node.id, principal=owner()).props == {}
+    assert service.list_proposals(principal=owner()) == []
+
+
+def test_create_edge_bad_props_raises_without_committing(fresh_db):
+    """A bad `props` edge must fail pre-commit, or the row bricks `list_edges`."""
+    a = service.create_node(type="claim", title="A", principal=owner())
+    b = service.create_node(type="claim", title="B", principal=owner())
+    before_events = _count_rows("events")
+    with pytest.raises(ValidationError):
+        service.create_edge(a.id, b.id, "supports", props=["x"], principal=owner())
+    assert service.list_edges(principal=owner()) == []
+    assert _count_rows("edges") == 0
+    assert _count_rows("events") == before_events
+
+
+def test_transition_bad_props_raises_without_committing(fresh_db):
+    """A transition of a row whose props no longer model must fail pre-commit:
+    the state flip, event, and version all roll back (the row is corrupted
+    directly, the way the pre-fix `create_node`/`update_node` left rows)."""
+    node = service.create_node(type="note", title="t", principal=owner())
+    _corrupt_props(node.id)
+    before = (_count_rows("versions"), _count_rows("events"))
+    with pytest.raises(ValidationError):
+        service.transition(node.id, "archive", principal=owner())
+    conn = db.connect()
+    try:
+        state = conn.execute("SELECT state FROM nodes WHERE id = ?", (node.id,)).fetchone()[0]
+    finally:
+        conn.close()
+    assert state == "active"  # still active: the flip was rolled back
+    assert (_count_rows("versions"), _count_rows("events")) == before
