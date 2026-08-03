@@ -824,18 +824,18 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "argon2-cffi", specifier = ">=23" },
-    { name = "fastembed", marker = "extra == 'embeddings'", specifier = ">=0.8.0" },
-    { name = "faster-whisper", marker = "extra == 'audio'", specifier = ">=1" },
-    { name = "mcp", specifier = ">=1.28.1" },
+    { name = "fastembed", marker = "extra == 'embeddings'", specifier = ">=0.8.0,<1" },
+    { name = "faster-whisper", marker = "extra == 'audio'", specifier = ">=1,<2" },
+    { name = "mcp", specifier = ">=1.28.1,<2" },
     { name = "pillow", specifier = ">=11" },
-    { name = "pydantic", specifier = ">=2.9" },
-    { name = "pypdf", marker = "extra == 'pdf'", specifier = ">=5" },
+    { name = "pydantic", specifier = ">=2.9,<3" },
+    { name = "pypdf", marker = "extra == 'pdf'", specifier = ">=5,<7" },
     { name = "pypdfium2", marker = "extra == 'pdf'", specifier = ">=4" },
-    { name = "pytesseract", marker = "extra == 'ocr'", specifier = ">=0.3" },
-    { name = "sqlite-vec", specifier = ">=0.1.9" },
-    { name = "starlette", specifier = ">=0.48" },
-    { name = "typer", specifier = ">=0.16" },
-    { name = "uvicorn", specifier = ">=0.34" },
+    { name = "pytesseract", marker = "extra == 'ocr'", specifier = ">=0.3,<1" },
+    { name = "sqlite-vec", specifier = ">=0.1.9,<1" },
+    { name = "starlette", specifier = ">=0.48,<2" },
+    { name = "typer", specifier = ">=0.16,<1" },
+    { name = "uvicorn", specifier = ">=0.34,<1" },
 ]
 provides-extras = ["audio", "embeddings", "ocr", "pdf"]
 
