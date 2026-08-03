@@ -44,6 +44,15 @@ theme:
 extra_css:
   - assets/stylesheets/extra.css
 
+# Mermaid is vendored locally (docs/assets/js/mermaid.min.js) so the built
+# site makes zero third-party fetches; mkdocs-material 9.7.7 skips its CDN
+# fallback as soon as a `mermaid` global exists. Order matters: the vendor
+# bundle must load before the init snippet (both are classic scripts that run
+# before material's DOMContentLoaded handlers).
+extra_javascript:
+  - assets/js/mermaid.min.js
+  - assets/js/mermaid-init.js
+
 extra:
   social:
     - icon: fontawesome/brands/github
