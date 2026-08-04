@@ -90,6 +90,7 @@ artifacts = ["nodum/_web/**"]
 
 [dependency-groups]
 dev = [
+    "pyright>=1.1.411",
     "pytest>=9.0.2",
     "pytest-cov>=6.0",
     "ruff>=0.15.2",
@@ -99,6 +100,18 @@ dev = [
 pythonpath = ["."]
 addopts = "-q"
 testpaths = ["tests"]
+
+[tool.pyright]
+# Type-checking scope: the 25 nodum/ package modules. tests/ is deliberately
+# excluded — M29 is about the package's ~29k annotated lines. `typeCheckingMode
+# = "standard"` is pyright's default; it is set explicitly so the mode is
+# documented. There is deliberately no blanket `ignore` of any error rule: the
+# only suppressions in the tree are the per-site `# pyright: ignore` comments on
+# the 7 optional-dependency imports (fastembed, loguru, pytesseract,
+# faster_whisper), whose degraded-mode design makes an absent dependency a
+# returned result, never an exception.
+include = ["nodum"]
+typeCheckingMode = "standard"
 
 [tool.ruff]
 line-length = 100

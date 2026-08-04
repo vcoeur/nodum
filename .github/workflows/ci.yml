@@ -24,6 +24,8 @@ jobs:
         run: uv run --locked ruff check .
       - name: Ruff format check
         run: uv run --locked ruff format --check .
+      - name: Pyright typecheck
+        run: uv run --locked pyright nodum
 
   test:
     name: Tests (py${{ matrix.python-version }})

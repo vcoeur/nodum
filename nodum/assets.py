@@ -109,6 +109,7 @@ import json
 import mimetypes
 import re
 import sqlite3
+from collections.abc import Buffer
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -1044,12 +1045,18 @@ class _BlobReader(io.RawIOBase):
     def seekable(self) -> bool:
         return True
 
-    def readinto(self, buffer: memoryview) -> int:
+    def readinto(self, buffer: Buffer, /) -> int:
+        # `RawIOBase.readinto` takes a writeable buffer (typeshed's
+        # WriteableBuffer is an alias for the PEP 688 Buffer, which the type
+        # system cannot distinguish from a read-only one). Every Buffer can be
+        # wrapped in a memoryview — that is the buffer protocol's contract —
+        # and the view carries the slice-assign `__setitem__` the body needs.
+        view = memoryview(buffer)
         if self._position >= self._size:
             return 0
         self._blob.seek(self._position)
-        chunk = self._blob.read(min(len(buffer), self._size - self._position))
-        buffer[: len(chunk)] = chunk
+        chunk = self._blob.read(min(len(view), self._size - self._position))
+        view[: len(chunk)] = chunk
         self._position += len(chunk)
         return len(chunk)
 
@@ -1096,7 +1103,7 @@ def _downscale(image: Image.Image, profile: Profile) -> Image.Image:
     render paths — stored image and PDF page — end here, so the "never upscale"
     rule has one home.
     """
-    image.thumbnail((profile.max_edge, profile.max_edge), Image.LANCZOS)
+    image.thumbnail((profile.max_edge, profile.max_edge), Image.Resampling.LANCZOS)
     return image
 
 
@@ -1135,7 +1142,11 @@ def _render_pdf_page(original: sqlite3.Blob, page_number: int, profile: Profile)
             "install the 'pdf' extra (pip install 'nodum[pdf]') to render PDF pages"
         ) from exc
 
-    scale = PAGE_DPI / 72  # PDFium scales the page's own 1/72-inch canvas unit.
+    # PDFium scales the page's own 1/72-inch canvas unit. Integral division is
+    # exact here: PAGE_DPI is a whole multiple of 72 by design (144 DPI is
+    # exactly 2× the page's coordinate space — see its rationale), so the scale
+    # is a genuine int, which is what pypdfium2's render() takes.
+    scale = PAGE_DPI // 72
     try:
         document = pypdfium2.PdfDocument(io.BufferedReader(_BlobReader(original)))
     except pypdfium2.PdfiumError as exc:

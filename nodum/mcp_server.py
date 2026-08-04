@@ -67,8 +67,9 @@ from __future__ import annotations
 
 import os
 import urllib.parse
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, overload
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.utilities.types import Image
@@ -209,9 +210,17 @@ OVERWRITING_TOOLS = ("update_node",)
 MAX_EXTRACTED_TEXT_CHARS = ingest.SOURCE_CONTENT_CHARS
 
 
-def _dump(result: BaseModel | list[BaseModel]) -> dict[str, Any] | list[dict[str, Any]]:
+@overload
+def _dump(result: BaseModel) -> dict[str, Any]: ...
+
+
+@overload
+def _dump(result: Sequence[BaseModel]) -> list[dict[str, Any]]: ...
+
+
+def _dump(result: BaseModel | Sequence[BaseModel]) -> dict[str, Any] | list[dict[str, Any]]:
     """Serialise service results exactly like every other adapter."""
-    if isinstance(result, list):
+    if isinstance(result, Sequence):
         return [item.model_dump(mode="json") for item in result]
     return result.model_dump(mode="json")
 

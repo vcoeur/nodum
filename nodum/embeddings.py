@@ -126,7 +126,7 @@ class FastembedProvider:
     def __init__(
         self, model_name: str = DEFAULT_MODEL, *, cache_dir: str | Path | None = None
     ) -> None:
-        from fastembed import TextEmbedding
+        from fastembed import TextEmbedding  # pyright: ignore[reportMissingImports] degraded-mode
 
         self._cache_dir = Path(cache_dir).expanduser() if cache_dir is not None else cache_path()
         self._model = TextEmbedding(model_name=model_name, cache_dir=str(self._cache_dir))
@@ -310,7 +310,7 @@ def reset_provider() -> None:
 def _resolve_default() -> tuple[EmbeddingProvider | None, str | None]:
     """Build the default fastembed provider, or explain why it cannot run."""
     try:
-        import fastembed  # noqa: F401
+        import fastembed  # noqa: F401  # pyright: ignore[reportMissingImports] degraded-mode
     except ImportError:
         return None, "fastembed is not installed (install the 'embeddings' extra)"
     model_name = os.environ.get(ENV_MODEL_VAR, DEFAULT_MODEL)
@@ -394,7 +394,7 @@ def _silence_fastembed() -> Iterator[None]:
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         try:
-            from loguru import logger
+            from loguru import logger  # pyright: ignore[reportMissingImports] degraded-mode
 
             logger.disable("fastembed")
             try:

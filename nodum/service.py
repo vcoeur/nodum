@@ -730,6 +730,11 @@ def _emit(
             cycle_id if cycle_id is not None else _CURRENT_CYCLE.get(),
         ),
     )
+    if cur.lastrowid is None:
+        # The sqlite3 contract: an INSERT that completes sets rowid. A None
+        # here would mean the driver did not run the statement — impossible
+        # without an exception having already propagated.
+        raise RuntimeError("INSERT into events did not set a rowid")
     return int(cur.lastrowid)
 
 
@@ -1289,6 +1294,11 @@ def update_node(
                     json.dumps(fields),
                 ),
             )
+            if cur.lastrowid is None:
+                # The sqlite3 contract: an INSERT that completes sets rowid. A
+                # None here would mean the driver did not run the statement —
+                # impossible without an exception having already propagated.
+                raise RuntimeError("INSERT into versions did not set a rowid")
             version = _row_dict(_get_version_row(conn, int(cur.lastrowid)))
             # The return value is built before the commit so a validation
             # failure lands pre-commit: `finally: conn.close()` then rolls back.
@@ -3470,7 +3480,15 @@ def record_asset_event(
         raise ValueError(f"op must be one of {ASSET_EVENT_OPS}, got {op!r}")
     if (principal is None) == (actor is None):
         raise ValueError("pass exactly one of principal= or actor=")
-    actor_string = actor if actor is not None else principal.actor_string
+    # The guard proves exactly one identity was passed. Prefer the explicit
+    # string; when it is absent, the principal — which the guard guarantees
+    # is present in that case — is the identity.
+    if principal is not None:
+        actor_string = principal.actor_string
+    elif actor is not None:
+        actor_string = actor
+    else:
+        raise RuntimeError("unreachable: the guard guarantees exactly one identity")
     if conn is not None:
         return _emit(conn, actor_string, op, payload)
     own_conn = _connect(path)
@@ -4610,6 +4628,11 @@ def archive_space(space: str, *, principal: Principal, path: str | Path | None =
     # including the structural refusal, which `_transition_row` owns so that
     # `archive <id>` cannot route around it.
     archived = transition(space_id, "archive", principal=principal, path=path)
+    if not isinstance(archived, NodeOut):
+        # Unreachable: a space id resolves to a space node, so the node branch
+        # of the transition is the only one that can apply. Stated so the
+        # declared NodeOut return is honest to the type checker.
+        raise RuntimeError("unreachable: archiving a space node returns a node")
     return archived
 
 

@@ -1042,7 +1042,7 @@ def _is_structured_rejection(detail: str) -> bool:
     )
 
 
-def _optional_count(block: Any, key: str) -> int:
+def _optional_count(block: dict[str, Any], key: str) -> int:
     """Read a non-negative integer the wire may simply not carry.
 
     Absent is ``0`` and unreadable is ``0``, which is the opposite of how the
@@ -1057,8 +1057,10 @@ def _optional_count(block: Any, key: str) -> int:
     if not isinstance(block, dict):
         return 0
     value = block.get(key)
+    if value is None:
+        return 0  # absent — the docstring's "wire did not say"
     try:
-        count = int(value)  # type: ignore[arg-type]
+        count = int(value)
     except (TypeError, ValueError):
         return 0
     return max(0, count)

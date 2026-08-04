@@ -247,7 +247,7 @@ class TextHandler(_BaseHandler):
     """
 
     name = "text"
-    mimes = ("text/*", "application/json")
+    mimes: tuple[str, ...] = ("text/*", "application/json")
 
     def handles(self, mime: str) -> bool:
         """Claim the text family and JSON — but leave HTML to the ``html`` handler."""
@@ -333,7 +333,7 @@ class HtmlHandler(_BaseHandler):
     """
 
     name = "html"
-    mimes = HTML_MIMES
+    mimes: tuple[str, ...] = HTML_MIMES
 
     def extract(self, source: Path, *, mime: str) -> Extraction:
         """Parse ``source`` and return its visible text.
@@ -363,7 +363,7 @@ class PdfHandler(_BaseHandler):
     """
 
     name = "pdf"
-    mimes = ("application/pdf",)
+    mimes: tuple[str, ...] = ("application/pdf",)
 
     def availability(self) -> tuple[bool, str | None]:
         """Available when ``pypdf`` imports."""
@@ -401,7 +401,7 @@ class ImageHandler(_BaseHandler):
     """
 
     name = "image"
-    mimes = ("image/*",)
+    mimes: tuple[str, ...] = ("image/*",)
 
     def availability(self) -> tuple[bool, str | None]:
         """Available when ``pytesseract`` imports *and* the tesseract binary is on PATH."""
@@ -409,7 +409,7 @@ class ImageHandler(_BaseHandler):
 
     def extract(self, source: Path, *, mime: str) -> Extraction:
         """Run OCR over the image and return the recognised text."""
-        import pytesseract
+        import pytesseract  # pyright: ignore[reportMissingImports] degraded-mode
         from PIL import Image
 
         with Image.open(source) as image:
@@ -421,7 +421,7 @@ class AudioHandler(_BaseHandler):
     """Speech-to-text through ``faster-whisper`` (the ``audio`` extra)."""
 
     name = "audio"
-    mimes = ("audio/*",)
+    mimes: tuple[str, ...] = ("audio/*",)
 
     def availability(self) -> tuple[bool, str | None]:
         """Available when ``faster_whisper`` imports."""
@@ -436,7 +436,9 @@ class AudioHandler(_BaseHandler):
         cache, and an uncached model raises here, which :func:`extract` turns
         into a ``detail`` naming the flag rather than a silent download.
         """
-        from faster_whisper import WhisperModel
+        from faster_whisper import (  # pyright: ignore[reportMissingImports] degraded-mode
+            WhisperModel,
+        )
 
         model = WhisperModel(
             os.environ.get(ENV_AUDIO_MODEL_VAR, AUDIO_MODEL),
@@ -491,7 +493,7 @@ def _probe_pypdf() -> tuple[bool, str | None]:
 def _probe_pytesseract() -> tuple[bool, str | None]:
     """Check for the OCR wrapper and, separately, the binary it drives."""
     try:
-        import pytesseract  # noqa: F401
+        import pytesseract  # noqa: F401  # pyright: ignore[reportMissingImports] degraded-mode
     except ImportError:
         return False, "pytesseract is not installed (install the 'ocr' extra)"
     if shutil.which(TESSERACT_BINARY) is None:
@@ -505,7 +507,7 @@ def _probe_pytesseract() -> tuple[bool, str | None]:
 def _probe_faster_whisper() -> tuple[bool, str | None]:
     """Check for the speech-to-text dependency."""
     try:
-        import faster_whisper  # noqa: F401
+        import faster_whisper  # noqa: F401  # pyright: ignore[reportMissingImports] degraded-mode
     except ImportError:
         return False, "faster-whisper is not installed (install the 'audio' extra)"
     return True, None
