@@ -2299,6 +2299,41 @@ def test_every_download_refusal_reads_identically(client, fresh_db, tmp_path):
     assert urls.consume(upload["token"], kind="upload")["kind"] == "upload"
 
 
+def test_a_head_probe_does_not_spend_a_download_token(client, fresh_db, tmp_path):
+    """HEAD must never redeem the capability: a probe is not a download.
+
+    Starlette answers HEAD on a GET route by running the handler with the
+    body suppressed, so a bare route would *spend the single-use token* on a
+    request that asked for no bytes — and the real GET behind it would come
+    back refused. The route refuses HEAD with 405 (``Allow: GET``), the probe
+    is not event-logged, and the token survives for the GET that wants it.
+    """
+    original = b"%PDF-1.4\nprobe me not\n"
+    ingested = _ingest_file(client, tmp_path, original)
+    grant = _mint_download(client, ingested["asset"]["hash"])
+    assert _events("asset.download") == []
+
+    probe = client.request("HEAD", grant["url"])
+
+    assert probe.status_code == 405
+    assert set(probe.headers["allow"].split(", ")) == {"GET"}
+    assert probe.content == b""  # HEAD carries no body — the status is the refusal
+    assert _events("asset.download") == []  # the probe spent nothing
+
+    # The same refusal through a body-bearing method, so the error is readable:
+    # the app's own 405 machinery (``MethodNotAllowed``), not an accidental one.
+    delete = client.delete(grant["url"])
+    assert delete.status_code == 405
+    assert delete.json()["error"]["type"] == "MethodNotAllowed"
+    assert _events("asset.download") == []
+
+    response = client.get(grant["url"])
+
+    assert response.status_code == 200
+    assert response.content == original
+    assert len(_events("asset.download")) == 1  # spent by the GET, exactly once
+
+
 def test_an_upload_url_ingests_the_bytes_the_grant_was_minted_for(client, fresh_db):
     """A PUT with no cookie, no origin headers and no content type at all.
 

@@ -1665,6 +1665,25 @@ def _original_response(asset_hash: str, path: str | Path | None) -> Response:
 # ── Routing ───────────────────────────────────────────────────────────────────
 
 
+class _NoHeadRoute(Route):
+    """A :class:`~starlette.routing.Route` that never answers HEAD.
+
+    Starlette adds ``HEAD`` to every route whose methods include ``GET`` —
+    even when ``methods=["GET"]`` was passed explicitly — and answers a HEAD
+    request by running the handler with the body suppressed. For an ordinary
+    read that is a feature. For the download route it is not: the handler
+    **spends the single-use token**, so a HEAD probe would burn the
+    capability and the real GET behind it would come back refused (M6).
+    Removing HEAD from the method set sends the request on to the ``/api``
+    catch-all, which answers 405 with ``Allow: GET``.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self.methods:
+            self.methods = {method for method in self.methods if method != "HEAD"}
+
+
 def _partial_match_methods(routes: Iterable[Route], scope: Scope) -> set[str]:
     """Return the methods real routes accept on this path, if any accept the path.
 
@@ -2901,7 +2920,11 @@ def create_app(
         # check and the body ceiling apply to them exactly as to the rest.
         # Their paths come from `nodum.urls.TOKEN_PATHS`, which is also what
         # the minted URLs are built from, so the two cannot drift apart.
-        Route(f"{urls.TOKEN_PATHS['download']}/{{token}}", download_original),
+        # `methods=["GET"]` alone does not exclude HEAD — Starlette adds HEAD
+        # to any route whose methods include GET — and running the download
+        # handler on a HEAD request would spend the single-use token (M6), so
+        # this route is the one `_NoHeadRoute` exists for.
+        _NoHeadRoute(f"{urls.TOKEN_PATHS['download']}/{{token}}", download_original),
         Route(f"{urls.TOKEN_PATHS['upload']}/{{token}}", upload_original, methods=["PUT"]),
         Route("/api/events", list_events),
         Route("/api/undo", undo, methods=["POST"]),
