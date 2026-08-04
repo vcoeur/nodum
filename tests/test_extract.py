@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import importlib.util
 import shutil
+import struct
 import sys
 import types
+import zlib
+from pathlib import Path
 
 import pytest
+from PIL import Image
 
 from nodum import extract
 
@@ -66,6 +70,27 @@ def _minimal_pdf(page_texts: list[str]) -> bytes:
         f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n"
     ).encode()
     return bytes(out)
+
+
+def _bomb_png(path: Path) -> Path:
+    """Write a decompression-bomb PNG: 45 bytes on disk, 1e10 pixels on decode.
+
+    A PNG whose IHDR declares a 100000×100000 raster is a real bomb — Pillow
+    refuses it from the header, exactly as a 68-byte file declaring 150
+    megapixels would be.
+    """
+
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(data))
+            + kind
+            + data
+            + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+        )
+
+    header = struct.pack(">IIBBBBB", 100_000, 100_000, 8, 2, 0, 0, 0)
+    path.write_bytes(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header) + chunk(b"IEND", b""))
+    return path
 
 
 # ── MIME routing ─────────────────────────────────────────────────────────────
@@ -233,6 +258,20 @@ def test_html_with_no_visible_text_says_so(tmp_path):
     assert result.detail == "the document holds no visible text"
 
 
+def test_html_reading_is_bounded_before_the_cap_bites(tmp_path, monkeypatch):
+    """Finding M24 applies to markup too: the read window is the bound, and the
+    cut is reported — truncation is never silent."""
+    monkeypatch.setattr(extract, "MAX_TEXT_CHARS", 64)
+    path = tmp_path / "big.html"
+    path.write_text("<p>" + "x" * 1_000_000 + "</p>", encoding="utf-8")
+
+    result = extract.extract(path, mime="text/html")
+
+    assert len(result.text) <= extract.MAX_TEXT_CHARS + extract._MAX_UTF8_CHAR_BYTES
+    assert result.text.strip("x") == ""
+    assert "truncated" in result.detail
+
+
 # ── Absent dependencies: the path most installs take (note 01 D2) ────────────
 
 
@@ -330,6 +369,46 @@ def test_availability_reports_every_handler_in_registry_order():
         # An unavailable handler always explains itself; an available one has
         # nothing to explain.
         assert (status.detail is None) is status.available
+
+
+# ── The image handler's pixel budget (finding M28) ───────────────────────────
+
+
+def test_the_ocr_handler_refuses_a_decompression_bomb(tmp_path):
+    """Finding M28: the pixel budget guards the OCR decode like the rendition
+    path — and the refusal is a returned result, not an exception that would
+    wedge the pipeline."""
+    path = _bomb_png(tmp_path / "scan.png")
+
+    result = extract.ImageHandler().extract(path, mime="image/png")
+
+    assert result.handler == "image"
+    assert result.text == ""
+    assert result.pages == []
+    assert result.detail is not None
+    assert "bomb" in result.detail or "pixels" in result.detail
+
+
+def test_a_normal_image_still_reaches_the_ocr_call(tmp_path, monkeypatch):
+    """The budget guard only refuses what it should: an ordinary image still
+    OCRs (pytesseract mocked; the probe is the handler's own seam)."""
+    seen: list[object] = []
+    module = types.ModuleType("pytesseract")
+
+    def image_to_string(image, **kwargs):
+        seen.append(image)
+        return "recognised prose"
+
+    module.image_to_string = image_to_string
+    monkeypatch.setitem(sys.modules, "pytesseract", module)
+    path = tmp_path / "scan.png"
+    Image.new("L", (40, 30), "white").save(path)
+
+    result = extract.ImageHandler().extract(path, mime="image/png")
+
+    assert result.text == "recognised prose"
+    assert len(seen) == 1
+    assert result.detail is None
 
 
 # ── Nothing escapes ──────────────────────────────────────────────────────────
@@ -489,6 +568,52 @@ def test_text_above_the_cap_is_truncated_and_says_so(tmp_path, monkeypatch):
     assert "100" in result.detail
 
 
+def test_a_large_text_file_is_read_only_up_to_the_cap(tmp_path, monkeypatch):
+    """Finding M24: the read is the memory bound, not the decode.
+
+    The old read — `source.read_bytes()` then cap — pulled the whole file into
+    memory (~3× its size, decoded) before the cap could bite. The assertion is
+    therefore on the *read*: a capped result alone proves nothing about how
+    many bytes came off disk, so `Path.open` is wrapped to count them.
+    """
+    monkeypatch.setattr(extract, "MAX_TEXT_CHARS", 64)
+    path = tmp_path / "huge.txt"
+    path.write_bytes(b"x" * 1_000_000)
+
+    pulled: list[int] = []
+    original_open = Path.open
+
+    def counting_open(self, *args, **kwargs):
+        handle = original_open(self, *args, **kwargs)
+
+        class _Counting:
+            def __init__(self, inner):
+                self.inner = inner
+
+            def read(self, size=-1):
+                chunk = self.inner.read(size)
+                pulled.append(len(chunk))
+                return chunk
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return self.inner.__exit__(*exc)
+
+        return _Counting(handle)
+
+    monkeypatch.setattr(Path, "open", counting_open)
+
+    result = extract.extract(path, mime="text/plain")
+
+    assert len(result.text) == 64
+    assert "truncated" in result.detail
+    # The load-bearing assertion: the read stopped at the window, not the file.
+    assert sum(pulled) <= extract.MAX_TEXT_CHARS + extract._MAX_UTF8_CHAR_BYTES
+    assert sum(pulled) < 1_000_000
+
+
 @requires_pypdf
 def test_pdf_pages_stop_at_the_cap_rather_than_running_past_it(tmp_path, monkeypatch):
     monkeypatch.setattr(extract, "MAX_TEXT_CHARS", 20)
@@ -502,6 +627,39 @@ def test_pdf_pages_stop_at_the_cap_rather_than_running_past_it(tmp_path, monkeyp
     # Pages and text stay consistent: no page carries text the cap dropped.
     assert extract.PAGE_SEPARATOR.join(result.pages) == result.text
     assert "cap" in result.detail
+
+
+@requires_pypdf
+def test_pdf_parsing_stops_at_the_page_cap(tmp_path, monkeypatch):
+    """Finding M23: a pathological PDF is bounded at the parse, not at the write.
+
+    `reader.pages` is lazy — `get_page(n)` parses page n only when the
+    iteration reaches it — so the pages past the cap are never parsed at all.
+    The spy on `extract_text` proves the parse stopped, not just the result.
+    """
+    import pypdf
+
+    monkeypatch.setattr(extract, "MAX_PDF_PAGES", 3)
+    path = tmp_path / "book.pdf"
+    path.write_bytes(_minimal_pdf(["A", "B", "C", "D", "E"]))
+
+    calls: list[object] = []
+    original = pypdf.PageObject.extract_text
+
+    def spy(self, *args, **kwargs):
+        calls.append(self)
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(pypdf.PageObject, "extract_text", spy)
+
+    result = extract.extract(path, mime="application/pdf")
+
+    assert len(calls) == 3
+    assert len(result.pages) == 3
+    # The extraction reports the page-count cut, distinct from a char cut.
+    assert result.detail is not None
+    assert "parse cap" in result.detail
+    assert "of 5" in result.detail
 
 
 # ── The pdf handler on a real PDF ────────────────────────────────────────────

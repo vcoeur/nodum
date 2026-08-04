@@ -61,17 +61,20 @@ names a type from the *bytes*, over a vocabulary of what this system can act on
 audio containers, and text).
 
 **Evidence has two strengths, and the stored MIME depends on which it got.** A
-leading signature is a format identifying itself: definite, and it may overrule
-the filename's ``mimetypes.guess_type`` when the two name different families,
-because the name is chosen by whoever supplied the bytes while the stored MIME
-is what ``page:<n>`` rasters and extraction dispatch on — a PDF delivered as
-``scan.txt`` has to land as ``application/pdf`` or it reaches neither. The text
-heuristic is not that: it is a *window* test that can only say "nothing in
-these 4 KiB looks binary", so it may only **fill in** where the name guessed
-nothing (:func:`_stored_mime`, note 01 D3 as revised by review F3). So an SVG
-keeps ``image/svg+xml``, and ``application/json`` and ``application/xhtml+xml``
-keep themselves without a special-case list, because weak evidence can no longer
-overrule a specific guess.
+leading signature is a format identifying itself: definite, and it always beats
+the filename's ``mimetypes.guess_type``, because the name is chosen by whoever
+supplied the bytes while the stored MIME is what ``page:<n>`` rasters and
+extraction dispatch on — a PDF delivered as ``scan.txt`` *or* as
+``report.json`` has to land as ``application/pdf`` or it reaches neither.
+(Overruling used to be cross-family only, which let an ``application/*`` name
+keep its answer against an ``application/*`` signature: a real PDF called
+``report.json`` was stored as JSON and its bytes decoded as garbage text,
+finding M25.) The text heuristic is not that: it is a *window* test that can
+only say "nothing in these 4 KiB looks binary", so it may only **fill in**
+where the name guessed nothing (:func:`_stored_mime`, note 01 D3 as revised by
+review F3). So an SVG keeps ``image/svg+xml``, and ``application/json`` and
+``application/xhtml+xml`` keep themselves without a special-case list, because
+weak evidence can no longer overrule a specific guess.
 
 **A displaced PDF header is definite evidence too** — the readers this project
 uses scan for ``%PDF-`` rather than requiring it at offset 0, so a PDF behind a
@@ -430,9 +433,9 @@ class _Sniff:
     """What the bytes said, and how strongly they said it.
 
     ``definite`` is true only for a leading-signature match — a format
-    identifying itself, which may overrule a filename from another family. The
-    text heuristic sets it false, because a window test can never be more than
-    weak evidence (see :func:`_sniff_text`).
+    identifying itself, which always overrules a filename. The text heuristic
+    sets it false, because a window test can never be more than weak evidence
+    (see :func:`_sniff_text`).
     """
 
     mime: str | None
@@ -610,20 +613,25 @@ def _decodes_as_text(window: bytes, encoding: str, unit: int, *, skew: int) -> b
 
 
 def _mime_family(mime: str) -> str:
-    """Group a MIME into the family :func:`_stored_mime` compares on."""
+    """Group a MIME into the family :func:`_repaired_mime` compares on."""
     return mime.split("/", 1)[0]
 
 
 def _stored_mime(original_name: str, sniffed: _Sniff) -> str:
-    """Decide the MIME to record for a fresh registration (note 01 D3, review F3).
+    """Decide the MIME to record for a fresh registration (note 01 D3, review F3, finding M25).
 
     Two rules, one per strength of evidence:
 
-    * a **signature** may overrule the name when the two name different
-      families, and the name keeps its specificity *within* one family. So PDF
-      bytes called ``scan.txt`` are stored as ``application/pdf`` — which is
-      what ``page:<n>`` rasters and extraction dispatch on — while a PNG called
-      ``photo.jpeg`` keeps the name's answer, which no path here depends on.
+    * a **signature** always beats the name, whatever family the name
+      guessed. The signature is the format naming itself from its own bytes;
+      the name is chosen by whoever supplied the bytes, and the stored MIME
+      is what ``page:<n>`` rasters and extraction dispatch on — so PDF bytes
+      delivered as ``scan.txt`` *or* as ``report.json`` have to land as
+      ``application/pdf`` or they reach neither. The family comparison used
+      to let an ``application/*`` name keep its answer against an
+      ``application/*`` signature: a real PDF called ``report.json`` was
+      stored as JSON and its bytes decoded as garbage text by the ``text``
+      handler (finding M25).
     * the **text heuristic** may only fill in where the name guessed nothing.
       It is a window test, not an identification: a PDF whose ``%PDF-`` sits one
       byte in sniffs as text, and letting that overrule ``.pdf`` cost the
@@ -647,11 +655,28 @@ def _stored_mime(original_name: str, sniffed: _Sniff) -> str:
         guessed = None
     if sniffed.mime is None:
         return guessed or FALLBACK_MIME
-    if guessed is None:
+    if sniffed.definite:
         return sniffed.mime
-    if not sniffed.definite:
-        return guessed
-    return guessed if _mime_family(guessed) == _mime_family(sniffed.mime) else sniffed.mime
+    return guessed or sniffed.mime
+
+
+def stored_mime(source: str | Path, *, name: str) -> str:
+    """The MIME :func:`register_asset` will record for these bytes under this name.
+
+    Registration's own decision exposed as the public admission question: a
+    surface that must refuse before storing (``ingest_url``'s type policy,
+    finding M26) can ask what registration would record and refuse on that —
+    the sniff weighed against the name with the strength rules of
+    :func:`_stored_mime`, not a bare sniff a misnamed file would defeat.
+
+    Args:
+        source: Path to the file to inspect.
+        name: The name registration would record; its extension is the guess.
+
+    Returns:
+        The exact MIME :func:`register_asset` would store for the same input.
+    """
+    return _stored_mime(name, _sniff(source))
 
 
 def check_image_pixel_budget(
@@ -799,8 +824,10 @@ def register_asset(
 
         # `_sniff` reads a window from each end of the file, so neither this nor
         # the dedup branch above is a third *pass* over it — the hash and copy
-        # passes are the only full reads.
-        mime = _stored_mime(original_name, _sniff(source_file))
+        # passes are the only full reads. `stored_mime` is the public spelling
+        # of the same decision, so a surface refusing on type before storing
+        # asks exactly the question registration answers.
+        mime = stored_mime(source_file, name=original_name)
         # Metadata row, then a zero-filled blob of the right size, then the
         # bytes streamed into it — all in one transaction, so a crash mid-copy
         # rolls back rather than leaving a half-written asset.

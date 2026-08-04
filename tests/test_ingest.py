@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
@@ -155,6 +156,75 @@ def test_a_run_interrupted_between_the_two_nodes_is_repaired_by_rerunning(fresh_
     assert repaired.asset_ref.id == first.asset_ref.id, "the describing node is reused"
     assert repaired.source.id != first.source.id, "the retired source is replaced"
     assert len(_nodes("asset_ref", owner(), state="active")) == 1
+
+
+def test_a_run_interrupted_after_the_node_writes_is_repaired_by_rerunning(
+    fresh_db, tmp_path, monkeypatch
+):
+    """Finding M27: the two-node gate is not the whole subgraph.
+
+    A run interrupted after both node writes but before the `derived_from`
+    edge or the page blocks used to answer "already ingested" forever — the
+    gate passed, so the missing half was never recreated, and the caller was
+    told the subgraph was complete over one that was partial. The repair now
+    covers the edge and the page blocks too, and `created` reports what the
+    re-run actually wrote.
+    """
+    monkeypatch.setattr(
+        extract,
+        "extract",
+        lambda source, *, mime: extract.Extraction(
+            handler="pdf", text="one two", pages=["one", "two"]
+        ),
+    )
+    source = tmp_path / "scan.pdf"
+    source.write_bytes(b"%PDF-1.4\n%%EOF\n")
+    first = ingest.ingest_file(source, principal=owner())
+    assert first.created is True
+    assert len(first.pages) == 2
+
+    # The interrupted state: both nodes exist; the edge and the page blocks
+    # never made it, which is exactly what a crash after the node writes left
+    # behind (deleted here the way the crash skipped them — the blocks'
+    # version snapshots go with them, since a crash wrote neither).
+    conn = db.connect(fresh_db)
+    try:
+        conn.execute("DELETE FROM edges WHERE id = ?", (first.edges[0].id,))
+        conn.execute(
+            "DELETE FROM versions WHERE node_id IN (SELECT id FROM nodes WHERE parent_id = ?)",
+            (first.source.id,),
+        )
+        conn.execute("DELETE FROM nodes WHERE parent_id = ?", (first.source.id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+    repaired = ingest.ingest_file(source, principal=owner())
+
+    assert repaired.created is True, "the re-run wrote the missing half"
+    assert repaired.asset_ref.id == first.asset_ref.id, "the describing node is reused"
+    assert repaired.source.id == first.source.id, "the source is reused"
+    edges = service.list_edges(
+        node_id=repaired.source.id, type=ingest.PROVENANCE_EDGE, principal=owner()
+    )
+    assert [(edge.src_id, edge.dst_id) for edge in edges] == [
+        (repaired.source.id, repaired.asset_ref.id)
+    ]
+    assert [page.props["page"] for page in repaired.pages] == [1, 2]
+
+    # A third run finds a complete subgraph: nothing recreated, and nothing
+    # duplicated — no second edge, no second set of blocks.
+    again = ingest.ingest_file(source, principal=owner())
+    assert again.created is False
+    assert (
+        len(
+            service.list_edges(
+                node_id=again.source.id, type=ingest.PROVENANCE_EDGE, principal=owner()
+            )
+        )
+        == 1
+    )
+    assert len(again.pages) == 2
 
 
 def test_an_archived_describing_node_frees_its_hash(fresh_db, tmp_path):
@@ -610,6 +680,48 @@ def fixture_server():
     server.server_close()
 
 
+class _DripHandler(BaseHTTPRequestHandler):
+    """Serves a body one chunk at a time, sleeping between chunks.
+
+    The drip is the whole point of finding M26's deadline: every read returns
+    well inside the per-read socket timeout, so neither that timeout nor the
+    byte ceiling ever cuts the fetch — only the wall-clock deadline does. A
+    client that raises mid-stream closes the socket; the next write then
+    fails and the handler stops rather than printing a traceback into the
+    test output.
+    """
+
+    _chunks = (b"chunk-one-", b"chunk-two-", b"chunk-three-", b"chunk-four")
+
+    def do_GET(self):  # noqa: N802 - BaseHTTPRequestHandler's own naming
+        body = b"".join(self._chunks)
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        for chunk in self._chunks:
+            try:
+                self.wfile.write(chunk)
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                break
+            time.sleep(0.7)
+
+    def log_message(self, *args):
+        return
+
+
+@pytest.fixture()
+def drip_server():
+    """A loopback server that drips one body across a few seconds."""
+    server = HTTPServer(("127.0.0.1", 0), _DripHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield server
+    server.shutdown()
+    server.server_close()
+
+
 def _url(server, path: str) -> str:
     return f"http://127.0.0.1:{server.server_address[1]}{path}"
 
@@ -660,6 +772,57 @@ def test_a_body_over_the_ceiling_is_refused_mid_stream(fresh_db, fixture_server,
 
     with pytest.raises(ingest.IngestError, match="fetch ceiling"):
         ingest.ingest_url(_url(fixture_server, "/big.txt"), principal=owner())
+
+
+def test_a_slow_drip_is_cut_off_at_the_deadline(fresh_db, drip_server, monkeypatch):
+    """Finding M26: the socket timeout bounds one read, not the fetch.
+
+    A server dripping a chunk every 0.7 s stays inside the per-read timeout
+    forever, so only the wall-clock deadline cuts it — and it cuts it before
+    any byte reaches the blob store, like every refusal that needs no bytes.
+    """
+    monkeypatch.setattr(ingest, "FETCH_DEADLINE_SECONDS", 2)
+
+    with pytest.raises(ingest.IngestError, match="deadline"):
+        ingest.ingest_url(_url(drip_server, "/drip.txt"), principal=owner())
+
+    assert assets.list_assets(principal=owner()) == []
+    conn = db.connect(fresh_db)
+    try:
+        assert conn.execute("SELECT count(*) AS n FROM asset_blobs").fetchone()["n"] == 0
+    finally:
+        conn.close()
+
+
+def test_a_fetched_body_no_handler_claims_is_refused_before_storage(fresh_db, fixture_server):
+    """Finding M26: the type policy refuses what the pipeline cannot act on.
+
+    An ``application/octet-stream`` with no sniffable magic and no extension
+    reaches no handler, so the URL is fetchable but not ingestible — refused
+    with a readable reason rather than silently "succeeding" with an empty
+    extraction, and before registration, so the no-bytes rule holds.
+    """
+    fixture_server.canned = (b"\x00\x01\x02\x03", "application/octet-stream")
+
+    with pytest.raises(ingest.IngestError, match="no extraction handler claims"):
+        ingest.ingest_url(_url(fixture_server, "/binary.bin"), principal=owner())
+
+    assert assets.list_assets(principal=owner()) == []
+    conn = db.connect(fresh_db)
+    try:
+        assert conn.execute("SELECT count(*) AS n FROM asset_blobs").fetchone()["n"] == 0
+    finally:
+        conn.close()
+
+
+def test_a_fetched_body_of_a_supported_type_still_ingests(fresh_db, fixture_server):
+    """Finding M26's positive control: the policy admits what the registry claims."""
+    fixture_server.canned = (b"plain body", "text/plain")
+
+    result = ingest.ingest_url(_url(fixture_server, "/note.txt"), principal=owner())
+
+    assert result.created is True
+    assert result.extraction.handler == "text"
 
 
 def test_an_unreachable_host_is_an_ingest_error_not_a_traceback(fresh_db):
