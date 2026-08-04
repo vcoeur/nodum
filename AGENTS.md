@@ -637,10 +637,12 @@ commands on a saved node for exactly this reason.
   Auth is the agent token in `NODUM_AGENT_TOKEN` —
   an `ndm_…` token minted by `nodum agent create` / `token-rotate`, shown
   once and stored hashed — carried in the environment, never a flag (a flag
-  leaks into `ps` and shell history). At startup it is verified against the
-  `agents` table (an unknown or disabled agent is a startup error), the
-  verified agent's principal is loaded with its grant set, and every read
-  and write is confined to those grants. **Three tiers are never registered,
+  leaks into `ps` and shell history). It is verified against the `agents`
+  table once at launch (an unknown or disabled agent is a startup error) and
+  **re-verified on every tool call**: each call re-mints the principal from
+  stored state, so disabling the agent or archiving a space it holds a grant
+  on bites at the next call rather than at the next restart, and every read
+  and write is confined to the then-current grants. **Three tiers are never registered,
   and each one is a named absence**: the review tools
   (`accept`, `reject` — `REVIEW_TOOLS`, the §8.1 "write (human)" tier), the
   curative tools (`merge_nodes`, `retype`, `supersede_edge`, `bulk_relink`,
@@ -2181,12 +2183,21 @@ commands on a saved node for exactly this reason.
   sparse rather than quietly renumbered, and `MAX_PAGE_BLOCKS` (100) stops a
   900-page scan from becoming a 900-item review queue — the overflow is
   reported through `pages_truncated`, never dropped silently.
-  **Nothing irreversible happens before a refusal that needs no bytes**: the
-  target space is resolved *before* `register_asset`, because registration is the
-  irreversible half (there is no delete route) and a grant minted against a space
-  archived inside its five-minute TTL otherwise stored up to 32 MiB with no
-  describing node, no FTS row, and no way to reclaim them — while the client was
-  told the upload failed. `ingest_url` is
+  **Nothing irreversible happens before the refusals that need no bytes — an
+  unresolvable target space, a missing write grant, and an unresolvable
+  describing-node type**: the
+  target space is resolved *and the write grant and the `asset_ref`/`source`
+  types probed* before `register_asset`,
+  because registration is the irreversible half (there is no delete route). A
+  grant minted against a space archived inside its five-minute TTL otherwise
+  stored up to 32 MiB with no describing node, no FTS row, and no way to reclaim
+  them (review F13), and a read-only agent's refused ingest committed the same
+  bytes with the same permanence, because the write grant was only demanded by
+  the node write afterwards (review B6). The probes ask the same questions the
+  write itself asks (`Store.landing_state` and type resolution), so a refusal
+  here is exactly the refusal the node write would have given, moved before any
+  byte is stored.
+  `ingest_url` is
   `http`/`https` only, one bounded read with a timeout, redirects confined to
   the same two schemes (urllib would otherwise follow one to `ftp:`); it does
   **not** block loopback or private ranges, because the server is itself a

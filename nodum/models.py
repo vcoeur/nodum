@@ -853,7 +853,8 @@ class RollbackBlockerOut(BaseModel):
     ``row_id`` is the row the cycle created, named by ``cycle_event_seq`` /
     ``cycle_event_op``. ``dependants`` are the ids in the way — children of a
     node, occupants of a space, nodes typed by a type node, agents granted on a
-    space, merge redirects naming a node — and ``reason`` is the guard's own
+    space, merge redirects naming a node, edges typed by a type node — and
+    ``reason`` is the guard's own
     sentence, which is what the refusal says if the rollback is attempted.
     """
 

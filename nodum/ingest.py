@@ -202,6 +202,7 @@ def ingest_url(
     Raises:
         IngestError: If the scheme is not fetchable, the fetch fails, or the
             body passes :data:`MAX_FETCH_BYTES`.
+        GrantNotPermitted: If the principal may not write the target space.
     """
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme not in FETCHABLE_SCHEMES:
@@ -257,6 +258,8 @@ def ingest_upload(
     Raises:
         UnknownPrincipal: If the row names no account.
         PrincipalDisabled: If that account has since been disabled.
+        GrantNotPermitted: If the account's write grant on the target space has
+            been revoked since the grant was minted.
     """
     principal = auth.principal_from_actor(token_row["created_by"], path=path)
     return ingest_file(
@@ -280,13 +283,26 @@ def _ingest(
     path: str | Path | None,
 ) -> IngestOut:
     """Run the pipeline over a file already on disk (the shared half of both entry points)."""
-    # Resolve the target space **before** any bytes are stored. Registration is
-    # the irreversible half of this function — there is no delete route — so a
-    # refusal that needs nothing but the space reference must happen first: an
-    # upload grant minted against a space archived inside its five-minute TTL
+    # Resolve the target space and probe the write grant **before** any bytes
+    # are stored. Registration is the irreversible half of this function — there
+    # is no delete route — so the two refusals that need no bytes, an
+    # unresolvable target space and a missing write grant, must happen first:
+    # an upload grant minted against a space archived inside its five-minute TTL
     # used to store up to 32 MiB with no describing node, no FTS row, and no way
-    # to reclaim them, while the caller was told the upload failed (review F13).
+    # to reclaim them (review F13), and a read-only agent's refused ingest
+    # committed the same bytes with the same permanence, because the write grant
+    # was only demanded by the node write afterwards (review B6). The grant
+    # probe is the same authority the node write itself uses
+    # (`service.require_write_grant` → `Store.landing_state`), so this refusal
+    # is exactly the one the write would have given, moved before any byte is
+    # stored.
     target_space = service.resolve_space_id(space, principal=principal, path=path)
+    service.require_write_grant(target_space, principal=principal, path=path)
+    # The describing nodes are typed asset_ref/source, which live in meta — a
+    # principal that cannot read meta can never write them, and that refusal
+    # must not wait until after the bytes are stored either.
+    service.require_type_read(ASSET_REF_TYPE, principal=principal, path=path)
+    service.require_type_read(SOURCE_TYPE, principal=principal, path=path)
     asset = assets.register_asset(source_file, name=name, path=path)
 
     existing_ref = service.find_by_asset_hash(

@@ -155,6 +155,34 @@ def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
     return {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
 
 
+def foreign_keys_into(conn: sqlite3.Connection, table: str) -> frozenset[tuple[str, str]]:
+    """The foreign keys other tables hold into ``table``, as ``(child, column)`` pairs.
+
+    ``PRAGMA foreign_key_list`` answers the reverse question — the constraints a
+    *child* table's own DDL declares, naming its parent — so every table in the
+    schema is asked, and the rows that name ``table`` as their parent are kept.
+    This is the enumeration a guard that must name every reference into
+    ``nodes(id)`` walks: the delete-guard completeness test in ``test_rollback``
+    asserts :func:`nodum.service._delete_blocker`'s coverage against it, so a
+    migration that adds a foreign key into ``nodes`` fails that test on the
+    commit that adds it — the honest way to keep a hand-written guard list from
+    rotting.
+
+    Args:
+        conn: The open connection.
+        table: The parent table whose referrers are wanted.
+
+    Returns:
+        One ``(child table, referencing column)`` pair per referencing column.
+    """
+    referrers: set[tuple[str, str]] = set()
+    for child in _tables(conn):
+        for row in conn.execute(f"PRAGMA foreign_key_list({child})").fetchall():
+            if row["table"] == table:
+                referrers.add((child, str(row["from"])))
+    return frozenset(referrers)
+
+
 #: ``--`` to end of line, and ``/* … */`` across lines. Stripped from stored DDL
 #: before anything searches it: SQLite keeps a ``CREATE TABLE`` verbatim,
 #: comments included, and a comment is text that looks like schema and

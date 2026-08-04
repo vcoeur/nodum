@@ -2355,6 +2355,36 @@ def test_an_upload_grant_dies_with_the_account_that_minted_it(client, fresh_db):
     assert service.list_nodes(type="source", principal=owner()) == []
 
 
+def test_a_grant_revoked_before_redemption_stores_no_bytes(client, fresh_db):
+    """Review B6: a write grant revoked between mint and redeem must not leave bytes.
+
+    ``mint_upload`` probes the grant before the transfer, but the gap is the
+    window *after* the mint: a grant revoked there used to store the body
+    anyway, because the refusal arrived from the node write, after
+    ``register_asset`` had committed the bytes. The redemption re-mints the
+    grant's principal and ``ingest_upload`` runs the same pre-registration
+    probe, so the refused PUT answers 403 with ``asset_blobs`` still empty.
+    """
+    payload = b"revoked before redemption"
+    courier = agent("courier", grants={"meta": "read", "main": "suggest"})
+    grant = urls.mint_upload("drop.txt", "text/plain", len(payload), principal=courier).grant
+    # The write grant is gone by redemption time, while the read grant that
+    # keeps the space resolvable stays — the exact case the old code refused
+    # only after storing the bytes.
+    service.grant("courier", "main", "read", principal=owner())
+
+    response = Client(client.app).put(grant.url, guard=False, content=payload)
+
+    assert response.status_code == 403, response.text
+    assert response.json()["error"]["type"] == "GrantNotPermitted"
+    assert assets.list_assets(principal=owner()) == []
+    conn = db.connect(fresh_db)
+    try:
+        assert conn.execute("SELECT count(*) AS n FROM asset_blobs").fetchone()["n"] == 0
+    finally:
+        conn.close()
+
+
 def test_a_grant_for_a_space_archived_since_the_mint_stores_no_bytes(client, fresh_db):
     """Review F13: a doomed upload used to store up to 32 MiB anyway.
 

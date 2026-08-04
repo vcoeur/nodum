@@ -625,6 +625,69 @@ def resolve_space_id(
         conn.close()
 
 
+def require_write_grant(
+    space_id: str, *, principal: Principal, path: str | Path | None = None
+) -> None:
+    """Refuse an ingestion whose describing nodes the principal could never write.
+
+    The ingestion pipeline resolves the target space and then stores the bytes;
+    this probe is what makes the write grant part of that pre-storage
+    resolution. Registration is the irreversible half of ingestion — there is no
+    delete route — so a principal whose grant would refuse the node write must
+    be refused here, before any byte is stored.
+
+    It asks the **same question the write itself asks**: a
+    :class:`~nodum.store.Store` probe of :meth:`Store.landing_state`, the exact
+    call :func:`create_node` makes with the same ``principal``. A probe that
+    disagreed with the write would be worse than none — this one cannot.
+
+    Args:
+        space_id: The resolved target space id.
+        principal: Who would be writing.
+        path: Explicit database path.
+
+    Raises:
+        GrantNotPermitted: If the principal may not write the space.
+    """
+    conn = _connect(path)
+    try:
+        Store(conn, principal).landing_state(space_id)
+    finally:
+        conn.close()
+
+
+def require_type_read(
+    type_ref: str, *, principal: Principal, path: str | Path | None = None
+) -> None:
+    """Refuse an ingestion whose describing nodes' types the principal cannot read.
+
+    The describing nodes an ingestion writes are typed ``asset_ref`` and
+    ``source``, which live in the ``meta`` space — so a principal that can
+    write a space but cannot read ``meta`` would resolve no type at all. That
+    refusal used to surface inside :func:`find_by_asset_hash` and
+    :func:`create_node`, after the bytes were already stored; this probe moves
+    it before :func:`~nodum.assets.register_asset`, next to the write-grant
+    probe, so the two no-bytes refusals of ingestion — a missing write grant
+    and an unresolvable type — both land before anything is irreversible.
+
+    It asks the same question the write asks: :func:`_resolve_node_type` with
+    the same ``principal``, the exact resolution :func:`create_node` performs.
+
+    Args:
+        type_ref: The node-type id or name the pipeline needs to resolve.
+        principal: Who would be writing.
+        path: Explicit database path.
+
+    Raises:
+        TypeNotFound: If the principal cannot resolve the type.
+    """
+    conn = _connect(path)
+    try:
+        _resolve_node_type(conn, type_ref, principal)
+    finally:
+        conn.close()
+
+
 def find_by_asset_hash(
     asset_hash: str,
     *,
@@ -2816,25 +2879,39 @@ def _delete_blocker(
     *,
     doomed_nodes: frozenset[str] = frozenset(),
     doomed_redirects: frozenset[str] = frozenset(),
+    doomed_edges: frozenset[str] = frozenset(),
 ) -> tuple[list[str], str] | None:
     """What stands in the way of deleting a node row, if anything.
 
-    **Every foreign key into ``nodes(id)`` is here**, and that completeness is
-    the point rather than a list that grew: an unguarded one is not a refusal
-    the caller can read but a bare ``sqlite3.IntegrityError`` — a 500 over HTTP
-    and ``database error: FOREIGN KEY constraint failed`` on a CLI whose
-    contract promises to name "an undo the graph has grown past". The graph is
-    never corrupted by one (the transaction rolls back whole); what is lost is
-    the ability to act on the answer.
+    **Every foreign key into ``nodes(id)`` that is neither cascading nor removed
+    by the deletion itself is here**, and that completeness is the point rather
+    than a list that grew: an unguarded one is not a refusal the caller can read
+    but a bare ``sqlite3.IntegrityError`` — a 500 over HTTP and ``database
+    error: FOREIGN KEY constraint failed`` on a CLI whose contract promises to
+    name "an undo the graph has grown past". The graph is never corrupted by
+    one (the transaction rolls back whole); what is lost is the ability to act
+    on the answer.
 
-    The five, in the order a caller most likely meets them: ``nodes.parent_id``
+    Completeness is pinned to the schema rather than to this paragraph:
+    ``test_rollback`` walks ``PRAGMA foreign_key_list`` through
+    :func:`nodum.db.foreign_keys_into` and asserts every non-cascading foreign
+    key into ``nodes(id)`` is owned by a guard here or a delete in
+    :func:`_delete_created_row` — so a migration that adds a reference fails
+    that test on the commit that adds it, not on an install a human runs.
+
+    The six, in the order a caller most likely meets them: ``nodes.parent_id``
     (children), ``nodes.space_id`` (a space's occupants), ``merge_redirects``
-    (a node merged away, or merged into), ``grants.space_id`` (agents granted on
-    a space) and ``nodes.type_id`` (nodes typed by a type node). The sixth
-    foreign key into ``nodes(id)`` — ``annotations.target_node_id`` (migration
-    0016) — is deliberately not here: it cascades, because an annotation is
-    derived judgement and can never be the reason a node's undo is refused
-    (which is what its ``cycle_id`` already implies).
+    (a node merged away, or merged into), ``grants.space_id`` (agents granted
+    on a space), ``nodes.type_id`` (nodes typed by a type node) and
+    ``edges.type_id`` (edges typed by a type node). The foreign keys into
+    ``nodes(id)`` this guard deliberately does not answer for are the cascade
+    and the deletion's own housekeeping: ``annotations.target_node_id``
+    (migration 0016) cascades, because an annotation is derived judgement and
+    can never be the reason a node's undo is refused (which is what its
+    ``cycle_id`` already implies), and ``edges.src_id``/``dst_id`` with
+    ``versions.node_id`` are deleted by :func:`_delete_created_row` itself
+    before the node goes — a guard over them would refuse a delete that in
+    fact succeeds.
 
     Args:
         conn: The open connection.
@@ -2846,6 +2923,11 @@ def _delete_blocker(
             :func:`undo`, which reverses exactly one event.
         doomed_redirects: Tombstone ids whose ``merge_redirects`` rows the same
             reversal removes, for the same reason.
+        doomed_edges: Edge ids the same reversal removes — every edge incident
+            to a node it deletes, and every edge its own create-reversal takes
+            out. The ``edges.type_id`` check needs them most: a cycle that
+            creates a type node and an edge wearing it reverses the edge first,
+            so the preflight has to know the edge is already gone.
 
     Returns:
         ``(dependant ids, the refusal's sentence)``, or ``None`` if the row can
@@ -2923,6 +3005,21 @@ def _delete_blocker(
             f"type {node_id} still types {len(typed)} node(s) ({_named_rows(typed)}) — "
             "take those back first: undo their creation, or roll back the cycle that made them"
         )
+    typed_edges = surviving(
+        conn.execute("SELECT id FROM edges WHERE type_id = ?", (node_id,)).fetchall(),
+        "id",
+        doomed_edges,
+    )
+    if typed_edges:
+        # `edges.type_id` references `nodes(id)` since migration 0009 — an
+        # edge's type is a node — so a type node that has since been used to
+        # type any edge is held down by every edge wearing it, exactly as a
+        # node type is by the nodes wearing it.
+        return typed_edges, (
+            f"type {node_id} still types {len(typed_edges)} edge(s) "
+            f"({_named_rows(typed_edges)}) — take those back first: undo their "
+            "creation, or roll back the cycle that made them"
+        )
     return None
 
 
@@ -2950,21 +3047,30 @@ def _delete_created_row(
     Raises:
         UndoNotPossible: If the graph has grown something onto the row that the
             reversal was never asked to touch — every foreign key into
-            ``nodes(id)``, checked by :func:`_delete_blocker`, which
-            :func:`_rollback_plan` also reads so that the preflight and the run
-            agree about what will happen.
+            ``nodes(id)`` that the deletion does not remove itself, checked by
+            :func:`_delete_blocker` (the incident edges and versions below are
+            the ones it does remove, so the guard is told about them and skips
+            them), which :func:`_rollback_plan` also reads so that the preflight
+            and the run agree about what will happen.
     """
     deleted: list[dict[str, Any]] = []
     if kind == "node":
-        # No `doomed_*`: this is the apply path, and a rollback deletes
-        # newest-first, so anything it will remove is already gone by now.
-        blocker = _delete_blocker(conn, row["id"])
-        if blocker is not None:
-            raise UndoNotPossible(f"{context}: {blocker[1]}")
-        for edge in conn.execute(
+        # No `doomed_nodes` or `doomed_redirects`: this is the apply path, and a
+        # rollback deletes newest-first, so anything it will remove is already
+        # gone by now. The incident edges are the one set that still stands —
+        # they go below, and the `edges.type_id` guard must not count what the
+        # delete itself removes, or it would refuse a deletion that in fact
+        # succeeds.
+        incident = conn.execute(
             "SELECT * FROM edges WHERE src_id = ? OR dst_id = ?",
             (row["id"], row["id"]),
-        ).fetchall():
+        ).fetchall()
+        blocker = _delete_blocker(
+            conn, row["id"], doomed_edges=frozenset(str(edge["id"]) for edge in incident)
+        )
+        if blocker is not None:
+            raise UndoNotPossible(f"{context}: {blocker[1]}")
+        for edge in incident:
             deleted.append({"table": "edges", "row": _row_dict(edge)})
             conn.execute("DELETE FROM edges WHERE id = ?", (edge["id"],))
         for version in conn.execute(
@@ -4388,10 +4494,10 @@ def disable_agent(agent_id: str, *, principal: Principal, path: str | Path | Non
     """Disable an agent: its token stops verifying; its proposals stay, flagged.
 
     Revocation is verification-time, so *when* it bites depends on the
-    surface (Q13 review S8): HTTP re-checks every request, but an MCP server
-    verifies its token once at launch and holds the principal for the life of
-    the process — a running ``nodum mcp serve`` keeps working until it exits.
-    Kill the process to be sure.
+    surface (Q13 review S8): HTTP re-checks every request, and the MCP server
+    re-verifies its token on every tool call — a running ``nodum mcp serve``
+    refuses its next call after the disable, on every surface. There is no
+    longer anything that outlives the disable to kill.
     """
     conn = _connect(path)
     try:
@@ -6691,7 +6797,9 @@ def _rollback_blockers(
     log. Rows the reversal removes on its way are excluded: the pass goes newest
     first, so anything the cycle created *after* the row in question is already
     gone, as is any ``merge_redirects`` row the reversal of a merge takes with
-    it.
+    it — and, since ``edges.type_id`` became a guard, any edge the reversal
+    deletes: one the cycle created (reversed before the type node's create) or
+    one incident to a node it deletes (taken with it).
     """
     payloads = [(event, json.loads(event["payload"])) for event in events]
     created = [
@@ -6709,10 +6817,35 @@ def _rollback_blockers(
             event["op"].split(".", 1)[0], payload.get("before"), payload.get("after")
         )
     )
+    # Edges the reversal removes, for the `edges.type_id` guard's benefit: the
+    # ones the cycle created (their own create-reversal takes them out, newest
+    # first) and the ones incident to a node it deletes (taken with it by
+    # `_delete_created_row`). Both are gone before any doomed node's create is
+    # reversed, so counting either would refuse a rollback that in fact works.
+    doomed_edges = frozenset(
+        payload["after"]["id"]
+        for event, payload in payloads
+        if event["op"].startswith("edge.")
+        and payload.get("before") is None
+        and payload.get("after") is not None
+    )
+    if doomed_nodes:
+        marks = ", ".join("?" for _ in doomed_nodes)
+        doomed_edges |= frozenset(
+            str(row["id"])
+            for row in conn.execute(
+                f"SELECT id FROM edges WHERE src_id IN ({marks}) OR dst_id IN ({marks})",
+                (*doomed_nodes, *doomed_nodes),
+            ).fetchall()
+        )
     blockers: list[RollbackBlockerOut] = []
     for event, after in created:
         blocker = _delete_blocker(
-            conn, after["id"], doomed_nodes=doomed_nodes, doomed_redirects=doomed_redirects
+            conn,
+            after["id"],
+            doomed_nodes=doomed_nodes,
+            doomed_redirects=doomed_redirects,
+            doomed_edges=doomed_edges,
         )
         if blocker is not None:
             dependants, reason = blocker

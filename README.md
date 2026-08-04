@@ -405,7 +405,8 @@ cycle quietly drop the vector signal until you re-run the download.
 - **MCP server.** `nodum mcp serve` runs a stdio MCP server (the official
   Python SDK's FastMCP). The agent authenticates with its token in
   `NODUM_AGENT_TOKEN` (minted by `nodum agent create`, shown once, stored
-  hashed) and is verified at startup; every write is confined to its grants.
+  hashed) and is verified at launch and re-verified on every tool call; every
+  write is confined to its then-current grants.
   The registry is the design §8.1 read tier (`get_node`, `get_children`,
   `search`, `traverse`, `list_types`, `get_schema`, `find_path`, `history`,
   `diff`, `get_asset`, `get_download_url`) and additive tier (`create_node`,
@@ -503,10 +504,11 @@ cycle quietly drop the vector signal until you re-run the download.
   says exactly what each one checks: the text test is a window at each end of the
   file, and the displaced-PDF scan admits any non-text bytes carrying a versioned
   `%PDF-` header in the head window — so a zip whose first entry is a PDF gets
-  in, and gets an honest "no text came out" for its trouble. There is
+  in, and gets an honest "no text came out" for its trouble.   There is
   no delete route, so what lands stays until it is managed out of band — which is
   why an upload that will be refused for a reason needing no bytes (an
-  unresolvable target space) is refused before anything is stored.
+  unresolvable target space, or a write grant the ingesting principal does not
+  hold) is refused before anything is stored.
 - **Ingesting over HTTP.** `POST /api/ingest` takes exactly one of `path` and
   `url` (both or neither is a 400 rather than a precedence rule nobody
   remembers). Note what it hands the session's human: `path` is read *by the

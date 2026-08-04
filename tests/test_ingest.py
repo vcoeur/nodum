@@ -403,6 +403,14 @@ def test_an_agent_with_suggest_ingests_into_the_review_queue(fresh_db, tmp_path)
 
 
 def test_an_agent_without_a_write_grant_on_the_space_is_refused(fresh_db, tmp_path):
+    """Review B6: the grant refusal lands before registration, not after.
+
+    A read-only agent passes the space *resolution* (it can read the space), so
+    the refusal has to come from the write grant — and it used to come from
+    ``service.create_node``, *after* ``register_asset`` had committed the bytes
+    to ``asset_blobs`` with no delete route to reclaim them. "Refused" has to
+    mean no bytes either, not merely a 403 after the store.
+    """
     source = tmp_path / "note.txt"
     source.write_text("secret", encoding="utf-8")
     # `meta: read` is needed to resolve the type vocabulary at all; the point
@@ -411,6 +419,79 @@ def test_an_agent_without_a_write_grant_on_the_space_is_refused(fresh_db, tmp_pa
 
     with pytest.raises(service.GrantNotPermitted):
         ingest.ingest_file(source, principal=reader)
+
+    assert assets.list_assets(principal=owner()) == []
+    conn = db.connect(fresh_db)
+    try:
+        assert conn.execute("SELECT count(*) AS n FROM asset_blobs").fetchone()["n"] == 0
+    finally:
+        conn.close()
+
+
+def test_an_agent_without_meta_read_is_refused_before_the_bytes_are_stored(fresh_db, tmp_path):
+    """The write grant is not the only no-bytes refusal: the types must resolve.
+
+    A principal with ``edit`` on a content space but no ``meta`` read can pass
+    the space resolution and the write grant — and then fail to resolve the
+    ``asset_ref``/``source`` types, which live in ``meta``. That refusal used
+    to surface inside the node write, after ``register_asset`` had committed
+    the bytes; the type probe moves it before registration, so this edge stores
+    nothing either.
+    """
+    source = tmp_path / "note.txt"
+    source.write_text("secret", encoding="utf-8")
+    writer = agent("writer", grants={"main": "edit"})
+
+    with pytest.raises(service.TypeNotFound):
+        ingest.ingest_file(source, principal=writer)
+
+    assert assets.list_assets(principal=owner()) == []
+    conn = db.connect(fresh_db)
+    try:
+        assert conn.execute("SELECT count(*) AS n FROM asset_blobs").fetchone()["n"] == 0
+    finally:
+        conn.close()
+
+
+def test_a_suggest_grant_on_the_target_space_still_ingests_and_lands_proposed(fresh_db, tmp_path):
+    """The probe's positive control: a write grant on the target passes it.
+
+    ``read`` elsewhere and ``suggest`` on the target is the smallest grant that
+    should ingest — the probe must refuse only the genuinely write-less, not
+    anyone whose grants are mostly read.
+    """
+    seed_space("research")
+    source = tmp_path / "note.txt"
+    source.write_text("proposal", encoding="utf-8")
+    writer = agent("writer", grants={"meta": "read", "research": "suggest"})
+
+    result = ingest.ingest_file(source, space="research", principal=writer)
+
+    assert result.created is True
+    assert result.asset_ref.state == "proposed"
+    assert result.source.state == "proposed"
+    assert result.edges[0].state == "proposed"
+
+
+def test_a_read_only_agents_refused_url_ingest_stores_no_bytes(fresh_db, fixture_server):
+    """Review B6, on the URL path: refusal before registration holds there too.
+
+    ``ingest_url`` flows through the same ``_ingest``, so the write grant is
+    probed before ``register_asset`` here as well — the fetch's spooled body is
+    transient /tmp, and nothing reaches ``asset_blobs``.
+    """
+    fixture_server.canned = (b"secret", "text/plain")
+    reader = agent("reader", grants={"meta": "read", "main": "read"})
+
+    with pytest.raises(service.GrantNotPermitted):
+        ingest.ingest_url(_url(fixture_server, "/note.txt"), principal=reader)
+
+    assert assets.list_assets(principal=owner()) == []
+    conn = db.connect(fresh_db)
+    try:
+        assert conn.execute("SELECT count(*) AS n FROM asset_blobs").fetchone()["n"] == 0
+    finally:
+        conn.close()
 
 
 def test_an_asset_is_invisible_to_an_agent_that_cannot_reach_its_describing_node(
