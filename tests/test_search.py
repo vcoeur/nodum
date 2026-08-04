@@ -10,7 +10,7 @@ import httpx
 import pytest
 from helpers import OWNER_ACTOR, agent, owner
 
-from nodum import db, http_api, projectors, search, service
+from nodum import db, embeddings, http_api, projectors, search, service
 
 
 def test_search_returns_ranked_hits_with_snippet_and_signals(fresh_db):
@@ -234,6 +234,41 @@ def test_date_filters_apply_to_the_vector_signal_too(fresh_db, fake_embedder):
         created_before="2000-01-01 00:00:00",
         principal=owner(),
     )
+
+
+def test_chunks_from_a_different_model_are_invisible_to_the_vector_signal(fresh_db, fake_embedder):
+    """Finding M13: the KNN join filters on the active provider's `model_id`.
+
+    A chunk a different embedding model wrote lives in another vector space —
+    ranking it against this query would compare across spaces. The store has
+    carried `model_id` per chunk since migration 0006; this pins the read that
+    makes it matter: the same-model node keeps its `vector` signal, the
+    foreign-model node is returned by `bm25` alone.
+    """
+    provider = embeddings.get_provider()
+    same = service.create_node(
+        type="note", title="Same", content="xylem vessels", principal=owner()
+    )
+    other = service.create_node(
+        type="note", title="Other", content="xylem vessels", principal=owner()
+    )
+    projectors.run_projectors(names=["vec"])
+
+    conn = db.connect(fresh_db)
+    try:
+        conn.execute(
+            "UPDATE chunks SET model_id = ? WHERE node_id = ?",
+            (f"{provider.model_id}-other", other.id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    result = search.search("xylem", k=5, principal=owner())
+    by_id = {hit.node_id: hit for hit in result.hits}
+    assert "vector" in by_id[same.id].signals  # same-model chunk is retrieved
+    assert "vector" not in by_id[other.id].signals  # foreign-model chunk is not
+    assert by_id[same.id].score > by_id[other.id].score
 
 
 def test_k_limits_hits(fresh_db):

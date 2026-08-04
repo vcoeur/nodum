@@ -115,10 +115,21 @@ from pathlib import Path
 
 from PIL import Image, ImageOps
 
-from nodum import db
+from nodum import db, service
 from nodum.models import AssetOut, PurgeResult, RenditionOut
 from nodum.principal import Principal
 from nodum.store import Store
+
+#: The actor recorded on the ``asset.extract`` event
+#: (:func:`set_extracted_text` writes one on every store or clear).
+#:
+#: Extraction has no principal: the step is a deterministic pipeline write on
+#: content-addressed base state, decided by bytes, not by an account, and the
+#: same "system" attribution the schema seeds use for the nodes and spaces it
+#: creates. An honest actor has to name the system, not a human who did not
+#: run the extractor — the principal who *triggered* an ingest is already on
+#: the run's own ``asset.ingest`` event.
+EXTRACT_ACTOR = "system"
 
 #: MIME type every rendition is encoded as (design §5.7).
 RENDITION_MIME = "image/webp"
@@ -831,8 +842,11 @@ def _repaired_mime(conn: sqlite3.Connection, row: sqlite3.Row, source_file: Path
 
     An ``UPDATE`` is how this table is already maintained: ``assets`` is
     content-addressed base state rather than graph state, so it carries no
-    principal and no event (:func:`set_extracted_text` is the precedent, and
-    migration 0007's comment the reason) — the same bytes always resolve to the
+    principal — there is nobody to authorise against, access being decided one
+    level up by the describing nodes — and this repair in particular writes no
+    event: unlike :func:`set_extracted_text`, whose ``asset.extract`` event the
+    ``fts`` projector consumes, nothing derived reads the stored MIME, so a log
+    entry would say the same thing twice. The same bytes always resolve to the
     same row, so there is nothing to undo.
 
     Returns:
@@ -980,16 +994,21 @@ def set_extracted_text(
 ) -> None:
     """Store (or clear) the text an extraction handler pulled out of an asset.
 
-    Takes no principal and writes no event, for the same reason registration
-    does neither (migration ``0007``'s comment): an asset row is
-    content-addressed base state, not graph state. There is nothing to undo —
-    the same bytes always resolve to the same row, and re-extracting them lands
-    the same text — and there is nobody to authorise against here, because
-    access to an asset is decided one level up, by the ``asset_ref`` nodes that
-    describe the hash (see the module docstring's access note). The ingestion
-    pipeline that calls this emits the single ``asset.ingest`` event covering
-    the whole run, of which the extraction is one step; a second event would
-    only say the same thing again, with bytes-derived text in its payload.
+    Takes no principal, and the write itself is content-addressed base state,
+    not graph state — there is nothing to undo, and nobody to authorise
+    against, because access to an asset is decided one level up by the
+    ``asset_ref`` nodes that describe the hash (see the module docstring's
+    access note). But the write **is event-logged** (``asset.extract``, actor
+    :data:`EXTRACT_ACTOR`): the ``fts`` projector consumes the event, so text
+    stored *after* the describing node was already projected still reaches the
+    index, and a rebuild from event 0 replays the extraction instead of
+    depending on the live table alone (finding M14).
+
+    The payload is metadata only — ``asset_hash`` plus a character count,
+    never the text itself: bytes-derived text in an event payload is what the
+    asset store's docstring and the ``asset.ingest`` rule both avoid, and the
+    projector re-reads the stored text through its live join when it replays
+    the event.
 
     Args:
         asset_hash: The asset's sha256.
@@ -1006,7 +1025,16 @@ def set_extracted_text(
             "UPDATE assets SET extracted_text = ? WHERE hash = ?", (text, asset_hash)
         )
         if cursor.rowcount == 0:
+            conn.rollback()
             raise AssetNotFound(f"asset not found: {asset_hash}")
+        # The UPDATE and its event share one transaction: a text that landed
+        # with no log entry would be exactly the gap a rebuild cannot see.
+        service.record_asset_event(
+            "asset.extract",
+            {"asset_hash": asset_hash, "chars": len(text) if text else 0},
+            actor=EXTRACT_ACTOR,
+            conn=conn,
+        )
         conn.commit()
     finally:
         conn.close()

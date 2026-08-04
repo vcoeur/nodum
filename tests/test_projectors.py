@@ -291,18 +291,21 @@ def test_extracted_text_is_dropped_when_the_asset_text_is_cleared(fresh_db, tmp_
     projectors.run_projectors()
     assert _fts_extracted(fresh_db)[node.id] == "quokka"
 
-    assets.set_extracted_text(asset.hash, None)
+    assets.set_extracted_text(asset.hash, None)  # clears, and logs asset.extract
+    projectors.run_projectors()  # the event re-projects the node
+    assert _fts_extracted(fresh_db)[node.id] == ""
+
     projectors.rebuild_projector("fts")
     assert _fts_extracted(fresh_db)[node.id] == ""
 
 
-def test_text_stored_after_a_node_is_projected_waits_for_the_next_projection(fresh_db, tmp_path):
-    """The honest limitation: `assets` is not event-logged, so the join is a
-    live read taken *at projection time*.
+def test_text_stored_after_a_node_is_projected_is_indexed_by_the_extract_event(fresh_db, tmp_path):
+    """Finding M14: `set_extracted_text` logs `asset.extract`, so the `fts`
+    projector re-projects the describing node — no rebuild needed.
 
-    Storing the text after a node has been projected leaves the index stale
-    until that node is projected again or `fts` is rebuilt — which is exactly
-    why the ingestion pipeline stores the text before it creates the node.
+    This is what makes a rebuild from event 0 equal to an incremental replay:
+    the log itself records that the extraction happened, so a replay from
+    event 0 folds the same text in at the same point.
     """
     asset = _register_bytes(tmp_path, "paper.pdf")
     node = service.create_node(
@@ -312,10 +315,32 @@ def test_text_stored_after_a_node_is_projected_waits_for_the_next_projection(fre
     assert _fts_extracted(fresh_db)[node.id] == ""
 
     assets.set_extracted_text(asset.hash, "quokka")
-    projectors.run_projectors()  # no new events, so nothing is re-projected
-    assert _fts_extracted(fresh_db)[node.id] == ""
+    projectors.run_projectors()  # the asset.extract event re-projects the node
+    assert _fts_extracted(fresh_db)[node.id] == "quokka"
 
+    # A rebuild replays the same chain to the same index.
     projectors.rebuild_projector("fts")
+    assert _fts_extracted(fresh_db)[node.id] == "quokka"
+
+
+def test_an_extract_event_before_the_describing_node_does_not_wedge_the_projector(
+    fresh_db, tmp_path
+):
+    """The pipeline stores text before it creates the `asset_ref` node (M14).
+
+    At replay the event finds no node for the hash and is a skip; the node's
+    own create then does the live join and picks the text up in the same run.
+    """
+    asset = _register_bytes(tmp_path, "paper.pdf")
+    assets.set_extracted_text(asset.hash, "quokka")  # event written; no node yet
+    run = _runs()["fts"]
+    assert run.applied == 1  # the asset.extract event alone
+    assert _fts_extracted(fresh_db) == {}
+
+    node = service.create_node(
+        type="asset_ref", props={"asset_hash": asset.hash}, principal=owner()
+    )
+    projectors.run_projectors()
     assert _fts_extracted(fresh_db)[node.id] == "quokka"
 
 

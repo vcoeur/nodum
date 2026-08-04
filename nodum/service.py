@@ -3610,13 +3610,15 @@ def list_events(
 # ── Asset-pipeline events (design §5.5–§5.7): one named door into the log ─────
 
 #: The only ops :func:`record_asset_event` will write — an **allowlist**, not a
-#: ``asset.*`` prefix test. Ingestion (:mod:`nodum.ingest`) and the capability
-#: URLs (:mod:`nodum.urls`) live outside this module and need to append to the
-#: append-only log; a helper that took any dotted string would hand them the
-#: ability to forge a ``node.create`` or an ``undo``, which is a far larger
-#: door than either of them asked for.
+#: ``asset.*`` prefix test. Ingestion (:mod:`nodum.ingest`), the extraction
+#: write (:mod:`nodum.assets`) and the capability URLs (:mod:`nodum.urls`) live
+#: outside this module and need to append to the append-only log; a helper that
+#: took any dotted string would hand them the ability to forge a
+#: ``node.create`` or an ``undo``, which is a far larger door than either of
+#: them asked for.
 ASSET_EVENT_OPS = (
     "asset.ingest",
+    "asset.extract",
     "asset.download_url",
     "asset.upload_url",
     "asset.upload",
@@ -3652,13 +3654,16 @@ def record_asset_event(
     rebuild reads end to end) and never a live credential.
 
     **``actor`` is not a second identity channel.** Every caller that *has* a
-    principal must pass it; the string form exists for exactly one case, the
-    redemption of a capability URL, where there is no live principal **by
-    design** — a capability carries no ambient credential — and the only
-    truthful actor is the ``created_by`` already stored on the token row. It
-    is read from the database, never from a request, and no adapter may reach
-    this argument (the HTTP surface's ``_write`` refuses a caller-supplied
-    identity before anything gets here).
+    principal must pass it; the string form exists for exactly two cases,
+    neither with a live principal **by design**. One is the redemption of a
+    capability URL, where a capability carries no ambient credential and the
+    only truthful actor is the ``created_by`` already stored on the token row —
+    read from the database, never from a request, and no adapter may reach this
+    argument (the HTTP surface's ``_write`` refuses a caller-supplied identity
+    before anything gets here). The other is the extraction step
+    (:func:`nodum.assets.set_extracted_text` writing ``asset.extract``), which
+    takes no principal and is attributed to the system itself
+    (:data:`nodum.assets.EXTRACT_ACTOR`).
 
     **``conn`` keeps a spend and its audit entry in one transaction.** A
     single-use token whose redemption committed while its log entry did not
@@ -3670,8 +3675,10 @@ def record_asset_event(
         op: The event op; must be one of :data:`ASSET_EVENT_OPS`.
         payload: JSON-serialisable metadata describing what happened.
         principal: Who performed it. Required unless ``actor`` is given.
-        actor: Actor string read from stored state, for the credential-free
-            redemption path only. Mutually exclusive with ``principal``.
+        actor: Actor string for a caller with no principal: the capability
+            redemption path (read from stored state, never from a request) or
+            the principal-less extraction write (see :data:`nodum.assets.EXTRACT_ACTOR`).
+            Mutually exclusive with ``principal``.
         conn: An open connection to write within; the caller then commits.
             Defaults to a short-lived connection this function commits itself.
         path: Explicit database path; defaults to ``NODUM_DB`` resolution.

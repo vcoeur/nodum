@@ -208,8 +208,10 @@ VECTORS_DDL = """
 -- (sqlite-vec) holds each chunk's embedding, keyed by the chunk's rowid —
 -- which is why `chunks.id` is an integer rowid rather than the design's TEXT
 -- id (vec0 keys on integer rowids). `model_id` records the producing
--- embedding model per chunk, so mixed-model states are detectable and a
--- model change is a `projector rebuild vec`. The vec0 dimension must match
+-- embedding model per chunk, so search filters the KNN join to the active
+-- provider's model — mixed-model chunks are excluded from results, and a
+-- model change needs a `projector rebuild vec` to be effective (finding
+-- M13). The vec0 dimension must match
 -- nodum.embeddings.EMBEDDING_DIMS (the default model's size); a dimension
 -- change needs a new migration. `chunks.node_id` deliberately carries no FK:
 -- the projector replays the event log (not the live tables), and the log

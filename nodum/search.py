@@ -714,6 +714,7 @@ def _search_vector(
     conn: sqlite3.Connection,
     query_vector: list[float],
     *,
+    model_id: str,
     k: int,
     state: NodeState | None,
     type_id: str | None,
@@ -736,11 +737,19 @@ def _search_vector(
     query whose content words the graph has never seen is answered ``k`` deep
     by this function, vector-signal-only, while the keyword arm returns
     nothing. See the module docstring for why a floor is not simply added.
+
+    **Only the active provider's chunks enter the join** (finding M13):
+    ``model_id`` is the id of the provider that embedded ``query_vector`` —
+    the caller passes it so the filter and the query can never disagree — and
+    a chunk some *other* model wrote lives in a different vector space, where
+    a cosine against this query means nothing. Mixed-model chunks are simply
+    invisible to search; making them searchable again is a
+    ``projector rebuild vec``, which is the model-change path (design D6).
     """
     filters, params = _node_filters(
         state, type_id, created_by, created_after, created_before, include_meta, space_id, principal
     )
-    clauses = filters or ["1=1"]
+    clauses = ["c.model_id = ?", *(filters or ["1=1"])]
     rows = conn.execute(
         f"""
         SELECT n.id, n.space_id, n.type_id, n.title, c.text AS chunk_text,
@@ -760,6 +769,7 @@ def _search_vector(
         (
             sqlite_vec.serialize_float32(query_vector),
             max(k * 4, _VECTOR_CANDIDATES),
+            model_id,
             *params,
             k,
         ),
@@ -1000,6 +1010,9 @@ def search(
             vector_rows = _search_vector(
                 conn,
                 query_vector,
+                # The filter is the same model that produced the query vector:
+                # the two can never disagree, because there is only one `provider`.
+                model_id=provider.model_id,
                 k=k,
                 state=state,
                 type_id=type_id,

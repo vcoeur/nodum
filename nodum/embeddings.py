@@ -8,9 +8,12 @@ API key), served from nodum's own model cache — see the cache rule below.
 
 Design D6: node text is embedded in fixed-window chunks (512 tokens, ~15%
 overlap — approximated as whitespace-separated words, see :func:`chunk_text`),
-every chunk records the producing ``model_id``, and a model change is a full
-``projector rebuild vec`` (the projector is derived state, so replaying the
-event log re-embeds everything with the new model).
+every chunk records the producing ``model_id``, and search reads only the
+chunks carrying the *active* provider's id (finding M13: a different model's
+chunks live in a different vector space, so they are excluded from the KNN
+join). A model change is therefore a full ``projector rebuild vec`` — the
+projector is derived state, so replaying the event log re-embeds everything
+with the new model.
 
 **The model cache is nodum's, and it lives beside the database.**
 :data:`DEFAULT_CACHE_PATH` is ``~/.local/share/nodum/models``, overridable with

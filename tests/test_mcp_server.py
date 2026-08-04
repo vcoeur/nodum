@@ -1128,6 +1128,8 @@ def test_an_agent_cannot_reach_bytes_described_only_in_a_space_it_cannot_read(fr
 
     assert fetched.isError and "asset not found" in fetched.content[0].text
     assert minted.isError and "asset not found" in minted.content[0].text
-    # Refused means refused: no capability was written either.
+    # Refused means refused: no capability was written either. (The two asset
+    # events are the ingest covering the run and the extraction it recorded —
+    # finding M14 — both newest-first.)
     logged = [event.op for event in service.list_events(owner()) if event.op.startswith("asset.")]
-    assert logged == ["asset.ingest"]
+    assert logged == ["asset.ingest", "asset.extract"]

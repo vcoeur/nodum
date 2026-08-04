@@ -516,7 +516,11 @@ def test_an_asset_is_invisible_to_an_agent_that_cannot_reach_its_describing_node
 # ── The event ────────────────────────────────────────────────────────────────
 
 
-def test_one_ingestion_writes_one_event_and_no_bytes(fresh_db, tmp_path):
+def test_ingestion_logs_an_extract_event_and_one_ingest_event_and_no_bytes(fresh_db, tmp_path):
+    """The pipeline's two asset events (finding M14): `asset.extract` for the
+    text write, then the single `asset.ingest` covering the run. The extract
+    event is what makes the `fts` projector re-index describing nodes, and
+    neither payload carries the text or the bytes."""
     source = tmp_path / "note.txt"
     source.write_text("hydrology", encoding="utf-8")
 
@@ -524,17 +528,46 @@ def test_one_ingestion_writes_one_event_and_no_bytes(fresh_db, tmp_path):
 
     conn = db.connect()
     try:
-        rows = conn.execute("SELECT * FROM events WHERE op = 'asset.ingest'").fetchall()
+        rows = conn.execute(
+            "SELECT * FROM events WHERE op IN ('asset.ingest', 'asset.extract') ORDER BY seq"
+        ).fetchall()
     finally:
         conn.close()
-    assert len(rows) == 1
-    payload = json.loads(rows[0]["payload"])
-    assert payload["asset_hash"] == result.asset.hash
-    assert payload["source_id"] == result.source.id
-    assert payload["handler"] == "text"
-    # The rule the asset store has carried since 0007.
-    assert "data" not in payload and "bytes" not in payload
-    assert len(rows[0]["payload"]) < 4096
+    assert [row["op"] for row in rows] == ["asset.extract", "asset.ingest"]
+    # The extraction is a principal-less pipeline step: attributed to the system.
+    assert rows[0]["actor"] == assets.EXTRACT_ACTOR
+    extract_payload = json.loads(rows[0]["payload"])
+    assert extract_payload == {"asset_hash": result.asset.hash, "chars": len("hydrology")}
+    ingest_payload = json.loads(rows[1]["payload"])
+    assert ingest_payload["asset_hash"] == result.asset.hash
+    assert ingest_payload["source_id"] == result.source.id
+    assert ingest_payload["handler"] == "text"
+    # The rule the asset store has carried since 0007 — and the text itself.
+    for row in rows:
+        parsed = json.loads(row["payload"])
+        assert "data" not in parsed and "bytes" not in parsed
+        assert "hydrology" not in row["payload"]
+        assert len(row["payload"]) < 4096
+
+
+def test_an_extraction_indexed_incrementally_survives_a_rebuild(fresh_db, tmp_path):
+    """Finding M14, end to end: the `asset.extract` event makes a rebuild from
+    event 0 identical to the incremental replay for the FTS index.
+
+    The pipeline stores the text *before* the describing node exists, so at
+    replay the extract event is a no-op and the node's own create does the
+    join — and the same chain replays identically after a rebuild.
+    """
+    source = tmp_path / "note.txt"
+    source.write_text("hydrology of the quokka valley", encoding="utf-8")
+    result = ingest.ingest_file(source, principal=owner())
+
+    incremental = {hit.node_id for hit in search.search("quokka", principal=owner()).hits}
+    assert result.asset_ref.id in incremental  # through the extracted-text join
+
+    projectors.rebuild_projector("fts")
+    rebuilt = {hit.node_id for hit in search.search("quokka", principal=owner()).hits}
+    assert rebuilt == incremental
 
 
 def test_an_ingest_event_cannot_be_undone(fresh_db, tmp_path):
