@@ -1522,8 +1522,9 @@ def test_a_successful_login_writes_a_human_login_event(fresh_db):
 def test_a_refused_login_writes_a_human_login_failed_event(fresh_db):
     """Wrong credentials stay an indistinguishable 401 and land on the log.
 
-    The event's actor is the *attempted* name: a failed login has no verified
-    principal, and the payload carries no password material.
+    The attempted name is in the *payload*; the actor is
+    ``UNAUTHENTICATED_ACTOR``, because a failed login has no verified
+    principal. The payload carries no password material.
     """
     service.set_human_password("owner", OWNER_PASSWORD, principal=owner())
     anonymous = Client(http_api.create_app())
@@ -1532,16 +1533,72 @@ def test_a_refused_login_writes_a_human_login_failed_event(fresh_db):
 
     assert response.status_code == 401
     (failed,) = _events("human.login_failed")
-    assert failed.actor == "owner"
+    assert failed.actor == service.UNAUTHENTICATED_ACTOR
     assert failed.payload == {"name": "owner", "reason": "invalid credentials"}
+
+
+def test_an_unauthenticated_caller_cannot_choose_the_actor_a_failed_login_is_logged_under(
+    fresh_db,
+):
+    """`events.actor` is never a string off the wire (finding M2).
+
+    Login is the one `/api` route outside the session gate, and the attempted
+    name used to become the event's actor verbatim — so `{"name":
+    "human:owner"}` wrote rows attributed to the seeded owner, with no
+    credential presented, into the column that answers *who did this*. The
+    name is data about the attempt and lives in the payload; the actor is an
+    identity, and on a failure the only truthful one is nobody.
+    """
+    anonymous = Client(http_api.create_app())
+
+    for claimed in ("human:owner", "agent:builtin-gardener", "scheduler"):
+        assert (
+            anonymous.post("/api/login", json={"name": claimed, "password": "x"}).status_code == 401
+        )
+
+    actors = {event.actor for event in _events("human.login_failed")}
+    assert actors == {service.UNAUTHENTICATED_ACTOR}
+    # The claim is still on the record, where it is evidence rather than identity.
+    assert {event.payload["name"] for event in _events("human.login_failed")} == {
+        "human:owner",
+        "agent:builtin-gardener",
+        "scheduler",
+    }
+    # And it cannot be read back as an account.
+    with pytest.raises(auth.UnknownPrincipal):
+        auth.principal_from_actor(service.UNAUTHENTICATED_ACTOR)
+
+
+def test_a_lockout_refusal_writes_no_event_of_its_own(fresh_db):
+    """A refused-before-checking attempt is a rate limit, not an audit entry (M2).
+
+    It used to write one, so that a guesser who kept trying kept the lockout
+    fresh. That is two defects at once: an unauthenticated request became an
+    unbounded append to the append-only log, and any local process could hold
+    the real human out forever by re-arming the window every quarter-hour. The
+    five failures that *earned* the lockout are the record; their refusals are
+    not.
+    """
+    anonymous = Client(http_api.create_app())
+    for _ in range(service.LOGIN_MAX_FAILED_ATTEMPTS):
+        anonymous.post("/api/login", json={"name": "owner", "password": "wrong"})
+    assert len(_events("human.login_failed")) == service.LOGIN_MAX_FAILED_ATTEMPTS
+
+    for _ in range(20):
+        assert (
+            anonymous.post("/api/login", json={"name": "owner", "password": "wrong"}).status_code
+            == 429
+        )
+
+    assert len(_events("human.login_failed")) == service.LOGIN_MAX_FAILED_ATTEMPTS
 
 
 def test_five_failed_attempts_lock_a_name_until_the_window_slides(fresh_db):
     """M5: the lockout refuses the next attempt — correct password or not.
 
-    The refusal is itself recorded, with the lockout as its reason, so the
-    audit trail says what happened. The window is real: once it slides past
-    the failures, the correct password works again.
+    The window is real: once it slides past the failures, the correct password
+    works again. The refusal writes no event of its own (M2) — see
+    ``test_a_lockout_refusal_writes_no_event_of_its_own``.
     """
     service.set_human_password("owner", OWNER_PASSWORD, principal=owner())
     anonymous = Client(http_api.create_app())
@@ -1554,7 +1611,6 @@ def test_five_failed_attempts_lock_a_name_until_the_window_slides(fresh_db):
     refused = anonymous.post("/api/login", json={"name": "owner", "password": OWNER_PASSWORD})
     assert refused.status_code == 429
     assert refused.json()["error"]["type"] == "LoginLocked"
-    assert _events("human.login_failed")[0].payload["reason"] == "locked"
     assert service.login_is_locked("owner") is True
 
     conn = db.connect()
@@ -1589,7 +1645,6 @@ def test_the_lockout_is_not_an_existence_oracle(fresh_db):
     refused = anonymous.post("/api/login", json={"name": "nobody", "password": "anything"})
     assert refused.status_code == 429
     assert refused.json()["error"]["type"] == "LoginLocked"
-    assert _events("human.login_failed")[0].payload["reason"] == "locked"
 
 
 def test_a_successful_login_resets_the_failure_count(fresh_db):
@@ -3149,7 +3204,7 @@ def test_a_page_raster_reaches_the_rendition_route_through_its_colon(client, fre
 def test_the_blocking_routes_run_their_service_call_off_the_event_loop(
     client, fresh_db, tmp_path, fixture_server, monkeypatch
 ):
-    """M22: the upload, ingest and rendition service calls never run on the loop.
+    """M22: the login, upload, ingest and rendition calls never run on the loop.
 
     There is no way to assert "the loop was not blocked" from inside the
     process, but there is a way to assert the mechanism that keeps it free:
@@ -3158,6 +3213,13 @@ def test_the_blocking_routes_run_their_service_call_off_the_event_loop(
     remembers the thread it ran on; the harness drives one ``asyncio.run`` per
     request on the main thread, so a call that stayed inline would record the
     main thread and fail the final assertion.
+
+    ``verify_login`` joined the list for finding M2 and is the one that
+    mattered most: argon2id is ~100 ms of deliberate work — spent on names
+    that do not exist too, so the failure path costs what the success path
+    costs — and it is the only route here an unauthenticated caller can
+    reach. Inline, ten requests a second from anybody with a socket was a
+    stopped server.
     """
     recordings: list[tuple[str, threading.Thread]] = []
 
@@ -3170,6 +3232,18 @@ def test_the_blocking_routes_run_their_service_call_off_the_event_loop(
             return wrapper
 
         return decorate
+
+    # POST /api/login — argon2id, on the one route with no session in front of
+    # it. The `client` fixture has already set this password; setting it again
+    # would end the session that fixture logged in with (service.set_password
+    # drops a human's sessions on a credential change).
+    monkeypatch.setattr(auth, "verify_login", off_loop("verify_login")(auth.verify_login))
+    assert (
+        Client(client.app)
+        .post("/api/login", json={"name": "owner", "password": OWNER_PASSWORD})
+        .status_code
+        == 200
+    )
 
     # POST /api/assets — registration streams the whole file into the store.
     monkeypatch.setattr(assets, "register_asset", off_loop("register_asset")(assets.register_asset))
@@ -3208,6 +3282,7 @@ def test_the_blocking_routes_run_their_service_call_off_the_event_loop(
 
     recorded = {name for name, _ in recordings}
     assert recorded == {
+        "verify_login",
         "register_asset",
         "get_rendition",
         "ingest_file",

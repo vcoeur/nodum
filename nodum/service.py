@@ -4090,6 +4090,14 @@ AUTH_EVENT_OPS = (
     "human.logout",
 )
 
+#: The ``events.actor`` value for something nobody authenticated did — today
+#: only a failed login. Deliberately not parseable as a principal: it carries
+#: neither the ``human:`` nor the ``agent:`` prefix
+#: :attr:`~nodum.principal.Principal.actor_string` mints, so it can never be
+#: mistaken for an account and :func:`nodum.auth.principal_from_actor` refuses
+#: it as malformed rather than resolving it to somebody.
+UNAUTHENTICATED_ACTOR = "unauthenticated"
+
 
 def record_auth_event(
     op: str,
@@ -4110,9 +4118,19 @@ def record_auth_event(
     must never be able to name an identity. ``human.login`` and
     ``human.logout`` record the verified human (the payload must carry its
     ``human_id``, and the actor is ``human:<id>``, exactly as the service's
-    own ``human.*`` events are attributed); ``human.login_failed`` carries
-    the **attempted** name — there is no verified principal on a failure, so
-    the actor column records the name the attempt claimed.
+    own ``human.*`` events are attributed).
+
+    ``human.login_failed`` records :data:`UNAUTHENTICATED_ACTOR`, and the
+    attempted name stays in the *payload* where it belongs. It used to be the
+    actor, on the reasoning that a failure has no verified principal so the
+    column should say what the attempt claimed — but this route is the one
+    ``/api`` path outside the session gate, so that made ``events.actor`` a
+    field an unauthenticated caller writes. ``{"name": "human:owner"}`` put
+    sixty rows attributed to the seeded owner in the log with no credential
+    presented, and ``events --actor human:owner`` listed them beside the real
+    owner's. The actor column is this system's answer to *who did this*; the
+    only truthful answer on a failed login is *nobody*, and a claimed name is
+    data about the attempt rather than an identity.
 
     Payloads are metadata only: ids, the attempted name, a reason. Never a
     password, and never a credential hash.
@@ -4139,7 +4157,7 @@ def record_auth_event(
         name = payload.get("name")
         if not isinstance(name, str):
             raise ValueError("a 'human.login_failed' payload must carry the attempted 'name'")
-        actor = name
+        actor = UNAUTHENTICATED_ACTOR
     else:
         human_id = payload.get("human_id")
         if not isinstance(human_id, str):
@@ -4327,6 +4345,15 @@ def _walk(
     edge is followed only when **both** endpoints are readable by the
     principal, so the walk never crosses into an unreadable space (Q13).
 
+    **The endpoint rows are re-checked here, not assumed from that clause.**
+    Delegating the whole guarantee to :meth:`Store.edge_scope` is what let a
+    space node reach an agent holding no grant on it: that clause tested
+    ``space_id`` where the node rule tests a space node's *own id*, and this
+    loop then loaded both endpoints with an unscoped row read. The clause is
+    fixed, and the row check below is the second layer — a node read in this
+    module that does not pass :meth:`Store.node_visible` is the shape of that
+    defect, whatever the SQL upstream says.
+
     ``as_of`` swaps the lens from the live graph to the graph true at an
     instant (D2): the walk then follows ``active`` edges plus ``archived``
     ones whose validity window covered that instant (:func:`_as_of_edge_clause`).
@@ -4367,13 +4394,20 @@ def _walk(
             edge = _row_dict(edge_row)
             if edge["id"] in seen_edges:
                 continue
+            unseen = [end for end in (edge["src_id"], edge["dst_id"]) if end not in nodes]
+            fetched = {end: _get_node_row(conn, end) for end in unseen}
+            # The edge clause should already have excluded an edge with an
+            # unreadable endpoint; reaching here means the two rules
+            # disagreed, and the answer is to drop the edge whole rather than
+            # return it with an endpoint the principal may not see.
+            if not all(store.node_visible(row) for row in fetched.values()):
+                continue
             seen_edges.add(edge["id"])
             edges.append(edge)
-            for endpoint in (edge["src_id"], edge["dst_id"]):
-                if endpoint not in nodes:
-                    nodes[endpoint] = _row_dict(_get_node_row(conn, endpoint))
-                    order.append(endpoint)
-                    next_frontier.add(endpoint)
+            for endpoint, row in fetched.items():
+                nodes[endpoint] = _row_dict(row)
+                order.append(endpoint)
+                next_frontier.add(endpoint)
         frontier = next_frontier
     return [nodes[node_id] for node_id in order], edges
 

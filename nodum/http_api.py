@@ -118,6 +118,10 @@ perceptible time — one 20.8 MB ingest was measured holding it for 20.8 s and
 680 MB of RSS — and every one of them runs through
 :func:`~starlette.concurrency.run_in_threadpool`:
 
+* **``POST /api/login``** — argon2id is ~100 ms of deliberate work, spent on
+  unknown names too so the failure path costs what the success path costs.
+  This is the one route reachable without a session, so inline it was a
+  denial-of-service anybody with a socket could run at ten requests a second;
 * the **read-heavy routes** — ``GET /api/search`` (a 400-term query held the
   loop for 126 ms), ``POST /api/ask`` and ``POST /api/summarize``, each a model
   call on top of graph work;
@@ -1841,6 +1845,34 @@ def create_app(
         """
         return EnvelopeResponse({"status": "ok", "version": VERSION})
 
+    def _verify_login(name: str, password: str) -> Principal:
+        """The blocking half of :func:`login`: lockout, argon2, failure event.
+
+        Split out so the whole of it runs in one thread-pool hop rather than
+        three — the lockout query, the password verification and the failure
+        event are each a synchronous database or CPU call, and interleaving
+        them with the loop would put the argon2 work back on it.
+
+        Raises:
+            LoginLocked: If the name is under the failed-attempt lockout. No
+                event is written for this: see :func:`login`.
+            InvalidCredentials: If the name or password does not verify. This
+                one *is* written, as ``human.login_failed``.
+        """
+        if service.login_is_locked(name, path=db_path):
+            raise auth.LoginLocked(
+                f"login for {name!r} is locked: too many failed attempts, try again later"
+            )
+        try:
+            return auth.verify_login(name, password, path=db_path)
+        except auth.InvalidCredentials:
+            service.record_auth_event(
+                "human.login_failed",
+                {"name": name, "reason": "invalid credentials"},
+                path=db_path,
+            )
+            raise
+
     async def login(request: Request) -> Response:
         """Password login — the one ``/api`` route outside the session gate.
 
@@ -1852,36 +1884,37 @@ def create_app(
         their own job. Failure is a 401 with no cookie, indistinguishable
         between "no such name" and "wrong password".
 
-        Every attempt is event-logged: a success writes ``human.login``, a
-        refused credential ``human.login_failed`` (the auth half of the audit
-        trail, via :func:`service.record_auth_event`). The failed-login
-        **lockout** (M5) throttles brute force: a name with five failed
-        attempts inside fifteen minutes is refused up front with a 429,
-        correct password or not, until the window slides past the failures —
-        and the refusal is itself logged as a failed attempt, so a guesser
-        who keeps trying keeps the lockout fresh. The lockout keys on the
-        attempted name, so it applies identically to names that do not exist.
+        Every attempt that reaches a password check is event-logged: a success
+        writes ``human.login``, a refused credential ``human.login_failed``
+        (the auth half of the audit trail, via
+        :func:`service.record_auth_event`). The failed-login **lockout** (M5)
+        throttles brute force: a name with five failed attempts inside fifteen
+        minutes is refused up front with a 429, correct password or not, until
+        the window slides past the failures. The lockout keys on the attempted
+        name, so it applies identically to names that do not exist.
+
+        **A refusal by the lockout writes no event of its own** (M2). It used
+        to, on the reasoning that a guesser who keeps trying should keep the
+        lockout fresh — which is true and is also two defects. The lockout is
+        the one ``/api`` route outside the session gate, so that made an
+        unauthenticated request an unbounded append to the append-only event
+        log; and it handed any local process a permanent lockout of the real
+        human, by re-arming the window every fifteen minutes forever. The five
+        failures that *caused* the lockout are on the record, which is what the
+        audit trail needs; the refusals they earn are a rate limit, and a rate
+        limit that logs is a rate limit that can be turned around.
+
+        The whole handler runs off the event loop. Argon2id is ~100 ms of
+        deliberate work — the constant-time path spends it on names that do not
+        exist too — and this is the one route an unauthenticated caller can
+        reach, so inline it is a stalled server at ten requests a second (see
+        the module docstring's list, which this route belongs on).
         """
         body = await _json_body(request)
         name = _required_str(body, "name")
         password = _required_str(body, "password")
-        if service.login_is_locked(name, path=db_path):
-            service.record_auth_event(
-                "human.login_failed", {"name": name, "reason": "locked"}, path=db_path
-            )
-            raise auth.LoginLocked(
-                f"login for {name!r} is locked: too many failed attempts, try again later"
-            )
-        try:
-            principal = auth.verify_login(name, password, path=db_path)
-        except auth.InvalidCredentials:
-            service.record_auth_event(
-                "human.login_failed",
-                {"name": name, "reason": "invalid credentials"},
-                path=db_path,
-            )
-            raise
-        session_id = auth.create_session(principal.id, path=db_path)
+        principal = await run_in_threadpool(_verify_login, name, password)
+        session_id = await run_in_threadpool(auth.create_session, principal.id, path=db_path)
         service.record_auth_event("human.login", {"human_id": principal.id}, path=db_path)
         response = EnvelopeResponse({"human": principal.id})
         response.set_cookie(

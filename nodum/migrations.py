@@ -1054,6 +1054,24 @@ CREATE UNIQUE INDEX idx_annotations_version
 """
 
 
+#: Index the two columns the failed-login lockout filters on (finding M2).
+#:
+#: ``service.login_failure_count`` runs on **every** password attempt, and the
+#: only index on ``events`` was ``idx_events_cycle`` — so the check was a full
+#: scan of the append-only log with a ``json_extract`` per row, on the one
+#: route reachable without a session. The log only grows, and failed attempts
+#: grow it, so the check got slower with exactly the traffic it exists to
+#: throttle.
+#:
+#: ``(op, created_at)`` in that order: ``op`` is the equality, ``created_at``
+#: the range, so the window scan happens inside the one op's rows. The
+#: ``json_extract`` on the name stays a per-row test — over five rows in a
+#: quarter-hour instead of the whole log.
+EVENT_OP_INDEX_DDL = """
+CREATE INDEX idx_events_op_created ON events(op, created_at);
+"""
+
+
 #: Ordered (name, SQL) migrations. Append-only — never edit a shipped entry.
 MIGRATIONS: list[tuple[str, str]] = [
     ("0001_core", CORE_DDL),
@@ -1073,4 +1091,5 @@ MIGRATIONS: list[tuple[str, str]] = [
     ("0015_cycle_stop_switch", CYCLE_STOP_SWITCH_DDL),
     ("0016_conventions_and_annotations", CONVENTIONS_AND_ANNOTATIONS_DDL),
     ("0017_projector_skips", PROJECTOR_SKIPS_DDL),
+    ("0018_events_op_index", EVENT_OP_INDEX_DDL),
 ]

@@ -95,6 +95,16 @@ dev = [
     "pytest-cov>=6.0",
     "ruff>=0.15.2",
 ]
+# The docs gate, declared so `make docs` can run it the way CI does. Exact
+# pins rather than ranges: this builds a published site, and mkdocs-material's
+# minor releases move theme markup — the point of the group is that the local
+# build and the CI build are the same build. `docs.yml` names the same two
+# versions inline, because the Pages job installs them into an ephemeral env
+# rather than syncing this project's groups.
+docs = [
+    "mkdocs==1.6.1",
+    "mkdocs-material==9.7.7",
+]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

@@ -418,7 +418,13 @@ def test_the_last_enabled_human_cannot_disable_itself(fresh_db):
 
 
 def test_record_auth_event_writes_the_three_auth_ops_with_derived_actors(fresh_db):
-    """The actor comes from the op: the verified human, or the attempted name."""
+    """The actor comes from the op: the verified human, or nobody.
+
+    A failure has no verified principal, so it records
+    ``UNAUTHENTICATED_ACTOR`` and keeps the attempted name in the payload. It
+    used to record the name itself, which made ``events.actor`` a field an
+    unauthenticated caller wrote (finding M2).
+    """
     service.record_auth_event("human.login", {"human_id": "owner"})
     service.record_auth_event(
         "human.login_failed", {"name": "owner", "reason": "invalid credentials"}
@@ -428,9 +434,12 @@ def test_record_auth_event_writes_the_three_auth_ops_with_derived_actors(fresh_d
     recorded = [e for e in service.list_events(owner(), limit=10) if e.op.startswith("human.")]
     assert [(e.op, e.actor) for e in recorded] == [
         ("human.logout", "human:owner"),
-        ("human.login_failed", "owner"),
+        ("human.login_failed", service.UNAUTHENTICATED_ACTOR),
         ("human.login", "human:owner"),
     ]
+    # The claimed name is evidence, not identity: it stays in the payload.
+    (failed,) = [e for e in recorded if e.op == "human.login_failed"]
+    assert failed.payload["name"] == "owner"
 
 
 def test_record_auth_event_refuses_ops_and_payloads_outside_its_allowlist(fresh_db):

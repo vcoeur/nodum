@@ -125,20 +125,31 @@ class Store:
 
         An edge is visible iff **both** endpoints are readable — anything
         less leaks the other space's existence (design-pass note 03).
+
+        "Readable" is :func:`node_scope_clause`'s rule, applied to each
+        endpoint, and it is reused rather than restated for the reason M3
+        exists: this clause used to test ``space_id`` alone, which is the
+        rule *before* the space-node fix. A ``space`` node's ``space_id`` is
+        meta and every agent reads meta, so an edge touching one passed —
+        and :func:`nodum.service._walk` returns both endpoints of every edge
+        it follows, handing over the id and title of a space
+        :meth:`node_scope` correctly refuses. One rule, two call sites, no
+        second copy to fall behind.
         """
         spaces = self.principal.read_spaces
         if spaces is None:
             return "", []
         if not spaces:
             return " AND 1 = 0", []
-        placeholders = ",".join("?" * len(spaces))
+        src_clause, src_params = node_scope_clause(spaces, "s.")
+        dst_clause, dst_params = node_scope_clause(spaces, "d.")
         sql = (
             f" AND EXISTS (SELECT 1 FROM nodes s WHERE s.id = {alias}src_id"
-            f" AND s.space_id IN ({placeholders}))"
+            f" AND {src_clause})"
             f" AND EXISTS (SELECT 1 FROM nodes d WHERE d.id = {alias}dst_id"
-            f" AND d.space_id IN ({placeholders}))"
+            f" AND {dst_clause})"
         )
-        return sql, sorted(spaces) * 2
+        return sql, [*src_params, *dst_params]
 
     def node_visible(self, row: sqlite3.Row | dict) -> bool:
         """Is this nodes row inside the principal's read set?"""

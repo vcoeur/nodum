@@ -1027,3 +1027,46 @@ def test_naming_a_space_tells_a_principal_that_cannot_read_meta_nothing(fresh_db
         service.update_node("decoy", title="classified", principal=owner())
     assert "archived space already answers to 'classified'" in str(refused.value)
     assert secret.id in str(refused.value)
+
+
+def test_a_walk_never_hands_back_a_space_node_the_principal_holds_nothing_on(fresh_db):
+    """The M3 space-node rule holds on the traversal path too (finding M1).
+
+    `Store.node_scope` scopes a `space`-typed node to its **own id**, because
+    space nodes live in meta and every agent reads meta for the type
+    vocabulary — filtering one on `space_id` alone hands every space in the
+    file to any meta reader. `Store.edge_scope` did filter on `space_id`
+    alone, and `service._walk` loads both endpoints of every edge it follows
+    with an unscoped row read, trusting that clause. So a `mentions` edge onto
+    a space node — which wikilink materialisation writes whenever a readable
+    note links a space by name — carried that space node's id *and title* back
+    to an agent that `get_node` correctly refuses.
+    """
+    secret = service.create_space("secret-research", principal=owner())
+    note = service.create_node(
+        type="note",
+        title="Public note",
+        content="see [[secret-research]] for the rest",
+        principal=owner(),
+    )
+    scout = agent("scout", grants={"meta": "read", "main": "edit"})
+
+    # The direct read is refused, and always was.
+    with pytest.raises(service.NodeNotFound):
+        service.get_node(secret.id, principal=scout)
+
+    # Every read that walks edges must answer the same way.
+    neighborhood = service.get_neighborhood(note.id, depth=1, principal=scout)
+    assert [node.id for node in neighborhood.nodes] == [note.id]
+    assert neighborhood.edges == []
+
+    walked = service.traverse(note.id, depth=3, principal=scout)
+    assert secret.id not in {node.id for node in walked.nodes}
+    assert "secret-research" not in {node.title for node in walked.nodes}
+
+    assert service.list_edges(node_id=note.id, principal=scout) == []
+
+    # The human still sees the whole thing — this narrows an agent's read, not
+    # the graph.
+    seen = service.get_neighborhood(note.id, depth=1, principal=owner())
+    assert secret.id in {node.id for node in seen.nodes}

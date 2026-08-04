@@ -175,6 +175,8 @@ The invariants that must never be broken, whatever the section:
   (`{"nodes": [...], "count": 2}`); keep new list commands to that shape.
 - DB path resolution: `--db` flag → `NODUM_DB` env var →
   `~/.local/share/nodum/nodum.db`.
+### Identity and authority
+
 - **The CLI is human-only, and every command that touches the graph names its
   human** with a required `--as human:<id>` (or the bare id) — reads included.
   There is no `--actor`: agents drive MCP, never the CLI. A human write lands
@@ -190,6 +192,8 @@ The invariants that must never be broken, whatever the section:
   in that set — it retires live state — so it is the human tier with `undo`.
   `undo` and `rollback` stay human-only. Both reject spellings require
   `--reason`.
+### Reversal
+
 - **`undo` and `rollback` split on one line: does the event carry a `cycle_id`?**
   An event with none is reversed by `undo`; one with a cycle id is reversed by
   `rollback <cycle-id>`, and `undo` refuses it by name. The no-`seq` search
@@ -199,6 +203,8 @@ The invariants that must never be broken, whatever the section:
 - Errors are always one line on stderr with exit 1, never a traceback. **A
   command that reads a file reads it *through* `_run`**, never beside it; new
   file-reading options follow that rule.
+### Errors and exit codes
+
 - **Widening `_run`'s except list is not how a new error gets a message.** The
   list is the set of things a *caller* can provoke; a class that also covers
   defects would turn every future bug into a friendly sentence and exit 1.
@@ -209,6 +215,8 @@ The invariants that must never be broken, whatever the section:
   CLI's whole command tree as JSON. Both short-circuit without touching a
   database. Note `schema-dump` (the CLI adapter's own surface) is a different
   thing from `schema <type>` (one node/edge type's catalog entry).
+### Spaces, search and the smart verbs
+
 - **A space is two independent controls, not a mode** (D1): reads take an
   optional `--space` **filter** (default: every space in scope); writes take a
   `--space` **target** (default `main`). The filter **narrows** and never
@@ -289,6 +297,8 @@ The invariants that must never be broken, whatever the section:
   `reasoning_effort: "none"`. `llm status` also reports the negotiated state
   (`structured_output`, `thinking`/`thinking_applied`,
   `effective_max_output_tokens`). (The measurements: `docs/decisions.md`.)
+### Rehearsals and batches
+
 - **A `--dry-run` answers "what would happen", and each one is precise about
   what it costs.** `consolidate --dry-run` still writes its journal entry,
   flagged — and emits **no** event, so `events --cycle <id>` on it is empty.
@@ -366,6 +376,8 @@ from the live route table (`uv run python scripts/gen-http-api-docs.py`
 after a route-table change; `tests/test_docs.py` holds the lock). The rules
 below are the parts that do not fit a route table.
 
+### Identity, and why it is structural
+
 - **The HTTP surface is the human's.** Every write is attributed to the
   session's human principal; the identity is never read from a request. Do not
   add an "actor" parameter, header, or override "for testing" — the MCP
@@ -381,6 +393,8 @@ below are the parts that do not fit a route table.
   drives every state-changing method of every route in `app.routes` with
   actor-carrying bodies, query strings and headers, then asserts nothing
   written is attributed to anything but the session's human.
+### Origin control, and what it is not
+
 - **A state-changing request must prove it is same-origin**
   (`RequestGuardMiddleware`), because `nodum serve` binds loopback and loopback
   is reachable from every page the user visits. The rule: `Sec-Fetch-Site` in
@@ -398,6 +412,8 @@ below are the parts that do not fit a route table.
   --allow-host)`. This is the DNS-rebinding defence and the only check that
   protects *reads*. Host names are compared without ports (the `make web-dev`
   proxy sends `Host: localhost:5700`).
+### The session gate and the capability hatch
+
 - **The session gate is one rule: every `/api` route `_needs_a_session` claims
   needs a valid session, reads included.** The cookie is `HttpOnly;
   SameSite=Strict` over a server-side row with a 30-day sliding expiry; logout,
@@ -426,6 +442,8 @@ below are the parts that do not fit a route table.
   built from the content hash — serving a stranger's `text/html` back from
   this origin is stored XSS. The bytes stream out of the blob in 1 MiB chunks;
   never read an original into memory to send it.
+### Ingestion and assets
+
 - **`PUT /api/uploads/{token}` ingests: bytes in, reviewable subgraph out.**
   It answers with the whole ingestion — asset, `asset_ref`, `source`,
   `derived_from`, one `block` per page — via `ingest.ingest_upload`, which
@@ -438,6 +456,8 @@ below are the parts that do not fit a route table.
   `name`/`space`/`title`); both or neither is a 400. `path` is read *by the
   server* and `url` is fetched *by the server*, which is exactly why this
   route is inside the session gate and the two token routes are not.
+### Spaces, accounts and the smart routes
+
 - **Spaces reach the human over HTTP as a filter, a target, and a lifecycle.**
   `GET /api/nodes` and `GET /api/search` take `?space=` (narrow to one space)
   and `?include_meta=` (off by default). `POST /api/nodes` takes `space` in
@@ -510,6 +530,8 @@ below are the parts that do not fit a route table.
   `merge_nodes`, `retype`, `supersede_edge` or `bulk_relink` here: they are
   the curative tier and they belong to the CLI, and `PATCH /api/nodes/{id}`
   still cannot retype a node.
+### Failures, limits and the shape of a request
+
 - **A wrong verb on a real route is a 405 with an `Allow` header**, not the
   catch-all's 404 — `api_not_found` asks the real routes what they would have
   matched.
@@ -584,15 +606,16 @@ by `nodum mcp serve`. It registers exactly two tiers and nothing else.
   read tier (`get_node`, `get_children`, `search`, `traverse`, `list_types`,
   `get_schema`, `find_path`, `history`, `diff`, `get_asset`,
   `get_download_url`) and additive tier (`create_node`, `update_node`, `link`,
-  `propose_edges`, `ingest_file`, `ingest_url`, `request_upload_url`) — every
+  `propose_edges`, `ingest_url`, `request_upload_url`) — every
   tool a thin delegate to one service/search/assets/ingest/urls function.
-- **Three tiers are never registered, and each one is a named absence**: the
+- **Four tiers are never registered, and each one is a named absence**: the
   review tools (`accept`, `reject` — `REVIEW_TOOLS`, gated by
   `Store.require_review` — a human, or `edit` on the item's space), the
   curative tools (`merge_nodes`, `retype`, `supersede_edge`, `bulk_relink`,
-  `consolidate` — `CURATIVE_TOOLS`, §8.2), and **reversal plus the journal
+  `consolidate` — `CURATIVE_TOOLS`, §8.2), **reversal plus the journal
   that records it** (`undo`, `rollback`, `abandon_cycle`, `request_stop`,
-  `get_cycle`, `list_cycles` — `HUMAN_ONLY_TOOLS`). `UNREGISTERED_TOOLS` is
+  `get_cycle`, `list_cycles` — `HUMAN_ONLY_TOOLS`), and **anything that names a
+  path on the server's own disk** (`FILESYSTEM_TOOLS`). `UNREGISTERED_TOOLS` is
   the union, and what `tests/test_mcp_server.py` asserts the registry stays
   disjoint from; adding an operation to any of those tiers means adding its
   name to a list, never to the registry. This is **structural enforcement, not
@@ -612,6 +635,8 @@ by `nodum mcp serve`. It registers exactly two tiers and nothing else.
   in place — MCP hosts auto-approve on that flag, so it must not lie. Every
   write tool's description says what an `edit` grant changes rather than
   promising `proposed`.
+### Authentication
+
 - **Auth is the agent token in `NODUM_AGENT_TOKEN`** — an `ndm_…` token minted
   by `nodum agent create` / `token-rotate`, shown once and stored hashed —
   carried in the environment, never a flag (a flag leaks into `ps` and shell
@@ -620,11 +645,18 @@ by `nodum mcp serve`. It registers exactly two tiers and nothing else.
   call**: each call re-mints the principal from stored state, so disabling the
   agent or archiving a space it holds a grant on bites at the next call rather
   than at the next restart.
-- **Ingestion is by reference** (§5.7 rule 2): the tool takes a path the server
-  can read or a URL it can fetch — an `http`/`https` value routes to
-  `ingest_url`, anything else is a local path — and **no base64 ever crosses
-  MCP**; a host sharing no filesystem with the server asks `request_upload_url`
-  for somewhere to PUT instead.
+- **Ingestion is by reference** (§5.7 rule 2), and by **URL or upload only**:
+  `ingest_url` takes something this server can fetch, `request_upload_url`
+  hands back somewhere to PUT bytes the caller holds. **No base64 ever crosses
+  MCP, and no path does either.** `ingest_file` took one until finding B1: an
+  agent holding nothing but `suggest` named a server path, the pipeline wrote
+  the extracted text to `assets.extracted_text`, a `proposed` describing node
+  was enough to reach it, and `get_asset` returned it — two calls a host
+  auto-approves. Withholding the text from the first call was tried and was not
+  the fix, because the second call was never the reported path. Grants scope
+  the *graph*; a filesystem read is not a graph read, so nothing in the grant
+  model could bound it. `nodum ingest` on the CLI still takes a path — there,
+  local access is already the trust boundary.
 - **`get_asset` never serves originals** (§5.7): metadata (carrying the
   asset's extracted text, capped, with the real length and a truncation flag)
   plus a `preview`/`thumb`/`page:<n>` WebP image block; an unknown profile is

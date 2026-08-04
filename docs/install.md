@@ -119,14 +119,46 @@ Create an agent account first:
 nodum agent create researcher --as owner    # prints the token once — store it
 ```
 
-Then run the MCP server with the token in the environment:
+Then point your MCP client at it. **You do not run `nodum mcp serve` yourself**:
+the transport is stdio, so the client launches it as a subprocess and talks to
+it over that process's stdin and stdout. The token goes in the client
+configuration's `env` block, which is what the client injects into the process
+it starts:
+
+```json
+{
+  "mcpServers": {
+    "nodum": {
+      "command": "nodum",
+      "args": ["mcp", "serve"],
+      "env": {
+        "NODUM_AGENT_TOKEN": "ndm_…",
+        "NODUM_DB": "/home/you/.local/share/nodum/nodum.db"
+      }
+    }
+  }
+}
+```
+
+That is the whole setup — there is no port, no daemon and no `--token` flag. A
+flag would put the token in `ps` and in shell history, which is why it is the
+environment or nothing. `NODUM_DB` is worth setting explicitly: the client
+launches the process, so it does not inherit the shell environment you set the
+variable in.
+
+To check the token before wiring it up, run the server by hand and press
+Ctrl-D — it will fail at startup on a token that verifies no enabled agent:
 
 ```sh
 NODUM_AGENT_TOKEN=ndm_… nodum mcp serve
 ```
 
-It speaks MCP over stdio, exposes the read and additive tool tiers only, and
-confines every call to that agent's grants. A `suggest` grant means its writes
-land `proposed` and wait for a human. Put the token in the MCP client
-configuration's env block — never on the command line, where it would leak into
-`ps` and shell history.
+It exposes the read and additive tool tiers only, and confines every call to
+that agent's grants — re-read from the database on every call, so
+`nodum agent disable` takes effect at the next one. A `suggest` grant means its
+writes land `proposed` and wait for a human.
+
+One token is one agent account is one grant set, so two clients can hold two
+tokens with different reach. Ingestion is **by URL or upload**: no tool on this
+surface takes a path on the server's filesystem, which matters most when the
+server is not the machine the agent runs on.

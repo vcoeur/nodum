@@ -16,10 +16,11 @@ own documented exception (§5.7 rule 4): a short-lived, single-use URL to the
 original bytes, for a host that has to open the real file, with the mint and
 the redemption both in the event log.
 
-Ingestion is **by reference** (§5.7 rule 2) — the server reads the path or
-fetches the URL itself, and a host that shares no filesystem with the server
-asks ``request_upload_url`` for somewhere to PUT the bytes. No base64 ever
-crosses MCP in either direction.
+Ingestion is **by reference** (§5.7 rule 2) — the server fetches the URL
+itself, and a host holding bytes the server cannot fetch asks
+``request_upload_url`` for somewhere to PUT them. No base64 ever crosses MCP
+in either direction, and **no server path does either**: see
+:data:`FILESYSTEM_TOOLS`.
 
 **A tool that writes a node takes a ``space``, because the SDK will not say a
 word if it does not.** ``create_node`` had no such parameter while
@@ -35,7 +36,7 @@ keyword this module does not declare is silently discarded rather than refused.
 Every write result carries the ``space_id`` it actually landed in, which is the
 other half of that: it can be checked rather than assumed.
 
-**Three tiers are never registered, and each one is a named absence.** The
+**Four tiers are never registered, and each one is a named absence.** The
 review tools (``accept``, ``reject`` — :data:`REVIEW_TOOLS`) are the §8.1
 review tier: the service gates them with ``Store.require_review`` — a human,
 or ``edit`` on the item's space — and retiring the live structure an accept
@@ -43,11 +44,13 @@ replaces is the human tier, but either way they do not belong on an agent's
 surface, so the CLI and the review API are where they live. The curative tools
 (``merge_nodes``,
 ``retype``, ``supersede_edge``, ``bulk_relink``, ``consolidate`` —
-:data:`CURATIVE_TOOLS`) are §8.2. And reversal plus the journal that records it
+:data:`CURATIVE_TOOLS`) are §8.2. Reversal plus the journal that records it
 (``undo``, ``rollback``, ``abandon_cycle``, ``get_cycle``, ``list_cycles`` —
 :data:`HUMAN_ONLY_TOOLS`) is the third: reversal writes recorded payloads back
 verbatim and no grant delegates that, while a journal entry says what the
-gardener did across every space in the file. All three are enforced the same
+gardener did across every space in the file. And the fourth is
+:data:`FILESYSTEM_TOOLS` — anything that lets a caller name a path on the
+server's own disk. All four are enforced the same
 way: they simply do not exist here, so there is no runtime check to argue
 around — and :mod:`nodum.service` refuses a non-human regardless of surface.
 The lists exist so ``tests/test_mcp_server.py`` can assert the registry stays
@@ -70,7 +73,6 @@ logic here beyond argument mapping and JSON shaping.
 from __future__ import annotations
 
 import os
-import urllib.parse
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, overload
@@ -167,10 +169,38 @@ HUMAN_ONLY_TOOLS = (
     "list_cycles",
 )
 
+#: The fourth named absence: **no tool here lets a caller name a path on the
+#: server's disk.** ``ingest_file`` was one, and its removal is the fix for a
+#: capability the grant model cannot express.
+#:
+#: Grants scope the *graph*. The bytes an ingestion reads come from the
+#: *filesystem*, which no grant describes — so an agent holding the minimal
+#: write grant (``suggest`` on one space) could name any path this server's
+#: user can read, and then read it back: the ingestion writes the extracted
+#: text to ``assets.extracted_text``, ``assets._readable_hashes`` deliberately
+#: admits a ``proposed`` describing node, and ``get_asset`` returns that text.
+#: Two calls, both auto-approved by a host (``destructiveHint=False`` and
+#: ``readOnlyHint=True``), and ``name`` chooses the extraction handler, so an
+#: extensionless secret reads as text by asking for it.
+#:
+#: Removing the *echo* was not the fix and was tried first: the tool result no
+#: longer carries the text (:func:`_ingest_result`), and the capability was
+#: untouched, because the second call was never the reported path. **The
+#: capability is the thing to close, not the delivery vector.**
+#:
+#: Nothing is lost. Ingestion by reference (§5.7 rule 2) has two other doors
+#: and they are the ones a remote server needs anyway: ``ingest_url`` for
+#: anything this server can fetch, ``request_upload_url`` for bytes that live
+#: on the caller's host. A path on the server's disk only ever made sense when
+#: the agent and the server shared a machine — and when they do, the operator
+#: has ``nodum ingest``, where local access is already the trust boundary.
+FILESYSTEM_TOOLS = ("ingest_file", "ingest_path", "read_file")
+
 #: Every name that must never appear in the registry, in one place — what the
-#: disjointness assertions ask about. A new human-only or curative operation
-#: joins one of the three lists above; it never joins the registry.
-UNREGISTERED_TOOLS = CURATIVE_TOOLS + REVIEW_TOOLS + HUMAN_ONLY_TOOLS
+#: disjointness assertions ask about. A new human-only, curative, review or
+#: filesystem operation joins one of the four lists above; it never joins the
+#: registry.
+UNREGISTERED_TOOLS = CURATIVE_TOOLS + REVIEW_TOOLS + HUMAN_ONLY_TOOLS + FILESYSTEM_TOOLS
 
 #: The tools this server registers, by tier (documentation + test anchor).
 #:
@@ -198,7 +228,6 @@ ADDITIVE_TOOLS = (
     "update_node",
     "link",
     "propose_edges",
-    "ingest_file",
     "ingest_url",
     "request_upload_url",
 )
@@ -238,13 +267,19 @@ def _ingest_result(out: ingest.IngestOut) -> dict[str, Any]:
 
     The write is the tool's job and its result is the describing subgraph —
     ids, spaces, states, extraction statistics — that tells the agent where
-    its work landed. The text itself does not cross this surface: the asset's
-    ``extracted_text`` and the ``source``/page nodes' content are the full
-    extraction, and echoing them would hand any token-bearing agent the
-    contents of any file the server can read or URL it can fetch. Omitted
-    rather than blanked, so a missing key can never be mistaken for a document
-    that extracted nothing; once a describing node is readable, ``get_asset``
-    returns the text, scoped by the same grant set that confined the write.
+    its work landed. The text itself is omitted rather than blanked, so a
+    missing key can never be mistaken for a document that extracted nothing;
+    once a describing node is readable, ``get_asset`` returns it, scoped by
+    the same grant set that confined the write.
+
+    **This is a payload-size decision, not a security boundary, and it must
+    not be mistaken for one again.** It was written as though withholding the
+    text were what stopped an agent reading a file it should not — and it was
+    not, because ``get_asset`` hands the same text over on the very next call
+    by design. What actually bounds this surface is that no tool here can name
+    a file at all (:data:`FILESYSTEM_TOOLS`): the caller supplies a URL this
+    server fetches, or bytes it uploads, and in both cases the caller already
+    had whatever it is asking the graph to remember.
     """
     return out.model_dump(
         mode="json",
@@ -303,12 +338,14 @@ def create_server(*, token: str, db_path: str | Path | None = None) -> FastMCP:
         instructions=(
             "nodum knowledge graph — read tier (get_node/get_children/search/traverse/"
             "list_types/get_schema/find_path/history/diff/get_asset/get_download_url) and "
-            "additive tier (create_node/update_node/link/propose_edges/ingest_file/"
+            "additive tier (create_node/update_node/link/propose_edges/"
             "ingest_url/request_upload_url). Writes land as proposals for human review "
             "under a 'suggest' grant and live under 'edit'. Reviewing (accept/reject) "
             "and curative operations are not available over MCP — they belong to the "
-            "human. Ingest by reference: give a path or a URL this server can reach, "
-            "never bytes. Assets come back as metadata, extracted text and small derived "
+            "human. Ingest by reference: give a URL this server can fetch, or ask "
+            "request_upload_url for somewhere to PUT bytes you hold — never bytes "
+            "inline, and never a path on the server's disk. Assets come back as "
+            "metadata, extracted text and small derived "
             "renditions; the original binary crosses this surface only through "
             "get_download_url, and that is logged (design §5.7)."
         ),
@@ -454,7 +491,13 @@ def create_server(*, token: str, db_path: str | Path | None = None) -> FastMCP:
                 f"unsupported rendition {rendition!r}: MCP serves "
                 f"{', '.join(sorted(assets.PROFILES))} and page:<n> only — originals never"
             ) from exc
-        asset = assets.get_asset(id_or_hash, principal=_principal(), path=db_path)
+        # One verification for the whole call: `_principal()` re-verifies the
+        # token against the database, and this tool makes two scoped reads. Two
+        # hops bought nothing — a revocation landing between them would only
+        # move which of the two reads refused — and paid for it twice on the
+        # one read tool that also decodes an image.
+        principal = _principal()
+        asset = assets.get_asset(id_or_hash, principal=principal, path=db_path)
         text = asset.extracted_text
         metadata: dict[str, Any] = {
             "asset": asset.model_dump(mode="json", exclude={"extracted_text"}),
@@ -467,7 +510,7 @@ def create_server(*, token: str, db_path: str | Path | None = None) -> FastMCP:
                 id_or_hash,
                 profile=rendition,
                 include_data=True,
-                principal=_principal(),
+                principal=principal,
                 path=db_path,
             )
         except assets.UnsupportedRendition:
@@ -631,24 +674,25 @@ def create_server(*, token: str, db_path: str | Path | None = None) -> FastMCP:
         return _dump(service.propose_edges(suggestions, principal=_principal(), path=db_path))
 
     @server.tool(annotations=_ADDITIVE)
-    def ingest_file(
-        path_or_url: str,
+    def ingest_url(
+        url: str,
         name: str | None = None,
         space: str | None = None,
         title: str | None = None,
     ) -> dict[str, Any]:
-        """Ingest a document the server can reach — bytes in, a described subgraph out.
+        """Fetch an `http`/`https` URL into the graph — bytes in, a described subgraph out.
 
-        Give a **path on the server's own filesystem**, or an `http`/`https`
-        URL (which routes to `ingest_url`). The server reads or fetches the
-        bytes itself: that is design §5.7's "ingestion by reference", and it
-        is why there is no way to send file contents through this tool and
-        never will be. For bytes that live only on *your* host, ask
-        `request_upload_url` for somewhere to put them.
+        The **server** does the fetch — one bounded read with a timeout, and
+        redirects that may not leave http/https — and records the URL on both
+        written nodes as provenance. That is design §5.7's "ingestion by
+        reference", and it is why there is no way to send file contents
+        through this tool and never will be. **There is no way to name a path
+        on the server's disk either**: for bytes that live on your own host,
+        ask `request_upload_url` for somewhere to PUT them.
 
-        One ingestion registers the bytes (content-addressed, so the same file
-        twice moves nothing), extracts what text it can, and writes an
-        `asset_ref` node describing the bytes in `space`, a `source` node
+        One ingestion registers the bytes (content-addressed, so the same
+        document twice moves nothing), extracts what text it can, and writes
+        an `asset_ref` node describing the bytes in `space`, a `source` node
         carrying the extracted text, a `derived_from` edge from the source to
         the asset, and one `block` child per page for paginated formats.
 
@@ -659,70 +703,23 @@ def create_server(*, token: str, db_path: str | Path | None = None) -> FastMCP:
         subgraph with `created: false`: nothing is duplicated, nothing is
         overwritten, and an interrupted run is repaired by running it again.
 
-        `extraction.handler` names what read the file and `extraction.detail`
-        says why nothing came out when nothing did — usually a handler whose
-        optional dependency is not installed on the server. An asset no
-        handler could read is still registered and still described.
+        `extraction.handler` names what read the document and
+        `extraction.detail` says why nothing came out when nothing did —
+        usually a handler whose optional dependency is not installed on the
+        server. An asset no handler could read is still registered and still
+        described.
 
-        **The text itself is never in this result.** The asset's
-        `extracted_text` and the `source`/page nodes' content are the full
-        extraction, and echoing them would hand any token-bearing agent the
-        contents of any file this server can read — so the describing
-        subgraph comes back, the text does not. `extraction.chars` (and
+        **The text itself is never in this result** — `extraction.chars` (and
         `extracted_chars` on the `asset_ref`'s props) say how much there is,
-        and `get_asset` returns the text itself once a describing node is
-        readable, scoped by the same grants that confined this write.
-
-        `name` overrides the recorded filename, **and with it the extension
-        that picks the extraction handler**; `title` names the `source` node.
-        """
-        # Only http/https route out: a plain path has no scheme, and a `file:`
-        # URL is not silently fetched — it falls through to the path branch and
-        # is refused there as "not a file", which is the truthful answer.
-        if urllib.parse.urlparse(path_or_url).scheme in ingest.FETCHABLE_SCHEMES:
-            return _ingest_result(
-                ingest.ingest_url(
-                    path_or_url,
-                    name=name,
-                    space=space,
-                    title=title,
-                    principal=_principal(),
-                    path=db_path,
-                )
-            )
-        return _ingest_result(
-            ingest.ingest_file(
-                path_or_url,
-                name=name,
-                space=space,
-                title=title,
-                principal=_principal(),
-                path=db_path,
-            )
-        )
-
-    @server.tool(annotations=_ADDITIVE)
-    def ingest_url(
-        url: str,
-        name: str | None = None,
-        space: str | None = None,
-        title: str | None = None,
-    ) -> dict[str, Any]:
-        """Fetch an `http`/`https` URL into the graph and ingest it like a local file.
-
-        The **server** does the fetch — one bounded read with a timeout, and
-        redirects that may not leave http/https — and records the URL on both
-        written nodes as provenance. Everything else matches `ingest_file`:
-        the same subgraph, the same content-addressed dedup, and the same
-        landing rule — `proposed` under a `suggest` grant, live under `edit`.
+        and `get_asset` returns the text once a describing node is readable.
 
         A page served from an extensionless path still extracts: the
-        response's own content type picks the handler. Only the URL's bytes
-        are ingested, so a link that returns a login page ingests the login
-        page — check `extraction.chars` (and the `source` content via
-        `get_asset` once a describing node is readable, since the text
-        itself never comes back in this result) before treating the outcome
-        as the document you meant.
+        response's own content type picks the handler. `name` overrides the
+        recorded filename, **and with it the extension that picks the
+        handler**; `title` names the `source` node. Only the URL's bytes are
+        ingested, so a link that returns a login page ingests the login page —
+        check `extraction.chars` before treating the outcome as the document
+        you meant.
         """
         return _ingest_result(
             ingest.ingest_url(
@@ -781,6 +778,13 @@ def create_server(*, token: str, db_path: str | Path | None = None) -> FastMCP:
     # space) — and this is an agent surface, so they live on `nodum review …`
     # and the review API instead. Retiring the live structure an accept
     # replaces is the human tier, enforced by the service either way.
+
+    # ── `ingest_file` is deliberately absent ──
+    # No tool here takes a path on the server's disk (`FILESYSTEM_TOOLS`).
+    # Grants scope the graph; a filesystem read is not a graph read, so the
+    # grant model could not bound it — and `ingest_url` plus
+    # `request_upload_url` are the two doors a server the caller does not share
+    # a machine with needs anyway.
 
     return server
 

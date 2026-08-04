@@ -25,6 +25,7 @@ from nodum import assets, auth, ingest, mcp_server, service, urls
 from nodum.mcp_server import (
     ADDITIVE_TOOLS,
     CURATIVE_TOOLS,
+    FILESYSTEM_TOOLS,
     HUMAN_ONLY_TOOLS,
     OVERWRITING_TOOLS,
     READ_TOOLS,
@@ -39,7 +40,7 @@ TOKEN = "ndm_test_token_for_the_mcp_suite"
 #: The Phase-4 ingestion tools, named literally: the tier constants are the
 #: registry's contract, and a test that only walked them would pass just as
 #: happily with a tool missing from both.
-INGEST_TOOLS = ("ingest_file", "ingest_url", "request_upload_url")
+INGEST_TOOLS = ("ingest_url", "request_upload_url")
 
 #: The committed two-page PDF, shared with the ingestion suite.
 FIXTURE_PDF = Path(__file__).parent / "fixtures" / "sample.pdf"
@@ -172,13 +173,18 @@ def test_reversal_and_the_journal_are_a_named_absence_too(fresh_db):
     `undo`, `abandon_cycle`, or the two journal reads — so a future tool
     exposing any of them would have passed every assertion in this file. That is
     the gap this closes: their absence is now a **decision** with a name on it.
+
+    `ingest_file` is the fourth list, and it is the same lesson arriving from
+    the other direction: it was *registered*, and no list said it should not be
+    (B1).
     """
     assert {"undo", "rollback_cycle", "abandon_cycle", "get_cycle", "list_cycles"} <= set(
         HUMAN_ONLY_TOOLS
     )
-    # The three absence lists are one surface, and nothing may be in two tiers.
+    assert "ingest_file" in FILESYSTEM_TOOLS
+    # The four absence lists are one surface, and nothing may be in two tiers.
     assert set(UNREGISTERED_TOOLS) == (
-        set(CURATIVE_TOOLS) | set(REVIEW_TOOLS) | set(HUMAN_ONLY_TOOLS)
+        set(CURATIVE_TOOLS) | set(REVIEW_TOOLS) | set(HUMAN_ONLY_TOOLS) | set(FILESYSTEM_TOOLS)
     )
     assert len(UNREGISTERED_TOOLS) == len(set(UNREGISTERED_TOOLS))
     # And no absence list may name something the registry actually serves.
@@ -297,7 +303,7 @@ def test_create_node_files_into_the_space_it_was_asked_for(fresh_db):
     Three nodes asked for in `research` landed in `main` behind a 200-shaped
     response naming `space_id: "main"` — the generated argument model ignores
     unknown keys, so an agent had no way to choose a space and no way to learn
-    it had not got one. `ingest_file` had taken `space` since Phase 4; this is
+    it had not got one. The ingestion tools had taken `space` since Phase 4; this is
     the tool that writes a plain node.
     """
     seed_space("research")
@@ -848,16 +854,17 @@ def _url(server, path: str) -> str:
     return f"http://127.0.0.1:{server.server_address[1]}{path}"
 
 
-def test_ingest_file_takes_a_local_path_and_writes_the_subgraph(fresh_db, tmp_path):
-    """Ingestion by reference: the path crosses MCP, the bytes never do.
+def test_ingest_url_writes_the_describing_subgraph(fresh_db, fixture_server):
+    """Ingestion by reference: the URL crosses MCP, the bytes never do.
 
     The result is the describing subgraph — the text itself never comes back
     over MCP (M4), so what is asserted is structure, not content.
     """
-    source = tmp_path / "hydrology.txt"
-    source.write_text("Vercingetorix basin hydrology", encoding="utf-8")
+    fixture_server.canned = (b"Vercingetorix basin hydrology", "text/plain")
 
-    result = _run(lambda session: _call(session, "ingest_file", {"path_or_url": str(source)}))
+    result = _run(
+        lambda session: _call(session, "ingest_url", {"url": _url(fixture_server, "/hydrology")})
+    )
 
     assert not result.isError
     out = result.structuredContent
@@ -874,23 +881,41 @@ def test_ingest_file_takes_a_local_path_and_writes_the_subgraph(fresh_db, tmp_pa
     )
 
 
-def test_ingest_file_routes_an_http_url_to_the_fetch_path(fresh_db, fixture_server):
-    """Only an http/https value leaves the filesystem; anything else is a local path."""
-    fixture_server.canned = (
-        b"<html><body><p>Basin hydrology</p></body></html>",
-        "text/html; charset=utf-8",
-    )
+def test_no_registered_tool_can_name_a_path_on_the_servers_disk(fresh_db, tmp_path):
+    """The filesystem is not reachable from this surface at all (B1).
 
-    result = _run(
-        lambda session: _call(
-            session, "ingest_file", {"path_or_url": _url(fixture_server, "/article")}
+    ``ingest_file`` took a server path, and the grant model had nothing to say
+    about it: grants scope the *graph*, and a file read is not a graph read. An
+    agent holding the minimal write grant could name any path this server's
+    user could read and then read it back — the ingestion writes the extracted
+    text to ``assets.extracted_text``, a ``proposed`` describing node is enough
+    to reach it, and ``get_asset`` returns it. Two calls, both auto-approved by
+    a host.
+
+    Withholding the text from the *first* call was tried and was not the fix:
+    the second call was never the reported path. The fix is that no tool takes
+    a path, which is what this asserts — over the live registry, so a tool
+    added later with a ``path``-shaped parameter fails here.
+    """
+    secret = tmp_path / "id_rsa"
+    secret.write_text("-----BEGIN OPENSSH PRIVATE KEY-----\ntop secret\n", encoding="utf-8")
+
+    tools = _run(lambda session: session.list_tools()).tools
+    assert "ingest_file" not in {tool.name for tool in tools}
+
+    # No tool declares a parameter a filesystem path would go in.
+    for tool in tools:
+        properties = (tool.inputSchema or {}).get("properties", {})
+        assert not {"path", "path_or_url", "file", "filename", "source_path"} & set(properties), (
+            f"{tool.name} takes a path-shaped argument: {sorted(properties)}"
         )
-    )
 
-    out = result.structuredContent
-    assert out["extraction"]["handler"] == "html"
-    assert "content" not in out["source"]
-    assert out["asset_ref"]["props"]["url"].endswith("/article")
+    # And the one tool that still takes a *location* will not read one.
+    refused = _run(lambda session: _call(session, "ingest_url", {"url": str(secret)}))
+    assert refused.isError
+    assert "ingest_url takes" in refused.content[0].text
+    assert "top secret" not in refused.content[0].text
+    assert not service.list_nodes(type="source", principal=owner(), limit=50)
 
 
 def test_ingest_url_fetches_and_records_its_provenance(fresh_db, fixture_server):
@@ -913,14 +938,13 @@ def test_ingest_url_refuses_a_scheme_it_will_not_fetch(fresh_db):
 
 
 def test_a_suggest_agent_gets_a_proposed_subgraph_and_the_tool_does_not_claim_otherwise(
-    fresh_db, tmp_path
+    fresh_db, fixture_server
 ):
     """Ingestion adds no authority of its own — the landing state is the grant's."""
-    source = tmp_path / "proposal.txt"
-    source.write_text("proposal", encoding="utf-8")
+    fixture_server.canned = (b"proposal", "text/plain")
 
     out = _run(
-        lambda session: _call(session, "ingest_file", {"path_or_url": str(source)})
+        lambda session: _call(session, "ingest_url", {"url": _url(fixture_server, "/proposal")})
     ).structuredContent
 
     assert out["asset_ref"]["state"] == "proposed"
@@ -936,45 +960,36 @@ def test_a_suggest_agent_gets_a_proposed_subgraph_and_the_tool_does_not_claim_ot
         assert "suggest" in descriptions[name] and "edit" in descriptions[name], name
 
 
-def test_re_ingesting_the_same_file_adds_nothing(fresh_db, tmp_path):
+def test_re_ingesting_the_same_document_adds_nothing(fresh_db, fixture_server):
     """The idempotency gate is what makes the additive annotation true on a re-run."""
-    source = tmp_path / "twice.txt"
-    source.write_text("marginalia", encoding="utf-8")
+    fixture_server.canned = (b"marginalia", "text/plain")
+    url = _url(fixture_server, "/twice")
 
-    first = _run(
-        lambda session: _call(session, "ingest_file", {"path_or_url": str(source)})
-    ).structuredContent
-    second = _run(
-        lambda session: _call(session, "ingest_file", {"path_or_url": str(source)})
-    ).structuredContent
+    first = _run(lambda session: _call(session, "ingest_url", {"url": url})).structuredContent
+    second = _run(lambda session: _call(session, "ingest_url", {"url": url})).structuredContent
 
     assert second["created"] is False
     assert second["asset_ref"]["id"] == first["asset_ref"]["id"]
     assert len(service.list_nodes(type="asset_ref", principal=owner())) == 1
 
 
-def test_ingest_file_refuses_a_path_that_is_not_a_file(fresh_db, tmp_path):
-    result = _run(lambda session: _call(session, "ingest_file", {"path_or_url": str(tmp_path)}))
+def test_the_ingest_result_omits_the_text_and_the_scoped_read_still_returns_it(
+    fresh_db, fixture_server
+):
+    """The result carries the describing subgraph, not the extraction (M4).
 
-    assert result.isError
-    assert "not a file" in result.content[0].text
-
-
-def test_ingest_file_returns_the_describing_subgraph_but_never_the_text(fresh_db, tmp_path):
-    """M4 regression: the ingest result carries no extracted text over MCP.
-
-    The tool is auto-approve (``destructiveHint=False``), and echoing the full
-    extraction in the result would hand any token-bearing agent the contents
-    of any file the server can read — so the describing subgraph comes back
-    (ids, spaces, states, extraction statistics) and the text does not. The
-    scoped read path is untouched: ``get_asset`` still returns the text once
-    the describing node is readable.
+    This is a **payload-size** property, and saying so is the point: it was
+    written as the fix for an arbitrary-file read and it never was one, because
+    ``get_asset`` hands the same text over on the next call by design — which
+    the second half of this test asserts, so nobody reads the first half as a
+    boundary. What bounds this surface is that no tool can name a file at all
+    (see ``test_no_registered_tool_can_name_a_path_on_the_servers_disk``); the
+    bytes here are ones the caller supplied a URL for and could already fetch.
     """
-    source = tmp_path / "hydrology.txt"
-    source.write_text("Vercingetorix basin hydrology", encoding="utf-8")
+    fixture_server.canned = (b"Vercingetorix basin hydrology", "text/plain")
 
     out = _run(
-        lambda session: _call(session, "ingest_file", {"path_or_url": str(source)})
+        lambda session: _call(session, "ingest_url", {"url": _url(fixture_server, "/hydrology")})
     ).structuredContent
 
     # The describing subgraph is the result: identities, states, statistics.
@@ -1085,15 +1100,16 @@ def test_request_upload_url_dedups_a_declared_hash_without_moving_bytes(fresh_db
 # ── Scope: a grant is the whole of an agent's reach, ingestion included ───────
 
 
-def test_an_agent_cannot_ingest_into_a_space_it_holds_nothing_on(fresh_db, tmp_path):
+def test_an_agent_cannot_ingest_into_a_space_it_holds_nothing_on(fresh_db, fixture_server):
     """An ungranted space and a nonexistent one answer identically (Q13 S3)."""
     seed_space("research")
-    source = tmp_path / "scoped.txt"
-    source.write_text("scoped", encoding="utf-8")
+    fixture_server.canned = (b"scoped", "text/plain")
 
     result = _run(
         lambda session: _call(
-            session, "ingest_file", {"path_or_url": str(source), "space": "research"}
+            session,
+            "ingest_url",
+            {"url": _url(fixture_server, "/scoped"), "space": "research"},
         )
     )
 
@@ -1102,12 +1118,11 @@ def test_an_agent_cannot_ingest_into_a_space_it_holds_nothing_on(fresh_db, tmp_p
     assert service.list_nodes(type="asset_ref", principal=owner()) == []
 
 
-def test_a_read_only_agent_cannot_ingest_at_all(fresh_db, tmp_path):
-    source = tmp_path / "scoped.txt"
-    source.write_text("scoped", encoding="utf-8")
+def test_a_read_only_agent_cannot_ingest_at_all(fresh_db, fixture_server):
+    fixture_server.canned = (b"scoped", "text/plain")
 
     result = _run(
-        lambda session: _call(session, "ingest_file", {"path_or_url": str(source)}),
+        lambda session: _call(session, "ingest_url", {"url": _url(fixture_server, "/scoped")}),
         actor="agent:reader",
         token="ndm_test_token_for_the_reader",
         grants={"meta": "read", "main": "read"},

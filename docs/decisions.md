@@ -62,7 +62,7 @@ grant; idempotent per `(hash, space)`), **`page:<n>` PDF rasters** beside
 `0012_url_tokens` — short-lived, single-use, event-logged download and upload
 grants for a host that shares no filesystem with the graph). The surfaces:
 CLI `ingest file|url|handlers` and `asset download-url|upload-url`, MCP
-`ingest_file`/`ingest_url`/`request_upload_url`/`get_download_url`, and HTTP
+`ingest_url`/`request_upload_url`/`get_download_url`, and HTTP
 `POST /api/ingest`, `POST /api/assets/{id}/download-url`, `POST /api/uploads`,
 `GET /api/download/{token}`, `PUT /api/uploads/{token}`.
 
@@ -465,7 +465,7 @@ human cannot write a note.
 ## 2026-08-04 — `create_node` grew a `space` parameter because the SDK discards what it does not declare
 
 The MCP SDK discards a keyword this module does not declare instead of refusing
-it: `create_node` had no `space` parameter while `ingest_file`/`ingest_url`/
+it: `create_node` had no `space` parameter while the ingestion tools and
 `request_upload_url` did, so an agent asking for `research` got a 200-shaped
 response describing a node in `main` — no way to choose a space and no way to
 learn it had not got one. `create_node` now takes `space` (a space id or name,
@@ -2195,3 +2195,104 @@ review drove**: a consolidation stopped mid-run through
 `POST /api/cycles/{id}/stop` ran to `completed` with the stop kept on its
 entry, and the journal entry for it reads *"a stop was asked for on this run
 and it completed anyway"*.
+
+## 2026-08-05 — the MCP surface takes no path on the server's disk
+
+`ingest_file` accepted a path this server could read, and the grant model had
+nothing to say about it: grants scope the *graph*, and reading a file is not a
+graph read. An agent holding the minimal write grant — `suggest` on one space,
+what a new agent is given — named a path, the pipeline wrote the extraction to
+`assets.extracted_text`, a `proposed` describing node was enough to reach it,
+and `get_asset` returned it. Two calls, both auto-approved by a host
+(`destructiveHint=False`, then `readOnlyHint=True`), and `name` picks the
+extraction handler, so an extensionless secret reads as text by asking for it.
+
+**The first fix was the wrong one and is worth recording as such.** A review
+reported the capability through the path it noticed — the tool *echoed* the
+text in its own result — so the result stopped carrying it, and
+`_ingest_result` got a docstring naming the harm: "echoing them would hand any
+token-bearing agent the contents of any file this server can read". Two
+sentences later the same docstring documented the next call. The delivery
+vector closed; the capability never moved. Its own docstring now says it is a
+payload-size decision and not a boundary, and the test that pins it asserts the
+second call *does* return the text, so nobody reads the first half as a defence
+again.
+
+What bounds the surface is that nothing here names a file
+(`mcp_server.FILESYSTEM_TOOLS`, the fourth named absence beside the review,
+curative and human-only tiers). Nothing is lost: ingestion by reference (§5.7
+rule 2) keeps `ingest_url` for anything the server can fetch and
+`request_upload_url` for bytes the caller holds — which are the two doors a
+server the agent does not share a machine with needs anyway. `nodum ingest`
+still takes a path, on the CLI, where local access is already the trust
+boundary.
+
+## 2026-08-05 — `edge_scope` computes the node rule instead of restating it
+
+`node_scope_clause` scopes a `space`-typed node to its **own id**: space nodes
+live in meta, every agent reads meta for the type vocabulary, and filtering one
+on `space_id` alone hands every space in the file to any meta reader. That was
+M3. `edge_scope` kept the pre-M3 rule — `space_id IN (…)` for both endpoints —
+and `service._walk` loads both endpoints of every edge it follows, trusting
+that clause. So a `mentions` edge onto a space node, which wikilink
+materialisation writes whenever a readable note links a space by name, carried
+that space node's id *and its title* to an agent `get_node` refuses.
+
+Two copies of one rule, and the second was a year behind the first. `edge_scope`
+now calls `node_scope_clause` per endpoint, and `_walk` re-checks each endpoint
+row against `Store.node_visible` — the clause is the filter, the row check is
+the second layer, and a node read in the service that skips it is the shape of
+this defect. Both docstrings asserted the guarantee that did not hold; that is
+the tell, not the SQL.
+
+## 2026-08-05 — a failed login is nobody, and its refusal is not an event
+
+`events.actor` answers *who did this*. `human.login_failed` put the attempted
+name there, reasoning that a failure has no verified principal so the column
+should record what the attempt claimed — on the one `/api` route outside the
+session gate. `{"name": "human:owner"}` therefore wrote rows attributed to the
+seeded owner, with no credential presented, and `nodum events --actor
+human:owner` listed them beside the real owner's. The name is data about the
+attempt and lives in the payload; the actor is `UNAUTHENTICATED_ACTOR`, which
+carries neither identity prefix and so cannot be resolved to an account.
+
+A refusal by the lockout no longer writes an event either. It did, so that a
+guesser who kept trying kept the window fresh — true, and two defects: an
+unauthenticated request became an unbounded append to the append-only log, and
+any local process could hold the real human out forever by re-arming the window
+every quarter-hour. Sixty attempts on one name wrote sixty rows; they now write
+five, which are the failures that earned the lockout. Its refusals are a rate
+limit, and a rate limit that logs is a rate limit that can be turned around.
+
+Two things under it. `login` runs through `run_in_threadpool` like every other
+blocking route: argon2id is ~100 ms, spent on names that do not exist too, and
+this is the only route an unauthenticated caller reaches — inline, ten requests
+a second was a stopped server. And `0018` indexes `events(op, created_at)`,
+because `login_failure_count` runs on every attempt and was a full scan of the
+log with a `json_extract` per row: the check got slower with exactly the
+traffic it throttles. `EXPLAIN QUERY PLAN` reads `SEARCH events USING INDEX
+idx_events_op_created`, where it read `SCAN events`.
+
+**The residual, stated rather than defended**: the lockout is per name because
+it must not be an existence oracle, so an attacker cycling distinct names still
+appends a row per name. A global limit would fix that by handing the same
+attacker a way to lock the human out of their own graph, which is worse.
+
+## 2026-08-05 — the tag gate runs what the PR gate runs, and a test says so
+
+`release.yml`'s comment read "the matrix mirrors ci.yml's so the tag gate is
+not weaker than the PR gate". True of the matrix, false of the gate: ruff,
+pyright, the highest-resolution resolution leg and the whole frontend suite ran
+on pull requests only, so the artifact users install was gated more weakly than
+the branch it came from. Usually a tag names a commit that already passed
+ci.yml — and "usually" is what a release gate exists not to depend on. This
+project has already pushed a tag at a tree that was never the merged one
+(`v0.12.0` published a pre-merge state).
+
+The three missing jobs are in `release.yml` and in `build-and-publish`'s
+`needs`, and `tests/test_docs.py` reads both workflows and asserts the cover:
+the claim is checkable now rather than written down, and a job added to ci.yml
+fails the suite until somebody decides whether a release needs it. The
+highest-resolution leg matters most of the four — it is the leg that exists for
+an unbounded dependency major breaking a fresh resolution, which is a thing a
+*release* ships and a PR does not.

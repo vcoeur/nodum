@@ -25,6 +25,71 @@ jobs:
       - name: Run test suite
         run: uv run --locked --extra pdf pytest -q
 
+  # The three legs ci.yml runs that this workflow used to skip (finding M3).
+  # A tag push does not trigger ci.yml, and the comment on `build-and-publish`
+  # claimed the tag gate was "not weaker than the PR gate" while ruff, pyright,
+  # the ceiling resolution and the whole frontend suite ran on neither. Usually
+  # a tag names a commit that already passed ci.yml on its PR — but "usually"
+  # is what a release gate exists to not depend on, and this project has
+  # already pushed a tag at a tree that was never the merged one (v0.12.0
+  # published a pre-merge state).
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0 # hatch-vcs needs full history + tags to derive the version
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+      - name: Ruff check
+        run: uv run --locked ruff check .
+      - name: Ruff format check
+        run: uv run --locked ruff format --check .
+      - name: Pyright typecheck
+        run: uv run --locked --extra pdf pyright nodum
+
+  # The leg that exists *for* the class of break a release ships: an unbounded
+  # dependency major that resolves differently for a user than for the lock.
+  # Running it anywhere but the release path was the gap — `smoke` catches the
+  # import half of that class, and a behavioural break at the ceiling imports
+  # fine.
+  test-highest:
+    name: Tests (highest resolution)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0 # hatch-vcs needs full history + tags to derive the version
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+      - name: Resolve dependencies at their highest allowed versions
+        run: uv sync --upgrade --extra pdf
+      - name: Run test suite
+        run: uv run --extra pdf pytest -q
+
+  web:
+    name: Frontend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Set up Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Install the frontend dependencies
+        run: make web-install
+      - name: Frontend unit tests
+        run: make web-test
+      - name: Frontend lint
+        run: make web-lint
+
   smoke:
     name: Clean-install smoke
     runs-on: ubuntu-latest
@@ -57,9 +122,14 @@ jobs:
     name: Build and publish to PyPI
     # Never publish a wheel that fails tests, or one that fails to install and
     # self-describe clean — tag pushes do not trigger ci.yml, so the release
-    # workflow must gate on the suite itself. The matrix mirrors ci.yml's so the
-    # tag gate is not weaker than the PR gate.
-    needs: [test, smoke]
+    # workflow must gate on the suite itself.
+    #
+    # `needs` names every job ci.yml has, so the tag gate is not weaker than the
+    # PR gate — and that is now a checkable claim rather than a comment:
+    # `tests/test_docs.py` reads both workflows and asserts this list covers
+    # ci.yml's job set. It said this while ruff, pyright, the ceiling leg and
+    # the frontend suite ran on the PR only (finding M3).
+    needs: [lint, test, test-highest, web, smoke]
     runs-on: ubuntu-latest
     permissions:
       id-token: write   # required for OIDC trusted publishing

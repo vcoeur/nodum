@@ -107,13 +107,24 @@ nodum undo --as owner                # reverse the latest event
 ## Let an agent write
 
 Agents do not drive the CLI. Create an agent account and grant it access to a
-space, then run the MCP server:
+space:
 
 ```sh
 nodum agent create researcher --as owner     # prints a show-once token to stderr
 nodum grant researcher main suggest --as owner
-NODUM_AGENT_TOKEN=ndm_… nodum mcp serve      # the agent's surface, over stdio
 ```
+
+Then give the token to the **MCP client**, which launches `nodum mcp serve` for
+itself over stdio — there is no daemon to start and no port:
+
+```json
+{ "mcpServers": { "nodum": {
+    "command": "nodum", "args": ["mcp", "serve"],
+    "env": { "NODUM_AGENT_TOKEN": "ndm_…" }
+} } }
+```
+
+Full configuration, and why the token is never a flag: [Install](install.md#using-it-from-an-agent).
 
 Over MCP the agent's writes on `main` land `proposed` (the `suggest` grant) and
 wait in the review queue. Review them with the human CLI:
