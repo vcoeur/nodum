@@ -10,8 +10,8 @@ import pytest
 from nodum import db, embeddings, llm, service
 
 
-@pytest.fixture(autouse=True)
-def _never_the_real_database(tmp_path_factory, monkeypatch):
+@pytest.fixture(scope="session", autouse=True)
+def _never_the_real_database(tmp_path_factory):
     """Make the default database path unreachable for the whole test session.
 
     ``fresh_db`` points ``NODUM_DB`` at a temp file, but any test that unsets
@@ -27,8 +27,19 @@ def _never_the_real_database(tmp_path_factory, monkeypatch):
     Asserting on the constant's *value* would be the weaker move — this
     removes the reachable state instead (see the repo's own
     "structural tests don't hold invariants" finding).
+
+    The redirect only holds if it outlives the ``MonkeyPatch`` instance a test
+    can call ``undo()`` on — pytest hands out **one function-scoped instance
+    per test**, shared with every fixture and the test body, so a guard built
+    on the shared fixture is reverted by the very call it exists to survive.
+    This fixture therefore patches on its own session-scoped instance, and
+    ``tests/test_migrations.py`` exercises the hazard by calling ``undo()``
+    before asserting.
     """
-    monkeypatch.setattr(db, "DEFAULT_DB_PATH", tmp_path_factory.mktemp("default-db") / "nodum.db")
+    patch = pytest.MonkeyPatch()
+    patch.setattr(db, "DEFAULT_DB_PATH", tmp_path_factory.mktemp("default-db") / "nodum.db")
+    yield
+    patch.undo()
 
 
 class HashEmbedder:

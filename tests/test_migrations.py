@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import re
 import sqlite3
 from pathlib import Path
 
@@ -30,6 +31,8 @@ CORE_TABLES = {
 #: The type catalogs became type-nodes in 0009 (Q13) — the tables must be gone.
 DROPPED_TABLES = {"types", "edge_types"}
 
+ARCHITECTURE_DOC = Path(__file__).resolve().parents[1] / "docs" / "architecture.md"
+
 
 def test_no_test_can_reach_the_developers_own_database(monkeypatch):
     """The suite migrates whatever database it resolves, so an unset `NODUM_DB`
@@ -39,8 +42,16 @@ def test_no_test_can_reach_the_developers_own_database(monkeypatch):
     three asset tests then asserted against `~/.local/share/nodum/nodum.db`.
     `conftest._never_the_real_database` removes the reachable path entirely;
     this is the assertion that it stays removed.
+
+    The hazard is exercised, not assumed: `undo()` is called **before** the
+    assertion. The guard once patched on the shared function-scoped
+    `MonkeyPatch` instance, so a test calling `undo()` reverted the
+    `DEFAULT_DB_PATH` redirect along with `fresh_db`'s `NODUM_DB` — and a test
+    that never calls it could not see that. The guard now patches on its own
+    session-scoped instance, so the resolution still lands under the temp dir.
     """
     monkeypatch.delenv(db.ENV_DB_VAR, raising=False)
+    monkeypatch.undo()
 
     resolved = db.db_path()
 
@@ -91,6 +102,35 @@ def test_init_seeds_builtin_edge_types_with_inverses(fresh_db):
     # Inverse pairs are symmetric: the inverse of the inverse is the original.
     for name, edge_type in by_name.items():
         assert by_name[edge_type.inverse_name].inverse_name == name
+
+
+def test_architecture_doc_builtin_type_counts_match_the_seed_catalog():
+    """docs/architecture.md's §5.3 counts derive from the seed catalog.
+
+    The doc states the built-in counts by hand; this derives them from the
+    code instead — the 0002 seeds plus the two type-nodes 0009 bootstraps
+    (`type`, `space`), the same set
+    ``test_init_seeds_builtin_node_types`` asserts a fresh database holds.
+    A migration that adds a node or edge type without the doc being brought
+    along fails here, so the claim cannot silently go stale.
+    """
+    expected_nodes = len(set(SEED_NODE_TYPES) | {"type", "space"})
+    expected_edges = len(SEED_EDGE_TYPES)
+    doc = ARCHITECTURE_DOC.read_text(encoding="utf-8")
+
+    node_match = re.search(r"(\d+) node types", doc)
+    edge_match = re.search(r"(\d+) edge types", doc)
+    assert node_match is not None, "architecture.md lost its 'N node types' figure"
+    assert edge_match is not None, "architecture.md lost its 'N edge types' figure"
+
+    assert int(node_match.group(1)) == expected_nodes, (
+        f"architecture.md says {node_match.group(1)} node types; the seed catalog "
+        f"(SEED_NODE_TYPES + 0009's `type`/`space`) has {expected_nodes} — update the doc"
+    )
+    assert int(edge_match.group(1)) == expected_edges, (
+        f"architecture.md says {edge_match.group(1)} edge types; SEED_EDGE_TYPES has "
+        f"{expected_edges} — update the doc"
+    )
 
 
 def test_new_nodes_land_in_the_main_space(fresh_db):

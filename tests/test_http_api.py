@@ -677,16 +677,52 @@ WRITE_FUNCTIONS = {
 }
 
 
+#: Write (method, path-template) pairs this sweep deliberately does not enter,
+#: each with the reason. The reachability assertion fails a route that leaves
+#: the sweep's reach, so anything listed here is a route the sweep *cannot*
+#: enter, not one it happens not to. Empty today: the sweep reaches every write
+#: route (a 400 the handler's own validation produces counts as entered — the
+#: handler ran). The candidates the review floated were decided as follows:
+#: ``POST /api/ask`` and ``POST /api/summarize`` are entered on the missing
+#: ``question``/``node_id`` 400 without needing an LLM provider (and write
+#: nothing by design, E1); ``POST /api/ingest`` is entered on the neither-path-
+#: nor-url 400 *and* runs a real ingest via :data:`PDF_FIXTURE`. A route added
+#: later that genuinely cannot be reached here (one whose handler needs an
+#: external service no body can fake, say) must be listed here with its reason.
+UNREACHABLE_BY_DESIGN: frozenset[tuple[str, str]] = frozenset()
+
+
+def writable_pairs(app) -> set[tuple[str, str]]:
+    """Every state-changing (method, path-template) pair in the live route table.
+
+    The route table is the input, so a write route added tomorrow joins the
+    reachability assertion without anyone remembering it exists. The catch-all
+    ``/api/{path:path}`` is excluded: it claims every method and refuses
+    everything, and a sweep that "entered" it would have entered nothing.
+    """
+    pairs = set()
+    for route in app.routes:
+        path = getattr(route, "path", "")
+        if not path.startswith("/api/") or path == "/api/{path:path}":
+            continue
+        for method in ("POST", "PUT", "PATCH", "DELETE"):
+            if method in (route.methods or ()):
+                pairs.add((method, path))
+    return pairs
+
+
 def _swept_requests(
     app, ids: dict[str, str], name: str, password: str
 ) -> list[tuple[str, str, int]]:
     """Fire an actor-carrying request at every method of every route in ``app``.
 
     The route table is the input, so a handler added later is swept without
-    anyone remembering it exists. Several body shapes are tried because a rogue
-    handler's signature is unknown: a bare ``{"actor": …}`` reaches one that
-    forwards a whole body, and the fuller shapes reach one that also needs a
-    type or a title before it will do any work.
+    anyone remembering it exists. Every write route is fired with a body shape
+    its handler can act on (a real id per route family, real create bodies,
+    a real asset hash, live capability tokens) — the whole point of the sweep
+    is that the handler runs, because a request refused before the handler
+    proves nothing about attribution. A route the sweep cannot enter is a
+    failure (see the reachability assertion in the test), not a silence.
 
     The client drives behind a real session for ``name`` — and re-logs in
     whenever a request kills it (``POST /api/logout`` is in the table too),
@@ -701,35 +737,63 @@ def _swept_requests(
     """
     client = Client(app, session=_login(app, name, password))
     bodies = [
+        # A bare actor claim: reaches any handler that forwards a whole body.
         {"actor": AGENT},
-        {"type": "note", "title": "swept", "actor": AGENT},
-        {"type": "note", "title": "swept", "created_by": AGENT},
-        {
-            "type": "note",
-            "title": "swept",
-            "content": "swept",
-            "src_id": ids["node"],
-            "dst_id": ids["other"],
-            "ids": [ids["proposal"]],
-            "reason": "swept",
-            "rules": [],
-            "actor": AGENT,
-            "created_by": AGENT,
-            "updated_by": AGENT,
-        },
+        # A valid node create — the shape the M1 boundary accepts (extra=forbid
+        # refuses the actor claim in the body, so it rides the query string and
+        # the header instead).
+        {"type": "note", "title": "swept", "content": "swept"},
+        # A node update: a title-only PATCH.
+        {"title": "swept"},
+        # An edge create: real node ids and a real edge type.
+        {"src_id": ids["node"], "dst_id": ids["other"], "type": "relates_to"},
+        # A review batch: a real proposal id, plus the mandatory reject reason.
+        {"ids": [ids["proposal"]], "reason": "swept"},
+        # An account or space create.
+        {"name": "swept"},
+        # A password change.
+        {"password": "swept-password"},
+        # A grant (the revoke route reads the same agent/space keys).
+        {"agent": ids["agent"], "space": ids["space"], "level": "read"},
+        # An upload-grant mint.
+        {"name": "swept.png", "mime": "image/png", "size": 1000},
+        # A real server-side ingest of the committed PDF fixture.
+        {"path": str(PDF_FIXTURE), "actor": AGENT},
     ]
     fired: list[tuple[str, str, int]] = []
-    for route in app.routes:
-        path = route.path
-        for key, value in ids.items():
-            path = path.replace(f"{{{key}}}", value)
-        path = (
-            path.replace("{id}", ids["node"])
-            .replace("{type}", "note")
+
+    # Route templates use `{id}` generically; which real id substitutes is a
+    # per-family decision. The blanket node-id replacement this loop once made
+    # sent every account/agent/space/cycle/asset route to a 404 before its
+    # handler — the exact reach gap this sweep exists to close. The prefix
+    # decides the family; a route in none of them takes the node id.
+    def concrete(path: str) -> str:
+        for prefix, value in (
+            ("/api/humans", ids["human"]),
+            ("/api/agents", ids["agent"]),
+            ("/api/spaces", ids["space"]),
+            ("/api/cycles", ids["cycle"]),
+            ("/api/assets", ids["asset"]),
+        ):
+            if path.startswith(prefix):
+                path = path.replace("{id}", value)
+                break
+        else:
+            path = path.replace("{id}", ids["node"])
+        if "{token}" in path:
+            token = (
+                ids["upload-token"] if path.startswith("/api/uploads") else ids["download-token"]
+            )
+            path = path.replace("{token}", token)
+        return (
+            path.replace("{type}", "note")
             .replace("{agent}", AGENT)
             .replace("{profile}", "thumb")
             .replace("{path:path}", "swept")
         )
+
+    for route in app.routes:
+        path = concrete(route.path)
         for method in sorted(route.methods or set()):
             if method in ("GET", "HEAD", "OPTIONS"):
                 response = client.request(
@@ -740,7 +804,9 @@ def _swept_requests(
                     response = client.request(
                         method, f"{path}?actor={AGENT}", headers={"X-Actor": AGENT}
                     )
-                fired.append((method, path, response.status_code))
+                # The template path, not the concrete one: the reachability
+                # assertion compares against the route table's own templates.
+                fired.append((method, route.path, response.status_code))
                 continue
             # One part only: the upload handler caps multipart fields at one,
             # so the actor claim rides the filename, the query and the header.
@@ -752,7 +818,7 @@ def _swept_requests(
             if multipart.status_code == 401:
                 client = Client(app, session=_login(app, name, password))
                 multipart = client.request(method, f"{path}?actor={AGENT}", **multipart_kwargs)
-            fired.append((method, f"{path} (multipart)", multipart.status_code))
+            fired.append((method, f"{route.path} (multipart)", multipart.status_code))
             for body in bodies:
                 response = client.request(
                     method, f"{path}?actor={AGENT}", json=body, headers={"X-Actor": AGENT}
@@ -765,11 +831,11 @@ def _swept_requests(
                     response = client.request(
                         method, f"{path}?actor={AGENT}", json=body, headers={"X-Actor": AGENT}
                     )
-                fired.append((method, path, response.status_code))
+                fired.append((method, route.path, response.status_code))
     return fired
 
 
-def test_writes_are_attributed_to_the_sessions_human_and_nothing_else(fresh_db):
+def test_writes_are_attributed_to_the_sessions_human_and_nothing_else(fresh_db, tmp_path):
     """The session-attribution guarantee, as one property over the route table.
 
     This is the load-bearing test, and it knows nothing about how the boundary
@@ -793,15 +859,31 @@ def test_writes_are_attributed_to_the_sessions_human_and_nothing_else(fresh_db):
     ``created_by: "agent:evil"``. This test fails on it, because the row it
     writes is in the same database the assertion reads.
 
-    **One principal besides the session's human is allowed, and it is named.**
-    ``POST /api/cycles`` asks the consolidation runner to run, and the runner
-    writes as the in-process gardener because the gardener made those edits
-    (decision G4). That is a *domain* fact, not something the request chose:
-    the sweep therefore keeps asking its question of the thing a request could
-    actually influence — who **asked** — and asserts that every journal entry
-    the sweep produced records the session's human as the trigger, never the
-    agent identity every body, query and header claimed. The hole that
-    exemption could open is closed from the other side by
+    **It only proves anything about a route it actually entered** — a request
+    refused before the handler (404 on a wrong-id family, a 400 on a body the
+    handler never saw) writes nothing and proves nothing. The sweep therefore
+    seeds a real id per route family — a second human for ``/api/humans``, an
+    agent for ``/api/agents``, a space for ``/api/spaces``, a cycle for
+    ``/api/cycles``, an asset hash for ``/api/assets``, live capability tokens
+    for the two token routes — plus a body shape each create route accepts, so
+    the handlers actually run. The reachability assertion then derives the
+    required set from the live route table itself: **every** write route must
+    be entered, or the test fails. The integer floors it replaces could not
+    see a sweep that lost every write route — the five required successes
+    could all be ``GET``s.
+
+    **Two principals besides the session's human may appear, and each is
+    named.** ``POST /api/cycles`` asks the consolidation runner to run, and the
+    runner writes as the in-process gardener because the gardener made those
+    edits (decision G4); ``assets.EXTRACT_ACTOR`` (``"system"``) stamps the
+    ``asset.extract`` event an ingest's extraction writes, and is a module
+    constant no request can name. Both are *domain* facts, not something the
+    request could choose: the sweep therefore keeps asking its question of the
+    thing a request could actually influence — who **asked** — and asserts that
+    every journal entry the sweep produced records the session's human (or one
+    of the two fixed actors) as the trigger, never the agent identity every
+    body, query and header claimed. The hole that the gardener exemption could
+    open is closed from the other side by
     ``test_the_only_credential_path_is_the_session``, which forbids this module
     from minting the gardener itself.
     """
@@ -812,7 +894,37 @@ def test_writes_are_attributed_to_the_sessions_human_and_nothing_else(fresh_db):
     node = service.create_node(type="concept", title="Sweep target", principal=owner())
     other = service.create_node(type="concept", title="Sweep other", principal=owner())
     proposal = service.create_node(type="note", title="Sweep proposal", principal=agent(AGENT))
-    ids = {"node": node.id, "other": other.id, "proposal": proposal.id}
+    # Real ids of the right kind per route family: a node id in any of these
+    # slots is a 404 before the handler, which is precisely what the sweep is
+    # here to notice (review B10). The tokens are minted as the sweep's second
+    # human so the capability routes attribute their writes inside the allowed
+    # set. The cycle is `curative`, not a consolidation trigger, so the sweep's
+    # own `POST /api/cycles` runs can still open beside it.
+    target = service.create_human("target", principal=owner())
+    swept_agent = agent("swept-agent")
+    space = service.create_space("sweep-seed", principal=owner())
+    cycle = service.open_cycle(trigger="curative", principal=owner())
+    seed_file = tmp_path / "seed.txt"
+    seed_file.write_text("sweep asset bytes", encoding="utf-8")
+    seeded_asset = assets.register_asset(seed_file, name="seed.txt")
+    second_principal = auth.principal_from_actor(second_actor)
+    download = urls.mint_download(seeded_asset.hash, principal=second_principal)
+    upload = urls.mint_upload(
+        "swept.bin", "application/octet-stream", 32 * 1024, principal=second_principal
+    )
+    assert upload.grant is not None, "a mint without sha256 always grants a URL"
+    ids = {
+        "node": node.id,
+        "other": other.id,
+        "proposal": proposal.id,
+        "human": target.id,
+        "agent": swept_agent.id,
+        "space": space.id,
+        "cycle": cycle.id,
+        "asset": seeded_asset.hash,
+        "download-token": download.token,
+        "upload-token": upload.grant.token,
+    }
 
     before_seq = max((event.seq for event in service.list_events(owner(), limit=5000)), default=0)
     before_nodes = {row.id for row in service.list_nodes(principal=owner(), limit=5000)}
@@ -821,9 +933,20 @@ def test_writes_are_attributed_to_the_sessions_human_and_nothing_else(fresh_db):
 
     fired = _swept_requests(app, ids, "second", "second-pw")
 
-    # A sweep that never reached a handler would pass vacuously.
-    assert len(fired) >= 40, fired
-    assert sum(1 for _, _, status in fired if status < 300) >= 5, fired
+    # Reachability, derived from the route table rather than guessed: every
+    # write route must have at least one fire that got past the router and the
+    # middleware into the handler. A 400 the handler's own validation produces
+    # counts as entered (the handler ran); 404/405 mean the request never
+    # reached the handler (a wrong-id family, or a verb the route does not
+    # declare), 401/415 are the session gate and the media-type guard, and a
+    # 5xx is a handler that crashed — all of them fail the sweep.
+    entered = {
+        (method, path.removesuffix(" (multipart)"))
+        for method, path, status in fired
+        if status < 500 and status not in (401, 404, 405, 415)
+    }
+    missing = writable_pairs(app) - entered - UNREACHABLE_BY_DESIGN
+    assert missing == set(), f"the sweep never reached these write handlers: {sorted(missing)}"
     # And the multipart pass really did register an asset, rather than 415ing
     # at the guard the way the JSON bodies do (review N9).
     assert any(path.endswith("(multipart)") and status < 300 for _, path, status in fired), fired
@@ -832,7 +955,7 @@ def test_writes_are_attributed_to_the_sessions_human_and_nothing_else(fresh_db):
         event for event in service.list_events(owner(), limit=5000) if event.seq > before_seq
     ]
     assert new_events, "the sweep wrote nothing, so it proves nothing"
-    allowed = {second_actor, GARDENER_ACTOR}
+    allowed = {second_actor, GARDENER_ACTOR, assets.EXTRACT_ACTOR}
     offenders = [
         (event.op, event.seq, event.actor) for event in new_events if event.actor not in allowed
     ]
