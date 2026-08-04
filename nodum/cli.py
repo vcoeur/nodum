@@ -1624,7 +1624,7 @@ def agent_disable(
     agent_id: str = typer.Argument(..., help="Agent to disable."),
     as_human: str = AS_OPTION,
 ) -> None:
-    """Disable an agent (its token dies immediately; its proposals stay, reviewable)."""
+    """Disable an agent (its token stops verifying; its proposals stay, reviewable)."""
     _run(service.disable_agent, agent_id, principal=_principal(as_human))
     _print_json({"ok": True, "agent_id": agent_id, "disabled": True})
 

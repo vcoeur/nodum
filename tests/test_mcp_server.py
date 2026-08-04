@@ -218,6 +218,65 @@ def test_create_server_rejects_a_token_whose_owner_is_disabled(fresh_db):
         create_server(token=created.token)
 
 
+def test_a_disabled_agent_stops_writing_at_its_next_call(fresh_db):
+    """B5 regression: the principal is re-verified per call, not snapshotted.
+
+    ``create_server`` used to verify the token once and capture the principal
+    in the closure, so ``disable_agent`` never bit a running server — a
+    disabled agent kept writing until the process exited. Every tool call now
+    re-verifies the token, so the disable lands on the next call, writes and
+    reads alike.
+    """
+
+    async def scenario(session):
+        first = await _call(session, "create_node", {"type": "note", "title": "Before disable"})
+        service.disable_agent("tester", principal=owner())
+        write = await _call(session, "create_node", {"type": "note", "title": "After disable"})
+        read = await _call(session, "get_node", {"id": "whatever"})
+        return first, write, read
+
+    first, write, read = _run(scenario)
+
+    assert not first.isError
+    assert write.isError and "invalid credentials" in write.content[0].text
+    assert read.isError
+    # Refused means refused: only the pre-disable write exists.
+    assert [n.title for n in service.list_nodes(principal=owner(), limit=50)] == ["Before disable"]
+
+
+def test_archiving_a_space_stops_the_grant_at_the_next_call(fresh_db):
+    """B5 regression: the grant set is re-loaded per call, so archiving bites.
+
+    ``auth._grant_set`` drops grants on archived spaces at verification time;
+    with a mint-time snapshot a running server kept writing into a space the
+    human had archived, because the grant set was fixed at launch.
+    """
+    seed_space("research")
+    grants = {"meta": "read", "main": "suggest", "research": "suggest"}
+
+    async def scenario(session):
+        first = await _call(
+            session,
+            "create_node",
+            {"type": "note", "title": "Before archive", "space": "research"},
+        )
+        service.archive_space("research", principal=owner())
+        second = await _call(
+            session,
+            "create_node",
+            {"type": "note", "title": "After archive", "space": "research"},
+        )
+        return first, second
+
+    first, second = _run(scenario, grants=grants)
+
+    assert not first.isError
+    assert second.isError
+    # The archived space reads exactly like one that never existed (non-oracle).
+    assert "unknown space" in second.content[0].text
+    assert [n.title for n in service.list_nodes(principal=owner(), limit=50)] == ["Before archive"]
+
+
 # ── Additive tier: writes are attributed and land proposed ────────────────────
 
 
@@ -787,7 +846,11 @@ def _url(server, path: str) -> str:
 
 
 def test_ingest_file_takes_a_local_path_and_writes_the_subgraph(fresh_db, tmp_path):
-    """Ingestion by reference: the path crosses MCP, the bytes never do."""
+    """Ingestion by reference: the path crosses MCP, the bytes never do.
+
+    The result is the describing subgraph — the text itself never comes back
+    over MCP (M4), so what is asserted is structure, not content.
+    """
     source = tmp_path / "hydrology.txt"
     source.write_text("Vercingetorix basin hydrology", encoding="utf-8")
 
@@ -798,7 +861,8 @@ def test_ingest_file_takes_a_local_path_and_writes_the_subgraph(fresh_db, tmp_pa
     assert out["created"] is True
     assert out["extraction"]["handler"] == "text"
     assert out["asset_ref"]["props"]["asset_hash"] == out["asset"]["hash"]
-    assert "hydrology" in out["source"]["content"]
+    assert "extracted_text" not in out["asset"]
+    assert "content" not in out["source"]
     (edge,) = out["edges"]
     assert (edge["src_id"], edge["dst_id"], edge["type"]) == (
         out["source"]["id"],
@@ -822,7 +886,7 @@ def test_ingest_file_routes_an_http_url_to_the_fetch_path(fresh_db, fixture_serv
 
     out = result.structuredContent
     assert out["extraction"]["handler"] == "html"
-    assert out["source"]["content"] == "Basin hydrology"
+    assert "content" not in out["source"]
     assert out["asset_ref"]["props"]["url"].endswith("/article")
 
 
@@ -891,6 +955,48 @@ def test_ingest_file_refuses_a_path_that_is_not_a_file(fresh_db, tmp_path):
 
     assert result.isError
     assert "not a file" in result.content[0].text
+
+
+def test_ingest_file_returns_the_describing_subgraph_but_never_the_text(fresh_db, tmp_path):
+    """M4 regression: the ingest result carries no extracted text over MCP.
+
+    The tool is auto-approve (``destructiveHint=False``), and echoing the full
+    extraction in the result would hand any token-bearing agent the contents
+    of any file the server can read — so the describing subgraph comes back
+    (ids, spaces, states, extraction statistics) and the text does not. The
+    scoped read path is untouched: ``get_asset`` still returns the text once
+    the describing node is readable.
+    """
+    source = tmp_path / "hydrology.txt"
+    source.write_text("Vercingetorix basin hydrology", encoding="utf-8")
+
+    out = _run(
+        lambda session: _call(session, "ingest_file", {"path_or_url": str(source)})
+    ).structuredContent
+
+    # The describing subgraph is the result: identities, states, statistics.
+    assert out["created"] is True
+    assert out["asset"]["hash"] == out["asset_ref"]["props"]["asset_hash"]
+    assert out["extraction"]["handler"] == "text"
+    assert out["extraction"]["chars"] == len("Vercingetorix basin hydrology")
+    assert out["source"]["id"] and out["source"]["state"] == "proposed"
+
+    # The text itself is not in the message — omitted, not blanked.
+    assert "extracted_text" not in out["asset"]
+    assert "content" not in out["source"]
+    assert all("content" not in page for page in out["pages"])
+    # The bytes were still ingested and described in the database.
+    assert service.list_nodes(type="source", principal=owner(), limit=50)
+
+    # And the scoped read path is intact: once a describing node is active,
+    # get_asset hands the text back through the ordinary grant-confined read.
+    service.accept_proposals([out["asset_ref"]["id"]], principal=owner())
+    fetched = _run(
+        lambda session: _call(session, "get_asset", {"id_or_hash": out["asset"]["hash"]})
+    )
+    assert not fetched.isError
+    metadata = json.loads(fetched.content[0].text)
+    assert "Vercingetorix basin hydrology" in metadata["extracted_text"]
 
 
 # ── The escape hatch: a logged, single-use URL to the original bytes ──────────

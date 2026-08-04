@@ -2719,7 +2719,8 @@ def create_app(
         return EnvelopeResponse({"agent_id": agent_id, "token": token})
 
     async def disable_agent(request: Request) -> Response:
-        """Disable an agent — its token dies immediately."""
+        """Disable an agent — its token dies immediately on HTTP; a running MCP
+        server stops at its next call."""
         agent_id = request.path_params["id"]
         _write(request, service.disable_agent, agent_id, path=db_path)
         return EnvelopeResponse({"ok": True, "agent_id": agent_id, "disabled": True})
