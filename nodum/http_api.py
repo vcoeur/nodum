@@ -109,20 +109,33 @@ half of the audit trail — so who tried the password is on record even though
 the password itself never is. ``nodum serve`` says so at startup rather than
 leaving it implicit.
 
-Handlers call the service inline rather than through a thread pool: the service
-opens one short-lived connection per call and SQLite has a single writer
-anyway, so a local single-user server gains nothing from concurrency here and
-stays much easier to reason about.
+Most handlers call the service inline: the service opens one short-lived
+connection per call and SQLite has a single writer anyway, so a local
+single-user server gains nothing from concurrency for a read of a row or a
+single-row write, and the inline calls stay much easier to reason about. The
+exceptions are the work a single request can make the loop wait on for a
+perceptible time — one 20.8 MB ingest was measured holding it for 20.8 s and
+680 MB of RSS — and every one of them runs through
+:func:`~starlette.concurrency.run_in_threadpool`:
 
-**One handler is the exception, and it is the one that is not a read of a
-row.** ``POST /api/cycles`` runs a whole consolidation cycle, which is every
-job over every node in scope — measured at 3.75 s on 450 nodes with no
-embedding provider, and minutes on a real graph with one. Inline, that is not a
-slow request, it is a **stopped server**: the event loop is single-threaded, so
-``/healthz``, the SPA and every other tab stall for exactly as long as the
-cycle runs. :mod:`nodum.scheduler` already made this argument for the nightly
-half and answered it with :func:`asyncio.to_thread`; the on-demand half is the
-one a human is actually watching, so it runs through
+* the **read-heavy routes** — ``GET /api/search`` (a 400-term query held the
+  loop for 126 ms), ``POST /api/ask`` and ``POST /api/summarize``, each a model
+  call on top of graph work;
+* every **blocking write** — ``POST /api/assets`` and
+  ``PUT /api/uploads/{token}`` (registration streams up to a 1 GB blob),
+  ``POST /api/ingest`` (a fetch, then register/extract/describe),
+  ``GET /api/assets/{id}/rendition/{profile}`` (Pillow decode or pypdfium2
+  rasterisation on a miss), and the original download's spool; and
+* ``POST /api/cycles``, which runs a whole consolidation cycle — every job
+  over every node in scope — measured at 3.75 s on 450 nodes with no embedding
+  provider, and minutes on a real graph with one.
+
+Inline, any of those is not a slow request, it is a **stopped server**: the
+event loop is single-threaded, so ``/healthz``, the SPA and every other tab
+stall for exactly as long as the work runs. :mod:`nodum.scheduler` already made
+this argument for the nightly half and answered it with
+:func:`asyncio.to_thread`; the on-demand half is the one a human is actually
+watching, so it runs through
 :func:`~starlette.concurrency.run_in_threadpool` for the same reason. The
 identity boundary is untouched: what goes to the thread is :func:`_write`
 itself, so the principal is still bound in the one place this module binds one.
@@ -2275,7 +2288,9 @@ def create_app(
         The upload is spooled to a temp file and handed to the existing
         ``assets.register_asset``, so this path inherits its sha256 dedup, its
         blob-limit check, and its hash/copy cross-check rather than growing a
-        second registration path with weaker guarantees.
+        second registration path with weaker guarantees. The registration
+        streams the whole file and runs off the event loop; the admission
+        checks below read only the file's header and stay inline.
 
         Three checks happen before the bytes are offered to the store, and each
         one exists because the version without it was exploitable:
@@ -2318,7 +2333,13 @@ def create_app(
                     pixel_limit=assets.MAX_IMAGE_PIXELS,
                     cli_hint=False,
                 )
-                asset = assets.register_asset(spooled, name=original_name, path=db_path)
+                # register_asset streams the whole file (up to the 1 GB blob
+                # limit) into the store, hashing and copying it — the M22
+                # measured case — so it runs off the event loop. The refusal
+                # above reads only the header and stays inline.
+                asset = await run_in_threadpool(
+                    assets.register_asset, spooled, name=original_name, path=db_path
+                )
         return EnvelopeResponse(envelope(asset))
 
     async def list_assets(request: Request) -> Response:
@@ -2342,8 +2363,14 @@ def create_app(
 
         Renditions only (design §5.7): ``thumb`` and ``preview`` are the whole
         vocabulary, and originals are never served — here or anywhere else.
+
+        A cache miss renders the image — Pillow decode, or pypdfium2
+        rasterisation for a PDF page, which is seconds on a big document — so
+        the render runs off the event loop (M22). The stored-bytes read that
+        follows is a bounded WebP and stays inline.
         """
-        rendition = assets.get_rendition(
+        rendition = await run_in_threadpool(
+            assets.get_rendition,
             request.path_params["id"],
             profile=request.path_params["profile"],
             principal=_session_principal(request),
@@ -2372,13 +2399,25 @@ def create_app(
         is itself a loopback service. Both are properties of a human-only
         surface behind a password, and they are exactly why this route is
         inside the session gate while the two token routes below are not.
+
+        The ingest itself — fetch, register, extract, describe — is the M22
+        measured case (20.8 s for one 20.8 MB PDF, holding the loop the whole
+        time) and runs off the event loop through
+        :func:`~starlette.concurrency.run_in_threadpool`; :func:`_write` is
+        what goes to the thread, so the principal is still bound in the one
+        place this module binds one.
         """
         body = await _json_body(request)
         by_url = body.get("url") is not None
         if by_url == (body.get("path") is not None):
             raise ValueError("ingest takes exactly one of 'path' and 'url'")
         operation = ingest.ingest_url if by_url else ingest.ingest_file
-        result = _write(
+        # An ingest fetches (url branch), registers up to a gigabyte, extracts
+        # and describes — the M22 measured case — so, like POST /api/cycles,
+        # what goes to the thread is _write itself and the principal is still
+        # bound in the one place this module binds one.
+        result = await run_in_threadpool(
+            _write,
             request,
             operation,
             _required_str(body, "url" if by_url else "path"),
@@ -2463,10 +2502,15 @@ def create_app(
         The bytes are spooled to a temp file and streamed back rather than
         held in memory or pinned to the database for the client-paced
         transfer, and served as an opaque attachment nothing will render: see
-        :data:`DOWNLOAD_CONTENT_TYPE`.
+        :data:`DOWNLOAD_CONTENT_TYPE`. The spool copies the whole original (up
+        to the 1 GB blob limit) and runs off the event loop (M22); only the
+        streaming back is client-paced.
         """
         row = urls.consume(request.path_params["token"], kind="download", path=db_path)
-        return _original_response(row["asset_hash"], db_path)
+        # _original_response copies the whole original (up to the 1 GB blob
+        # limit) into a spool file before anything streams — the same big-read
+        # class as the M22 routes — so the copy runs off the event loop.
+        return await run_in_threadpool(_original_response, row["asset_hash"], db_path)
 
     async def upload_original(request: Request) -> Response:
         """Spend an upload token and store the raw request body as an asset.
@@ -2526,6 +2570,10 @@ def create_app(
         window too. An ingest nobody is listening for is a graph change with
         no party able to read its outcome — and the retry, which must re-mint
         anyway, would find its document already described.
+
+        The ingest itself registers up to a gigabyte and describes it — the M22
+        measured class — so it runs off the event loop through
+        :func:`~starlette.concurrency.run_in_threadpool`.
         """
         row = urls.consume(request.path_params["token"], kind="upload", path=db_path)
         max_bytes = row["max_bytes"]
@@ -2555,7 +2603,9 @@ def create_app(
             )
             if await request.is_disconnected():
                 raise ClientDisconnect()
-            result = ingest.ingest_upload(row, spooled, path=db_path)
+            # ingest_upload registers up to a gigabyte and describes it — the
+            # M22 measured class — so it runs off the event loop.
+            result = await run_in_threadpool(ingest.ingest_upload, row, spooled, path=db_path)
         return EnvelopeResponse(envelope(result))
 
     # ── Event log, undo, export ───────────────────────────────────────────
@@ -2621,13 +2671,14 @@ def create_app(
         things ``GET /api/cycles/{id}`` returns, so a caller that just ran one
         needs no second request to render it.
 
-        **It runs off the event loop.** Every other handler here calls the
-        service inline, which is right for a read of a row; a cycle is every job
-        over every node in scope, and inline it would hold the single-threaded
-        loop for its whole length — 3.75 s measured on 450 nodes without
-        embeddings, minutes with them — so ``/healthz`` and the SPA would freeze
-        with it. What is handed to the thread is :func:`_write`, not the runner,
-        so the principal is still bound where this module binds every principal.
+        **It runs off the event loop.** It joins the other read-heavy and
+        blocking handlers on the thread pool for the same reason: a cycle is
+        every job over every node in scope, and inline it would hold the
+        single-threaded loop for its whole length — 3.75 s measured on 450
+        nodes without embeddings, minutes with them — so ``/healthz`` and the
+        SPA would freeze with it. What is handed to the thread is
+        :func:`_write`, not the runner, so the principal is still bound where
+        this module binds every principal.
         """
         body = await _json_body(request)
         result = await run_in_threadpool(

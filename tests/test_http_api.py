@@ -2981,6 +2981,79 @@ def test_a_page_raster_reaches_the_rendition_route_through_its_colon(client, fre
     assert client.get(f"{base}/thumb").status_code == 400
 
 
+def test_the_blocking_routes_run_their_service_call_off_the_event_loop(
+    client, fresh_db, tmp_path, fixture_server, monkeypatch
+):
+    """M22: the upload, ingest and rendition service calls never run on the loop.
+
+    There is no way to assert "the loop was not blocked" from inside the
+    process, but there is a way to assert the mechanism that keeps it free:
+    each blocking service call must run on a worker thread, never the loop's.
+    Every one of them is wrapped in a recorder that runs the real function and
+    remembers the thread it ran on; the harness drives one ``asyncio.run`` per
+    request on the main thread, so a call that stayed inline would record the
+    main thread and fail the final assertion.
+    """
+    recordings: list[tuple[str, threading.Thread]] = []
+
+    def off_loop(name: str):
+        def decorate(func):
+            def wrapper(*args, **kwargs):
+                recordings.append((name, threading.current_thread()))
+                return func(*args, **kwargs)
+
+            return wrapper
+
+        return decorate
+
+    # POST /api/assets — registration streams the whole file into the store.
+    monkeypatch.setattr(assets, "register_asset", off_loop("register_asset")(assets.register_asset))
+    payload = _png_bytes()
+    uploaded = _ok(client.post("/api/assets", files={"file": ("photo.png", payload, "image/png")}))
+    assert uploaded["hash"] == hashlib.sha256(payload).hexdigest()
+
+    # GET /api/assets/{id}/rendition/thumb — a miss renders (Pillow/pypdfium2).
+    monkeypatch.setattr(assets, "get_rendition", off_loop("get_rendition")(assets.get_rendition))
+    rendition = client.get(f"/api/assets/{uploaded['hash']}/rendition/thumb")
+    assert rendition.status_code == 200, rendition.text
+    assert Image.open(io.BytesIO(rendition.content)).format == "WEBP"
+
+    # POST /api/ingest — both branches: a local path, then a server-side fetch.
+    source = tmp_path / "hydrology.txt"
+    source.write_text("Vercingetorix basin hydrology", encoding="utf-8")
+    monkeypatch.setattr(ingest, "ingest_file", off_loop("ingest_file")(ingest.ingest_file))
+    ingested = _ok(client.post("/api/ingest", json={"path": str(source), "title": "Basin"}))
+    assert ingested["created"] is True
+    assert ingested["source"]["title"] == "Basin"
+    fixture_server.canned = (
+        b"<html><body><p>Basin hydrology</p></body></html>",
+        "text/html; charset=utf-8",
+    )
+    monkeypatch.setattr(ingest, "ingest_url", off_loop("ingest_url")(ingest.ingest_url))
+    fetched = _ok(
+        client.post("/api/ingest", json={"url": _fixture_url(fixture_server, "/article")})
+    )
+    assert fetched["extraction"]["handler"] == "html"
+
+    # PUT /api/uploads/{token} — the capability route: no session at all.
+    grant = _mint_upload(client, "scan.png", len(payload))["grant"]
+    monkeypatch.setattr(ingest, "ingest_upload", off_loop("ingest_upload")(ingest.ingest_upload))
+    redemption = _ok(Client(client.app).put(grant["url"], guard=False, content=payload))
+    assert redemption["asset"]["hash"] == uploaded["hash"]  # same bytes: dedup
+
+    recorded = {name for name, _ in recordings}
+    assert recorded == {
+        "register_asset",
+        "get_rendition",
+        "ingest_file",
+        "ingest_url",
+        "ingest_upload",
+    }, f"every blocking call must have run: {recorded}"
+    main = threading.main_thread()
+    inline = [name for name, thread in recordings if thread is main]
+    assert inline == [], f"blocking calls ran on the event loop: {inline}"
+
+
 def test_healthz_reports_liveness_and_not_the_database_path(fresh_db):
     """A probe needs ``status``, not a filesystem tour.
 

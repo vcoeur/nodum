@@ -781,10 +781,17 @@ commands on a saved node for exactly this reason.
   `SIGKILL` or a shutdown mid-nightly-run makes its own writes irreversible
   until somebody closes it, and `POST /api/cycles` is here because a schedule
   that is off by default would otherwise leave the journal empty forever.
-  **`POST /api/cycles` and `GET /api/search` are the handlers that do not call
-  the service inline** — both go through `run_in_threadpool`. Every other
-  handler here is a
-  read or a single-row write, where inline is right; a cycle is every job over
+  **The handlers that do not call the service inline are the read-heavy routes
+  and the blocking writes** — `GET /api/search` (both branches; one 400-term
+  query measured holding the loop 126 ms), `POST /api/ask` and
+  `POST /api/summarize` (model calls), `POST /api/assets` and
+  `PUT /api/uploads/{token}` (registration streams up to a 1 GB blob),
+  `POST /api/ingest` (a fetch, then register/extract/describe — one 20.8 MB
+  PDF measured 20.8 s and 680 MB of RSS holding the loop), the rendition route
+  (Pillow decode, or pypdfium2 rasterisation on a miss), the download route's
+  spool, and `POST /api/cycles` — all through `run_in_threadpool`. Every other
+  handler here is a read of a row or a single-row write, where inline is
+  right; a cycle is every job over
   every node in scope (3.75 s measured on 450 nodes with no embeddings, minutes
   with them) and the event loop is single-threaded, so inline it froze
   `/healthz`, the SPA and every other tab for the length of the run —
@@ -2092,10 +2099,13 @@ commands on a saved node for exactly this reason.
   asserted to be covered by `extract.handler_for` rather than merely claimed to
   be. **A signature is definite evidence and the text heuristic is weak
   evidence**, which is the whole of the stored-MIME rule (`_stored_mime`): a
-  signature may overrule a name from another family — PDF bytes called
-  `scan.txt` land as `application/pdf`, which is what `page:<n>` rasters and
-  extraction dispatch on — while the name keeps its specificity *within* a
-  family, and the text heuristic may only **fill in** where the name guessed
+  signature always beats the name, whatever family it guessed — PDF bytes
+  called `scan.txt` *or* `report.json` land as `application/pdf`, which is
+  what `page:<n>` rasters and extraction dispatch on (the same-family case was
+  the hole: an `application/*` name kept its answer against an
+  `application/*` signature, so a real PDF called `report.json` was stored as
+  JSON and its bytes decoded as garbage text, finding M25) — and the text
+  heuristic may only **fill in** where the name guessed
   nothing. That last clause is load-bearing: an uncompressed PDF whose `%PDF-`
   sits one byte in sniffs as text, and letting that win cost the document its
   handler, its page rasters, and put raw PDF bytes into the FTS index. It is also
@@ -3438,7 +3448,11 @@ Phase-1 decision log.
   branches, not just `?nl=1`: the ordinary branch catches two projectors up and
   probes the index once per query term, and one 400-term `GET` (a 4 KB query
   string, nothing exotic) was measured holding the loop **126 ms** with every
-  other tab waiting behind it. Those two are the whole exception list. **The caveat is the write lock, and it is
+  other tab waiting behind it. The other read-heavy routes (`POST /api/ask`,
+  `POST /api/summarize`) run off the loop for the same reason, and so do the
+  blocking writes M22 measured: `POST /api/assets`, `POST /api/ingest`,
+  `PUT /api/uploads/{token}`, the rendition route and the download spool —
+  one 20.8 MB ingest held the loop **20.8 s** at **680 MB** of RSS. **The caveat is the write lock, and it is
   measured**: the loop is free, but a `GET /api/nodes` issued while a cycle runs
   waited **1168 ms** against **5 ms** on an idle server, because SQLite has one
   writer and a reader queues behind the burst holding it. A client that times
