@@ -1540,6 +1540,11 @@ def ask(
         _offered_hit(index, hit, principal=principal, path=path)
         for index, hit in enumerate(result.hits, start=1)
     ]
+    # The empty case is honest, and unreachable by accident since finding M20:
+    # the vector arm carries a similarity floor (search._VECTOR_MIN_SIMILARITY),
+    # so a query whose term exists in no document returns no hits even when an
+    # embedding provider is present — the model is never offered the nearest
+    # unrelated chunks to cite as fact.
     if not retrieved:
         return AskOut(
             question=question,

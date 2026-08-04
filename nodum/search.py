@@ -27,19 +27,15 @@ got the corpus to say it with. They never decide a search on their own: a query
 the graph knows no content word of answers with **nothing from the keyword
 arm**, rather than with the notes that happen to share its phrasing.
 
-**That refusal is the keyword arm's, and it is not the whole of `search`.**
-:func:`_search_vector` has no similarity threshold — the ANN list is always
-``k`` deep — so on an install that *has* an embedding provider the vector arm
-answers the query the keyword arm just refused, and the caller gets ``k`` hits
-each carrying the ``vector`` signal alone. On the default install, which has no
-provider, the refusal is the whole answer. Both are pinned:
-``tests/test_search.py`` for the keyword arm, ``tests/test_hybrid_search.py``
-for what the vector arm does beside it. Closing the gap means a similarity
-floor, and a floor is a number nothing here can measure yet: it needs a real
-embedding model over a real graph, because the test provider's similarity is
-token overlap and every threshold measured against it would look free while
-costing the paraphrase recall the vector arm exists for. Until then the
-disagreement is stated rather than papered over.
+**The refusal is the whole of `search`.** :func:`_search_vector` carries a
+similarity floor (:data:`_VECTOR_MIN_SIMILARITY`): a chunk whose cosine to
+the query is below the bar never enters the KNN result, so on an install
+that *has* an embedding provider a query the keyword arm just refused
+answers with nothing from the vector arm either — the nearest unrelated
+chunks are no longer "evidence" for a term the graph has never seen. Both
+arms are pinned: ``tests/test_search.py`` for the keyword arm,
+``tests/test_hybrid_search.py`` for the vector floor and what each arm
+contributes beside the other.
 
 Both projectors are caught up before querying, so search always reflects the
 latest committed events without a manual projector run.
@@ -74,6 +70,42 @@ _RRF_K = 60
 #: ANN candidates fetched per query before aggregating chunks to nodes —
 #: several chunks can belong to the same node, so the raw list is wider.
 _VECTOR_CANDIDATES = 32
+
+#: The vector signal's similarity floor, in cosine-similarity units: a chunk
+#: is evidence only when its embedding's cosine to the query is at least this
+#: high, and everything below it never enters the KNN result. That is what
+#: stops the vector arm from answering a query the graph has never seen one
+#: content word of (finding M20): with no floor the ANN list is always ``k``
+#: deep, so an absent term was answered ``k`` deep from the nearest unrelated
+#: chunks, which /ask then cited as confident fact.
+#:
+#: **The metric.** ``node_vec`` is a vec0 table declared with
+#: ``distance_metric=cosine`` (migration 0006), and sqlite-vec's cosine
+#: distance is ``1 - cosine_similarity`` — measured, not assumed: identical
+#: vectors land at 0.0, orthogonal at 1.0, opposite at 2.0. The stored chunk
+#: vectors are the provider's raw output (``VecProjector`` embeds without
+#: normalising) and the query vector comes from the same provider; cosine
+#: distance is scale-invariant, so neither normalisation enters the metric.
+#: The floor is stated here in similarity and applied as
+#: :data:`_VECTOR_MAX_DISTANCE`, in the ``distance`` column's units.
+#:
+#: **The value.** 0.5 means a returned chunk shares at least half of its
+#: direction with the query (angle ≤ 60°): it agrees more than it disagrees.
+#: A 0.6 floor would be the honest first guess for the default model
+#: (``paraphrase-multilingual-MiniLM-L12-v2``, whose paraphrase pairs land
+#: well above it), but it would drop the test provider's genuine seeded
+#: matches: ``HashEmbedder`` similarity *is* token overlap, so the weakest
+#: genuine match in this suite sits at exactly 0.5 ("xylem" against a
+#: four-token "xylem vessels carry water") with "xylem carries sap" at 0.577.
+#: Measured against that provider, 0.5 keeps every genuine seeded match and
+#: drops every disjoint one (all at cosine 0.0); the absent-term shape lands
+#: at 0.0 as well. The constant is tunable per model: a model whose
+#: unrelated-pair distribution overlaps 0.5 should raise it.
+_VECTOR_MIN_SIMILARITY = 0.5
+
+#: The floor in the ``distance`` column's units — ``1 - cos_sim`` for the
+#: vec0 cosine metric (see :data:`_VECTOR_MIN_SIMILARITY`).
+_VECTOR_MAX_DISTANCE = 1.0 - _VECTOR_MIN_SIMILARITY
 
 #: One-hop graph-expansion weights by edge type (design §7); unlisted types
 #: default to 0.5. The edge's confidence (default 1.0) multiplies the weight.
@@ -729,14 +761,15 @@ def _search_vector(
 
     The raw KNN pulls :data:`_VECTOR_CANDIDATES` chunks (a node can own
     several), then each node keeps its closest chunk's distance and text.
-    There is no similarity threshold — the ANN list is always ``k`` deep,
-    which is exactly what RRF expects: a weak vector hit still fuses, just
-    with a small contribution.
-
-    The cost of that is :func:`_compile_match`'s refusal not reaching here: a
-    query whose content words the graph has never seen is answered ``k`` deep
-    by this function, vector-signal-only, while the keyword arm returns
-    nothing. See the module docstring for why a floor is not simply added.
+    The KNN is floored by similarity: a chunk within
+    :data:`_VECTOR_MIN_SIMILARITY` of the query enters the join, and one
+    below it never does — the predicate sits on the ANN itself, so a node
+    whose *best* chunk is below the bar has no group and no hit, and the
+    list can come back shorter than ``k``, or empty. That is what makes the
+    keyword arm's refusal the whole of ``search`` (finding M20): a query
+    whose content words the graph has never seen is no longer answered
+    ``k`` deep from the nearest unrelated chunks, and fusion sees only hits
+    that cleared the bar.
 
     **Only the active provider's chunks enter the join** (finding M13):
     ``model_id`` is the id of the provider that embedded ``query_vector`` —
@@ -757,7 +790,7 @@ def _search_vector(
         FROM (
             SELECT rowid AS chunk_id, distance
             FROM node_vec
-            WHERE embedding MATCH ? AND k = ?
+            WHERE embedding MATCH ? AND k = ? AND distance <= ?
         ) AS knn
         JOIN chunks c ON c.id = knn.chunk_id
         JOIN nodes n ON n.id = c.node_id
@@ -769,6 +802,7 @@ def _search_vector(
         (
             sqlite_vec.serialize_float32(query_vector),
             max(k * 4, _VECTOR_CANDIDATES),
+            _VECTOR_MAX_DISTANCE,
             model_id,
             *params,
             k,

@@ -881,10 +881,9 @@ def test_a_report_built_from_the_environment_is_strict_json(monkeypatch):
     assert "Infinity" not in rendered
 
 
-def test_the_report_key_and_the_props_key_are_named_once():
-    """The later waves splice these in; a second spelling would be a second home."""
+def test_the_report_key_is_named_once():
+    """The later waves splice it in; a second spelling would be a second home."""
     assert agent.REPORT_KEY == "llm"
-    assert agent.GENERATED_BY_PROP == "generated_by"
 
 
 # ── Provenance (A1–A3) ────────────────────────────────────────────────────────
@@ -896,13 +895,6 @@ def test_generated_by_carries_three_fields_and_no_cost():
         provider="fake://provider", model_id="fake-model", prompt_version="abc123def456"
     )
     assert set(provenance.model_dump()) == {"provider", "model_id", "prompt_version"}
-    assert provenance.as_props() == {
-        "generated_by": {
-            "provider": "fake://provider",
-            "model_id": "fake-model",
-            "prompt_version": "abc123def456",
-        }
-    }
 
 
 def test_a_prompt_version_changes_when_and_only_when_the_template_does():

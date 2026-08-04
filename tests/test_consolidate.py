@@ -1778,9 +1778,31 @@ def test_a_chain_is_not_dense(fresh_db):
     assert "not dense" in skip["reason"]
 
 
+def _synthesis_node(principal, title):
+    """A concept written the way the abstraction job writes it: by the
+    gardener, filed ``proposed``, carrying the synthesis marker in the props
+    of the same call that emits the create event — the shape the freshness
+    gate's event-log verification accepts (M21)."""
+    return service.create_node(
+        type="concept",
+        title=title,
+        content="synthesised from the members",
+        landing="proposed",
+        props={"synthesized": True, "members": [], "job": consolidate.JOB_ABSTRACTION},
+        principal=principal,
+    )
+
+
 def test_a_synthesized_member_is_not_resynthesized(fresh_db):
-    """Both halves of the freshness gate: the member's own flag, or a
-    ``derived_from`` edge from a synthesized node.
+    """Both halves of the freshness gate: a member's own verified synthesis,
+    or a ``derived_from`` edge from a verified synthesis node.
+
+    "Verified" is the point (M21): the gate reads ``props.synthesized``
+    through the node's create event — the flag alone, forged on a node an
+    ordinary agent wrote, must not skip a cluster. The syntheses below are
+    therefore written by the gardener (``agent:builtin-gardener``), the one
+    actor the verification accepts: the first is a *reviewed* synthesis made
+    active by its review, the second a *pending* one still in the queue.
 
     The ancestor edge is filed ``proposed`` — the state the job writes it in —
     because the gate has to protect members of a synthesis that is still
@@ -1788,17 +1810,19 @@ def test_a_synthesized_member_is_not_resynthesized(fresh_db):
     are ``active``).
     """
     _place(Alpha=0.0)
-    flagged = _node("Alpha one", props={"synthesized": True})
+    gardener = auth.internal_principal()
+    flagged = _synthesis_node(gardener, "Alpha one")
+    service.transition(flagged.id, "accept", principal=owner())
     second, third = _node("Alpha two"), _node("Alpha three")
     _relates(flagged.id, second.id)
     _relates(second.id, third.id)
     _relates(third.id, flagged.id)
 
-    ancestor = _node("Beta one", props={"synthesized": True})
-    member, other = _node("Beta two"), _node("Beta three")
+    ancestor = _synthesis_node(gardener, "Beta one")
+    member, other, fourth = _node("Beta two"), _node("Beta three"), _node("Beta four")
     _relates(member.id, other.id)
-    _relates(other.id, ancestor.id)
-    _relates(ancestor.id, member.id)
+    _relates(other.id, fourth.id)
+    _relates(fourth.id, member.id)
     service.create_edge(
         ancestor.id,
         member.id,
@@ -1814,6 +1838,29 @@ def test_a_synthesized_member_is_not_resynthesized(fresh_db):
         "member is already part of a synthesis",
         "member is already part of a synthesis",
     ]
+
+
+def test_a_forged_synthesized_flag_does_not_skip_a_cluster(fresh_db):
+    """M21's regression on the freshness gate: ``props.synthesized`` written
+    by an ordinary agent is a forge, not a synthesis.
+
+    The gate used to trust the flag, so a dense cluster containing the forged
+    node was skipped as "already part of a synthesis" — an attacker could
+    silence the abstraction job over any cluster. The flag is now held against
+    the node's create event, whose actor is not the gardener, so the cluster
+    stays eligible and the job proposes it like any other.
+    """
+    _place(Alpha=0.0)
+    forged = _node("Alpha one", props={"synthesized": True})
+    second, third = _node("Alpha two"), _node("Alpha three")
+    _relates(forged.id, second.id)
+    _relates(second.id, third.id)
+    _relates(third.id, forged.id)
+
+    outcome = _abstraction_outcome(_run(jobs=[consolidate.JOB_ABSTRACTION]).report)
+
+    assert outcome.detail["clusters_eligible"] == 1
+    assert all("already part of a synthesis" not in skip["reason"] for skip in outcome.skipped)
 
 
 def test_an_over_cap_graph_reports_the_overflow(fresh_db, monkeypatch):
@@ -2002,7 +2049,9 @@ def test_abstraction_with_a_budget_synthesizes_a_proposed_concept(fresh_db, monk
 
     The write goes through the public service API exactly like every other
     job's — visible to ``service.get_node``, filed ``proposed``, carrying the
-    freshness gate's own record (``props.synthesized``) and the provenance.
+    freshness gate's own marker (``props.synthesized``) and the member list.
+    The write carries no ``generated_by`` prop — nothing ever read it there
+    (M21) — the model's provenance rides the cycle report instead.
     """
     monkeypatch.setenv(agent_runtime.ENV_CYCLE_BUDGET, "100000")
     body = {"title": "Alpha matters", "content": "What the Alpha notes share."}
@@ -2022,8 +2071,7 @@ def test_abstraction_with_a_budget_synthesizes_a_proposed_concept(fresh_db, monk
     assert concept.props["synthesized"] is True
     assert concept.props["members"] == sorted([first.id, second.id, third.id])
     assert concept.props["job"] == consolidate.JOB_ABSTRACTION
-    assert concept.props["generated_by"]["model_id"] == "fake-model"
-    assert concept.props["generated_by"]["prompt_version"] == consolidate.ABSTRACTION_PROMPT_VERSION
+    assert "generated_by" not in concept.props
     edges = service.list_edges(
         node_id=concept_id, type=consolidate.DERIVED_FROM_EDGE_TYPE, principal=owner()
     )

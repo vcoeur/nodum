@@ -1160,12 +1160,14 @@ def _mean_pairwise_cosine(vectors: dict[str, list[float]], members: list[str]) -
 
 def _cluster_components(
     context: _Context, in_scope: set[str]
-) -> tuple[list[EdgeOut], list[list[str]], set[str]]:
+) -> tuple[list[EdgeOut], list[list[str]], set[str], set[str]]:
     """The active ``relates_to`` graph among in-scope nodes, as components.
 
     Returns the related edges, the connected components (each sorted, and the
-    list itself in id order — the sort that makes a run deterministic), and the
-    set of node ids that are already members of a synthesis (the ``dst`` of a
+    list itself in id order — the sort that makes a run deterministic), the
+    set of node ids that are syntheses (verified against the create events —
+    M21, so a forged ``props.synthesized`` does not count), and the set of
+    node ids that are already members of a synthesis (the ``dst`` of a
     non-archived ``derived_from`` edge from a synthesized node — non-archived
     because a *pending* synthesis's ``proposed`` edges protect its members
     too, and only a rejected concept — whose edges the service archives with
@@ -1195,11 +1197,20 @@ def _cluster_components(
     # every non-archived state — a pending concept is `proposed`, not
     # `active` — and that check is also what tells a synthesis's edge from
     # ingestion's provenance ``derived_from`` edges.
-    synthesized_nodes = {
-        node.id
-        for node in context.nodes()
-        if node.state != "archived" and bool(node.props.get("synthesized"))
-    }
+    # The marker alone is not trusted (M21): ``props.synthesized`` is forgeable
+    # by any writer, so the flag is verified against the nodes' create events
+    # — a node counts only when the event that wrote it was the gardener's
+    # abstraction write. The verification is one batched read over the create
+    # events (the M19 shape, `synthesized_node_ids`), and the pre-filter below
+    # keeps the batch to the nodes that could be syntheses at all.
+    synthesized_nodes = service.synthesized_node_ids(
+        [
+            node.id
+            for node in context.nodes()
+            if node.state != "archived" and bool(node.props.get("synthesized"))
+        ],
+        path=context.path,
+    )
     synthesized_ancestors = {
         edge.dst_id
         for edge in context.typed_edges(DERIVED_FROM_EDGE_TYPE)
@@ -1227,7 +1238,7 @@ def _cluster_components(
                 seen.add(neighbour)
                 stack.append(neighbour)
         components.append(sorted(members))
-    return related, components, synthesized_ancestors
+    return related, components, synthesized_nodes, synthesized_ancestors
 
 
 def _render_abstraction_prompt(members: list[NodeOut]) -> str:
@@ -1297,12 +1308,15 @@ def _job_abstraction(context: _Context) -> JobOutcome:
     2. **Dense, graph half** — at least as many internal active
        ``relates_to`` edges as members: average degree ≥ 2, which is one
        cycle rather than a chain.
-    3. **Not already synthesized** — no member carries truthy
-       ``props["synthesized"]``, and no member is the target of a non-archived
-       ``derived_from`` edge from a node that does. A synthesis is decided
-       together with its members: accepting the concept activates its edges,
-       rejecting it archives them — so a *pending* synthesis (``proposed``
-       edges) protects its members too, and only a rejected one frees them.
+    3. **Not already synthesized** — no member is a synthesis, and no member
+       is the target of a non-archived ``derived_from`` edge from a node that
+       is one. A synthesis is decided together with its members: accepting the
+       concept activates its edges, rejecting it archives them — so a *pending*
+       synthesis (``proposed`` edges) protects its members too, and only a
+       rejected one frees them. "Is a synthesis" is verified against the
+       node's create event (M21): ``props.synthesized`` alone is forgeable by
+       any writer, so the flag is trusted only when the event that wrote the
+       node was the gardener's abstraction write.
     4. **Dense, vector half** — the mean pairwise cosine among the members is
        at least :data:`ABSTRACTION_COHESION_COSINE` (the calibrated link bar,
        reused rather than invented). This is why the job needs the embedding
@@ -1317,7 +1331,8 @@ def _job_abstraction(context: _Context) -> JobOutcome:
     (:data:`nodum.agent.ENV_CYCLE_BUDGET`, off by default) and on a configured
     provider — and the model's ``{title, content}`` is the *only* thing the
     gates did not decide. The write files the concept node ``proposed`` with
-    ``props.synthesized`` (the freshness gate's own record) plus one
+    ``props.synthesized`` (the marker the freshness gate and the review path
+    hold against the node's create event before trusting — M21) plus one
     ``derived_from`` edge per member — in the cycle's scope when there is one
     (the concept belongs with its members, and the whole unit waits in review
     together), and in ``main`` — the default write target — on an unscoped
@@ -1333,7 +1348,9 @@ def _job_abstraction(context: _Context) -> JobOutcome:
     in_scope = set(nodes_by_id)
     outcome.examined = len(nodes)
 
-    related, components, synthesized_ancestors = _cluster_components(context, in_scope)
+    related, components, synthesized_nodes, synthesized_ancestors = _cluster_components(
+        context, in_scope
+    )
 
     eligible: list[list[str]] = []
     for members in components:
@@ -1358,7 +1375,7 @@ def _job_abstraction(context: _Context) -> JobOutcome:
                 }
             )
             continue
-        if any(bool(nodes_by_id[member].props.get("synthesized")) for member in members) or any(
+        if any(member in synthesized_nodes for member in members) or any(
             member in synthesized_ancestors for member in members
         ):
             outcome.skipped.append(
@@ -1465,7 +1482,6 @@ def _job_abstraction(context: _Context) -> JobOutcome:
                     "synthesized": True,
                     "members": members,
                     "job": JOB_ABSTRACTION,
-                    **generation.generated_by.as_props(),
                 },
                 principal=context.principal,
                 path=context.path,

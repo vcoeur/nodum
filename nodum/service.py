@@ -27,7 +27,7 @@ from typing import Any, NamedTuple
 from pydantic import ValidationError
 
 from nodum import auth, db
-from nodum.migrations import BUILTIN_AGENT_PREFIX, MAIN_SPACE_ID, META_SPACE_ID
+from nodum.migrations import BUILTIN_AGENT_PREFIX, GARDENER_AGENT_ID, MAIN_SPACE_ID, META_SPACE_ID
 from nodum.models import (
     AgentCreatedOut,
     AgentOut,
@@ -1096,12 +1096,16 @@ def _settle_synthesis_edges(
     reviewer's own authority over both endpoint spaces. Each transition is
     its own event, attributed to the reviewer.
 
-    A node that is not a synthesis (``props.synthesized`` falsy) is a no-op —
-    ordinary nodes carry no ``derived_from`` edges of their own, and the
-    helper must not settle anyone else's.
+    A node that is not a synthesis is a no-op — ordinary nodes carry no
+    ``derived_from`` edges of their own, and the helper must not settle anyone
+    else's. "Is a synthesis" is verified against the event log, not read off
+    the props (M21): ``props.synthesized`` is forgeable by any writer, but the
+    create event is append-only, so the distinction lives in the event that
+    wrote the node — see :func:`is_synthesis`. The check is made on the same
+    connection: a second one could not see this transaction's uncommitted
+    writes, and inside a bulk review's immediate lock it could not even read.
     """
-    props = json.loads(node.get("props") or "{}")
-    if not props.get("synthesized"):
+    if not is_synthesis(node["id"], conn=conn):
         return
     rows = conn.execute(
         """
@@ -3827,6 +3831,141 @@ def list_proposal_creations(
         return created & set(ids)
     finally:
         conn.close()
+
+
+#: The only actor the synthesis verification accepts (M21) — the gardener, the
+#: one principal that writes through :mod:`nodum.consolidate`. ``actor_string``
+#: renders ``agent:<id>``; spelled here so :func:`_synthesized_creation_ids`
+#: holds the log's actor strings up against it.
+GARDENER_ACTOR = f"agent:{GARDENER_AGENT_ID}"
+
+
+def _synthesized_creation_ids(conn: sqlite3.Connection, ids: list[str]) -> set[str]:
+    """Which of ``ids`` were created by the gardener's abstraction write.
+
+    The verification behind :func:`is_synthesis` and
+    :func:`synthesized_node_ids`, over an open connection. A node is a
+    synthesis iff the event that created it was the gardener's abstraction
+    write — the op names the create (a node has exactly one create event), the
+    event's actor is the gardener, and its ``after.props.synthesized`` is
+    truthy. The event is append-only, so none of that is forgeable by a later
+    write: forging the props makes a *new* event (``node.update``), it does
+    not rewrite the create.
+
+    The scan-and-intersect shape mirrors :func:`list_proposal_creations`
+    (M19): one pass over the create events, cheap in SQLite's C filter and
+    paid per call rather than per candidate, so a batch of any size costs the
+    same single scan.
+
+    Args:
+        conn: The open connection (the caller commits).
+        ids: The row ids to classify. Ids with no qualifying create event are
+            simply absent from the answer.
+    """
+    wanted = set(ids)
+    if not wanted:
+        return set()
+    verified: set[str] = set()
+    for row in conn.execute(
+        "SELECT actor, payload FROM events WHERE op IN ('node.create', 'node.propose')"
+    ).fetchall():
+        if row["actor"] != GARDENER_ACTOR:
+            continue
+        after = json.loads(row["payload"]).get("after")
+        if not isinstance(after, dict) or not isinstance(after.get("id"), str):
+            continue
+        if after["id"] not in wanted:
+            continue
+        props = after.get("props")
+        if isinstance(props, str):
+            try:
+                props = json.loads(props)
+            except json.JSONDecodeError:
+                continue
+        if isinstance(props, dict) and props.get("synthesized"):
+            verified.add(after["id"])
+    return verified
+
+
+def is_synthesis(
+    node_id: str,
+    *,
+    conn: sqlite3.Connection | None = None,
+    path: str | Path | None = None,
+) -> bool:
+    """Whether ``node_id`` is a synthesis — a fact about the event that wrote it.
+
+    ``props.synthesized`` is forgeable by any writer (M21): a node whose props
+    carry the flag but whose create event was not the gardener's abstraction
+    write is not a synthesis, whatever its current props say. The distinction
+    lives in the append-only create event — its op names the create, its actor
+    is the gardener, and its ``after.props.synthesized`` is truthy. A forged
+    flag — at create or by a later ``update_node`` — makes an event with a
+    different actor or a different op; it does not rewrite the create.
+
+    This is the **second deliberate exception to "the event log is a human
+    surface"** (:func:`list_events` refuses an agent), beside
+    :func:`list_proposal_creations`, and it is shaped the same way: it answers
+    only about the id the caller already holds, one bit, no node, space or
+    count beyond that. It is what lets the review path settle a genuine
+    synthesis's membership edges with the concept (:func:`_settle_synthesis_edges`)
+    and what lets the abstraction job's freshness gate trust the flag it
+    itself wrote.
+
+    Args:
+        node_id: The node id to classify.
+        conn: An open connection to read through — for a caller already inside
+            a transaction (:func:`_settle_synthesis_edges`), where a second
+            connection could not see uncommitted writes and a bulk review's
+            immediate lock would refuse it outright.
+        path: Explicit database path, when ``conn`` is not given.
+
+    Returns:
+        ``True`` iff the node's create event was the gardener's synthesis
+        write.
+    """
+    if conn is None:
+        conn = _connect(path)
+        try:
+            return bool(_synthesized_creation_ids(conn, [node_id]))
+        finally:
+            conn.close()
+    return bool(_synthesized_creation_ids(conn, [node_id]))
+
+
+def synthesized_node_ids(
+    ids: list[str],
+    *,
+    conn: sqlite3.Connection | None = None,
+    path: str | Path | None = None,
+) -> set[str]:
+    """Which of ``ids`` are syntheses, verified against their create events.
+
+    The batched form of :func:`is_synthesis`, shaped like
+    :func:`list_proposal_creations`: the ids the caller supplies, answered one
+    bit each, nothing beyond. The abstraction job's freshness gate uses it over
+    the nodes whose props carry the marker, so a forged flag an ordinary agent
+    wrote cannot make the job skip a cluster (M21); the verification scans the
+    create events once whatever the batch size, so an attacker inflating the
+    candidate list pays the same single scan.
+
+    Args:
+        ids: The row ids to classify. Ids with no qualifying create event are
+            simply absent from the answer.
+        conn: An open connection to read through, when the caller has one.
+        path: Explicit database path, when ``conn`` is not given.
+
+    Returns:
+        The subset of ``ids`` whose create event was the gardener's synthesis
+        write.
+    """
+    if conn is None:
+        conn = _connect(path)
+        try:
+            return _synthesized_creation_ids(conn, ids)
+        finally:
+            conn.close()
+    return _synthesized_creation_ids(conn, ids)
 
 
 # ── Asset-pipeline events (design §5.5–§5.7): one named door into the log ─────

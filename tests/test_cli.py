@@ -373,8 +373,12 @@ def test_search(fresh_db):
 
 
 def test_search_hybrid_signals_over_the_cli(fresh_db, fake_embedder):
+    # "xylem vessels" (with the "Sap" title) keeps this above the vector
+    # similarity floor: the pre-floor fixture "xylem carries sap" repeated
+    # "sap" across title and content, which diluted the HashEmbedder cosine
+    # to 0.59 — below search._VECTOR_MIN_SIMILARITY — and dropped the signal.
     node = _run_json(
-        "node", "create", "--type", "note", "--title", "Sap", "--content", "xylem carries sap"
+        "node", "create", "--type", "note", "--title", "Sap", "--content", "xylem vessels"
     )
     result = _run_json("search", "xylem")
     hit = result["hits"][0]

@@ -1593,6 +1593,46 @@ def test_a_question_the_search_cannot_serve_costs_no_model_call(graph):
     assert result.refusal and "search" in result.refusal
 
 
+def test_an_absent_term_with_embeddings_present_is_refused_not_answered(fresh_db, fake_embedder):
+    """Finding M20's gate: embeddings present, term absent → honest empty.
+
+    Before the vector similarity floor, an install with an embedding provider
+    answered a query whose term existed in no document ``k`` deep from the
+    nearest unrelated chunks: the model cited one or two of them, both
+    resolved against the retrieval, and ``answered: true`` carried
+    confidently wrong content — the project's own "empty becomes confidently
+    wrong" class, on the one install shape the keyword refusal never reached.
+    With the floor (``search._VECTOR_MIN_SIMILARITY``, cosine 0.5) the
+    nearest chunk is below the bar, search returns nothing, and ``ask``
+    refuses without spending a model call — the same honest empty the default
+    install always had. The fixture's single node keeps the control honest:
+    a query the graph *does* hold still answers from the vector signal.
+    """
+    node = service.create_node(
+        type="note",
+        title="Compaction",
+        content="A compacted topic works as a state store",
+        principal=owner(),
+    )
+    provider = FakeProvider(_reply("It is hosted on AWS.", ["1"]))
+    llm.set_provider(provider)
+
+    result = answers.ask("What does zarquon protect against?", principal=owner(), run=_run())
+
+    assert result.answered is False
+    assert result.answer is None
+    assert provider.calls == [], "nothing to answer from is not a question worth spending on"
+    assert result.considered == []
+    assert result.refusal and "search" in result.refusal
+
+    # The control: the same graph answers a query whose words it holds, from
+    # the same vector signal (cosine ≈ 0.60 against the node, above the bar).
+    llm.set_provider(FakeProvider(_reply("A compacted topic works as a state store.", ["1"])))
+    answered = answers.ask("compacted topic state store", principal=owner(), run=_run())
+    assert answered.answered is True
+    assert [citation.node_id for citation in answered.citations] == [node.id]
+
+
 def test_the_prompt_carries_only_what_was_retrieved(graph):
     provider = FakeProvider(_reply("x", ["1"]))
     llm.set_provider(provider)

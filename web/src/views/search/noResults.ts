@@ -27,11 +27,12 @@
  * to state the rule wider than it holds:
  *
  * 1. **It is the keyword half's silence, not the server's.** The vector
- *    signal has no similarity threshold, so on a graph with an embedding
- *    provider that same query comes back full of vector-only hits and this
- *    view never renders. The advice below is therefore written for the case
- *    it is actually shown in — a genuinely empty result — and says nothing
- *    about why the result was empty.
+ *    signal is floored by cosine similarity (a disjoint query's nearest
+ *    vectors are below the bar and dropped), so on a graph with an embedding
+ *    provider a query with no genuine match also comes back empty and this
+ *    view renders for it too. The advice below is therefore written for the
+ *    case it is actually shown in — a genuinely empty result — and says
+ *    nothing about why the result was empty.
  * 2. **"Knows no content word" means none at all**, not "none that
  *    discriminates". Ordinary English nouns and verbs count as content words
  *    on purpose, so a question wrapping an unknown subject still answers

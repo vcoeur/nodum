@@ -400,6 +400,117 @@ def test_transition_applies_to_edges_too(fresh_db):
     assert accepted.id == edge.id
 
 
+# ── Synthesis: the flag is verified against the create event (M21) ────────────
+
+
+def _synthesis_unit(gardener, member_ids=(), *, title="Concept"):
+    """A concept and its membership edges, written the way the abstraction job
+    writes them: by the gardener, filed ``proposed``, the synthesis marker in
+    the props of the same call that emits the create event."""
+    node = service.create_node(
+        type="concept",
+        title=title,
+        content="synthesised from the members",
+        landing="proposed",
+        props={"synthesized": True, "members": list(member_ids), "job": "abstraction"},
+        principal=gardener,
+    )
+    edges = [
+        service.create_edge(node.id, member, "derived_from", landing="proposed", principal=gardener)
+        for member in member_ids
+    ]
+    return node, edges
+
+
+def test_is_synthesis_verifies_the_create_event_not_current_props(fresh_db):
+    """M21's contract, at the reader itself: ``synthesized`` is a fact about
+    the event that wrote the node. A flag forged at create, or bolted on by a
+    later update, is not a synthesis; only the gardener's abstraction write
+    is."""
+    gardener = auth.internal_principal()
+
+    forged_at_create = service.create_node(
+        type="concept",
+        title="forged",
+        content="c",
+        landing="proposed",
+        props={"synthesized": True},
+        principal=agent("intruder", grants={"meta": "read", "main": "edit"}),
+    )
+    assert service.is_synthesis(forged_at_create.id) is False
+
+    plain = service.create_node(type="note", title="plain", principal=owner())
+    service.update_node(plain.id, props={"synthesized": True}, principal=owner())
+    assert service.is_synthesis(plain.id) is False
+
+    real = service.create_node(
+        type="concept",
+        title="real",
+        content="c",
+        landing="proposed",
+        props={"synthesized": True, "members": [], "job": "abstraction"},
+        principal=gardener,
+    )
+    assert service.is_synthesis(real.id) is True
+    assert service.is_synthesis("no-such-node") is False
+
+
+def test_accepting_a_real_synthesis_activates_its_membership_edges(fresh_db):
+    """The privileged settle survives M21: a synthesis the gardener actually
+    wrote (its create event names the gardener and the marker) settles its
+    ``derived_from`` edges with the review — active on accept, as before."""
+    gardener = auth.internal_principal()
+    member = service.create_node(type="note", title="M", principal=owner())
+    concept, edges = _synthesis_unit(gardener, [member.id])
+    assert [edge.state for edge in edges] == ["proposed"]
+
+    service.transition(concept.id, "accept", principal=owner())
+
+    settled = service.list_edges(node_id=concept.id, type="derived_from", principal=owner())
+    assert [edge.state for edge in settled] == ["active"]
+
+
+def test_rejecting_a_real_synthesis_archives_its_membership_edges(fresh_db):
+    """The reject arm of the same unit: a rejected concept's membership edges
+    are archived with it, never left as orphaned proposals."""
+    gardener = auth.internal_principal()
+    member = service.create_node(type="note", title="M", principal=owner())
+    concept, edges = _synthesis_unit(gardener, [member.id])
+    assert [edge.state for edge in edges] == ["proposed"]
+
+    service.transition(concept.id, "reject", principal=owner())
+
+    settled = service.list_edges(node_id=concept.id, type="derived_from", principal=owner())
+    assert [edge.state for edge in settled] == ["archived"]
+
+
+def test_a_forged_synthesized_flag_does_not_settle_membership_edges(fresh_db):
+    """M21's regression on the accept path: ``props.synthesized`` on a node an
+    ordinary writer created is a forge, and accepting it must not sweep its
+    ``derived_from`` edges to ``active``. The flag alone used to gate the
+    settle; it is now held against the create event, whose actor is not the
+    gardener."""
+    intruder = agent("intruder", grants={"meta": "read", "main": "edit"})
+    member = service.create_node(type="note", title="M", principal=owner())
+    forged = service.create_node(
+        type="concept",
+        title="forged",
+        content="not written by the gardener",
+        landing="proposed",
+        props={"synthesized": True, "members": [member.id]},
+        principal=intruder,
+    )
+    edge = service.create_edge(
+        forged.id, member.id, "derived_from", landing="proposed", principal=intruder
+    )
+    assert edge.state == "proposed"
+
+    service.transition(forged.id, "accept", principal=owner())
+
+    untouched = service.list_edges(node_id=forged.id, type="derived_from", principal=owner())
+    assert [edge.state for edge in untouched] == ["proposed"]
+
+
 # ── Edge temporality (D2/B8) ──────────────────────────────────────────────────
 
 

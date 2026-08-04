@@ -849,9 +849,11 @@ commands on a saved node for exactly this reason.
   connected components of the active `relates_to` graph, gated on size
   (`MIN_CLUSTER_MEMBERS` 3 to `MAX_CLUSTER_MEMBERS` 10), density (at least as
   many internal edges as members — one cycle, not a chain), freshness (no
-  member carries `props.synthesized`, and no member is the target of a
-  non-archived `derived_from` edge from a node that does — a *pending*
-  synthesis protects its members too, and only a rejected one frees them),
+  member is a synthesis, and no member is the target of a
+  non-archived `derived_from` edge from a node that is one — a *pending*
+  synthesis protects its members too, and only a rejected one frees them;
+  "is a synthesis" is verified against the node's create event (M21), so a
+  forged `props.synthesized` an ordinary agent wrote does not count),
   and cohesion (mean pairwise
   cosine at or above the *reused* link bar `LINK_EMBEDDING_COSINE` — the
   calibrated same-area bar is the cohesion bar), capped at
@@ -860,8 +862,8 @@ commands on a saved node for exactly this reason.
   (`NODUM_LLM_CYCLE_BUDGET`, off by default) and on a configured provider —
   and the model's `{title, content}` is the only thing the gates did not
   decide. The write files a `concept` node `proposed` with `props.synthesized`
-  (the freshness gate's own record, which is what the review queue's badge
-  reads) plus `props.members` and the `generated_by` provenance, and one
+  (the marker the freshness gate and the accept-path settle hold against the
+  node's create event before trusting — M21) plus `props.members`, and one
   `derived_from` edge per member; a dry run still pays for the model calls (B4)
   and writes nothing; a malformed body is a job error, never a write; and the
   run's cost rides the cycle report under `report["llm"]`, which the dream
@@ -2364,23 +2366,22 @@ commands on a saved node for exactly this reason.
   That was the same conversion the JSON-schema finding names — a visibly empty
   result turned into a confidently wrong one — reached this time by wrapping an
   unknown word in a question.
-  **That refusal is the keyword arm's, and on an install with an embedding
-  provider it is not the whole answer**: `_search_vector` has no similarity
-  threshold — the ANN list is always `k` deep — so the vector arm answers the
-  query the keyword arm just refused, `k` rows deep, every hit carrying the
-  `vector` signal alone. Measured with the repo's own `HashEmbedder` on a 20-row
+  **The refusal is now the whole answer, embeddings or not**: `_search_vector`
+  carries a similarity floor (`_VECTOR_MIN_SIMILARITY`, cosine 0.5 — a chunk
+  below it never enters the ANN list), so the vector arm no longer answers
+  the query the keyword arm just refused `k` rows deep from the nearest
+  unrelated chunks. Measured with the repo's own `HashEmbedder` on a 20-row
   graph: `zarquon` and *"What does zarquon protect against?"* both come back
-  with **10 of 10 hits, none carrying `bm25`**. On the default install — no
-  provider — the refusal is the whole answer, which is the install
-  `tests/test_search.py` asserts it on; `tests/test_hybrid_search.py` asserts
-  what happens beside it when a provider exists. **No similarity floor was
-  added**, because a floor is a number nothing here can measure yet: it needs a
-  real embedding model over a real graph, since the test provider's similarity
-  *is* token overlap and every threshold measured against it would look free
-  while costing exactly the paraphrase recall the vector arm exists for.
-  Suppressing the fused list on the keyword arm's refusal has the same problem
-  from the other side and would contradict
-  `test_vector_only_hit_surfaces_with_vector_signal` directly. Carried to 5b-ii. Measured across five corpus sizes, questions whose content is
+  with **no hits at all**, vector signal included — the closest prose note
+  sits at distance 0.63 (cosine 0.37), below the bar. On the default
+  install — no provider — the refusal is the whole answer the same way;
+  `tests/test_search.py` asserts it on the keyword arm,
+  `tests/test_hybrid_search.py` asserts the floor and the empty result
+  beside it, and `tests/test_answers.py` pins the `/ask` gate: an absent
+  term with embeddings present is refused, not answered. The floor is a
+  tunable constant, chosen so the test provider's genuine seeded matches
+  (cosine 0.5-0.71) pass and its disjoint ones (0.0) drop; the derivation
+  and units live in the constant's docstring. Finding M20. Measured across five corpus sizes, questions whose content is
   invented returned **4.8 / 5.1 / 5.9 / 7.9 mean hits and were never silent**
   before — measured on the claim graph of `tests/test_search.py`, twelve
   questions built around an invented subject — and **six of the twelve are
