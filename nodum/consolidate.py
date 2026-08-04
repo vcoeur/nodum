@@ -120,6 +120,7 @@ from nodum.migrations import GARDENER_AGENT_ID, META_SPACE_ID
 from nodum.models import CycleOut, EdgeOut, NodeOut
 from nodum.principal import Principal
 from nodum.store import GrantNotPermitted
+from nodum.vocab import CycleTrigger, LandingState, NodeState, TransitionKind
 
 #: Re-exported from :mod:`nodum.service`, where the guard now lives: the refusal
 #: is the ``cycles`` row a second opener cannot insert. It stays reachable under
@@ -169,7 +170,7 @@ DUPLICATE_EDGE_TYPE = "duplicate_of"
 #: The state every edge a job suggests is filed in, whatever the gardener's
 #: grant would otherwise allow (see :func:`_write_edges`). A suggestion nobody
 #: reviews is not a suggestion.
-SUGGESTION_LANDING = "proposed"
+SUGGESTION_LANDING: LandingState = "proposed"
 
 #: The honest type for an inferred link. Embedding proximity and co-citation are
 #: evidence that two nodes are *about* related things — they are not evidence
@@ -645,7 +646,7 @@ class _Context:
     #: :data:`JOBS` keeps its one signature.
     llm_report: agent.LLMReport | None = None
 
-    def nodes(self, *, state: str | None = None) -> list[NodeOut]:
+    def nodes(self, *, state: NodeState | None = None) -> list[NodeOut]:
         """Curatable nodes in scope, oldest first, capped at :data:`MAX_SCAN_NODES`."""
         rows = service.list_nodes(
             state=state,
@@ -656,7 +657,7 @@ class _Context:
         )
         return [node for node in rows if _is_curatable(node)]
 
-    def edges(self, *, state: str | None = None) -> list[EdgeOut]:
+    def edges(self, *, state: NodeState | None = None) -> list[EdgeOut]:
         """Readable edges, oldest first, capped at :data:`MAX_SCAN_EDGES`.
 
         Not narrowed by ``scope`` here — :func:`nodum.service.list_edges` takes
@@ -1831,7 +1832,7 @@ def _job_curation(context: _Context) -> JobOutcome:
     for proposal in proposals:
         if proposal.kind == "node":
             counts = node_counts.get((proposal.created_by, proposal.type))
-            target_kind = "node"
+            target_kind: TransitionKind = "node"
         elif proposal.kind == "edge":
             counts = edge_counts.get((proposal.created_by, proposal.type))
             target_kind = "edge"
@@ -2026,7 +2027,7 @@ def _resolve_jobs(names: list[str] | None) -> list[str]:
 
 def _opener(
     triggered_by: str, gardener: Principal, path: str | Path | None
-) -> tuple[str, Principal]:
+) -> tuple[CycleTrigger, Principal]:
     """Resolve ``triggered_by`` to ``(trigger, the principal that opens the cycle)``.
 
     The literal ``scheduler`` means nobody asked — the clock did — so the cycle

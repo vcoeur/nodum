@@ -170,6 +170,7 @@ from nodum.service import (
     UndoNotPossible,
 )
 from nodum.urls import PayloadTooLarge
+from nodum.vocab import GRANT_LEVEL_NAMES, PROPOSAL_KINDS, STATES, NodeState
 
 #: The session cookie's name: an opaque id for a server-side ``sessions`` row
 #: (30-day sliding expiry), set by ``POST /api/login`` as ``HttpOnly;
@@ -1374,31 +1375,76 @@ def _list_param(params: QueryParams, *names: str) -> list[str] | None:
     return values or None
 
 
-def _state_param(params: QueryParams, name: str = "state") -> str | None:
+def _state_param(params: QueryParams, name: str = "state") -> NodeState | None:
     """Read a search state filter for a service call.
 
     Absent → the service default ``"active"``; ``"any"`` → ``None`` (the
-    service's "no filter", meaning every state); any other value → that
-    value. An absent parameter must not become ``None`` — that would silently
-    widen a default search to every state, where the CLI's ``--state`` and the
-    MCP server's ``filters.state`` both default to ``active``.
+    service's "no filter", meaning every state); any other value must be one
+    of :data:`~nodum.vocab.STATES` or the request is refused with the same
+    sentence the service would have refused it with. An absent parameter must
+    not become ``None`` — that would silently widen a default search to every
+    state, where the CLI's ``--state`` and the MCP server's ``filters.state``
+    both default to ``active``.
     """
     state = params.get(name)
     if state is None:
         return "active"
-    return None if state == "any" else state
+    if state == "any":
+        return None
+    if state not in STATES:
+        raise ValueError(f"state must be one of {STATES}, got {state!r}")
+    return state
+
+
+def _state_filter(params: QueryParams, name: str = "state") -> NodeState | None:
+    """Read a raw state query parameter for a listing route.
+
+    The listing routes pass the parameter through unchanged (absent → the
+    service's "no filter"), so ``"any"`` is refused here exactly as the
+    service refuses it — a listing has no pseudo-value for every state, and
+    the refusal is the service's own sentence.
+    """
+    state = params.get(name)
+    if state is None:
+        return None
+    if state not in STATES:
+        raise ValueError(f"state must be one of {STATES}, got {state!r}")
+    return state
+
+
+def _edge_states_param(params: QueryParams) -> list[NodeState] | None:
+    """Repeatable edge-state filters, each narrowed against :data:`STATES`.
+
+    The sentence is the service's own, so a refused value renders identically
+    whether the route or the service raises it.
+    """
+    edge_states = _list_param(params, "edge_state", "edge_states")
+    if edge_states is None:
+        return None
+    narrowed: list[NodeState] = []
+    for edge_state in edge_states:
+        if edge_state not in STATES:
+            raise ValueError(f"state must be one of {STATES}, got {edge_state!r}")
+        narrowed.append(edge_state)
+    return narrowed
 
 
 def _proposal_filters(source: Any) -> dict[str, Any]:
     """Pick the review-queue filter keys out of a body or a query string.
 
     An allowlist by construction: keys outside :data:`PROPOSAL_FILTERS` are
-    never read, so nothing a caller invents reaches a service argument.
+    never read, so nothing a caller invents reaches a service argument. The
+    ``kind`` value is narrowed against :data:`PROPOSAL_KINDS` here, with the
+    service's own sentence, so a refused value renders identically whether
+    this helper or the service raises it.
     """
     filters = {key: source.get(key) for key in PROPOSAL_FILTERS}
     # `agent` is the review UI's word for the proposing author.
     if filters["created_by"] is None:
         filters["created_by"] = source.get("agent")
+    kind = filters["kind"]
+    if kind is not None and kind not in PROPOSAL_KINDS:
+        raise ValueError(f"kind must be 'node', 'edge', or 'update', got {kind!r}")
     return filters
 
 
@@ -1787,7 +1833,7 @@ def create_app(
         params = request.query_params
         nodes = service.list_nodes(
             type=params.get("type"),
-            state=params.get("state"),
+            state=_state_filter(params),
             parent_id=_param(params, "parent_id", "parent"),
             space=params.get("space"),
             include_meta=_bool_param(params, "include_meta"),
@@ -1891,7 +1937,7 @@ def create_app(
         edges = service.list_edges(
             node_id=_param(params, "node_id", "node"),
             type=params.get("type"),
-            state=params.get("state"),
+            state=_state_filter(params),
             principal=_session_principal(request),
             limit=_int_param(params, "limit", default=500),
             path=db_path,
@@ -2048,7 +2094,7 @@ def create_app(
             _required_param(params, "root", "root_id"),
             depth=_int_param(params, "depth", default=2),
             edge_types=_list_param(params, "edge_type", "edge_types"),
-            edge_states=_list_param(params, "edge_state", "edge_states"),
+            edge_states=_edge_states_param(params),
             min_confidence=_float_param(params, "min_confidence"),
             created_by=params.get("created_by"),
             node_types=_list_param(params, "node_type", "node_types"),
@@ -2696,12 +2742,15 @@ def create_app(
     async def set_grant(request: Request) -> Response:
         """Grant (or re-level) an agent's access to a space."""
         body = await _json_body(request)
+        level = _required_str(body, "level")
+        if level not in GRANT_LEVEL_NAMES:
+            raise ValueError(f"level must be one of {GRANT_LEVEL_NAMES}, got {level!r}")
         granted = _write(
             request,
             service.grant,
             _required_str(body, "agent"),
             _required_str(body, "space"),
-            _required_str(body, "level"),
+            level,
             path=db_path,
         )
         return EnvelopeResponse(envelope(granted))

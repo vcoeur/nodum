@@ -67,21 +67,40 @@ from nodum.models import (
 )
 from nodum.principal import EDIT, READ, SUGGEST, Principal
 from nodum.store import GrantNotPermitted, Store, require_landing_state
+from nodum.vocab import (
+    CONSOLIDATION_TRIGGERS,
+    CYCLE_CLOSED_STATUSES,
+    CYCLE_STATUSES,
+    CYCLE_TRIGGERS,
+    DEFAULT_EDGE_STATES,
+    DIRECTIONS,
+    GRANT_LEVEL_NAMES,
+    REVIEW_ACTIONS,
+    STATES,
+    SUGGEST_STATES,
+    TRANSITIONS,
+    AgentKind,
+    CycleTrigger,
+    Direction,
+    GrantLevel,
+    LandingState,
+    NodeState,
+    ProposalKind,
+    RollbackKind,
+    TransitionAction,
+    TransitionKind,
+)
 
-#: Allowed state values shared by nodes and edges.
-STATES = ("proposed", "active", "archived")
+#: Allowed state values shared by nodes and edges (vocab: :data:`STATES`).
+STATES = STATES
 
 #: State transitions: action → (required current state, resulting state).
-TRANSITIONS = {
-    "accept": ("proposed", "active"),
-    "reject": ("proposed", "archived"),
-    "archive": ("active", "archived"),
-}
+TRANSITIONS = TRANSITIONS
 
 #: The transitions that *review* a proposal. Reviewing turns proposed
 #: structure into live structure (and archives what it replaces), so it needs
 #: a human — or an ``edit`` grant on the item's space (Q13 note 03 Q1).
-REVIEW_ACTIONS = ("accept", "reject")
+REVIEW_ACTIONS = REVIEW_ACTIONS
 
 #: The node fields a version snapshots, and the only fields a proposed update
 #: may name.
@@ -90,11 +109,11 @@ VERSION_FIELDS = ("title", "content", "props")
 #: Node states :func:`suggest_links` draws link targets from. ``proposed``
 #: stays in, as it does for every other node read; ``archived`` is out,
 #: because a retired node is not something to link to.
-SUGGEST_STATES = ("active", "proposed")
+SUGGEST_STATES = SUGGEST_STATES
 
 #: Edge states :func:`subgraph` follows when the caller names none — the live
 #: graph, matching every other traversal (design §8.1).
-DEFAULT_EDGE_STATES = ("active",)
+DEFAULT_EDGE_STATES = DEFAULT_EDGE_STATES
 
 #: Ceiling on :func:`subgraph`'s node cap. A caller's ``limit`` is clamped to
 #: it rather than refused, so a query string cannot turn the bounded read into
@@ -570,7 +589,7 @@ def _require_space_name_free(
     )
 
 
-def _create_op(state: str) -> str:
+def _create_op(state: NodeState) -> str:
     """Name a create-op after the state it lands in (``create`` vs ``propose``)."""
     return "create" if state == "active" else "propose"
 
@@ -785,7 +804,7 @@ def _materialize_mentions(
     actor: str,
     store: Store,
     cycle_id: str | None = None,
-    landing: str | None = None,
+    landing: LandingState | None = None,
 ) -> None:
     """Sync a node's ``[[wikilinks]]`` with its pending/active ``mentions`` edges.
 
@@ -818,7 +837,7 @@ def _materialize_mentions(
     node = dict(node_row)
     targets = set(WIKILINK_RE.findall(node["content"] or ""))
     resolved: set[str] = set()
-    edge_landing: dict[str, str] = {}
+    edge_landing: dict[str, LandingState] = {}
     for target in targets:
         dst = _resolve_wikilink(conn, target, store)
         if dst is None or dst == node["id"]:
@@ -984,7 +1003,7 @@ def _insert_edge(
     props: dict[str, Any],
     confidence: float | None,
     actor: str,
-    state: str,
+    state: NodeState,
     cycle_id: str | None = None,
 ) -> dict[str, Any]:
     """Insert one edge row and emit its create/propose event; returns the row."""
@@ -1020,8 +1039,8 @@ def _insert_edge(
 def _set_edge_state(
     conn: sqlite3.Connection,
     before: dict[str, Any],
-    new_state: str,
-    action: str,
+    new_state: NodeState,
+    action: TransitionAction,
     actor: str,
     cycle_id: str | None = None,
     reason: str | None = None,
@@ -1081,7 +1100,7 @@ def create_node(
     parent_id: str | None = None,
     props: dict[str, Any] | None = None,
     space: str | None = None,
-    landing: str | None = None,
+    landing: LandingState | None = None,
     principal: Principal,
     path: str | Path | None = None,
 ) -> NodeOut:
@@ -1330,7 +1349,7 @@ def update_node(
 def _node_list_filters(
     store: Store,
     *,
-    state: str | None,
+    state: NodeState | None,
     type_id: str | None,
     parent_id: str | None,
     space_id: str | None,
@@ -1425,7 +1444,7 @@ def require_positive_limit(limit: int, name: str = "limit") -> None:
 def list_nodes(
     *,
     type: str | None = None,
-    state: str | None = None,
+    state: NodeState | None = None,
     parent_id: str | None = None,
     space: str | None = None,
     include_meta: bool = False,
@@ -1623,7 +1642,7 @@ def _create_edge_in_conn(
     *,
     props: dict[str, Any] | None,
     confidence: float | None,
-    landing: str | None,
+    landing: LandingState | None,
     actor: str,
     store: Store,
 ) -> dict[str, Any]:
@@ -1665,7 +1684,7 @@ def create_edge(
     *,
     props: dict[str, Any] | None = None,
     confidence: float | None = None,
-    landing: str | None = None,
+    landing: LandingState | None = None,
     principal: Principal,
     path: str | Path | None = None,
 ) -> EdgeOut:
@@ -1746,7 +1765,7 @@ def _suggestion_error(exc: ValidationError) -> str:
 def propose_edges(
     suggestions: list[dict[str, Any]],
     *,
-    landing: str | None = None,
+    landing: LandingState | None = None,
     principal: Principal,
     path: str | Path | None = None,
 ) -> ProposeEdgesOut:
@@ -1815,7 +1834,7 @@ def list_edges(
     *,
     node_id: str | None = None,
     type: str | None = None,
-    state: str | None = None,
+    state: NodeState | None = None,
     principal: Principal,
     limit: int = 500,
     path: str | Path | None = None,
@@ -1936,7 +1955,9 @@ def _transition_version(
     return _row_dict(_get_version_row(conn, version_id))
 
 
-def _item_spaces(conn: sqlite3.Connection, kind: str, row: dict[str, Any]) -> set[str | None]:
+def _item_spaces(
+    conn: sqlite3.Connection, kind: TransitionKind, row: dict[str, Any]
+) -> set[str | None]:
     """The spaces a transition touches: the node's, both endpoints' for an
     edge, the node's for a version (typed through it)."""
     if kind == "node":
@@ -1952,11 +1973,11 @@ def _item_spaces(conn: sqlite3.Connection, kind: str, row: dict[str, Any]) -> se
 def _transition_row(
     conn: sqlite3.Connection,
     record_id: str,
-    action: str,
+    action: TransitionAction,
     actor: str,
     store: Store,
     reason: str | None = None,
-) -> tuple[str, dict[str, Any]]:
+) -> tuple[TransitionKind, dict[str, Any]]:
     """Apply one state transition inside an open connection (no commit).
 
     Returns:
@@ -1975,7 +1996,7 @@ def _transition_row(
     """
     from_state, to_state = TRANSITIONS[action]
     row = conn.execute("SELECT * FROM nodes WHERE id = ?", (record_id,)).fetchone()
-    kind = "node"
+    kind: TransitionKind = "node"
     if row is None:
         row = conn.execute("SELECT * FROM edges WHERE id = ?", (record_id,)).fetchone()
         kind = "edge"
@@ -2030,7 +2051,7 @@ def _transition_row(
 
 def transition(
     record_id: str,
-    action: str,
+    action: TransitionAction,
     *,
     reason: str | None = None,
     principal: Principal,
@@ -2179,7 +2200,7 @@ def _proposal_rows(
     conn: sqlite3.Connection,
     store: Store,
     *,
-    kind: str | None = None,
+    kind: ProposalKind | None = None,
     **filters: Any,
 ) -> list[tuple[str, sqlite3.Row]]:
     """Fetch proposed node/edge/version rows matching the filters, oldest first.
@@ -2331,7 +2352,7 @@ def list_proposals(
     *,
     created_by: str | None = None,
     type: str | None = None,
-    kind: str | None = None,
+    kind: ProposalKind | None = None,
     created_before: str | None = None,
     created_after: str | None = None,
     principal: Principal,
@@ -2434,7 +2455,7 @@ def list_proposals(
 
 def _transition_many(
     ids: list[str],
-    action: str,
+    action: TransitionAction,
     *,
     principal: Principal,
     reason: str | None,
@@ -2500,7 +2521,7 @@ def reject_proposals(
 
 
 def annotate(
-    target_kind: str,
+    target_kind: TransitionKind,
     target_id: str | int,
     body: dict[str, Any],
     *,
@@ -2624,7 +2645,7 @@ def annotate(
 def _resolve_annotatable(
     conn: sqlite3.Connection,
     store: Store,
-    target_kind: str,
+    target_kind: TransitionKind,
     target_id: str | int,
 ) -> dict[str, Any]:
     """Resolve an ``annotate`` target to a readable row, or answer *not found*.
@@ -2672,7 +2693,7 @@ def _resolve_annotatable(
 
 
 def _matching_ids(
-    conn: sqlite3.Connection, store: Store, *, kind: str | None, **filters: Any
+    conn: sqlite3.Connection, store: Store, *, kind: ProposalKind | None, **filters: Any
 ) -> list[str]:
     """Resolve a proposal filter to concrete ids (the batch-by-filter input).
 
@@ -2687,7 +2708,7 @@ def accept_matching(
     *,
     created_by: str | None = None,
     type: str | None = None,
-    kind: str | None = None,
+    kind: ProposalKind | None = None,
     created_before: str | None = None,
     created_after: str | None = None,
     principal: Principal,
@@ -2723,7 +2744,7 @@ def reject_matching(
     reason: str,
     created_by: str | None = None,
     type: str | None = None,
-    kind: str | None = None,
+    kind: ProposalKind | None = None,
     created_before: str | None = None,
     created_after: str | None = None,
     principal: Principal,
@@ -3567,7 +3588,7 @@ def get_schema(
 
 
 #: Valid traversal directions: follow edges out of, into, or through a node.
-DIRECTIONS = ("out", "in", "both")
+DIRECTIONS = DIRECTIONS
 
 
 def _walk(
@@ -3576,7 +3597,7 @@ def _walk(
     *,
     type_ids: list[str] | None,
     depth: int,
-    direction: str,
+    direction: Direction,
     store: Store,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Breadth-first walk over ``active`` edges; returns (node rows, edge rows).
@@ -3666,7 +3687,7 @@ def traverse(
     *,
     edge_types: list[str] | None = None,
     depth: int = 2,
-    direction: str = "both",
+    direction: Direction = "both",
     principal: Principal,
     path: str | Path | None = None,
 ) -> SubgraphOut:
@@ -3711,7 +3732,7 @@ def subgraph(
     *,
     depth: int = 2,
     edge_types: list[str] | None = None,
-    edge_states: list[str] | None = None,
+    edge_states: list[NodeState] | None = None,
     min_confidence: float | None = None,
     created_by: str | None = None,
     node_types: list[str] | None = None,
@@ -4049,7 +4070,7 @@ def diff_versions(
 # ── Account and grant administration (Q13; human-only, event-logged) ──────────
 
 #: Grant levels accepted by :func:`grant` (hierarchical: read ⊂ suggest ⊂ edit).
-GRANT_LEVEL_NAMES = ("read", "suggest", "edit")
+GRANT_LEVEL_NAMES = GRANT_LEVEL_NAMES
 
 #: Shortest password :func:`set_human_password` accepts. A floor, not a policy:
 #: the empty string used to be storable over both surfaces and logged in fine.
@@ -4212,7 +4233,7 @@ def list_agents(*, principal: Principal, path: str | Path | None = None) -> list
 def create_agent(
     name: str,
     *,
-    kind: str = "external",
+    kind: AgentKind = "external",
     owner_human_id: str | None = None,
     grants: dict[str, str] | None = None,
     principal: Principal,
@@ -4397,7 +4418,7 @@ def enable_agent(agent_id: str, *, principal: Principal, path: str | Path | None
 def grant(
     agent_id: str,
     space: str,
-    level: str,
+    level: GrantLevel,
     *,
     principal: Principal,
     path: str | Path | None = None,
@@ -4707,14 +4728,14 @@ def list_spaces(*, principal: Principal, path: str | Path | None = None) -> list
 #: operation, and ``rollback`` is the cycle that takes another one back. The
 #: schema carries the same four; this is what refuses a fifth with a sentence
 #: instead of a bare ``IntegrityError``.
-CYCLE_TRIGGERS = ("manual", "scheduled", "curative", "rollback")
+CYCLE_TRIGGERS = CYCLE_TRIGGERS
 
 #: The statuses a cycle may be closed into. It opens ``running`` and leaves that
 #: state exactly once (:data:`CYCLE_STATUSES` is the schema's full set).
-CYCLE_CLOSED_STATUSES = ("completed", "failed", "rolled_back")
+CYCLE_CLOSED_STATUSES = CYCLE_CLOSED_STATUSES
 
 #: Every status a ``cycles`` row may hold.
-CYCLE_STATUSES = ("running", *CYCLE_CLOSED_STATUSES)
+CYCLE_STATUSES = CYCLE_STATUSES
 
 #: ``cycles.triggered_by`` for a scheduled cycle: nobody asked, the clock did.
 #: Derived from the trigger rather than taken as an argument, so no caller can
@@ -4726,7 +4747,7 @@ SCHEDULER_ACTOR = "scheduler"
 #: deliberately outside it: each is one short, human-driven operation, and
 #: blocking them for the length of a nightly sweep would take the curative tier
 #: offline every night.
-CONSOLIDATION_TRIGGERS = ("manual", "scheduled")
+CONSOLIDATION_TRIGGERS = CONSOLIDATION_TRIGGERS
 
 
 def _cycle_out(row: sqlite3.Row) -> CycleOut:
@@ -4812,7 +4833,7 @@ def _cycle_authority_spaces(principal: Principal, scope_id: str | None) -> set[s
 
 def open_cycle(
     *,
-    trigger: str,
+    trigger: CycleTrigger,
     scope: str | None = None,
     dry_run: bool = False,
     principal: Principal,
@@ -6302,7 +6323,7 @@ ROLLBACK_SUMMARY_OP = "cycle.rollback"
 #: :func:`_transition_row` is the only writer of ``versions.state`` and it moves
 #: a row out of ``proposed`` exactly once, so there is no later write for a
 #: rollback to collide with.
-_TABLE_KIND = {"nodes": "node", "edges": "edge"}
+_TABLE_KIND: dict[str, RollbackKind] = {"nodes": "node", "edges": "edge"}
 
 #: How many conflicts a refusal spells out before summarising the rest. The
 #: full list is always on the exception's ``conflicts``.
@@ -6443,7 +6464,7 @@ def _applies_a_merge(
     return kind == "node" and _merged_into(after) is not None and _merged_into(before) is None
 
 
-def _touched_rows(op: str, payload: dict[str, Any]) -> set[tuple[str, str]]:
+def _touched_rows(op: str, payload: dict[str, Any]) -> set[tuple[RollbackKind, str]]:
     """Every ``(kind, row_id)`` an event's payload says it wrote.
 
     An ``undo``'s reach is read too — the row it restored *and* the rows it
@@ -6452,20 +6473,25 @@ def _touched_rows(op: str, payload: dict[str, Any]) -> set[tuple[str, str]]:
     relinked). Conflict detection that only read ``node.``/``edge.`` events
     would miss exactly that.
     """
-    rows: set[tuple[str, str]] = set()
+    rows: set[tuple[RollbackKind, str]] = set()
     if op == "undo":
         reversed_kind = str(payload.get("reversed_op", "")).split(".", 1)[0]
         restored = payload.get("restored")
-        if restored is not None and reversed_kind in _TABLE_KIND.values():
-            rows.add((reversed_kind, restored["id"]))
-    elif op.split(".", 1)[0] in _TABLE_KIND.values():
-        kind = op.split(".", 1)[0]
-        for side in ("before", "after"):
-            row = payload.get(side)
-            if row is not None:
-                rows.add((kind, row["id"]))
+        if restored is not None:
+            for kind in _TABLE_KIND.values():
+                if kind == reversed_kind:
+                    rows.add((kind, restored["id"]))
     else:
-        return rows
+        prefix = op.split(".", 1)[0]
+        for kind in _TABLE_KIND.values():
+            if kind == prefix:
+                for side in ("before", "after"):
+                    row = payload.get(side)
+                    if row is not None:
+                        rows.add((kind, row["id"]))
+                break
+        else:
+            return rows
     for entry in payload.get("deleted", []):
         kind = _TABLE_KIND.get(entry.get("table", ""))
         if kind is not None:

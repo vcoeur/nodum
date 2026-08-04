@@ -60,6 +60,7 @@ from nodum.migrations import META_SPACE_ID
 from nodum.models import SearchHit, SearchResult
 from nodum.principal import READ, Principal
 from nodum.service import require_positive_limit
+from nodum.vocab import NodeState
 
 #: bm25() column weights for (node_id, title, content, extracted_text): node_id
 #: is unindexed (weight ignored); a title hit outranks a body hit.
@@ -572,7 +573,7 @@ def _resolve_space(conn: sqlite3.Connection, space_ref: str, principal: Principa
 
 
 def _node_filters(
-    state: str | None,
+    state: NodeState | None,
     type_id: str | None,
     created_by: str | None,
     created_after: str | None,
@@ -651,7 +652,7 @@ def _search_bm25(
     terms: list[str],
     *,
     k: int,
-    state: str | None,
+    state: NodeState | None,
     type_id: str | None,
     created_by: str | None,
     created_after: str | None,
@@ -711,7 +712,7 @@ def _search_vector(
     query_vector: list[float],
     *,
     k: int,
-    state: str | None,
+    state: NodeState | None,
     type_id: str | None,
     created_by: str | None,
     created_after: str | None,
@@ -825,7 +826,7 @@ def _expand_hits(
     hits: list[SearchHit],
     *,
     k: int,
-    state: str | None,
+    state: NodeState | None,
     type_id: str | None,
     include_meta: bool,
     space_id: str | None,
@@ -893,7 +894,7 @@ def search(
     query: str,
     *,
     k: int = 10,
-    state: str | None = "active",
+    state: NodeState | None = "active",
     type: str | None = None,
     created_by: str | None = None,
     created_after: str | None = None,

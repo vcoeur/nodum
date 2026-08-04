@@ -19,17 +19,18 @@ import sqlite3
 
 from nodum.migrations import META_SPACE_ID
 from nodum.principal import EDIT, READ, SUGGEST, Principal
+from nodum.vocab import LANDING_STATES, LandingState
 
 #: The two states a write can land in. ``archived`` is not one of them: a write
 #: lands live or as a proposal, and retiring it is a transition afterwards.
-LANDING_STATES = ("proposed", "active")
+LANDING_STATES = LANDING_STATES
 
 
 class GrantNotPermitted(PermissionError):
     """Raised when a principal's grants do not cover the attempted write."""
 
 
-def require_landing_state(landing: str | None) -> None:
+def require_landing_state(landing: LandingState | None) -> None:
     """Reject a requested landing state that is not one a write can land in.
 
     Args:
@@ -91,7 +92,9 @@ class Store:
 
     # ── Writes ────────────────────────────────────────────────────────────
 
-    def landing_state(self, space_id: str | None, landing: str | None = None) -> str:
+    def landing_state(
+        self, space_id: str | None, landing: LandingState | None = None
+    ) -> LandingState:
         """The state a node create lands in on ``space_id`` (``active``/``proposed``).
 
         Args:
@@ -103,6 +106,7 @@ class Store:
             GrantNotPermitted: If the principal may not write the space at all.
         """
         level = self.principal.level_on(space_id)
+        granted: LandingState
         if level >= EDIT:
             granted = "active"
         elif level >= SUGGEST:
@@ -118,8 +122,8 @@ class Store:
         src_space: str | None,
         dst_space: str | None,
         type_space: str | None,
-        landing: str | None = None,
-    ) -> str:
+        landing: LandingState | None = None,
+    ) -> LandingState:
         """The state an edge create lands in, from both endpoint grants.
 
         Creating an edge needs the matching level on **both** endpoint
@@ -136,6 +140,7 @@ class Store:
         if src_space != dst_space and type_space != META_SPACE_ID:
             raise GrantNotPermitted("a cross-space edge's type node must live in the meta space")
         level = min(self.principal.level_on(src_space), self.principal.level_on(dst_space))
+        granted: LandingState
         if level >= EDIT:
             granted = "active"
         elif level >= SUGGEST:
@@ -146,7 +151,7 @@ class Store:
             )
         return self.cap_landing(granted, landing)
 
-    def cap_landing(self, granted: str, landing: str | None) -> str:
+    def cap_landing(self, granted: LandingState, landing: LandingState | None) -> LandingState:
         """Lower a granted landing state to the writer's own ceiling.
 
         Design §8.3: *"``edit`` = the agent writes ``active`` directly and

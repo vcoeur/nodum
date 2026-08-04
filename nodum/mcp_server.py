@@ -78,6 +78,7 @@ from pydantic import BaseModel
 
 from nodum import assets, auth, ingest, service, urls
 from nodum import search as search_module
+from nodum.vocab import DIRECTIONS, STATES, NodeState
 
 #: Tool annotations per registered tier (design §8). Reads are read-only.
 #: Additive writes only ever *add* state — a node, an edge, a proposed
@@ -294,10 +295,17 @@ def create_server(*, token: str, db_path: str | Path | None = None) -> FastMCP:
         if unknown:
             raise ValueError(f"unknown search filter(s): {', '.join(unknown)}")
         state = filters.pop("state", "active")
+        if state in (None, "any"):
+            narrowed_state: NodeState | None = None
+        else:
+            state = str(state)
+            if state not in STATES:
+                raise ValueError(f"state must be one of {STATES}, got {state!r}")
+            narrowed_state = state
         result = search_module.search(
             query,
             k=k,
-            state=None if state in (None, "any") else str(state),
+            state=narrowed_state,
             type=filters.pop("type", None),
             created_by=filters.pop("created_by", None),
             created_after=filters.pop("created_after", None),
@@ -320,6 +328,8 @@ def create_server(*, token: str, db_path: str | Path | None = None) -> FastMCP:
         `edge_types` restricts the walk (ids or names), `depth` caps hops,
         `direction` is "out" / "in" / "both".
         """
+        if direction not in DIRECTIONS:
+            raise ValueError(f"direction must be one of {DIRECTIONS}, got {direction!r}")
         return _dump(
             service.traverse(
                 start_id,

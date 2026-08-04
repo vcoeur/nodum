@@ -2605,6 +2605,9 @@ ALLOWED_NODUM_IMPORTS = {
     "nodum.projectors",
     "nodum.service",
     "nodum.store",
+    # M30: the shared closed vocabularies (state/kind/level Literals + the
+    # tuple constants) moved to one module, imported by every consumer.
+    "nodum.vocab",
 }
 
 #: Call names that mean somebody is talking to SQLite directly.

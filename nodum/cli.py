@@ -38,6 +38,16 @@ from nodum.service import (
     TypeNotFound,
     UndoNotPossible,
 )
+from nodum.vocab import (
+    DIRECTIONS,
+    GRANT_LEVEL_NAMES,
+    PROPOSAL_KINDS,
+    STATES,
+    Direction,
+    GrantLevel,
+    NodeState,
+    ProposalKind,
+)
 
 app = typer.Typer(
     no_args_is_help=True,
@@ -272,6 +282,62 @@ def _principal(as_human: str) -> Principal:
     return _run(auth.owner_principal, human_id)
 
 
+def _state_value(state: str | None) -> NodeState | None:
+    """Narrow a ``--state`` string to the node-state vocabulary.
+
+    Refused with the service's own sentence, so a bad value reads identically
+    whether this helper or the service raises it. Callers route it through
+    :func:`_run`, the same error boundary every service refusal goes through.
+    """
+    if state is not None and state not in STATES:
+        raise ValueError(f"state must be one of {STATES}, got {state!r}")
+    return state
+
+
+def _search_state_value(state: str) -> NodeState | None:
+    """The ``search --state`` value: ``any`` translates to "no filter" here.
+
+    ``any`` is this adapter's documented pseudo-value and is accepted exactly
+    as before; every other value must be a real state.
+    """
+    if state == "any":
+        return None
+    return _state_value(state)
+
+
+def _edge_states_value(edge_states: list[str] | None) -> list[NodeState] | None:
+    """Narrow repeatable ``--edge-state`` values to the node-state vocabulary."""
+    if edge_states is None:
+        return None
+    narrowed: list[NodeState] = []
+    for edge_state in edge_states:
+        if edge_state not in STATES:
+            raise ValueError(f"state must be one of {STATES}, got {edge_state!r}")
+        narrowed.append(edge_state)
+    return narrowed
+
+
+def _kind_value(kind: str | None) -> ProposalKind | None:
+    """Narrow a ``--kind`` string to the proposal-kind vocabulary."""
+    if kind is not None and kind not in PROPOSAL_KINDS:
+        raise ValueError(f"kind must be 'node', 'edge', or 'update', got {kind!r}")
+    return kind
+
+
+def _direction_value(direction: str) -> Direction:
+    """Narrow a ``--direction`` string to the traversal-direction vocabulary."""
+    if direction not in DIRECTIONS:
+        raise ValueError(f"direction must be one of {DIRECTIONS}, got {direction!r}")
+    return direction
+
+
+def _level_value(level: str) -> GrantLevel:
+    """Narrow a ``grant`` level argument to the grant-level vocabulary."""
+    if level not in GRANT_LEVEL_NAMES:
+        raise ValueError(f"level must be one of {GRANT_LEVEL_NAMES}, got {level!r}")
+    return level
+
+
 SET_OPTION = typer.Option(None, "--set", help="Repeatable key=value props (values parsed as JSON).")
 
 #: The two read-side space controls, shared by `node list` and `search`. They
@@ -375,7 +441,7 @@ def node_list(
     nodes = _run(
         service.list_nodes,
         type=type,
-        state=state,
+        state=_run(_state_value, state),
         parent_id=parent,
         space=space,
         include_meta=include_meta,
@@ -430,7 +496,7 @@ def edge_list(
         service.list_edges,
         node_id=node,
         type=type,
-        state=state,
+        state=_run(_state_value, state),
         principal=_principal(as_human),
         limit=limit,
     )
@@ -603,7 +669,7 @@ def search(
     """
     shared = {
         "k": k,
-        "state": None if state == "any" else state,
+        "state": _run(_search_state_value, state),
         "type": type,
         "created_by": created_by,
         "created_after": created_after,
@@ -763,7 +829,7 @@ def traverse(
             start_id,
             edge_types=edge_type,
             depth=depth,
-            direction=direction,
+            direction=_run(_direction_value, direction),
             principal=_principal(as_human),
         )
     )
@@ -805,7 +871,7 @@ def subgraph(
             root_id,
             depth=depth,
             edge_types=edge_type,
-            edge_states=edge_state,
+            edge_states=_run(_edge_states_value, edge_state),
             min_confidence=min_confidence,
             created_by=created_by,
             node_types=node_type,
@@ -1351,7 +1417,7 @@ def review_queue(
         service.list_proposals,
         created_by=created_by,
         type=type,
-        kind=kind,
+        kind=_run(_kind_value, kind),
         created_before=created_before,
         created_after=created_after,
         principal=_principal(as_human),
@@ -1411,7 +1477,7 @@ def review_accept_all(
         service.accept_matching,
         created_by=created_by,
         type=type,
-        kind=kind,
+        kind=_run(_kind_value, kind),
         created_before=created_before,
         created_after=created_after,
         principal=_principal(as_human),
@@ -1440,7 +1506,7 @@ def review_reject_all(
         reason=reason,
         created_by=created_by,
         type=type,
-        kind=kind,
+        kind=_run(_kind_value, kind),
         created_before=created_before,
         created_after=created_after,
         principal=_principal(as_human),
@@ -1581,7 +1647,15 @@ def grant(
     as_human: str = AS_OPTION,
 ) -> None:
     """Grant (or re-level) an agent's access to a space; event-logged."""
-    _emit(_run(service.grant, agent_id, space, level, principal=_principal(as_human)))
+    _emit(
+        _run(
+            service.grant,
+            agent_id,
+            space,
+            _run(_level_value, level),
+            principal=_principal(as_human),
+        )
+    )
 
 
 @app.command()

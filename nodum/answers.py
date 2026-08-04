@@ -195,6 +195,7 @@ from nodum import agent, service
 from nodum import search as search_module
 from nodum.models import NodeOut, SearchHit
 from nodum.principal import Principal
+from nodum.vocab import NodeState
 
 __all__ = [
     "AskOut",
@@ -258,7 +259,7 @@ MIN_CONTEXT_CHARS = 240
 #: a human who can read every one of these rows — but a human archives a note to
 #: take it out of circulation, and "circulation" has to include the one path
 #: that puts its text on somebody else's machine.
-SENDABLE_STATES = ("active",)
+SENDABLE_STATES: tuple[NodeState, ...] = ("active",)
 
 #: Terms a query rewrite may contribute. One call, bounded output, bounded
 #: query — a rewrite that could return fifty terms would be a rewrite that can
@@ -567,7 +568,7 @@ class Offered(BaseModel):
     node_id: str
     title: str | None
     space_id: str | None
-    state: str | None = None
+    state: NodeState | None = None
     text: str
     excerpt: str = ""
     truncated: bool = False
@@ -588,7 +589,7 @@ class Citation(BaseModel):
     node_id: str
     title: str | None
     space_id: str | None
-    state: str | None = None
+    state: NodeState | None = None
     truncated: bool = False
 
 
@@ -1970,7 +1971,7 @@ def natural_search(
     query: str,
     *,
     k: int = 10,
-    state: str | None = "active",
+    state: NodeState | None = "active",
     type: str | None = None,
     created_by: str | None = None,
     created_after: str | None = None,

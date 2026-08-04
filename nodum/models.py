@@ -10,6 +10,20 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict
 
+from nodum.vocab import (
+    AgentKind,
+    CycleStatus,
+    CycleTrigger,
+    GrantLevel,
+    NodeState,
+    ProposalKind,
+    RollbackKind,
+    TransitionAction,
+    TransitionKind,
+    UrlGrantKind,
+    VersionState,
+)
+
 
 class NodeCreateIn(BaseModel):
     """A node as a client asks to create it.
@@ -95,7 +109,7 @@ class NodeOut(BaseModel):
     title: str | None
     content: str
     props: dict[str, Any]
-    state: str
+    state: NodeState
     created_by: str
     created_at: str
     updated_at: str
@@ -111,7 +125,7 @@ class EdgeOut(BaseModel):
     props: dict[str, Any]
     confidence: float | None
     created_by: str
-    state: str
+    state: NodeState
     valid_from: str | None
     valid_to: str | None
     created_at: str
@@ -137,7 +151,7 @@ class VersionOut(BaseModel):
     props: dict[str, Any]
     actor: str
     event_seq: int
-    state: str
+    state: VersionState
     proposed_fields: list[str] | None = None
     created_at: str
 
@@ -296,7 +310,7 @@ class ProposalOut(BaseModel):
     when the item has none.
     """
 
-    kind: str
+    kind: ProposalKind
     id: str
     type: str
     created_by: str
@@ -321,7 +335,7 @@ class AnnotationOut(BaseModel):
     """
 
     id: str
-    target_kind: str
+    target_kind: TransitionKind
     target_id: str
     body: dict[str, Any]
     actor: str
@@ -344,7 +358,7 @@ class BatchTransitionOut(BaseModel):
     the required state — a batch never aborts on a single bad id.
     """
 
-    action: str
+    action: TransitionAction
     actor: str
     reason: str | None = None
     transitioned: list[str]
@@ -530,7 +544,7 @@ class UrlGrantOut(BaseModel):
     ready-to-use address the token is embedded in.
     """
 
-    kind: str
+    kind: UrlGrantKind
     token: str
     url: str
     asset_hash: str | None
@@ -565,7 +579,7 @@ class AgentOut(BaseModel):
     """An agent account. ``has_token`` is all anyone ever learns of the token."""
 
     id: str
-    kind: str
+    kind: AgentKind
     name: str
     owner_human_id: str | None
     has_token: bool
@@ -585,7 +599,7 @@ class GrantOut(BaseModel):
 
     agent_id: str
     space_id: str
-    level: str
+    level: GrantLevel
     created_at: str
 
 
@@ -619,11 +633,11 @@ class CycleOut(BaseModel):
     """
 
     id: str
-    trigger: str
+    trigger: CycleTrigger
     triggered_by: str
     scope: str | None
     dry_run: bool
-    status: str
+    status: CycleStatus
     report: dict[str, Any] | None
     started_at: str
     finished_at: str | None
@@ -815,7 +829,7 @@ class RollbackConflictOut(BaseModel):
     conflict).
     """
 
-    kind: str
+    kind: RollbackKind
     row_id: str
     cycle_event_seq: int
     cycle_event_op: str
@@ -843,7 +857,7 @@ class RollbackBlockerOut(BaseModel):
     sentence, which is what the refusal says if the rollback is attempted.
     """
 
-    kind: str
+    kind: RollbackKind
     row_id: str
     cycle_event_seq: int
     cycle_event_op: str

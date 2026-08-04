@@ -1622,8 +1622,11 @@ _PLACEHOLDER_OPTIONS = {
 
 #: Required arguments Click type-converts *before* the command body runs. A
 #: non-numeric placeholder for `diff a b` is a usage error (exit 2), which would
-#: hide the refusal this sweep is about behind Click's own complaint.
-_PLACEHOLDER_ARGUMENTS = {"a": "1", "b": "2"}
+#: hide the refusal this sweep is about behind Click's own complaint. `level`
+#: is the same category one step later: `grant` narrows it against the grant
+#: levels in the command body, and a "placeholder" value would be refused there
+#: before `--as` is resolved — so it gets a valid level instead.
+_PLACEHOLDER_ARGUMENTS = {"a": "1", "b": "2", "level": "read"}
 
 #: Required arguments naming a file the command reads before it resolves `--as`.
 #: `edge create-batch` reports the missing file first — correctly, and through
