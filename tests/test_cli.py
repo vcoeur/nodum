@@ -190,6 +190,7 @@ def test_every_list_command_reports_a_count(fresh_db):
         (("ingest", "handlers"), "handlers"),
         (("projector", "run"), "projectors"),
         (("projector", "status"), "projectors"),
+        (("projector", "skips"), "skips"),
         (("cycle-list",), "cycles"),
     ):
         payload = _run_json(*args)
@@ -404,6 +405,7 @@ def test_projector_run_status_rebuild(fresh_db):
         "from_seq": 0,
         "to_seq": 1,
         "detail": None,
+        "skipped": 0,
     }
     assert by_name["vec"]["applied"] == 0
     assert by_name["vec"]["detail"]
@@ -422,6 +424,37 @@ def test_projector_rebuild_unknown_exits_1(fresh_db):
     result = runner.invoke(app, ["projector", "rebuild", "nope"])
     assert result.exit_code == 1
     assert "unknown projector" in result.stderr
+
+
+def test_projector_skips_lists_quarantined_events(fresh_db):
+    """Finding M12's CLI half: the quarantine has a read surface.
+
+    `projector status` reports the count; `projector skips` lists the rows
+    behind it, so a human can see which event was skipped and why.
+    """
+    _run_json("node", "create", "--type", "note", "--title", "one", "--content", "xylem")
+    _run_json("node", "create", "--type", "note", "--title", "two", "--content", "phloem")
+    conn = db.connect(fresh_db)
+    try:
+        conn.execute("UPDATE events SET payload = '{not json' WHERE seq = 1")
+        conn.commit()
+    finally:
+        conn.close()
+
+    runs = _run_json("projector", "run")
+    fts = {run["name"]: run for run in runs["projectors"]}["fts"]
+    assert fts["skipped"] == 1
+    assert fts["applied"] == 1
+
+    status = _run_json("projector", "status")
+    statuses = {entry["name"]: entry for entry in status["projectors"]}
+    assert statuses["fts"]["skipped"] == 1
+
+    skips = _run_json("projector", "skips")
+    assert skips["count"] == 1
+    (row,) = skips["skips"]
+    assert (row["projector"], row["seq"], row["op"]) == ("fts", 1, "node.create")
+    assert "JSONDecodeError" in row["error"]
 
 
 def test_node_get_with_depth(fresh_db):

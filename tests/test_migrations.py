@@ -278,6 +278,7 @@ def test_0012_applies_to_a_populated_database_already_at_0011(tmp_path, monkeypa
             "0014_cycles_and_gardener",
             "0015_cycle_stop_switch",
             "0016_conventions_and_annotations",
+            "0017_projector_skips",
         ]
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
         conn.execute(
@@ -396,6 +397,7 @@ def test_0013_applies_to_a_populated_database_holding_duplicate_space_titles(tmp
             "0014_cycles_and_gardener",
             "0015_cycle_stop_switch",
             "0016_conventions_and_annotations",
+            "0017_projector_skips",
         ]
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
         titles = dict(
@@ -472,6 +474,7 @@ def test_0013_finds_a_free_name_when_the_deduping_rename_would_itself_collide(
             "0014_cycles_and_gardener",
             "0015_cycle_stop_switch",
             "0016_conventions_and_annotations",
+            "0017_projector_skips",
         ]
         titles = dict(
             conn.execute("SELECT id, title FROM nodes WHERE id LIKE 'sp-%' ORDER BY id").fetchall()
@@ -522,6 +525,7 @@ def test_0013_deduplicates_a_title_that_is_another_spaces_id(tmp_path, monkeypat
             "0014_cycles_and_gardener",
             "0015_cycle_stop_switch",
             "0016_conventions_and_annotations",
+            "0017_projector_skips",
         ]
         titles = dict(
             conn.execute("SELECT id, title FROM nodes WHERE id LIKE 'sp-%' ORDER BY id").fetchall()
@@ -822,6 +826,7 @@ def test_0014_applies_to_a_populated_database_already_at_0013(tmp_path, monkeypa
             "0014_cycles_and_gardener",
             "0015_cycle_stop_switch",
             "0016_conventions_and_annotations",
+            "0017_projector_skips",
         ]
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
         conn.execute(
@@ -948,6 +953,7 @@ def test_0014_lets_an_ordinary_agent_id_through(tmp_path, monkeypatch):
             "0014_cycles_and_gardener",
             "0015_cycle_stop_switch",
             "0016_conventions_and_annotations",
+            "0017_projector_skips",
         ]
     finally:
         conn.close()
@@ -1077,7 +1083,11 @@ def test_0015_applies_to_a_populated_database_already_at_0014(tmp_path, monkeypa
     monkeypatch.setattr(db, "MIGRATIONS", MIGRATIONS)
     conn = db.connect()
     try:
-        assert db.init_db(conn) == ["0015_cycle_stop_switch", "0016_conventions_and_annotations"]
+        assert db.init_db(conn) == [
+            "0015_cycle_stop_switch",
+            "0016_conventions_and_annotations",
+            "0017_projector_skips",
+        ]
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
     finally:
         conn.close()
@@ -1163,7 +1173,7 @@ def test_the_missing_stop_columns_are_refused_with_the_statements_that_add_them(
         conn.commit()
         # The file was stopped at 0014, so the repair clears the last obstacle
         # and 0016 applies like any later migration.
-        assert db.init_db(conn) == ["0016_conventions_and_annotations"]
+        assert db.init_db(conn) == ["0016_conventions_and_annotations", "0017_projector_skips"]
 
         # And the repaired file enforces the coherence the CHECK exists for, so
         # a statement carrying only the right column *names* would not pass.
@@ -1213,7 +1223,7 @@ def test_a_half_applied_0015_is_repaired_without_re_adding_the_column_it_has(tmp
         conn.commit()
         # The file was stopped at 0014, so the repair clears the last obstacle
         # and 0016 applies like any later migration.
-        assert db.init_db(conn) == ["0016_conventions_and_annotations"]
+        assert db.init_db(conn) == ["0016_conventions_and_annotations", "0017_projector_skips"]
     finally:
         conn.close()
 
@@ -2214,7 +2224,7 @@ def test_0016_applies_to_a_populated_database_already_at_0015(tmp_path, monkeypa
     monkeypatch.setattr(db, "MIGRATIONS", MIGRATIONS)
     conn = db.connect()
     try:
-        assert db.init_db(conn) == ["0016_conventions_and_annotations"]
+        assert db.init_db(conn) == ["0016_conventions_and_annotations", "0017_projector_skips"]
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
     finally:
         conn.close()

@@ -1008,6 +1008,12 @@ def projector_status() -> None:
     _emit_list("projectors", statuses)
 
 
+@projector_app.command("skips")
+def projector_skips() -> None:
+    """List events the projectors quarantined instead of applying."""
+    _emit_list("skips", _run(projectors.list_skips))
+
+
 # ── Assets and renditions ─────────────────────────────────────────────────────
 
 

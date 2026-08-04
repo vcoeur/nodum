@@ -173,6 +173,25 @@ CREATE VIRTUAL TABLE node_fts USING fts5(
 """
 
 
+PROJECTOR_SKIPS_DDL = """
+-- Events a projector quarantined instead of replaying forever (finding M12).
+-- One row per (projector, seq): the event a projector's apply refused, the op
+-- it carried, and why it raised. The checkpoint advances past a skipped
+-- event, so one malformed row can no longer wedge a projector; this table is
+-- the audit trail a human reads to see what was skipped and fix the writer.
+-- It is append-only like the log it annotates: a rebuild replays a still-bad
+-- event and refreshes the row (the writer upserts) rather than deleting it.
+CREATE TABLE projector_skips (
+    projector  TEXT NOT NULL,
+    seq        INTEGER NOT NULL,
+    op         TEXT NOT NULL,
+    error      TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (projector, seq)
+);
+"""
+
+
 POLICIES_DDL = """
 -- Per-agent policy rulesets (design §8.3). `rules` is a JSON array of rule
 -- objects keyed by `job` (internal-agent jobs, evaluated by the Phase-5
@@ -1053,4 +1072,5 @@ MIGRATIONS: list[tuple[str, str]] = [
     ("0014_cycles_and_gardener", CYCLES_AND_GARDENER_DDL),
     ("0015_cycle_stop_switch", CYCLE_STOP_SWITCH_DDL),
     ("0016_conventions_and_annotations", CONVENTIONS_AND_ANNOTATIONS_DDL),
+    ("0017_projector_skips", PROJECTOR_SKIPS_DDL),
 ]

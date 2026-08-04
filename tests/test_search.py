@@ -51,6 +51,54 @@ def test_search_catches_the_projector_up_implicitly(fresh_db):
     assert [hit.title for hit in search.search("xylem", principal=owner()).hits] == ["T"]
 
 
+def test_a_corrupted_event_does_not_wedge_search(fresh_db):
+    """Finding M12's acceptance: corrupt one event and search still works.
+
+    Search catches the projectors up on every call, and before this fix one
+    unparseable event made `apply` raise forever — every search after the
+    corruption failed on the same row. The event is quarantined now: the
+    checkpoint advances past it, events after it still apply, and the search
+    answers from the index that survived.
+    """
+    good = service.create_node(
+        type="note", title="Good", content="xylem carries sap", principal=owner()
+    )
+    casualty = service.create_node(
+        type="note", title="Casualty", content="turbulence", principal=owner()
+    )
+    tail = service.create_node(type="note", title="Tail", content="phloem", principal=owner())
+    # Corrupt the middle event (`casualty`'s create): the payload column is
+    # no longer parseable JSON. The events before and after it must still
+    # project.
+    conn = db.connect(fresh_db)
+    try:
+        conn.execute("UPDATE events SET payload = '{not json' WHERE seq = 2")
+        conn.commit()
+    finally:
+        conn.close()
+
+    result = search.search("xylem", principal=owner())
+    assert [hit.node_id for hit in result.hits] == [good.id]
+    assert "bm25" in result.hits[0].signals
+
+    # The quarantine is visible through projector status, and only the
+    # corrupted event's node is missing from the index.
+    fts = {status.name: status for status in projectors.projector_status()}["fts"]
+    assert fts.skipped == 1
+    conn = db.connect(fresh_db)
+    try:
+        indexed = {row["node_id"] for row in conn.execute("SELECT node_id FROM node_fts")}
+    finally:
+        conn.close()
+    assert good.id in indexed and tail.id in indexed
+    assert casualty.id not in indexed
+
+    # A later search answers the same way — the checkpoint moved past the bad
+    # event, so nothing re-fails.
+    again = search.search("xylem", principal=owner())
+    assert [hit.node_id for hit in again.hits] == [good.id]
+
+
 def test_bm25_ranks_the_stronger_match_first(fresh_db):
     service.create_node(
         type="note",

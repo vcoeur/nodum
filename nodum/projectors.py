@@ -15,7 +15,11 @@ Everything here is deterministic and LLM-free (design Constraint 4): the
 service layer never calls into this module on the write path — the event log
 is the only coupling. Embedding models are deterministic transformers, not
 agents; a projector with no usable embedding provider simply reports itself
-unavailable and makes no progress (its backlog waits).
+unavailable and makes no progress (its backlog waits). An event whose
+``apply`` refuses it — one malformed row in the log, say — is quarantined
+and skipped past rather than failing forever on the same row (finding M12);
+a systemic failure (a dead provider, a database error) is never quarantined,
+because a whole batch of skips would hide it.
 """
 
 from __future__ import annotations
@@ -28,7 +32,7 @@ from typing import Any
 import sqlite_vec
 
 from nodum import db, embeddings
-from nodum.models import ProjectorRun, ProjectorStatus
+from nodum.models import ProjectorRun, ProjectorSkip, ProjectorStatus
 
 #: The node type whose FTS row carries its asset's extracted text. Spelled here
 #: rather than imported from :mod:`nodum.ingest`: a projector is derived state
@@ -421,11 +425,45 @@ def _resolve(names: list[str] | None) -> list[Projector]:
     return [REGISTRY[name] for name in names]
 
 
-def _run_one(conn: sqlite3.Connection, projector: Projector) -> ProjectorRun:
-    """Apply every event past the checkpoint, advancing it per batch.
+def _record_skip(conn: sqlite3.Connection, name: str, event: sqlite3.Row, exc: Exception) -> None:
+    """Quarantine one event a projector refused, in the projector's transaction.
 
-    The whole batch applies in one transaction: a failure rolls back to the
-    last committed checkpoint, and replaying the same events is deterministic.
+    The row is upserted: a rebuild that replays the same still-bad event
+    refreshes the record rather than colliding on the ``(projector, seq)``
+    primary key.
+    """
+    conn.execute(
+        """
+        INSERT INTO projector_skips (projector, seq, op, error, created_at)
+        VALUES (?, ?, ?, ?, datetime('now'))
+        ON CONFLICT(projector, seq) DO UPDATE SET
+            error = excluded.error,
+            created_at = excluded.created_at
+        """,
+        (name, event["seq"], event["op"], f"{type(exc).__name__}: {exc}"),
+    )
+
+
+def _run_one(conn: sqlite3.Connection, projector: Projector) -> ProjectorRun:
+    """Apply every event past the checkpoint in one self-contained transaction.
+
+    The projector's whole batch — its writes and its checkpoint together —
+    commits in a single transaction (finding M11), so the batch is atomic
+    and a failure in one projector can never discard another projector's
+    already-committed work. Within the batch:
+
+    * an event whose ``apply`` raises ``ValueError``, ``KeyError`` or
+      ``AttributeError`` — the exceptions a malformed payload raises: the
+      JSON decode, a payload that is not a dict, a missing key — is
+      quarantined in ``projector_skips`` and the checkpoint advances past it,
+      so one bad row cannot wedge the projector forever (finding M12);
+    * any other exception is systemic — a provider outage, a database error —
+      and aborts the batch: the transaction rolls back and the exception
+      propagates, so a systemic failure is never hidden as a run of skips.
+      The same abort applies when *every* event in the batch was skipped: an
+      all-malformed backlog is a writer bug, not N independent corruptions,
+      and the checkpoint stays put until a human looks.
+
     An unavailable projector is a no-op — the checkpoint stays put so the
     backlog is picked up once the blocker clears.
     """
@@ -436,11 +474,34 @@ def _run_one(conn: sqlite3.Connection, projector: Projector) -> ProjectorRun:
             name=projector.name, applied=0, from_seq=from_seq, to_seq=from_seq, detail=reason
         )
     rows = conn.execute("SELECT * FROM events WHERE seq > ? ORDER BY seq", (from_seq,)).fetchall()
-    for event in rows:
-        projector.apply(conn, event)
-        _set_checkpoint(conn, projector.name, event["seq"])
-    to_seq = rows[-1]["seq"] if rows else from_seq
-    return ProjectorRun(name=projector.name, applied=len(rows), from_seq=from_seq, to_seq=to_seq)
+    if not rows:
+        return ProjectorRun(name=projector.name, applied=0, from_seq=from_seq, to_seq=from_seq)
+    try:
+        skipped = 0
+        last_error: Exception | None = None
+        for event in rows:
+            try:
+                projector.apply(conn, event)
+            except (ValueError, KeyError, AttributeError) as exc:
+                _record_skip(conn, projector.name, event, exc)
+                skipped += 1
+                last_error = exc
+            # The checkpoint advances past every event, skipped or applied —
+            # a skipped event must not be replayed (and re-failed) next run.
+            _set_checkpoint(conn, projector.name, event["seq"])
+        if skipped == len(rows) and last_error is not None:
+            raise last_error
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return ProjectorRun(
+        name=projector.name,
+        applied=len(rows) - skipped,
+        from_seq=from_seq,
+        to_seq=rows[-1]["seq"],
+        skipped=skipped,
+    )
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -450,6 +511,14 @@ def run_projectors(
     *, names: list[str] | None = None, path: str | Path | None = None
 ) -> list[ProjectorRun]:
     """Bring projectors up to date with the event log.
+
+    Each projector's batch runs in its own transaction (:func:`_run_one`),
+    so a failure in one projector rolls back only its own batch — the other
+    projectors' committed work survives (finding M11). A systemic failure (a
+    provider outage, a database error, a backlog whose every event is
+    malformed) propagates: the failing projector's batch rolls back and the
+    exception surfaces to the caller, with the other projectors' work already
+    committed.
 
     Args:
         names: Projectors to run (default: all registered).
@@ -464,9 +533,7 @@ def run_projectors(
     selected = _resolve(names)
     conn = _connect(path)
     try:
-        runs = [_run_one(conn, projector) for projector in selected]
-        conn.commit()
-        return runs
+        return [_run_one(conn, projector) for projector in selected]
     finally:
         conn.close()
 
@@ -502,7 +569,12 @@ def rebuild_projector(name: str, *, path: str | Path | None = None) -> Projector
 
 
 def projector_status(*, path: str | Path | None = None) -> list[ProjectorStatus]:
-    """Report every projector's checkpoint, backlog, store size, and availability."""
+    """Report every projector's checkpoint, backlog, store size, and availability.
+
+    ``skipped`` counts the events the projector has quarantined instead of
+    applying (finding M12) — a non-zero count is the signal to read
+    :func:`list_skips` for the rows behind it.
+    """
     conn = _connect(path)
     try:
         max_seq_row = conn.execute("SELECT COALESCE(MAX(seq), 0) AS m FROM events").fetchone()
@@ -512,6 +584,10 @@ def projector_status(*, path: str | Path | None = None) -> list[ProjectorStatus]
             available, reason = projector.availability()
             note = projector.mixed_model_note(conn) if available else None
             checkpoint = _checkpoint(conn, projector.name)
+            skipped_row = conn.execute(
+                "SELECT COUNT(*) AS n FROM projector_skips WHERE projector = ?",
+                (projector.name,),
+            ).fetchone()
             statuses.append(
                 ProjectorStatus(
                     name=projector.name,
@@ -520,8 +596,37 @@ def projector_status(*, path: str | Path | None = None) -> list[ProjectorStatus]
                     rows=projector.count(conn),
                     available=available,
                     detail=note or reason,
+                    skipped=int(skipped_row["n"]),
                 )
             )
         return statuses
+    finally:
+        conn.close()
+
+
+def list_skips(*, path: str | Path | None = None) -> list[ProjectorSkip]:
+    """Return every quarantined event, one row per (projector, seq).
+
+    The read surface behind the ``skipped`` counts on
+    :class:`ProjectorRun` / :class:`ProjectorStatus`: a human who sees a
+    non-zero count comes here for the error each skip recorded (finding
+    M12). Rows are newest-first within each projector.
+    """
+    conn = _connect(path)
+    try:
+        rows = conn.execute(
+            "SELECT projector, seq, op, error, created_at FROM projector_skips"
+            " ORDER BY projector, seq DESC"
+        ).fetchall()
+        return [
+            ProjectorSkip(
+                projector=row["projector"],
+                seq=row["seq"],
+                op=row["op"],
+                error=row["error"],
+                created_at=row["created_at"],
+            )
+            for row in rows
+        ]
     finally:
         conn.close()

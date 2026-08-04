@@ -233,7 +233,9 @@ class ProjectorStatus(BaseModel):
     the size of its derived store (index rows for the FTS projector, chunks
     for the vector projector). ``available`` is false when the projector
     cannot make progress (e.g. no embedding provider for ``vec``); ``detail``
-    then carries the reason.
+    then carries the reason. ``skipped`` counts the events this projector has
+    quarantined instead of applying (finding M12) — ``nodum projector skips``
+    lists the rows behind the count.
     """
 
     name: str
@@ -242,6 +244,7 @@ class ProjectorStatus(BaseModel):
     rows: int
     available: bool = True
     detail: str | None = None
+    skipped: int = 0
 
 
 class ProjectorRun(BaseModel):
@@ -250,7 +253,10 @@ class ProjectorRun(BaseModel):
     ``applied`` counts the events consumed in this call; ``from_seq`` /
     ``to_seq`` are the checkpoint before and after. When a projector is
     unavailable the run is a no-op (``applied`` 0, checkpoint unmoved) and
-    ``detail`` carries the reason.
+    ``detail`` carries the reason. ``skipped`` counts the events this run
+    quarantined rather than applied (finding M12): a malformed event is
+    recorded in ``projector_skips`` and the checkpoint advances past it, so
+    the next run starts after it instead of failing on it forever.
     """
 
     name: str
@@ -258,6 +264,25 @@ class ProjectorRun(BaseModel):
     from_seq: int
     to_seq: int
     detail: str | None = None
+    skipped: int = 0
+
+
+class ProjectorSkip(BaseModel):
+    """One event a projector quarantined instead of applying (finding M12).
+
+    ``projector`` / ``seq`` name the event (the pair is the table's primary
+    key), ``op`` the operation it carried, and ``error`` why ``apply``
+    refused it. The projector's checkpoint has already advanced past ``seq``,
+    so the row is the record of a skip that happened — this is the read
+    surface behind the ``skipped`` counts on :class:`ProjectorRun` and
+    :class:`ProjectorStatus`.
+    """
+
+    projector: str
+    seq: int
+    op: str
+    error: str
+    created_at: str
 
 
 class SearchHit(BaseModel):

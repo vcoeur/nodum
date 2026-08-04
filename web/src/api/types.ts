@@ -10,7 +10,7 @@
  * - Field names are copied verbatim; do not camelCase them.
  *
  * Keep this file in lockstep with `nodum/models.py`. Mirrored against the
- * principals tree (migrations 0001–0016). `tests/test_types_contract.py` is
+ * principals tree (migrations 0001–0017). `tests/test_types_contract.py` is
  * the lock: it fails when this file drifts from the pydantic models.
  */
 
@@ -137,7 +137,10 @@ export interface InitResult {
   already_applied: string[];
 }
 
-/** One projector's checkpoint state and backlog. */
+/**
+ * One projector's checkpoint state and backlog. `skipped` counts the events
+ * the projector has quarantined instead of applying (finding M12).
+ */
 export interface ProjectorStatus {
   name: string;
   last_event_seq: number;
@@ -145,15 +148,20 @@ export interface ProjectorStatus {
   rows: number;
   available: boolean;
   detail: string | null;
+  skipped: number;
 }
 
-/** The outcome of running (or rebuilding) one projector. */
+/**
+ * The outcome of running (or rebuilding) one projector. `skipped` counts the
+ * events this run quarantined instead of applying (finding M12).
+ */
 export interface ProjectorRun {
   name: string;
   applied: number;
   from_seq: number;
   to_seq: number;
   detail: string | null;
+  skipped: number;
 }
 
 /**

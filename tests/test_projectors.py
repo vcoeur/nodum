@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 
 import pytest
+from conftest import HashEmbedder
 from helpers import owner
 
 from nodum import assets, db, embeddings, projectors, search, service
@@ -398,3 +399,136 @@ def test_rebuild_replays_the_asset_join_from_event_zero(fresh_db, tmp_path):
     projectors.rebuild_projector("fts")
     assert _fts_extracted(fresh_db) == before
     assert _fts_extracted(fresh_db)[node.id] == "quokka"
+
+
+# ── M11: per-projector transactions; M12: the quarantine ─────────────────────
+
+
+def _corrupt_payload(fresh_db, seq, payload="{not json"):
+    """Rewrite one event's payload column to text `apply` cannot parse.
+
+    The service layer can only write valid JSON objects there, so this has to
+    be injected: the point is that a replay meeting one quarantines it and
+    moves on, whatever wrote it (finding M12).
+    """
+    conn = db.connect(fresh_db)
+    try:
+        conn.execute("UPDATE events SET payload = ? WHERE seq = ?", (payload, seq))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_a_failing_projector_rolls_back_only_its_own_batch(fresh_db):
+    """Finding M11: one projector's failure must not discard another's work.
+
+    `fts` and `vec` share one run call and (before this) one transaction: the
+    vec projector failing mid-batch rolled back fts's applied events and
+    checkpoints with it. Each projector's batch is its own transaction now —
+    vec's failure rolls back vec's own writes and checkpoint, while fts's
+    committed work survives.
+    """
+
+    class FailingEmbedder(HashEmbedder):
+        def embed(self, texts):
+            if any("boom" in text for text in texts):
+                raise RuntimeError("embedding provider fell over")
+            return super().embed(texts)
+
+    embeddings.set_provider(FailingEmbedder())
+    ok = service.create_node(type="note", title="ok", content="safe text", principal=owner())
+    boom = service.create_node(type="note", title="boom", content="boom text", principal=owner())
+    with pytest.raises(RuntimeError, match="fell over"):
+        projectors.run_projectors(names=["fts", "vec"])
+
+    # fts's batch committed: both nodes indexed, checkpoint at the end.
+    rows = _fts_rows(fresh_db)
+    assert ok.id in rows and boom.id in rows
+    fts_status = _statuses()["fts"]
+    assert fts_status.last_event_seq == 2
+    assert fts_status.pending_events == 0
+
+    # vec's batch rolled back: nothing in the store, checkpoint unmoved.
+    vec_status = _statuses()["vec"]
+    assert vec_status.last_event_seq == 0
+    assert vec_status.rows == 0
+
+    # The next run retries vec from the same checkpoint (and fails again —
+    # a provider failure is systemic, never quarantined as skips).
+    with pytest.raises(RuntimeError, match="fell over"):
+        projectors.run_projectors(names=["vec"])
+    assert _statuses()["vec"].last_event_seq == 0
+
+
+def test_a_malformed_event_is_quarantined_and_the_checkpoint_moves_on(fresh_db):
+    """Finding M12: one bad row must not wedge the projector forever.
+
+    A replay that meets an unparseable payload skips the event, records the
+    skip, and keeps applying what comes after — the checkpoint advances past
+    the bad row, so the next run starts after it instead of failing on it.
+    """
+    before = service.create_node(type="note", title="before", principal=owner())
+    bad = service.create_node(type="note", title="bad", principal=owner())
+    after = service.create_node(type="note", title="after", principal=owner())
+    _corrupt_payload(fresh_db, 2)  # the middle event: `bad`'s create
+
+    run = _runs()["fts"]
+    assert (run.applied, run.skipped, run.from_seq, run.to_seq) == (2, 1, 0, 3)
+    rows = _fts_rows(fresh_db)
+    assert before.id in rows and after.id in rows
+    assert bad.id not in rows
+
+    # The next run starts after the bad event: nothing left to do.
+    run = _runs()["fts"]
+    assert (run.applied, run.skipped) == (0, 0)
+
+    # The skip is recorded with the event's op and the failure reason.
+    conn = db.connect(fresh_db)
+    try:
+        (skip,) = conn.execute(
+            "SELECT projector, seq, op, error FROM projector_skips WHERE projector = 'fts'"
+        ).fetchall()
+    finally:
+        conn.close()
+    assert (skip["seq"], skip["op"]) == (2, "node.create")
+    assert "JSONDecodeError" in skip["error"]
+
+    # A rebuild replays the bad event and re-skips it: the record is
+    # upserted, not duplicated.
+    run = projectors.rebuild_projector("fts")
+    assert (run.applied, run.skipped) == (2, 1)
+    conn = db.connect(fresh_db)
+    try:
+        count = conn.execute("SELECT COUNT(*) AS n FROM projector_skips").fetchone()["n"]
+    finally:
+        conn.close()
+    assert count == 1
+
+    # The quarantine is visible through status.
+    assert _statuses()["fts"].skipped == 1
+
+
+def test_a_backlog_whose_every_event_is_malformed_aborts_instead_of_hiding(fresh_db):
+    """The all-failed bound: an all-malformed backlog is a writer bug, not N
+    independent corruptions, so it must not be recorded as N skips.
+
+    A single bad event is quarantined and the projector moves on; a batch
+    where *every* event raises is a systemic signal, so the batch aborts, the
+    checkpoint stays behind, and the failure surfaces to the caller.
+    """
+    service.create_node(type="note", title="one", principal=owner())
+    service.create_node(type="note", title="two", principal=owner())
+    _corrupt_payload(fresh_db, 1)
+    _corrupt_payload(fresh_db, 2)
+    with pytest.raises(json.JSONDecodeError):
+        projectors.run_projectors(names=["fts"])
+
+    # Nothing committed: checkpoint unmoved, and the skip rows rolled back
+    # with the batch.
+    assert _statuses()["fts"].last_event_seq == 0
+    conn = db.connect(fresh_db)
+    try:
+        count = conn.execute("SELECT COUNT(*) AS n FROM projector_skips").fetchone()["n"]
+    finally:
+        conn.close()
+    assert count == 0
