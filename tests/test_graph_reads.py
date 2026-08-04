@@ -5,8 +5,8 @@ from __future__ import annotations
 import pytest
 from helpers import agent, owner
 
+from nodum import db, service
 from nodum import search as search_module
-from nodum import service
 from nodum.service import NodeNotFound, TypeNotFound
 
 AGENT = "agent:researcher"
@@ -88,6 +88,55 @@ def test_traverse_rejects_bad_input(fresh_db):
         service.traverse(a.id, direction="sideways", principal=owner())
     with pytest.raises(TypeNotFound):
         service.traverse(a.id, edge_types=["bogus"], principal=owner())
+
+
+def _set_validity(edge_id, valid_from, valid_to):
+    """Stamp an edge's window directly, past the writers (see test_service)."""
+    conn = db.connect()
+    try:
+        conn.execute(
+            "UPDATE edges SET valid_from = ?, valid_to = ? WHERE id = ?",
+            (valid_from, valid_to, edge_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_traverse_as_of_follows_window_covered_edges(fresh_db):
+    """The D2/B8 gate, traverse form: a retired edge is followed at the
+    instants its window covered, and nowhere else."""
+    a = service.create_node(type="concept", title="Alpha", principal=owner())
+    b = service.create_node(type="concept", title="Beta", principal=owner())
+    ab = service.create_edge(a.id, b.id, "supports", principal=owner())
+    service.transition(ab.id, "archive", principal=owner())
+    _set_validity(ab.id, "2026-08-01 10:00:00", "2026-08-01 10:00:10")
+
+    # Default traverse reads the live graph: the far endpoint is unreachable.
+    assert {node.id for node in service.traverse(a.id, depth=1, principal=owner()).nodes} == {a.id}
+    # As-of mid-window: the walk crosses the retired edge.
+    mid = service.traverse(a.id, depth=1, as_of="2026-08-01 10:00:05", principal=owner())
+    assert {node.id for node in mid.nodes} == {a.id, b.id}
+    assert [e.id for e in mid.edges] == [ab.id]
+    # As-of after the window closed: gone again.
+    later = service.traverse(a.id, depth=1, as_of="2026-08-01 10:00:20", principal=owner())
+    assert {node.id for node in later.nodes} == {a.id}
+
+
+def test_get_neighborhood_as_of_shows_window_covered_edges(fresh_db):
+    """The gate, get_neighborhood form: the same lens `traverse` uses."""
+    a = service.create_node(type="concept", title="Alpha", principal=owner())
+    b = service.create_node(type="concept", title="Beta", principal=owner())
+    ab = service.create_edge(a.id, b.id, "supports", principal=owner())
+    service.transition(ab.id, "archive", principal=owner())
+    _set_validity(ab.id, "2026-08-01 10:00:00", "2026-08-01 10:00:10")
+
+    assert {node.id for node in service.get_neighborhood(a.id, principal=owner()).nodes} == {a.id}
+    mid = service.get_neighborhood(a.id, as_of="2026-08-01 10:00:05", principal=owner())
+    assert {node.id for node in mid.nodes} == {a.id, b.id}
+    assert [e.id for e in mid.edges] == [ab.id]
+    later = service.get_neighborhood(a.id, as_of="2026-08-01 10:00:20", principal=owner())
+    assert {node.id for node in later.nodes} == {a.id}
 
 
 # ── find_path ─────────────────────────────────────────────────────────────────

@@ -1979,6 +1979,7 @@ def natural_search(
     include_meta: bool = False,
     space: str | None = None,
     expand: bool = False,
+    as_of: str | None = None,
     principal: Principal,
     path: str | Path | None = None,
     run: agent.AgentRun | None = None,
@@ -2023,6 +2024,8 @@ def natural_search(
         include_meta: Include meta-space nodes in an unnarrowed search.
         space: Narrow to one space.
         expand: Append one-hop neighbours of the fused hits.
+        as_of: Follow, for the ``expand`` half, the edges true at an instant
+            (D2), exactly as :func:`nodum.search.search` means it.
         principal: Who is asking.
         path: Explicit database path.
         run: An explicit runtime, overriding the per-request default.
@@ -2072,6 +2075,7 @@ def natural_search(
         include_meta=include_meta,
         space=space,
         expand=expand,
+        as_of=as_of,
         principal=principal,
         path=path,
     )

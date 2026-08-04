@@ -59,7 +59,7 @@ from nodum import db, embeddings, projectors
 from nodum.migrations import META_SPACE_ID
 from nodum.models import SearchHit, SearchResult
 from nodum.principal import READ, Principal
-from nodum.service import require_positive_limit
+from nodum.service import _as_of_edge_clause, require_positive_limit
 from nodum.store import node_readable, node_scope_clause
 from nodum.vocab import NodeState
 
@@ -844,6 +844,7 @@ def _expand_hits(
     include_meta: bool,
     space_id: str | None,
     principal: Principal | None,
+    as_of: str | None = None,
 ) -> list[SearchHit]:
     """One-hop graph expansion: active-edge neighbors of the fused hits.
 
@@ -858,14 +859,26 @@ def _expand_hits(
     different question — there the far endpoint is drawn dimmed rather than
     dropped, because a graph asserting a connection ends is asserting
     something false. A ranked list asserts nothing of the sort.)
+
+    ``as_of`` follows the edges true at an instant instead of the live graph
+    (D2): ``archived`` edges whose validity window covered it are followed
+    alongside ``active`` ones (the same window
+    :func:`nodum.service._as_of_edge_clause` encodes).
     """
     seen = {hit.node_id for hit in hits}
     weights: dict[str, float] = {}
     for hit in hits:
-        rows = conn.execute(
-            "SELECT * FROM edges WHERE state = 'active' AND (src_id = ? OR dst_id = ?)",
-            (hit.node_id, hit.node_id),
-        ).fetchall()
+        if as_of is not None:
+            clause, params = _as_of_edge_clause(as_of, ("active",))
+            rows = conn.execute(
+                f"SELECT * FROM edges WHERE {clause} AND (src_id = ? OR dst_id = ?)",
+                [*params, hit.node_id, hit.node_id],
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM edges WHERE state = 'active' AND (src_id = ? OR dst_id = ?)",
+                (hit.node_id, hit.node_id),
+            ).fetchall()
         for edge in rows:
             other = edge["dst_id"] if edge["src_id"] == hit.node_id else edge["src_id"]
             if other in seen:
@@ -915,6 +928,7 @@ def search(
     include_meta: bool = False,
     space: str | None = None,
     expand: bool = False,
+    as_of: str | None = None,
     principal: Principal,
     path: str | Path | None = None,
 ) -> SearchResult:
@@ -952,6 +966,12 @@ def search(
         expand: Append one-hop active-edge neighbors of the fused hits
             (design §7 graph expansion), scored by edge type weight ×
             confidence.
+        as_of: Follow, for the ``expand`` half, the edges true at an instant
+            instead of the live graph (D2): ``archived`` edges whose validity
+            window covered it join the ``active`` ones. Node retrieval itself
+            is timeless — nodes carry no validity window — so ``as_of`` only
+            changes which edges expansion crosses, and the default (``None``)
+            leaves the search exactly as it was.
         path: Explicit database path.
 
     Returns:
@@ -1034,6 +1054,7 @@ def search(
                 include_meta=include_meta,
                 space_id=space_id,
                 principal=principal,
+                as_of=as_of,
             )
         return SearchResult(query=query, k=k, hits=hits)
     finally:

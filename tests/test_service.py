@@ -400,6 +400,177 @@ def test_transition_applies_to_edges_too(fresh_db):
     assert accepted.id == edge.id
 
 
+# ── Edge temporality (D2/B8) ──────────────────────────────────────────────────
+
+
+def _set_validity(edge_id, valid_from, valid_to):
+    """Stamp an edge's window directly, past the writers, for read-predicate tests.
+
+    The writers record SQLite's second-resolution wall clock; a test that
+    needs *exact* instants (a between-instant inside a one-second window is
+    not representable) sets the window by hand and asserts the reads against
+    it. The writer tests above assert the writers fire at all.
+    """
+    conn = db.connect()
+    try:
+        conn.execute(
+            "UPDATE edges SET valid_from = ?, valid_to = ? WHERE id = ?",
+            (valid_from, valid_to, edge_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_create_edge_sets_valid_from_when_it_lands_active(fresh_db):
+    """An active edge IS true at creation, so its window opens with it (D2)."""
+    a = service.create_node(type="claim", title="A", principal=owner())
+    b = service.create_node(type="claim", title="B", principal=owner())
+    edge = service.create_edge(a.id, b.id, "supports", principal=owner())
+    assert edge.state == "active"
+    assert edge.valid_from is not None
+    assert edge.valid_to is None
+
+
+def test_create_edge_landing_proposed_opens_no_window(fresh_db):
+    """A proposed edge is not yet true — its window opens only on accept."""
+    a = service.create_node(type="claim", title="A", principal=owner())
+    b = service.create_node(type="claim", title="B", principal=owner())
+    edge = service.create_edge(a.id, b.id, "supports", principal=agent("researcher"))
+    assert edge.state == "proposed"
+    assert edge.valid_from is None
+    assert edge.valid_to is None
+
+
+def test_accepting_a_proposed_edge_sets_valid_from(fresh_db):
+    """Accept is when the edge became true, so accept writes `valid_from`."""
+    a = service.create_node(type="claim", title="A", principal=owner())
+    b = service.create_node(type="claim", title="B", principal=owner())
+    edge = service.create_edge(a.id, b.id, "supports", principal=agent("researcher"))
+    accepted = service.transition(edge.id, "accept", principal=owner())
+    assert accepted.state == "active"
+    assert accepted.valid_from is not None
+
+
+def test_rejecting_a_proposed_edge_closes_no_window(fresh_db):
+    """A rejected proposal was never true, so no window opens or closes."""
+    a = service.create_node(type="claim", title="A", principal=owner())
+    b = service.create_node(type="claim", title="B", principal=owner())
+    edge = service.create_edge(a.id, b.id, "supports", principal=agent("researcher"))
+    rejected = service.transition(edge.id, "reject", reason="not true", principal=owner())
+    assert rejected.state == "archived"
+    assert rejected.valid_from is None
+    assert rejected.valid_to is None
+
+
+def test_archiving_an_edge_sets_valid_to(fresh_db):
+    """Retiring a live edge closes its window at the archive instant (D2)."""
+    a = service.create_node(type="claim", title="A", principal=owner())
+    b = service.create_node(type="claim", title="B", principal=owner())
+    edge = service.create_edge(a.id, b.id, "supports", principal=owner())
+    archived = service.transition(edge.id, "archive", principal=owner())
+    assert archived.state == "archived"
+    assert archived.valid_from is not None
+    assert archived.valid_to is not None
+
+
+def test_as_of_lists_edges_inside_their_validity_window(fresh_db):
+    """The D2/B8 gate, list_edges form: a closed window hides an edge from the
+    default read but an as-of read places it at the instants the window
+    covered, and nowhere else."""
+    a = service.create_node(type="claim", title="A", principal=owner())
+    b = service.create_node(type="claim", title="B", principal=owner())
+    edge = service.create_edge(a.id, b.id, "supports", principal=owner())
+    service.transition(edge.id, "archive", principal=owner())
+    # Window: valid from 10:00:00 to 10:00:10 (exclusive of the close).
+    _set_validity(edge.id, "2026-08-01 10:00:00", "2026-08-01 10:00:10")
+
+    # Default live-graph read: archived, so gone (already true before D2).
+    assert service.list_edges(state="active", principal=owner()) == []
+    # As-of between creation and archive: present.
+    mid = service.list_edges(as_of="2026-08-01 10:00:05", principal=owner())
+    assert [e.id for e in mid] == [edge.id]
+    # As-of after the window closed: absent.
+    assert service.list_edges(as_of="2026-08-01 10:00:20", principal=owner()) == []
+    # As-of exactly at the close: the window is (valid_from, valid_to], so the
+    # closed instant itself is outside it.
+    assert service.list_edges(as_of="2026-08-01 10:00:10", principal=owner()) == []
+
+
+def test_as_of_places_a_proposed_edge_only_after_its_accept(fresh_db):
+    """The D2/B8 gate, accept form: `valid_from` opens at the accept instant,
+    so an as-of read before the accept does not show the edge, and one after
+    does."""
+    a = service.create_node(type="claim", title="A", principal=owner())
+    b = service.create_node(type="claim", title="B", principal=owner())
+    edge = service.create_edge(a.id, b.id, "supports", principal=agent("researcher"))
+    accepted = service.transition(edge.id, "accept", principal=owner())
+    _set_validity(accepted.id, "2026-08-01 10:00:10", None)
+
+    assert service.list_edges(as_of="2026-08-01 10:00:05", principal=owner()) == []
+    after = service.list_edges(as_of="2026-08-01 10:00:15", principal=owner())
+    assert [e.id for e in after] == [edge.id]
+
+
+def test_as_of_legacy_active_edge_is_valid_since_the_beginning(fresh_db):
+    """A pre-D2 active edge has no window; as-of at "now" must agree with the
+    default read, so NULL `valid_from` reads as "valid since the beginning"."""
+    a = service.create_node(type="claim", title="A", principal=owner())
+    b = service.create_node(type="claim", title="B", principal=owner())
+    edge = service.create_edge(a.id, b.id, "supports", principal=owner())
+    _set_validity(edge.id, None, None)  # a pre-D2 row: neither column set
+
+    assert [e.id for e in service.list_edges(principal=owner())] == [edge.id]
+    assert [e.id for e in service.list_edges(as_of="2020-01-01 00:00:00", principal=owner())] == [
+        edge.id
+    ]
+    assert [e.id for e in service.list_edges(as_of="2026-08-01 10:00:00", principal=owner())] == [
+        edge.id
+    ]
+
+
+def test_as_of_legacy_archived_edge_with_no_window_is_not_placed(fresh_db):
+    """A pre-D2 archived edge has NULL `valid_to` — its closure is unknown, so
+    no instant can be placed inside its window. The default read hides it by
+    state; an as-of read must not resurrect it at any instant."""
+    a = service.create_node(type="claim", title="A", principal=owner())
+    b = service.create_node(type="claim", title="B", principal=owner())
+    edge = service.create_edge(a.id, b.id, "supports", principal=owner())
+    service.transition(edge.id, "archive", principal=owner())
+    _set_validity(edge.id, None, None)  # a pre-D2 retirement: no window
+
+    assert service.list_edges(state="active", principal=owner()) == []
+    assert service.list_edges(as_of="2020-01-01 00:00:00", principal=owner()) == []
+    assert service.list_edges(as_of="2026-08-01 10:00:00", principal=owner()) == []
+    # Even the archived-state read of the past cannot place it.
+    archived_past = service.list_edges(
+        state="archived", as_of="2026-08-01 10:00:00", principal=owner()
+    )
+    assert archived_past == []
+
+
+def test_as_of_composes_with_an_explicit_state_filter(fresh_db):
+    """A state filter under as-of narrows the live part; the window still
+    rules, and a window-covered archived edge is admitted regardless."""
+    a = service.create_node(type="claim", title="A", principal=owner())
+    b = service.create_node(type="claim", title="B", principal=owner())
+    live = service.create_edge(a.id, b.id, "supports", principal=owner())
+    retired = service.create_edge(a.id, b.id, "contradicts", principal=owner())
+    service.transition(retired.id, "archive", principal=owner())
+    _set_validity(live.id, "2026-08-01 09:00:00", None)
+    _set_validity(retired.id, "2026-08-01 10:00:00", "2026-08-01 10:00:10")
+
+    # As-of with no state filter: the live edge and the window-covered retired
+    # one both placed.
+    both = service.list_edges(as_of="2026-08-01 10:00:05", principal=owner())
+    assert {e.id for e in both} == {live.id, retired.id}
+    # As-of with a state filter still admits the window-covered archived edge.
+    with_archive = service.list_edges(
+        state="active", as_of="2026-08-01 10:00:05", principal=owner()
+    )
+    assert {e.id for e in with_archive} == {live.id, retired.id}
+
+
 def test_transition_unknown_id_raises_the_kind_agnostic_base(fresh_db):
     """A bare id names no kind, so an unresolvable one is not a *node* miss.
 

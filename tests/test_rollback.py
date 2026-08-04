@@ -333,6 +333,27 @@ def test_a_supersede_comes_back_including_the_valid_to_it_closed(fresh_db):
     assert _graph() == before, "the replacement edge outlived the cycle that created it"
 
 
+def test_an_edge_accept_rolls_back_its_valid_from(fresh_db):
+    """A proposal accepted inside a cycle carries its `valid_from` on the same
+    row, so the reversal restores the NULL with it — the window opens with the
+    accept and closes with its rollback."""
+    first, second = _node("A"), _node("B")
+    edge = service.create_edge(first.id, second.id, "supports", principal=agent())
+    assert _edge(edge.id)["valid_from"] is None
+
+    cycle = service.open_cycle(trigger="manual", principal=owner())
+    with service.in_cycle(cycle.id):
+        service.transition(edge.id, "accept", principal=owner())
+    service.close_cycle(cycle.id, status="completed", report={}, principal=owner())
+    assert _edge(edge.id)["state"] == "active"
+    assert _edge(edge.id)["valid_from"] is not None
+
+    service.rollback_cycle(cycle.id, principal=owner())
+
+    assert _edge(edge.id)["state"] == "proposed"
+    assert _edge(edge.id)["valid_from"] is None
+
+
 # ── Refusing rather than clobbering (decision C4) ─────────────────────────────
 
 

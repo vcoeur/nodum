@@ -287,6 +287,53 @@ def test_empty_query_raises(fresh_db):
         search.search("   ", principal=owner())
 
 
+def _set_validity(edge_id, valid_from, valid_to):
+    """Stamp an edge's window directly, past the writers (see test_service)."""
+    conn = db.connect()
+    try:
+        conn.execute(
+            "UPDATE edges SET valid_from = ?, valid_to = ? WHERE id = ?",
+            (valid_from, valid_to, edge_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_expand_as_of_follows_window_covered_edges(fresh_db):
+    """The D2/B8 gate, search-expansion form: the one-hop expansion follows
+    an edge at the instants its window covered, and the default search (no
+    ``as_of``) still reads the live graph."""
+    alpha = service.create_node(
+        type="concept",
+        title="graph alpha",
+        content="graph theory",
+        principal=owner(),
+    )
+    beta = service.create_node(
+        type="note",
+        title="graph beta",
+        content="graph theory",
+        principal=owner(),
+    )
+    edge = service.create_edge(alpha.id, beta.id, "supports", confidence=0.8, principal=owner())
+    service.transition(edge.id, "archive", principal=owner())
+    _set_validity(edge.id, "2026-08-01 10:00:00", "2026-08-01 10:00:10")
+
+    # Default expand: the retired edge is not followed.
+    default = search.search("graph alpha", expand=True, principal=owner())
+    assert [hit.node_id for hit in default.hits] == [alpha.id]
+    # As-of mid-window: the expansion crosses the retired edge.
+    mid = search.search("graph alpha", expand=True, as_of="2026-08-01 10:00:05", principal=owner())
+    assert [hit.node_id for hit in mid.hits] == [alpha.id, beta.id]
+    assert mid.hits[1].signals == {"graph": 0.8}
+    # As-of after the window closed: gone again.
+    later = search.search(
+        "graph alpha", expand=True, as_of="2026-08-01 10:00:20", principal=owner()
+    )
+    assert [hit.node_id for hit in later.hits] == [alpha.id]
+
+
 def test_no_match_returns_no_hits(fresh_db):
     service.create_node(type="note", title="T", content="something", principal=owner())
     assert search.search("nonexistentterm", principal=owner()).hits == []

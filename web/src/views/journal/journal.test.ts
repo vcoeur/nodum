@@ -1761,17 +1761,18 @@ describe("describeEvent", () => {
     expect(fields).toContain("confidence");
     // `props` came back as the empty object, so there is nothing to read.
     expect(fields).not.toContain("props");
-    // Neither validity column has a value on a fresh edge; `valid_from` still
-    // has no writer anywhere in the system.
+    // Neither validity column has a value on a fresh edge — a create does not
+    // close a window and a directly-created active edge is written valid_from
+    // in the row, not as a diff field here.
     expect(fields).not.toContain("valid_from");
     expect(fields).not.toContain("valid_to");
     expect(change.fields.every((field) => field.before === null)).toBe(true);
   });
 
   it("shows valid_to closing beside the archive, because they are two facts", () => {
-    // A supersede records both — `valid_to` (when it stopped being true) and
+    // A retirement records both — `valid_to` (when it stopped being true) and
     // `archived` (it is no longer live) — and the diff showed only the second,
-    // which is half of the only write this wave gave that column.
+    // which is half of the write that closes an edge's window.
     const change = describeEvent(
       event({
         seq: 51,

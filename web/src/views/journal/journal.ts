@@ -1735,12 +1735,13 @@ const NODE_FIELDS = ["title", "state", "type_id", "space_id", "parent_id", "cont
  * Edge columns the diff compares, in reading order.
  *
  * `valid_from` and `valid_to` sit next to `state` because that adjacency is the
- * point: `supersede_edge` records **two** facts as two, `valid_to` closed (when
- * the edge stopped being true) *and* `archived` (it is no longer live), and a
- * diff that showed the second without the first showed half of the only write
- * this wave gave that column. `valid_from` still has no writer anywhere in the
- * system and costs nothing to list — {@link describeEvent} drops a row that did
- * not change, so it appears the day something starts writing it and not before.
+ * point: an edge is written `valid_from` when it becomes true (at create for
+ * an active edge, at accept for a proposed one) and `valid_to` is closed when
+ * it stops being true — every `active → archived` retirement records the same
+ * instant, `supersede_edge` included — so `state` and the window are one fact,
+ * and a diff that showed one without the other showed half of the write.
+ * {@link describeEvent} drops a row that did not change, so a column only
+ * appears in a diff the moment something starts writing it.
  */
 const EDGE_FIELDS = [
   "state",

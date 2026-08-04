@@ -819,6 +819,14 @@ export interface EdgeFilters {
   node_id?: string;
   type?: string;
   state?: NodeState;
+  /**
+   * Read the edges true at this instant instead of the live set: an edge is
+   * returned iff its validity window covered `as_of`. Archived edges whose
+   * window covered it are included; pre-D2 rows without a window follow the
+   * service's NULL rules. The graph view never sets this — the live graph is
+   * the default.
+   */
+  as_of?: string;
   limit?: number;
 }
 
@@ -865,6 +873,13 @@ export interface SubgraphParams {
    */
   min_confidence?: number;
   created_by?: string;
+  /**
+   * Read the subgraph as it was true at this instant instead of the live
+   * graph: an edge is followed iff its validity window covered `as_of`, and
+   * archived edges whose window covered it are followed even though
+   * `edge_state` does not name `archived`. The graph view never sets this.
+   */
+  as_of?: string;
   /** Server-side node cap; the server may return fewer. */
   limit?: number;
 }

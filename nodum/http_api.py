@@ -1486,6 +1486,7 @@ def _search_filters(params: QueryParams) -> dict[str, Any]:
         "include_meta": _bool_param(params, "include_meta"),
         "space": params.get("space"),
         "expand": _bool_param(params, "expand"),
+        "as_of": params.get("as_of"),
     }
 
 
@@ -2025,12 +2026,13 @@ def create_app(
     # ── Edges ─────────────────────────────────────────────────────────────
 
     async def list_edges(request: Request) -> Response:
-        """List edges, optionally filtered by incident node, type, or state."""
+        """List edges, optionally filtered by incident node, type, state, or validity window."""
         params = request.query_params
         edges = service.list_edges(
             node_id=_param(params, "node_id", "node"),
             type=params.get("type"),
             state=_state_filter(params),
+            as_of=params.get("as_of"),
             principal=_session_principal(request),
             limit=_int_param(params, "limit", default=500),
             path=db_path,
@@ -2191,6 +2193,7 @@ def create_app(
             min_confidence=_float_param(params, "min_confidence"),
             created_by=params.get("created_by"),
             node_types=_list_param(params, "node_type", "node_types"),
+            as_of=params.get("as_of"),
             principal=_session_principal(request),
             limit=_int_param(params, "limit", default=200),
             path=db_path,

@@ -99,12 +99,24 @@ running as a peer client over the public service API), the **nightly
 scheduler** (`nodum.scheduler`, one asyncio task in `nodum serve`'s lifespan,
 **off unless `NODUM_CONSOLIDATE_AT` is set**), and the **dream-journal view**
 in the web UI, which Phase 3 deferred to Phase 5 precisely because it needed a
-cycle to have something to show. Two columns reserved since `0001` and never
-written by anything get their first writers here: `merge_redirects` (from
-`merge_nodes`) and `edges.valid_to` (from `supersede_edge`). `edges.valid_from`
-still has none — nothing in this system yet knows when an edge *started* being
-true, and inventing a value at creation would be a guess in a column whose
-whole purpose is a fact.
+cycle to have something to show. Two columns reserved since `0001` get their
+full temporality here (D2): `merge_redirects` gets its first writer (from
+`merge_nodes`), and `edges.valid_from`/`valid_to` become a real capability —
+**`valid_from`** is written at creation by an edge that lands `active` (an
+active edge IS true at creation, so the value is a fact, not a guess) and by
+the accept transition (`proposed` → `active`, only when still NULL — the edge
+became true when accepted); **`valid_to`** is written by every
+`active` → `archived` retirement — the shared edge-state writer
+(`_set_edge_state`) records it for plain archives, wikilink/synthesis
+retirement, merge and `supersede_edge` alike, so archival and validity closure
+are the same instant by construction, and a rejected proposal (never true)
+closes no window. The read paths pair with the writers: `list_edges`,
+`subgraph`, `traverse`/`get_neighborhood` and search's `--expand` gain an
+`as_of` instant — the default read stays the live graph, and an as-of read
+returns exactly the edges whose validity window covered the instant
+(`valid_from` unset or `<= t`, and `valid_to` unset on a live row or `> t`),
+with pre-D2 NULL rows read as "valid since the beginning" (active) or "closed
+at an unknown time, so not placeable" (archived).
 **Deliberately not built yet** (later phases — do not add): **claim
 proposals**, which moved to Phase 5b deliberately rather than being forgotten —
 deciding that a sentence *is* a claim is a judgement call and belongs to the
@@ -428,7 +440,9 @@ commands on a saved node for exactly this reason.
   exception to an immutable field; **no props are transformed**, because what a
   property *means* after a retype is judgement and judgement is 5b),
   `supersede_edge` (two facts, recorded as two: `valid_to` closed — *when* it
-  stopped being true — **and** `archived` — *it is no longer live*; a
+  stopped being true, written by the shared active→archived edge writer so a
+  supersede and a plain archive record the same fact — **and** `archived` —
+  *it is no longer live*; a
   replacement inherits every field it does not name, and the seeded
   `supersedes`/`superseded_by` pair is carried **in props, not as an edge**,
   since `edges.src_id`/`dst_id` reference `nodes` and one edge cannot point at

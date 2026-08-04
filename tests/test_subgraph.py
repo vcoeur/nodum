@@ -8,7 +8,7 @@ import pytest
 from helpers import OWNER_ACTOR, agent, owner
 from typer.testing import CliRunner
 
-from nodum import service
+from nodum import db, service
 from nodum.cli import app
 from nodum.service import NodeNotFound, TypeNotFound
 
@@ -185,6 +185,90 @@ def test_edge_count_stays_bounded_under_a_node_cap(fresh_db):
 def test_default_follows_active_edges_only(fresh_db):
     hub, live, pending, weak, person = _mixed()
     assert pending.id not in _ids(service.subgraph(hub.id, depth=1, principal=owner()))
+
+
+def _set_validity(edge_id, valid_from, valid_to):
+    """Stamp an edge's window directly, past the writers (see test_service)."""
+    conn = db.connect()
+    try:
+        conn.execute(
+            "UPDATE edges SET valid_from = ?, valid_to = ? WHERE id = ?",
+            (valid_from, valid_to, edge_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_subgraph_as_of_shows_window_covered_archived_edges(fresh_db):
+    """The D2/B8 gate, subgraph form: a retired edge is followed at the
+    instants its window covered — even under the default edge states — and
+    nowhere else."""
+    hub = service.create_node(type="concept", title="Hub", principal=owner())
+    leaf = service.create_node(type="note", title="Leaf", principal=owner())
+    edge = service.create_edge(hub.id, leaf.id, "supports", confidence=0.5, principal=owner())
+    service.transition(edge.id, "archive", principal=owner())
+    _set_validity(edge.id, "2026-08-01 10:00:00", "2026-08-01 10:00:10")
+
+    # Default (live graph): the leaf is gone with its edge.
+    assert leaf.id not in _ids(service.subgraph(hub.id, depth=1, principal=owner()))
+    # As-of mid-window: present, under the default edge states — the window
+    # clause replaces the state filter, so 'archived' need not be named.
+    mid = service.subgraph(hub.id, depth=1, as_of="2026-08-01 10:00:05", principal=owner())
+    assert leaf.id in _ids(mid)
+    assert [e.id for e in mid.edges] == [edge.id]
+    # As-of after the window closed: gone again.
+    assert leaf.id not in _ids(
+        service.subgraph(hub.id, depth=1, as_of="2026-08-01 10:00:20", principal=owner())
+    )
+    # A window that never covered the read instant leaves the walk empty.
+    never = service.subgraph(hub.id, depth=1, as_of="2020-01-01 00:00:00", principal=owner())
+    assert never.edges == []
+
+
+def test_subgraph_as_of_places_a_proposed_edge_only_after_its_accept(fresh_db):
+    """The accept half of the gate: `valid_from` opens at accept, so an as-of
+    read before it does not follow the edge, and one after it does."""
+    hub = service.create_node(type="concept", title="Hub", principal=owner())
+    leaf = service.create_node(type="note", title="Leaf", principal=owner())
+    edge = service.create_edge(hub.id, leaf.id, "supports", principal=agent(AGENT))
+    accepted = service.transition(edge.id, "accept", principal=owner())
+    _set_validity(accepted.id, "2026-08-01 10:00:10", None)
+
+    assert leaf.id not in _ids(
+        service.subgraph(hub.id, depth=1, as_of="2026-08-01 10:00:05", principal=owner())
+    )
+    assert leaf.id in _ids(
+        service.subgraph(hub.id, depth=1, as_of="2026-08-01 10:00:15", principal=owner())
+    )
+
+
+def test_subgraph_as_of_state_filter_narrows_only_the_live_part(fresh_db):
+    """Under as-of, `edge_states` names which live states to follow; a
+    window-covered archived edge is admitted regardless, and a proposed one is
+    never admitted (it is not true at any instant)."""
+    hub = service.create_node(type="concept", title="Hub", principal=owner())
+    live = service.create_node(type="note", title="Live", principal=owner())
+    pending = service.create_node(type="note", title="Pending", principal=owner())
+    retired = service.create_node(type="note", title="Retired", principal=owner())
+    live_edge = service.create_edge(hub.id, live.id, "supports", principal=owner())
+    service.create_edge(hub.id, pending.id, "relates_to", principal=agent(AGENT))
+    gone = service.create_edge(hub.id, retired.id, "contradicts", principal=owner())
+    service.transition(gone.id, "archive", principal=owner())
+    _set_validity(live_edge.id, "2026-08-01 09:00:00", None)
+    _set_validity(gone.id, "2026-08-01 10:00:00", "2026-08-01 10:00:10")
+
+    as_of = "2026-08-01 10:00:05"
+    result = service.subgraph(hub.id, depth=1, as_of=as_of, principal=owner())
+    # The live edge (window open) and the retired one (window covered) are
+    # followed; the proposal is not true at any instant.
+    assert _ids(result) == {hub.id, live.id, retired.id}
+    # An explicit edge_state that names neither the live edge's state nor the
+    # archived widening still lets the window-covered retirement through.
+    archived_only = service.subgraph(
+        hub.id, depth=1, edge_states=["archived"], as_of=as_of, principal=owner()
+    )
+    assert _ids(archived_only) == {hub.id, retired.id}
 
 
 def test_edge_states_opens_the_walk_to_proposals(fresh_db):
@@ -399,6 +483,28 @@ def test_cli_subgraph(fresh_db):
     assert payload["root"] == hub.id
     assert {node["id"] for node in payload["nodes"]} == {hub.id, live.id}
     assert payload["truncated"] is False
+
+
+def test_cli_subgraph_as_of(fresh_db):
+    """The gate through the CLI: `subgraph --as-of` follows a retired edge at
+    the instants its window covered, while the default read does not."""
+    hub = service.create_node(type="concept", title="Hub", principal=owner())
+    leaf = service.create_node(type="note", title="Leaf", principal=owner())
+    edge = service.create_edge(hub.id, leaf.id, "supports", principal=owner())
+    service.transition(edge.id, "archive", principal=owner())
+    _set_validity(edge.id, "2026-08-01 10:00:00", "2026-08-01 10:00:10")
+
+    live = runner.invoke(app, ["subgraph", hub.id, "--depth", "1", "--as", "owner"])
+    assert live.exit_code == 0, live.output
+    assert {node["id"] for node in json.loads(live.stdout)["nodes"]} == {hub.id}
+
+    mid = runner.invoke(
+        app, ["subgraph", hub.id, "--depth", "1", "--as-of", "2026-08-01 10:00:05", "--as", "owner"]
+    )
+    assert mid.exit_code == 0, mid.output
+    payload = json.loads(mid.stdout)
+    assert {node["id"] for node in payload["nodes"]} == {hub.id, leaf.id}
+    assert [e["id"] for e in payload["edges"]] == [edge.id]
 
 
 def test_cli_subgraph_reports_truncation(fresh_db):

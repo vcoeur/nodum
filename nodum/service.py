@@ -1129,10 +1129,16 @@ def _insert_edge(
 ) -> dict[str, Any]:
     """Insert one edge row and emit its create/propose event; returns the row."""
     edge_id = uuid.uuid4().hex
+    # An edge that lands `active` is true from the moment it exists, so its
+    # validity window opens at creation time (D2: the value is a fact — the
+    # edge IS true — not a guess). An edge that lands `proposed` is not yet
+    # true; its `valid_from` stays NULL until the accept transition opens the
+    # window (`_set_edge_state`).
     conn.execute(
         """
-        INSERT INTO edges (id, src_id, dst_id, type_id, props, confidence, created_by, state)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO edges (id, src_id, dst_id, type_id, props, confidence, created_by, state,
+                           valid_from)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, CASE WHEN ? = 'active' THEN datetime('now') END)
         """,
         (
             edge_id,
@@ -1142,6 +1148,7 @@ def _insert_edge(
             json.dumps(props, ensure_ascii=False),
             confidence,
             actor,
+            state,
             state,
         ),
     )
@@ -1165,12 +1172,40 @@ def _set_edge_state(
     actor: str,
     cycle_id: str | None = None,
     reason: str | None = None,
+    props: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Transition an edge's state, emitting the event; returns the after row.
 
-    ``reason`` is recorded in the event payload on rejects (design §8.1).
+    This is the **single writer for the validity window** (D2): the two
+    transition directions that change what is true write the corresponding
+    column here, so every retirement path — transition, wikilink
+    materialisation, synthesis settlement, merge, supersede — records the same
+    facts and the paths cannot disagree:
+
+    * ``proposed`` → ``active`` (accept): ``valid_from`` opens at the accept
+      time, but only when the edge has none yet — a re-accept after a rollback
+      must not rewrite the fact.
+    * ``active`` → ``archived`` (archive): ``valid_to`` closes at the archive
+      time — the edge stopped being true the moment it was retired.
+    * ``proposed`` → ``archived`` (reject): neither column moves. A rejected
+      proposal was never true, so it has no window to open or close.
+
+    ``props``, when given, is written in the same UPDATE — ``supersede_edge``
+    rides its ``superseded_by`` props write on the shared retirement so the
+    row is written once, not twice. ``reason`` is recorded in the event
+    payload on rejects (design §8.1).
     """
-    conn.execute("UPDATE edges SET state = ? WHERE id = ?", (new_state, before["id"]))
+    sets = ["state = ?"]
+    params: list[Any] = [new_state]
+    if before["state"] == "active" and new_state == "archived":
+        sets.append("valid_to = datetime('now')")
+    if before["state"] == "proposed" and new_state == "active" and before["valid_from"] is None:
+        sets.append("valid_from = datetime('now')")
+    if props is not None:
+        sets.append("props = ?")
+        params.append(json.dumps(props, ensure_ascii=False))
+    params.append(before["id"])
+    conn.execute(f"UPDATE edges SET {', '.join(sets)} WHERE id = ?", params)
     after = _row_dict(_get_edge_row(conn, before["id"]))
     payload: dict[str, Any] = {"before": before, "after": after}
     if reason is not None:
@@ -1954,11 +1989,48 @@ def propose_edges(
         conn.close()
 
 
+def _as_of_edge_clause(t: str, admitted: tuple[str, ...]) -> tuple[str, list[Any]]:
+    """The SQL fragment (and params) that admits exactly the edges true at instant ``t``.
+
+    D2's read predicate, spelled once and reused by every as-of read so the
+    lens cannot drift between surfaces. Callers pass the states their
+    *non*-as-of filter would admit; this clause **replaces** that filter (it
+    subsumes it), so the state filter under as-of narrows only the live part.
+    An edge is present at instant ``t`` iff:
+
+    * its state is one of ``admitted`` **or** it is ``archived`` — a retired
+      edge is admitted when its window covered ``t``, whatever the caller's
+      state filter says (the as-of lens shows the graph *as it was true*, and
+      an archived edge whose window covered ``t`` was true then), and
+    * its window covers ``t``: ``valid_from`` is unset (a pre-D2 edge, valid
+      since the beginning of recorded history — as-of at "now" must agree with
+      the default read) or ``valid_from <= t``, **and**
+    * its window has not closed before ``t``: ``valid_to`` is unset on a row
+      still ``active`` (a live edge, window still open) or ``valid_to > t``.
+
+    Two legacy shapes fall out of that composition. A pre-D2 **active** edge
+    (neither column set) is present at every instant — it is part of the live
+    graph today, so as-of at now agrees with the default read. A pre-D2
+    **archived** edge (``valid_to`` NULL — pre-D2 retirement recorded no
+    window) is present at *no* instant: its closure is unknown, so no ``t``
+    can be placed inside its window, and the default read already hides it by
+    state.
+    """
+    placeholders = ",".join("?" * len(admitted))
+    clause = (
+        f"((state IN ({placeholders}) OR state = 'archived')"
+        " AND (valid_from IS NULL OR valid_from <= ?)"
+        " AND ((valid_to IS NULL AND state = 'active') OR valid_to > ?))"
+    )
+    return clause, [*admitted, t, t]
+
+
 def list_edges(
     *,
     node_id: str | None = None,
     type: str | None = None,
     state: NodeState | None = None,
+    as_of: str | None = None,
     principal: Principal,
     limit: int = 500,
     path: str | Path | None = None,
@@ -1967,6 +2039,16 @@ def list_edges(
 
     ``node_id`` matches edges in either direction. An agent principal sees
     only edges whose endpoints are both readable.
+
+    ``as_of`` reads the graph as it was true at an instant (D2): pass a
+    timestamp and an edge is returned iff its validity window covered it. The
+    window clause subsumes the state filter — under as-of the filter narrows
+    only which live states are admitted, and a window-covered archived edge is
+    returned regardless (``state IN (filter) OR state = 'archived'`` composed
+    with ``valid_from <= t AND (valid_to IS NULL OR valid_to > t)``, with the
+    pre-D2 NULL rules :func:`_as_of_edge_clause` documents). Without ``as_of``
+    the read is unchanged: the state filter alone, defaulting to every state
+    (the live graph plus anything retired).
 
     Raises:
         ValueError: If ``state`` is not a known state, or ``limit`` is below 1
@@ -1989,9 +2071,19 @@ def list_edges(
         if type is not None:
             clauses.append("type_id = ?")
             params.append(_resolve_edge_type(conn, type, principal)[0])
-        if state is not None:
-            if state not in STATES:
-                raise ValueError(f"state must be one of {STATES}, got {state!r}")
+        if state is not None and state not in STATES:
+            raise ValueError(f"state must be one of {STATES}, got {state!r}")
+        if as_of is not None:
+            # The window clause subsumes the state filter: under as-of the
+            # filter only narrows which *live* states are admitted, and a
+            # window-covered archived edge is admitted regardless — the lens
+            # shows what was true at the instant.
+            as_of_clause, as_of_params = _as_of_edge_clause(
+                as_of, (state,) if state is not None else DEFAULT_EDGE_STATES
+            )
+            clauses.append(as_of_clause)
+            params.extend(as_of_params)
+        elif state is not None:
             clauses.append("state = ?")
             params.append(state)
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
@@ -3956,6 +4048,7 @@ def _walk(
     depth: int,
     direction: Direction,
     store: Store,
+    as_of: str | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Breadth-first walk over ``active`` edges; returns (node rows, edge rows).
 
@@ -3964,6 +4057,10 @@ def _walk(
     archived edges are never followed — reads default to the live graph. An
     edge is followed only when **both** endpoints are readable by the
     principal, so the walk never crosses into an unreadable space (Q13).
+
+    ``as_of`` swaps the lens from the live graph to the graph true at an
+    instant (D2): the walk then follows ``active`` edges plus ``archived``
+    ones whose validity window covered that instant (:func:`_as_of_edge_clause`).
     """
     start = _get_node_row(conn, start_id)
     if not store.node_visible(start):
@@ -3986,8 +4083,14 @@ def _walk(
             column = "src_id" if direction == "out" else "dst_id"
             where = f"{column} IN ({placeholders})"
         scope, scope_params = store.edge_scope()
-        sql = f"SELECT * FROM edges WHERE state = 'active' AND {where}{scope}"
-        params += scope_params
+        if as_of is not None:
+            # `as_of_clause` leads the WHERE, so its params lead the list.
+            as_of_clause, as_of_params = _as_of_edge_clause(as_of, DEFAULT_EDGE_STATES)
+            sql = f"SELECT * FROM edges WHERE {as_of_clause} AND {where}{scope}"
+            params = [*as_of_params, *params, *scope_params]
+        else:
+            sql = f"SELECT * FROM edges WHERE state = 'active' AND {where}{scope}"
+            params += scope_params
         if type_ids:
             sql += f" AND type_id IN ({','.join('?' * len(type_ids))})"
             params += type_ids
@@ -4010,12 +4113,15 @@ def get_neighborhood(
     node_id: str,
     *,
     depth: int = 1,
+    as_of: str | None = None,
     principal: Principal,
     path: str | Path | None = None,
 ) -> SubgraphOut:
     """Return a node plus its active-edge neighborhood out to ``depth`` hops.
 
     Depth 0 returns the node alone. Design §8.1 ``get_node(id, depth)``.
+    ``as_of`` reads the neighborhood as it was true at an instant (D2), the
+    same lens :func:`_walk` applies.
 
     Raises:
         NodeNotFound: If the id does not resolve, or is not readable.
@@ -4027,7 +4133,13 @@ def get_neighborhood(
     try:
         store = Store(conn, principal)
         nodes, edges = _walk(
-            conn, node_id, type_ids=None, depth=depth, direction="both", store=store
+            conn,
+            node_id,
+            type_ids=None,
+            depth=depth,
+            direction="both",
+            store=store,
+            as_of=as_of,
         )
         return SubgraphOut(
             root=node_id,
@@ -4045,6 +4157,7 @@ def traverse(
     edge_types: list[str] | None = None,
     depth: int = 2,
     direction: Direction = "both",
+    as_of: str | None = None,
     principal: Principal,
     path: str | Path | None = None,
 ) -> SubgraphOut:
@@ -4052,7 +4165,9 @@ def traverse(
 
     The pattern parameters (design §8.1 / T2): ``edge_types`` restricts the
     walk to those edge types (ids or names), ``depth`` caps the hops, and
-    ``direction`` (``out`` / ``in`` / ``both``) orients it.
+    ``direction`` (``out`` / ``in`` / ``both``) orients it. ``as_of`` reads
+    the graph as it was true at an instant (D2) — ``archived`` edges whose
+    window covered it are followed too (:func:`_walk`).
 
     Raises:
         NodeNotFound: If ``start_id`` does not resolve.
@@ -4072,7 +4187,13 @@ def traverse(
             else None
         )
         nodes, edges = _walk(
-            conn, start_id, type_ids=type_ids, depth=depth, direction=direction, store=store
+            conn,
+            start_id,
+            type_ids=type_ids,
+            depth=depth,
+            direction=direction,
+            store=store,
+            as_of=as_of,
         )
         return SubgraphOut(
             root=start_id,
@@ -4093,8 +4214,9 @@ def subgraph(
     min_confidence: float | None = None,
     created_by: str | None = None,
     node_types: list[str] | None = None,
-    principal: Principal,
+    as_of: str | None = None,
     limit: int = 200,
+    principal: Principal,
     path: str | Path | None = None,
 ) -> SubgraphOut:
     """Walk a bounded, server-side-filtered neighborhood of one node.
@@ -4137,18 +4259,23 @@ def subgraph(
     renderer therefore never draws two nodes it is showing as unconnected when
     the stored graph connects them.
 
-    Args:
-        root_id: Node at the centre of the subgraph.
-        depth: Maximum hops from the root (0 returns the root alone).
-        edge_types: Edge type ids/names the walk may follow (default: any).
-        edge_states: Edge states the walk may follow (default:
-            :data:`DEFAULT_EDGE_STATES`, the live graph).
-        min_confidence: Floor on an edge's stored confidence.
-        created_by: Only follow edges written by this actor.
-        node_types: Node type ids/names that may be admitted (default: any).
-        limit: Hard cap on the number of nodes returned, root included,
-            clamped to :data:`MAX_SUBGRAPH_LIMIT`.
-        path: Explicit database path.
+        Args:
+            root_id: Node at the centre of the subgraph.
+            depth: Maximum hops from the root (0 returns the root alone).
+            edge_types: Edge type ids/names the walk may follow (default: any).
+            edge_states: Edge states the walk may follow (default:
+                :data:`DEFAULT_EDGE_STATES`, the live graph).
+            min_confidence: Floor on an edge's stored confidence.
+            created_by: Only follow edges written by this actor.
+            node_types: Node type ids/names that may be admitted (default: any).
+            as_of: Read the subgraph as it was true at an instant (D2): an
+                edge is followed iff its validity window covered it —
+                ``archived`` edges whose window covered the instant are
+                admitted even when ``edge_states`` does not name ``archived``
+                (:func:`_as_of_edge_clause`).
+            limit: Hard cap on the number of nodes returned, root included,
+                clamped to :data:`MAX_SUBGRAPH_LIMIT`.
+            path: Explicit database path.
 
     Returns:
         The subgraph, with ``truncated`` true when the node cap or the edge
@@ -4179,8 +4306,19 @@ def subgraph(
         root = _get_node_row(conn, root_id)
         if not store.node_visible(root):
             raise NodeNotFound(f"node not found: {root_id}")
-        edge_clauses = [f"state IN ({','.join('?' * len(states))})"]
-        edge_params: list[Any] = list(states)
+        edge_clauses: list[str] = []
+        edge_params: list[Any] = []
+        if as_of is not None:
+            # The window clause replaces the state filter: under as-of the
+            # filter only narrows which *live* states are followed, and a
+            # window-covered archived edge is admitted regardless — the walk
+            # shows the graph as it was true at the instant.
+            as_of_clause, as_of_params = _as_of_edge_clause(as_of, states)
+            edge_clauses.append(as_of_clause)
+            edge_params += as_of_params
+        else:
+            edge_clauses.append(f"state IN ({','.join('?' * len(states))})")
+            edge_params = list(states)
         scope, scope_params = store.edge_scope()
         if scope:
             edge_clauses.append(scope.removeprefix(" AND "))
@@ -6292,11 +6430,12 @@ def supersede_edge(
 
     Two facts are recorded, because they are two different facts: ``valid_to``
     is closed (*when* it stopped being true) **and** the edge is ``archived``
-    (*it is no longer part of the live graph*). ``edges.valid_from`` /
-    ``valid_to`` have existed since migration ``0001`` and reach the frontend
-    type, and no writer in this codebase had ever set either; this is the first,
-    and it uses SQLite's own ``datetime('now')`` like every other timestamp
-    here, never a Python clock.
+    (*it is no longer part of the live graph*). The closure is written by the
+    shared edge-archive transition (:func:`_set_edge_state` — the same writer
+    every other active→archived path uses, so a supersede and a plain archive
+    cannot record different facts), with the ``superseded_by`` props write
+    riding on the same UPDATE; the timestamps use SQLite's own
+    ``datetime('now')`` like every other timestamp here, never a Python clock.
 
     When ``replacement`` is given it is created first and the two are linked
     through the ``supersedes``/``superseded_by`` vocabulary migration ``0001``
@@ -6370,12 +6509,14 @@ def supersede_edge(
             after_props = json.loads(before["props"])
             if new_edge is not None:
                 after_props["superseded_by"] = new_edge["id"]
-            conn.execute(
-                "UPDATE edges SET state = 'archived', valid_to = datetime('now'), props = ?"
-                " WHERE id = ?",
-                (json.dumps(after_props, ensure_ascii=False), before["id"]),
-            )
-            after = _row_dict(_get_edge_row(conn, before["id"]))
+            # The retirement itself goes through the shared edge-archive
+            # writer, so `valid_to` closes in exactly the same UPDATE shape —
+            # and records the same fact — as every other active→archived
+            # transition. The `superseded_by` props write rides on that same
+            # UPDATE (the writer takes `props`), so the row is written once;
+            # the `edge.archive` event it emits is the row move, and the
+            # `edge.supersede` event below carries the link on top of it.
+            after = _set_edge_state(conn, before, "archived", "archive", actor, props=after_props)
             payload: dict[str, Any] = {"before": before, "after": after}
             if new_edge is not None:
                 payload["replacement_id"] = new_edge["id"]

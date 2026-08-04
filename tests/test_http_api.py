@@ -3173,6 +3173,62 @@ def test_edges_list_and_create(client, fresh_db):
     assert bad.status_code == 400
 
 
+def test_edges_as_of_reads_the_validity_window(client, fresh_db):
+    """The D2/B8 gate through the HTTP surface: `?as_of=` places a retired
+    edge at the instants its window covered, and nowhere else."""
+    a = service.create_node(type="concept", title="A", principal=owner())
+    b = service.create_node(type="concept", title="B", principal=owner())
+    edge = _ok(
+        client.post(
+            "/api/edges",
+            json={"src_id": a.id, "dst_id": b.id, "type": "relates_to", "confidence": 0.5},
+        )
+    )
+    # Edges retire through the service (no archive route on this surface).
+    retired = service.transition(edge["id"], "archive", principal=owner())
+    assert retired.valid_to
+
+    conn = db.connect()
+    try:
+        conn.execute(
+            "UPDATE edges SET valid_from = ?, valid_to = ? WHERE id = ?",
+            ("2026-08-01 10:00:00", "2026-08-01 10:00:10", edge["id"]),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    assert _ok(client.get("/api/edges?state=active"))["edges"] == []
+    mid = _ok(client.get("/api/edges?as_of=2026-08-01%2010:00:05"))
+    assert [e["id"] for e in mid["edges"]] == [edge["id"]]
+    assert _ok(client.get("/api/edges?as_of=2026-08-01%2010:00:20"))["edges"] == []
+
+
+def test_subgraph_as_of_reads_the_validity_window(client, fresh_db):
+    """`GET /api/graph/subgraph?as_of=` follows a retired edge at the instants
+    its window covered; the default read stays the live graph."""
+    a = service.create_node(type="concept", title="A", principal=owner())
+    b = service.create_node(type="concept", title="B", principal=owner())
+    edge = service.create_edge(a.id, b.id, "relates_to", principal=owner())
+    service.transition(edge.id, "archive", principal=owner())
+    conn = db.connect()
+    try:
+        conn.execute(
+            "UPDATE edges SET valid_from = ?, valid_to = ? WHERE id = ?",
+            ("2026-08-01 10:00:00", "2026-08-01 10:00:10", edge.id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    live = _ok(client.get(f"/api/graph/subgraph?root={a.id}&depth=1"))
+    assert {node["id"] for node in live["nodes"]} == {a.id}
+    mid = _ok(client.get(f"/api/graph/subgraph?root={a.id}&depth=1&as_of=2026-08-01%2010:00:05"))
+    assert {node["id"] for node in mid["nodes"]} == {a.id, b.id}
+    later = _ok(client.get(f"/api/graph/subgraph?root={a.id}&depth=1&as_of=2026-08-01%2010:00:20"))
+    assert {node["id"] for node in later["nodes"]} == {a.id}
+
+
 def test_node_create_rejects_malformed_field_types(client, fresh_db):
     """M1: caller input that used to reach SQLite as a 500 is a 400 at the boundary.
 

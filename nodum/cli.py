@@ -540,6 +540,9 @@ def edge_list(
     node: str | None = typer.Option(None, "--node", help="Filter by incident node id."),
     type: str | None = typer.Option(None, "--type", "-t", help="Filter by edge type."),
     state: str | None = typer.Option(None, "--state", help="Filter by state."),
+    as_of: str | None = typer.Option(
+        None, "--as-of", help="Read the edges true at this timestamp (validity window)."
+    ),
     limit: int = typer.Option(500, "--limit", help="Maximum rows."),
     as_human: str = AS_OPTION,
 ) -> None:
@@ -549,6 +552,7 @@ def edge_list(
         node_id=node,
         type=type,
         state=_run(_state_value, state),
+        as_of=as_of,
         principal=_principal(as_human),
         limit=limit,
     )
@@ -700,6 +704,11 @@ def search(
     expand: bool = typer.Option(
         False, "--expand", help="Append one-hop active-edge neighbors of the hits."
     ),
+    as_of: str | None = typer.Option(
+        None,
+        "--as-of",
+        help="With --expand, follow the edges true at this timestamp instead of the live graph.",
+    ),
     nl: bool = typer.Option(
         False,
         "--nl",
@@ -729,6 +738,7 @@ def search(
         "include_meta": include_meta,
         "space": space,
         "expand": expand,
+        "as_of": as_of,
         "principal": _principal(as_human),
     }
     search_call = answers.natural_search if nl else search_module.search
@@ -906,6 +916,11 @@ def subgraph(
     node_type: list[str] | None = typer.Option(
         None, "--node-type", help="Only include nodes of these types (repeatable)."
     ),
+    as_of: str | None = typer.Option(
+        None,
+        "--as-of",
+        help="Read the subgraph as it was true at this timestamp (validity window).",
+    ),
     limit: int = typer.Option(200, "--limit", help="Maximum nodes, root included."),
     as_human: str = AS_OPTION,
 ) -> None:
@@ -927,6 +942,7 @@ def subgraph(
             min_confidence=min_confidence,
             created_by=created_by,
             node_types=node_type,
+            as_of=as_of,
             principal=_principal(as_human),
             limit=limit,
         )

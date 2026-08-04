@@ -119,6 +119,34 @@ def test_edge_create_and_list(fresh_db):
     assert listing["edges"][0]["id"] == edge["id"]
 
 
+def test_edge_list_as_of(fresh_db):
+    """The D2/B8 gate through the CLI: a closed window hides the edge from the
+    live read and from an as-of read after the close, and shows it at the
+    instants the window covered."""
+    a = _run_json("node", "create", "--type", "claim", "--title", "A")
+    b = _run_json("node", "create", "--type", "claim", "--title", "B")
+    edge = _run_json("edge", "create", a["id"], b["id"], "--type", "supports")
+    retired = _run_json("archive", edge["id"])
+    assert retired["state"] == "archived"
+    assert retired["valid_to"]
+
+    # A deterministic window, exactly as test_service stamps it.
+    conn = db.connect()
+    try:
+        conn.execute(
+            "UPDATE edges SET valid_from = ?, valid_to = ? WHERE id = ?",
+            ("2026-08-01 10:00:00", "2026-08-01 10:00:10", edge["id"]),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    assert _run_json("edge", "list", "--state", "active")["edges"] == []
+    mid = _run_json("edge", "list", "--as-of", "2026-08-01 10:00:05")
+    assert [e["id"] for e in mid["edges"]] == [edge["id"]]
+    assert _run_json("edge", "list", "--as-of", "2026-08-01 10:00:20")["edges"] == []
+
+
 def test_state_transitions_and_actor(fresh_db):
     # A suggest-level agent's write (via the service; the CLI is human-only).
     proposed = service.create_node(type="note", title="bot", principal=agent("test"))
@@ -510,6 +538,38 @@ def test_search_filters_and_expand(fresh_db):
     expanded = _run_json("search", "xylem alpha", "--expand")
     assert [hit["node_id"] for hit in expanded["hits"]] == [a["id"], b["id"]]
     assert expanded["hits"][1]["signals"]["graph"] > 0
+
+
+def test_search_as_of_reads_expansion_through_the_validity_window(fresh_db):
+    """The D2/B8 gate through the CLI: `--as-of` re-opens the expansion to a
+    retired edge at the instants its window covered."""
+    a = _run_json("node", "create", "--type", "concept", "--title", "xylem alpha")
+    b = _run_json("node", "create", "--type", "note", "--title", "xylem beta")
+    edge = _run_json(
+        "edge", "create", a["id"], b["id"], "--type", "supports", "--confidence", "0.9"
+    )
+    _run_json("archive", edge["id"])
+
+    conn = db.connect()
+    try:
+        conn.execute(
+            "UPDATE edges SET valid_from = ?, valid_to = ? WHERE id = ?",
+            ("2026-08-01 10:00:00", "2026-08-01 10:00:10", edge["id"]),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    live = _run_json("search", "xylem alpha", "--expand")
+    assert [hit["node_id"] for hit in live["hits"]] == [a["id"]]
+    mid = _run_json("search", "xylem alpha", "--expand", "--as-of", "2026-08-01 10:00:05")
+    assert [hit["node_id"] for hit in mid["hits"]] == [a["id"], b["id"]]
+    # `--nl` layers the rewrite on the identical filters; with no provider it
+    # is a no-op that searches the original words, so as-of still applies.
+    nl_mid = _run_json(
+        "search", "xylem alpha", "--expand", "--nl", "--as-of", "2026-08-01 10:00:05"
+    )
+    assert [hit["node_id"] for hit in nl_mid["hits"]] == [a["id"], b["id"]]
 
 
 def test_agent_update_proposes_and_review_accepts(fresh_db):
