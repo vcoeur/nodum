@@ -571,7 +571,10 @@ def test_agent_proposes_over_mcp_and_only_the_human_can_review(fresh_db):
     service.reject_proposals([str(drop["id"])], reason="not good enough", principal=owner())
     assert service.get_node(note.id, principal=owner()).content == "accepted body"
     versions = service.history(note.id, principal=owner())
-    assert [v.state for v in versions] == ["applied", "applied", "archived"]
+    # The create snapshot, the accepted proposal (relabeled), the rejected one,
+    # and — since M9 — the true snapshot the accept writes of the node as it
+    # now stands.
+    assert [v.state for v in versions] == ["applied", "applied", "archived", "applied"]
 
 
 def test_agent_wikilinks_over_mcp_stay_proposed(fresh_db):

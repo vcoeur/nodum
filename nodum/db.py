@@ -93,6 +93,44 @@ def connect(path: str | Path | None = None) -> sqlite3.Connection:
     return conn
 
 
+def begin_immediate(conn: sqlite3.Connection) -> None:
+    """Open an IMMEDIATE write transaction: no writer can interleave after it.
+
+    A read-then-write service path (a review, a cycle close) must see the row
+    it checks and the row it writes as one atomic fact, or two concurrent
+    callers both pass the check and both write — two accepts of one proposal,
+    two closes of one cycle. SQLite's own serialisation does not do this for
+    free: with the driver's default ``isolation_level`` the connection runs
+    each statement in its own implicit transaction, so the read and the write
+    are separate lock acquisitions with an interleavable window between them.
+    ``BEGIN IMMEDIATE`` takes the single write lock up front, so any other
+    writer blocks until this transaction commits or rolls back, and a caller
+    that reads a row here cannot race a caller that wrote it.
+
+    **It must be the first statement on the connection.** A SELECT opens no
+    implicit transaction, but the first DML does — and ``BEGIN IMMEDIATE``
+    after any DML raises ``cannot start a transaction within a transaction``,
+    while a DEFERRED transaction opened by an earlier statement would make
+    this a no-op at best. :func:`connect` + :func:`init_db` leave a fresh
+    connection with no transaction in flight, which is where every service
+    caller starts.
+
+    Args:
+        conn: A connection with no transaction in flight.
+
+    Raises:
+        RuntimeError: If a transaction is already open on ``conn`` — the write
+            lock would already be DEFERRED, and the immediate guarantee is the
+            entire point of this function.
+    """
+    if conn.in_transaction:
+        raise RuntimeError(
+            "cannot BEGIN IMMEDIATE with a transaction already open on the connection: "
+            "the write lock would already be DEFERRED"
+        )
+    conn.execute("BEGIN IMMEDIATE")
+
+
 def applied_migrations(conn: sqlite3.Connection) -> list[str]:
     """Return the names of migrations already applied, in application order."""
     rows = conn.execute("SELECT name FROM schema_migrations ORDER BY rowid").fetchall()

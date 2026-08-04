@@ -596,7 +596,7 @@ export interface RunCycleBody {
 }
 
 /** The row kinds a rollback conflict or blocker can name (server's `RollbackKind`). */
-export type RollbackKind = "node" | "edge";
+export type RollbackKind = "node" | "edge" | "version";
 
 /**
  * One row standing between a cycle and its rollback (decision C4).

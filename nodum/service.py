@@ -860,16 +860,31 @@ def _emit(
 
 def _write_version(
     conn: sqlite3.Connection, node_row: sqlite3.Row | dict[str, Any], actor: str, event_seq: int
-) -> None:
-    """Snapshot a node's title/content/props into ``versions`` after a mutation."""
+) -> int:
+    """Snapshot a node's title/content/props into ``versions`` after a mutation.
+
+    The snapshot row lands ``applied`` — the ``state`` column's DDL default
+    (``0008_proposed_versions``) — which is what a snapshot *is*: a record of
+    state that was true, as opposed to a ``proposed`` row waiting on a review.
+
+    Returns:
+        The new version row's id — what an accept records so that reversing
+        the accept can remove the snapshot again (:func:`_accept_snapshot_row`).
+    """
     data = dict(node_row)
-    conn.execute(
+    cur = conn.execute(
         """
         INSERT INTO versions (node_id, title, content, props, actor, event_seq)
         VALUES (?, ?, ?, ?, ?, ?)
         """,
         (data["id"], data["title"], data["content"], data["props"], actor, event_seq),
     )
+    if cur.lastrowid is None:
+        # The sqlite3 contract: an INSERT that completes sets rowid. A None
+        # here would mean the driver did not run the statement — impossible
+        # without an exception having already propagated.
+        raise RuntimeError("INSERT into versions did not set a rowid")
+    return int(cur.lastrowid)
 
 
 # ── Wikilink materialisation ──────────────────────────────────────────────────
@@ -1411,6 +1426,9 @@ def update_node(
     """
     conn = _connect(path)
     try:
+        # The space-name check below is a read the UPDATE would otherwise race:
+        # two concurrent renames both probing the name as free (finding M8).
+        db.begin_immediate(conn)
         store = Store(conn, principal)
         actor = principal.actor_string
         before_row = _get_node_row(conn, node_id)
@@ -2143,7 +2161,7 @@ def _transition_version(
         )
         node_after = _row_dict(_get_node_row(conn, before["node_id"]))
         conn.execute("UPDATE versions SET state = 'applied' WHERE id = ?", (version_id,))
-        _emit(
+        seq = _emit(
             conn,
             actor,
             "node.update",
@@ -2159,6 +2177,14 @@ def _transition_version(
                 },
             },
         )
+        # A **true snapshot of the node as it now stands** — the proposal row
+        # flipped to `applied` above is the record of the proposal, and its
+        # un-named fields are copies from proposal time (:func:`_proposed_fields`),
+        # so history must not read it as the state the accept landed (finding
+        # M9). Written after the event so it can carry the event's seq, and
+        # removed again by the reversal of this accept
+        # (:func:`_accept_snapshot_row`).
+        _write_version(conn, node_after, actor, seq)
         if "content" in fields:
             _materialize_mentions(conn, node_after, actor, store)
     else:  # reject
@@ -2318,6 +2344,12 @@ def transition(
         raise ValueError(f"unknown transition {action!r}; expected one of {sorted(TRANSITIONS)}")
     conn = _connect(path)
     try:
+        # The whole read-check-write is one atomic fact: two concurrent
+        # accepts of one proposal must not both pass the state check. The
+        # immediate lock is taken before any read, so the second caller sees
+        # the first caller's committed state rather than a stale pre-check
+        # row (finding M8).
+        db.begin_immediate(conn)
         store = Store(conn, principal)
         kind, after = _transition_row(
             conn, record_id, action, principal.actor_string, store, reason=reason
@@ -2707,6 +2739,9 @@ def _transition_many(
     """
     conn = _connect(path)
     try:
+        # As in :func:`transition`: one atomic read-check-write per row, so a
+        # proposal two callers both picked cannot be accepted twice (finding M8).
+        db.begin_immediate(conn)
         store = Store(conn, principal)
         actor = principal.actor_string
         transitioned: list[str] = []
@@ -3308,11 +3343,17 @@ def _restore_row(
 VERSION_STATE_KEY = "version_state"
 
 #: Kinds a reversal can put a row back for, and the table each lives in.
-#: ``version`` is here and deliberately **not** in :data:`_TABLE_KIND`: a
-#: version row is reversible but carries no conflict of its own, because
-#: :func:`_transition_row` is the only writer of ``versions.state`` and it moves
-#: a row out of ``proposed`` exactly once — there is no second write for a
-#: rollback to collide with.
+#: ``version`` is here and deliberately **not** in :data:`_TABLE_KIND`: the two
+#: maps answer different questions. A version row is *reversible* (a review
+#: decision moved it, and :func:`_restore_row` / :func:`_restore_version_state`
+#: put it back), but it carries no conflict of **its own** in the
+#: :data:`_TABLE_KIND` sense — the conflict map is keyed by payload table name,
+#: and a version row's moves ride on the ``node.update`` an accept caused or a
+#: ``version.`` event, which :func:`_touched_rows` resolves by op rather than by
+#: table. ``versions.state`` has two writers, not one: :func:`_transition_row`
+#: moves a row out of ``proposed``, and :func:`_restore_version_state` (via
+#: :func:`_restore_row`) moves it back on a rollback or an undo — which is
+#: exactly the later write a conflict check has to see.
 _REVERSIBLE_TABLES = {"node": "nodes", "edge": "edges", "version": "versions"}
 
 #: The ``version.`` ops a reversal can read, named rather than matched by
@@ -3372,6 +3413,35 @@ def _restore_version_state(
         return None
     _restore_row(conn, "version", "versions", recorded["before"], principal, context)
     return {"before": recorded["after"], "after": recorded["before"]}
+
+
+def _accept_snapshot_row(
+    conn: sqlite3.Connection, event_seq: int, payload: dict[str, Any]
+) -> dict[str, Any] | None:
+    """The snapshot row an accept's ``node.update`` wrote, if this event is one.
+
+    An accept writes a true snapshot of the accepted node (finding M9),
+    stamped with the accept event's own seq — the one ``versions`` row no
+    other event shares that stamp with. Reversing the accept takes that row
+    with it: it is a record of the exact state the reversal exists to take
+    back, and leaving it would show history a state the accept was already
+    undone from. The caller records the row in the reversal's ``deleted``, so
+    reversing the reversal re-inserts it (the involution the rest of these
+    payloads already hold).
+
+    Only events that moved a version row (a :data:`VERSION_STATE_KEY` payload)
+    get this. An ordinary edit's snapshot is history like any other
+    (:func:`_write_version` on every other node mutation) and stays; and a
+    rollback's own snapshot is removed when *that* rollback is reversed, by
+    the mirror it carries, which is the same rule applied to its own event.
+    """
+    if payload.get(VERSION_STATE_KEY) is None:
+        return None
+    row = conn.execute(
+        "SELECT * FROM versions WHERE node_id = ? AND event_seq = ?",
+        (payload["before"]["id"], event_seq),
+    ).fetchone()
+    return None if row is None else _row_dict(row)
 
 
 def _reinsert_rows(conn: sqlite3.Connection, rows: list[dict[str, Any]]) -> None:
@@ -3589,6 +3659,13 @@ def undo(
             restored = _restore_row(conn, kind, table, before, principal, context)
         # An accept moved a version row too, recorded on this same event.
         version_state = _restore_version_state(conn, payload, principal, context)
+        # And it wrote a snapshot of the accepted node; reversing it takes the
+        # snapshot with it, recorded in `deleted` so a reversal of *this* puts
+        # it back (finding M9).
+        accept_snapshot = _accept_snapshot_row(conn, int(event["seq"]), payload)
+        if accept_snapshot is not None:
+            deleted.append({"table": "versions", "row": accept_snapshot})
+            conn.execute("DELETE FROM versions WHERE id = ?", (accept_snapshot["id"],))
         undo_payload: dict[str, Any] = {
             "reversed_seq": event["seq"],
             "reversed_op": event["op"],
@@ -5506,10 +5583,21 @@ def close_cycle(
             raise InvalidTransition(
                 f"cycle {cycle_id} is already {row['status']}: a cycle leaves 'running' once"
             )
-        conn.execute(
-            "UPDATE cycles SET status = ?, report = ?, finished_at = datetime('now') WHERE id = ?",
+        # `AND status = 'running'` is the atomic guard, not the read above: two
+        # concurrent closes both pass the read, and the second one's UPDATE then
+        # matches nothing — so exactly one close wins, and the rowcount is the
+        # honest refusal rather than the pre-check (finding M8, the
+        # `request_stop` shape).
+        cursor = conn.execute(
+            "UPDATE cycles SET status = ?, report = ?, finished_at = datetime('now')"
+            " WHERE id = ? AND status = 'running'",
             (status, json.dumps(report, ensure_ascii=False), cycle_id),
         )
+        if cursor.rowcount == 0:
+            raise InvalidTransition(
+                f"cycle {cycle_id} is already {_get_cycle_row(conn, cycle_id)['status']}: "
+                "a cycle leaves 'running' once"
+            )
         closed = _get_cycle_row(conn, cycle_id)
         conn.commit()
         return _cycle_out(closed)
@@ -5573,9 +5661,11 @@ def abandon_cycle(
             )
     finally:
         conn.close()
-    # Through `close_cycle`, so a cycle leaves `running` in exactly one place —
-    # including the re-check under the write, which is what makes the read above
-    # a message rather than a race.
+    # Through `close_cycle`, so a cycle leaves `running` in exactly one place.
+    # The read above is message-only: the race is closed by close_cycle's
+    # `UPDATE ... WHERE status = 'running'` and its rowcount check, which makes
+    # the second of two concurrent abandons a clean refusal instead of a
+    # double-close (finding M8).
     return close_cycle(
         cycle_id,
         status="failed",
@@ -6117,6 +6207,10 @@ def merge_nodes(
     with _curative_cycle("merge_nodes", principal, path) as (cycle_id, report):
         conn = _connect(path)
         try:
+            # The mergeability checks below are reads the writes would otherwise
+            # race — two concurrent merges of the same tombstone both passing
+            # `_require_mergeable` (finding M8).
+            db.begin_immediate(conn)
             store = Store(conn, principal)
             actor = principal.actor_string
             survivor = _row_dict(_readable_node(conn, store, into))
@@ -6360,6 +6454,10 @@ def retype(
     with _curative_cycle("retype", principal, path) as (cycle_id, report):
         conn = _connect(path)
         try:
+            # Each id's already-a-type check is a read the UPDATE would
+            # otherwise race — two concurrent retypes of one node both passing
+            # it and both emitting an event (finding M8).
+            db.begin_immediate(conn)
             store = Store(conn, principal)
             actor = principal.actor_string
             # Resolved once, outside the loop: the type is the same for every
@@ -6648,6 +6746,9 @@ def _relink(
     """
     conn = _connect(path)
     try:
+        # The duplicate/skip checks below are reads the relink writes would
+        # otherwise race — two concurrent relinks both passing them (finding M8).
+        db.begin_immediate(conn)
         store = Store(conn, principal)
         actor = principal.actor_string
         clauses: list[str] = []
@@ -6816,11 +6917,12 @@ ROLLBACK_SUMMARY_OP = "cycle.rollback"
 
 #: Payload table names mapped to the kind of graph record they hold. This is the
 #: **conflict** map, not the reversal map (:data:`_REVERSIBLE_TABLES`): it is
-#: what reads an ``undo``'s reach out of its ``deleted`` list, and `versions`
-#: rows are absent because they carry no conflict of their own —
-#: :func:`_transition_row` is the only writer of ``versions.state`` and it moves
-#: a row out of ``proposed`` exactly once, so there is no later write for a
-#: rollback to collide with.
+#: what reads an ``undo``'s reach out of its ``deleted`` list. ``versions`` is
+#: absent because a version row's moves ride on the events themselves — an
+#: accept's move is recorded under :data:`VERSION_STATE_KEY` on the ``node.update``
+#: it caused, a reject is a ``version.`` event — and :func:`_touched_rows`
+#: resolves those by op; a version row *is* a potential conflict when one of
+#: those events moved it (finding M10), it just is not addressed by table name.
 _TABLE_KIND: dict[str, RollbackKind] = {"nodes": "node", "edges": "edge"}
 
 #: How many conflicts a refusal spells out before summarising the rest. The
@@ -6970,6 +7072,14 @@ def _touched_rows(op: str, payload: dict[str, Any]) -> set[tuple[RollbackKind, s
     later cycle touched (undoing an ``edge.create`` deletes an edge a merge had
     relinked). Conflict detection that only read ``node.``/``edge.`` events
     would miss exactly that.
+
+    **Version rows are covered by op, not by table.** A review moves one from
+    one decision: the accept's move rides on the ``node.update`` it caused
+    under :data:`VERSION_STATE_KEY` (a rollback mirrors it), a reject is a
+    ``version.`` event of its own, and a rollback's removal of an accept's
+    snapshot row lands in the reversal's ``deleted`` — all three name the
+    ``versions`` row in a way this function reads, so a version row that moved
+    outside the cycle is a conflict like any other (finding M10).
     """
     rows: set[tuple[RollbackKind, str]] = set()
     if op == "undo":
@@ -6979,6 +7089,8 @@ def _touched_rows(op: str, payload: dict[str, Any]) -> set[tuple[RollbackKind, s
             for kind in _TABLE_KIND.values():
                 if kind == reversed_kind:
                     rows.add((kind, restored["id"]))
+            if reversed_kind == "version":
+                rows.add(("version", str(restored["id"])))
     else:
         prefix = op.split(".", 1)[0]
         for kind in _TABLE_KIND.values():
@@ -6989,9 +7101,23 @@ def _touched_rows(op: str, payload: dict[str, Any]) -> set[tuple[RollbackKind, s
                         rows.add((kind, row["id"]))
                 break
         else:
-            return rows
+            if prefix == "version":
+                for side in ("before", "after"):
+                    row = payload.get(side)
+                    if row is not None:
+                        rows.add(("version", str(row["id"])))
+            else:
+                return rows
+    # An accept moved the proposal's own row on the node.update it caused, and
+    # a rollback mirrors that move — a `versions.state` change that would
+    # otherwise ride on the event unseen.
+    recorded = payload.get(VERSION_STATE_KEY)
+    if recorded is not None:
+        rows.add(("version", str(recorded["before"]["id"])))
     for entry in payload.get("deleted", []):
         kind = _TABLE_KIND.get(entry.get("table", ""))
+        if kind is None and entry.get("table") == "versions":
+            kind = "version"
         if kind is not None:
             rows.add((kind, entry["row"]["id"]))
     return rows
@@ -7477,6 +7603,13 @@ def _apply_rollback(
         # *this* back re-applies the accept — the involution the rest of these
         # payloads already hold, at every depth.
         version_state = _restore_version_state(conn, payload, principal, context)
+        # The snapshot the accept wrote of the accepted node goes with it,
+        # recorded in `deleted` so that reversing *this* reversal re-inserts it
+        # (finding M9).
+        accept_snapshot = _accept_snapshot_row(conn, int(event["seq"]), payload)
+        if accept_snapshot is not None:
+            removed.append({"table": "versions", "row": accept_snapshot})
+            conn.execute("DELETE FROM versions WHERE id = ?", (accept_snapshot["id"],))
 
         reversal.update(
             {

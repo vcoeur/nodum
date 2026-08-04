@@ -1087,6 +1087,42 @@ def test_a_version_review_is_re_applied_by_rolling_its_rollback_back(fresh_db):
     assert service.get_node(node.id, principal=owner()).content == "first"
 
 
+def test_a_version_row_moved_outside_the_cycle_is_a_conflict(fresh_db):
+    """Finding M10: a review moved a `versions` row inside the cycle, and a
+    later review moved it again — that is a conflict like any other.
+
+    The conflict scan used to read only node/edge rows off event payloads, so a
+    version row another writer moved since was invisible and the rollback
+    clobbered the later decision. Here: the first reject is taken back by its
+    own rollback (the proposal is ``proposed`` again), a second cycle rejects it
+    once more, and rolling the first rollback back — which would re-apply the
+    first reject over the second cycle's decision — must refuse, naming the
+    version row and the second cycle's event.
+    """
+    node = _node("Alpha", content="first")
+    version = _proposal(node.id)
+
+    first = _reviewed_in_a_cycle(version.id, "reject")
+    assert _version_state(version.id) == "archived"
+    reversal = service.rollback_cycle(first, principal=owner())
+    assert _version_state(version.id) == "proposed"
+    # The same proposal, rejected again outside the first cycle's reversal.
+    second = _reviewed_in_a_cycle(version.id, "reject")
+    assert _version_state(version.id) == "archived"
+
+    with pytest.raises(RollbackConflict) as refusal:
+        service.rollback_cycle(reversal.rollback_cycle_id, principal=owner())
+    conflicts = refusal.value.conflicts
+    assert [conflict.kind for conflict in conflicts] == ["version"], (
+        f"only the version row stands in the way, got {conflicts!r}"
+    )
+    assert conflicts[0].row_id == str(version.id)
+    assert conflicts[0].conflicting_op == "version.reject"
+    assert conflicts[0].conflicting_cycle_id == second
+    # The second cycle's decision is still standing, untouched by the refusal.
+    assert _version_state(version.id) == "archived"
+
+
 def test_a_proposal_staged_and_reviewed_inside_one_cycle_comes_back(fresh_db):
     """The node's create and the review of a proposal on it, in one reversal.
 

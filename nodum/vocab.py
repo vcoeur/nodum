@@ -53,9 +53,12 @@ UrlGrantKind = Literal["download", "upload"]
 #: Traversal directions.
 Direction = Literal["out", "in", "both"]
 
-#: The row kinds a rollback conflict/blocker can name (a version row carries no
-#: conflict of its own — see ``service._REVERSIBLE_TABLES``).
-RollbackKind = Literal["node", "edge"]
+#: The row kinds a rollback conflict/blocker can name. A version row can now
+#: be a conflict too (a review decision moved it inside the cycle and another
+#: writer moved it since — see ``service._touched_rows``); only *nodes and
+#: edges* can be blockers, since only a created row can have something grown
+#: onto it that the reversal was never asked to touch.
+RollbackKind = Literal["node", "edge", "version"]
 
 #: How a consolidation cycle came to exist.
 CycleTrigger = Literal["manual", "scheduled", "curative", "rollback"]

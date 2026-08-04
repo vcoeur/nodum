@@ -824,7 +824,9 @@ class RollbackConflictOut(BaseModel):
     the row since — because a human told *which* rows are in the way can act,
     and one told "rollback failed" cannot.
 
-    ``kind`` is ``node`` or ``edge``; ``conflicting_cycle_id`` is set when the
+    ``kind`` is ``node``, ``edge`` or ``version`` (a review decision the cycle
+    made moves a ``versions`` row, and another writer moving that row since is
+    a conflict like any other); ``conflicting_cycle_id`` is set when the
     later work was itself a cycle's (still "outside this cycle", and still a
     conflict).
     """
