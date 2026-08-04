@@ -1157,10 +1157,14 @@ commands on a saved node for exactly this reason.
   `content` is empty, so without the join a PDF's text would be findable
   through nothing at all. It is a read of *live* state inside an event replay,
   deliberately: `assets` is not event-logged (there is nothing to undo about
-  content-addressed bytes), so text stored after a node was projected is not
-  indexed until that node is projected again or `projector rebuild fts` runs —
-  which is exactly why the pipeline calls `assets.set_extracted_text` **before**
-  it creates the `asset_ref` node. The
+  content-addressed bytes). What keeps the read safe for a rebuild is that the
+  *write* is logged — `assets.set_extracted_text` appends an `asset.extract`
+  event, and the projector re-projects the describing nodes when it replays
+  one, so text stored after a node was projected is indexed by the next run
+  and a rebuild from event 0 lands on the same index an incremental replay
+  produced. The pipeline still calls `assets.set_extracted_text` **before**
+  it creates the `asset_ref` node — the event then replays as a no-op and the
+  node's own create does the join. The
   service layer never calls projectors — the event log is the only coupling.
   A projector whose requirements are unmet (`vec` without a usable embedding
   provider) reports itself unavailable in `projector status` and its runs
@@ -2042,10 +2046,14 @@ commands on a saved node for exactly this reason.
   freshly registered bytes whose ingestion has not run. **Bytes live in the database, not on the
   filesystem**: `assets` holds metadata (including the `extracted_text`
   ingestion writes through `set_extracted_text`, which takes no principal and
-  logs no event — content-addressed base state, like registration itself),
+  is attributed to the system on the `asset.extract` event it logs — the
+  write is content-addressed base state, like registration itself, but the
+  `fts` projector needs the event to re-index describing nodes),
   `asset_blobs` holds the bytes under
-  the same sha256 key, so the whole system is one file and disaster recovery
-  is `DB = everything`. Registration is idempotent sha256 dedup with no
+  the same sha256 key, so the whole system is one file and recovery is
+  `nodum backup <dest>` — a consistent `VACUUM INTO` snapshot that folds the
+  WAL in; copying the raw file while a connection is open can strand committed
+  rows in `-wal`. Registration is idempotent sha256 dedup with no
   event-log entry (there is nothing to undo), and streams through
   `Connection.blobopen` so a large file is never held in memory — never
   inline asset bytes into an event payload. The two read passes (hash, then

@@ -363,6 +363,52 @@ def init() -> None:
     _emit(_run(service.init))
 
 
+def _backup_to(destination: str, path: str | None) -> dict[str, str | int]:
+    """Write a consistent snapshot of the graph to ``destination``.
+
+    ``VACUUM INTO`` copies the source as one consistent snapshot, folding
+    whatever committed rows still live in the ``-wal`` file into the new file —
+    the rows a plain ``copyfile`` of the ``.db`` alone would silently lose
+    while a connection is open. It refuses to run inside a transaction, so the
+    source connection is a fresh ``db.connect`` with no DML before it: only
+    DML opens an implicit DEFERRED transaction (``isolation_level`` is ``""``),
+    never a bare ``SELECT`` or ``PRAGMA``.
+
+    Raises:
+        ValueError: If the source database does not exist, if the destination
+            resolves to the source file itself, or if the destination already
+            exists and is not empty.
+    """
+    source = db.db_path() if path is None else Path(path).expanduser()
+    if not source.is_file():
+        raise ValueError(f"no database at {source} — run 'nodum init' first")
+    dest = Path(destination).expanduser()
+    if source.resolve() == dest.resolve():
+        raise ValueError(f"destination is the source database itself: {dest}")
+    if dest.exists() and dest.stat().st_size > 0:
+        raise ValueError(f"destination already exists and is not empty: {dest}")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    conn = db.connect(source)
+    try:
+        conn.execute("VACUUM INTO ?", (str(dest),))
+    finally:
+        conn.close()
+    with sqlite3.connect(str(dest)) as check:
+        integrity = check.execute("PRAGMA integrity_check").fetchone()[0]
+    return {"destination": str(dest), "bytes": dest.stat().st_size, "integrity": integrity}
+
+
+@app.command("backup")
+def backup(
+    destination: str = typer.Argument(..., help="Path to write the backup database to."),
+    path: str | None = typer.Option(
+        None, "--path", help=f"Source graph path (defaults to ${ENV_DB_VAR})."
+    ),
+) -> None:
+    """Write a consistent snapshot of the graph to another file (VACUUM INTO)."""
+    _print_json(_run(_backup_to, destination, path))
+
+
 @node_app.command("create")
 def node_create(
     type: str = typer.Option(..., "--type", "-t", help="Node type id or name."),

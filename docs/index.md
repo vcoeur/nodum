@@ -22,8 +22,10 @@ nodum node create --type concept --title "Graph Theory" --as owner
 
 The whole graph — nodes, edges, versions, the event log, derived indexes, and
 even binary assets — lives in a single SQLite database. There is no server to
-run, no daemon, no external index to keep in sync, and no API key. Copying the
-file copies the knowledge base.
+run, no daemon, no external index to keep in sync, and no API key. The
+database runs in WAL mode, so copying the file alone can strand committed rows
+in its `-wal` companion — the snapshot is `nodum backup <dest>`, a consistent
+single-file copy (`VACUUM INTO`) that folds the WAL in.
 
 ## What makes it agent-native
 
