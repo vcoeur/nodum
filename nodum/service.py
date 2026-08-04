@@ -4127,10 +4127,14 @@ def record_auth_event(
     ``/api`` path outside the session gate, so that made ``events.actor`` a
     field an unauthenticated caller writes. ``{"name": "human:owner"}`` put
     sixty rows attributed to the seeded owner in the log with no credential
-    presented, and ``events --actor human:owner`` listed them beside the real
-    owner's. The actor column is this system's answer to *who did this*; the
-    only truthful answer on a failed login is *nobody*, and a claimed name is
-    data about the attempt rather than an identity.
+    presented, and :func:`list_events` returned them interleaved with the real
+    owner's and indistinguishable from them. It is the log's only reader — what
+    ``nodum events`` prints — it orders by ``seq``, and it filters on nothing
+    but ``cycle_id``: there is no actor filter to separate the forgeries out
+    with, and one would not help, because it would be filtering on a column the
+    attempt chose. The actor column is this system's answer to *who did this*;
+    the only truthful answer on a failed login is *nobody*, and a claimed name
+    is data about the attempt rather than an identity.
 
     Payloads are metadata only: ids, the attempted name, a reason. Never a
     password, and never a credential hash.
@@ -4352,7 +4356,10 @@ def _walk(
     loop then loaded both endpoints with an unscoped row read. The clause is
     fixed, and the row check below is the second layer — a node read in this
     module that does not pass :meth:`Store.node_visible` is the shape of that
-    defect, whatever the SQL upstream says.
+    defect, whatever the SQL upstream says. That is a claim about the module,
+    so the two other walks that load an endpoint the same way apply it too:
+    :func:`subgraph` drops the edge, :func:`find_path` drops the path. An
+    invariant applied at one of three sites is a comment, not an invariant.
 
     ``as_of`` swaps the lens from the live graph to the graph true at an
     instant (D2): the walk then follows ``active`` edges plus ``archived``
@@ -4680,7 +4687,16 @@ def subgraph(
                         # 10_000 spokes costs `limit` node reads, not 10_000.
                         truncated = True
                         continue  # the node cap bites here, mid-walk
-                    row = _row_dict(_get_node_row(conn, far))
+                    far_row = _get_node_row(conn, far)
+                    if not store.node_visible(far_row):
+                        # `_walk`'s second layer, applied here for the
+                        # same reason: `edge_scope` should already have
+                        # excluded an edge with an unreadable endpoint, so
+                        # reaching this is the two rules disagreeing — and the
+                        # answer is to drop the edge whole rather than return
+                        # it with an endpoint the principal may not see.
+                        continue
+                    row = _row_dict(far_row)
                     if admissible_types is not None and row["type_id"] not in admissible_types:
                         continue  # excluded node — its edge would dangle
                     nodes[far] = row
@@ -4801,10 +4817,20 @@ def find_path(
             node_ids.append(previous)
         node_ids.reverse()
         path_edges.reverse()
+        path_rows = [_get_node_row(conn, node_id) for node_id in node_ids]
+        if not all(store.node_visible(row) for row in path_rows):
+            # `_walk`'s second layer, applied here for the same reason:
+            # `edge_scope` should already have kept the walk out of every space
+            # this principal cannot read, so an unreadable row on the assembled
+            # path is the two rules disagreeing. The answer is the one this
+            # function already documents — a path through a space the principal
+            # cannot read does not exist — rather than a `NodeNotFound` naming
+            # an id the caller never asked about.
+            return PathOut(found=False, hops=0, nodes=[], edges=[])
         return PathOut(
             found=True,
             hops=len(path_edges),
-            nodes=[_node_out(_get_node_row(conn, node_id)) for node_id in node_ids],
+            nodes=[_node_out(row) for row in path_rows],
             edges=[_edge_out(edge) for edge in path_edges],
         )
     finally:

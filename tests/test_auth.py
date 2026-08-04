@@ -10,7 +10,7 @@ from helpers import OWNER_ACTOR, agent, owner
 
 from nodum import auth, db, service
 from nodum.migrations import GARDENER_AGENT_ID
-from nodum.store import GrantNotPermitted
+from nodum.store import GrantNotPermitted, Store
 
 #: Cookie by session-row id, so a test can key the table and still present the
 #: cookie the caller was handed (the row holds only the hash — review S9).
@@ -555,3 +555,79 @@ def test_a_new_grant_takes_effect_immediately(fresh_db):
         type="note", title="reached", principal=auth.verify_agent_token(created.token)
     )
     assert node.state == "proposed"
+
+
+# ── The read set is two layers, not one SQL clause (finding M1) ───────────────
+
+
+def _notes_either_side_of_a_secret_space() -> tuple[str, str, str]:
+    """Two readable notes with an unreadable space node between them.
+
+    Wikilink materialisation writes the `mentions` edges: each note names the
+    space by title, so the only path from one note to the other runs through a
+    node `get_node` refuses — the exact shape M1 was found in.
+
+    Returns:
+        `(space id, left note id, right note id)`.
+    """
+    secret = service.create_space("secret-research", principal=owner())
+    left = service.create_node(
+        type="note", title="Left", content="see [[secret-research]]", principal=owner()
+    )
+    right = service.create_node(
+        type="note", title="Right", content="also [[secret-research]]", principal=owner()
+    )
+    return secret.id, left.id, right.id
+
+
+def _blind_the_edge_clause(monkeypatch) -> None:
+    """Take the SQL layer away, leaving only the per-row check under it.
+
+    `Store.edge_scope` is correct today, so neither test below is a live bug —
+    which is the whole reason the row check has to be tested this way. A second
+    layer that is only ever exercised behind a working first layer is a comment
+    about defence in depth rather than defence in depth, and `service._walk`
+    states the rule for the *module*: a node read there that does not pass
+    `Store.node_visible` is the shape of the defect, whatever the SQL says.
+    """
+    monkeypatch.setattr(Store, "edge_scope", lambda self, alias="": ("", []))
+
+
+def test_subgraph_drops_an_edge_whose_far_node_is_outside_the_read_set(fresh_db, monkeypatch):
+    """`subgraph` re-checks the endpoint row it loads, exactly as `_walk` does."""
+    secret_id, left_id, _ = _notes_either_side_of_a_secret_space()
+    scout = agent("scout", grants={"meta": "read", "main": "edit"})
+    _blind_the_edge_clause(monkeypatch)
+
+    walked = service.subgraph(left_id, depth=2, principal=scout)
+
+    assert secret_id not in {node.id for node in walked.nodes}
+    assert "secret-research" not in {node.title for node in walked.nodes}
+    # The edge is dropped whole rather than returned naming an endpoint the
+    # principal may not see.
+    assert all(secret_id not in (edge.src_id, edge.dst_id) for edge in walked.edges)
+    # This narrows an agent's read, not the graph: the human still sees it all.
+    seen = service.subgraph(left_id, depth=2, principal=owner())
+    assert secret_id in {node.id for node in seen.nodes}
+
+
+def test_find_path_refuses_a_path_that_runs_through_an_unreadable_node(fresh_db, monkeypatch):
+    """A path through a space the principal cannot read does not exist.
+
+    That is what `find_path` documents, and it was true only because the edge
+    clause held: the returned nodes were loaded with an unscoped row read.
+    """
+    secret_id, left_id, right_id = _notes_either_side_of_a_secret_space()
+    scout = agent("scout", grants={"meta": "read", "main": "edit"})
+    _blind_the_edge_clause(monkeypatch)
+
+    path = service.find_path(left_id, right_id, principal=scout)
+
+    assert path.found is False
+    assert path.nodes == []
+    assert path.edges == []
+    # The path really is there, and the human really does get it — two hops,
+    # the middle one being the node the agent may not see.
+    visible = service.find_path(left_id, right_id, principal=owner())
+    assert visible.found is True
+    assert [node.id for node in visible.nodes] == [left_id, secret_id, right_id]

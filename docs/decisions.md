@@ -2289,10 +2289,27 @@ ci.yml — and "usually" is what a release gate exists not to depend on. This
 project has already pushed a tag at a tree that was never the merged one
 (`v0.12.0` published a pre-merge state).
 
-The three missing jobs are in `release.yml` and in `build-and-publish`'s
-`needs`, and `tests/test_docs.py` reads both workflows and asserts the cover:
-the claim is checkable now rather than written down, and a job added to ci.yml
-fails the suite until somebody decides whether a release needs it. The
-highest-resolution leg matters most of the four — it is the leg that exists for
-an unbounded dependency major breaking a fresh resolution, which is a thing a
-*release* ships and a PR does not.
+The missing jobs are in `release.yml` and in `build-and-publish`'s `needs`,
+and `tests/test_docs.py` asserts the cover: the claim is checkable now rather
+than written down, and a job added to a PR-gating workflow fails the suite
+until somebody decides whether a release needs it. The highest-resolution leg
+matters most of them — it is the leg that exists for an unbounded dependency
+major breaking a fresh resolution, which is a thing a *release* ships and a PR
+does not.
+
+**The first cut of that test asserted less than its own docstring claimed**,
+which is the defect it exists to prevent, arriving inside the fix for it. Four
+ways: it read `ci.yml` alone, so `docs.yml` — a third `pull_request`-triggered
+workflow, and the one that catches a broken internal link — was invisible, and
+a tag at a tree with a dead link published green; its job-id regex was
+`[a-z0-9-]+`, so a job named `type_check` was silently *not seen* rather than
+reported missing; it took the first `needs:` in the file and assumed it was
+`build-and-publish`'s; and it compared job *names*, while `release.yml`'s `web`
+job was in fact missing `make web-build` — the frontend typecheck — that
+`ci.yml`'s ran. All four are closed: workflows are discovered by their
+triggers, an unparseable job id is a loud failure rather than a skip, `needs:`
+is read out of the named job in both YAML spellings, and same-named jobs are
+compared by their `run:` steps with the release side required to be a superset.
+Two exemptions are named and load-bearing rather than decorative — `npm audit`
+(an advisory published overnight must not block a tag) and `docs.yml`'s deploy
+job (never a PR check).

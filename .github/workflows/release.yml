@@ -72,6 +72,26 @@ jobs:
       - name: Run test suite
         run: uv run --extra pdf pytest -q
 
+  # The docs gate. docs.yml runs `mkdocs build --strict` on every pull request
+  # touching docs/ or mkdocs.yml, and with mkdocs.yml's `validation:` block
+  # that build is what catches an orphan page or a dead internal link. A tag
+  # push triggers neither docs.yml (push-to-main, PR and dispatch only) nor
+  # ci.yml, so until this job existed a tag cut at a tree with a broken doc
+  # link published green. The command is docs.yml's, spelled out inline rather
+  # than `make docs`: identical text is what makes the parity assertion in
+  # tests/test_docs.py an exact one, and the --with pins build in an ephemeral
+  # env that does not depend on this project's dependency groups. (`make docs`
+  # runs the same build from the `docs` group, for local use.)
+  docs:
+    name: Docs build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+      - name: Build site
+        run: uv run --locked --with "mkdocs==1.6.1" --with "mkdocs-material==9.7.7" mkdocs build --strict
+
   web:
     name: Frontend
     runs-on: ubuntu-latest
@@ -89,6 +109,19 @@ jobs:
         run: make web-test
       - name: Frontend lint
         run: make web-lint
+      # `web-build` runs `tsc --noEmit` before Vite, so these two steps are the
+      # frontend type check, not a duplicate of the bundle `build-and-publish`
+      # makes for the wheel. Sharing the job id with ci.yml's `web` was never
+      # the same gate: the type check ran on the PR and, on a tag, only inside
+      # the publishing job — a check that runs *as* the release rather than
+      # before it. `npm audit` is deliberately not mirrored here (it is
+      # `continue-on-error` on the PR side for the same reason, and named in
+      # tests/test_docs.py's RELEASE_STEP_EXEMPT): an advisory published
+      # overnight must annotate a build, never stop a tag.
+      - name: Build the UI bundle
+        run: make web-build
+      - name: Check the bundle was emitted
+        run: test -f nodum/_web/index.html && test -d nodum/_web/assets
 
   smoke:
     name: Clean-install smoke
@@ -124,12 +157,16 @@ jobs:
     # self-describe clean — tag pushes do not trigger ci.yml, so the release
     # workflow must gate on the suite itself.
     #
-    # `needs` names every job ci.yml has, so the tag gate is not weaker than the
-    # PR gate — and that is now a checkable claim rather than a comment:
-    # `tests/test_docs.py` reads both workflows and asserts this list covers
-    # ci.yml's job set. It said this while ruff, pyright, the ceiling leg and
-    # the frontend suite ran on the PR only (finding M3).
-    needs: [lint, test, test-highest, web, smoke]
+    # `needs` names a counterpart for every job of every workflow a pull
+    # request triggers — ci.yml and docs.yml — so the tag gate is not weaker
+    # than the PR gate. That is a checkable claim rather than a comment:
+    # `tests/test_docs.py` discovers the PR-triggered workflows, maps each of
+    # their jobs onto a job named in this list, and compares the two jobs'
+    # `run:` steps, so neither a new job nor a step quietly dropped from a
+    # counterpart can pass. It said this while ruff, pyright, the ceiling leg
+    # and the frontend suite ran on the PR only (finding M3), and again while
+    # the strict docs build did.
+    needs: [lint, test, test-highest, web, docs, smoke]
     runs-on: ubuntu-latest
     permissions:
       id-token: write   # required for OIDC trusted publishing

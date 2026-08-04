@@ -194,6 +194,18 @@ HUMAN_ONLY_TOOLS = (
 #: on the caller's host. A path on the server's disk only ever made sense when
 #: the agent and the server shared a machine — and when they do, the operator
 #: has ``nodum ingest``, where local access is already the trust boundary.
+#:
+#: **What this tuple is, and what it is not.** Like the other three absence
+#: lists it is a set of *names*, and a name list cannot catch a tool called
+#: something else — ``ingest.ingest_file``'s own parameter is ``source``, which
+#: is what a re-added tool would most plausibly be called. The rule it
+#: shorthands is a sentence, and the sentence is the thing to apply at review:
+#: **no tool on this surface takes an argument the server resolves against its
+#: own filesystem.** What actually holds mechanically is one line up in
+#: ``tests/test_mcp_server.py`` —
+#: ``names == set(READ_TOOLS) | set(ADDITIVE_TOOLS)`` — so *any* new tool fails
+#: the suite until somebody adds it to a tier deliberately, whatever it is
+#: named. This list is what makes that moment ask the right question.
 FILESYSTEM_TOOLS = ("ingest_file", "ingest_path", "read_file")
 
 #: Every name that must never appear in the registry, in one place — what the
@@ -274,12 +286,23 @@ def _ingest_result(out: ingest.IngestOut) -> dict[str, Any]:
 
     **This is a payload-size decision, not a security boundary, and it must
     not be mistaken for one again.** It was written as though withholding the
-    text were what stopped an agent reading a file it should not — and it was
-    not, because ``get_asset`` hands the same text over on the very next call
-    by design. What actually bounds this surface is that no tool here can name
-    a file at all (:data:`FILESYSTEM_TOOLS`): the caller supplies a URL this
-    server fetches, or bytes it uploads, and in both cases the caller already
-    had whatever it is asking the graph to remember.
+    text were what stopped an agent reading something it should not — and it
+    was not, because ``get_asset`` hands the same text over on the very next
+    call by design, from a ``proposed`` describing node, with no human in
+    between.
+
+    What this surface actually bounds is narrower than "what the caller could
+    already read", and stating it precisely is the point of this paragraph:
+    **no tool here can name a file** (:data:`FILESYSTEM_TOOLS`), so the
+    server's *filesystem* is not reachable. Its **network position still is**.
+    ``ingest_url`` fetches on the server's behalf, and :mod:`nodum.ingest`
+    blocks neither loopback nor private ranges — deliberately, and argued
+    there: the server is itself a loopback service. So an agent holding
+    ``suggest`` can have this server fetch something only *it* can reach and
+    then read the result back with ``get_asset``. That is a property of
+    granting an agent ingestion at all, it predates the removal of the
+    filesystem tool, and it is **not** closed by anything in this function —
+    which is exactly why this docstring no longer claims otherwise.
     """
     return out.model_dump(
         mode="json",
@@ -742,9 +765,10 @@ def create_server(*, token: str, db_path: str | Path | None = None) -> FastMCP:
     ) -> dict[str, Any]:
         """Get a single-use URL to PUT one file to, for bytes the server cannot reach.
 
-        Reach for this only when `ingest_file` cannot do the job: the file
-        sits on your host, not on the server's filesystem, and no URL the
-        server can fetch points at it. Declare `sha256` whenever you know it —
+        Reach for this when `ingest_url` cannot do the job: the bytes sit on
+        your host and no URL the server can fetch points at them. There is no
+        third option — no tool on this surface reads a path on the server's
+        own disk. Declare `sha256` whenever you know it —
         if the store already holds those bytes you get the existing `asset`
         back with **no grant and no transfer at all** (design §5.7 rule 4);
         otherwise you get a `grant` whose `url` accepts exactly one PUT of at
@@ -754,9 +778,9 @@ def create_server(*, token: str, db_path: str | Path | None = None) -> FastMCP:
         must be able to write it: a grant onto a space you cannot write is
         refused **now** rather than after the upload. Under `suggest` that
         describing node lands `proposed` like any other write; under `edit` it
-        lands live. Note that an asset is only reachable through an *active*
-        describing node, so under `suggest` you will not be able to read back
-        what you just sent until a human accepts it.
+        lands live. Either way you can read the bytes back with `get_asset`
+        straight away — a describing node makes an asset reachable in any state
+        but `archived`, so a proposal you are still waiting on is enough.
 
         The mint is event-logged, the dedup shortcut included.
         """

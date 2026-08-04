@@ -40,6 +40,7 @@ import json
 import pkgutil
 import sqlite3
 import threading
+import time
 import zipfile
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from importlib.util import find_spec
@@ -1674,6 +1675,157 @@ def test_a_successful_login_resets_the_failure_count(fresh_db):
         anonymous.post("/api/login", json={"name": "owner", "password": OWNER_PASSWORD}).status_code
         == 200
     )
+
+
+def _counting_verify_login(monkeypatch) -> list[str]:
+    """Wrap ``auth.verify_login`` so a test can see whether argon2 ran at all.
+
+    Returns the list the names actually verified land in — empty means the
+    handler refused the body before it ever reached the password check.
+    """
+    verified: list[str] = []
+    real = auth.verify_login
+
+    def counting(name, password, **kwargs):
+        verified.append(name)
+        return real(name, password, **kwargs)
+
+    monkeypatch.setattr(auth, "verify_login", counting)
+    return verified
+
+
+def test_concurrent_logins_never_exceed_the_login_verification_limiter(fresh_db, monkeypatch):
+    """The one unauthenticated route may not reserve memory without a bound.
+
+    Moving argon2id off the loop was right and incomplete: inline, exactly one
+    verification ran at a time, and through the *default* thread limiter forty
+    do — each holding argon2id's 64 MiB memory cost. Sixteen concurrent
+    unauthenticated attempts were measured at +1032 MiB of RSS against
+    +64 MiB with the call inline, with a ceiling around 2.5 GiB. The per-name
+    lockout bounds none of it, which is why every attempt below claims a
+    different name: rotating the name never trips it.
+
+    There is no way to assert "the server did not become resident" from inside
+    the process, but the mechanism that keeps it from becoming resident is
+    assertable — how many verifications are ever in flight at once. Each one
+    records its own arrival and departure, so the high-water mark is exact.
+    """
+    service.set_human_password("owner", OWNER_PASSWORD, principal=owner())
+    app = http_api.create_app()
+    attempts = 6 * http_api.LOGIN_VERIFY_CONCURRENCY
+
+    lock = threading.Lock()
+    in_flight = 0
+    peak = 0
+    real_verify = auth.verify_login
+
+    def watched_verify(name, password, **kwargs):
+        nonlocal in_flight, peak
+        with lock:
+            in_flight += 1
+            peak = max(peak, in_flight)
+        try:
+            # Wide enough that unbounded callers demonstrably overlap; argon2's
+            # own ~100 ms would mostly do it, but not as a guarantee.
+            time.sleep(0.02)
+            return real_verify(name, password, **kwargs)
+        finally:
+            with lock:
+                in_flight -= 1
+
+    monkeypatch.setattr(auth, "verify_login", watched_verify)
+
+    async def hammer() -> list[httpx.Response]:
+        transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+        async with httpx.AsyncClient(transport=transport, base_url=BASE_URL) as concurrent:
+            return await asyncio.gather(
+                *(
+                    concurrent.post(
+                        "/api/login",
+                        json={"name": f"nobody-{index}", "password": "wrong"},
+                        headers=CLIENT_HEADERS,
+                    )
+                    for index in range(attempts)
+                )
+            )
+
+    responses = asyncio.run(hammer())
+
+    assert peak <= http_api.LOGIN_VERIFY_CONCURRENCY, (
+        f"{peak} argon2 verifications were in flight at once, "
+        f"bound is {http_api.LOGIN_VERIFY_CONCURRENCY}"
+    )
+    assert peak >= 1, "the wrapper never ran: this test asserted nothing"
+    # Every one of them was still answered: the excess *queued* on the limiter
+    # rather than being refused, which would hand anybody with a socket a way
+    # to deny logins to the human this route exists for.
+    assert [response.status_code for response in responses] == [401] * attempts
+
+
+def test_an_over_long_login_name_is_refused_before_the_log_and_before_argon2(fresh_db, monkeypatch):
+    """An unauthenticated caller does not get to choose the size of a row.
+
+    The name a failed attempt claimed is written verbatim into the append-only
+    ``events`` payload, and nothing capped its length: ``{"name": "A" *
+    200_000}`` appended a 200 kB row from a caller with no session, bounded
+    only by ``MAX_REQUEST_BYTES`` — 32 MiB, per attempt, indefinitely. The cap
+    has to bite in the handler, because the lockout query, argon2 and the
+    failure event are all on the far side of it.
+    """
+    service.set_human_password("owner", OWNER_PASSWORD, principal=owner())
+    anonymous = Client(http_api.create_app())
+    verified = _counting_verify_login(monkeypatch)
+
+    response = anonymous.post(
+        "/api/login", json={"name": "A" * 200_000, "password": OWNER_PASSWORD}
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["type"] == "ValueError"
+    # The refusal does not echo the field back: a message quoting a 200 kB name
+    # moves it into the response body and the server log instead of the table.
+    assert "AAAAAAAAAA" not in response.text
+    assert _events("human.login_failed") == []
+    assert not any("AAAAAAAAAA" in json.dumps(event.payload) for event in _events())
+    assert verified == []  # argon2 never ran either
+
+    # The boundary is the constant, and a name exactly on it is ordinary input.
+    at_cap = anonymous.post(
+        "/api/login",
+        json={"name": "A" * http_api.MAX_LOGIN_NAME_CHARS, "password": OWNER_PASSWORD},
+    )
+    assert at_cap.status_code == 401
+    assert verified == ["A" * http_api.MAX_LOGIN_NAME_CHARS]
+    assert len(_events("human.login_failed")) == 1
+
+
+def test_an_over_long_login_password_is_refused_before_argon2(fresh_db, monkeypatch):
+    """argon2id hashes whatever it is handed, at the full work factor.
+
+    So an uncapped password field is CPU an unauthenticated caller buys by the
+    megabyte — and it is spent on unknown names too, through the constant-time
+    dummy path. The concurrency limiter caps how many verifications run at
+    once; this caps what one of them can cost.
+    """
+    service.set_human_password("owner", OWNER_PASSWORD, principal=owner())
+    anonymous = Client(http_api.create_app())
+    verified = _counting_verify_login(monkeypatch)
+
+    response = anonymous.post("/api/login", json={"name": "owner", "password": "p" * 200_000})
+
+    assert response.status_code == 400
+    assert response.json()["error"]["type"] == "ValueError"
+    assert "pppppppppp" not in response.text
+    assert verified == []
+    assert _events("human.login_failed") == []
+
+    # And a password exactly on the cap is verified like any other wrong one.
+    at_cap = anonymous.post(
+        "/api/login",
+        json={"name": "owner", "password": "p" * http_api.MAX_LOGIN_PASSWORD_CHARS},
+    )
+    assert at_cap.status_code == 401
+    assert verified == ["owner"]
 
 
 def test_logout_records_the_human_logout_event_and_removes_the_session(client, fresh_db):

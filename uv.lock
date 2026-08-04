@@ -994,6 +994,7 @@ wheels = [
 name = "nodum"
 source = { editable = "." }
 dependencies = [
+    { name = "anyio" },
     { name = "argon2-cffi" },
     { name = "mcp" },
     { name = "pillow" },
@@ -1033,6 +1034,7 @@ docs = [
 
 [package.metadata]
 requires-dist = [
+    { name = "anyio", specifier = ">=4,<5" },
     { name = "argon2-cffi", specifier = ">=23" },
     { name = "fastembed", marker = "extra == 'embeddings'", specifier = ">=0.8.0,<1" },
     { name = "faster-whisper", marker = "extra == 'audio'", specifier = ">=1,<2" },

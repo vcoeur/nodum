@@ -12,6 +12,18 @@ dependencies = [
     # "ceiling-tested" — the CI highest-resolution leg and the smoke install's
     # fresh resolution exercise the ceiling, so a break surfaces there instead
     # of on a fresh install.
+    # Declared because `nodum.http_api` imports it directly — for the login
+    # route's own `CapacityLimiter`, which bounds how many argon2 hashes may be
+    # in flight at once. It arrives transitively with starlette either way, and
+    # that is exactly the trap: an undeclared import that happens to resolve is
+    # the B1 shape, one dependency-tree change away from a fresh install that
+    # cannot import. The floor is the 4.x major, whose `CapacityLimiter`
+    # constructs outside a running event loop (it returns a
+    # `CapacityLimiterAdapter` that materialises on first use) — which is what
+    # lets the limiter be a module-level constant instead of a lifespan hook.
+    # 4.14.2 is what the lock pins and what that behaviour was checked against;
+    # the CI highest-resolution leg covers the other end of the range.
+    "anyio>=4,<5",
     "argon2-cffi>=23",         # ceiling-tested: year-major versioning, API stable for a decade
     "mcp>=1.28.1,<2",          # mcp 2.0.0 removed mcp.server.fastmcp, which nodum.mcp_server imports
     "pillow>=11",              # ceiling-tested: mature, non-breaking majors; tiny API surface used

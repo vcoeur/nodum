@@ -154,6 +154,47 @@ def test_ingestion_is_annotated_additive_because_it_only_ever_adds(fresh_db):
     assert by_name["get_download_url"].annotations.destructiveHint is False
 
 
+def test_no_tool_description_advertises_a_tool_that_is_not_registered(fresh_db):
+    """The descriptions are the only text an agent reads — they must not name a ghost.
+
+    When `ingest_file` was removed, the module docstring, the server
+    `instructions`, `ingest_url`'s docstring, `AGENTS.md`, `docs/architecture.md`,
+    `docs/decisions.md` and `docs/llms.txt` were all updated — and
+    `request_upload_url`'s docstring, which *is* its MCP tool description, was
+    missed. So every model with this server attached was still being told to
+    "reach for this only when `ingest_file` cannot do the job: the file sits on
+    your host, **not on the server's filesystem**" — a removed tool named as the
+    primary ingestion path, and a filesystem door advertised as existing, by the
+    surface the agent actually reads.
+
+    Nothing caught it: the registry assertions check *names*, and the
+    docstring assertions grepped for "suggest"/"edit". This closes that gap
+    from the other side — no registered tool may name an unregistered one, in
+    its description or in the server's instructions.
+    """
+    tools = _run(lambda session: session.list_tools()).tools
+    registered = {tool.name for tool in tools}
+
+    # Backticked, because that is how this surface cites a tool — and because a
+    # bare substring test cannot tell the *tool* `reject` from the English word
+    # in "proposed/rejected updates", which `history`'s description contains.
+    def cited(text: str) -> set[str]:
+        return {ghost for ghost in UNREGISTERED_TOOLS if f"`{ghost}`" in text}
+
+    for tool in tools:
+        named = cited(tool.description or "")
+        assert not named, (
+            f"{tool.name}'s description names unregistered tool(s) {sorted(named)} — "
+            "that text is what an agent reads before calling"
+        )
+
+    agent(AGENT, token=TOKEN)  # the server verifies its token at construction
+    named = cited(create_server(token=TOKEN).instructions or "")
+    assert not named, f"the server instructions name unregistered tool(s) {sorted(named)}"
+    # And the instructions still describe the registry they front.
+    assert registered <= set(READ_TOOLS) | set(ADDITIVE_TOOLS)
+
+
 def test_the_grown_registry_still_holds_no_review_or_curative_tool(fresh_db):
     """Four tools bigger, and the absent tiers are still absent."""
     names = {tool.name for tool in _run(lambda session: session.list_tools()).tools}
@@ -894,19 +935,44 @@ def test_no_registered_tool_can_name_a_path_on_the_servers_disk(fresh_db, tmp_pa
 
     Withholding the text from the *first* call was tried and was not the fix:
     the second call was never the reported path. The fix is that no tool takes
-    a path, which is what this asserts — over the live registry, so a tool
-    added later with a ``path``-shaped parameter fails here.
+    a path.
+
+    **What holds this mechanically is the registry equality one test up**
+    (``names == set(READ_TOOLS) | set(ADDITIVE_TOOLS)``): any new tool at all
+    fails the suite until somebody puts it in a tier deliberately, whatever it
+    is named and whatever its parameters are called. The parameter sweep below
+    is a *prompt at that moment*, not the guard — a name list cannot catch a
+    tool that spells its argument something else, and ``ingest.ingest_file``
+    calls its own parameter ``source``, which is the spelling a re-added tool
+    would most plausibly use. Both halves are asserted here so the reader meets
+    the rule, but only the one above is airtight.
     """
     secret = tmp_path / "id_rsa"
     secret.write_text("-----BEGIN OPENSSH PRIVATE KEY-----\ntop secret\n", encoding="utf-8")
 
     tools = _run(lambda session: session.list_tools()).tools
+    assert {tool.name for tool in tools} == set(READ_TOOLS) | set(ADDITIVE_TOOLS)
     assert "ingest_file" not in {tool.name for tool in tools}
 
-    # No tool declares a parameter a filesystem path would go in.
+    # A prompt, not a guard: the spellings a filesystem argument has worn here
+    # or would plausibly wear. `source` is on the list because that is what the
+    # removed tool's service function still calls its own parameter.
+    path_shaped = {
+        "path",
+        "path_or_url",
+        "file",
+        "file_path",
+        "filename",
+        "source",
+        "source_path",
+        "local_path",
+        "directory",
+        "dir",
+        "location",
+    }
     for tool in tools:
         properties = (tool.inputSchema or {}).get("properties", {})
-        assert not {"path", "path_or_url", "file", "filename", "source_path"} & set(properties), (
+        assert not path_shaped & set(properties), (
             f"{tool.name} takes a path-shaped argument: {sorted(properties)}"
         )
 

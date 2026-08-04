@@ -96,10 +96,16 @@ The invariants that must never be broken, whatever the section:
   never bump a version in code.
 - **Releasing.** Land the change on `main`, then push an annotated `vX.Y.Z`
   tag on a commit reachable from `origin/main`. That triggers
-  `.github/workflows/release.yml`: the test matrix and the clean-install smoke
-  gate a `uv build`, which publishes to PyPI over OIDC trusted publishing (no
-  API token). Tag pushes do **not** trigger `ci.yml`, which is why the release
-  workflow re-runs the suite itself. The publish step sets `skip-existing:
+  `.github/workflows/release.yml`: **every check a pull request passes** —
+  lint (ruff + pyright), the test matrix, the highest-resolution resolution
+  leg, the frontend suite, the docs build and the clean-install smoke — gates a
+  `uv build`, which publishes to PyPI over OIDC trusted publishing (no API
+  token). Tag pushes do **not** trigger `ci.yml` or `docs.yml`, which is why
+  the release workflow re-runs their checks itself; four of them ran on pull
+  requests only until 2026-08-05, so a tag was gated more weakly than the
+  branch it came from. That parity is no longer a promise in this paragraph:
+  `tests/test_docs.py` reads the workflow files and asserts it, jobs and
+  `run:` steps both, with every exemption named. The publish step sets `skip-existing:
   true`, so re-pushing a tag onto an already-released version is a no-op rather
   than a `400 File already exists` failure, and pins the publish action to an
   exact tag because that job holds OIDC publish rights.
@@ -153,8 +159,9 @@ The invariants that must never be broken, whatever the section:
   pull request that touches them. The build runs `--strict`; `mkdocs.yml`'s
   `validation` block raises the orphan-page and broken-anchor checks from
   INFO to WARN, which is what makes a broken internal link or a page missing
-  from `nav` **fail CI** — check a docs change locally with
-  `uv run --with "mkdocs==1.6.1" --with "mkdocs-material==9.7.7" mkdocs build --strict`.
+  from `nav` **fail CI** — check a docs change locally with `make docs`
+  (`make docs-serve` for live reload), which runs the same `mkdocs build
+  --strict` against the pinned `docs` dependency group.
   `docs/CNAME` carries the custom domain and must survive any docs
   reorganisation. **`docs/llms.txt`** is the agent-facing summary published at
   `/llms.txt` (mkdocs copies non-Markdown files through verbatim); it states the
@@ -175,6 +182,7 @@ The invariants that must never be broken, whatever the section:
   (`{"nodes": [...], "count": 2}`); keep new list commands to that shape.
 - DB path resolution: `--db` flag → `NODUM_DB` env var →
   `~/.local/share/nodum/nodum.db`.
+
 ### Identity and authority
 
 - **The CLI is human-only, and every command that touches the graph names its
@@ -192,6 +200,7 @@ The invariants that must never be broken, whatever the section:
   in that set — it retires live state — so it is the human tier with `undo`.
   `undo` and `rollback` stay human-only. Both reject spellings require
   `--reason`.
+
 ### Reversal
 
 - **`undo` and `rollback` split on one line: does the event carry a `cycle_id`?**
@@ -203,6 +212,7 @@ The invariants that must never be broken, whatever the section:
 - Errors are always one line on stderr with exit 1, never a traceback. **A
   command that reads a file reads it *through* `_run`**, never beside it; new
   file-reading options follow that rule.
+
 ### Errors and exit codes
 
 - **Widening `_run`'s except list is not how a new error gets a message.** The
@@ -215,6 +225,7 @@ The invariants that must never be broken, whatever the section:
   CLI's whole command tree as JSON. Both short-circuit without touching a
   database. Note `schema-dump` (the CLI adapter's own surface) is a different
   thing from `schema <type>` (one node/edge type's catalog entry).
+
 ### Spaces, search and the smart verbs
 
 - **A space is two independent controls, not a mode** (D1): reads take an
@@ -297,6 +308,7 @@ The invariants that must never be broken, whatever the section:
   `reasoning_effort: "none"`. `llm status` also reports the negotiated state
   (`structured_output`, `thinking`/`thinking_applied`,
   `effective_max_output_tokens`). (The measurements: `docs/decisions.md`.)
+
 ### Rehearsals and batches
 
 - **A `--dry-run` answers "what would happen", and each one is precise about
@@ -393,6 +405,7 @@ below are the parts that do not fit a route table.
   drives every state-changing method of every route in `app.routes` with
   actor-carrying bodies, query strings and headers, then asserts nothing
   written is attributed to anything but the session's human.
+
 ### Origin control, and what it is not
 
 - **A state-changing request must prove it is same-origin**
@@ -412,6 +425,7 @@ below are the parts that do not fit a route table.
   --allow-host)`. This is the DNS-rebinding defence and the only check that
   protects *reads*. Host names are compared without ports (the `make web-dev`
   proxy sends `Host: localhost:5700`).
+
 ### The session gate and the capability hatch
 
 - **The session gate is one rule: every `/api` route `_needs_a_session` claims
@@ -442,6 +456,7 @@ below are the parts that do not fit a route table.
   built from the content hash — serving a stranger's `text/html` back from
   this origin is stored XSS. The bytes stream out of the blob in 1 MiB chunks;
   never read an original into memory to send it.
+
 ### Ingestion and assets
 
 - **`PUT /api/uploads/{token}` ingests: bytes in, reviewable subgraph out.**
@@ -456,6 +471,7 @@ below are the parts that do not fit a route table.
   `name`/`space`/`title`); both or neither is a 400. `path` is read *by the
   server* and `url` is fetched *by the server*, which is exactly why this
   route is inside the session gate and the two token routes are not.
+
 ### Spaces, accounts and the smart routes
 
 - **Spaces reach the human over HTTP as a filter, a target, and a lifecycle.**
@@ -530,6 +546,7 @@ below are the parts that do not fit a route table.
   `merge_nodes`, `retype`, `supersede_edge` or `bulk_relink` here: they are
   the curative tier and they belong to the CLI, and `PATCH /api/nodes/{id}`
   still cannot retype a node.
+
 ### Failures, limits and the shape of a request
 
 - **A wrong verb on a real route is a 405 with an `Allow` header**, not the
@@ -635,6 +652,7 @@ by `nodum mcp serve`. It registers exactly two tiers and nothing else.
   in place — MCP hosts auto-approve on that flag, so it must not lie. Every
   write tool's description says what an `edit` grant changes rather than
   promising `proposed`.
+
 ### Authentication
 
 - **Auth is the agent token in `NODUM_AGENT_TOKEN`** — an `ndm_…` token minted
