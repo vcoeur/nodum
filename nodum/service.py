@@ -3671,6 +3671,169 @@ def record_asset_event(
         own_conn.close()
 
 
+# ── Auth events and the login lockout (finding M5): the other named door ──────
+
+#: The only ops :func:`record_auth_event` will write — the auth half of the
+#: audit trail. An allowlist, not a ``human.*`` prefix test, for the same
+#: reason :data:`ASSET_EVENT_OPS` is one: the HTTP adapter lives outside this
+#: module and needs to record that a login happened, not the ability to write
+#: any event it likes — a helper that took any dotted string could forge a
+#: ``node.create`` or an ``undo``.
+AUTH_EVENT_OPS = (
+    "human.login",
+    "human.login_failed",
+    "human.logout",
+)
+
+
+def record_auth_event(
+    op: str,
+    payload: dict[str, Any],
+    *,
+    path: str | Path | None = None,
+) -> int:
+    """Append one password-login event to the log — the auth half of the audit trail.
+
+    ``op`` must be named in :data:`AUTH_EVENT_OPS`; anything else is refused.
+    Like :func:`record_asset_event`, this is the one exported writer to the
+    log for its domain, and the allowlist is the point: :func:`_emit` stays
+    private, and the HTTP adapter — the only surface a password is ever
+    presented on — records login outcomes through this door and no other.
+
+    The log's ``actor`` is derived from the op, never taken from the caller:
+    a verified principal does not exist on every path here, and a request
+    must never be able to name an identity. ``human.login`` and
+    ``human.logout`` record the verified human (the payload must carry its
+    ``human_id``, and the actor is ``human:<id>``, exactly as the service's
+    own ``human.*`` events are attributed); ``human.login_failed`` carries
+    the **attempted** name — there is no verified principal on a failure, so
+    the actor column records the name the attempt claimed.
+
+    Payloads are metadata only: ids, the attempted name, a reason. Never a
+    password, and never a credential hash.
+
+    These events are **audit-only by construction**: :func:`undo` reverses
+    ``node.*`` / ``edge.*`` events only, so a ``human.*`` entry can be read
+    and listed forever and never replayed into state.
+
+    Args:
+        op: The event op; must be one of :data:`AUTH_EVENT_OPS`.
+        payload: JSON-serialisable metadata describing the login outcome.
+        path: Explicit database path; defaults to ``NODUM_DB`` resolution.
+
+    Returns:
+        The new event's ``seq``.
+
+    Raises:
+        ValueError: If ``op`` is not allowlisted, or the payload does not
+            name the identity the op's actor needs.
+    """
+    if op not in AUTH_EVENT_OPS:
+        raise ValueError(f"op must be one of {AUTH_EVENT_OPS}, got {op!r}")
+    if op == "human.login_failed":
+        name = payload.get("name")
+        if not isinstance(name, str):
+            raise ValueError("a 'human.login_failed' payload must carry the attempted 'name'")
+        actor = name
+    else:
+        human_id = payload.get("human_id")
+        if not isinstance(human_id, str):
+            raise ValueError(f"a {op!r} payload must carry the verified 'human_id'")
+        actor = f"human:{human_id}"
+    own_conn = _connect(path)
+    try:
+        seq = _emit(own_conn, actor, op, payload)
+        own_conn.commit()
+        return seq
+    finally:
+        own_conn.close()
+
+
+#: Failed login attempts within :data:`LOGIN_LOCKOUT_WINDOW_MINUTES` that lock
+#: a login name out of password login (finding M5). Five wrong attempts is a
+#: pattern rather than a typo streak, and the window means the count is about
+#: *recent* failures.
+LOGIN_MAX_FAILED_ATTEMPTS = 5
+
+#: How far back (minutes) a failed login still counts toward the lockout. The
+#: lockout clears once the window slides past enough failures — that is, after
+#: the attempts stop for the window's duration — so this one number is both
+#: the counting window and the cooldown.
+LOGIN_LOCKOUT_WINDOW_MINUTES = 15
+
+
+def login_failure_count(name: str, *, path: str | Path | None = None) -> int:
+    """How many recent failed login attempts ``name`` has absorbed.
+
+    The audit trail **is** the state: the count is read off the
+    ``human.login_failed`` events themselves, so there is no second record of
+    who failed to log in that could disagree with the log, and no migration.
+    The cost is one query per login attempt — a short scan of the events
+    table, fine at this scale.
+
+    Two rules keep the count honest rather than a stale total:
+
+    - **The window.** Only failures inside
+      :data:`LOGIN_LOCKOUT_WINDOW_MINUTES` count, so a burst long past does
+      not keep a name locked forever.
+    - **Reset on success.** Failures before the name's last successful login
+      are ignored — a success proves the human behind the name got through,
+      which is what "consecutive" means. The success event itself is the
+      reset: there is nothing to delete.
+
+    The count is per **attempted name**, existing account or not — the
+    lockout must not be an existence oracle, so it cannot look the name up
+    before deciding.
+
+    Args:
+        name: The login name the attempts claimed.
+        path: Explicit database path.
+
+    Returns:
+        The number of failed attempts within the window since the name last
+        logged in successfully.
+    """
+    conn = _connect(path)
+    try:
+        row = conn.execute(
+            """
+            SELECT COUNT(*) AS n
+            FROM events
+            WHERE op = 'human.login_failed'
+              AND json_extract(payload, '$.name') = ?
+              AND created_at >= datetime('now', ?)
+              AND seq > COALESCE(
+                  (SELECT MAX(e2.seq) FROM events e2
+                   JOIN humans h ON h.id = json_extract(e2.payload, '$.human_id')
+                   WHERE e2.op = 'human.login' AND h.name = ?),
+                  0)
+            """,
+            (name, f"-{LOGIN_LOCKOUT_WINDOW_MINUTES} minutes", name),
+        ).fetchone()
+        return int(row["n"])
+    finally:
+        conn.close()
+
+
+def login_is_locked(name: str, *, path: str | Path | None = None) -> bool:
+    """Whether password login for ``name`` is currently refused by the lockout.
+
+    The lockout applies to the **attempt**, not the account: the same failed
+    attempts against a name that does not exist lock it exactly as they would
+    a real one, so an attacker cannot learn which names exist by watching who
+    gets a 429.
+
+    Args:
+        name: The attempted login name.
+        path: Explicit database path.
+
+    Returns:
+        True when :func:`login_failure_count` has reached
+        :data:`LOGIN_MAX_FAILED_ATTEMPTS` within the window.
+    """
+    return login_failure_count(name, path=path) >= LOGIN_MAX_FAILED_ATTEMPTS
+
+
 def _type_out(row: sqlite3.Row) -> TypeOut | EdgeTypeOut:
     """Build the public type-catalog model from a type-node row."""
     props = json.loads(row["props"])

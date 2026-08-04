@@ -676,7 +676,15 @@ commands on a saved node for exactly this reason.
   live credential) and sets an `HttpOnly; SameSite=Strict` cookie;
   `SessionMiddleware` resolves it to the session's human principal on every
   `/api` request — reads included; only `/healthz`, `/api/login` and the
-  static UI stay open. Every write is attributed to that principal and **no
+  static UI stay open. A failed-login **lockout** throttles brute force (M5):
+  five failed attempts for a name inside fifteen minutes refuse further
+  attempts for that name with a **429** — correct password or not — until the
+  window slides past the failures, applied identically to names that do not
+  exist so the lockout is not an existence oracle. Every attempt is
+  event-logged through `service.record_auth_event` (`human.login` /
+  `human.login_failed` / `human.logout`): the auth half of the audit trail,
+  alongside the `human.create`/`human.password`/`grant.*` rows the service
+  itself writes. Every write is attributed to that principal and **no
   request field, header, or query parameter can set an identity** — a body
   carrying `{"actor": "agent:x"}` is refused, never honoured: the typed
   write routes forbid it outright, and a handler that forwarded one would
@@ -695,12 +703,14 @@ commands on a saved node for exactly this reason.
   `DataError` land on a status rather than a generic 500 — plus
   `sqlite3.OperationalError` → 503, `OverflowError` → 400,
   `urls.PayloadTooLarge` → 413 and `ClientDisconnect` → 499, which only a network
-  surface meets. **Three of this package's exceptions sit in the `OSError`
+  surface meets. **Four of this package's exceptions sit in the `OSError`
   subtree**, because `PermissionError` derives from it: `auth.InvalidCredentials`
   → 401, `auth.PrincipalDisabled` → **403** (reached for real when a capability
-  outlives the account that minted it), and `store.GrantNotPermitted` → **403**
+  outlives the account that minted it), `store.GrantNotPermitted` → **403**
   (reached for real by `POST /api/cycles`, since the runner writes as the
-  *gardener* and `0014` grants it `main` and `meta` alone). Each needs a row of
+  *gardener* and `0014` grants it `main` and `meta` alone), and
+  `auth.LoginLocked` → **429** (M5: a name refused by the failed-login
+  lockout). Each needs a row of
   its own or it inherits `OSError`'s 500 — and each also needs `_failure_message`
   to leave its message alone, because that function rewrites an `OSError` as
   `storage error: <strerror>` so this surface never prints the operator's
@@ -3218,7 +3228,9 @@ Phase-1 decision log.
   with a 30-day sliding expiry; logout, expiry, and `human disable` all kill
   it at the next request (verification-time, no cache). Any local process can
   satisfy every origin check with three curl headers, so it may *attempt* a
-  login — the human's password is the whole defence there, and the `serve`
+  login — the human's password is the heart of the defence there, throttled
+  only by the failed-login lockout (five misses per name per quarter-hour,
+  then a 429 until the window slides past them), and the `serve`
   banner says so. The predicate has exactly two exemptions — `/api/login`,
   which *makes* sessions, and the two capability-URL routes below — and
   `test_the_only_api_routes_outside_the_session_gate_are_login_and_the_

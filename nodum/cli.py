@@ -233,6 +233,12 @@ def _run(func, *args, **kwargs):
         # call it feeds — see that function for why the argument-list position
         # made it a traceback.
         auth.UnknownPrincipal,
+        # A login name refused by the failed-login lockout (M5, 429 over
+        # HTTP). No CLI command verifies a password today, so nothing here can
+        # raise it yet — it is named so the surfaces' exception tables stay in
+        # lockstep and a future command that does verify one inherits the
+        # one-readable-line contract instead of a traceback.
+        auth.LoginLocked,
         AssetNotFound,
         AssetTooLarge,
         AssetSourceChanged,
@@ -1322,8 +1328,10 @@ def serve(
 
     A non-loopback bind is allowed — login is the boundary, not the bind —
     and the session cookie gains ``Secure`` there. Either way, any process
-    that can reach the port may *attempt* a login, so the human's password
-    is the whole defence; the banner says so rather than leaving it implicit.
+    that can reach the port may *attempt* a login — throttled only by the
+    failed-login lockout, five misses per name per quarter-hour then a 429
+    until the window slides past them — so the human's password is still the
+    heart of the defence; the banner says so rather than leaving it implicit.
     """
     import uvicorn
 

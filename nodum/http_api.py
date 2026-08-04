@@ -96,10 +96,18 @@ Everything else is convention, shared rather than re-stated:
   above is about what a *request* can claim, and neither of these takes one.
 
 **What this surface still does not defend against, on purpose.** Login is
-the whole boundary: any process that can open a socket on this port may
-*attempt* one, so the strength of the human's password is the strength of
-the defence. ``nodum serve`` says so at startup rather than leaving it
-implicit.
+the boundary: any process that can open a socket on this port may *attempt*
+one, so the strength of the human's password is the strength of the defence.
+The one throttle is the failed-login lockout (M5): five failed attempts for
+a name inside fifteen minutes refuse further attempts for that name with a
+429 until the window slides past them — a guesser is limited to a handful
+of tries per name per quarter-hour, and a name that does not exist locks
+exactly like a real one, so the lockout cannot be used to probe the file.
+Every attempt, success and failure alike, is written to the event log
+(``human.login`` / ``human.login_failed`` / ``human.logout``) — the auth
+half of the audit trail — so who tried the password is on record even though
+the password itself never is. ``nodum serve`` says so at startup rather than
+leaving it implicit.
 
 Handlers call the service inline rather than through a thread pool: the service
 opens one short-lived connection per call and SQLite has a single writer
@@ -425,7 +433,8 @@ _SAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]")
 #: ``sqlite3`` and ``OSError`` rows are the **base** classes, so every
 #: ``DatabaseError``/``IntegrityError``/``ProgrammingError``/``DataError`` lands
 #: on a status instead of a generic 500 — plus the failures only a network
-#: surface can meet (an oversized body, a client that hung up). A failure
+#: surface can meet (an oversized body, a client that hung up, a login name
+#: under the failed-login lockout). A failure
 #: therefore reads the same on both surfaces and the status is the HTTP
 #: translation of the CLI's exit 1.
 #:
@@ -470,6 +479,14 @@ EXCEPTION_STATUS: dict[type[Exception], int] = {
     # Listed explicitly because InvalidCredentials derives from OSError via
     # PermissionError and would otherwise inherit the 500 below.
     auth.InvalidCredentials: 401,
+    # 429 — the login lockout refused the attempt (M5): a name with five
+    # failed attempts inside fifteen minutes is refused up front, correct
+    # password or not, until the window slides past the failures. The status
+    # is about the *attempt* — too many of them — not the account, so it
+    # applies identically to a name that does not exist (the lockout must not
+    # be an existence oracle). It derives from PermissionError like the 401
+    # above, so it needs this row or it would inherit OSError's 500.
+    auth.LoginLocked: 429,
     # 403 — the grant model refused. Sessions mint human principals only and
     # humans are unfiltered, so this was once unreachable here by construction —
     # `POST /api/cycles` ended that: the runner's writes are the *gardener's*,
@@ -700,9 +717,10 @@ def _failure_message(exc: Exception) -> str:
     terminal and a stranger's over a socket.
 
     That rewrite is scoped by :func:`_is_domain_failure`, and the scoping is the
-    fix for a defect found twice. Three of this package's exceptions are
+    fix for a defect found twice. Four of this package's exceptions are
     ``PermissionError`` subclasses — ``auth.InvalidCredentials``,
-    ``auth.PrincipalDisabled`` and ``store.GrantNotPermitted`` — so all three
+    ``auth.PrincipalDisabled``, ``auth.LoginLocked`` and
+    ``store.GrantNotPermitted`` — so all four
     fell into the ``OSError`` net, and the exemption used to be a literal tuple
     that nothing audited. ``PrincipalDisabled`` joined it when a live pass caught
     ``storage error: PrincipalDisabled`` in a browser; ``GrantNotPermitted`` was
@@ -1794,12 +1812,38 @@ def create_app(
         which is what lets the origin guard and the session gate each do
         their own job. Failure is a 401 with no cookie, indistinguishable
         between "no such name" and "wrong password".
+
+        Every attempt is event-logged: a success writes ``human.login``, a
+        refused credential ``human.login_failed`` (the auth half of the audit
+        trail, via :func:`service.record_auth_event`). The failed-login
+        **lockout** (M5) throttles brute force: a name with five failed
+        attempts inside fifteen minutes is refused up front with a 429,
+        correct password or not, until the window slides past the failures —
+        and the refusal is itself logged as a failed attempt, so a guesser
+        who keeps trying keeps the lockout fresh. The lockout keys on the
+        attempted name, so it applies identically to names that do not exist.
         """
         body = await _json_body(request)
         name = _required_str(body, "name")
         password = _required_str(body, "password")
-        principal = auth.verify_login(name, password, path=db_path)
+        if service.login_is_locked(name, path=db_path):
+            service.record_auth_event(
+                "human.login_failed", {"name": name, "reason": "locked"}, path=db_path
+            )
+            raise auth.LoginLocked(
+                f"login for {name!r} is locked: too many failed attempts, try again later"
+            )
+        try:
+            principal = auth.verify_login(name, password, path=db_path)
+        except auth.InvalidCredentials:
+            service.record_auth_event(
+                "human.login_failed",
+                {"name": name, "reason": "invalid credentials"},
+                path=db_path,
+            )
+            raise
         session_id = auth.create_session(principal.id, path=db_path)
+        service.record_auth_event("human.login", {"human_id": principal.id}, path=db_path)
         response = EnvelopeResponse({"human": principal.id})
         response.set_cookie(
             SESSION_COOKIE,
@@ -1815,11 +1859,16 @@ def create_app(
         """Log out: drop the server-side session row and clear the cookie.
 
         The session gate ran first, so the cookie this resolves was valid a
-        moment ago; deleting is idempotent regardless.
+        moment ago; deleting is idempotent regardless. The verified session's
+        human is who the ``human.logout`` event records — the last entry a
+        session writes, on the auth half of the audit trail.
         """
         session_id = request.cookies.get(SESSION_COOKIE)
         if session_id is not None:
             auth.delete_session(session_id, path=db_path)
+        service.record_auth_event(
+            "human.logout", {"human_id": _session_principal(request).id}, path=db_path
+        )
         response = EnvelopeResponse({"status": "ok"})
         response.delete_cookie(SESSION_COOKIE, path="/")
         return response

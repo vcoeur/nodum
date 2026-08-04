@@ -1350,6 +1350,146 @@ def test_logout_kills_the_session_and_clears_the_cookie(client, fresh_db):
     assert Client(http_api.create_app(), session=session).get("/api/types").status_code == 401
 
 
+def test_a_successful_login_writes_a_human_login_event(fresh_db):
+    """The auth half of the audit trail: a successful login is on record.
+
+    M5: the finding was that a password login wrote nothing at all — success
+    or failure — to the events table the service calls "the audit trail".
+    """
+    service.set_human_password("owner", OWNER_PASSWORD, principal=owner())
+    anonymous = Client(http_api.create_app())
+
+    response = anonymous.post("/api/login", json={"name": "owner", "password": OWNER_PASSWORD})
+
+    assert response.status_code == 200, response.text
+    (login,) = _events("human.login")
+    assert login.actor == OWNER_ACTOR
+    assert login.payload == {"human_id": "owner"}
+
+
+def test_a_refused_login_writes_a_human_login_failed_event(fresh_db):
+    """Wrong credentials stay an indistinguishable 401 and land on the log.
+
+    The event's actor is the *attempted* name: a failed login has no verified
+    principal, and the payload carries no password material.
+    """
+    service.set_human_password("owner", OWNER_PASSWORD, principal=owner())
+    anonymous = Client(http_api.create_app())
+
+    response = anonymous.post("/api/login", json={"name": "owner", "password": "wrong"})
+
+    assert response.status_code == 401
+    (failed,) = _events("human.login_failed")
+    assert failed.actor == "owner"
+    assert failed.payload == {"name": "owner", "reason": "invalid credentials"}
+
+
+def test_five_failed_attempts_lock_a_name_until_the_window_slides(fresh_db):
+    """M5: the lockout refuses the next attempt — correct password or not.
+
+    The refusal is itself recorded, with the lockout as its reason, so the
+    audit trail says what happened. The window is real: once it slides past
+    the failures, the correct password works again.
+    """
+    service.set_human_password("owner", OWNER_PASSWORD, principal=owner())
+    anonymous = Client(http_api.create_app())
+    for _ in range(service.LOGIN_MAX_FAILED_ATTEMPTS):
+        assert (
+            anonymous.post("/api/login", json={"name": "owner", "password": "wrong"}).status_code
+            == 401
+        )
+
+    refused = anonymous.post("/api/login", json={"name": "owner", "password": OWNER_PASSWORD})
+    assert refused.status_code == 429
+    assert refused.json()["error"]["type"] == "LoginLocked"
+    assert _events("human.login_failed")[0].payload["reason"] == "locked"
+    assert service.login_is_locked("owner") is True
+
+    conn = db.connect()
+    try:
+        conn.execute(
+            "UPDATE events SET created_at = datetime('now', '-30 minutes')"
+            " WHERE op = 'human.login_failed'"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    assert service.login_is_locked("owner") is False
+    assert (
+        anonymous.post("/api/login", json={"name": "owner", "password": OWNER_PASSWORD}).status_code
+        == 200
+    )
+
+
+def test_the_lockout_is_not_an_existence_oracle(fresh_db):
+    """A nonexistent name locks exactly like a real one — no way to probe.
+
+    The failed attempts are counted by the name the attempt claimed, so
+    nothing about the answer discloses whether the name exists.
+    """
+    anonymous = Client(http_api.create_app())
+    for _ in range(service.LOGIN_MAX_FAILED_ATTEMPTS):
+        assert (
+            anonymous.post("/api/login", json={"name": "nobody", "password": "wrong"}).status_code
+            == 401
+        )
+
+    refused = anonymous.post("/api/login", json={"name": "nobody", "password": "anything"})
+    assert refused.status_code == 429
+    assert refused.json()["error"]["type"] == "LoginLocked"
+    assert _events("human.login_failed")[0].payload["reason"] == "locked"
+
+
+def test_a_successful_login_resets_the_failure_count(fresh_db):
+    """Consecutive misses are real: a success clears the failures before it.
+
+    Three misses, a correct login, three more misses: only the last three
+    count, so the name is not locked — without the reset it would be six
+    failures and the seventh attempt would be refused.
+    """
+    service.set_human_password("owner", OWNER_PASSWORD, principal=owner())
+    anonymous = Client(http_api.create_app())
+    for _ in range(3):
+        assert (
+            anonymous.post("/api/login", json={"name": "owner", "password": "wrong"}).status_code
+            == 401
+        )
+    assert (
+        anonymous.post("/api/login", json={"name": "owner", "password": OWNER_PASSWORD}).status_code
+        == 200
+    )
+    for _ in range(3):
+        assert (
+            anonymous.post("/api/login", json={"name": "owner", "password": "wrong"}).status_code
+            == 401
+        )
+    assert (
+        anonymous.post("/api/login", json={"name": "owner", "password": OWNER_PASSWORD}).status_code
+        == 200
+    )
+
+
+def test_logout_records_the_human_logout_event_and_removes_the_session(client, fresh_db):
+    """Logout is the last entry a session writes, and the row is really gone."""
+    session = client.session
+
+    response = client.post("/api/logout")
+
+    assert response.status_code == 200
+    (logout,) = _events("human.logout")
+    assert logout.actor == OWNER_ACTOR
+    assert logout.payload == {"human_id": "owner"}
+    conn = db.connect()
+    try:
+        remaining = conn.execute(
+            "SELECT count(*) AS n FROM sessions WHERE id = ?",
+            (hashlib.sha256(session.encode()).hexdigest(),),
+        ).fetchone()["n"]
+    finally:
+        conn.close()
+    assert remaining == 0
+
+
 def test_a_dead_session_cookie_is_cleared_on_the_401(fresh_db):
     """A client offering an expired/deleted cookie should stop offering it."""
     response = Client(http_api.create_app(), session="no-such-session").get("/api/types")

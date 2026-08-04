@@ -609,7 +609,9 @@ sections to the code:
   the rebinding defence. What none of it does is authenticate — any local
   process satisfies every check with three curl headers — so every `/api` route
   sits behind the password-login session gate, and `nodum serve` says in its
-  banner that the password is the whole defence there.
+  banner that the password is the heart of the defence there — a failed-login
+  lockout (five misses per name per quarter-hour, then a 429 until the window
+  slides past them) is the one throttle on it.
 - **A limit that fires after the bytes are on disk is not a limit.**
   `POST /api/assets` was bounded only by `assets.AssetTooLarge` at SQLite's 1 GB
   blob ceiling, checked inside `register_asset` — after Starlette's parser had

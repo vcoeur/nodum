@@ -190,7 +190,7 @@ NODUM_AGENT_TOKEN=ndm_… uv run nodum mcp serve
 # HTTP server for the human: JSON API under /api plus the web UI at /.
 # Every /api route needs a session — log in with a human name and password
 # (`nodum human passwd` sets one). Loopback or LAN, the password is the
-# boundary.
+# boundary; failed logins lock a name out for a while (5 misses in 15 min).
 uv run nodum serve                      # http://127.0.0.1:8600
 uv run nodum serve --host 0.0.0.0       # allowed: login, not the bind, is the boundary
 curl -s localhost:8600/api/nodes/<id> -b nodum_session=…   # identical bytes to `nodum node get <id>`
@@ -468,7 +468,12 @@ cycle quietly drop the vector signal until you re-run the download.
   30-day sliding session row and sets an `HttpOnly; SameSite=Strict` cookie;
   every `/api` route but login needs it — reads included — while `/healthz`
   (liveness and nothing else) and the static UI stay open. Origin control
-  stops browsers; the password stops other processes on the machine. A
+  stops browsers; the password stops other processes on the machine, and a
+  failed-login lockout throttles guessing — five misses for a name inside
+  fifteen minutes refuse further attempts for it with a 429 until the window
+  slides past them, applied identically to names that do not exist. Every
+  attempt is event-logged (`human.login` / `human.login_failed` /
+  `human.logout`), the auth half of the audit trail. A
   non-loopback bind is allowed — login, not the bind, is the boundary — and
   marks the cookie `Secure` there. `nodum human passwd` sets the password;
   logout, expiry, and `human disable` kill the session at the next request.
