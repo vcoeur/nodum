@@ -46,6 +46,8 @@ jobs:
       # here, so this step cannot silently become a no-op.
       - name: Build the UI bundle
         run: make web-install web-build
+      # The smoke script also imports every module of the installed wheel, so a
+      # lazy-import break (mcp 2.0.0) cannot reach a release either.
       - name: Clean-install smoke
         env:
           NODUM_SMOKE_REQUIRE_WEB: "1"

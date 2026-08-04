@@ -24,9 +24,12 @@ test: ## Run pytest (with the `pdf` extra, as CI does)
 coverage: ## Run pytest with line-coverage report
 	uv run pytest --cov=nodum --cov-report=term-missing --cov-report=html
 
-lint: ## Ruff lint + format check
+lint: typecheck ## Ruff lint + format check + pyright typecheck
 	uv run ruff check .
 	uv run ruff format --check .
+
+typecheck: ## Pyright type check over nodum/ (the 25 package modules)
+	uv run pyright nodum
 
 format: ## Ruff auto-fix + format
 	uv run ruff check --fix .
@@ -48,6 +51,14 @@ web-dev: ## Run the Vite dev server (proxies /api and /healthz to nodum serve)
 web-typecheck: ## Type-check the frontend without building
 	cd $(WEB_DIR) && npm run typecheck
 
+# ESLint over web/src — the hook-dependency rule (react-hooks/exhaustive-deps)
+# catches stale-closure bugs (e.g. a useCallback pinning setSearchParams) that
+# the type-checker cannot see. Scope is src/: the eslint flat config is
+# web/eslint.config.js and the parser is Babel (typescript@7 has no JS API for
+# typescript-eslint to use).
+web-lint: ## Lint the frontend (eslint over web/src)
+	cd $(WEB_DIR) && npm run lint
+
 # Vitest over the pure modules in web/src. The run is pinned to a non-UTC
 # timezone (vitest.config.ts) because the zone-less-timestamp bug src/lib/time.ts
 # fixes is invisible in UTC — which is what CI runs in.
@@ -57,5 +68,5 @@ web-test: ## Run the frontend unit tests (vitest)
 web-clean: ## Drop the built bundle (nodum serve falls back to the placeholder)
 	rm -rf $(WEB_BUNDLE)
 
-.PHONY: help install dev-install cli init-db test coverage lint format \
-	web-install web-build web-dev web-typecheck web-test web-clean
+.PHONY: help install dev-install cli init-db test coverage lint typecheck format \
+	web-install web-build web-dev web-typecheck web-lint web-test web-clean

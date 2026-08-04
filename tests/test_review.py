@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 
 import pytest
 from helpers import OWNER_ACTOR, agent, owner, seed_space
@@ -10,6 +12,7 @@ from typer.testing import CliRunner
 
 from nodum import db, service
 from nodum.cli import app
+from nodum.service import InvalidTransition
 
 runner = CliRunner()
 
@@ -371,13 +374,71 @@ def test_edit_agent_reviews_within_its_granted_space(fresh_db):
     assert result.actor == "agent:editor"
 
 
-def test_suggest_agent_cannot_archive_live_state(fresh_db):
-    """Archiving retires live structure, so it needs edit too."""
-    a, _, _, _ = _seed_proposals()
-    with pytest.raises(service.GrantNotPermitted):
-        service.transition(a.id, "archive", principal=agent("researcher"))
+def test_only_a_human_can_archive_live_state(fresh_db):
+    """Archiving retires live structure, so it is the human tier.
+
+    An ``edit`` grant is in-space authority, not the right to retire live
+    state: not even an editor on the node's own space may archive it, while
+    accepting in that same space stays open to it.
+    """
+    a, _, note, edge = _seed_proposals()
+    editor = agent("editor", grants={"meta": "read", "main": "edit"})
+    for who in (editor, agent("researcher")):
+        with pytest.raises(service.GrantNotPermitted, match="only a human"):
+            service.transition(a.id, "archive", principal=who)
     assert service.get_node(a.id, principal=owner()).state == "active"
+    # The half that stays: accepting within a granted space is not the human
+    # tier, so the same editor accepts the queued proposals.
+    accepted = service.accept_proposals([note.id, edge.id], principal=editor)
+    assert set(accepted.transitioned) == {note.id, edge.id}
+    # And a human archives.
     assert service.transition(a.id, "archive", principal=owner()).state == "archived"
+
+
+def test_an_edit_grant_accepts_but_never_reaches_archive_or_undo(fresh_db):
+    """The D1 line, end to end: retiring or resurrecting live state is human.
+
+    An agent holding ``edit`` on a space can accept its proposals — that is
+    Q13's grant design, unchanged — but cannot reach ``archive`` or ``undo``
+    by any service spelling, and a content edit cannot retire a live mention
+    either. Each refusal leaves the state it would have moved untouched.
+    """
+    _, _, note, edge = _seed_proposals()
+    editor = agent("editor", grants={"meta": "read", "main": "edit"})
+    accepted = service.accept_proposals([note.id, edge.id], principal=editor)
+    assert set(accepted.transitioned) == {note.id, edge.id}
+
+    # No archive route: the direct transition, the space archive, and — the
+    # back path — a content edit that drops a wikilink to a live mention.
+    with pytest.raises(service.GrantNotPermitted, match="only a human"):
+        service.transition(note.id, "archive", principal=editor)
+    with pytest.raises(service.GrantNotPermitted, match="only a human"):
+        service.archive_space("main", principal=editor)
+    mention_target = service.create_node(type="concept", title="Mentioned", principal=owner())
+    source = service.create_node(
+        type="note", title="Source", content="sees [[Mentioned]]", principal=owner()
+    )
+    service.update_node(source.id, content="dropped the link", principal=editor)
+    assert [
+        e.dst_id
+        for e in service.list_edges(
+            node_id=source.id, type="mentions", state="active", principal=owner()
+        )
+    ] == [mention_target.id]  # still live — an agent's edit left it for a human
+
+    # No undo route either.
+    undo_seq = service.list_events(limit=1, principal=owner())[0].seq
+    with pytest.raises(service.GrantNotPermitted, match="only a human"):
+        service.undo(undo_seq, principal=editor)
+
+    # The HTTP surface offers no agent identity at all (session human only),
+    # so the service refusals above are the whole agent reach; a human then
+    # retires what the agent could not.
+    service.update_node(source.id, content="dropped the link", principal=owner())
+    assert (
+        service.list_edges(node_id=source.id, type="mentions", state="active", principal=owner())
+        == []
+    )
 
 
 def test_agent_cannot_undo(fresh_db):
@@ -413,6 +474,129 @@ def test_batch_collects_failures_without_aborting(fresh_db):
     assert {f.id for f in result.failed} == {active.id, "missing-id"}
     assert any("cannot accept" in f.error for f in result.failed)
     assert any("no node, edge, or version" in f.error for f in result.failed)
+
+
+# ── Two concurrent reviews of one proposal (finding M8) ──────────────────────
+
+
+def test_two_concurrent_accepts_of_one_proposal_have_one_winner(fresh_db):
+    """The read-check-write is one atomic fact: exactly one accept lands.
+
+    Without the immediate write lock, both callers read the proposal
+    ``proposed``, both pass the state check, and both write — two
+    ``node.update`` events and two applied versions for one proposal. With it,
+    the loser's ``BEGIN IMMEDIATE`` blocks until the winner commits, and the
+    state check then reads the committed ``applied`` row and refuses. The
+    loser surfaces as a batch ``failed`` entry, which is how a batch review
+    reports a per-item refusal.
+    """
+    _, _, note, _ = _seed_proposals()
+    version = service.update_node(note.id, content="raced", principal=agent("racer"))
+    results: list[object] = []
+    barrier = threading.Barrier(2)
+
+    def race() -> None:
+        barrier.wait()
+        try:
+            results.append(service.accept_proposals([str(version.id)], principal=owner()))
+        except BaseException as failure:
+            results.append(failure)
+
+    threads = [threading.Thread(target=race) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+    assert not any(thread.is_alive() for thread in threads), "a racer never returned"
+
+    outcomes = [r for r in results if isinstance(r, service.BatchTransitionOut)]
+    assert len(outcomes) == 2, f"both racers must answer as batches, got {results!r}"
+    assert sorted(len(r.transitioned) for r in outcomes) == [0, 1]
+    loser = next(r for r in outcomes if not r.transitioned)
+    assert [f.id for f in loser.failed] == [str(version.id)]
+    assert "cannot accept" in loser.failed[0].error
+    # One accept landed: the node was rewritten once and the update proposal
+    # left the queue (the seeded node and edge proposals are not the racer's).
+    assert service.get_node(note.id, principal=owner()).content == "raced"
+    assert [
+        item.version.id for item in service.list_proposals(kind="update", principal=owner())
+    ] == []
+
+
+def test_two_concurrent_single_accepts_of_one_proposal_have_one_winner(fresh_db):
+    """The single-review spelling: the loser *raises* rather than batch-fails.
+
+    The same race through :func:`service.transition` — the loser's state check
+    runs against the winner's committed ``applied`` row and raises
+    :class:`InvalidTransition`.
+    """
+    _, _, note, _ = _seed_proposals()
+    version = service.update_node(note.id, content="raced", principal=agent("racer"))
+    results: list[object] = []
+    barrier = threading.Barrier(2)
+
+    def race() -> None:
+        barrier.wait()
+        try:
+            results.append(service.transition(str(version.id), "accept", principal=owner()))
+        except BaseException as failure:
+            results.append(failure)
+
+    threads = [threading.Thread(target=race) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+    assert not any(thread.is_alive() for thread in threads), "a racer never returned"
+
+    wins = [r for r in results if isinstance(r, service.VersionOut)]
+    refusals = [r for r in results if isinstance(r, InvalidTransition)]
+    assert len(wins) == 1, f"exactly one accept must win, got {results!r}"
+    assert len(refusals) == 1, f"the loser must raise, got {results!r}"
+    assert wins[0].state == "applied"
+
+
+def test_an_accept_racing_a_concurrent_winner_is_refused(fresh_db):
+    """The guard's mechanism, proven deterministically: stale read, refused write.
+
+    A concurrent winner's accept lands between the loser's pre-read and its
+    write — the interleaving the threads tests cannot force. The loser's
+    ``BEGIN IMMEDIATE`` (first statement, before any read) means it sees the
+    committed ``applied`` row and the state check refuses; without it, the
+    loser's read had already passed ``proposed`` and its unconditional UPDATE
+    would have gone through on top of the winner's accept.
+    """
+    _, _, note, _ = _seed_proposals()
+    version = service.update_node(note.id, content="raced", principal=agent("racer"))
+    holder = db.connect()
+    outcome: list[object] = []
+
+    def race() -> None:
+        try:
+            outcome.append(service.accept_proposals([str(version.id)], principal=owner()))
+        except BaseException as failure:
+            outcome.append(failure)
+
+    try:
+        holder.execute("BEGIN IMMEDIATE")
+        thread = threading.Thread(target=race)
+        thread.start()
+        # The loser has passed its read (WAL reads do not block on the write
+        # lock) and is waiting on the write lock for its write. The winner's
+        # accept, written straight to the row the loser is about to update.
+        time.sleep(0.3)
+        holder.execute("UPDATE versions SET state = 'applied' WHERE id = ?", (version.id,))
+        holder.commit()
+    finally:
+        holder.close()
+    thread.join(timeout=30)
+    assert not thread.is_alive(), "the racing accept never returned"
+
+    result = outcome[0]
+    assert isinstance(result, service.BatchTransitionOut), f"got {result!r}"
+    assert result.transitioned == []
+    assert [f.id for f in result.failed] == [str(version.id)]
+    assert "cannot accept" in result.failed[0].error
 
 
 # ── Batch by filter ───────────────────────────────────────────────────────────

@@ -55,7 +55,7 @@ import { TruncationNotice } from "./TruncationNotice";
 import { classifyFailure } from "./errors";
 import { applyFilters, parseFilters, spaceDimming } from "./filters";
 import type { GraphFilters } from "./filters";
-import { distinctValues, incidentEdges, toElements } from "./graphElements";
+import { distinctValues, incidentEdges, nodeListItems, toElements } from "./graphElements";
 import { shapeForType } from "./graphStyle";
 import { useSubgraph, usePath } from "./useGraphData";
 import { offeredTypes, useTypeCatalog } from "./useTypeCatalog";
@@ -265,10 +265,19 @@ export default function GraphView() {
     if (selectedId && data && !presentNodeIds.has(selectedId)) setSelectedId(null);
   }, [selectedId, data, presentNodeIds, setSelectedId]);
 
-  const selectFromList = useCallback((nodeId: string) => {
-    setSelectedId(nodeId);
-    canvasRef.current?.center(nodeId);
-  }, []);
+  // `setSelectedId` is itself a callback over `setSearchParams`, so a stable
+  // `selectFromList` would pin the mount-time query string: a selection from
+  // the path or detail panel would silently revert every filter change since
+  // mount, while a canvas click (which re-reads the callback every render via
+  // onSelectRef) would not. The callback changes identity only when the
+  // underlying setter does — the canvas already tolerates that.
+  const selectFromList = useCallback(
+    (nodeId: string) => {
+      setSelectedId(nodeId);
+      canvasRef.current?.center(nodeId);
+    },
+    [setSelectedId],
+  );
 
   /* --- No root yet -------------------------------------------------------- */
 
@@ -496,6 +505,31 @@ export default function GraphView() {
               dimmedEdgeIds={dimming.edges}
               onSelect={setSelectedId}
             />
+          ) : null}
+
+          {/* A focusable twin for every canvas node (review 08-frontend,
+              MAJOR 3): the canvas paints into a <canvas> with no text
+              alternative, so without this a keyboard or screen-reader user
+              could not reach any node data. Hidden with the .nd-sr-only
+              recipe; focusing the list reveals it over the canvas. Tab moves
+              between nodes, Enter selects — the same state a canvas click
+              sets, via selectFromList (safe since M33: it re-reads the
+              current query string instead of the mount-time one). */}
+          {data ? (
+            <ul className="nd-sr-only nd-graph__node-list" aria-label="Graph nodes">
+              {nodeListItems(data.nodes).map(({ id, label }) => (
+                <li key={id}>
+                  <button
+                    type="button"
+                    className="nd-graph__node-button"
+                    aria-label={label}
+                    onClick={() => selectFromList(id)}
+                  >
+                    {label}
+                  </button>
+                </li>
+              ))}
+            </ul>
           ) : null}
 
           {!data && subgraph.status === "loading" ? (

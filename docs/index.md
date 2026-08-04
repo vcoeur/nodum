@@ -22,8 +22,10 @@ nodum node create --type concept --title "Graph Theory" --as owner
 
 The whole graph — nodes, edges, versions, the event log, derived indexes, and
 even binary assets — lives in a single SQLite database. There is no server to
-run, no daemon, no external index to keep in sync, and no API key. Copying the
-file copies the knowledge base.
+run, no daemon, no external index to keep in sync, and no API key. The
+database runs in WAL mode, so copying the file alone can strand committed rows
+in its `-wal` companion — the snapshot is `nodum backup <dest>`, a consistent
+single-file copy (`VACUUM INTO`) that folds the WAL in.
 
 ## What makes it agent-native
 
@@ -33,10 +35,12 @@ privileges enforced at the service layer**, not by convention:
 - A human write lands `active` immediately.
 - An agent write lands `proposed` when its grant on the space is `suggest`, and
   `active` when its grant is `edit`.
-- Anything that retires or rewrites live state (`accept`, `reject`, `archive`,
-  every `review` subcommand, and the curative tier — `merge-nodes`, `retype`,
-  `supersede-edge`, `bulk-relink`, `consolidate`) is limited to a human — or,
-  in-space, to an agent holding `edit`. `undo` and `rollback` are human-only.
+- Retiring or resurrecting live state is the human's alone: `archive`, `undo`,
+  and `rollback` are limited to a human — an `edit` grant is in-space
+  authority, not the right to retire it. Accepting is a different act:
+  `accept`/`reject`, every `review` subcommand, and the curative tier
+  (`merge-nodes`, `retype`, `supersede-edge`, `bulk-relink`, `consolidate`)
+  are open to a human or, in-space, to an agent holding `edit`.
 
 An agent edit does not overwrite: it stages a `proposed` version recording
 *which fields it named*, so accepting it applies only those fields to the node

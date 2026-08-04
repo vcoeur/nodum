@@ -75,8 +75,9 @@ export function AcceptanceSection({ entries }: { entries: AcceptanceEntry[] }) {
         </table>
       </div>
       <p className="nd-meta nd-jn-section__note">
-        Acceptance is read from row state over the curation window (90 days), never from
-        the event log. Deltas between cycles are the diff of the convention nodes' own
+        Acceptance is read from row state over the curation window (90 days); the event log
+        classifies which rows were proposals, so direct writes never count toward a
+        proposer's rate. Deltas between cycles are the diff of the convention nodes' own
         versions — this view shows the rates tonight's cycle computed.
       </p>
     </section>

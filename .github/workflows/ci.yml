@@ -24,6 +24,12 @@ jobs:
         run: uv run --locked ruff check .
       - name: Ruff format check
         run: uv run --locked ruff format --check .
+      # Pyright resolves optional-extras imports (pypdf/pypdfium2 in the `pdf`
+      # extra) the same way the test job installs them, so a fresh CI venv sees
+      # what a developer's pdf-enabled venv sees — an import the lint leg cannot
+      # resolve is a real gap, not an absent-extra artifact.
+      - name: Pyright typecheck
+        run: uv run --locked --extra pdf pyright nodum
 
   test:
     name: Tests (py${{ matrix.python-version }})
@@ -49,6 +55,29 @@ jobs:
       - name: Run test suite
         run: uv run --locked --extra pdf pytest -q
 
+  # The "highest resolution" gate. A plain `uv sync` keeps any lock that
+  # already satisfies pyproject.toml, so this leg must `--upgrade`: it resolves
+  # every dep at the newest version its bound allows and runs the suite there.
+  # An unbounded major that breaks an import — the mcp 2.0.0 removal of
+  # mcp.server.fastmcp class — fails loudly here instead of on a fresh install.
+  # It is allowed to break: that is its job. The `pdf` extra mirrors the
+  # `--locked` leg so both cover the same surface.
+  test-highest:
+    name: Tests (highest resolution)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0   # hatch-vcs needs full history + tags to derive the version
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+      - name: Resolve dependencies at their highest allowed versions
+        run: uv sync --upgrade --extra pdf
+      - name: Run test suite
+        run: uv run --extra pdf pytest -q
+
   web:
     name: Frontend build
     runs-on: ubuntu-latest
@@ -67,6 +96,10 @@ jobs:
       # src/lib/time.ts fixes is invisible in UTC.
       - name: Frontend unit tests
         run: make web-test
+      # ESLint over web/src (react-hooks/exhaustive-deps at error), so a
+      # stale hook closure fails here instead of in review.
+      - name: Frontend lint
+        run: make web-lint
       # `web-build` runs `tsc --noEmit` before Vite, so this step is the type
       # check as well as the build — the frontend cannot rot silently.
       - name: Build the UI bundle

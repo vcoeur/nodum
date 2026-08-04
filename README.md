@@ -190,7 +190,7 @@ NODUM_AGENT_TOKEN=ndm_… uv run nodum mcp serve
 # HTTP server for the human: JSON API under /api plus the web UI at /.
 # Every /api route needs a session — log in with a human name and password
 # (`nodum human passwd` sets one). Loopback or LAN, the password is the
-# boundary.
+# boundary; failed logins lock a name out for a while (5 misses in 15 min).
 uv run nodum serve                      # http://127.0.0.1:8600
 uv run nodum serve --host 0.0.0.0       # allowed: login, not the bind, is the boundary
 curl -s localhost:8600/api/nodes/<id> -b nodum_session=…   # identical bytes to `nodum node get <id>`
@@ -256,16 +256,18 @@ cycle quietly drop the vector signal until you re-run the download.
   brings the pending `mentions` edges its wikilinks materialized to `active` —
   those the acceptor could have reviewed directly, that is; a mention into a
   space they hold nothing on stays queued for someone who can.
-- **Live state is the human's, structurally.** Review (`accept`, `reject`,
-  `archive`) and the curative tier (`merge-nodes`, `retype`, `supersede-edge`,
+- **Live state is the human's, structurally.** Review (`accept`, `reject`) and
+  the curative tier (`merge-nodes`, `retype`, `supersede-edge`,
   `bulk-relink`, `consolidate`)
   require a human principal or an agent holding `edit` on the item's space;
-  `undo` and `rollback` are human-only. Either way is refused with
-  `GrantNotPermitted`.
-  Reviewing turns proposed structure into live structure, archiving retires it,
-  and `undo` writes an event's prior payload back verbatim — `state = 'active'`
-  included — so leaving any of them open would hand an agent the live state it
-  may not write directly. `rollback` does exactly that for a whole cycle at
+  `archive` — which retires live state — and `undo` and `rollback` — which
+  write an event's prior payload back verbatim, `state = 'active'` included —
+  are human-only. Either way is refused with `GrantNotPermitted`.
+  Accepting turns proposed structure into live structure, which an `edit`
+  grant is in-space authority over; archiving retires live state and `undo`
+  resurrects it, and neither is in-space authority — leaving either open would
+  hand an agent the live state it may not write directly. `rollback` does
+  exactly what `undo` does for a whole cycle at
   once, which is why it cannot be gated more weakly than `undo`. None of them is
   an MCP tool either: agents may only *grow* the graph.
 - **Grants, not policies.** Each agent holds one grant per space at `read`,
@@ -405,7 +407,8 @@ cycle quietly drop the vector signal until you re-run the download.
 - **MCP server.** `nodum mcp serve` runs a stdio MCP server (the official
   Python SDK's FastMCP). The agent authenticates with its token in
   `NODUM_AGENT_TOKEN` (minted by `nodum agent create`, shown once, stored
-  hashed) and is verified at startup; every write is confined to its grants.
+  hashed) and is verified at launch and re-verified on every tool call; every
+  write is confined to its then-current grants.
   The registry is the design §8.1 read tier (`get_node`, `get_children`,
   `search`, `traverse`, `list_types`, `get_schema`, `find_path`, `history`,
   `diff`, `get_asset`, `get_download_url`) and additive tier (`create_node`,
@@ -467,7 +470,12 @@ cycle quietly drop the vector signal until you re-run the download.
   30-day sliding session row and sets an `HttpOnly; SameSite=Strict` cookie;
   every `/api` route but login needs it — reads included — while `/healthz`
   (liveness and nothing else) and the static UI stay open. Origin control
-  stops browsers; the password stops other processes on the machine. A
+  stops browsers; the password stops other processes on the machine, and a
+  failed-login lockout throttles guessing — five misses for a name inside
+  fifteen minutes refuse further attempts for it with a 429 until the window
+  slides past them, applied identically to names that do not exist. Every
+  attempt is event-logged (`human.login` / `human.login_failed` /
+  `human.logout`), the auth half of the audit trail. A
   non-loopback bind is allowed — login, not the bind, is the boundary — and
   marks the cookie `Secure` there. `nodum human passwd` sets the password;
   logout, expiry, and `human disable` kill the session at the next request.
@@ -503,10 +511,11 @@ cycle quietly drop the vector signal until you re-run the download.
   says exactly what each one checks: the text test is a window at each end of the
   file, and the displaced-PDF scan admits any non-text bytes carrying a versioned
   `%PDF-` header in the head window — so a zip whose first entry is a PDF gets
-  in, and gets an honest "no text came out" for its trouble. There is
+  in, and gets an honest "no text came out" for its trouble.   There is
   no delete route, so what lands stays until it is managed out of band — which is
   why an upload that will be refused for a reason needing no bytes (an
-  unresolvable target space) is refused before anything is stored.
+  unresolvable target space, or a write grant the ingesting principal does not
+  hold) is refused before anything is stored.
 - **Ingesting over HTTP.** `POST /api/ingest` takes exactly one of `path` and
   `url` (both or neither is a 400 rather than a precedence rule nobody
   remembers). Note what it hands the session's human: `path` is read *by the
@@ -689,8 +698,9 @@ cycle quietly drop the vector signal until you re-run the download.
   than passed on, and `nodum llm status` shows whether your endpoint actually
   accepts it, since `ollama` takes only `none`.
 
-See [docs/architecture.md](docs/architecture.md) for the module map and
-[AGENTS.md](AGENTS.md) for contributor/agent workflow rules.
+See [docs/architecture.md](docs/architecture.md) for the module map,
+[docs/decisions.md](docs/decisions.md) for the decision log, and
+[AGENTS.md](AGENTS.md) for the contributor/agent contract and workflow rules.
 
 ## Development
 

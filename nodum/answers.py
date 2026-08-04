@@ -195,6 +195,7 @@ from nodum import agent, service
 from nodum import search as search_module
 from nodum.models import NodeOut, SearchHit
 from nodum.principal import Principal
+from nodum.vocab import NodeState
 
 __all__ = [
     "AskOut",
@@ -258,7 +259,7 @@ MIN_CONTEXT_CHARS = 240
 #: a human who can read every one of these rows — but a human archives a note to
 #: take it out of circulation, and "circulation" has to include the one path
 #: that puts its text on somebody else's machine.
-SENDABLE_STATES = ("active",)
+SENDABLE_STATES: tuple[NodeState, ...] = ("active",)
 
 #: Terms a query rewrite may contribute. One call, bounded output, bounded
 #: query — a rewrite that could return fifty terms would be a rewrite that can
@@ -315,8 +316,9 @@ REWRITE_OUTPUT_TOKENS = 2048
 #:
 #: 2 048 is therefore 3.9x the worst sample, and it is chosen at that distance
 #: rather than closer for two reasons that are not margin-for-its-own-sake.
-#: It is the number ``AGENTS.md`` records as the measured cure for ``qwen3:8b``
-#: answering with an empty body, so nothing below it may be shipped to the local
+#: It is the number ``docs/decisions.md`` records as the measured cure for
+#: ``qwen3:8b`` answering with an empty body, so nothing below it may be
+#: shipped to the local
 #: half. And on ollama's 4 096-token window it is **exactly what /ask already
 #: gets**: :data:`~nodum.llm.OUTPUT_RESERVATION_FRACTION` clamps the blanket
 #: 4 096 to 2 048 there, so this can regress no local install at all.
@@ -567,7 +569,7 @@ class Offered(BaseModel):
     node_id: str
     title: str | None
     space_id: str | None
-    state: str | None = None
+    state: NodeState | None = None
     text: str
     excerpt: str = ""
     truncated: bool = False
@@ -588,7 +590,7 @@ class Citation(BaseModel):
     node_id: str
     title: str | None
     space_id: str | None
-    state: str | None = None
+    state: NodeState | None = None
     truncated: bool = False
 
 
@@ -1539,6 +1541,11 @@ def ask(
         _offered_hit(index, hit, principal=principal, path=path)
         for index, hit in enumerate(result.hits, start=1)
     ]
+    # The empty case is honest, and unreachable by accident since finding M20:
+    # the vector arm carries a similarity floor (search._VECTOR_MIN_SIMILARITY),
+    # so a query whose term exists in no document returns no hits even when an
+    # embedding provider is present — the model is never offered the nearest
+    # unrelated chunks to cite as fact.
     if not retrieved:
         return AskOut(
             question=question,
@@ -1970,7 +1977,7 @@ def natural_search(
     query: str,
     *,
     k: int = 10,
-    state: str | None = "active",
+    state: NodeState | None = "active",
     type: str | None = None,
     created_by: str | None = None,
     created_after: str | None = None,
@@ -1978,6 +1985,7 @@ def natural_search(
     include_meta: bool = False,
     space: str | None = None,
     expand: bool = False,
+    as_of: str | None = None,
     principal: Principal,
     path: str | Path | None = None,
     run: agent.AgentRun | None = None,
@@ -2022,6 +2030,8 @@ def natural_search(
         include_meta: Include meta-space nodes in an unnarrowed search.
         space: Narrow to one space.
         expand: Append one-hop neighbours of the fused hits.
+        as_of: Follow, for the ``expand`` half, the edges true at an instant
+            (D2), exactly as :func:`nodum.search.search` means it.
         principal: Who is asking.
         path: Explicit database path.
         run: An explicit runtime, overriding the per-request default.
@@ -2071,6 +2081,7 @@ def natural_search(
         include_meta=include_meta,
         space=space,
         expand=expand,
+        as_of=as_of,
         principal=principal,
         path=path,
     )

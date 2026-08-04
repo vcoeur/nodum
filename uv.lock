@@ -786,6 +786,15 @@ wheels = [
 ]
 
 [[package]]
+name = "nodeenv"
+version = "1.10.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/24/bf/d1bda4f6168e0b2e9e5958945e01910052158313224ada5ce1fb2e1113b8/nodeenv-1.10.0.tar.gz", hash = "sha256:996c191ad80897d076bdfba80a41994c2b47c68e224c542b48feba42ba00f8bb", size = 55611, upload-time = "2025-12-20T14:08:54.006Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/88/b2/d0896bdcdc8d28a7fc5717c305f1a861c26e18c05047949fb371034d98bd/nodeenv-1.10.0-py2.py3-none-any.whl", hash = "sha256:5bb13e3eed2923615535339b3c620e76779af4cb4c6a90deccc9e36b274d3827", size = 23438, upload-time = "2025-12-20T14:08:52.782Z" },
+]
+
+[[package]]
 name = "nodum"
 source = { editable = "." }
 dependencies = [
@@ -816,6 +825,7 @@ pdf = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "pyright" },
     { name = "pytest" },
     { name = "pytest-cov" },
     { name = "ruff" },
@@ -824,23 +834,24 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "argon2-cffi", specifier = ">=23" },
-    { name = "fastembed", marker = "extra == 'embeddings'", specifier = ">=0.8.0" },
-    { name = "faster-whisper", marker = "extra == 'audio'", specifier = ">=1" },
-    { name = "mcp", specifier = ">=1.28.1" },
+    { name = "fastembed", marker = "extra == 'embeddings'", specifier = ">=0.8.0,<1" },
+    { name = "faster-whisper", marker = "extra == 'audio'", specifier = ">=1,<2" },
+    { name = "mcp", specifier = ">=1.28.1,<2" },
     { name = "pillow", specifier = ">=11" },
-    { name = "pydantic", specifier = ">=2.9" },
-    { name = "pypdf", marker = "extra == 'pdf'", specifier = ">=5" },
+    { name = "pydantic", specifier = ">=2.9,<3" },
+    { name = "pypdf", marker = "extra == 'pdf'", specifier = ">=5,<7" },
     { name = "pypdfium2", marker = "extra == 'pdf'", specifier = ">=4" },
-    { name = "pytesseract", marker = "extra == 'ocr'", specifier = ">=0.3" },
-    { name = "sqlite-vec", specifier = ">=0.1.9" },
-    { name = "starlette", specifier = ">=0.48" },
-    { name = "typer", specifier = ">=0.16" },
-    { name = "uvicorn", specifier = ">=0.34" },
+    { name = "pytesseract", marker = "extra == 'ocr'", specifier = ">=0.3,<1" },
+    { name = "sqlite-vec", specifier = ">=0.1.9,<1" },
+    { name = "starlette", specifier = ">=0.48,<2" },
+    { name = "typer", specifier = ">=0.16,<1" },
+    { name = "uvicorn", specifier = ">=0.34,<1" },
 ]
 provides-extras = ["audio", "embeddings", "ocr", "pdf"]
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "pyright", specifier = ">=1.1.411" },
     { name = "pytest", specifier = ">=9.0.2" },
     { name = "pytest-cov", specifier = ">=6.0" },
     { name = "ruff", specifier = ">=0.15.2" },
@@ -1243,6 +1254,19 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/f7/67/53c61d366222550220b42a9212131407f49d3dbcf050178c620bf80fa899/pypdfium2-5.12.1-py3-none-win32.whl", hash = "sha256:e5358d2ce4ebc5c899aab1df9ca5d215357244e9168aa443225d3c1e649c7eac", size = 3725466, upload-time = "2026-07-17T10:01:17.773Z" },
     { url = "https://files.pythonhosted.org/packages/a9/c3/08b62718faf2f6b6aa49207626e3113ff3ec1b3cd076c0ef8fd852f0e57c/pypdfium2-5.12.1-py3-none-win_amd64.whl", hash = "sha256:9609be73a6701a68f29dffe0335f7a2e4b3ba581542ed65d35d49f761a4600ca", size = 3859845, upload-time = "2026-07-17T10:01:19.417Z" },
     { url = "https://files.pythonhosted.org/packages/6c/d5/ad551e55790134c8bc87ea16e0866a3721def0620fbfa19112c8ad4a25a6/pypdfium2-5.12.1-py3-none-win_arm64.whl", hash = "sha256:afc0b7e0c975a429abc75875209ce17b66d749f6ac5cbe8ba72470e83901e304", size = 3674605, upload-time = "2026-07-17T10:01:21.008Z" },
+]
+
+[[package]]
+name = "pyright"
+version = "1.1.411"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "nodeenv" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/7e/ab/265f7dc69d28113ebba19092e57b075f41543b2ed048429c5f56e2b88eac/pyright-1.1.411.tar.gz", hash = "sha256:d885a0551f2e763b089a02702174e7f4ba77548cddabc972ab86d1f7f1b0f998", size = 4112861, upload-time = "2026-06-25T02:14:06.37Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/0a/49/385be530a6a5b78d1cbcd5c2e38debc8959a2fc6bdb716f4e581002979fc/pyright-1.1.411-py3-none-any.whl", hash = "sha256:dc7c72a8e2700c55baa127554040e067041ea53ccfd50bf96308cc4291c7d5d9", size = 6181526, upload-time = "2026-06-25T02:14:04.691Z" },
 ]
 
 [[package]]

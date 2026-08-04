@@ -96,25 +96,46 @@ Everything else is convention, shared rather than re-stated:
   above is about what a *request* can claim, and neither of these takes one.
 
 **What this surface still does not defend against, on purpose.** Login is
-the whole boundary: any process that can open a socket on this port may
-*attempt* one, so the strength of the human's password is the strength of
-the defence. ``nodum serve`` says so at startup rather than leaving it
-implicit.
+the boundary: any process that can open a socket on this port may *attempt*
+one, so the strength of the human's password is the strength of the defence.
+The one throttle is the failed-login lockout (M5): five failed attempts for
+a name inside fifteen minutes refuse further attempts for that name with a
+429 until the window slides past them — a guesser is limited to a handful
+of tries per name per quarter-hour, and a name that does not exist locks
+exactly like a real one, so the lockout cannot be used to probe the file.
+Every attempt, success and failure alike, is written to the event log
+(``human.login`` / ``human.login_failed`` / ``human.logout``) — the auth
+half of the audit trail — so who tried the password is on record even though
+the password itself never is. ``nodum serve`` says so at startup rather than
+leaving it implicit.
 
-Handlers call the service inline rather than through a thread pool: the service
-opens one short-lived connection per call and SQLite has a single writer
-anyway, so a local single-user server gains nothing from concurrency here and
-stays much easier to reason about.
+Most handlers call the service inline: the service opens one short-lived
+connection per call and SQLite has a single writer anyway, so a local
+single-user server gains nothing from concurrency for a read of a row or a
+single-row write, and the inline calls stay much easier to reason about. The
+exceptions are the work a single request can make the loop wait on for a
+perceptible time — one 20.8 MB ingest was measured holding it for 20.8 s and
+680 MB of RSS — and every one of them runs through
+:func:`~starlette.concurrency.run_in_threadpool`:
 
-**One handler is the exception, and it is the one that is not a read of a
-row.** ``POST /api/cycles`` runs a whole consolidation cycle, which is every
-job over every node in scope — measured at 3.75 s on 450 nodes with no
-embedding provider, and minutes on a real graph with one. Inline, that is not a
-slow request, it is a **stopped server**: the event loop is single-threaded, so
-``/healthz``, the SPA and every other tab stall for exactly as long as the
-cycle runs. :mod:`nodum.scheduler` already made this argument for the nightly
-half and answered it with :func:`asyncio.to_thread`; the on-demand half is the
-one a human is actually watching, so it runs through
+* the **read-heavy routes** — ``GET /api/search`` (a 400-term query held the
+  loop for 126 ms), ``POST /api/ask`` and ``POST /api/summarize``, each a model
+  call on top of graph work;
+* every **blocking write** — ``POST /api/assets`` and
+  ``PUT /api/uploads/{token}`` (registration streams up to a 1 GB blob),
+  ``POST /api/ingest`` (a fetch, then register/extract/describe),
+  ``GET /api/assets/{id}/rendition/{profile}`` (Pillow decode or pypdfium2
+  rasterisation on a miss), and the original download's spool; and
+* ``POST /api/cycles``, which runs a whole consolidation cycle — every job
+  over every node in scope — measured at 3.75 s on 450 nodes with no embedding
+  provider, and minutes on a real graph with one.
+
+Inline, any of those is not a slow request, it is a **stopped server**: the
+event loop is single-threaded, so ``/healthz``, the SPA and every other tab
+stall for exactly as long as the work runs. :mod:`nodum.scheduler` already made
+this argument for the nightly half and answered it with
+:func:`asyncio.to_thread`; the on-demand half is the one a human is actually
+watching, so it runs through
 :func:`~starlette.concurrency.run_in_threadpool` for the same reason. The
 identity boundary is untouched: what goes to the thread is :func:`_write`
 itself, so the principal is still bound in the one place this module binds one.
@@ -156,7 +177,7 @@ from nodum.assets import (
     UnsupportedRendition,
 )
 from nodum.envelope import envelope, list_envelope, render_json
-from nodum.models import CycleDetailOut
+from nodum.models import CycleDetailOut, EdgeCreateIn, NodeCreateIn, NodeUpdateIn
 from nodum.principal import Principal
 from nodum.service import (
     AccountExists,
@@ -170,6 +191,7 @@ from nodum.service import (
     UndoNotPossible,
 )
 from nodum.urls import PayloadTooLarge
+from nodum.vocab import GRANT_LEVEL_NAMES, PROPOSAL_KINDS, STATES, NodeState
 
 #: The session cookie's name: an opaque id for a server-side ``sessions`` row
 #: (30-day sliding expiry), set by ``POST /api/login`` as ``HttpOnly;
@@ -424,7 +446,8 @@ _SAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]")
 #: ``sqlite3`` and ``OSError`` rows are the **base** classes, so every
 #: ``DatabaseError``/``IntegrityError``/``ProgrammingError``/``DataError`` lands
 #: on a status instead of a generic 500 — plus the failures only a network
-#: surface can meet (an oversized body, a client that hung up). A failure
+#: surface can meet (an oversized body, a client that hung up, a login name
+#: under the failed-login lockout). A failure
 #: therefore reads the same on both surfaces and the status is the HTTP
 #: translation of the CLI's exit 1.
 #:
@@ -469,6 +492,14 @@ EXCEPTION_STATUS: dict[type[Exception], int] = {
     # Listed explicitly because InvalidCredentials derives from OSError via
     # PermissionError and would otherwise inherit the 500 below.
     auth.InvalidCredentials: 401,
+    # 429 — the login lockout refused the attempt (M5): a name with five
+    # failed attempts inside fifteen minutes is refused up front, correct
+    # password or not, until the window slides past the failures. The status
+    # is about the *attempt* — too many of them — not the account, so it
+    # applies identically to a name that does not exist (the lockout must not
+    # be an existence oracle). It derives from PermissionError like the 401
+    # above, so it needs this row or it would inherit OSError's 500.
+    auth.LoginLocked: 429,
     # 403 — the grant model refused. Sessions mint human principals only and
     # humans are unfiltered, so this was once unreachable here by construction —
     # `POST /api/cycles` ended that: the runner's writes are the *gardener's*,
@@ -699,9 +730,10 @@ def _failure_message(exc: Exception) -> str:
     terminal and a stranger's over a socket.
 
     That rewrite is scoped by :func:`_is_domain_failure`, and the scoping is the
-    fix for a defect found twice. Three of this package's exceptions are
+    fix for a defect found twice. Four of this package's exceptions are
     ``PermissionError`` subclasses — ``auth.InvalidCredentials``,
-    ``auth.PrincipalDisabled`` and ``store.GrantNotPermitted`` — so all three
+    ``auth.PrincipalDisabled``, ``auth.LoginLocked`` and
+    ``store.GrantNotPermitted`` — so all four
     fell into the ``OSError`` net, and the exemption used to be a literal tuple
     that nothing audited. ``PrincipalDisabled`` joined it when a live pass caught
     ``storage error: PrincipalDisabled`` in a browser; ``GrantNotPermitted`` was
@@ -1374,22 +1406,76 @@ def _list_param(params: QueryParams, *names: str) -> list[str] | None:
     return values or None
 
 
-def _state_param(params: QueryParams, name: str = "state") -> str | None:
-    """Read a search state filter, mapping the CLI's ``any`` to "no filter"."""
+def _state_param(params: QueryParams, name: str = "state") -> NodeState | None:
+    """Read a search state filter for a service call.
+
+    Absent → the service default ``"active"``; ``"any"`` → ``None`` (the
+    service's "no filter", meaning every state); any other value must be one
+    of :data:`~nodum.vocab.STATES` or the request is refused with the same
+    sentence the service would have refused it with. An absent parameter must
+    not become ``None`` — that would silently widen a default search to every
+    state, where the CLI's ``--state`` and the MCP server's ``filters.state``
+    both default to ``active``.
+    """
     state = params.get(name)
-    return None if state in (None, "any") else state
+    if state is None:
+        return "active"
+    if state == "any":
+        return None
+    if state not in STATES:
+        raise ValueError(f"state must be one of {STATES}, got {state!r}")
+    return state
+
+
+def _state_filter(params: QueryParams, name: str = "state") -> NodeState | None:
+    """Read a raw state query parameter for a listing route.
+
+    The listing routes pass the parameter through unchanged (absent → the
+    service's "no filter"), so ``"any"`` is refused here exactly as the
+    service refuses it — a listing has no pseudo-value for every state, and
+    the refusal is the service's own sentence.
+    """
+    state = params.get(name)
+    if state is None:
+        return None
+    if state not in STATES:
+        raise ValueError(f"state must be one of {STATES}, got {state!r}")
+    return state
+
+
+def _edge_states_param(params: QueryParams) -> list[NodeState] | None:
+    """Repeatable edge-state filters, each narrowed against :data:`STATES`.
+
+    The sentence is the service's own, so a refused value renders identically
+    whether the route or the service raises it.
+    """
+    edge_states = _list_param(params, "edge_state", "edge_states")
+    if edge_states is None:
+        return None
+    narrowed: list[NodeState] = []
+    for edge_state in edge_states:
+        if edge_state not in STATES:
+            raise ValueError(f"state must be one of {STATES}, got {edge_state!r}")
+        narrowed.append(edge_state)
+    return narrowed
 
 
 def _proposal_filters(source: Any) -> dict[str, Any]:
     """Pick the review-queue filter keys out of a body or a query string.
 
     An allowlist by construction: keys outside :data:`PROPOSAL_FILTERS` are
-    never read, so nothing a caller invents reaches a service argument.
+    never read, so nothing a caller invents reaches a service argument. The
+    ``kind`` value is narrowed against :data:`PROPOSAL_KINDS` here, with the
+    service's own sentence, so a refused value renders identically whether
+    this helper or the service raises it.
     """
     filters = {key: source.get(key) for key in PROPOSAL_FILTERS}
     # `agent` is the review UI's word for the proposing author.
     if filters["created_by"] is None:
         filters["created_by"] = source.get("agent")
+    kind = filters["kind"]
+    if kind is not None and kind not in PROPOSAL_KINDS:
+        raise ValueError(f"kind must be 'node', 'edge', or 'update', got {kind!r}")
     return filters
 
 
@@ -1413,6 +1499,7 @@ def _search_filters(params: QueryParams) -> dict[str, Any]:
         "include_meta": _bool_param(params, "include_meta"),
         "space": params.get("space"),
         "expand": _bool_param(params, "expand"),
+        "as_of": params.get("as_of"),
     }
 
 
@@ -1533,30 +1620,29 @@ def _refuse_unsupported_upload(
 # ── Serving original bytes ────────────────────────────────────────────────────
 
 
-async def _blob_chunks(conn: sqlite3.Connection, blob: sqlite3.Blob) -> AsyncIterator[bytes]:
-    """Yield an open blob's bytes in bounded chunks, closing both handles after.
+async def _spooled_chunks(spool: Path) -> AsyncIterator[bytes]:
+    """Yield a spooled original's bytes in bounded chunks, unlinking the file after.
 
     The point of the generator: an original may be a gigabyte, and reading it
     into a ``bytes`` to hand to a ``Response`` would put all of it in the
-    server's memory to send a copy the client reads at its own pace. The
-    connection outlives the handler that opened it — a blob handle is only
-    valid while its connection is — so this owns the close, including the one
-    that matters, when a client hangs up mid-transfer and Starlette closes the
-    generator instead of draining it.
+    server's memory to send a copy the client reads at its own pace. The file
+    outlives the handler that spooled it — :func:`_original_response` wrote it
+    and closed its handle before returning — so this owns the deletion,
+    including the one that matters, when a client hangs up mid-transfer and
+    Starlette closes the generator instead of draining it.
 
     Args:
-        conn: The connection the blob was opened on; closed on the way out.
-        blob: An open, readable blob handle positioned at its start.
+        spool: The temporary file holding the original's bytes.
 
     Yields:
         Successive chunks of at most :data:`UPLOAD_CHUNK_BYTES`.
     """
     try:
-        with blob:
-            while chunk := blob.read(UPLOAD_CHUNK_BYTES):
+        with spool.open("rb") as handle:
+            while chunk := handle.read(UPLOAD_CHUNK_BYTES):
                 yield chunk
     finally:
-        conn.close()
+        spool.unlink(missing_ok=True)
 
 
 def _original_response(asset_hash: str, path: str | Path | None) -> Response:
@@ -1569,6 +1655,16 @@ def _original_response(asset_hash: str, path: str | Path | None) -> Response:
     is the whole game on a file host). The filename is the content address run
     through :data:`_SAFE_FILENAME_RE` — the one name attached to these bytes
     that no stranger chose.
+
+    The bytes are **spooled to a temporary file before anything streams**: the
+    blob copy is one tight loop on a short-lived connection, and the
+    client-paced response then serves a plain file with no database handle
+    open. Streaming the blob directly would hold its open read transaction —
+    and with it the WAL snapshot, since ``conn.in_transaction`` stays False —
+    for the whole transfer, which a stalled client could pin for the life of
+    the connection. The spool is disk, not memory, and the connection is
+    closed before the response is returned (:func:`_spooled_chunks` owns the
+    file's deletion, client disconnect included).
 
     ``no-store`` keeps a shared proxy from retaining a private document that
     was reachable for one request under a URL that is now spent.
@@ -1587,16 +1683,32 @@ def _original_response(asset_hash: str, path: str | Path | None) -> Response:
     # only caller reached this through `urls.consume`, which just read and
     # updated a row in this database, so the schema is present by construction
     # and a migration pass on a download would be a second writer for nothing.
-    conn = db.connect(path)
+    # A NamedTemporaryFile rather than the TemporaryDirectory the upload
+    # routes use: this file must outlive the handler that created it, so its
+    # deletion is the streaming generator's job, not a ``with`` block's.
+    # (SIM115: the close below is a real ``with spool:``, just not on this line —
+    # a plain context manager would delete the file at block exit.)
+    spool = tempfile.NamedTemporaryFile(prefix="nodum-download-", suffix=".tmp", delete=False)  # noqa: SIM115
+    spool_path = Path(spool.name)
     try:
-        blob = assets.open_original(conn, asset_hash)
-        size = len(blob)
+        with spool:
+            conn = db.connect(path)
+            try:
+                blob = assets.open_original(conn, asset_hash)
+                with blob:
+                    while chunk := blob.read(UPLOAD_CHUNK_BYTES):
+                        spool.write(chunk)
+                size = spool.tell()
+            finally:
+                conn.close()
     except Exception:
-        conn.close()
+        # The spool outlives this call, so a failure before the response
+        # exists must not leave it behind.
+        spool_path.unlink(missing_ok=True)
         raise
     filename = f"nodum-{_SAFE_FILENAME_RE.sub('-', asset_hash)[:64]}"
     return StreamingResponse(
-        _blob_chunks(conn, blob),
+        _spooled_chunks(spool_path),
         media_type=DOWNLOAD_CONTENT_TYPE,
         headers={
             "content-length": str(size),
@@ -1608,6 +1720,25 @@ def _original_response(asset_hash: str, path: str | Path | None) -> Response:
 
 
 # ── Routing ───────────────────────────────────────────────────────────────────
+
+
+class _NoHeadRoute(Route):
+    """A :class:`~starlette.routing.Route` that never answers HEAD.
+
+    Starlette adds ``HEAD`` to every route whose methods include ``GET`` —
+    even when ``methods=["GET"]`` was passed explicitly — and answers a HEAD
+    request by running the handler with the body suppressed. For an ordinary
+    read that is a feature. For the download route it is not: the handler
+    **spends the single-use token**, so a HEAD probe would burn the
+    capability and the real GET behind it would come back refused (M6).
+    Removing HEAD from the method set sends the request on to the ``/api``
+    catch-all, which answers 405 with ``Allow: GET``.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self.methods:
+            self.methods = {method for method in self.methods if method != "HEAD"}
 
 
 def _partial_match_methods(routes: Iterable[Route], scope: Scope) -> set[str]:
@@ -1720,12 +1851,38 @@ def create_app(
         which is what lets the origin guard and the session gate each do
         their own job. Failure is a 401 with no cookie, indistinguishable
         between "no such name" and "wrong password".
+
+        Every attempt is event-logged: a success writes ``human.login``, a
+        refused credential ``human.login_failed`` (the auth half of the audit
+        trail, via :func:`service.record_auth_event`). The failed-login
+        **lockout** (M5) throttles brute force: a name with five failed
+        attempts inside fifteen minutes is refused up front with a 429,
+        correct password or not, until the window slides past the failures —
+        and the refusal is itself logged as a failed attempt, so a guesser
+        who keeps trying keeps the lockout fresh. The lockout keys on the
+        attempted name, so it applies identically to names that do not exist.
         """
         body = await _json_body(request)
         name = _required_str(body, "name")
         password = _required_str(body, "password")
-        principal = auth.verify_login(name, password, path=db_path)
+        if service.login_is_locked(name, path=db_path):
+            service.record_auth_event(
+                "human.login_failed", {"name": name, "reason": "locked"}, path=db_path
+            )
+            raise auth.LoginLocked(
+                f"login for {name!r} is locked: too many failed attempts, try again later"
+            )
+        try:
+            principal = auth.verify_login(name, password, path=db_path)
+        except auth.InvalidCredentials:
+            service.record_auth_event(
+                "human.login_failed",
+                {"name": name, "reason": "invalid credentials"},
+                path=db_path,
+            )
+            raise
         session_id = auth.create_session(principal.id, path=db_path)
+        service.record_auth_event("human.login", {"human_id": principal.id}, path=db_path)
         response = EnvelopeResponse({"human": principal.id})
         response.set_cookie(
             SESSION_COOKIE,
@@ -1741,11 +1898,16 @@ def create_app(
         """Log out: drop the server-side session row and clear the cookie.
 
         The session gate ran first, so the cookie this resolves was valid a
-        moment ago; deleting is idempotent regardless.
+        moment ago; deleting is idempotent regardless. The verified session's
+        human is who the ``human.logout`` event records — the last entry a
+        session writes, on the auth half of the audit trail.
         """
         session_id = request.cookies.get(SESSION_COOKIE)
         if session_id is not None:
             auth.delete_session(session_id, path=db_path)
+        service.record_auth_event(
+            "human.logout", {"human_id": _session_principal(request).id}, path=db_path
+        )
         response = EnvelopeResponse({"status": "ok"})
         response.delete_cookie(SESSION_COOKIE, path="/")
         return response
@@ -1778,7 +1940,7 @@ def create_app(
         params = request.query_params
         nodes = service.list_nodes(
             type=params.get("type"),
-            state=params.get("state"),
+            state=_state_filter(params),
             parent_id=_param(params, "parent_id", "parent"),
             space=params.get("space"),
             include_meta=_bool_param(params, "include_meta"),
@@ -1797,15 +1959,16 @@ def create_app(
         field can say otherwise.
         """
         body = await _json_body(request)
+        payload = NodeCreateIn.model_validate(body)
         node = _write(
             request,
             service.create_node,
-            type=_required(body, "type"),
-            title=body.get("title"),
-            content=body.get("content") or "",
-            parent_id=body.get("parent_id"),
-            props=body.get("props"),
-            space=_optional_str(body, "space"),
+            type=payload.type,
+            title=payload.title,
+            content=payload.content,
+            parent_id=payload.parent_id,
+            props=payload.props,
+            space=payload.space,
             path=db_path,
         )
         return EnvelopeResponse(envelope(node))
@@ -1825,9 +1988,24 @@ def create_app(
         return EnvelopeResponse(envelope(result))
 
     async def update_node(request: Request) -> Response:
-        """Update the named fields of a node, and only those."""
+        """Update the named fields of a node, and only those.
+
+        Absent and null are distinct: pydantic records which fields were
+        actually sent, and the handler reads that. ``title: null`` clears the
+        title (a documented web affordance); ``content: null`` and
+        ``props: null`` are refused, because those fields are non-nullable in
+        the read models and a null would corrupt read-back.
+        """
         body = await _json_body(request)
-        fields = {name: body[name] for name in PATCHABLE_FIELDS if name in body}
+        payload = NodeUpdateIn.model_validate(body)
+        fields: dict[str, Any] = {}
+        for name in ("title", "content", "props"):
+            if name not in payload.model_fields_set:
+                continue
+            value = getattr(payload, name)
+            if value is None and name != "title":
+                raise ValueError(f"{name} cannot be null")
+            fields[name] = value
         if not fields:
             raise ValueError(
                 f"nothing to update: send one of {', '.join(repr(f) for f in PATCHABLE_FIELDS)}"
@@ -1861,12 +2039,13 @@ def create_app(
     # ── Edges ─────────────────────────────────────────────────────────────
 
     async def list_edges(request: Request) -> Response:
-        """List edges, optionally filtered by incident node, type, or state."""
+        """List edges, optionally filtered by incident node, type, state, or validity window."""
         params = request.query_params
         edges = service.list_edges(
             node_id=_param(params, "node_id", "node"),
             type=params.get("type"),
-            state=params.get("state"),
+            state=_state_filter(params),
+            as_of=params.get("as_of"),
             principal=_session_principal(request),
             limit=_int_param(params, "limit", default=500),
             path=db_path,
@@ -1876,14 +2055,15 @@ def create_app(
     async def create_edge(request: Request) -> Response:
         """Create a typed, directed edge between two nodes."""
         body = await _json_body(request)
+        payload = EdgeCreateIn.model_validate(body)
         edge = _write(
             request,
             service.create_edge,
-            str(_required(body, "src_id")),
-            str(_required(body, "dst_id")),
-            str(_required(body, "type")),
-            props=body.get("props"),
-            confidence=body.get("confidence"),
+            payload.src_id,
+            payload.dst_id,
+            payload.type,
+            props=payload.props,
+            confidence=payload.confidence,
             path=db_path,
         )
         return EnvelopeResponse(envelope(edge))
@@ -2022,10 +2202,11 @@ def create_app(
             _required_param(params, "root", "root_id"),
             depth=_int_param(params, "depth", default=2),
             edge_types=_list_param(params, "edge_type", "edge_types"),
-            edge_states=_list_param(params, "edge_state", "edge_states"),
+            edge_states=_edge_states_param(params),
             min_confidence=_float_param(params, "min_confidence"),
             created_by=params.get("created_by"),
             node_types=_list_param(params, "node_type", "node_types"),
+            as_of=params.get("as_of"),
             principal=_session_principal(request),
             limit=_int_param(params, "limit", default=200),
             path=db_path,
@@ -2107,7 +2288,9 @@ def create_app(
         The upload is spooled to a temp file and handed to the existing
         ``assets.register_asset``, so this path inherits its sha256 dedup, its
         blob-limit check, and its hash/copy cross-check rather than growing a
-        second registration path with weaker guarantees.
+        second registration path with weaker guarantees. The registration
+        streams the whole file and runs off the event loop; the admission
+        checks below read only the file's header and stay inline.
 
         Three checks happen before the bytes are offered to the store, and each
         one exists because the version without it was exploitable:
@@ -2150,7 +2333,13 @@ def create_app(
                     pixel_limit=assets.MAX_IMAGE_PIXELS,
                     cli_hint=False,
                 )
-                asset = assets.register_asset(spooled, name=original_name, path=db_path)
+                # register_asset streams the whole file (up to the 1 GB blob
+                # limit) into the store, hashing and copying it — the M22
+                # measured case — so it runs off the event loop. The refusal
+                # above reads only the header and stays inline.
+                asset = await run_in_threadpool(
+                    assets.register_asset, spooled, name=original_name, path=db_path
+                )
         return EnvelopeResponse(envelope(asset))
 
     async def list_assets(request: Request) -> Response:
@@ -2174,8 +2363,14 @@ def create_app(
 
         Renditions only (design §5.7): ``thumb`` and ``preview`` are the whole
         vocabulary, and originals are never served — here or anywhere else.
+
+        A cache miss renders the image — Pillow decode, or pypdfium2
+        rasterisation for a PDF page, which is seconds on a big document — so
+        the render runs off the event loop (M22). The stored-bytes read that
+        follows is a bounded WebP and stays inline.
         """
-        rendition = assets.get_rendition(
+        rendition = await run_in_threadpool(
+            assets.get_rendition,
             request.path_params["id"],
             profile=request.path_params["profile"],
             principal=_session_principal(request),
@@ -2204,13 +2399,25 @@ def create_app(
         is itself a loopback service. Both are properties of a human-only
         surface behind a password, and they are exactly why this route is
         inside the session gate while the two token routes below are not.
+
+        The ingest itself — fetch, register, extract, describe — is the M22
+        measured case (20.8 s for one 20.8 MB PDF, holding the loop the whole
+        time) and runs off the event loop through
+        :func:`~starlette.concurrency.run_in_threadpool`; :func:`_write` is
+        what goes to the thread, so the principal is still bound in the one
+        place this module binds one.
         """
         body = await _json_body(request)
         by_url = body.get("url") is not None
         if by_url == (body.get("path") is not None):
             raise ValueError("ingest takes exactly one of 'path' and 'url'")
         operation = ingest.ingest_url if by_url else ingest.ingest_file
-        result = _write(
+        # An ingest fetches (url branch), registers up to a gigabyte, extracts
+        # and describes — the M22 measured case — so, like POST /api/cycles,
+        # what goes to the thread is _write itself and the principal is still
+        # bound in the one place this module binds one.
+        result = await run_in_threadpool(
+            _write,
             request,
             operation,
             _required_str(body, "url" if by_url else "path"),
@@ -2292,12 +2499,18 @@ def create_app(
         upload route. Distinguishing them would tell whoever is guessing which
         of the four they just achieved.
 
-        The bytes are streamed out of the blob rather than read whole, and
-        served as an opaque attachment nothing will render: see
-        :data:`DOWNLOAD_CONTENT_TYPE`.
+        The bytes are spooled to a temp file and streamed back rather than
+        held in memory or pinned to the database for the client-paced
+        transfer, and served as an opaque attachment nothing will render: see
+        :data:`DOWNLOAD_CONTENT_TYPE`. The spool copies the whole original (up
+        to the 1 GB blob limit) and runs off the event loop (M22); only the
+        streaming back is client-paced.
         """
         row = urls.consume(request.path_params["token"], kind="download", path=db_path)
-        return _original_response(row["asset_hash"], db_path)
+        # _original_response copies the whole original (up to the 1 GB blob
+        # limit) into a spool file before anything streams — the same big-read
+        # class as the M22 routes — so the copy runs off the event loop.
+        return await run_in_threadpool(_original_response, row["asset_hash"], db_path)
 
     async def upload_original(request: Request) -> Response:
         """Spend an upload token and store the raw request body as an asset.
@@ -2357,6 +2570,10 @@ def create_app(
         window too. An ingest nobody is listening for is a graph change with
         no party able to read its outcome — and the retry, which must re-mint
         anyway, would find its document already described.
+
+        The ingest itself registers up to a gigabyte and describes it — the M22
+        measured class — so it runs off the event loop through
+        :func:`~starlette.concurrency.run_in_threadpool`.
         """
         row = urls.consume(request.path_params["token"], kind="upload", path=db_path)
         max_bytes = row["max_bytes"]
@@ -2386,7 +2603,9 @@ def create_app(
             )
             if await request.is_disconnected():
                 raise ClientDisconnect()
-            result = ingest.ingest_upload(row, spooled, path=db_path)
+            # ingest_upload registers up to a gigabyte and describes it — the
+            # M22 measured class — so it runs off the event loop.
+            result = await run_in_threadpool(ingest.ingest_upload, row, spooled, path=db_path)
         return EnvelopeResponse(envelope(result))
 
     # ── Event log, undo, export ───────────────────────────────────────────
@@ -2452,13 +2671,14 @@ def create_app(
         things ``GET /api/cycles/{id}`` returns, so a caller that just ran one
         needs no second request to render it.
 
-        **It runs off the event loop.** Every other handler here calls the
-        service inline, which is right for a read of a row; a cycle is every job
-        over every node in scope, and inline it would hold the single-threaded
-        loop for its whole length — 3.75 s measured on 450 nodes without
-        embeddings, minutes with them — so ``/healthz`` and the SPA would freeze
-        with it. What is handed to the thread is :func:`_write`, not the runner,
-        so the principal is still bound where this module binds every principal.
+        **It runs off the event loop.** It joins the other read-heavy and
+        blocking handlers on the thread pool for the same reason: a cycle is
+        every job over every node in scope, and inline it would hold the
+        single-threaded loop for its whole length — 3.75 s measured on 450
+        nodes without embeddings, minutes with them — so ``/healthz`` and the
+        SPA would freeze with it. What is handed to the thread is
+        :func:`_write`, not the runner, so the principal is still bound where
+        this module binds every principal.
         """
         body = await _json_body(request)
         result = await run_in_threadpool(
@@ -2647,7 +2867,8 @@ def create_app(
         return EnvelopeResponse({"agent_id": agent_id, "token": token})
 
     async def disable_agent(request: Request) -> Response:
-        """Disable an agent — its token dies immediately."""
+        """Disable an agent — its token dies immediately on HTTP; a running MCP
+        server stops at its next call."""
         agent_id = request.path_params["id"]
         _write(request, service.disable_agent, agent_id, path=db_path)
         return EnvelopeResponse({"ok": True, "agent_id": agent_id, "disabled": True})
@@ -2670,12 +2891,15 @@ def create_app(
     async def set_grant(request: Request) -> Response:
         """Grant (or re-level) an agent's access to a space."""
         body = await _json_body(request)
+        level = _required_str(body, "level")
+        if level not in GRANT_LEVEL_NAMES:
+            raise ValueError(f"level must be one of {GRANT_LEVEL_NAMES}, got {level!r}")
         granted = _write(
             request,
             service.grant,
             _required_str(body, "agent"),
             _required_str(body, "space"),
-            _required_str(body, "level"),
+            level,
             path=db_path,
         )
         return EnvelopeResponse(envelope(granted))
@@ -2825,7 +3049,11 @@ def create_app(
         # check and the body ceiling apply to them exactly as to the rest.
         # Their paths come from `nodum.urls.TOKEN_PATHS`, which is also what
         # the minted URLs are built from, so the two cannot drift apart.
-        Route(f"{urls.TOKEN_PATHS['download']}/{{token}}", download_original),
+        # `methods=["GET"]` alone does not exclude HEAD — Starlette adds HEAD
+        # to any route whose methods include GET — and running the download
+        # handler on a HEAD request would spend the single-use token (M6), so
+        # this route is the one `_NoHeadRoute` exists for.
+        _NoHeadRoute(f"{urls.TOKEN_PATHS['download']}/{{token}}", download_original),
         Route(f"{urls.TOKEN_PATHS['upload']}/{{token}}", upload_original, methods=["PUT"]),
         Route("/api/events", list_events),
         Route("/api/undo", undo, methods=["POST"]),

@@ -228,6 +228,9 @@ const INERT_ATTRIBUTES = ALLOWED_ATTR.filter((name) => !URL_ATTRIBUTES.includes(
  * the same URL to the browser as the unpadded forms, so a prefix test has to
  * run against the stripped value or it tests the wrong string.
  */
+// The control-character range is the point: it is exactly what a browser
+// strips from a URL attribute before acting on it, so the check must match it.
+// eslint-disable-next-line no-control-regex
 const ATTRIBUTE_WHITESPACE = /[\u0000-\u0020\u00a0\u1680\u180e\u2000-\u2029\u205f\u3000]/g;
 
 /** Absolute links get `rel`; site-relative and in-page ones are not external. */

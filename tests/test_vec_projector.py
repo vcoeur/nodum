@@ -176,3 +176,31 @@ def test_unavailable_provider_is_a_noop_not_a_crash(fresh_db):
     assert run.applied == 1
     chunks, _ = _vec_state(fresh_db)
     assert len(chunks) == 1
+
+
+def test_projector_status_surfaces_foreign_model_chunks(fresh_db, fake_embedder):
+    """Finding M13's status half: `available: true` stays, and `detail` names
+    the chunks search will not read until a `projector rebuild vec`.
+
+    Before this the mixed state reported `available: true, pending_events: 0`
+    with no hint that a model swap had left the store half-invisible.
+    """
+    service.create_node(type="note", title="T", content="xylem", principal=owner())
+    projectors.run_projectors(names=["vec"])
+
+    status = {s.name: s for s in projectors.projector_status()}["vec"]
+    assert status.available is True
+    assert status.detail is None
+
+    provider = embeddings.get_provider()
+    conn = db.connect(fresh_db)
+    try:
+        conn.execute("UPDATE chunks SET model_id = ?", (f"{provider.model_id}-other",))
+        conn.commit()
+    finally:
+        conn.close()
+
+    status = {s.name: s for s in projectors.projector_status()}["vec"]
+    assert status.available is True  # still usable: the note never gates a run
+    assert "1 chunk from a different model" in status.detail
+    assert "projector rebuild vec" in status.detail

@@ -8,9 +8,12 @@ API key), served from nodum's own model cache — see the cache rule below.
 
 Design D6: node text is embedded in fixed-window chunks (512 tokens, ~15%
 overlap — approximated as whitespace-separated words, see :func:`chunk_text`),
-every chunk records the producing ``model_id``, and a model change is a full
-``projector rebuild vec`` (the projector is derived state, so replaying the
-event log re-embeds everything with the new model).
+every chunk records the producing ``model_id``, and search reads only the
+chunks carrying the *active* provider's id (finding M13: a different model's
+chunks live in a different vector space, so they are excluded from the KNN
+join). A model change is therefore a full ``projector rebuild vec`` — the
+projector is derived state, so replaying the event log re-embeds everything
+with the new model.
 
 **The model cache is nodum's, and it lives beside the database.**
 :data:`DEFAULT_CACHE_PATH` is ``~/.local/share/nodum/models``, overridable with
@@ -106,7 +109,14 @@ class EmbeddingProvider(Protocol):
         ...
 
     def embed(self, texts: list[str]) -> list[list[float]]:
-        """Embed a batch of texts, one vector per input, in input order."""
+        """Embed a batch of texts, one vector per input, in input order.
+
+        Args:
+            texts: The texts to embed.
+
+        Returns:
+            One vector per input text, in input order.
+        """
         ...
 
 
@@ -126,7 +136,7 @@ class FastembedProvider:
     def __init__(
         self, model_name: str = DEFAULT_MODEL, *, cache_dir: str | Path | None = None
     ) -> None:
-        from fastembed import TextEmbedding
+        from fastembed import TextEmbedding  # pyright: ignore[reportMissingImports] degraded-mode
 
         self._cache_dir = Path(cache_dir).expanduser() if cache_dir is not None else cache_path()
         self._model = TextEmbedding(model_name=model_name, cache_dir=str(self._cache_dir))
@@ -142,14 +152,23 @@ class FastembedProvider:
 
     @property
     def model_id(self) -> str:
+        """The model name, recorded per chunk for provenance (D6)."""
         return self._model_id
 
     @property
     def dimensions(self) -> int:
+        """Vector dimensionality, probed from the loaded model at construction."""
         return self._dimensions
 
     def embed(self, texts: list[str]) -> list[list[float]]:
-        """Embed a batch of texts with the local ONNX model."""
+        """Embed a batch of texts with the local ONNX model.
+
+        Args:
+            texts: The texts to embed.
+
+        Returns:
+            One vector per input text, in input order.
+        """
         return [vector.tolist() for vector in self._model.embed(texts)]
 
 
@@ -310,7 +329,7 @@ def reset_provider() -> None:
 def _resolve_default() -> tuple[EmbeddingProvider | None, str | None]:
     """Build the default fastembed provider, or explain why it cannot run."""
     try:
-        import fastembed  # noqa: F401
+        import fastembed  # noqa: F401  # pyright: ignore[reportMissingImports] degraded-mode
     except ImportError:
         return None, "fastembed is not installed (install the 'embeddings' extra)"
     model_name = os.environ.get(ENV_MODEL_VAR, DEFAULT_MODEL)
@@ -394,7 +413,7 @@ def _silence_fastembed() -> Iterator[None]:
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         try:
-            from loguru import logger
+            from loguru import logger  # pyright: ignore[reportMissingImports] degraded-mode
 
             logger.disable("fastembed")
             try:

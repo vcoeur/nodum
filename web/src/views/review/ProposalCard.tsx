@@ -233,7 +233,7 @@ function AnnotationLine({ annotation, kind }: { annotation: JsonObject; kind: st
     parts.push(`signals: ${signals.join(", ")}`);
   }
   return (
-    <p className="nd-meta nd-rv-card__annotation" title="Judged by the curation job from row state, over the last 90 days">
+    <p className="nd-meta nd-rv-card__annotation" title="Judged by the curation job over its proposals (row state for outcomes, the event log to classify them), last 90 days">
       {parts.join(" · ")}
     </p>
   );

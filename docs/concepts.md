@@ -69,16 +69,20 @@ levels: `read` ⊂ `suggest` ⊂ `edit`.
 | | Human | Agent |
 |---|---|---|
 | A write lands as | `active` | `proposed` on a `suggest` grant, `active` on `edit` |
-| Can accept / reject / archive | yes | only with `edit` on the item's space |
+| Can accept / reject | yes | only with `edit` on the item's space |
+| Can archive | yes | no — the human tier |
 | Can run curative operations | yes | only with `edit` on every space touched |
 | Can undo | yes | no |
 | Can roll a cycle back | yes | no |
 | Administers accounts and grants | yes | no |
 
-The human-only set is not delegable, whoever filed the proposal. `undo` most of
-all, since restoring an event's payload can write `state = 'active'` back — and
-`rollback` above even that, since it does exactly the same thing for a whole
-cycle at once, across spaces.
+The human-only set is not delegable, whoever filed the proposal. `archive`
+retires live state — an `edit` grant is in-space authority, not the right to
+retire it. `undo` most of all: restoring an event's payload can write
+`state = 'active'` back — and `rollback` above even that, since it does
+exactly the same thing for a whole cycle at once, across spaces. Accepting
+within a granted space is a different act from any of those, and stays open to
+`edit`.
 
 A grant is a **ceiling, not a mandate**. An agent holding `edit` may still file
 a write it is unsure of as `proposed` and put it in front of a human; what it
@@ -220,8 +224,9 @@ involved in them, and a cycle runs fine on a machine that has none:
 - **Link maintenance** — the two prunings a machine can be right about (an exact
   duplicate edge, an edge incident to an archived node), then `relates_to`
   inference from embedding proximity and shared neighbours.
-- **Queue curation** — each proposer's acceptance rate over the last ninety
-  days, from row state only, recorded as a convention note in the
+- **Queue curation** — each proposer's acceptance rate over its proposals in
+  the last ninety days — row state measures the outcomes, the event log
+  classifies which rows were proposals — recorded as a convention note in the
   `conventions` space and one annotation per queue item. It never accepts and
   never rejects.
 - **Housekeeping** — the fractional-position check, and embedding catch-up by

@@ -586,3 +586,34 @@ def test_undo_create_of_a_type_node_something_is_typed_by_is_refused(fresh_db):
     service.undo(create_type_seq, principal=owner())
     with pytest.raises(NodeNotFound):
         service.get_node(widget.id, principal=owner())
+
+
+def test_undo_create_of_a_type_node_edges_are_typed_by_is_refused(fresh_db):
+    """`edges.type_id` became a foreign key into `nodes` at 0009 — an edge's
+    type is a node — and it is the one the delete guard used to miss (B9).
+
+    A type node that has since been used to type any edge is held down by every
+    edge wearing it, and the delete served the same bare `IntegrityError` the
+    other guards exist to prevent — an edge is never an endpoint of the type
+    node, so the incident-edge delete cannot save it.
+    """
+    link = service.create_node(
+        type="type", title="link", space="meta", props={"type_kind": "edge"}, principal=owner()
+    )
+    create_type_seq = _events()[0].seq
+    a = service.create_node(type="claim", title="A", principal=owner())
+    b = service.create_node(type="claim", title="B", principal=owner())
+    edge = service.create_edge(a.id, b.id, link.id, principal=owner())
+
+    with pytest.raises(UndoNotPossible, match="still types 1 edge"):
+        service.undo(create_type_seq, principal=owner())
+
+    assert service.get_node(link.id, principal=owner()).state == "active"
+    assert [row["id"] for row in _graph_rows()["edges"]] == [edge.id]
+    assert [event.op for event in _events() if event.op == "undo"] == []
+
+    # Taking the edge back first clears the way.
+    service.undo(principal=owner())
+    service.undo(create_type_seq, principal=owner())
+    with pytest.raises(NodeNotFound):
+        service.get_node(link.id, principal=owner())

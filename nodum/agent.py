@@ -17,11 +17,16 @@ same rollback as any other.
 
 ## What gets recorded (A1–A3)
 
-**The model goes on the event; the cost goes on the cycle; nothing
-decision-bearing goes on the node.** :class:`GeneratedBy` — ``{provider,
-model_id, prompt_version}`` — is the provenance a model-caused write carries,
-and it belongs in the append-only log because that log is already this system's
-answer to *who is answerable for this write*. ``actor`` stays
+**The cost goes on the cycle; nothing decision-bearing goes on the node.**
+:class:`GeneratedBy` — ``{provider, model_id, prompt_version}`` — is the
+provenance of a model-caused write, and :class:`Generation` carries it beside
+the text. It is no longer merged into the write's ``props``: for a while it
+was (the payload of a graph event **is** the row, so a prop written by the
+emitting call rode the append-only log, removed by a rollback along with the
+row), but nothing ever read it there — the abstraction job's concept was the
+only write to carry it, and M21 took the write out rather than keep a prop
+nobody consumes. What a human or a job can still ask — *who is answerable for
+this write* — the event's actor already answers: ``actor`` stays
 ``agent:builtin-gardener``: the gardener made the write, the model is *how*.
 Collapsing the two would make ``agent:llama3.2:1b`` an actor with no account,
 no grants and nothing to revoke.
@@ -34,17 +39,11 @@ else — so its provenance has to live *in* the log rather than beside it. Do no
 later "unify" the two into a ``model_id`` column on ``nodes``; that would put
 irreproducible provenance into mutable state.
 
-**How it reaches the log, given the service as it stands.** ``service._emit``'s
-payload for a graph write is the row's ``before``/``after``, and no public write
-function takes an extra payload key — so the route that exists today is
-:meth:`GeneratedBy.as_props`, merged into the node's or edge's ``props``. That
-lands the object *inside* the event payload (the payload **is** the row), never
-rewritten because nothing rewrites an event, and removed by a rollback along
-with the row. A1's objection to "the node" was to props as *mutable state no
-event covers*; a prop written by the same call that emits the event is covered
-by it. If a later wave wants the object off the row entirely, the service needs
-a ``generated_by=`` keyword that ``_emit`` splices in beside ``before``/
-``after`` — recorded in this phase's notes rather than reached around here.
+**If a later wave wants the object on the row.** ``service._emit``'s payload
+for a graph write is the row's ``before``/``after``, and no public write
+function takes an extra payload key; the route would be a ``generated_by=``
+keyword that ``_emit`` splices in beside ``before``/``after`` — recorded in
+this phase's notes rather than reached around here.
 
 ``prompt_version`` (A2) is a short hash of the prompt *template*, because two
 cycles a month apart can name the same ``model_id`` and produce different
@@ -206,10 +205,6 @@ __all__ = [
 #: both objects rather than columns — this needs no migration.
 REPORT_KEY = "llm"
 
-#: The ``props`` key :class:`GeneratedBy` is merged under. Named here so the
-#: badge, the filter and the write all spell it once.
-GENERATED_BY_PROP = "generated_by"
-
 #: The per-**cycle** token budget, and the only budget a human configures (B1).
 #: **Unset or 0 means the LLM jobs do not run** — the same posture as
 #: ``NODUM_CONSOLIDATE_AT`` being unset, and K2's level 1.
@@ -267,7 +262,7 @@ DEFAULT_CALL_TIMEOUT = 120.0
 #: answer come out of one KV cache — it would have eaten the whole thing, which
 #: is why :data:`nodum.llm.OUTPUT_RESERVATION_FRACTION` caps what is actually
 #: reserved and sent at a share of the window. On ollama this number therefore
-#: lands at 2 048, which is the value ``AGENTS.md`` already records as the
+#: lands at 2 048, which is the value ``docs/decisions.md`` records as the
 #: measured cure for ``qwen3:8b`` answering with an empty body.
 DEFAULT_MAX_OUTPUT_TOKENS = 4096
 
@@ -356,16 +351,6 @@ class GeneratedBy(BaseModel):
     provider: str
     model_id: str
     prompt_version: str
-
-    def as_props(self) -> dict[str, Any]:
-        """This object as the ``props`` fragment a write merges in.
-
-        The route to the event payload that the service supports today: a
-        graph event's payload **is** the row, so a prop written by the call
-        that emits the event is inside that payload, append-only with it, and
-        deleted with the row by a rollback.
-        """
-        return {GENERATED_BY_PROP: self.model_dump(mode="json")}
 
 
 class Generation(BaseModel):
@@ -925,10 +910,12 @@ class AgentRun:
 
     @property
     def model_id(self) -> str | None:
+        """The provider's model id, or ``None`` with no provider configured."""
         return self._provider.model_id if self._provider is not None else None
 
     @property
     def provider_id(self) -> str | None:
+        """The provider's identifier, or ``None`` with no provider configured."""
         return self._provider.provider_id if self._provider is not None else None
 
     @property

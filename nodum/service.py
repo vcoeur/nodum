@@ -24,8 +24,10 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, NamedTuple
 
+from pydantic import ValidationError
+
 from nodum import auth, db
-from nodum.migrations import BUILTIN_AGENT_PREFIX, MAIN_SPACE_ID, META_SPACE_ID
+from nodum.migrations import BUILTIN_AGENT_PREFIX, GARDENER_AGENT_ID, MAIN_SPACE_ID, META_SPACE_ID
 from nodum.models import (
     AgentCreatedOut,
     AgentOut,
@@ -35,6 +37,7 @@ from nodum.models import (
     CycleOut,
     DiffOut,
     EdgeOut,
+    EdgeSuggestionIn,
     EdgeTypeOut,
     EventOut,
     GrantOut,
@@ -64,21 +67,40 @@ from nodum.models import (
 )
 from nodum.principal import EDIT, READ, SUGGEST, Principal
 from nodum.store import GrantNotPermitted, Store, require_landing_state
+from nodum.vocab import (
+    CONSOLIDATION_TRIGGERS,
+    CYCLE_CLOSED_STATUSES,
+    CYCLE_STATUSES,
+    CYCLE_TRIGGERS,
+    DEFAULT_EDGE_STATES,
+    DIRECTIONS,
+    GRANT_LEVEL_NAMES,
+    REVIEW_ACTIONS,
+    STATES,
+    SUGGEST_STATES,
+    TRANSITIONS,
+    AgentKind,
+    CycleTrigger,
+    Direction,
+    GrantLevel,
+    LandingState,
+    NodeState,
+    ProposalKind,
+    RollbackKind,
+    TransitionAction,
+    TransitionKind,
+)
 
-#: Allowed state values shared by nodes and edges.
-STATES = ("proposed", "active", "archived")
+#: Allowed state values shared by nodes and edges (vocab: :data:`STATES`).
+STATES = STATES
 
 #: State transitions: action → (required current state, resulting state).
-TRANSITIONS = {
-    "accept": ("proposed", "active"),
-    "reject": ("proposed", "archived"),
-    "archive": ("active", "archived"),
-}
+TRANSITIONS = TRANSITIONS
 
 #: The transitions that *review* a proposal. Reviewing turns proposed
 #: structure into live structure (and archives what it replaces), so it needs
 #: a human — or an ``edit`` grant on the item's space (Q13 note 03 Q1).
-REVIEW_ACTIONS = ("accept", "reject")
+REVIEW_ACTIONS = REVIEW_ACTIONS
 
 #: The node fields a version snapshots, and the only fields a proposed update
 #: may name.
@@ -87,11 +109,11 @@ VERSION_FIELDS = ("title", "content", "props")
 #: Node states :func:`suggest_links` draws link targets from. ``proposed``
 #: stays in, as it does for every other node read; ``archived`` is out,
 #: because a retired node is not something to link to.
-SUGGEST_STATES = ("active", "proposed")
+SUGGEST_STATES = SUGGEST_STATES
 
 #: Edge states :func:`subgraph` follows when the caller names none — the live
 #: graph, matching every other traversal (design §8.1).
-DEFAULT_EDGE_STATES = ("active",)
+DEFAULT_EDGE_STATES = DEFAULT_EDGE_STATES
 
 #: Ceiling on :func:`subgraph`'s node cap. A caller's ``limit`` is clamped to
 #: it rather than refused, so a query string cannot turn the bounded read into
@@ -446,15 +468,20 @@ def _require_space_lives_in_meta(space_id: str) -> None:
     territory while the grants that govern it are the *host* space's.
 
     It is also what made :func:`_require_space_name_free` an existence oracle.
-    That check is deliberately unscoped, on the premise that only a meta writer
-    can reach it and a meta reader can already list every space; the premise
-    held for creates (:func:`_resolve_node_type` needs READ on meta to resolve
-    the ``space`` type) but not for renames, which are gated on SUGGEST on the
-    space the node itself lives in. A ``space``-typed node in ``main`` therefore
-    let a principal holding nothing but ``main`` rename it onto a name and learn
-    from the refusal that some space it cannot list holds it — plus that space's
-    id. Keeping spaces in meta restores the premise instead of weakening the
-    refusal, which has to keep naming an archived holder to be usable at all.
+    That check is deliberately unscoped, on the premise that only a principal
+    that could already list every space can reach it; the premise held for
+    creates (:func:`_resolve_node_type` needs READ on meta to resolve the
+    ``space`` type, and a meta reader used to list every space) but not for
+    renames, which are gated on SUGGEST on the space the node itself lives in.
+    A ``space``-typed node in ``main`` therefore let a principal holding
+    nothing but ``main`` rename it onto a name and learn from the refusal that
+    some space it cannot list holds it — plus that space's id. Keeping spaces
+    in meta restores the premise instead of weakening the refusal, which has
+    to keep naming an archived holder to be usable at all. The premise is no
+    longer inherited from the placement: a space node now resolves through its
+    own id, not through ``meta`` (M3), so a meta reader sees only the space
+    nodes it holds grants on — and :func:`_require_space_name_free` therefore
+    checks the premise itself rather than trusting it.
 
     Migration ``0013``'s index stays deliberately unscoped to meta, and this
     does not contradict it: the index is the backstop for writers that never
@@ -499,26 +526,33 @@ def _require_space_name_free(
     An archived holder gets its own sentence, and both name the space. Nothing
     lists archived spaces — :func:`list_spaces` and ``GET /api/spaces`` return
     active ones — so a human would otherwise be refused a name held by
-    something they cannot see anywhere. Saying so is not an existence oracle,
-    but only because **the caller can read meta**, and a meta reader can already
-    list every space node in it, archived ones included.
+    something they cannot see anywhere. Naming the holder is not an existence
+    oracle only for a principal that can already list every space, and that
+    premise is checked here rather than trusted: the search spans every space
+    in the file regardless of scope, so the principal it answers has to be one
+    that could run the search itself. Reading meta used to buy that — a meta
+    reader could list every space node, archived ones included — but a space
+    node now resolves through its own id (M3), so a meta reader with a partial
+    grant set sees only the spaces it holds grants on. An agent that cannot
+    list every space is refused outright, identically for every name, so a
+    probe of a taken name and a free one answer the same — and the refusal
+    itself names no space at all.
 
-    That premise is checked here rather than trusted, and here rather than at
-    each call site, because this is the function that discloses: the search
-    spans every space in the file regardless of scope, so the principal it
-    answers has to be one that could run the search itself. `create_node` is
-    safe by construction (resolving the ``space`` type needs READ on meta), but
-    a rename is gated on SUGGEST on the space the node *already lives in* — and
-    a ``space``-typed node sitting in ``main`` therefore let a principal holding
-    nothing but ``main`` read a confirm/deny, plus the holder's id, for a space
-    it cannot list. :func:`_require_space_lives_in_meta` stops new ones being
-    made; this check covers the rows a database already holds, and covers the
-    accept path (:func:`_transition_version`) where the reviewer need not be the
-    proposer. The refusal is on the **grant**, so it reads identically whether
-    or not the name is taken — weakening the message was not the alternative,
-    since it has to keep naming an archived holder, the one space no listing
-    shows. Freeing that name means renaming it, an ordinary :func:`update_node`
-    by id — :func:`rename_space` will not reach it, since :func:`_resolve_space`
+    That premise is checked here rather than at each call site, because this
+    is the function that discloses. `create_node` is safe by construction
+    (resolving the ``space`` type needs READ on meta, and the grant gate below
+    needs every space), but a rename is gated on SUGGEST on the space the node
+    *already lives in* — and a ``space``-typed node sitting in ``main``
+    therefore let a principal holding nothing but ``main`` read a confirm/deny,
+    plus the holder's id, for a space it cannot list.
+    :func:`_require_space_lives_in_meta` stops new ones being made; this check
+    covers the rows a database already holds, and covers the accept path
+    (:func:`_transition_version`) where the reviewer need not be the proposer.
+    The refusal is on the **grant**, so it reads identically whether or not the
+    name is taken — weakening the message was not the alternative, since it has
+    to keep naming an archived holder, the one space no listing shows. Freeing
+    that name means renaming it, an ordinary :func:`update_node` by id —
+    :func:`rename_space` will not reach it, since :func:`_resolve_space`
     matches ``active`` only.
 
     Migration ``0013_unique_space_titles`` is the structural half of this and
@@ -530,12 +564,13 @@ def _require_space_name_free(
     Args:
         conn: Open connection.
         name: The proposed name; ``None`` (an untitled space) is always free.
-        principal: Who is asking — must be able to read the meta space, since
-            the answer describes every space in the file.
+        principal: Who is asking — must be able to list every space in the
+            file, since the answer describes all of them.
         exclude_id: The space being renamed, so it never clashes with itself.
 
     Raises:
-        GrantNotPermitted: If ``principal`` cannot read the meta space.
+        GrantNotPermitted: If ``principal`` cannot read the meta space, or —
+            for an agent — cannot list every space in the file.
         SpaceNameTaken: If any other space already answers to ``name``.
     """
     if principal.level_on(META_SPACE_ID) < READ:
@@ -544,6 +579,31 @@ def _require_space_name_free(
             "space is naming part of the vocabulary every space is named from, so it takes a "
             "grant on the space that holds it"
         )
+    if not principal.is_human:
+        # The search below spans every space in the file, and the refusal names
+        # the holder — so the caller must be able to list every space itself.
+        # Reading meta no longer buys that (M3): a space node is visible only
+        # to a principal granted on that space, so a meta reader with a partial
+        # grant set could probe create/rename refusals for spaces it cannot
+        # see. The gate is on the grant, so it reads identically whether or not
+        # any space holds the probed name.
+        readable = principal.read_spaces or frozenset()
+        if readable:
+            hidden = conn.execute(
+                "SELECT 1 FROM nodes WHERE type_id = 'space' AND id NOT IN ("
+                + ",".join("?" * len(readable))
+                + ") LIMIT 1",
+                sorted(readable),
+            ).fetchone()
+        else:
+            hidden = conn.execute("SELECT 1 FROM nodes WHERE type_id = 'space' LIMIT 1").fetchone()
+        if hidden is not None:
+            raise GrantNotPermitted(
+                f"{principal.actor_string} may not name a space: the name check spans every "
+                "space in the file, so only a principal that can already list every space may "
+                "run it — anything less could learn from the refusal that a space it cannot "
+                "see exists"
+            )
     if name is None:
         return
     # `IS NOT` rather than `!=` so a None exclusion compares against NULL.
@@ -567,7 +627,7 @@ def _require_space_name_free(
     )
 
 
-def _create_op(state: str) -> str:
+def _create_op(state: NodeState) -> str:
     """Name a create-op after the state it lands in (``create`` vs ``propose``)."""
     return "create" if state == "active" else "propose"
 
@@ -599,6 +659,69 @@ def resolve_space_id(
     conn = _connect(path)
     try:
         return _resolve_space(conn, space, principal)
+    finally:
+        conn.close()
+
+
+def require_write_grant(
+    space_id: str, *, principal: Principal, path: str | Path | None = None
+) -> None:
+    """Refuse an ingestion whose describing nodes the principal could never write.
+
+    The ingestion pipeline resolves the target space and then stores the bytes;
+    this probe is what makes the write grant part of that pre-storage
+    resolution. Registration is the irreversible half of ingestion — there is no
+    delete route — so a principal whose grant would refuse the node write must
+    be refused here, before any byte is stored.
+
+    It asks the **same question the write itself asks**: a
+    :class:`~nodum.store.Store` probe of :meth:`Store.landing_state`, the exact
+    call :func:`create_node` makes with the same ``principal``. A probe that
+    disagreed with the write would be worse than none — this one cannot.
+
+    Args:
+        space_id: The resolved target space id.
+        principal: Who would be writing.
+        path: Explicit database path.
+
+    Raises:
+        GrantNotPermitted: If the principal may not write the space.
+    """
+    conn = _connect(path)
+    try:
+        Store(conn, principal).landing_state(space_id)
+    finally:
+        conn.close()
+
+
+def require_type_read(
+    type_ref: str, *, principal: Principal, path: str | Path | None = None
+) -> None:
+    """Refuse an ingestion whose describing nodes' types the principal cannot read.
+
+    The describing nodes an ingestion writes are typed ``asset_ref`` and
+    ``source``, which live in the ``meta`` space — so a principal that can
+    write a space but cannot read ``meta`` would resolve no type at all. That
+    refusal used to surface inside :func:`find_by_asset_hash` and
+    :func:`create_node`, after the bytes were already stored; this probe moves
+    it before :func:`~nodum.assets.register_asset`, next to the write-grant
+    probe, so the two no-bytes refusals of ingestion — a missing write grant
+    and an unresolvable type — both land before anything is irreversible.
+
+    It asks the same question the write asks: :func:`_resolve_node_type` with
+    the same ``principal``, the exact resolution :func:`create_node` performs.
+
+    Args:
+        type_ref: The node-type id or name the pipeline needs to resolve.
+        principal: Who would be writing.
+        path: Explicit database path.
+
+    Raises:
+        TypeNotFound: If the principal cannot resolve the type.
+    """
+    conn = _connect(path)
+    try:
+        _resolve_node_type(conn, type_ref, principal)
     finally:
         conn.close()
 
@@ -727,21 +850,41 @@ def _emit(
             cycle_id if cycle_id is not None else _CURRENT_CYCLE.get(),
         ),
     )
+    if cur.lastrowid is None:
+        # The sqlite3 contract: an INSERT that completes sets rowid. A None
+        # here would mean the driver did not run the statement — impossible
+        # without an exception having already propagated.
+        raise RuntimeError("INSERT into events did not set a rowid")
     return int(cur.lastrowid)
 
 
 def _write_version(
     conn: sqlite3.Connection, node_row: sqlite3.Row | dict[str, Any], actor: str, event_seq: int
-) -> None:
-    """Snapshot a node's title/content/props into ``versions`` after a mutation."""
+) -> int:
+    """Snapshot a node's title/content/props into ``versions`` after a mutation.
+
+    The snapshot row lands ``applied`` — the ``state`` column's DDL default
+    (``0008_proposed_versions``) — which is what a snapshot *is*: a record of
+    state that was true, as opposed to a ``proposed`` row waiting on a review.
+
+    Returns:
+        The new version row's id — what an accept records so that reversing
+        the accept can remove the snapshot again (:func:`_accept_snapshot_row`).
+    """
     data = dict(node_row)
-    conn.execute(
+    cur = conn.execute(
         """
         INSERT INTO versions (node_id, title, content, props, actor, event_seq)
         VALUES (?, ?, ?, ?, ?, ?)
         """,
         (data["id"], data["title"], data["content"], data["props"], actor, event_seq),
     )
+    if cur.lastrowid is None:
+        # The sqlite3 contract: an INSERT that completes sets rowid. A None
+        # here would mean the driver did not run the statement — impossible
+        # without an exception having already propagated.
+        raise RuntimeError("INSERT into versions did not set a rowid")
+    return int(cur.lastrowid)
 
 
 # ── Wikilink materialisation ──────────────────────────────────────────────────
@@ -777,7 +920,7 @@ def _materialize_mentions(
     actor: str,
     store: Store,
     cycle_id: str | None = None,
-    landing: str | None = None,
+    landing: LandingState | None = None,
 ) -> None:
     """Sync a node's ``[[wikilinks]]`` with its pending/active ``mentions`` edges.
 
@@ -796,12 +939,17 @@ def _materialize_mentions(
     none. A pending edge goes live when a reviewer accepts the proposing
     node (:func:`_activate_pending_mentions`) or the edge itself.
 
-    **Archival is authority-gated the same way** (Q13 review B2): an existing
-    edge is only retired when the writer holds ``edit`` on *both* endpoint
-    spaces. Without it the edge is left untouched — a writer who cannot see
+    **Retirement is gated in two layers.** Q13 review B2: an existing edge is
+    only retired when the writer holds ``edit`` on *both* endpoint spaces.
+    Without it the edge is left untouched — a writer who cannot see
     the far endpoint cannot tell the link "disappeared" (its target does not
     resolve for them), and must not be able to strip another principal's
-    cross-space mentions out of a node it may otherwise edit.
+    cross-space mentions out of a node it may otherwise edit. On top of that,
+    retiring a **live** edge (the ``archive`` half) is the human tier: it
+    retires live state, which an ``edit`` grant is in-space authority over,
+    not a right to — so a non-human's content change leaves a stale active
+    mention in place for a human (:meth:`Store.require_human` at the call
+    site, with the edit-on-both bar underneath).
 
     Idempotent: re-running on unchanged content changes nothing, whichever
     state the existing edges are in — pending edges count as already
@@ -810,7 +958,7 @@ def _materialize_mentions(
     node = dict(node_row)
     targets = set(WIKILINK_RE.findall(node["content"] or ""))
     resolved: set[str] = set()
-    edge_landing: dict[str, str] = {}
+    edge_landing: dict[str, LandingState] = {}
     for target in targets:
         dst = _resolve_wikilink(conn, target, store)
         if dst is None or dst == node["id"]:
@@ -850,24 +998,39 @@ def _materialize_mentions(
     for dst_id, edge in current_by_dst.items():
         if dst_id in resolved:
             continue
-        if not _may_retire_mention(conn, node["space_id"], dst_id, store):
-            continue
         # A pending edge leaves `proposed`, so its op is `reject`, not
         # `archive` — the state machine allows only one of the two.
         action = "archive" if edge["state"] == "active" else "reject"
+        if action == "archive":
+            # Archiving an edge is retiring live state, the human tier: an
+            # `edit` grant is in-space authority, not the right to retire it,
+            # so a non-human's content change leaves the stale active mention
+            # in place for a human rather than pruning it.
+            try:
+                store.require_human("archive a mention")
+            except GrantNotPermitted:
+                continue
+        if not _may_retire_mention(conn, node["space_id"], dst_id, store):
+            continue
         _set_edge_state(conn, dict(edge), "archived", action, actor, cycle_id=cycle_id)
 
 
 def _may_retire_mention(
     conn: sqlite3.Connection, src_space: str | None, dst_id: str, store: Store
 ) -> bool:
-    """May this writer archive/reject a ``mentions`` edge into ``dst_id``?
+    """May this writer reject a ``mentions`` edge into ``dst_id``?
 
     Retiring an edge is a state-machine action on both endpoint spaces, so it
     needs ``edit`` on both — the same bar :meth:`Store.require_review` sets
-    for reviewing the edge directly. Unreadable far endpoints fail it too
+    for rejecting the edge directly. Unreadable far endpoints fail it too
     (no grant, no level), which is what keeps an under-granted writer from
     silently pruning links it cannot see.
+
+    This is the gate for the ``reject`` half only. The ``archive`` half —
+    retiring a **live** edge — is the human tier (it retires live state, which
+    an ``edit`` grant is in-space authority over, not a right to), so the
+    caller gates it on :meth:`Store.require_human` first and consults this for
+    humans alone.
     """
     row = conn.execute("SELECT space_id FROM nodes WHERE id = ?", (dst_id,)).fetchone()
     if row is None:
@@ -933,12 +1096,16 @@ def _settle_synthesis_edges(
     reviewer's own authority over both endpoint spaces. Each transition is
     its own event, attributed to the reviewer.
 
-    A node that is not a synthesis (``props.synthesized`` falsy) is a no-op —
-    ordinary nodes carry no ``derived_from`` edges of their own, and the
-    helper must not settle anyone else's.
+    A node that is not a synthesis is a no-op — ordinary nodes carry no
+    ``derived_from`` edges of their own, and the helper must not settle anyone
+    else's. "Is a synthesis" is verified against the event log, not read off
+    the props (M21): ``props.synthesized`` is forgeable by any writer, but the
+    create event is append-only, so the distinction lives in the event that
+    wrote the node — see :func:`is_synthesis`. The check is made on the same
+    connection: a second one could not see this transaction's uncommitted
+    writes, and inside a bulk review's immediate lock it could not even read.
     """
-    props = json.loads(node.get("props") or "{}")
-    if not props.get("synthesized"):
+    if not is_synthesis(node["id"], conn=conn):
         return
     rows = conn.execute(
         """
@@ -976,15 +1143,21 @@ def _insert_edge(
     props: dict[str, Any],
     confidence: float | None,
     actor: str,
-    state: str,
+    state: NodeState,
     cycle_id: str | None = None,
 ) -> dict[str, Any]:
     """Insert one edge row and emit its create/propose event; returns the row."""
     edge_id = uuid.uuid4().hex
+    # An edge that lands `active` is true from the moment it exists, so its
+    # validity window opens at creation time (D2: the value is a fact — the
+    # edge IS true — not a guess). An edge that lands `proposed` is not yet
+    # true; its `valid_from` stays NULL until the accept transition opens the
+    # window (`_set_edge_state`).
     conn.execute(
         """
-        INSERT INTO edges (id, src_id, dst_id, type_id, props, confidence, created_by, state)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO edges (id, src_id, dst_id, type_id, props, confidence, created_by, state,
+                           valid_from)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, CASE WHEN ? = 'active' THEN datetime('now') END)
         """,
         (
             edge_id,
@@ -994,6 +1167,7 @@ def _insert_edge(
             json.dumps(props, ensure_ascii=False),
             confidence,
             actor,
+            state,
             state,
         ),
     )
@@ -1012,17 +1186,45 @@ def _insert_edge(
 def _set_edge_state(
     conn: sqlite3.Connection,
     before: dict[str, Any],
-    new_state: str,
-    action: str,
+    new_state: NodeState,
+    action: TransitionAction,
     actor: str,
     cycle_id: str | None = None,
     reason: str | None = None,
+    props: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Transition an edge's state, emitting the event; returns the after row.
 
-    ``reason`` is recorded in the event payload on rejects (design §8.1).
+    This is the **single writer for the validity window** (D2): the two
+    transition directions that change what is true write the corresponding
+    column here, so every retirement path — transition, wikilink
+    materialisation, synthesis settlement, merge, supersede — records the same
+    facts and the paths cannot disagree:
+
+    * ``proposed`` → ``active`` (accept): ``valid_from`` opens at the accept
+      time, but only when the edge has none yet — a re-accept after a rollback
+      must not rewrite the fact.
+    * ``active`` → ``archived`` (archive): ``valid_to`` closes at the archive
+      time — the edge stopped being true the moment it was retired.
+    * ``proposed`` → ``archived`` (reject): neither column moves. A rejected
+      proposal was never true, so it has no window to open or close.
+
+    ``props``, when given, is written in the same UPDATE — ``supersede_edge``
+    rides its ``superseded_by`` props write on the shared retirement so the
+    row is written once, not twice. ``reason`` is recorded in the event
+    payload on rejects (design §8.1).
     """
-    conn.execute("UPDATE edges SET state = ? WHERE id = ?", (new_state, before["id"]))
+    sets = ["state = ?"]
+    params: list[Any] = [new_state]
+    if before["state"] == "active" and new_state == "archived":
+        sets.append("valid_to = datetime('now')")
+    if before["state"] == "proposed" and new_state == "active" and before["valid_from"] is None:
+        sets.append("valid_from = datetime('now')")
+    if props is not None:
+        sets.append("props = ?")
+        params.append(json.dumps(props, ensure_ascii=False))
+    params.append(before["id"])
+    conn.execute(f"UPDATE edges SET {', '.join(sets)} WHERE id = ?", params)
     after = _row_dict(_get_edge_row(conn, before["id"]))
     payload: dict[str, Any] = {"before": before, "after": after}
     if reason is not None:
@@ -1073,7 +1275,7 @@ def create_node(
     parent_id: str | None = None,
     props: dict[str, Any] | None = None,
     space: str | None = None,
-    landing: str | None = None,
+    landing: LandingState | None = None,
     principal: Principal,
     path: str | Path | None = None,
 ) -> NodeOut:
@@ -1169,8 +1371,11 @@ def create_node(
         seq = _emit(conn, actor, f"node.{_create_op(state)}", {"before": None, "after": node})
         _write_version(conn, node, actor, seq)
         _materialize_mentions(conn, node, actor, store, landing=landing)
+        # The return value is built before the commit so a validation failure
+        # lands pre-commit: `finally: conn.close()` then rolls back the write.
+        out = _node_out(node)
         conn.commit()
-        return _node_out(node)
+        return out
     finally:
         conn.close()
 
@@ -1225,6 +1430,9 @@ def update_node(
     """
     conn = _connect(path)
     try:
+        # The space-name check below is a read the UPDATE would otherwise race:
+        # two concurrent renames both probing the name as free (finding M8).
+        db.begin_immediate(conn)
         store = Store(conn, principal)
         actor = principal.actor_string
         before_row = _get_node_row(conn, node_id)
@@ -1283,9 +1491,17 @@ def update_node(
                     json.dumps(fields),
                 ),
             )
+            if cur.lastrowid is None:
+                # The sqlite3 contract: an INSERT that completes sets rowid. A
+                # None here would mean the driver did not run the statement —
+                # impossible without an exception having already propagated.
+                raise RuntimeError("INSERT into versions did not set a rowid")
             version = _row_dict(_get_version_row(conn, int(cur.lastrowid)))
+            # The return value is built before the commit so a validation
+            # failure lands pre-commit: `finally: conn.close()` then rolls back.
+            out = _version_out(version)
             conn.commit()
-            return _version_out(version)
+            return out
         conn.execute(
             """
             UPDATE nodes
@@ -1299,8 +1515,11 @@ def update_node(
         _write_version(conn, after, actor, seq)
         if content is not _UNSET:
             _materialize_mentions(conn, after, actor, store)
+        # The return value is built before the commit so a validation failure
+        # lands pre-commit: `finally: conn.close()` then rolls back the write.
+        out = _node_out(after)
         conn.commit()
-        return _node_out(after)
+        return out
     finally:
         conn.close()
 
@@ -1308,7 +1527,7 @@ def update_node(
 def _node_list_filters(
     store: Store,
     *,
-    state: str | None,
+    state: NodeState | None,
     type_id: str | None,
     parent_id: str | None,
     space_id: str | None,
@@ -1403,7 +1622,7 @@ def require_positive_limit(limit: int, name: str = "limit") -> None:
 def list_nodes(
     *,
     type: str | None = None,
-    state: str | None = None,
+    state: NodeState | None = None,
     parent_id: str | None = None,
     space: str | None = None,
     include_meta: bool = False,
@@ -1417,7 +1636,10 @@ def list_nodes(
     Meta-space nodes (the type vocabulary, spaces) are excluded unless
     ``include_meta`` — content listings are not the type catalog. An agent
     principal is additionally confined to its read set (which may include
-    meta, e.g. for the type vocabulary).
+    meta, e.g. for the type vocabulary), and the space nodes inside that read
+    set are the granted ones only: a ``space``-typed node resolves through its
+    own id (M3), so an agent holding ``meta: read`` lists the space nodes of
+    the spaces it holds grants on, and none of the others.
 
     ``space`` **narrows** that read set and can never widen it: it resolves
     through :func:`_resolve_space`, so a space the principal holds no grant on
@@ -1601,7 +1823,7 @@ def _create_edge_in_conn(
     *,
     props: dict[str, Any] | None,
     confidence: float | None,
-    landing: str | None,
+    landing: LandingState | None,
     actor: str,
     store: Store,
 ) -> dict[str, Any]:
@@ -1643,7 +1865,7 @@ def create_edge(
     *,
     props: dict[str, Any] | None = None,
     confidence: float | None = None,
-    landing: str | None = None,
+    landing: LandingState | None = None,
     principal: Principal,
     path: str | Path | None = None,
 ) -> EdgeOut:
@@ -1692,26 +1914,53 @@ def create_edge(
             actor=principal.actor_string,
             store=store,
         )
+        # The return value is built before the commit so a validation failure
+        # lands pre-commit: `finally: conn.close()` then rolls back the write.
+        out = _edge_out(row)
         conn.commit()
-        return _edge_out(row)
+        return out
     finally:
         conn.close()
+
+
+def _suggestion_error(exc: ValidationError) -> str:
+    """Map one suggestion's validation failure to the per-suggestion message.
+
+    Unknown keys are named, mirroring the ``unknown search filter(s): …``
+    sentence the MCP server uses for the same kind of caller bug; a missing
+    field keeps the old ``missing key: …`` wording so batch callers matching
+    it keep working. Any other shape failure reports pydantic's own sentence.
+    """
+    errors = exc.errors()
+    unknown = sorted(
+        {str(error["loc"][0]) for error in errors if error["type"] == "extra_forbidden"}
+    )
+    if unknown:
+        return f"unknown suggestion key(s): {', '.join(unknown)}"
+    missing = sorted({str(error["loc"][0]) for error in errors if error["type"] == "missing"})
+    if missing:
+        return f"missing key: {missing[0]}"
+    return errors[0]["msg"]
 
 
 def propose_edges(
     suggestions: list[dict[str, Any]],
     *,
-    landing: str | None = None,
+    landing: LandingState | None = None,
     principal: Principal,
     path: str | Path | None = None,
 ) -> ProposeEdgesOut:
     """Write a batch of edge suggestions, one event per edge (design §8.1).
 
     Each suggestion names ``src``, ``dst``, and ``edge_type``, plus optional
-    ``props`` and ``confidence`` — the same inputs as :func:`create_edge`,
-    A malformed suggestion (missing key,
+    ``props`` and ``confidence`` — the same inputs as :func:`create_edge`.
+    A malformed suggestion (missing key, unknown key, bad value shape,
     unknown endpoint/type, bad confidence) lands in ``failed`` with its
     input index; the rest still write. One commit for the whole batch.
+
+    Every suggestion is validated against :class:`EdgeSuggestionIn` **before
+    any write**, so a malformed one can never leave a partial row behind in
+    the single batch commit (finding M32).
 
     Args:
         suggestions: The edges to write, one object each.
@@ -1737,20 +1986,23 @@ def propose_edges(
                 failed.append(ItemFailure(index=index, error="suggestion must be an object"))
                 continue
             try:
+                valid = EdgeSuggestionIn.model_validate(suggestion)
+            except ValidationError as exc:
+                failed.append(ItemFailure(index=index, error=_suggestion_error(exc)))
+                continue
+            try:
                 row = _create_edge_in_conn(
                     conn,
-                    str(suggestion["src"]),
-                    str(suggestion["dst"]),
-                    str(suggestion["edge_type"]),
-                    props=suggestion.get("props"),
-                    confidence=suggestion.get("confidence"),
+                    valid.src,
+                    valid.dst,
+                    valid.edge_type,
+                    props=valid.props,
+                    confidence=valid.confidence,
                     landing=landing,
                     actor=principal.actor_string,
                     store=store,
                 )
                 created.append(_edge_out(row))
-            except KeyError as exc:
-                failed.append(ItemFailure(index=index, error=f"missing key: {exc.args[0]}"))
             except (NodeNotFound, TypeNotFound, ValueError, GrantNotPermitted) as exc:
                 failed.append(ItemFailure(index=index, error=str(exc)))
         conn.commit()
@@ -1759,11 +2011,48 @@ def propose_edges(
         conn.close()
 
 
+def _as_of_edge_clause(t: str, admitted: tuple[str, ...]) -> tuple[str, list[Any]]:
+    """The SQL fragment (and params) that admits exactly the edges true at instant ``t``.
+
+    D2's read predicate, spelled once and reused by every as-of read so the
+    lens cannot drift between surfaces. Callers pass the states their
+    *non*-as-of filter would admit; this clause **replaces** that filter (it
+    subsumes it), so the state filter under as-of narrows only the live part.
+    An edge is present at instant ``t`` iff:
+
+    * its state is one of ``admitted`` **or** it is ``archived`` — a retired
+      edge is admitted when its window covered ``t``, whatever the caller's
+      state filter says (the as-of lens shows the graph *as it was true*, and
+      an archived edge whose window covered ``t`` was true then), and
+    * its window covers ``t``: ``valid_from`` is unset (a pre-D2 edge, valid
+      since the beginning of recorded history — as-of at "now" must agree with
+      the default read) or ``valid_from <= t``, **and**
+    * its window has not closed before ``t``: ``valid_to`` is unset on a row
+      still ``active`` (a live edge, window still open) or ``valid_to > t``.
+
+    Two legacy shapes fall out of that composition. A pre-D2 **active** edge
+    (neither column set) is present at every instant — it is part of the live
+    graph today, so as-of at now agrees with the default read. A pre-D2
+    **archived** edge (``valid_to`` NULL — pre-D2 retirement recorded no
+    window) is present at *no* instant: its closure is unknown, so no ``t``
+    can be placed inside its window, and the default read already hides it by
+    state.
+    """
+    placeholders = ",".join("?" * len(admitted))
+    clause = (
+        f"((state IN ({placeholders}) OR state = 'archived')"
+        " AND (valid_from IS NULL OR valid_from <= ?)"
+        " AND ((valid_to IS NULL AND state = 'active') OR valid_to > ?))"
+    )
+    return clause, [*admitted, t, t]
+
+
 def list_edges(
     *,
     node_id: str | None = None,
     type: str | None = None,
-    state: str | None = None,
+    state: NodeState | None = None,
+    as_of: str | None = None,
     principal: Principal,
     limit: int = 500,
     path: str | Path | None = None,
@@ -1772,6 +2061,16 @@ def list_edges(
 
     ``node_id`` matches edges in either direction. An agent principal sees
     only edges whose endpoints are both readable.
+
+    ``as_of`` reads the graph as it was true at an instant (D2): pass a
+    timestamp and an edge is returned iff its validity window covered it. The
+    window clause subsumes the state filter — under as-of the filter narrows
+    only which live states are admitted, and a window-covered archived edge is
+    returned regardless (``state IN (filter) OR state = 'archived'`` composed
+    with ``valid_from <= t AND (valid_to IS NULL OR valid_to > t)``, with the
+    pre-D2 NULL rules :func:`_as_of_edge_clause` documents). Without ``as_of``
+    the read is unchanged: the state filter alone, defaulting to every state
+    (the live graph plus anything retired).
 
     Raises:
         ValueError: If ``state`` is not a known state, or ``limit`` is below 1
@@ -1794,9 +2093,19 @@ def list_edges(
         if type is not None:
             clauses.append("type_id = ?")
             params.append(_resolve_edge_type(conn, type, principal)[0])
-        if state is not None:
-            if state not in STATES:
-                raise ValueError(f"state must be one of {STATES}, got {state!r}")
+        if state is not None and state not in STATES:
+            raise ValueError(f"state must be one of {STATES}, got {state!r}")
+        if as_of is not None:
+            # The window clause subsumes the state filter: under as-of the
+            # filter only narrows which *live* states are admitted, and a
+            # window-covered archived edge is admitted regardless — the lens
+            # shows what was true at the instant.
+            as_of_clause, as_of_params = _as_of_edge_clause(
+                as_of, (state,) if state is not None else DEFAULT_EDGE_STATES
+            )
+            clauses.append(as_of_clause)
+            params.extend(as_of_params)
+        elif state is not None:
             clauses.append("state = ?")
             params.append(state)
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
@@ -1856,7 +2165,7 @@ def _transition_version(
         )
         node_after = _row_dict(_get_node_row(conn, before["node_id"]))
         conn.execute("UPDATE versions SET state = 'applied' WHERE id = ?", (version_id,))
-        _emit(
+        seq = _emit(
             conn,
             actor,
             "node.update",
@@ -1872,6 +2181,14 @@ def _transition_version(
                 },
             },
         )
+        # A **true snapshot of the node as it now stands** — the proposal row
+        # flipped to `applied` above is the record of the proposal, and its
+        # un-named fields are copies from proposal time (:func:`_proposed_fields`),
+        # so history must not read it as the state the accept landed (finding
+        # M9). Written after the event so it can carry the event's seq, and
+        # removed again by the reversal of this accept
+        # (:func:`_accept_snapshot_row`).
+        _write_version(conn, node_after, actor, seq)
         if "content" in fields:
             _materialize_mentions(conn, node_after, actor, store)
     else:  # reject
@@ -1884,7 +2201,9 @@ def _transition_version(
     return _row_dict(_get_version_row(conn, version_id))
 
 
-def _item_spaces(conn: sqlite3.Connection, kind: str, row: dict[str, Any]) -> set[str | None]:
+def _item_spaces(
+    conn: sqlite3.Connection, kind: TransitionKind, row: dict[str, Any]
+) -> set[str | None]:
     """The spaces a transition touches: the node's, both endpoints' for an
     edge, the node's for a version (typed through it)."""
     if kind == "node":
@@ -1900,11 +2219,11 @@ def _item_spaces(conn: sqlite3.Connection, kind: str, row: dict[str, Any]) -> se
 def _transition_row(
     conn: sqlite3.Connection,
     record_id: str,
-    action: str,
+    action: TransitionAction,
     actor: str,
     store: Store,
     reason: str | None = None,
-) -> tuple[str, dict[str, Any]]:
+) -> tuple[TransitionKind, dict[str, Any]]:
     """Apply one state transition inside an open connection (no commit).
 
     Returns:
@@ -1912,9 +2231,11 @@ def _transition_row(
         ``"version"``.
 
     Raises:
-        GrantNotPermitted: If the principal is not a human and holds no
-            ``edit`` grant on the item's space (both endpoint spaces for an
-            edge).
+        GrantNotPermitted: If the principal may not make the transition:
+            accept/reject need a human or an ``edit`` grant on the item's
+            space (both endpoint spaces for an edge); archive needs a human
+            outright, unless it is made inside a consolidation cycle, where
+            the cycle's own review bar applies (:data:`_CURRENT_CYCLE`).
         RecordNotFound: If the id resolves to neither a node, an edge, nor a
             version the principal can read — the id alone does not say which
             kind was meant, so the base class is what is raised.
@@ -1923,7 +2244,7 @@ def _transition_row(
     """
     from_state, to_state = TRANSITIONS[action]
     row = conn.execute("SELECT * FROM nodes WHERE id = ?", (record_id,)).fetchone()
-    kind = "node"
+    kind: TransitionKind = "node"
     if row is None:
         row = conn.execute("SELECT * FROM edges WHERE id = ?", (record_id,)).fetchone()
         kind = "edge"
@@ -1938,7 +2259,17 @@ def _transition_row(
         space in (store.principal.read_spaces or ()) for space in spaces
     ):
         raise RecordNotFound(f"no node, edge, or version with id: {record_id}")
-    store.require_review(spaces, action)
+    # accept/reject are the review tier (a human, or `edit` on the item's
+    # space); archive is the human tier — it retires live state, which an
+    # `edit` grant is in-space authority over, not a right to. The exception
+    # is an archive made *inside* a consolidation cycle: the pruning half and
+    # the curative tier retire edges as part of the cycle's work — gated at
+    # `open_cycle` and reversed by `rollback`, not by a reviewer's archive —
+    # so those stay at the cycle's own review bar.
+    if action == "archive" and not _CURRENT_CYCLE.get():
+        store.require_human("archive")
+    else:
+        store.require_review(spaces, action)
     # The structural spaces are not archivable by any spelling. This sits here
     # rather than in `archive_space` because `archive <id>` and
     # `POST /api/nodes/{id}/archive` reach the same row without going near it.
@@ -1978,7 +2309,7 @@ def _transition_row(
 
 def transition(
     record_id: str,
-    action: str,
+    action: TransitionAction,
     *,
     reason: str | None = None,
     principal: Principal,
@@ -1995,15 +2326,20 @@ def transition(
         reason: Recorded in the event payload — the same audit trail a batch
             :func:`reject_proposals` writes, so reviewing one item and
             reviewing a hundred leave the same record.
-        actor: Who performs the transition. Every transition is the human
-            tier (:data:`HUMAN_ONLY_ACTIONS`) and refuses any other actor.
+        actor: Who performs the transition. ``accept`` and ``reject`` are the
+            review tier: a human, or an agent holding ``edit`` on every space
+            the item touches. ``archive`` is the human tier
+            (:meth:`Store.require_human`): it retires live state, and an
+            ``edit`` grant is in-space authority, not the right to retire it.
         path: Explicit database path.
 
     Returns:
         The updated node, edge, or version.
 
     Raises:
-        GrantNotPermitted: If the principal may not review this item.
+        GrantNotPermitted: If the principal may not make this transition —
+            no human and no ``edit`` grant on the item's spaces for
+            accept/reject; not a human for archive.
         RecordNotFound: If the id resolves to no node, edge, or version.
         InvalidTransition: If the transition is not allowed from the current
             state.
@@ -2012,16 +2348,26 @@ def transition(
         raise ValueError(f"unknown transition {action!r}; expected one of {sorted(TRANSITIONS)}")
     conn = _connect(path)
     try:
+        # The whole read-check-write is one atomic fact: two concurrent
+        # accepts of one proposal must not both pass the state check. The
+        # immediate lock is taken before any read, so the second caller sees
+        # the first caller's committed state rather than a stale pre-check
+        # row (finding M8).
+        db.begin_immediate(conn)
         store = Store(conn, principal)
         kind, after = _transition_row(
             conn, record_id, action, principal.actor_string, store, reason=reason
         )
-        conn.commit()
+        # The return value is built before the commit so a validation failure
+        # lands pre-commit: `finally: conn.close()` then rolls back the write.
         if kind == "node":
-            return _node_out(after)
-        if kind == "version":
-            return _version_out(after)
-        return _edge_out(after)
+            out = _node_out(after)
+        elif kind == "version":
+            out = _version_out(after)
+        else:
+            out = _edge_out(after)
+        conn.commit()
+        return out
     finally:
         conn.close()
 
@@ -2123,7 +2469,7 @@ def _proposal_rows(
     conn: sqlite3.Connection,
     store: Store,
     *,
-    kind: str | None = None,
+    kind: ProposalKind | None = None,
     **filters: Any,
 ) -> list[tuple[str, sqlite3.Row]]:
     """Fetch proposed node/edge/version rows matching the filters, oldest first.
@@ -2163,7 +2509,10 @@ def _proposal_rows(
             created_before=filters.get("created_before"),
             created_after=filters.get("created_after"),
         )
-        update_scope = node_scope.replace("space_id", "n.space_id") if node_scope else ""
+        # The version query joins `nodes n`, so the scope needs the `n.` alias
+        # on every column it names — the scope builder's own `alias` argument,
+        # not a string replace that would leave `type_id`/`id` unprefixed.
+        update_scope, _ = store.node_scope(alias="n.")
         results += [
             ("update", row)
             for row in conn.execute(
@@ -2275,7 +2624,7 @@ def list_proposals(
     *,
     created_by: str | None = None,
     type: str | None = None,
-    kind: str | None = None,
+    kind: ProposalKind | None = None,
     created_before: str | None = None,
     created_after: str | None = None,
     principal: Principal,
@@ -2378,7 +2727,7 @@ def list_proposals(
 
 def _transition_many(
     ids: list[str],
-    action: str,
+    action: TransitionAction,
     *,
     principal: Principal,
     reason: str | None,
@@ -2394,6 +2743,9 @@ def _transition_many(
     """
     conn = _connect(path)
     try:
+        # As in :func:`transition`: one atomic read-check-write per row, so a
+        # proposal two callers both picked cannot be accepted twice (finding M8).
+        db.begin_immediate(conn)
         store = Store(conn, principal)
         actor = principal.actor_string
         transitioned: list[str] = []
@@ -2444,7 +2796,7 @@ def reject_proposals(
 
 
 def annotate(
-    target_kind: str,
+    target_kind: TransitionKind,
     target_id: str | int,
     body: dict[str, Any],
     *,
@@ -2568,7 +2920,7 @@ def annotate(
 def _resolve_annotatable(
     conn: sqlite3.Connection,
     store: Store,
-    target_kind: str,
+    target_kind: TransitionKind,
     target_id: str | int,
 ) -> dict[str, Any]:
     """Resolve an ``annotate`` target to a readable row, or answer *not found*.
@@ -2616,7 +2968,7 @@ def _resolve_annotatable(
 
 
 def _matching_ids(
-    conn: sqlite3.Connection, store: Store, *, kind: str | None, **filters: Any
+    conn: sqlite3.Connection, store: Store, *, kind: ProposalKind | None, **filters: Any
 ) -> list[str]:
     """Resolve a proposal filter to concrete ids (the batch-by-filter input).
 
@@ -2631,7 +2983,7 @@ def accept_matching(
     *,
     created_by: str | None = None,
     type: str | None = None,
-    kind: str | None = None,
+    kind: ProposalKind | None = None,
     created_before: str | None = None,
     created_after: str | None = None,
     principal: Principal,
@@ -2667,7 +3019,7 @@ def reject_matching(
     reason: str,
     created_by: str | None = None,
     type: str | None = None,
-    kind: str | None = None,
+    kind: ProposalKind | None = None,
     created_before: str | None = None,
     created_after: str | None = None,
     principal: Principal,
@@ -2739,25 +3091,39 @@ def _delete_blocker(
     *,
     doomed_nodes: frozenset[str] = frozenset(),
     doomed_redirects: frozenset[str] = frozenset(),
+    doomed_edges: frozenset[str] = frozenset(),
 ) -> tuple[list[str], str] | None:
     """What stands in the way of deleting a node row, if anything.
 
-    **Every foreign key into ``nodes(id)`` is here**, and that completeness is
-    the point rather than a list that grew: an unguarded one is not a refusal
-    the caller can read but a bare ``sqlite3.IntegrityError`` — a 500 over HTTP
-    and ``database error: FOREIGN KEY constraint failed`` on a CLI whose
-    contract promises to name "an undo the graph has grown past". The graph is
-    never corrupted by one (the transaction rolls back whole); what is lost is
-    the ability to act on the answer.
+    **Every foreign key into ``nodes(id)`` that is neither cascading nor removed
+    by the deletion itself is here**, and that completeness is the point rather
+    than a list that grew: an unguarded one is not a refusal the caller can read
+    but a bare ``sqlite3.IntegrityError`` — a 500 over HTTP and ``database
+    error: FOREIGN KEY constraint failed`` on a CLI whose contract promises to
+    name "an undo the graph has grown past". The graph is never corrupted by
+    one (the transaction rolls back whole); what is lost is the ability to act
+    on the answer.
 
-    The five, in the order a caller most likely meets them: ``nodes.parent_id``
+    Completeness is pinned to the schema rather than to this paragraph:
+    ``test_rollback`` walks ``PRAGMA foreign_key_list`` through
+    :func:`nodum.db.foreign_keys_into` and asserts every non-cascading foreign
+    key into ``nodes(id)`` is owned by a guard here or a delete in
+    :func:`_delete_created_row` — so a migration that adds a reference fails
+    that test on the commit that adds it, not on an install a human runs.
+
+    The six, in the order a caller most likely meets them: ``nodes.parent_id``
     (children), ``nodes.space_id`` (a space's occupants), ``merge_redirects``
-    (a node merged away, or merged into), ``grants.space_id`` (agents granted on
-    a space) and ``nodes.type_id`` (nodes typed by a type node). The sixth
-    foreign key into ``nodes(id)`` — ``annotations.target_node_id`` (migration
-    0016) — is deliberately not here: it cascades, because an annotation is
-    derived judgement and can never be the reason a node's undo is refused
-    (which is what its ``cycle_id`` already implies).
+    (a node merged away, or merged into), ``grants.space_id`` (agents granted
+    on a space), ``nodes.type_id`` (nodes typed by a type node) and
+    ``edges.type_id`` (edges typed by a type node). The foreign keys into
+    ``nodes(id)`` this guard deliberately does not answer for are the cascade
+    and the deletion's own housekeeping: ``annotations.target_node_id``
+    (migration 0016) cascades, because an annotation is derived judgement and
+    can never be the reason a node's undo is refused (which is what its
+    ``cycle_id`` already implies), and ``edges.src_id``/``dst_id`` with
+    ``versions.node_id`` are deleted by :func:`_delete_created_row` itself
+    before the node goes — a guard over them would refuse a delete that in
+    fact succeeds.
 
     Args:
         conn: The open connection.
@@ -2769,6 +3135,11 @@ def _delete_blocker(
             :func:`undo`, which reverses exactly one event.
         doomed_redirects: Tombstone ids whose ``merge_redirects`` rows the same
             reversal removes, for the same reason.
+        doomed_edges: Edge ids the same reversal removes — every edge incident
+            to a node it deletes, and every edge its own create-reversal takes
+            out. The ``edges.type_id`` check needs them most: a cycle that
+            creates a type node and an edge wearing it reverses the edge first,
+            so the preflight has to know the edge is already gone.
 
     Returns:
         ``(dependant ids, the refusal's sentence)``, or ``None`` if the row can
@@ -2846,6 +3217,21 @@ def _delete_blocker(
             f"type {node_id} still types {len(typed)} node(s) ({_named_rows(typed)}) — "
             "take those back first: undo their creation, or roll back the cycle that made them"
         )
+    typed_edges = surviving(
+        conn.execute("SELECT id FROM edges WHERE type_id = ?", (node_id,)).fetchall(),
+        "id",
+        doomed_edges,
+    )
+    if typed_edges:
+        # `edges.type_id` references `nodes(id)` since migration 0009 — an
+        # edge's type is a node — so a type node that has since been used to
+        # type any edge is held down by every edge wearing it, exactly as a
+        # node type is by the nodes wearing it.
+        return typed_edges, (
+            f"type {node_id} still types {len(typed_edges)} edge(s) "
+            f"({_named_rows(typed_edges)}) — take those back first: undo their "
+            "creation, or roll back the cycle that made them"
+        )
     return None
 
 
@@ -2873,21 +3259,30 @@ def _delete_created_row(
     Raises:
         UndoNotPossible: If the graph has grown something onto the row that the
             reversal was never asked to touch — every foreign key into
-            ``nodes(id)``, checked by :func:`_delete_blocker`, which
-            :func:`_rollback_plan` also reads so that the preflight and the run
-            agree about what will happen.
+            ``nodes(id)`` that the deletion does not remove itself, checked by
+            :func:`_delete_blocker` (the incident edges and versions below are
+            the ones it does remove, so the guard is told about them and skips
+            them), which :func:`_rollback_plan` also reads so that the preflight
+            and the run agree about what will happen.
     """
     deleted: list[dict[str, Any]] = []
     if kind == "node":
-        # No `doomed_*`: this is the apply path, and a rollback deletes
-        # newest-first, so anything it will remove is already gone by now.
-        blocker = _delete_blocker(conn, row["id"])
-        if blocker is not None:
-            raise UndoNotPossible(f"{context}: {blocker[1]}")
-        for edge in conn.execute(
+        # No `doomed_nodes` or `doomed_redirects`: this is the apply path, and a
+        # rollback deletes newest-first, so anything it will remove is already
+        # gone by now. The incident edges are the one set that still stands —
+        # they go below, and the `edges.type_id` guard must not count what the
+        # delete itself removes, or it would refuse a deletion that in fact
+        # succeeds.
+        incident = conn.execute(
             "SELECT * FROM edges WHERE src_id = ? OR dst_id = ?",
             (row["id"], row["id"]),
-        ).fetchall():
+        ).fetchall()
+        blocker = _delete_blocker(
+            conn, row["id"], doomed_edges=frozenset(str(edge["id"]) for edge in incident)
+        )
+        if blocker is not None:
+            raise UndoNotPossible(f"{context}: {blocker[1]}")
+        for edge in incident:
             deleted.append({"table": "edges", "row": _row_dict(edge)})
             conn.execute("DELETE FROM edges WHERE id = ?", (edge["id"],))
         for version in conn.execute(
@@ -2952,11 +3347,17 @@ def _restore_row(
 VERSION_STATE_KEY = "version_state"
 
 #: Kinds a reversal can put a row back for, and the table each lives in.
-#: ``version`` is here and deliberately **not** in :data:`_TABLE_KIND`: a
-#: version row is reversible but carries no conflict of its own, because
-#: :func:`_transition_row` is the only writer of ``versions.state`` and it moves
-#: a row out of ``proposed`` exactly once — there is no second write for a
-#: rollback to collide with.
+#: ``version`` is here and deliberately **not** in :data:`_TABLE_KIND`: the two
+#: maps answer different questions. A version row is *reversible* (a review
+#: decision moved it, and :func:`_restore_row` / :func:`_restore_version_state`
+#: put it back), but it carries no conflict of **its own** in the
+#: :data:`_TABLE_KIND` sense — the conflict map is keyed by payload table name,
+#: and a version row's moves ride on the ``node.update`` an accept caused or a
+#: ``version.`` event, which :func:`_touched_rows` resolves by op rather than by
+#: table. ``versions.state`` has two writers, not one: :func:`_transition_row`
+#: moves a row out of ``proposed``, and :func:`_restore_version_state` (via
+#: :func:`_restore_row`) moves it back on a rollback or an undo — which is
+#: exactly the later write a conflict check has to see.
 _REVERSIBLE_TABLES = {"node": "nodes", "edge": "edges", "version": "versions"}
 
 #: The ``version.`` ops a reversal can read, named rather than matched by
@@ -3016,6 +3417,35 @@ def _restore_version_state(
         return None
     _restore_row(conn, "version", "versions", recorded["before"], principal, context)
     return {"before": recorded["after"], "after": recorded["before"]}
+
+
+def _accept_snapshot_row(
+    conn: sqlite3.Connection, event_seq: int, payload: dict[str, Any]
+) -> dict[str, Any] | None:
+    """The snapshot row an accept's ``node.update`` wrote, if this event is one.
+
+    An accept writes a true snapshot of the accepted node (finding M9),
+    stamped with the accept event's own seq — the one ``versions`` row no
+    other event shares that stamp with. Reversing the accept takes that row
+    with it: it is a record of the exact state the reversal exists to take
+    back, and leaving it would show history a state the accept was already
+    undone from. The caller records the row in the reversal's ``deleted``, so
+    reversing the reversal re-inserts it (the involution the rest of these
+    payloads already hold).
+
+    Only events that moved a version row (a :data:`VERSION_STATE_KEY` payload)
+    get this. An ordinary edit's snapshot is history like any other
+    (:func:`_write_version` on every other node mutation) and stays; and a
+    rollback's own snapshot is removed when *that* rollback is reversed, by
+    the mirror it carries, which is the same rule applied to its own event.
+    """
+    if payload.get(VERSION_STATE_KEY) is None:
+        return None
+    row = conn.execute(
+        "SELECT * FROM versions WHERE node_id = ? AND event_seq = ?",
+        (payload["before"]["id"], event_seq),
+    ).fetchone()
+    return None if row is None else _row_dict(row)
 
 
 def _reinsert_rows(conn: sqlite3.Connection, rows: list[dict[str, Any]]) -> None:
@@ -3233,6 +3663,13 @@ def undo(
             restored = _restore_row(conn, kind, table, before, principal, context)
         # An accept moved a version row too, recorded on this same event.
         version_state = _restore_version_state(conn, payload, principal, context)
+        # And it wrote a snapshot of the accepted node; reversing it takes the
+        # snapshot with it, recorded in `deleted` so a reversal of *this* puts
+        # it back (finding M9).
+        accept_snapshot = _accept_snapshot_row(conn, int(event["seq"]), payload)
+        if accept_snapshot is not None:
+            deleted.append({"table": "versions", "row": accept_snapshot})
+            conn.execute("DELETE FROM versions WHERE id = ?", (accept_snapshot["id"],))
         undo_payload: dict[str, Any] = {
             "reversed_seq": event["seq"],
             "reversed_op": event["op"],
@@ -3343,16 +3780,206 @@ def list_events(
         conn.close()
 
 
+def list_proposal_creations(
+    ids: list[str],
+    *,
+    path: str | Path | None = None,
+) -> set[str]:
+    """Which of ``ids`` were created by a ``propose`` op — a proposal, not a direct write.
+
+    The classification the curation job's acceptance rates need (M19): a
+    ``node.propose``/``edge.propose`` creation op means the row went through
+    the review queue, while a ``node.create``/``edge.create`` — an
+    ``edit``-grant write, a materialised wikilink, an ingest subgraph — landed
+    ``active`` directly and never was a proposal. Row state cannot tell the
+    two apart: both end ``active``, on accept or by grant. The creation
+    event's op is the distinction, so it is read here.
+
+    This is the **one deliberate exception to "the event log is a human
+    surface"** (:func:`list_events` refuses an agent), and it is shaped to
+    disclose nothing the caller does not already hold: it answers only about
+    the ids the caller supplies — the rows it read through its own grants —
+    one bit per id, no node, space or count beyond that. The parallel is
+    :func:`stop_requested`, the other deliberately not-human-only journal
+    read: a runner that cannot ask whether it was told to stop cannot obey,
+    and a curation job that cannot tell proposals from direct writes cannot
+    report an honest acceptance rate.
+
+    A row is classified by the op of the event that created it; a payload
+    with no ``after.id`` (an old or foreign event) classifies nothing.
+
+    Args:
+        ids: The row ids to classify. Ids with no ``propose`` creation event
+            are simply absent from the answer.
+        path: Explicit database path.
+
+    Returns:
+        The subset of ``ids`` whose creation event op was ``node.propose`` or
+        ``edge.propose``.
+    """
+    if not ids:
+        return set()
+    conn = _connect(path)
+    try:
+        created: set[str] = set()
+        for (payload,) in conn.execute(
+            "SELECT payload FROM events WHERE op IN ('node.propose', 'edge.propose')"
+        ).fetchall():
+            after = json.loads(payload).get("after")
+            if isinstance(after, dict) and isinstance(after.get("id"), str):
+                created.add(after["id"])
+        return created & set(ids)
+    finally:
+        conn.close()
+
+
+#: The only actor the synthesis verification accepts (M21) — the gardener, the
+#: one principal that writes through :mod:`nodum.consolidate`. ``actor_string``
+#: renders ``agent:<id>``; spelled here so :func:`_synthesized_creation_ids`
+#: holds the log's actor strings up against it.
+GARDENER_ACTOR = f"agent:{GARDENER_AGENT_ID}"
+
+
+def _synthesized_creation_ids(conn: sqlite3.Connection, ids: list[str]) -> set[str]:
+    """Which of ``ids`` were created by the gardener's abstraction write.
+
+    The verification behind :func:`is_synthesis` and
+    :func:`synthesized_node_ids`, over an open connection. A node is a
+    synthesis iff the event that created it was the gardener's abstraction
+    write — the op names the create (a node has exactly one create event), the
+    event's actor is the gardener, and its ``after.props.synthesized`` is
+    truthy. The event is append-only, so none of that is forgeable by a later
+    write: forging the props makes a *new* event (``node.update``), it does
+    not rewrite the create.
+
+    The scan-and-intersect shape mirrors :func:`list_proposal_creations`
+    (M19): one pass over the create events, cheap in SQLite's C filter and
+    paid per call rather than per candidate, so a batch of any size costs the
+    same single scan.
+
+    Args:
+        conn: The open connection (the caller commits).
+        ids: The row ids to classify. Ids with no qualifying create event are
+            simply absent from the answer.
+    """
+    wanted = set(ids)
+    if not wanted:
+        return set()
+    verified: set[str] = set()
+    for row in conn.execute(
+        "SELECT actor, payload FROM events WHERE op IN ('node.create', 'node.propose')"
+    ).fetchall():
+        if row["actor"] != GARDENER_ACTOR:
+            continue
+        after = json.loads(row["payload"]).get("after")
+        if not isinstance(after, dict) or not isinstance(after.get("id"), str):
+            continue
+        if after["id"] not in wanted:
+            continue
+        props = after.get("props")
+        if isinstance(props, str):
+            try:
+                props = json.loads(props)
+            except json.JSONDecodeError:
+                continue
+        if isinstance(props, dict) and props.get("synthesized"):
+            verified.add(after["id"])
+    return verified
+
+
+def is_synthesis(
+    node_id: str,
+    *,
+    conn: sqlite3.Connection | None = None,
+    path: str | Path | None = None,
+) -> bool:
+    """Whether ``node_id`` is a synthesis — a fact about the event that wrote it.
+
+    ``props.synthesized`` is forgeable by any writer (M21): a node whose props
+    carry the flag but whose create event was not the gardener's abstraction
+    write is not a synthesis, whatever its current props say. The distinction
+    lives in the append-only create event — its op names the create, its actor
+    is the gardener, and its ``after.props.synthesized`` is truthy. A forged
+    flag — at create or by a later ``update_node`` — makes an event with a
+    different actor or a different op; it does not rewrite the create.
+
+    This is the **second deliberate exception to "the event log is a human
+    surface"** (:func:`list_events` refuses an agent), beside
+    :func:`list_proposal_creations`, and it is shaped the same way: it answers
+    only about the id the caller already holds, one bit, no node, space or
+    count beyond that. It is what lets the review path settle a genuine
+    synthesis's membership edges with the concept (:func:`_settle_synthesis_edges`)
+    and what lets the abstraction job's freshness gate trust the flag it
+    itself wrote.
+
+    Args:
+        node_id: The node id to classify.
+        conn: An open connection to read through — for a caller already inside
+            a transaction (:func:`_settle_synthesis_edges`), where a second
+            connection could not see uncommitted writes and a bulk review's
+            immediate lock would refuse it outright.
+        path: Explicit database path, when ``conn`` is not given.
+
+    Returns:
+        ``True`` iff the node's create event was the gardener's synthesis
+        write.
+    """
+    if conn is None:
+        conn = _connect(path)
+        try:
+            return bool(_synthesized_creation_ids(conn, [node_id]))
+        finally:
+            conn.close()
+    return bool(_synthesized_creation_ids(conn, [node_id]))
+
+
+def synthesized_node_ids(
+    ids: list[str],
+    *,
+    conn: sqlite3.Connection | None = None,
+    path: str | Path | None = None,
+) -> set[str]:
+    """Which of ``ids`` are syntheses, verified against their create events.
+
+    The batched form of :func:`is_synthesis`, shaped like
+    :func:`list_proposal_creations`: the ids the caller supplies, answered one
+    bit each, nothing beyond. The abstraction job's freshness gate uses it over
+    the nodes whose props carry the marker, so a forged flag an ordinary agent
+    wrote cannot make the job skip a cluster (M21); the verification scans the
+    create events once whatever the batch size, so an attacker inflating the
+    candidate list pays the same single scan.
+
+    Args:
+        ids: The row ids to classify. Ids with no qualifying create event are
+            simply absent from the answer.
+        conn: An open connection to read through, when the caller has one.
+        path: Explicit database path, when ``conn`` is not given.
+
+    Returns:
+        The subset of ``ids`` whose create event was the gardener's synthesis
+        write.
+    """
+    if conn is None:
+        conn = _connect(path)
+        try:
+            return _synthesized_creation_ids(conn, ids)
+        finally:
+            conn.close()
+    return _synthesized_creation_ids(conn, ids)
+
+
 # ── Asset-pipeline events (design §5.5–§5.7): one named door into the log ─────
 
 #: The only ops :func:`record_asset_event` will write — an **allowlist**, not a
-#: ``asset.*`` prefix test. Ingestion (:mod:`nodum.ingest`) and the capability
-#: URLs (:mod:`nodum.urls`) live outside this module and need to append to the
-#: append-only log; a helper that took any dotted string would hand them the
-#: ability to forge a ``node.create`` or an ``undo``, which is a far larger
-#: door than either of them asked for.
+#: ``asset.*`` prefix test. Ingestion (:mod:`nodum.ingest`), the extraction
+#: write (:mod:`nodum.assets`) and the capability URLs (:mod:`nodum.urls`) live
+#: outside this module and need to append to the append-only log; a helper that
+#: took any dotted string would hand them the ability to forge a
+#: ``node.create`` or an ``undo``, which is a far larger door than either of
+#: them asked for.
 ASSET_EVENT_OPS = (
     "asset.ingest",
+    "asset.extract",
     "asset.download_url",
     "asset.upload_url",
     "asset.upload",
@@ -3388,13 +4015,16 @@ def record_asset_event(
     rebuild reads end to end) and never a live credential.
 
     **``actor`` is not a second identity channel.** Every caller that *has* a
-    principal must pass it; the string form exists for exactly one case, the
-    redemption of a capability URL, where there is no live principal **by
-    design** — a capability carries no ambient credential — and the only
-    truthful actor is the ``created_by`` already stored on the token row. It
-    is read from the database, never from a request, and no adapter may reach
-    this argument (the HTTP surface's ``_write`` refuses a caller-supplied
-    identity before anything gets here).
+    principal must pass it; the string form exists for exactly two cases,
+    neither with a live principal **by design**. One is the redemption of a
+    capability URL, where a capability carries no ambient credential and the
+    only truthful actor is the ``created_by`` already stored on the token row —
+    read from the database, never from a request, and no adapter may reach this
+    argument (the HTTP surface's ``_write`` refuses a caller-supplied identity
+    before anything gets here). The other is the extraction step
+    (:func:`nodum.assets.set_extracted_text` writing ``asset.extract``), which
+    takes no principal and is attributed to the system itself
+    (:data:`nodum.assets.EXTRACT_ACTOR`).
 
     **``conn`` keeps a spend and its audit entry in one transaction.** A
     single-use token whose redemption committed while its log entry did not
@@ -3406,8 +4036,10 @@ def record_asset_event(
         op: The event op; must be one of :data:`ASSET_EVENT_OPS`.
         payload: JSON-serialisable metadata describing what happened.
         principal: Who performed it. Required unless ``actor`` is given.
-        actor: Actor string read from stored state, for the credential-free
-            redemption path only. Mutually exclusive with ``principal``.
+        actor: Actor string for a caller with no principal: the capability
+            redemption path (read from stored state, never from a request) or
+            the principal-less extraction write (see :data:`nodum.assets.EXTRACT_ACTOR`).
+            Mutually exclusive with ``principal``.
         conn: An open connection to write within; the caller then commits.
             Defaults to a short-lived connection this function commits itself.
         path: Explicit database path; defaults to ``NODUM_DB`` resolution.
@@ -3424,7 +4056,15 @@ def record_asset_event(
         raise ValueError(f"op must be one of {ASSET_EVENT_OPS}, got {op!r}")
     if (principal is None) == (actor is None):
         raise ValueError("pass exactly one of principal= or actor=")
-    actor_string = actor if actor is not None else principal.actor_string
+    # The guard proves exactly one identity was passed. Prefer the explicit
+    # string; when it is absent, the principal — which the guard guarantees
+    # is present in that case — is the identity.
+    if principal is not None:
+        actor_string = principal.actor_string
+    elif actor is not None:
+        actor_string = actor
+    else:
+        raise RuntimeError("unreachable: the guard guarantees exactly one identity")
     if conn is not None:
         return _emit(conn, actor_string, op, payload)
     own_conn = _connect(path)
@@ -3434,6 +4074,169 @@ def record_asset_event(
         return seq
     finally:
         own_conn.close()
+
+
+# ── Auth events and the login lockout (finding M5): the other named door ──────
+
+#: The only ops :func:`record_auth_event` will write — the auth half of the
+#: audit trail. An allowlist, not a ``human.*`` prefix test, for the same
+#: reason :data:`ASSET_EVENT_OPS` is one: the HTTP adapter lives outside this
+#: module and needs to record that a login happened, not the ability to write
+#: any event it likes — a helper that took any dotted string could forge a
+#: ``node.create`` or an ``undo``.
+AUTH_EVENT_OPS = (
+    "human.login",
+    "human.login_failed",
+    "human.logout",
+)
+
+
+def record_auth_event(
+    op: str,
+    payload: dict[str, Any],
+    *,
+    path: str | Path | None = None,
+) -> int:
+    """Append one password-login event to the log — the auth half of the audit trail.
+
+    ``op`` must be named in :data:`AUTH_EVENT_OPS`; anything else is refused.
+    Like :func:`record_asset_event`, this is the one exported writer to the
+    log for its domain, and the allowlist is the point: :func:`_emit` stays
+    private, and the HTTP adapter — the only surface a password is ever
+    presented on — records login outcomes through this door and no other.
+
+    The log's ``actor`` is derived from the op, never taken from the caller:
+    a verified principal does not exist on every path here, and a request
+    must never be able to name an identity. ``human.login`` and
+    ``human.logout`` record the verified human (the payload must carry its
+    ``human_id``, and the actor is ``human:<id>``, exactly as the service's
+    own ``human.*`` events are attributed); ``human.login_failed`` carries
+    the **attempted** name — there is no verified principal on a failure, so
+    the actor column records the name the attempt claimed.
+
+    Payloads are metadata only: ids, the attempted name, a reason. Never a
+    password, and never a credential hash.
+
+    These events are **audit-only by construction**: :func:`undo` reverses
+    ``node.*`` / ``edge.*`` events only, so a ``human.*`` entry can be read
+    and listed forever and never replayed into state.
+
+    Args:
+        op: The event op; must be one of :data:`AUTH_EVENT_OPS`.
+        payload: JSON-serialisable metadata describing the login outcome.
+        path: Explicit database path; defaults to ``NODUM_DB`` resolution.
+
+    Returns:
+        The new event's ``seq``.
+
+    Raises:
+        ValueError: If ``op`` is not allowlisted, or the payload does not
+            name the identity the op's actor needs.
+    """
+    if op not in AUTH_EVENT_OPS:
+        raise ValueError(f"op must be one of {AUTH_EVENT_OPS}, got {op!r}")
+    if op == "human.login_failed":
+        name = payload.get("name")
+        if not isinstance(name, str):
+            raise ValueError("a 'human.login_failed' payload must carry the attempted 'name'")
+        actor = name
+    else:
+        human_id = payload.get("human_id")
+        if not isinstance(human_id, str):
+            raise ValueError(f"a {op!r} payload must carry the verified 'human_id'")
+        actor = f"human:{human_id}"
+    own_conn = _connect(path)
+    try:
+        seq = _emit(own_conn, actor, op, payload)
+        own_conn.commit()
+        return seq
+    finally:
+        own_conn.close()
+
+
+#: Failed login attempts within :data:`LOGIN_LOCKOUT_WINDOW_MINUTES` that lock
+#: a login name out of password login (finding M5). Five wrong attempts is a
+#: pattern rather than a typo streak, and the window means the count is about
+#: *recent* failures.
+LOGIN_MAX_FAILED_ATTEMPTS = 5
+
+#: How far back (minutes) a failed login still counts toward the lockout. The
+#: lockout clears once the window slides past enough failures — that is, after
+#: the attempts stop for the window's duration — so this one number is both
+#: the counting window and the cooldown.
+LOGIN_LOCKOUT_WINDOW_MINUTES = 15
+
+
+def login_failure_count(name: str, *, path: str | Path | None = None) -> int:
+    """How many recent failed login attempts ``name`` has absorbed.
+
+    The audit trail **is** the state: the count is read off the
+    ``human.login_failed`` events themselves, so there is no second record of
+    who failed to log in that could disagree with the log, and no migration.
+    The cost is one query per login attempt — a short scan of the events
+    table, fine at this scale.
+
+    Two rules keep the count honest rather than a stale total:
+
+    - **The window.** Only failures inside
+      :data:`LOGIN_LOCKOUT_WINDOW_MINUTES` count, so a burst long past does
+      not keep a name locked forever.
+    - **Reset on success.** Failures before the name's last successful login
+      are ignored — a success proves the human behind the name got through,
+      which is what "consecutive" means. The success event itself is the
+      reset: there is nothing to delete.
+
+    The count is per **attempted name**, existing account or not — the
+    lockout must not be an existence oracle, so it cannot look the name up
+    before deciding.
+
+    Args:
+        name: The login name the attempts claimed.
+        path: Explicit database path.
+
+    Returns:
+        The number of failed attempts within the window since the name last
+        logged in successfully.
+    """
+    conn = _connect(path)
+    try:
+        row = conn.execute(
+            """
+            SELECT COUNT(*) AS n
+            FROM events
+            WHERE op = 'human.login_failed'
+              AND json_extract(payload, '$.name') = ?
+              AND created_at >= datetime('now', ?)
+              AND seq > COALESCE(
+                  (SELECT MAX(e2.seq) FROM events e2
+                   JOIN humans h ON h.id = json_extract(e2.payload, '$.human_id')
+                   WHERE e2.op = 'human.login' AND h.name = ?),
+                  0)
+            """,
+            (name, f"-{LOGIN_LOCKOUT_WINDOW_MINUTES} minutes", name),
+        ).fetchone()
+        return int(row["n"])
+    finally:
+        conn.close()
+
+
+def login_is_locked(name: str, *, path: str | Path | None = None) -> bool:
+    """Whether password login for ``name`` is currently refused by the lockout.
+
+    The lockout applies to the **attempt**, not the account: the same failed
+    attempts against a name that does not exist lock it exactly as they would
+    a real one, so an attacker cannot learn which names exist by watching who
+    gets a 429.
+
+    Args:
+        name: The attempted login name.
+        path: Explicit database path.
+
+    Returns:
+        True when :func:`login_failure_count` has reached
+        :data:`LOGIN_MAX_FAILED_ATTEMPTS` within the window.
+    """
+    return login_failure_count(name, path=path) >= LOGIN_MAX_FAILED_ATTEMPTS
 
 
 def _type_out(row: sqlite3.Row) -> TypeOut | EdgeTypeOut:
@@ -3503,7 +4306,7 @@ def get_schema(
 
 
 #: Valid traversal directions: follow edges out of, into, or through a node.
-DIRECTIONS = ("out", "in", "both")
+DIRECTIONS = DIRECTIONS
 
 
 def _walk(
@@ -3512,8 +4315,9 @@ def _walk(
     *,
     type_ids: list[str] | None,
     depth: int,
-    direction: str,
+    direction: Direction,
     store: Store,
+    as_of: str | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Breadth-first walk over ``active`` edges; returns (node rows, edge rows).
 
@@ -3522,6 +4326,10 @@ def _walk(
     archived edges are never followed — reads default to the live graph. An
     edge is followed only when **both** endpoints are readable by the
     principal, so the walk never crosses into an unreadable space (Q13).
+
+    ``as_of`` swaps the lens from the live graph to the graph true at an
+    instant (D2): the walk then follows ``active`` edges plus ``archived``
+    ones whose validity window covered that instant (:func:`_as_of_edge_clause`).
     """
     start = _get_node_row(conn, start_id)
     if not store.node_visible(start):
@@ -3544,8 +4352,14 @@ def _walk(
             column = "src_id" if direction == "out" else "dst_id"
             where = f"{column} IN ({placeholders})"
         scope, scope_params = store.edge_scope()
-        sql = f"SELECT * FROM edges WHERE state = 'active' AND {where}{scope}"
-        params += scope_params
+        if as_of is not None:
+            # `as_of_clause` leads the WHERE, so its params lead the list.
+            as_of_clause, as_of_params = _as_of_edge_clause(as_of, DEFAULT_EDGE_STATES)
+            sql = f"SELECT * FROM edges WHERE {as_of_clause} AND {where}{scope}"
+            params = [*as_of_params, *params, *scope_params]
+        else:
+            sql = f"SELECT * FROM edges WHERE state = 'active' AND {where}{scope}"
+            params += scope_params
         if type_ids:
             sql += f" AND type_id IN ({','.join('?' * len(type_ids))})"
             params += type_ids
@@ -3568,12 +4382,15 @@ def get_neighborhood(
     node_id: str,
     *,
     depth: int = 1,
+    as_of: str | None = None,
     principal: Principal,
     path: str | Path | None = None,
 ) -> SubgraphOut:
     """Return a node plus its active-edge neighborhood out to ``depth`` hops.
 
     Depth 0 returns the node alone. Design §8.1 ``get_node(id, depth)``.
+    ``as_of`` reads the neighborhood as it was true at an instant (D2), the
+    same lens :func:`_walk` applies.
 
     Raises:
         NodeNotFound: If the id does not resolve, or is not readable.
@@ -3585,7 +4402,13 @@ def get_neighborhood(
     try:
         store = Store(conn, principal)
         nodes, edges = _walk(
-            conn, node_id, type_ids=None, depth=depth, direction="both", store=store
+            conn,
+            node_id,
+            type_ids=None,
+            depth=depth,
+            direction="both",
+            store=store,
+            as_of=as_of,
         )
         return SubgraphOut(
             root=node_id,
@@ -3602,7 +4425,8 @@ def traverse(
     *,
     edge_types: list[str] | None = None,
     depth: int = 2,
-    direction: str = "both",
+    direction: Direction = "both",
+    as_of: str | None = None,
     principal: Principal,
     path: str | Path | None = None,
 ) -> SubgraphOut:
@@ -3610,7 +4434,9 @@ def traverse(
 
     The pattern parameters (design §8.1 / T2): ``edge_types`` restricts the
     walk to those edge types (ids or names), ``depth`` caps the hops, and
-    ``direction`` (``out`` / ``in`` / ``both``) orients it.
+    ``direction`` (``out`` / ``in`` / ``both``) orients it. ``as_of`` reads
+    the graph as it was true at an instant (D2) — ``archived`` edges whose
+    window covered it are followed too (:func:`_walk`).
 
     Raises:
         NodeNotFound: If ``start_id`` does not resolve.
@@ -3630,7 +4456,13 @@ def traverse(
             else None
         )
         nodes, edges = _walk(
-            conn, start_id, type_ids=type_ids, depth=depth, direction=direction, store=store
+            conn,
+            start_id,
+            type_ids=type_ids,
+            depth=depth,
+            direction=direction,
+            store=store,
+            as_of=as_of,
         )
         return SubgraphOut(
             root=start_id,
@@ -3647,12 +4479,13 @@ def subgraph(
     *,
     depth: int = 2,
     edge_types: list[str] | None = None,
-    edge_states: list[str] | None = None,
+    edge_states: list[NodeState] | None = None,
     min_confidence: float | None = None,
     created_by: str | None = None,
     node_types: list[str] | None = None,
-    principal: Principal,
+    as_of: str | None = None,
     limit: int = 200,
+    principal: Principal,
     path: str | Path | None = None,
 ) -> SubgraphOut:
     """Walk a bounded, server-side-filtered neighborhood of one node.
@@ -3695,18 +4528,23 @@ def subgraph(
     renderer therefore never draws two nodes it is showing as unconnected when
     the stored graph connects them.
 
-    Args:
-        root_id: Node at the centre of the subgraph.
-        depth: Maximum hops from the root (0 returns the root alone).
-        edge_types: Edge type ids/names the walk may follow (default: any).
-        edge_states: Edge states the walk may follow (default:
-            :data:`DEFAULT_EDGE_STATES`, the live graph).
-        min_confidence: Floor on an edge's stored confidence.
-        created_by: Only follow edges written by this actor.
-        node_types: Node type ids/names that may be admitted (default: any).
-        limit: Hard cap on the number of nodes returned, root included,
-            clamped to :data:`MAX_SUBGRAPH_LIMIT`.
-        path: Explicit database path.
+        Args:
+            root_id: Node at the centre of the subgraph.
+            depth: Maximum hops from the root (0 returns the root alone).
+            edge_types: Edge type ids/names the walk may follow (default: any).
+            edge_states: Edge states the walk may follow (default:
+                :data:`DEFAULT_EDGE_STATES`, the live graph).
+            min_confidence: Floor on an edge's stored confidence.
+            created_by: Only follow edges written by this actor.
+            node_types: Node type ids/names that may be admitted (default: any).
+            as_of: Read the subgraph as it was true at an instant (D2): an
+                edge is followed iff its validity window covered it —
+                ``archived`` edges whose window covered the instant are
+                admitted even when ``edge_states`` does not name ``archived``
+                (:func:`_as_of_edge_clause`).
+            limit: Hard cap on the number of nodes returned, root included,
+                clamped to :data:`MAX_SUBGRAPH_LIMIT`.
+            path: Explicit database path.
 
     Returns:
         The subgraph, with ``truncated`` true when the node cap or the edge
@@ -3737,8 +4575,19 @@ def subgraph(
         root = _get_node_row(conn, root_id)
         if not store.node_visible(root):
             raise NodeNotFound(f"node not found: {root_id}")
-        edge_clauses = [f"state IN ({','.join('?' * len(states))})"]
-        edge_params: list[Any] = list(states)
+        edge_clauses: list[str] = []
+        edge_params: list[Any] = []
+        if as_of is not None:
+            # The window clause replaces the state filter: under as-of the
+            # filter only narrows which *live* states are followed, and a
+            # window-covered archived edge is admitted regardless — the walk
+            # shows the graph as it was true at the instant.
+            as_of_clause, as_of_params = _as_of_edge_clause(as_of, states)
+            edge_clauses.append(as_of_clause)
+            edge_params += as_of_params
+        else:
+            edge_clauses.append(f"state IN ({','.join('?' * len(states))})")
+            edge_params = list(states)
         scope, scope_params = store.edge_scope()
         if scope:
             edge_clauses.append(scope.removeprefix(" AND "))
@@ -3985,7 +4834,7 @@ def diff_versions(
 # ── Account and grant administration (Q13; human-only, event-logged) ──────────
 
 #: Grant levels accepted by :func:`grant` (hierarchical: read ⊂ suggest ⊂ edit).
-GRANT_LEVEL_NAMES = ("read", "suggest", "edit")
+GRANT_LEVEL_NAMES = GRANT_LEVEL_NAMES
 
 #: Shortest password :func:`set_human_password` accepts. A floor, not a policy:
 #: the empty string used to be storable over both surfaces and logged in fine.
@@ -4148,7 +4997,7 @@ def list_agents(*, principal: Principal, path: str | Path | None = None) -> list
 def create_agent(
     name: str,
     *,
-    kind: str = "external",
+    kind: AgentKind = "external",
     owner_human_id: str | None = None,
     grants: dict[str, str] | None = None,
     principal: Principal,
@@ -4303,10 +5152,10 @@ def disable_agent(agent_id: str, *, principal: Principal, path: str | Path | Non
     """Disable an agent: its token stops verifying; its proposals stay, flagged.
 
     Revocation is verification-time, so *when* it bites depends on the
-    surface (Q13 review S8): HTTP re-checks every request, but an MCP server
-    verifies its token once at launch and holds the principal for the life of
-    the process — a running ``nodum mcp serve`` keeps working until it exits.
-    Kill the process to be sure.
+    surface (Q13 review S8): HTTP re-checks every request, and the MCP server
+    re-verifies its token on every tool call — a running ``nodum mcp serve``
+    refuses its next call after the disable, on every surface. There is no
+    longer anything that outlives the disable to kill.
     """
     conn = _connect(path)
     try:
@@ -4333,7 +5182,7 @@ def enable_agent(agent_id: str, *, principal: Principal, path: str | Path | None
 def grant(
     agent_id: str,
     space: str,
-    level: str,
+    level: GrantLevel,
     *,
     principal: Principal,
     path: str | Path | None = None,
@@ -4564,6 +5413,11 @@ def archive_space(space: str, *, principal: Principal, path: str | Path | None =
     # including the structural refusal, which `_transition_row` owns so that
     # `archive <id>` cannot route around it.
     archived = transition(space_id, "archive", principal=principal, path=path)
+    if not isinstance(archived, NodeOut):
+        # Unreachable: a space id resolves to a space node, so the node branch
+        # of the transition is the only one that can apply. Stated so the
+        # declared NodeOut return is honest to the type checker.
+        raise RuntimeError("unreachable: archiving a space node returns a node")
     return archived
 
 
@@ -4638,14 +5492,14 @@ def list_spaces(*, principal: Principal, path: str | Path | None = None) -> list
 #: operation, and ``rollback`` is the cycle that takes another one back. The
 #: schema carries the same four; this is what refuses a fifth with a sentence
 #: instead of a bare ``IntegrityError``.
-CYCLE_TRIGGERS = ("manual", "scheduled", "curative", "rollback")
+CYCLE_TRIGGERS = CYCLE_TRIGGERS
 
 #: The statuses a cycle may be closed into. It opens ``running`` and leaves that
 #: state exactly once (:data:`CYCLE_STATUSES` is the schema's full set).
-CYCLE_CLOSED_STATUSES = ("completed", "failed", "rolled_back")
+CYCLE_CLOSED_STATUSES = CYCLE_CLOSED_STATUSES
 
 #: Every status a ``cycles`` row may hold.
-CYCLE_STATUSES = ("running", *CYCLE_CLOSED_STATUSES)
+CYCLE_STATUSES = CYCLE_STATUSES
 
 #: ``cycles.triggered_by`` for a scheduled cycle: nobody asked, the clock did.
 #: Derived from the trigger rather than taken as an argument, so no caller can
@@ -4657,7 +5511,7 @@ SCHEDULER_ACTOR = "scheduler"
 #: deliberately outside it: each is one short, human-driven operation, and
 #: blocking them for the length of a nightly sweep would take the curative tier
 #: offline every night.
-CONSOLIDATION_TRIGGERS = ("manual", "scheduled")
+CONSOLIDATION_TRIGGERS = CONSOLIDATION_TRIGGERS
 
 
 def _cycle_out(row: sqlite3.Row) -> CycleOut:
@@ -4743,7 +5597,7 @@ def _cycle_authority_spaces(principal: Principal, scope_id: str | None) -> set[s
 
 def open_cycle(
     *,
-    trigger: str,
+    trigger: CycleTrigger,
     scope: str | None = None,
     dry_run: bool = False,
     principal: Principal,
@@ -4756,7 +5610,7 @@ def open_cycle(
     it did.
 
     Opening one is curative-tier authority, gated by the same
-    :meth:`~nodum.store.Store.require_review` check accept/reject/archive use —
+    :meth:`~nodum.store.Store.require_review` check accept/reject use —
     a human, or ``edit`` on the space in question (see
     :func:`_cycle_authority_spaces` for what an unscoped cycle checks against).
     Humans hold it everywhere by construction.
@@ -4921,10 +5775,21 @@ def close_cycle(
             raise InvalidTransition(
                 f"cycle {cycle_id} is already {row['status']}: a cycle leaves 'running' once"
             )
-        conn.execute(
-            "UPDATE cycles SET status = ?, report = ?, finished_at = datetime('now') WHERE id = ?",
+        # `AND status = 'running'` is the atomic guard, not the read above: two
+        # concurrent closes both pass the read, and the second one's UPDATE then
+        # matches nothing — so exactly one close wins, and the rowcount is the
+        # honest refusal rather than the pre-check (finding M8, the
+        # `request_stop` shape).
+        cursor = conn.execute(
+            "UPDATE cycles SET status = ?, report = ?, finished_at = datetime('now')"
+            " WHERE id = ? AND status = 'running'",
             (status, json.dumps(report, ensure_ascii=False), cycle_id),
         )
+        if cursor.rowcount == 0:
+            raise InvalidTransition(
+                f"cycle {cycle_id} is already {_get_cycle_row(conn, cycle_id)['status']}: "
+                "a cycle leaves 'running' once"
+            )
         closed = _get_cycle_row(conn, cycle_id)
         conn.commit()
         return _cycle_out(closed)
@@ -4988,9 +5853,11 @@ def abandon_cycle(
             )
     finally:
         conn.close()
-    # Through `close_cycle`, so a cycle leaves `running` in exactly one place —
-    # including the re-check under the write, which is what makes the read above
-    # a message rather than a race.
+    # Through `close_cycle`, so a cycle leaves `running` in exactly one place.
+    # The read above is message-only: the race is closed by close_cycle's
+    # `UPDATE ... WHERE status = 'running'` and its rowcount check, which makes
+    # the second of two concurrent abandons a clean refusal instead of a
+    # double-close (finding M8).
     return close_cycle(
         cycle_id,
         status="failed",
@@ -5395,7 +6262,7 @@ def _readable_edge(conn: sqlite3.Connection, store: Store, edge_id: str) -> sqli
     """
     row = _get_edge_row(conn, edge_id)
     for endpoint in (row["src_id"], row["dst_id"]):
-        node = conn.execute("SELECT space_id FROM nodes WHERE id = ?", (endpoint,)).fetchone()
+        node = _get_node_row(conn, endpoint)
         if node is None or not store.node_visible(node):
             raise EdgeNotFound(f"edge not found: {edge_id}")
     return row
@@ -5532,6 +6399,10 @@ def merge_nodes(
     with _curative_cycle("merge_nodes", principal, path) as (cycle_id, report):
         conn = _connect(path)
         try:
+            # The mergeability checks below are reads the writes would otherwise
+            # race — two concurrent merges of the same tombstone both passing
+            # `_require_mergeable` (finding M8).
+            db.begin_immediate(conn)
             store = Store(conn, principal)
             actor = principal.actor_string
             survivor = _row_dict(_readable_node(conn, store, into))
@@ -5775,6 +6646,10 @@ def retype(
     with _curative_cycle("retype", principal, path) as (cycle_id, report):
         conn = _connect(path)
         try:
+            # Each id's already-a-type check is a read the UPDATE would
+            # otherwise race — two concurrent retypes of one node both passing
+            # it and both emitting an event (finding M8).
+            db.begin_immediate(conn)
             store = Store(conn, principal)
             actor = principal.actor_string
             # Resolved once, outside the loop: the type is the same for every
@@ -5845,11 +6720,12 @@ def supersede_edge(
 
     Two facts are recorded, because they are two different facts: ``valid_to``
     is closed (*when* it stopped being true) **and** the edge is ``archived``
-    (*it is no longer part of the live graph*). ``edges.valid_from`` /
-    ``valid_to`` have existed since migration ``0001`` and reach the frontend
-    type, and no writer in this codebase had ever set either; this is the first,
-    and it uses SQLite's own ``datetime('now')`` like every other timestamp
-    here, never a Python clock.
+    (*it is no longer part of the live graph*). The closure is written by the
+    shared edge-archive transition (:func:`_set_edge_state` — the same writer
+    every other active→archived path uses, so a supersede and a plain archive
+    cannot record different facts), with the ``superseded_by`` props write
+    riding on the same UPDATE; the timestamps use SQLite's own
+    ``datetime('now')`` like every other timestamp here, never a Python clock.
 
     When ``replacement`` is given it is created first and the two are linked
     through the ``supersedes``/``superseded_by`` vocabulary migration ``0001``
@@ -5923,12 +6799,14 @@ def supersede_edge(
             after_props = json.loads(before["props"])
             if new_edge is not None:
                 after_props["superseded_by"] = new_edge["id"]
-            conn.execute(
-                "UPDATE edges SET state = 'archived', valid_to = datetime('now'), props = ?"
-                " WHERE id = ?",
-                (json.dumps(after_props, ensure_ascii=False), before["id"]),
-            )
-            after = _row_dict(_get_edge_row(conn, before["id"]))
+            # The retirement itself goes through the shared edge-archive
+            # writer, so `valid_to` closes in exactly the same UPDATE shape —
+            # and records the same fact — as every other active→archived
+            # transition. The `superseded_by` props write rides on that same
+            # UPDATE (the writer takes `props`), so the row is written once;
+            # the `edge.archive` event it emits is the row move, and the
+            # `edge.supersede` event below carries the link on top of it.
+            after = _set_edge_state(conn, before, "archived", "archive", actor, props=after_props)
             payload: dict[str, Any] = {"before": before, "after": after}
             if new_edge is not None:
                 payload["replacement_id"] = new_edge["id"]
@@ -6060,6 +6938,9 @@ def _relink(
     """
     conn = _connect(path)
     try:
+        # The duplicate/skip checks below are reads the relink writes would
+        # otherwise race — two concurrent relinks both passing them (finding M8).
+        db.begin_immediate(conn)
         store = Store(conn, principal)
         actor = principal.actor_string
         clauses: list[str] = []
@@ -6228,12 +7109,13 @@ ROLLBACK_SUMMARY_OP = "cycle.rollback"
 
 #: Payload table names mapped to the kind of graph record they hold. This is the
 #: **conflict** map, not the reversal map (:data:`_REVERSIBLE_TABLES`): it is
-#: what reads an ``undo``'s reach out of its ``deleted`` list, and `versions`
-#: rows are absent because they carry no conflict of their own —
-#: :func:`_transition_row` is the only writer of ``versions.state`` and it moves
-#: a row out of ``proposed`` exactly once, so there is no later write for a
-#: rollback to collide with.
-_TABLE_KIND = {"nodes": "node", "edges": "edge"}
+#: what reads an ``undo``'s reach out of its ``deleted`` list. ``versions`` is
+#: absent because a version row's moves ride on the events themselves — an
+#: accept's move is recorded under :data:`VERSION_STATE_KEY` on the ``node.update``
+#: it caused, a reject is a ``version.`` event — and :func:`_touched_rows`
+#: resolves those by op; a version row *is* a potential conflict when one of
+#: those events moved it (finding M10), it just is not addressed by table name.
+_TABLE_KIND: dict[str, RollbackKind] = {"nodes": "node", "edges": "edge"}
 
 #: How many conflicts a refusal spells out before summarising the rest. The
 #: full list is always on the exception's ``conflicts``.
@@ -6374,7 +7256,7 @@ def _applies_a_merge(
     return kind == "node" and _merged_into(after) is not None and _merged_into(before) is None
 
 
-def _touched_rows(op: str, payload: dict[str, Any]) -> set[tuple[str, str]]:
+def _touched_rows(op: str, payload: dict[str, Any]) -> set[tuple[RollbackKind, str]]:
     """Every ``(kind, row_id)`` an event's payload says it wrote.
 
     An ``undo``'s reach is read too — the row it restored *and* the rows it
@@ -6382,23 +7264,52 @@ def _touched_rows(op: str, payload: dict[str, Any]) -> set[tuple[str, str]]:
     later cycle touched (undoing an ``edge.create`` deletes an edge a merge had
     relinked). Conflict detection that only read ``node.``/``edge.`` events
     would miss exactly that.
+
+    **Version rows are covered by op, not by table.** A review moves one from
+    one decision: the accept's move rides on the ``node.update`` it caused
+    under :data:`VERSION_STATE_KEY` (a rollback mirrors it), a reject is a
+    ``version.`` event of its own, and a rollback's removal of an accept's
+    snapshot row lands in the reversal's ``deleted`` — all three name the
+    ``versions`` row in a way this function reads, so a version row that moved
+    outside the cycle is a conflict like any other (finding M10).
     """
-    rows: set[tuple[str, str]] = set()
+    rows: set[tuple[RollbackKind, str]] = set()
     if op == "undo":
         reversed_kind = str(payload.get("reversed_op", "")).split(".", 1)[0]
         restored = payload.get("restored")
-        if restored is not None and reversed_kind in _TABLE_KIND.values():
-            rows.add((reversed_kind, restored["id"]))
-    elif op.split(".", 1)[0] in _TABLE_KIND.values():
-        kind = op.split(".", 1)[0]
-        for side in ("before", "after"):
-            row = payload.get(side)
-            if row is not None:
-                rows.add((kind, row["id"]))
+        if restored is not None:
+            for kind in _TABLE_KIND.values():
+                if kind == reversed_kind:
+                    rows.add((kind, restored["id"]))
+            if reversed_kind == "version":
+                rows.add(("version", str(restored["id"])))
     else:
-        return rows
+        prefix = op.split(".", 1)[0]
+        for kind in _TABLE_KIND.values():
+            if kind == prefix:
+                for side in ("before", "after"):
+                    row = payload.get(side)
+                    if row is not None:
+                        rows.add((kind, row["id"]))
+                break
+        else:
+            if prefix == "version":
+                for side in ("before", "after"):
+                    row = payload.get(side)
+                    if row is not None:
+                        rows.add(("version", str(row["id"])))
+            else:
+                return rows
+    # An accept moved the proposal's own row on the node.update it caused, and
+    # a rollback mirrors that move — a `versions.state` change that would
+    # otherwise ride on the event unseen.
+    recorded = payload.get(VERSION_STATE_KEY)
+    if recorded is not None:
+        rows.add(("version", str(recorded["before"]["id"])))
     for entry in payload.get("deleted", []):
         kind = _TABLE_KIND.get(entry.get("table", ""))
+        if kind is None and entry.get("table") == "versions":
+            kind = "version"
         if kind is not None:
             rows.add((kind, entry["row"]["id"]))
     return rows
@@ -6596,7 +7507,9 @@ def _rollback_blockers(
     log. Rows the reversal removes on its way are excluded: the pass goes newest
     first, so anything the cycle created *after* the row in question is already
     gone, as is any ``merge_redirects`` row the reversal of a merge takes with
-    it.
+    it — and, since ``edges.type_id`` became a guard, any edge the reversal
+    deletes: one the cycle created (reversed before the type node's create) or
+    one incident to a node it deletes (taken with it).
     """
     payloads = [(event, json.loads(event["payload"])) for event in events]
     created = [
@@ -6614,10 +7527,35 @@ def _rollback_blockers(
             event["op"].split(".", 1)[0], payload.get("before"), payload.get("after")
         )
     )
+    # Edges the reversal removes, for the `edges.type_id` guard's benefit: the
+    # ones the cycle created (their own create-reversal takes them out, newest
+    # first) and the ones incident to a node it deletes (taken with it by
+    # `_delete_created_row`). Both are gone before any doomed node's create is
+    # reversed, so counting either would refuse a rollback that in fact works.
+    doomed_edges = frozenset(
+        payload["after"]["id"]
+        for event, payload in payloads
+        if event["op"].startswith("edge.")
+        and payload.get("before") is None
+        and payload.get("after") is not None
+    )
+    if doomed_nodes:
+        marks = ", ".join("?" for _ in doomed_nodes)
+        doomed_edges |= frozenset(
+            str(row["id"])
+            for row in conn.execute(
+                f"SELECT id FROM edges WHERE src_id IN ({marks}) OR dst_id IN ({marks})",
+                (*doomed_nodes, *doomed_nodes),
+            ).fetchall()
+        )
     blockers: list[RollbackBlockerOut] = []
     for event, after in created:
         blocker = _delete_blocker(
-            conn, after["id"], doomed_nodes=doomed_nodes, doomed_redirects=doomed_redirects
+            conn,
+            after["id"],
+            doomed_nodes=doomed_nodes,
+            doomed_redirects=doomed_redirects,
+            doomed_edges=doomed_edges,
         )
         if blocker is not None:
             dependants, reason = blocker
@@ -6857,6 +7795,13 @@ def _apply_rollback(
         # *this* back re-applies the accept — the involution the rest of these
         # payloads already hold, at every depth.
         version_state = _restore_version_state(conn, payload, principal, context)
+        # The snapshot the accept wrote of the accepted node goes with it,
+        # recorded in `deleted` so that reversing *this* reversal re-inserts it
+        # (finding M9).
+        accept_snapshot = _accept_snapshot_row(conn, int(event["seq"]), payload)
+        if accept_snapshot is not None:
+            removed.append({"table": "versions", "row": accept_snapshot})
+            conn.execute("DELETE FROM versions WHERE id = ?", (accept_snapshot["id"],))
 
         reversal.update(
             {

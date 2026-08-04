@@ -1276,8 +1276,8 @@ def test_ask_is_reachable_only_from_a_surface_a_human_types_at():
     ``getattr``, to ``importlib.import_module`` and to a re-export through
     ``__init__``. ``_nodum_imports`` sees all of those and carries its own
     meta-test (:func:`test_llm.test_the_rail_sees_every_spelling_of_the_import`)
-    asserting so, after ``AGENTS.md`` recorded having to fix exactly this hole
-    in exactly this way once already.
+    asserting so, after ``docs/decisions.md`` recorded having to fix exactly
+    this hole in exactly this way once already.
 
     Two claims, and the second is the transitive one:
 
@@ -1591,6 +1591,46 @@ def test_a_question_the_search_cannot_serve_costs_no_model_call(graph):
     assert provider.calls == [], "nothing to answer from is not a question worth spending on"
     assert result.considered == []
     assert result.refusal and "search" in result.refusal
+
+
+def test_an_absent_term_with_embeddings_present_is_refused_not_answered(fresh_db, fake_embedder):
+    """Finding M20's gate: embeddings present, term absent → honest empty.
+
+    Before the vector similarity floor, an install with an embedding provider
+    answered a query whose term existed in no document ``k`` deep from the
+    nearest unrelated chunks: the model cited one or two of them, both
+    resolved against the retrieval, and ``answered: true`` carried
+    confidently wrong content — the project's own "empty becomes confidently
+    wrong" class, on the one install shape the keyword refusal never reached.
+    With the floor (``search._VECTOR_MIN_SIMILARITY``, cosine 0.5) the
+    nearest chunk is below the bar, search returns nothing, and ``ask``
+    refuses without spending a model call — the same honest empty the default
+    install always had. The fixture's single node keeps the control honest:
+    a query the graph *does* hold still answers from the vector signal.
+    """
+    node = service.create_node(
+        type="note",
+        title="Compaction",
+        content="A compacted topic works as a state store",
+        principal=owner(),
+    )
+    provider = FakeProvider(_reply("It is hosted on AWS.", ["1"]))
+    llm.set_provider(provider)
+
+    result = answers.ask("What does zarquon protect against?", principal=owner(), run=_run())
+
+    assert result.answered is False
+    assert result.answer is None
+    assert provider.calls == [], "nothing to answer from is not a question worth spending on"
+    assert result.considered == []
+    assert result.refusal and "search" in result.refusal
+
+    # The control: the same graph answers a query whose words it holds, from
+    # the same vector signal (cosine ≈ 0.60 against the node, above the bar).
+    llm.set_provider(FakeProvider(_reply("A compacted topic works as a state store.", ["1"])))
+    answered = answers.ask("compacted topic state store", principal=owner(), run=_run())
+    assert answered.answered is True
+    assert [citation.node_id for citation in answered.citations] == [node.id]
 
 
 def test_the_prompt_carries_only_what_was_retrieved(graph):
@@ -2686,8 +2726,8 @@ def test_ask_asks_for_its_own_measured_ceiling_rather_than_the_blanket_one(graph
     Measured over 24 samples on the real template — ``deepseek-v4-flash`` at
     ``high`` and at ``low``, and ``qwen3:8b`` on ollama — the worst output was
     **528** tokens. :data:`~nodum.answers.ASK_OUTPUT_TOKENS` is 2 048, which is
-    3.9x that and is also the number ``AGENTS.md`` records as ``qwen3:8b``'s
-    cure, so nothing local can regress.
+    3.9x that and is also the number ``docs/decisions.md`` records as
+    ``qwen3:8b``'s cure, so nothing local can regress.
     """
     provider = FakeProvider(_reply("compaction keeps the latest value", ["1"]))
     llm.set_provider(provider)

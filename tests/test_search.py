@@ -10,7 +10,7 @@ import httpx
 import pytest
 from helpers import OWNER_ACTOR, agent, owner
 
-from nodum import db, http_api, projectors, search, service
+from nodum import db, embeddings, http_api, projectors, search, service
 
 
 def test_search_returns_ranked_hits_with_snippet_and_signals(fresh_db):
@@ -49,6 +49,54 @@ def test_search_catches_the_projector_up_implicitly(fresh_db):
         principal=owner(),
     )
     assert [hit.title for hit in search.search("xylem", principal=owner()).hits] == ["T"]
+
+
+def test_a_corrupted_event_does_not_wedge_search(fresh_db):
+    """Finding M12's acceptance: corrupt one event and search still works.
+
+    Search catches the projectors up on every call, and before this fix one
+    unparseable event made `apply` raise forever — every search after the
+    corruption failed on the same row. The event is quarantined now: the
+    checkpoint advances past it, events after it still apply, and the search
+    answers from the index that survived.
+    """
+    good = service.create_node(
+        type="note", title="Good", content="xylem carries sap", principal=owner()
+    )
+    casualty = service.create_node(
+        type="note", title="Casualty", content="turbulence", principal=owner()
+    )
+    tail = service.create_node(type="note", title="Tail", content="phloem", principal=owner())
+    # Corrupt the middle event (`casualty`'s create): the payload column is
+    # no longer parseable JSON. The events before and after it must still
+    # project.
+    conn = db.connect(fresh_db)
+    try:
+        conn.execute("UPDATE events SET payload = '{not json' WHERE seq = 2")
+        conn.commit()
+    finally:
+        conn.close()
+
+    result = search.search("xylem", principal=owner())
+    assert [hit.node_id for hit in result.hits] == [good.id]
+    assert "bm25" in result.hits[0].signals
+
+    # The quarantine is visible through projector status, and only the
+    # corrupted event's node is missing from the index.
+    fts = {status.name: status for status in projectors.projector_status()}["fts"]
+    assert fts.skipped == 1
+    conn = db.connect(fresh_db)
+    try:
+        indexed = {row["node_id"] for row in conn.execute("SELECT node_id FROM node_fts")}
+    finally:
+        conn.close()
+    assert good.id in indexed and tail.id in indexed
+    assert casualty.id not in indexed
+
+    # A later search answers the same way — the checkpoint moved past the bad
+    # event, so nothing re-fails.
+    again = search.search("xylem", principal=owner())
+    assert [hit.node_id for hit in again.hits] == [good.id]
 
 
 def test_bm25_ranks_the_stronger_match_first(fresh_db):
@@ -236,6 +284,41 @@ def test_date_filters_apply_to_the_vector_signal_too(fresh_db, fake_embedder):
     )
 
 
+def test_chunks_from_a_different_model_are_invisible_to_the_vector_signal(fresh_db, fake_embedder):
+    """Finding M13: the KNN join filters on the active provider's `model_id`.
+
+    A chunk a different embedding model wrote lives in another vector space —
+    ranking it against this query would compare across spaces. The store has
+    carried `model_id` per chunk since migration 0006; this pins the read that
+    makes it matter: the same-model node keeps its `vector` signal, the
+    foreign-model node is returned by `bm25` alone.
+    """
+    provider = embeddings.get_provider()
+    same = service.create_node(
+        type="note", title="Same", content="xylem vessels", principal=owner()
+    )
+    other = service.create_node(
+        type="note", title="Other", content="xylem vessels", principal=owner()
+    )
+    projectors.run_projectors(names=["vec"])
+
+    conn = db.connect(fresh_db)
+    try:
+        conn.execute(
+            "UPDATE chunks SET model_id = ? WHERE node_id = ?",
+            (f"{provider.model_id}-other", other.id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    result = search.search("xylem", k=5, principal=owner())
+    by_id = {hit.node_id: hit for hit in result.hits}
+    assert "vector" in by_id[same.id].signals  # same-model chunk is retrieved
+    assert "vector" not in by_id[other.id].signals  # foreign-model chunk is not
+    assert by_id[same.id].score > by_id[other.id].score
+
+
 def test_k_limits_hits(fresh_db):
     for i in range(5):
         service.create_node(
@@ -250,6 +333,53 @@ def test_k_limits_hits(fresh_db):
 def test_empty_query_raises(fresh_db):
     with pytest.raises(ValueError, match="at least one term"):
         search.search("   ", principal=owner())
+
+
+def _set_validity(edge_id, valid_from, valid_to):
+    """Stamp an edge's window directly, past the writers (see test_service)."""
+    conn = db.connect()
+    try:
+        conn.execute(
+            "UPDATE edges SET valid_from = ?, valid_to = ? WHERE id = ?",
+            (valid_from, valid_to, edge_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_expand_as_of_follows_window_covered_edges(fresh_db):
+    """The D2/B8 gate, search-expansion form: the one-hop expansion follows
+    an edge at the instants its window covered, and the default search (no
+    ``as_of``) still reads the live graph."""
+    alpha = service.create_node(
+        type="concept",
+        title="graph alpha",
+        content="graph theory",
+        principal=owner(),
+    )
+    beta = service.create_node(
+        type="note",
+        title="graph beta",
+        content="graph theory",
+        principal=owner(),
+    )
+    edge = service.create_edge(alpha.id, beta.id, "supports", confidence=0.8, principal=owner())
+    service.transition(edge.id, "archive", principal=owner())
+    _set_validity(edge.id, "2026-08-01 10:00:00", "2026-08-01 10:00:10")
+
+    # Default expand: the retired edge is not followed.
+    default = search.search("graph alpha", expand=True, principal=owner())
+    assert [hit.node_id for hit in default.hits] == [alpha.id]
+    # As-of mid-window: the expansion crosses the retired edge.
+    mid = search.search("graph alpha", expand=True, as_of="2026-08-01 10:00:05", principal=owner())
+    assert [hit.node_id for hit in mid.hits] == [alpha.id, beta.id]
+    assert mid.hits[1].signals == {"graph": 0.8}
+    # As-of after the window closed: gone again.
+    later = search.search(
+        "graph alpha", expand=True, as_of="2026-08-01 10:00:20", principal=owner()
+    )
+    assert [hit.node_id for hit in later.hits] == [alpha.id]
 
 
 def test_no_match_returns_no_hits(fresh_db):
@@ -833,8 +963,8 @@ def test_the_refusal_closes_half_the_invented_subject_shape_and_the_number_is_th
 ):
     """What the gate tests is *knownness*, not discrimination — measured.
 
-    `AGENTS.md` claims the refusal for "a query whose content words the graph
-    has simply never seen", and a reader takes that to cover every question
+    `docs/decisions.md` claims the refusal for "a query whose content words the
+    graph has simply never seen", and a reader takes that to cover every question
     built around an invented subject. It does not. The gate fires only when
     **no** content word of the query is in the index, and the questions people
     actually type carry ordinary English nouns and verbs that a technical graph
@@ -844,7 +974,8 @@ def test_the_refusal_closes_half_the_invented_subject_shape_and_the_number_is_th
 
     So the honest number: **six of these twelve** answer with nothing, and the
     six that still answer are the six whose non-invented content words the
-    graph genuinely holds. That count is the number `AGENTS.md` quotes, which
+    graph genuinely holds. That count is the number `docs/decisions.md`
+    records, which
     is the whole reason it is asserted exactly rather than as a floor: change
     `_QUERY_STOPWORDS` or the ordering and this fails, and the prose has to be
     re-derived rather than left to drift. Against 0 of 12 silent under the
@@ -866,7 +997,9 @@ def test_the_refusal_closes_half_the_invented_subject_shape_and_the_number_is_th
         for query, _ in _INVENTED_SUBJECT_QUESTIONS
     }
     silent = {query for query, hits in answered.items() if not hits}
-    assert len(silent) == 6, f"AGENTS.md says six of twelve; measured {len(silent)}: {answered}"
+    assert len(silent) == 6, (
+        f"docs/decisions.md says six of twelve; measured {len(silent)}: {answered}"
+    )
     # Deleting the invented subject leaves the same ranked list. Read that for
     # what it is — a **fixture guard**, not evidence about the gate. A term
     # with `df == 0` is dropped before any weight is computed and `match` is

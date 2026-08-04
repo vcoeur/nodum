@@ -28,7 +28,7 @@ import { describeSpaceFilterFailure } from "./spaceFailure";
 import type { SpaceFilterFailure } from "./spaceFailure";
 import { SIGNAL_HELP, SIGNAL_KEYS, describeSignals, readVectorEvidence } from "./signals";
 import type { SignalKey } from "./signals";
-import { queryTerms } from "./snippet";
+import { queryTerms } from "./snippetTerms";
 import "./search.css";
 
 /**
@@ -58,6 +58,10 @@ const DEBOUNCE_MS = 200;
 
 /** Skeleton rows drawn during the very first search, so the list does not jump. */
 const SKELETON_ROWS = 5;
+
+/** The stable empty list a no-result render reads: a literal `[]` would be a
+ * fresh identity every render, re-running every memo keyed on the hits. */
+const EMPTY_HITS: SearchHit[] = [];
 
 /** Group headers for the "by signal" arrangement. */
 const GROUP_LABEL: Record<SignalKey, string> = {
@@ -227,7 +231,7 @@ export default function SearchView() {
 
   /* --- Display ------------------------------------------------------ */
 
-  const hits = result?.hits ?? [];
+  const hits = result?.hits ?? EMPTY_HITS;
   const terms = useMemo(() => queryTerms(query), [query]);
 
   // A hit in a space `GET /api/spaces` does not list is a hit in a space that

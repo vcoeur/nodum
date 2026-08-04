@@ -414,6 +414,92 @@ def test_the_last_enabled_human_cannot_disable_itself(fresh_db):
         service.disable_human(second.id, principal=auth.owner_principal(second.id))
 
 
+# ── Auth events and the login lockout (finding M5) ────────────────────────────
+
+
+def test_record_auth_event_writes_the_three_auth_ops_with_derived_actors(fresh_db):
+    """The actor comes from the op: the verified human, or the attempted name."""
+    service.record_auth_event("human.login", {"human_id": "owner"})
+    service.record_auth_event(
+        "human.login_failed", {"name": "owner", "reason": "invalid credentials"}
+    )
+    service.record_auth_event("human.logout", {"human_id": "owner"})
+
+    recorded = [e for e in service.list_events(owner(), limit=10) if e.op.startswith("human.")]
+    assert [(e.op, e.actor) for e in recorded] == [
+        ("human.logout", "human:owner"),
+        ("human.login_failed", "owner"),
+        ("human.login", "human:owner"),
+    ]
+
+
+def test_record_auth_event_refuses_ops_and_payloads_outside_its_allowlist(fresh_db):
+    """The allowlist is the point: no other op, no missing identity, no event."""
+    with pytest.raises(ValueError, match="op must be one of"):
+        service.record_auth_event("node.create", {"before": None, "after": {}})
+    with pytest.raises(ValueError, match="human_id"):
+        service.record_auth_event("human.login", {"name": "owner"})
+    with pytest.raises(ValueError, match="name"):
+        service.record_auth_event("human.login_failed", {"human_id": "owner"})
+    assert service.list_events(owner(), limit=10) == []
+
+
+def test_the_login_failure_count_is_per_name_and_window_bounded(fresh_db):
+    """The audit trail is the state: the count reads the failure events."""
+    service.record_auth_event(
+        "human.login_failed", {"name": "owner", "reason": "invalid credentials"}
+    )
+    service.record_auth_event(
+        "human.login_failed", {"name": "nobody", "reason": "invalid credentials"}
+    )
+
+    assert service.login_failure_count("owner") == 1
+    assert service.login_failure_count("nobody") == 1
+    assert service.login_failure_count("second") == 0  # a name no attempt claimed
+    assert service.login_is_locked("owner") is False
+
+    conn = db.connect()
+    try:
+        conn.execute(
+            "UPDATE events SET created_at = datetime('now', '-30 minutes')"
+            " WHERE op = 'human.login_failed'"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    assert service.login_failure_count("owner") == 0  # the window slid past them
+
+
+def test_a_successful_login_is_the_reset_boundary_for_the_failure_count(fresh_db):
+    """Failures before the last success do not count: the lockout clears."""
+    service.record_auth_event(
+        "human.login_failed", {"name": "owner", "reason": "invalid credentials"}
+    )
+    service.record_auth_event(
+        "human.login_failed", {"name": "owner", "reason": "invalid credentials"}
+    )
+    service.record_auth_event("human.login", {"human_id": "owner"})
+    service.record_auth_event(
+        "human.login_failed", {"name": "owner", "reason": "invalid credentials"}
+    )
+
+    assert service.login_failure_count("owner") == 1  # only the post-success miss
+    assert service.login_is_locked("owner") is False
+
+
+def test_login_is_locked_honours_the_module_constants(fresh_db, monkeypatch):
+    """The rule is injectable: lower the threshold and two misses lock."""
+    monkeypatch.setattr(service, "LOGIN_MAX_FAILED_ATTEMPTS", 2)
+    service.record_auth_event(
+        "human.login_failed", {"name": "owner", "reason": "invalid credentials"}
+    )
+    assert service.login_is_locked("owner") is False
+    service.record_auth_event(
+        "human.login_failed", {"name": "owner", "reason": "invalid credentials"}
+    )
+    assert service.login_is_locked("owner") is True
+
+
 # ── Grant administration (human-only, event-logged) ───────────────────────────
 
 

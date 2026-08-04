@@ -61,17 +61,20 @@ names a type from the *bytes*, over a vocabulary of what this system can act on
 audio containers, and text).
 
 **Evidence has two strengths, and the stored MIME depends on which it got.** A
-leading signature is a format identifying itself: definite, and it may overrule
-the filename's ``mimetypes.guess_type`` when the two name different families,
-because the name is chosen by whoever supplied the bytes while the stored MIME
-is what ``page:<n>`` rasters and extraction dispatch on — a PDF delivered as
-``scan.txt`` has to land as ``application/pdf`` or it reaches neither. The text
-heuristic is not that: it is a *window* test that can only say "nothing in
-these 4 KiB looks binary", so it may only **fill in** where the name guessed
-nothing (:func:`_stored_mime`, note 01 D3 as revised by review F3). So an SVG
-keeps ``image/svg+xml``, and ``application/json`` and ``application/xhtml+xml``
-keep themselves without a special-case list, because weak evidence can no longer
-overrule a specific guess.
+leading signature is a format identifying itself: definite, and it always beats
+the filename's ``mimetypes.guess_type``, because the name is chosen by whoever
+supplied the bytes while the stored MIME is what ``page:<n>`` rasters and
+extraction dispatch on — a PDF delivered as ``scan.txt`` *or* as
+``report.json`` has to land as ``application/pdf`` or it reaches neither.
+(Overruling used to be cross-family only, which let an ``application/*`` name
+keep its answer against an ``application/*`` signature: a real PDF called
+``report.json`` was stored as JSON and its bytes decoded as garbage text,
+finding M25.) The text heuristic is not that: it is a *window* test that can
+only say "nothing in these 4 KiB looks binary", so it may only **fill in**
+where the name guessed nothing (:func:`_stored_mime`, note 01 D3 as revised by
+review F3). So an SVG keeps ``image/svg+xml``, and ``application/json`` and
+``application/xhtml+xml`` keep themselves without a special-case list, because
+weak evidence can no longer overrule a specific guess.
 
 **A displaced PDF header is definite evidence too** — the readers this project
 uses scan for ``%PDF-`` rather than requiring it at offset 0, so a PDF behind a
@@ -109,15 +112,27 @@ import json
 import mimetypes
 import re
 import sqlite3
+from collections.abc import Buffer
 from dataclasses import dataclass
 from pathlib import Path
 
 from PIL import Image, ImageOps
 
-from nodum import db
+from nodum import db, service
 from nodum.models import AssetOut, PurgeResult, RenditionOut
 from nodum.principal import Principal
 from nodum.store import Store
+
+#: The actor recorded on the ``asset.extract`` event
+#: (:func:`set_extracted_text` writes one on every store or clear).
+#:
+#: Extraction has no principal: the step is a deterministic pipeline write on
+#: content-addressed base state, decided by bytes, not by an account, and the
+#: same "system" attribution the schema seeds use for the nodes and spaces it
+#: creates. An honest actor has to name the system, not a human who did not
+#: run the extractor — the principal who *triggered* an ingest is already on
+#: the run's own ``asset.ingest`` event.
+EXTRACT_ACTOR = "system"
 
 #: MIME type every rendition is encoded as (design §5.7).
 RENDITION_MIME = "image/webp"
@@ -418,9 +433,9 @@ class _Sniff:
     """What the bytes said, and how strongly they said it.
 
     ``definite`` is true only for a leading-signature match — a format
-    identifying itself, which may overrule a filename from another family. The
-    text heuristic sets it false, because a window test can never be more than
-    weak evidence (see :func:`_sniff_text`).
+    identifying itself, which always overrules a filename. The text heuristic
+    sets it false, because a window test can never be more than weak evidence
+    (see :func:`_sniff_text`).
     """
 
     mime: str | None
@@ -598,20 +613,25 @@ def _decodes_as_text(window: bytes, encoding: str, unit: int, *, skew: int) -> b
 
 
 def _mime_family(mime: str) -> str:
-    """Group a MIME into the family :func:`_stored_mime` compares on."""
+    """Group a MIME into the family :func:`_repaired_mime` compares on."""
     return mime.split("/", 1)[0]
 
 
 def _stored_mime(original_name: str, sniffed: _Sniff) -> str:
-    """Decide the MIME to record for a fresh registration (note 01 D3, review F3).
+    """Decide the MIME to record for a fresh registration (note 01 D3, review F3, finding M25).
 
     Two rules, one per strength of evidence:
 
-    * a **signature** may overrule the name when the two name different
-      families, and the name keeps its specificity *within* one family. So PDF
-      bytes called ``scan.txt`` are stored as ``application/pdf`` — which is
-      what ``page:<n>`` rasters and extraction dispatch on — while a PNG called
-      ``photo.jpeg`` keeps the name's answer, which no path here depends on.
+    * a **signature** always beats the name, whatever family the name
+      guessed. The signature is the format naming itself from its own bytes;
+      the name is chosen by whoever supplied the bytes, and the stored MIME
+      is what ``page:<n>`` rasters and extraction dispatch on — so PDF bytes
+      delivered as ``scan.txt`` *or* as ``report.json`` have to land as
+      ``application/pdf`` or they reach neither. The family comparison used
+      to let an ``application/*`` name keep its answer against an
+      ``application/*`` signature: a real PDF called ``report.json`` was
+      stored as JSON and its bytes decoded as garbage text by the ``text``
+      handler (finding M25).
     * the **text heuristic** may only fill in where the name guessed nothing.
       It is a window test, not an identification: a PDF whose ``%PDF-`` sits one
       byte in sniffs as text, and letting that overrule ``.pdf`` cost the
@@ -635,11 +655,28 @@ def _stored_mime(original_name: str, sniffed: _Sniff) -> str:
         guessed = None
     if sniffed.mime is None:
         return guessed or FALLBACK_MIME
-    if guessed is None:
+    if sniffed.definite:
         return sniffed.mime
-    if not sniffed.definite:
-        return guessed
-    return guessed if _mime_family(guessed) == _mime_family(sniffed.mime) else sniffed.mime
+    return guessed or sniffed.mime
+
+
+def stored_mime(source: str | Path, *, name: str) -> str:
+    """The MIME :func:`register_asset` will record for these bytes under this name.
+
+    Registration's own decision exposed as the public admission question: a
+    surface that must refuse before storing (``ingest_url``'s type policy,
+    finding M26) can ask what registration would record and refuse on that —
+    the sniff weighed against the name with the strength rules of
+    :func:`_stored_mime`, not a bare sniff a misnamed file would defeat.
+
+    Args:
+        source: Path to the file to inspect.
+        name: The name registration would record; its extension is the guess.
+
+    Returns:
+        The exact MIME :func:`register_asset` would store for the same input.
+    """
+    return _stored_mime(name, _sniff(source))
 
 
 def check_image_pixel_budget(
@@ -787,8 +824,10 @@ def register_asset(
 
         # `_sniff` reads a window from each end of the file, so neither this nor
         # the dedup branch above is a third *pass* over it — the hash and copy
-        # passes are the only full reads.
-        mime = _stored_mime(original_name, _sniff(source_file))
+        # passes are the only full reads. `stored_mime` is the public spelling
+        # of the same decision, so a surface refusing on type before storing
+        # asks exactly the question registration answers.
+        mime = stored_mime(source_file, name=original_name)
         # Metadata row, then a zero-filled blob of the right size, then the
         # bytes streamed into it — all in one transaction, so a crash mid-copy
         # rolls back rather than leaving a half-written asset.
@@ -830,8 +869,11 @@ def _repaired_mime(conn: sqlite3.Connection, row: sqlite3.Row, source_file: Path
 
     An ``UPDATE`` is how this table is already maintained: ``assets`` is
     content-addressed base state rather than graph state, so it carries no
-    principal and no event (:func:`set_extracted_text` is the precedent, and
-    migration 0007's comment the reason) — the same bytes always resolve to the
+    principal — there is nobody to authorise against, access being decided one
+    level up by the describing nodes — and this repair in particular writes no
+    event: unlike :func:`set_extracted_text`, whose ``asset.extract`` event the
+    ``fts`` projector consumes, nothing derived reads the stored MIME, so a log
+    entry would say the same thing twice. The same bytes always resolve to the
     same row, so there is nothing to undo.
 
     Returns:
@@ -979,16 +1021,21 @@ def set_extracted_text(
 ) -> None:
     """Store (or clear) the text an extraction handler pulled out of an asset.
 
-    Takes no principal and writes no event, for the same reason registration
-    does neither (migration ``0007``'s comment): an asset row is
-    content-addressed base state, not graph state. There is nothing to undo —
-    the same bytes always resolve to the same row, and re-extracting them lands
-    the same text — and there is nobody to authorise against here, because
-    access to an asset is decided one level up, by the ``asset_ref`` nodes that
-    describe the hash (see the module docstring's access note). The ingestion
-    pipeline that calls this emits the single ``asset.ingest`` event covering
-    the whole run, of which the extraction is one step; a second event would
-    only say the same thing again, with bytes-derived text in its payload.
+    Takes no principal, and the write itself is content-addressed base state,
+    not graph state — there is nothing to undo, and nobody to authorise
+    against, because access to an asset is decided one level up by the
+    ``asset_ref`` nodes that describe the hash (see the module docstring's
+    access note). But the write **is event-logged** (``asset.extract``, actor
+    :data:`EXTRACT_ACTOR`): the ``fts`` projector consumes the event, so text
+    stored *after* the describing node was already projected still reaches the
+    index, and a rebuild from event 0 replays the extraction instead of
+    depending on the live table alone (finding M14).
+
+    The payload is metadata only — ``asset_hash`` plus a character count,
+    never the text itself: bytes-derived text in an event payload is what the
+    asset store's docstring and the ``asset.ingest`` rule both avoid, and the
+    projector re-reads the stored text through its live join when it replays
+    the event.
 
     Args:
         asset_hash: The asset's sha256.
@@ -1005,7 +1052,16 @@ def set_extracted_text(
             "UPDATE assets SET extracted_text = ? WHERE hash = ?", (text, asset_hash)
         )
         if cursor.rowcount == 0:
+            conn.rollback()
             raise AssetNotFound(f"asset not found: {asset_hash}")
+        # The UPDATE and its event share one transaction: a text that landed
+        # with no log entry would be exactly the gap a rebuild cannot see.
+        service.record_asset_event(
+            "asset.extract",
+            {"asset_hash": asset_hash, "chars": len(text) if text else 0},
+            actor=EXTRACT_ACTOR,
+            conn=conn,
+        )
         conn.commit()
     finally:
         conn.close()
@@ -1044,12 +1100,18 @@ class _BlobReader(io.RawIOBase):
     def seekable(self) -> bool:
         return True
 
-    def readinto(self, buffer: memoryview) -> int:
+    def readinto(self, buffer: Buffer, /) -> int:
+        # `RawIOBase.readinto` takes a writeable buffer (typeshed's
+        # WriteableBuffer is an alias for the PEP 688 Buffer, which the type
+        # system cannot distinguish from a read-only one). Every Buffer can be
+        # wrapped in a memoryview — that is the buffer protocol's contract —
+        # and the view carries the slice-assign `__setitem__` the body needs.
+        view = memoryview(buffer)
         if self._position >= self._size:
             return 0
         self._blob.seek(self._position)
-        chunk = self._blob.read(min(len(buffer), self._size - self._position))
-        buffer[: len(chunk)] = chunk
+        chunk = self._blob.read(min(len(view), self._size - self._position))
+        view[: len(chunk)] = chunk
         self._position += len(chunk)
         return len(chunk)
 
@@ -1096,7 +1158,7 @@ def _downscale(image: Image.Image, profile: Profile) -> Image.Image:
     render paths — stored image and PDF page — end here, so the "never upscale"
     rule has one home.
     """
-    image.thumbnail((profile.max_edge, profile.max_edge), Image.LANCZOS)
+    image.thumbnail((profile.max_edge, profile.max_edge), Image.Resampling.LANCZOS)
     return image
 
 
@@ -1135,7 +1197,11 @@ def _render_pdf_page(original: sqlite3.Blob, page_number: int, profile: Profile)
             "install the 'pdf' extra (pip install 'nodum[pdf]') to render PDF pages"
         ) from exc
 
-    scale = PAGE_DPI / 72  # PDFium scales the page's own 1/72-inch canvas unit.
+    # PDFium scales the page's own 1/72-inch canvas unit. Integral division is
+    # exact here: PAGE_DPI is a whole multiple of 72 by design (144 DPI is
+    # exactly 2× the page's coordinate space — see its rationale), so the scale
+    # is a genuine int, which is what pypdfium2's render() takes.
+    scale = PAGE_DPI // 72
     try:
         document = pypdfium2.PdfDocument(io.BufferedReader(_BlobReader(original)))
     except pypdfium2.PdfiumError as exc:

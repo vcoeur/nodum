@@ -508,6 +508,51 @@ def test_the_stored_mime_prefers_a_signature_over_a_name_from_another_family(
     assert assets.register_asset(source).mime == expected
 
 
+def test_pdf_bytes_named_json_keep_the_pdf_type(fresh_db, tmp_path):
+    """Finding M25: a definite signature beats the name *within* a family too.
+
+    `application/json` and `application/pdf` share a family, so the old
+    cross-family comparison let the name win and a real PDF called
+    `report.json` was stored as JSON — reaching the `text` handler, which
+    decoded the raw PDF bytes as replacement-character garbage. The stored
+    MIME is what extraction dispatches on, so the bytes themselves have to
+    name the type, whatever the extension says.
+    """
+    pdf = _make_pdf(tmp_path / "real.pdf")
+    misnamed = tmp_path / "report.json"
+    misnamed.write_bytes(pdf.read_bytes())
+
+    asset = assets.register_asset(misnamed)
+
+    assert asset.mime == "application/pdf"
+    # The dispatch chain: the stored MIME, not the name, picks the handler.
+    assert extract.handler_for(asset.mime).name == "pdf"
+    if find_spec("pypdf") is not None:
+        result = extract.extract(misnamed, mime=asset.mime)
+        assert result.handler == "pdf"
+        assert "alpha" in result.text and "beta" in result.text
+
+
+def test_text_bytes_named_pdf_keep_the_pdf_name_and_degrade_cleanly(fresh_db, tmp_path):
+    """Finding M25's control: an *indefinite* sniff still loses to the name.
+
+    Prose has no magic signature, so the name's `application/pdf` wins — and
+    the PDF handler, handed bytes that are not a PDF, degrades to an empty
+    result with a `detail` rather than letting garbage into the graph.
+    """
+    misnamed = tmp_path / "report.pdf"
+    misnamed.write_bytes(b"Just prose that is not a PDF at all.\n" * 10)
+
+    asset = assets.register_asset(misnamed)
+
+    assert asset.mime == "application/pdf"
+    if find_spec("pypdf") is not None:
+        result = extract.extract(misnamed, mime=asset.mime)
+        assert result.text == ""
+        assert result.detail is not None
+        assert "failed" in result.detail
+
+
 def test_a_shifted_pdf_header_keeps_the_name_the_bytes_cannot_provide(fresh_db, tmp_path):
     """The text heuristic is a window guess, and it used to outrank a real name.
 

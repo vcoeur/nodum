@@ -44,6 +44,15 @@ theme:
 extra_css:
   - assets/stylesheets/extra.css
 
+# Mermaid is vendored locally (docs/assets/js/mermaid.min.js) so the built
+# site makes zero third-party fetches; mkdocs-material 9.7.7 skips its CDN
+# fallback as soon as a `mermaid` global exists. Order matters: the vendor
+# bundle must load before the init snippet (both are classic scripts that run
+# before material's DOMContentLoaded handlers).
+extra_javascript:
+  - assets/js/mermaid.min.js
+  - assets/js/mermaid-init.js
+
 extra:
   social:
     - icon: fontawesome/brands/github
@@ -82,5 +91,19 @@ nav:
   - Quick start: quick-start.md
   - Concepts: concepts.md
   - Architecture: architecture.md
+  - Decisions: decisions.md
   - Commands: commands.md
+  - HTTP API: http-api.md
   - Legal: legal.md
+
+# mkdocs 1.6 defaults `validation.nav.omitted_files` and
+# `validation.links.anchors` to INFO, which `--strict` does not promote to a
+# failure — so an orphan page or a broken anchor used to build clean and even
+# deploy. Raising them to WARN is what makes them fail the build, since
+# `--strict` fails on any warning. (`nav.not_found` / `links.not_found` are
+# already WARN by default and need no entry here.)
+validation:
+  nav:
+    omitted_files: warn
+  links:
+    anchors: warn

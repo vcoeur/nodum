@@ -239,6 +239,7 @@ function rollback(overrides: Partial<RollbackOut> = {}): RollbackOut {
     skipped_events: [],
     restored_nodes: [],
     restored_edges: [],
+    restored_versions: [],
     deleted_nodes: [],
     deleted_edges: [],
     redirects_removed: [],
@@ -1190,7 +1191,7 @@ describe("abandonAvailability", () => {
   it("refuses a cycle that has already said how it ended, in those words", () => {
     // `service.abandon_cycle`'s one refusal, stated in front of the button
     // rather than met after clicking it.
-    for (const status of ["completed", "failed", "rolled_back"]) {
+    for (const status of ["completed", "failed", "rolled_back"] as const) {
       const verdict = abandonAvailability(cycle({ status }));
       expect(verdict.available).toBe(false);
       expect(verdict.reason).toContain(`closed ${status}`);
@@ -1243,7 +1244,7 @@ describe("stopAvailability", () => {
   });
 
   it("refuses a cycle that has already said how it ended, and says a stop needs a live run", () => {
-    for (const status of ["completed", "failed", "rolled_back"]) {
+    for (const status of ["completed", "failed", "rolled_back"] as const) {
       const verdict = stopAvailability(cycle({ status }));
       expect(verdict.available).toBe(false);
       expect(verdict.reason).toContain(`closed ${status}`);
@@ -1760,17 +1761,18 @@ describe("describeEvent", () => {
     expect(fields).toContain("confidence");
     // `props` came back as the empty object, so there is nothing to read.
     expect(fields).not.toContain("props");
-    // Neither validity column has a value on a fresh edge; `valid_from` still
-    // has no writer anywhere in the system.
+    // Neither validity column has a value on a fresh edge — a create does not
+    // close a window and a directly-created active edge is written valid_from
+    // in the row, not as a diff field here.
     expect(fields).not.toContain("valid_from");
     expect(fields).not.toContain("valid_to");
     expect(change.fields.every((field) => field.before === null)).toBe(true);
   });
 
   it("shows valid_to closing beside the archive, because they are two facts", () => {
-    // A supersede records both — `valid_to` (when it stopped being true) and
+    // A retirement records both — `valid_to` (when it stopped being true) and
     // `archived` (it is no longer live) — and the diff showed only the second,
-    // which is half of the only write this wave gave that column.
+    // which is half of the write that closes an edge's window.
     const change = describeEvent(
       event({
         seq: 51,

@@ -2,13 +2,16 @@
  * Route `/review` — the review queue.
  *
  * This is the safety-critical view. Everything it can do writes or retires live
- * state, which the service layer reserves to the `human` actor
- * (`_require_human_reviewer` over `HUMAN_ONLY_ACTIONS`, at the transition choke
- * point). The HTTP surface *is* the human surface: it forces `actor="human"`
- * server-side and exposes no request field that sets one, and the typed client
- * has no actor parameter anywhere. There is therefore nothing in this view that
- * chooses a reviewer identity — no picker, no setting, no header. If that ever
- * looks like a missing feature, it is the guarantee working.
+ * state, which the service layer gates at the transition choke point:
+ * `accept`/`reject` need a human or an `edit` grant on the item's space
+ * (`Store.require_review`), while `archive` and `undo` are strictly human
+ * (`Store.require_human`) — retiring or resurrecting live state is not
+ * in-space authority. The HTTP surface *is* the human surface: it forces
+ * `actor="human"` server-side and exposes no request field that sets one, and
+ * the typed client has no actor parameter anywhere. There is therefore nothing
+ * in this view that chooses a reviewer identity — no picker, no setting, no
+ * header. If that ever looks like a missing feature, it is the guarantee
+ * working.
  */
 
 import { ReviewInbox } from "./ReviewInbox";

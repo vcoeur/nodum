@@ -119,6 +119,34 @@ def test_edge_create_and_list(fresh_db):
     assert listing["edges"][0]["id"] == edge["id"]
 
 
+def test_edge_list_as_of(fresh_db):
+    """The D2/B8 gate through the CLI: a closed window hides the edge from the
+    live read and from an as-of read after the close, and shows it at the
+    instants the window covered."""
+    a = _run_json("node", "create", "--type", "claim", "--title", "A")
+    b = _run_json("node", "create", "--type", "claim", "--title", "B")
+    edge = _run_json("edge", "create", a["id"], b["id"], "--type", "supports")
+    retired = _run_json("archive", edge["id"])
+    assert retired["state"] == "archived"
+    assert retired["valid_to"]
+
+    # A deterministic window, exactly as test_service stamps it.
+    conn = db.connect()
+    try:
+        conn.execute(
+            "UPDATE edges SET valid_from = ?, valid_to = ? WHERE id = ?",
+            ("2026-08-01 10:00:00", "2026-08-01 10:00:10", edge["id"]),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    assert _run_json("edge", "list", "--state", "active")["edges"] == []
+    mid = _run_json("edge", "list", "--as-of", "2026-08-01 10:00:05")
+    assert [e["id"] for e in mid["edges"]] == [edge["id"]]
+    assert _run_json("edge", "list", "--as-of", "2026-08-01 10:00:20")["edges"] == []
+
+
 def test_state_transitions_and_actor(fresh_db):
     # A suggest-level agent's write (via the service; the CLI is human-only).
     proposed = service.create_node(type="note", title="bot", principal=agent("test"))
@@ -162,6 +190,7 @@ def test_every_list_command_reports_a_count(fresh_db):
         (("ingest", "handlers"), "handlers"),
         (("projector", "run"), "projectors"),
         (("projector", "status"), "projectors"),
+        (("projector", "skips"), "skips"),
         (("cycle-list",), "cycles"),
     ):
         payload = _run_json(*args)
@@ -344,8 +373,12 @@ def test_search(fresh_db):
 
 
 def test_search_hybrid_signals_over_the_cli(fresh_db, fake_embedder):
+    # "xylem vessels" (with the "Sap" title) keeps this above the vector
+    # similarity floor: the pre-floor fixture "xylem carries sap" repeated
+    # "sap" across title and content, which diluted the HashEmbedder cosine
+    # to 0.59 — below search._VECTOR_MIN_SIMILARITY — and dropped the signal.
     node = _run_json(
-        "node", "create", "--type", "note", "--title", "Sap", "--content", "xylem carries sap"
+        "node", "create", "--type", "note", "--title", "Sap", "--content", "xylem vessels"
     )
     result = _run_json("search", "xylem")
     hit = result["hits"][0]
@@ -376,6 +409,7 @@ def test_projector_run_status_rebuild(fresh_db):
         "from_seq": 0,
         "to_seq": 1,
         "detail": None,
+        "skipped": 0,
     }
     assert by_name["vec"]["applied"] == 0
     assert by_name["vec"]["detail"]
@@ -394,6 +428,37 @@ def test_projector_rebuild_unknown_exits_1(fresh_db):
     result = runner.invoke(app, ["projector", "rebuild", "nope"])
     assert result.exit_code == 1
     assert "unknown projector" in result.stderr
+
+
+def test_projector_skips_lists_quarantined_events(fresh_db):
+    """Finding M12's CLI half: the quarantine has a read surface.
+
+    `projector status` reports the count; `projector skips` lists the rows
+    behind it, so a human can see which event was skipped and why.
+    """
+    _run_json("node", "create", "--type", "note", "--title", "one", "--content", "xylem")
+    _run_json("node", "create", "--type", "note", "--title", "two", "--content", "phloem")
+    conn = db.connect(fresh_db)
+    try:
+        conn.execute("UPDATE events SET payload = '{not json' WHERE seq = 1")
+        conn.commit()
+    finally:
+        conn.close()
+
+    runs = _run_json("projector", "run")
+    fts = {run["name"]: run for run in runs["projectors"]}["fts"]
+    assert fts["skipped"] == 1
+    assert fts["applied"] == 1
+
+    status = _run_json("projector", "status")
+    statuses = {entry["name"]: entry for entry in status["projectors"]}
+    assert statuses["fts"]["skipped"] == 1
+
+    skips = _run_json("projector", "skips")
+    assert skips["count"] == 1
+    (row,) = skips["skips"]
+    assert (row["projector"], row["seq"], row["op"]) == ("fts", 1, "node.create")
+    assert "JSONDecodeError" in row["error"]
 
 
 def test_node_get_with_depth(fresh_db):
@@ -437,14 +502,45 @@ def test_edge_create_batch_from_stdin(fresh_db):
     suggestions = json.dumps(
         [
             {"src": a["id"], "dst": b["id"], "edge_type": "relates_to"},
-            {"src": a["id"], "dst": "missing", "edge_type": "supports"},
+            {"src": a["id"], "dst": b["id"], "edge_type": "supports"},
         ]
     )
     result = runner.invoke(app, ["edge", "create-batch", "-", "--as", "owner"], input=suggestions)
     assert result.exit_code == 0, result.output
     outcome = json.loads(result.stdout)
-    assert outcome["created"][0]["state"] == "active"
-    assert outcome["failed"][0]["index"] == 1
+    assert [edge["state"] for edge in outcome["created"]] == ["active", "active"]
+    assert outcome["failed"] == []
+
+
+def test_an_edge_create_batch_that_wrote_nothing_does_not_exit_zero(fresh_db):
+    """`edge create-batch`'s half of the batch rule: refusals buy exit 1.
+
+    `retype`'s defect, the batch-edge surface: the envelope reported every
+    suggestion in `failed[]` and the command still exited **0** — the one thing
+    a script reads. `ingest file`'s rule applies here too: a run that wrote
+    nothing must not report success. The identifier on the stderr line is the
+    input index, not an id — that is all a suggestion has.
+    """
+    a = _run_json("node", "create", "--type", "concept", "--title", "A")
+    b = _run_json("node", "create", "--type", "concept", "--title", "B")
+    suggestions = json.dumps(
+        [
+            {"src": a["id"], "dst": "missing", "edge_type": "supports"},
+            {"src": "also-missing", "dst": b["id"], "edge_type": "relates_to"},
+        ]
+    )
+    result = runner.invoke(app, ["edge", "create-batch", "-", "--as", "owner"], input=suggestions)
+
+    assert result.exit_code == 1
+    outcome = json.loads(result.stdout)
+    assert outcome["created"] == []
+    assert [failure["index"] for failure in outcome["failed"]] == [0, 1]
+    # The index is the name on stderr, and the reason rides along beside it.
+    assert "failed 0:" in result.stderr
+    assert "failed 1:" in result.stderr
+    assert isinstance(result.exception, SystemExit)
+    # The graph wrote nothing at all.
+    assert _run_json("edge", "list")["count"] == 0
 
 
 def test_search_date_filters(fresh_db):
@@ -481,6 +577,38 @@ def test_search_filters_and_expand(fresh_db):
     assert expanded["hits"][1]["signals"]["graph"] > 0
 
 
+def test_search_as_of_reads_expansion_through_the_validity_window(fresh_db):
+    """The D2/B8 gate through the CLI: `--as-of` re-opens the expansion to a
+    retired edge at the instants its window covered."""
+    a = _run_json("node", "create", "--type", "concept", "--title", "xylem alpha")
+    b = _run_json("node", "create", "--type", "note", "--title", "xylem beta")
+    edge = _run_json(
+        "edge", "create", a["id"], b["id"], "--type", "supports", "--confidence", "0.9"
+    )
+    _run_json("archive", edge["id"])
+
+    conn = db.connect()
+    try:
+        conn.execute(
+            "UPDATE edges SET valid_from = ?, valid_to = ? WHERE id = ?",
+            ("2026-08-01 10:00:00", "2026-08-01 10:00:10", edge["id"]),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    live = _run_json("search", "xylem alpha", "--expand")
+    assert [hit["node_id"] for hit in live["hits"]] == [a["id"]]
+    mid = _run_json("search", "xylem alpha", "--expand", "--as-of", "2026-08-01 10:00:05")
+    assert [hit["node_id"] for hit in mid["hits"]] == [a["id"], b["id"]]
+    # `--nl` layers the rewrite on the identical filters; with no provider it
+    # is a no-op that searches the original words, so as-of still applies.
+    nl_mid = _run_json(
+        "search", "xylem alpha", "--expand", "--nl", "--as-of", "2026-08-01 10:00:05"
+    )
+    assert [hit["node_id"] for hit in nl_mid["hits"]] == [a["id"], b["id"]]
+
+
 def test_agent_update_proposes_and_review_accepts(fresh_db):
     note = _run_json("node", "create", "--type", "note", "--title", "N", "--content", "original")
     # The CLI is human-only (agents use MCP); a suggest-level agent's update is
@@ -494,6 +622,32 @@ def test_agent_update_proposes_and_review_accepts(fresh_db):
     accepted = _run_json("accept", str(version.id))
     assert accepted["state"] == "applied"
     assert _run_json("node", "get", note["id"])["content"] == "bot rewrite"
+
+
+def test_review_accept_applies_and_a_refused_batch_does_not_exit_zero(fresh_db):
+    """`review accept`'s half of the batch rule: refusals buy exit 1.
+
+    The single-id `accept` fails loudly through `_run`, but the batch surface
+    reported its refusals in `failed[]` and still exited **0** — `ingest file`'s
+    rule, which every batch command follows: the envelope is printed whatever
+    happened, each refused id is named on stderr, and a run that accomplished
+    nothing must not report success to a script that only reads the code.
+    """
+    proposal = service.create_node(type="note", title="Bot note", principal=agent("researcher"))
+    assert proposal.state == "proposed"
+
+    accepted = _run_json("review", "accept", proposal.id)
+    assert accepted["transitioned"] == [proposal.id]
+    assert accepted["failed"] == []
+    assert _run_json("node", "get", proposal.id)["state"] == "active"
+
+    refused = runner.invoke(app, ["review", "accept", "no-such-proposal", "--as", "owner"])
+    assert refused.exit_code == 1
+    payload = json.loads(refused.stdout)
+    assert payload["transitioned"] == []
+    assert [failure["id"] for failure in payload["failed"]] == ["no-such-proposal"]
+    assert "failed no-such-proposal:" in refused.stderr
+    assert isinstance(refused.exception, SystemExit)
 
 
 # ── mcp serve: the actor is validated before anything is served ───────────────
@@ -1188,6 +1342,29 @@ def test_consolidate_selects_jobs_and_a_scope(fresh_db):
     assert scoped["report"]["scope"] == "main"
 
 
+def test_consolidate_refuses_a_repeated_job_name(fresh_db):
+    """M18: `--job abstraction --job abstraction` is the same work twice.
+
+    Each invocation mints a fresh full budget, so a repeat would spend 2x
+    `NODUM_LLM_CYCLE_BUDGET` and file a second report over the same graph —
+    refused before any cycle opens, like a misspelled job name.
+    """
+    result = runner.invoke(
+        app, ["consolidate", "--job", "abstraction", "--job", "abstraction", "--as", "owner"]
+    )
+
+    assert result.exit_code == 1
+    assert "duplicate consolidation job(s): abstraction" in result.stderr
+    assert isinstance(result.exception, SystemExit)
+
+
+def test_consolidate_accepts_distinct_job_names(fresh_db):
+    """M18: repeats are refused, distinct names still run, in the order given."""
+    outcome = _run_json("consolidate", "--job", "abstraction", "--job", "curation")
+
+    assert [job["name"] for job in outcome["report"]["jobs"]] == ["abstraction", "curation"]
+
+
 def test_cycle_list_and_cycle_get_are_the_journal(fresh_db):
     first = _run_json("consolidate", "--dry-run")["cycle"]
     second = _run_json("consolidate")["cycle"]
@@ -1565,8 +1742,11 @@ _PLACEHOLDER_OPTIONS = {
 
 #: Required arguments Click type-converts *before* the command body runs. A
 #: non-numeric placeholder for `diff a b` is a usage error (exit 2), which would
-#: hide the refusal this sweep is about behind Click's own complaint.
-_PLACEHOLDER_ARGUMENTS = {"a": "1", "b": "2"}
+#: hide the refusal this sweep is about behind Click's own complaint. `level`
+#: is the same category one step later: `grant` narrows it against the grant
+#: levels in the command body, and a "placeholder" value would be refused there
+#: before `--as` is resolved — so it gets a valid level instead.
+_PLACEHOLDER_ARGUMENTS = {"a": "1", "b": "2", "level": "read"}
 
 #: Required arguments naming a file the command reads before it resolves `--as`.
 #: `edge create-batch` reports the missing file first — correctly, and through
@@ -2108,8 +2288,11 @@ def test_no_help_text_anywhere_still_states_the_conjunctive_rule():
 #: Every prose file that spells commands at a reader. `schema-dump` is the
 #: authority they are checked against, which is the point: the CLI describes
 #: itself, so the docs can be checked against the surface rather than against a
-#: second list of it.
-DOC_SOURCES = ("README.md", "AGENTS.md", "docs")
+#: second list of it. The split docs are named explicitly so the coverage is
+#: visible: the `docs` directory sweep already includes them, and a future
+#: split must add its new files here too or the sweep silently stops covering
+#: them.
+DOC_SOURCES = ("README.md", "AGENTS.md", "docs", "docs/decisions.md", "docs/http-api.md")
 
 #: Hyphenated lowercase tokens the docs write in backticks that are *not*
 #: commands — a CSP directive, an HTTP header, a package, an agent id, a CI job.

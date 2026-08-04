@@ -21,6 +21,20 @@ MIGRATION_NAME_RE = re.compile(r"^[0-9a-z_]+$")
 #: Default database location when ``NODUM_DB`` is not set.
 DEFAULT_DB_PATH = Path("~/.local/share/nodum/nodum.db").expanduser()
 
+#: How long a connection waits for SQLite's single write lock before failing
+#: with "database is locked".
+#:
+#: The 5 s default Python applies (the ``timeout`` argument to
+#: ``sqlite3.connect``) is shorter than a big registration can hold the lock
+#: for: :func:`nodum.assets.register_asset` deliberately streams a whole asset
+#: in one write transaction, and the measured 200 MB → 1.22 s copy rate
+#: extrapolates to ≈ 6 s of write-lock hold at the documented 1 GB ceiling
+#: (``SQLITE_LIMIT_LENGTH``). 15 s is >2× headroom over that projected worst
+#: case, so a writer that collides with a big registration waits it out
+#: instead of failing — which is what the architecture doc's "Known
+#: limitation" on registration (docs/architecture.md) now promises.
+BUSY_TIMEOUT_MS = 15000
+
 
 class SchemaConsistencyError(RuntimeError):
     """Raised when the live schema contradicts the recorded migrations.
@@ -52,10 +66,11 @@ def connect(path: str | Path | None = None) -> sqlite3.Connection:
             directory is created if needed. Use ``":memory:"`` for tests.
 
     Returns:
-        A connection with row access by column name, an 8 KiB page size, WAL
-        journaling, foreign-key enforcement enabled, and the sqlite-vec
-        extension loaded (the ``node_vec`` vec0 table and its KNN queries
-        need it).
+        A connection with row access by column name, a busy timeout of
+        :data:`BUSY_TIMEOUT_MS` (see there for why it is not Python's 5 s
+        default), an 8 KiB page size, WAL journaling, foreign-key enforcement
+        enabled, and the sqlite-vec extension loaded (the ``node_vec`` vec0
+        table and its KNN queries need it).
     """
     db_file = Path(path).expanduser() if path is not None else db_path()
     if str(db_file) != ":memory:":
@@ -65,6 +80,9 @@ def connect(path: str | Path | None = None) -> sqlite3.Connection:
     conn.enable_load_extension(True)
     sqlite_vec.load(conn)
     conn.enable_load_extension(False)
+    # First pragma on purpose: ``busy_timeout`` is a silent no-op once a
+    # transaction is open, and nothing before this point opens one.
+    conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
     # Asset bytes live in this file, and sqlite.org's blob benchmarks put peak
     # blob I/O at 8-16 KiB pages. This only takes effect on an empty database
     # and is silently ignored once WAL is on, so it must precede the WAL pragma
@@ -73,6 +91,44 @@ def connect(path: str | Path | None = None) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     return conn
+
+
+def begin_immediate(conn: sqlite3.Connection) -> None:
+    """Open an IMMEDIATE write transaction: no writer can interleave after it.
+
+    A read-then-write service path (a review, a cycle close) must see the row
+    it checks and the row it writes as one atomic fact, or two concurrent
+    callers both pass the check and both write — two accepts of one proposal,
+    two closes of one cycle. SQLite's own serialisation does not do this for
+    free: with the driver's default ``isolation_level`` the connection runs
+    each statement in its own implicit transaction, so the read and the write
+    are separate lock acquisitions with an interleavable window between them.
+    ``BEGIN IMMEDIATE`` takes the single write lock up front, so any other
+    writer blocks until this transaction commits or rolls back, and a caller
+    that reads a row here cannot race a caller that wrote it.
+
+    **It must be the first statement on the connection.** A SELECT opens no
+    implicit transaction, but the first DML does — and ``BEGIN IMMEDIATE``
+    after any DML raises ``cannot start a transaction within a transaction``,
+    while a DEFERRED transaction opened by an earlier statement would make
+    this a no-op at best. :func:`connect` + :func:`init_db` leave a fresh
+    connection with no transaction in flight, which is where every service
+    caller starts.
+
+    Args:
+        conn: A connection with no transaction in flight.
+
+    Raises:
+        RuntimeError: If a transaction is already open on ``conn`` — the write
+            lock would already be DEFERRED, and the immediate guarantee is the
+            entire point of this function.
+    """
+    if conn.in_transaction:
+        raise RuntimeError(
+            "cannot BEGIN IMMEDIATE with a transaction already open on the connection: "
+            "the write lock would already be DEFERRED"
+        )
+    conn.execute("BEGIN IMMEDIATE")
 
 
 def applied_migrations(conn: sqlite3.Connection) -> list[str]:
@@ -153,6 +209,34 @@ def _tables(conn: sqlite3.Connection) -> set[str]:
 def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
     """Every column name of ``table`` (empty when the table is absent)."""
     return {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+
+
+def foreign_keys_into(conn: sqlite3.Connection, table: str) -> frozenset[tuple[str, str]]:
+    """The foreign keys other tables hold into ``table``, as ``(child, column)`` pairs.
+
+    ``PRAGMA foreign_key_list`` answers the reverse question — the constraints a
+    *child* table's own DDL declares, naming its parent — so every table in the
+    schema is asked, and the rows that name ``table`` as their parent are kept.
+    This is the enumeration a guard that must name every reference into
+    ``nodes(id)`` walks: the delete-guard completeness test in ``test_rollback``
+    asserts :func:`nodum.service._delete_blocker`'s coverage against it, so a
+    migration that adds a foreign key into ``nodes`` fails that test on the
+    commit that adds it — the honest way to keep a hand-written guard list from
+    rotting.
+
+    Args:
+        conn: The open connection.
+        table: The parent table whose referrers are wanted.
+
+    Returns:
+        One ``(child table, referencing column)`` pair per referencing column.
+    """
+    referrers: set[tuple[str, str]] = set()
+    for child in _tables(conn):
+        for row in conn.execute(f"PRAGMA foreign_key_list({child})").fetchall():
+            if row["table"] == table:
+                referrers.add((child, str(row["from"])))
+    return frozenset(referrers)
 
 
 #: ``--`` to end of line, and ``/* … */`` across lines. Stripped from stored DDL

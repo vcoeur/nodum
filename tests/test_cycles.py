@@ -10,6 +10,8 @@ call them.
 from __future__ import annotations
 
 import sqlite3
+import threading
+import time
 import uuid
 
 import pytest
@@ -464,6 +466,86 @@ def test_a_cycle_leaves_running_exactly_once(fresh_db):
     service.close_cycle(cycle.id, status="completed", report={}, principal=owner())
     with pytest.raises(InvalidTransition, match="already completed"):
         service.close_cycle(cycle.id, status="failed", report={}, principal=owner())
+
+
+def test_two_concurrent_closes_of_one_cycle_have_one_winner(fresh_db):
+    """The ``WHERE status = 'running'`` guard, not the pre-read, is the atomic fact.
+
+    Two concurrent closes both pass the pre-read while the row is still
+    ``running``; without the guard on the UPDATE both would then write, and the
+    journal would record two outcomes for one run. The guarded UPDATE matches
+    nothing for the loser, whose rowcount check turns the race into a clean
+    ``InvalidTransition`` refusal (finding M8, the ``request_stop`` shape).
+    """
+    cycle = _open()
+    results: list[object] = []
+    barrier = threading.Barrier(2)
+
+    def race() -> None:
+        barrier.wait()
+        try:
+            results.append(
+                service.close_cycle(cycle.id, status="completed", report={}, principal=owner())
+            )
+        except BaseException as failure:
+            results.append(failure)
+
+    threads = [threading.Thread(target=race) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+    assert not any(thread.is_alive() for thread in threads), "a racer never returned"
+
+    wins = [r for r in results if isinstance(r, service.CycleOut)]
+    refusals = [r for r in results if isinstance(r, InvalidTransition)]
+    assert len(wins) == 1, f"exactly one close must win, got {results!r}"
+    assert len(refusals) == 1, f"the loser must be refused, got {results!r}"
+    assert wins[0].status == "completed"
+    assert service.get_cycle(cycle.id, principal=owner()).status == "completed"
+
+
+def test_a_close_racing_a_concurrent_winner_is_refused_by_the_guard(fresh_db):
+    """The guard's mechanism, proven deterministically: stale read, refused write.
+
+    The service pre-reads the cycle ``running``, then a concurrent winner closes
+    it before the service's UPDATE reaches the row — the exact interleaving the
+    threads test above cannot force. The guarded UPDATE matches nothing and the
+    rowcount check refuses; without the guard the UPDATE would have overwritten
+    the winner's close and the journal would record two outcomes for one run.
+    """
+    cycle = _open()
+    holder = db.connect(fresh_db)
+    outcome: list[object] = []
+
+    def race() -> None:
+        try:
+            outcome.append(
+                service.close_cycle(cycle.id, status="failed", report={}, principal=owner())
+            )
+        except BaseException as failure:
+            outcome.append(failure)
+
+    try:
+        holder.execute("BEGIN IMMEDIATE")
+        thread = threading.Thread(target=race)
+        thread.start()
+        # The service call has passed its pre-read (WAL reads do not block on
+        # the write lock) and is waiting on the write lock for its UPDATE.
+        # Close the cycle from here — the concurrent winner — then let the
+        # loser's UPDATE through against the row it no longer matches.
+        time.sleep(0.3)
+        holder.execute(
+            "UPDATE cycles SET status = 'completed', finished_at = datetime('now') WHERE id = ?",
+            (cycle.id,),
+        )
+        holder.commit()
+    finally:
+        holder.close()
+    thread.join(timeout=30)
+    assert not thread.is_alive(), "the racing close never returned"
+    assert isinstance(outcome[0], InvalidTransition)
+    assert service.get_cycle(cycle.id, principal=owner()).status == "completed"
 
 
 def test_a_status_outside_the_closed_set_is_refused(fresh_db):

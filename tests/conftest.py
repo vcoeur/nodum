@@ -6,12 +6,13 @@ import hashlib
 import math
 
 import pytest
+from helpers import ReplayEmbedder
 
 from nodum import db, embeddings, llm, service
 
 
-@pytest.fixture(autouse=True)
-def _never_the_real_database(tmp_path_factory, monkeypatch):
+@pytest.fixture(scope="session", autouse=True)
+def _never_the_real_database(tmp_path_factory):
     """Make the default database path unreachable for the whole test session.
 
     ``fresh_db`` points ``NODUM_DB`` at a temp file, but any test that unsets
@@ -27,8 +28,19 @@ def _never_the_real_database(tmp_path_factory, monkeypatch):
     Asserting on the constant's *value* would be the weaker move — this
     removes the reachable state instead (see the repo's own
     "structural tests don't hold invariants" finding).
+
+    The redirect only holds if it outlives the ``MonkeyPatch`` instance a test
+    can call ``undo()`` on — pytest hands out **one function-scoped instance
+    per test**, shared with every fixture and the test body, so a guard built
+    on the shared fixture is reverted by the very call it exists to survive.
+    This fixture therefore patches on its own session-scoped instance, and
+    ``tests/test_migrations.py`` exercises the hazard by calling ``undo()``
+    before asserting.
     """
-    monkeypatch.setattr(db, "DEFAULT_DB_PATH", tmp_path_factory.mktemp("default-db") / "nodum.db")
+    patch = pytest.MonkeyPatch()
+    patch.setattr(db, "DEFAULT_DB_PATH", tmp_path_factory.mktemp("default-db") / "nodum.db")
+    yield
+    patch.undo()
 
 
 class HashEmbedder:
@@ -83,6 +95,21 @@ def _no_embedding_provider():
 def fake_embedder():
     """Install the deterministic hashing embedder as the provider for one test."""
     provider = HashEmbedder()
+    embeddings.set_provider(provider)
+    return provider
+
+
+@pytest.fixture()
+def replay_embedder():
+    """Install the frozen-table embedder as the provider for one test.
+
+    The hash embedder's cosine *is* token overlap, so the vector arm's real
+    differentiator — recalling a paraphrase sharing no word with the query —
+    needs a provider whose vectors are chosen, not derived from vocabulary.
+    :class:`helpers.ReplayEmbedder` is that: a frozen sentence → vector table
+    whose geometry the test controls directly.
+    """
+    provider = ReplayEmbedder()
     embeddings.set_provider(provider)
     return provider
 

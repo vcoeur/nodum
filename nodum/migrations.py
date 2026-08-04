@@ -173,6 +173,25 @@ CREATE VIRTUAL TABLE node_fts USING fts5(
 """
 
 
+PROJECTOR_SKIPS_DDL = """
+-- Events a projector quarantined instead of replaying forever (finding M12).
+-- One row per (projector, seq): the event a projector's apply refused, the op
+-- it carried, and why it raised. The checkpoint advances past a skipped
+-- event, so one malformed row can no longer wedge a projector; this table is
+-- the audit trail a human reads to see what was skipped and fix the writer.
+-- It is append-only like the log it annotates: a rebuild replays a still-bad
+-- event and refreshes the row (the writer upserts) rather than deleting it.
+CREATE TABLE projector_skips (
+    projector  TEXT NOT NULL,
+    seq        INTEGER NOT NULL,
+    op         TEXT NOT NULL,
+    error      TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (projector, seq)
+);
+"""
+
+
 POLICIES_DDL = """
 -- Per-agent policy rulesets (design §8.3). `rules` is a JSON array of rule
 -- objects keyed by `job` (internal-agent jobs, evaluated by the Phase-5
@@ -208,8 +227,10 @@ VECTORS_DDL = """
 -- (sqlite-vec) holds each chunk's embedding, keyed by the chunk's rowid —
 -- which is why `chunks.id` is an integer rowid rather than the design's TEXT
 -- id (vec0 keys on integer rowids). `model_id` records the producing
--- embedding model per chunk, so mixed-model states are detectable and a
--- model change is a `projector rebuild vec`. The vec0 dimension must match
+-- embedding model per chunk, so search filters the KNN join to the active
+-- provider's model — mixed-model chunks are excluded from results, and a
+-- model change needs a `projector rebuild vec` to be effective (finding
+-- M13). The vec0 dimension must match
 -- nodum.embeddings.EMBEDDING_DIMS (the default model's size); a dimension
 -- change needs a new migration. `chunks.node_id` deliberately carries no FK:
 -- the projector replays the event log (not the live tables), and the log
@@ -1051,4 +1072,5 @@ MIGRATIONS: list[tuple[str, str]] = [
     ("0014_cycles_and_gardener", CYCLES_AND_GARDENER_DDL),
     ("0015_cycle_stop_switch", CYCLE_STOP_SWITCH_DDL),
     ("0016_conventions_and_annotations", CONVENTIONS_AND_ANNOTATIONS_DDL),
+    ("0017_projector_skips", PROJECTOR_SKIPS_DDL),
 ]

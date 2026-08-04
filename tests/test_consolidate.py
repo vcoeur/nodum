@@ -1680,6 +1680,19 @@ def test_an_unknown_job_is_refused_by_name(fresh_db):
         _run(jobs=["polish"])
 
 
+def test_a_repeated_job_name_is_refused(fresh_db):
+    """M18: one name, one run — a repeat would spend a second full budget.
+
+    Each run mints a fresh cycle budget, so ``consolidate(jobs=["abstraction",
+    "abstraction"])`` is the same work twice at twice the price. ``Budget.split``
+    refuses a repeated share one layer up; the service refuses the duplicate
+    here, so every surface (CLI, HTTP, scheduler, tests) gets the same sentence
+    before any cycle opens.
+    """
+    with pytest.raises(ValueError, match="duplicate consolidation job"):
+        _run(jobs=["abstraction", "abstraction"])
+
+
 def test_no_job_at_all_still_produces_a_metrics_snapshot(fresh_db):
     report = _run(jobs=[]).report
 
@@ -1765,9 +1778,31 @@ def test_a_chain_is_not_dense(fresh_db):
     assert "not dense" in skip["reason"]
 
 
+def _synthesis_node(principal, title):
+    """A concept written the way the abstraction job writes it: by the
+    gardener, filed ``proposed``, carrying the synthesis marker in the props
+    of the same call that emits the create event — the shape the freshness
+    gate's event-log verification accepts (M21)."""
+    return service.create_node(
+        type="concept",
+        title=title,
+        content="synthesised from the members",
+        landing="proposed",
+        props={"synthesized": True, "members": [], "job": consolidate.JOB_ABSTRACTION},
+        principal=principal,
+    )
+
+
 def test_a_synthesized_member_is_not_resynthesized(fresh_db):
-    """Both halves of the freshness gate: the member's own flag, or a
-    ``derived_from`` edge from a synthesized node.
+    """Both halves of the freshness gate: a member's own verified synthesis,
+    or a ``derived_from`` edge from a verified synthesis node.
+
+    "Verified" is the point (M21): the gate reads ``props.synthesized``
+    through the node's create event — the flag alone, forged on a node an
+    ordinary agent wrote, must not skip a cluster. The syntheses below are
+    therefore written by the gardener (``agent:builtin-gardener``), the one
+    actor the verification accepts: the first is a *reviewed* synthesis made
+    active by its review, the second a *pending* one still in the queue.
 
     The ancestor edge is filed ``proposed`` — the state the job writes it in —
     because the gate has to protect members of a synthesis that is still
@@ -1775,17 +1810,19 @@ def test_a_synthesized_member_is_not_resynthesized(fresh_db):
     are ``active``).
     """
     _place(Alpha=0.0)
-    flagged = _node("Alpha one", props={"synthesized": True})
+    gardener = auth.internal_principal()
+    flagged = _synthesis_node(gardener, "Alpha one")
+    service.transition(flagged.id, "accept", principal=owner())
     second, third = _node("Alpha two"), _node("Alpha three")
     _relates(flagged.id, second.id)
     _relates(second.id, third.id)
     _relates(third.id, flagged.id)
 
-    ancestor = _node("Beta one", props={"synthesized": True})
-    member, other = _node("Beta two"), _node("Beta three")
+    ancestor = _synthesis_node(gardener, "Beta one")
+    member, other, fourth = _node("Beta two"), _node("Beta three"), _node("Beta four")
     _relates(member.id, other.id)
-    _relates(other.id, ancestor.id)
-    _relates(ancestor.id, member.id)
+    _relates(other.id, fourth.id)
+    _relates(fourth.id, member.id)
     service.create_edge(
         ancestor.id,
         member.id,
@@ -1801,6 +1838,29 @@ def test_a_synthesized_member_is_not_resynthesized(fresh_db):
         "member is already part of a synthesis",
         "member is already part of a synthesis",
     ]
+
+
+def test_a_forged_synthesized_flag_does_not_skip_a_cluster(fresh_db):
+    """M21's regression on the freshness gate: ``props.synthesized`` written
+    by an ordinary agent is a forge, not a synthesis.
+
+    The gate used to trust the flag, so a dense cluster containing the forged
+    node was skipped as "already part of a synthesis" — an attacker could
+    silence the abstraction job over any cluster. The flag is now held against
+    the node's create event, whose actor is not the gardener, so the cluster
+    stays eligible and the job proposes it like any other.
+    """
+    _place(Alpha=0.0)
+    forged = _node("Alpha one", props={"synthesized": True})
+    second, third = _node("Alpha two"), _node("Alpha three")
+    _relates(forged.id, second.id)
+    _relates(second.id, third.id)
+    _relates(third.id, forged.id)
+
+    outcome = _abstraction_outcome(_run(jobs=[consolidate.JOB_ABSTRACTION]).report)
+
+    assert outcome.detail["clusters_eligible"] == 1
+    assert all("already part of a synthesis" not in skip["reason"] for skip in outcome.skipped)
 
 
 def test_an_over_cap_graph_reports_the_overflow(fresh_db, monkeypatch):
@@ -1989,7 +2049,9 @@ def test_abstraction_with_a_budget_synthesizes_a_proposed_concept(fresh_db, monk
 
     The write goes through the public service API exactly like every other
     job's — visible to ``service.get_node``, filed ``proposed``, carrying the
-    freshness gate's own record (``props.synthesized``) and the provenance.
+    freshness gate's own marker (``props.synthesized``) and the member list.
+    The write carries no ``generated_by`` prop — nothing ever read it there
+    (M21) — the model's provenance rides the cycle report instead.
     """
     monkeypatch.setenv(agent_runtime.ENV_CYCLE_BUDGET, "100000")
     body = {"title": "Alpha matters", "content": "What the Alpha notes share."}
@@ -2009,8 +2071,7 @@ def test_abstraction_with_a_budget_synthesizes_a_proposed_concept(fresh_db, monk
     assert concept.props["synthesized"] is True
     assert concept.props["members"] == sorted([first.id, second.id, third.id])
     assert concept.props["job"] == consolidate.JOB_ABSTRACTION
-    assert concept.props["generated_by"]["model_id"] == "fake-model"
-    assert concept.props["generated_by"]["prompt_version"] == consolidate.ABSTRACTION_PROMPT_VERSION
+    assert "generated_by" not in concept.props
     edges = service.list_edges(
         node_id=concept_id, type=consolidate.DERIVED_FROM_EDGE_TYPE, principal=owner()
     )
@@ -2263,7 +2324,7 @@ def test_the_journal_carries_the_llm_report(fresh_db, monkeypatch):
     assert result.report.llm == stored, "the typed half of the report is the same data"
 
 
-# ── The curation job (§L1–§L4: rates from row state, conventions + annotations) ──
+# ── The curation job (§L1–§L4: rates over proposals, conventions + annotations) ──
 
 
 def _curation_outcome(report):
@@ -2271,7 +2332,9 @@ def _curation_outcome(report):
 
 
 def test_curation_computes_a_rate_from_row_state(fresh_db):
-    """The rate is the graph's measure: accepted rows active, rejected archived."""
+    """The rate is the graph's measure of a proposer: accepted proposals
+    active, rejected archived — every row seeded here is a genuine proposal
+    (the suggest grant files them ``proposed``), so all of them count (M19)."""
     proposer = agent("researcher")
     alpha = service.create_node(type="concept", title="Alpha", principal=owner())
     beta = service.create_node(type="concept", title="Beta", principal=owner())
@@ -2314,6 +2377,43 @@ def test_curation_computes_a_rate_from_row_state(fresh_db):
     assert entry["type"] == "supports"
     assert entry["accepted"] == 2 and entry["rejected"] == 1
     assert entry["rate"] == pytest.approx(2 / 3)
+
+
+def test_direct_edit_writes_do_not_count_as_proposals_in_the_rate(fresh_db):
+    """M19: the rate counts proposals, not rows.
+
+    A row is a proposal iff its creation event op was ``propose``. An
+    ``edit``-grant direct write lands ``active`` by ``edge.create`` and never
+    was a proposal, so it must not inflate a proposer's acceptance rate — even
+    though it is an ``active`` row of a type with a rate. A suggest-grant
+    write accepted by a human (op ``edge.propose``, then ``accept``) does
+    count.
+    """
+    writer = agent("editor", grants={"meta": "read", "main": "edit"})
+    proposer = agent("researcher")
+    alpha = service.create_node(type="concept", title="Alpha", principal=owner())
+    beta = service.create_node(type="concept", title="Beta", principal=owner())
+    direct = service.create_edge(alpha.id, beta.id, "supports", principal=writer)
+    proposed = service.create_edge(alpha.id, beta.id, "contradicts", principal=proposer)
+    accepted = service.transition(proposed.id, "accept", principal=owner())
+    assert direct.state == "active" and accepted.state == "active"
+
+    outcome = _curation_outcome(_run(jobs=[consolidate.JOB_CURATION]).report)
+
+    # One convention node, for the proposer whose proposal was accepted — the
+    # editor's direct write produced no proposal and no rate.
+    (convention_id,) = outcome.proposed
+    convention = service.get_node(convention_id, principal=owner())
+    assert convention.props["proposer"] == "agent:researcher"
+    assert convention.props["edge_type"] == "contradicts"
+    assert convention.props["accepted"] == 1
+    assert convention.props["rejected"] == 0
+    entries = [
+        (entry["proposer"], entry["type"], entry["accepted"], entry["rejected"])
+        for entry in outcome.detail["acceptance"]
+        if entry["kind"] == "edge" and entry["proposer"] in ("agent:editor", "agent:researcher")
+    ]
+    assert entries == [("agent:researcher", "contradicts", 1, 0)]
 
 
 def test_update_proposals_carry_a_version_rate(fresh_db):
@@ -2536,10 +2636,13 @@ def test_curation_dry_run_writes_nothing(fresh_db):
     assert service.list_proposals(principal=owner())[0].annotation is None
 
 
-def test_curation_reads_row_state_and_no_event_log():
-    """§L1's whole point: the job imports no agent runtime and reads no event
-    log — acceptance is computed from where the graph is now, never from what
-    happened (the gardener is `kind='internal'` and `list_events` refuses it)."""
+def test_curation_reads_outcomes_from_row_state_and_classifies_proposals_from_the_log():
+    """§L1's whole point, restated for M19: row state measures outcomes, the
+    event log classifies which rows were proposals. The one log read is the
+    narrow classification (:func:`nodum.service.list_proposal_creations`),
+    which answers only about the ids the job already holds — never the full
+    log (`list_events`, which refuses the gardener anyway) — and the job still
+    imports no agent runtime."""
     module = _module_ast()
     curation = next(
         node
@@ -2552,6 +2655,7 @@ def test_curation_reads_row_state_and_no_event_log():
         if isinstance(node, ast.Call)
     }
     assert "list_events" not in calls
+    assert "list_proposal_creations" in calls
     agent_uses = [
         node
         for node in ast.walk(curation)
@@ -2605,6 +2709,9 @@ ALLOWED_NODUM_IMPORTS = {
     "nodum.projectors",
     "nodum.service",
     "nodum.store",
+    # M30: the shared closed vocabularies (state/kind/level Literals + the
+    # tuple constants) moved to one module, imported by every consumer.
+    "nodum.vocab",
 }
 
 #: Call names that mean somebody is talking to SQLite directly.
@@ -2728,11 +2835,14 @@ def test_the_deterministic_runner_consults_no_stop_switch_and_the_copy_says_so(
 
     # Every call that consults the switch — the service read itself, the wiring
     # helper, the runtime's own check, the runtime's construction, and the one
-    # door that checks first — must live inside the abstraction job. The two
+    # door that checks first — must live inside the abstraction job. The
     # module-level uses of the `agent` name are excluded from the use check
     # below: `agent.prompt_version` is computed once at import time from the
-    # template string and consults nothing, and `agent.LLMReport` is the type
-    # of the context's report slot — an annotation rather than a call.
+    # template string and consults nothing, `agent.LLMReport` is the type
+    # of the context's report slot — an annotation rather than a call — and
+    # `agent.CycleStopped` is the exception the runner's guard re-raises when
+    # the abstraction job noticed the stop, a type mention rather than a
+    # check (M17).
     consulting = {"stop_requested", "cycle_stop_check", "check_stop", "for_cycle", "chat"}
     offside = [
         node
@@ -2755,7 +2865,7 @@ def test_the_deterministic_runner_consults_no_stop_switch_and_the_copy_says_so(
         if isinstance(node, ast.Attribute)
         and isinstance(node.value, ast.Name)
         and node.value.id == "agent"
-        and node.attr not in {"prompt_version", "LLMReport"}
+        and node.attr not in {"prompt_version", "LLMReport", "CycleStopped"}
     ]
     offside_uses = [use for use in agent_uses if not inside_abstraction(use)]
     assert offside_uses == [], (
@@ -2785,6 +2895,46 @@ def test_the_deterministic_runner_consults_no_stop_switch_and_the_copy_says_so(
     assert outcome.cycle.status == "completed", "and the run finished anyway"
     assert [job.name for job in outcome.report.jobs] == ran
     assert outcome.report.failed == []
+
+
+def test_a_stop_mid_run_propagates_and_no_later_job_writes(fresh_db, monkeypatch):
+    """M17: a stop noticed during a job is a stop, not a job error.
+
+    ``CycleStopped`` is "distinct from every failure": the run did what it was
+    told but not what it was asked. It therefore propagates out of the runner —
+    the blanket ``except Exception`` in ``_run_jobs`` must not file it as a
+    ``JobFailure`` and carry on to the next job — the cycle closes ``failed``,
+    and every job after the one that noticed it never runs. A job standing
+    where the abstraction job stands stops the cycle: curation is after it in
+    the job list, and its convention nodes and annotations are not written
+    after a human pressed stop.
+    """
+    proposer = agent("researcher")
+    alpha = service.create_node(type="concept", title="Alpha", principal=owner())
+    beta = service.create_node(type="concept", title="Beta", principal=owner())
+    accepted = service.create_edge(alpha.id, beta.id, "supports", principal=proposer)
+    service.transition(accepted.id, "accept", principal=owner())
+
+    def stopper(context):
+        (running,) = [
+            entry for entry in service.list_cycles(principal=owner()) if entry.status == "running"
+        ]
+        service.request_stop(running.id, principal=owner())
+        raise agent_runtime.CycleStopped("stopped: a human asked this run to stop")
+
+    monkeypatch.setitem(consolidate.JOBS, "stopper", stopper)
+    with pytest.raises(agent_runtime.CycleStopped):
+        consolidate.consolidate(
+            jobs=["stopper", consolidate.JOB_CURATION], triggered_by=auth.OWNER_ACTOR
+        )
+
+    (cycle,) = service.list_cycles(principal=owner())
+    assert cycle.status == "failed", "a stop still closes the cycle failed"
+    assert cycle.stop_requested is True
+    assert "CycleStopped" in cycle.report["failed"][0]["error"]
+    # Curation ran after the stopper in the job list and would have written a
+    # convention node for the accepted edge — it must not have run.
+    assert service.list_nodes(space=consolidate.CONVENTIONS_SPACE_ID, principal=owner()) == []
 
 
 def test_every_write_the_module_makes_names_the_gardener():

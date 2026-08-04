@@ -7,6 +7,15 @@ on:
       - "docs/**"
       - "mkdocs.yml"
       - ".github/workflows/docs.yml"
+  # Build the site on any PR touching the docs, so a broken build — and, via
+  # mkdocs --strict + the validation block, a broken link or an orphan page —
+  # fails the PR. The deploy job is gated to non-PR events, so a PR build can
+  # never publish to Pages.
+  pull_request:
+    paths:
+      - "docs/**"
+      - "mkdocs.yml"
+      - ".github/workflows/docs.yml"
   workflow_dispatch:
 
 permissions:
@@ -15,8 +24,11 @@ permissions:
   id-token: write
 
 concurrency:
-  group: pages
-  cancel-in-progress: false
+  # PR runs get their own self-cancelling group (only the latest docs PR build
+  # runs); push and manual runs keep the `pages` group with no cancellation,
+  # so a PR build never queues behind or cancels a Pages deploy and vice versa.
+  group: ${{ github.event_name == 'pull_request' && 'docs-pr' || 'pages' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   build:
@@ -30,10 +42,14 @@ jobs:
       - name: Setup Pages
         uses: actions/configure-pages@v5
 
-      # --strict turns a broken internal link or a missing nav entry into a
-      # build failure, so a stale doc cannot silently deploy.
+      # --strict fails the build on any warning, and mkdocs.yml's validation
+      # block raises the orphan-page and broken-anchor checks from INFO to
+      # WARN, so a stale doc cannot silently build (or deploy on main). mkdocs
+      # is pinned to the version mkdocs-material 9.7.7 resolves, so the
+      # ephemeral build env is reproducible; --locked keeps the project lock
+      # honest like every other CI leg.
       - name: Build site
-        run: uv run --with "mkdocs-material==9.7.7" mkdocs build --strict
+        run: uv run --locked --with "mkdocs==1.6.1" --with "mkdocs-material==9.7.7" mkdocs build --strict
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
@@ -42,6 +58,10 @@ jobs:
 
   deploy:
     needs: build
+    # Build runs on push, PR and manual dispatch; only non-PR events may
+    # publish Pages (a PR can never deploy, and workflow_dispatch keeps its
+    # current manual-deploy behaviour).
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     environment:
       name: github-pages

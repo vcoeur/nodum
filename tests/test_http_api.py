@@ -393,8 +393,9 @@ def test_an_os_error_is_mapped_and_does_not_echo_the_path(client, fresh_db, monk
 def test_every_exception_cli_run_catches_is_mapped():
     """The docstring's claim, asserted rather than repeated.
 
-    ``AGENTS.md`` and the module docstring both said the table held "exactly the
-    ones ``cli._run`` catches". It did not: ``cli._run`` catches ``sqlite3.Error``
+    ``docs/architecture.md`` records the first cut of the table claiming to
+    hold "exactly the ones ``cli._run`` catches" — the module docstring says
+    the same today. It did not: ``cli._run`` catches ``sqlite3.Error``
     and ``OSError``, and the table listed only ``sqlite3.OperationalError``, so
     ``DatabaseError``, ``IntegrityError``, ``ProgrammingError``, ``DataError``
     and every ``OSError`` were unmapped 500s.
@@ -677,16 +678,52 @@ WRITE_FUNCTIONS = {
 }
 
 
+#: Write (method, path-template) pairs this sweep deliberately does not enter,
+#: each with the reason. The reachability assertion fails a route that leaves
+#: the sweep's reach, so anything listed here is a route the sweep *cannot*
+#: enter, not one it happens not to. Empty today: the sweep reaches every write
+#: route (a 400 the handler's own validation produces counts as entered — the
+#: handler ran). The candidates the review floated were decided as follows:
+#: ``POST /api/ask`` and ``POST /api/summarize`` are entered on the missing
+#: ``question``/``node_id`` 400 without needing an LLM provider (and write
+#: nothing by design, E1); ``POST /api/ingest`` is entered on the neither-path-
+#: nor-url 400 *and* runs a real ingest via :data:`PDF_FIXTURE`. A route added
+#: later that genuinely cannot be reached here (one whose handler needs an
+#: external service no body can fake, say) must be listed here with its reason.
+UNREACHABLE_BY_DESIGN: frozenset[tuple[str, str]] = frozenset()
+
+
+def writable_pairs(app) -> set[tuple[str, str]]:
+    """Every state-changing (method, path-template) pair in the live route table.
+
+    The route table is the input, so a write route added tomorrow joins the
+    reachability assertion without anyone remembering it exists. The catch-all
+    ``/api/{path:path}`` is excluded: it claims every method and refuses
+    everything, and a sweep that "entered" it would have entered nothing.
+    """
+    pairs = set()
+    for route in app.routes:
+        path = getattr(route, "path", "")
+        if not path.startswith("/api/") or path == "/api/{path:path}":
+            continue
+        for method in ("POST", "PUT", "PATCH", "DELETE"):
+            if method in (route.methods or ()):
+                pairs.add((method, path))
+    return pairs
+
+
 def _swept_requests(
     app, ids: dict[str, str], name: str, password: str
 ) -> list[tuple[str, str, int]]:
     """Fire an actor-carrying request at every method of every route in ``app``.
 
     The route table is the input, so a handler added later is swept without
-    anyone remembering it exists. Several body shapes are tried because a rogue
-    handler's signature is unknown: a bare ``{"actor": …}`` reaches one that
-    forwards a whole body, and the fuller shapes reach one that also needs a
-    type or a title before it will do any work.
+    anyone remembering it exists. Every write route is fired with a body shape
+    its handler can act on (a real id per route family, real create bodies,
+    a real asset hash, live capability tokens) — the whole point of the sweep
+    is that the handler runs, because a request refused before the handler
+    proves nothing about attribution. A route the sweep cannot enter is a
+    failure (see the reachability assertion in the test), not a silence.
 
     The client drives behind a real session for ``name`` — and re-logs in
     whenever a request kills it (``POST /api/logout`` is in the table too),
@@ -701,35 +738,63 @@ def _swept_requests(
     """
     client = Client(app, session=_login(app, name, password))
     bodies = [
+        # A bare actor claim: reaches any handler that forwards a whole body.
         {"actor": AGENT},
-        {"type": "note", "title": "swept", "actor": AGENT},
-        {"type": "note", "title": "swept", "created_by": AGENT},
-        {
-            "type": "note",
-            "title": "swept",
-            "content": "swept",
-            "src_id": ids["node"],
-            "dst_id": ids["other"],
-            "ids": [ids["proposal"]],
-            "reason": "swept",
-            "rules": [],
-            "actor": AGENT,
-            "created_by": AGENT,
-            "updated_by": AGENT,
-        },
+        # A valid node create — the shape the M1 boundary accepts (extra=forbid
+        # refuses the actor claim in the body, so it rides the query string and
+        # the header instead).
+        {"type": "note", "title": "swept", "content": "swept"},
+        # A node update: a title-only PATCH.
+        {"title": "swept"},
+        # An edge create: real node ids and a real edge type.
+        {"src_id": ids["node"], "dst_id": ids["other"], "type": "relates_to"},
+        # A review batch: a real proposal id, plus the mandatory reject reason.
+        {"ids": [ids["proposal"]], "reason": "swept"},
+        # An account or space create.
+        {"name": "swept"},
+        # A password change.
+        {"password": "swept-password"},
+        # A grant (the revoke route reads the same agent/space keys).
+        {"agent": ids["agent"], "space": ids["space"], "level": "read"},
+        # An upload-grant mint.
+        {"name": "swept.png", "mime": "image/png", "size": 1000},
+        # A real server-side ingest of the committed PDF fixture.
+        {"path": str(PDF_FIXTURE), "actor": AGENT},
     ]
     fired: list[tuple[str, str, int]] = []
-    for route in app.routes:
-        path = route.path
-        for key, value in ids.items():
-            path = path.replace(f"{{{key}}}", value)
-        path = (
-            path.replace("{id}", ids["node"])
-            .replace("{type}", "note")
+
+    # Route templates use `{id}` generically; which real id substitutes is a
+    # per-family decision. The blanket node-id replacement this loop once made
+    # sent every account/agent/space/cycle/asset route to a 404 before its
+    # handler — the exact reach gap this sweep exists to close. The prefix
+    # decides the family; a route in none of them takes the node id.
+    def concrete(path: str) -> str:
+        for prefix, value in (
+            ("/api/humans", ids["human"]),
+            ("/api/agents", ids["agent"]),
+            ("/api/spaces", ids["space"]),
+            ("/api/cycles", ids["cycle"]),
+            ("/api/assets", ids["asset"]),
+        ):
+            if path.startswith(prefix):
+                path = path.replace("{id}", value)
+                break
+        else:
+            path = path.replace("{id}", ids["node"])
+        if "{token}" in path:
+            token = (
+                ids["upload-token"] if path.startswith("/api/uploads") else ids["download-token"]
+            )
+            path = path.replace("{token}", token)
+        return (
+            path.replace("{type}", "note")
             .replace("{agent}", AGENT)
             .replace("{profile}", "thumb")
             .replace("{path:path}", "swept")
         )
+
+    for route in app.routes:
+        path = concrete(route.path)
         for method in sorted(route.methods or set()):
             if method in ("GET", "HEAD", "OPTIONS"):
                 response = client.request(
@@ -740,7 +805,9 @@ def _swept_requests(
                     response = client.request(
                         method, f"{path}?actor={AGENT}", headers={"X-Actor": AGENT}
                     )
-                fired.append((method, path, response.status_code))
+                # The template path, not the concrete one: the reachability
+                # assertion compares against the route table's own templates.
+                fired.append((method, route.path, response.status_code))
                 continue
             # One part only: the upload handler caps multipart fields at one,
             # so the actor claim rides the filename, the query and the header.
@@ -752,7 +819,7 @@ def _swept_requests(
             if multipart.status_code == 401:
                 client = Client(app, session=_login(app, name, password))
                 multipart = client.request(method, f"{path}?actor={AGENT}", **multipart_kwargs)
-            fired.append((method, f"{path} (multipart)", multipart.status_code))
+            fired.append((method, f"{route.path} (multipart)", multipart.status_code))
             for body in bodies:
                 response = client.request(
                     method, f"{path}?actor={AGENT}", json=body, headers={"X-Actor": AGENT}
@@ -765,11 +832,11 @@ def _swept_requests(
                     response = client.request(
                         method, f"{path}?actor={AGENT}", json=body, headers={"X-Actor": AGENT}
                     )
-                fired.append((method, path, response.status_code))
+                fired.append((method, route.path, response.status_code))
     return fired
 
 
-def test_writes_are_attributed_to_the_sessions_human_and_nothing_else(fresh_db):
+def test_writes_are_attributed_to_the_sessions_human_and_nothing_else(fresh_db, tmp_path):
     """The session-attribution guarantee, as one property over the route table.
 
     This is the load-bearing test, and it knows nothing about how the boundary
@@ -793,15 +860,31 @@ def test_writes_are_attributed_to_the_sessions_human_and_nothing_else(fresh_db):
     ``created_by: "agent:evil"``. This test fails on it, because the row it
     writes is in the same database the assertion reads.
 
-    **One principal besides the session's human is allowed, and it is named.**
-    ``POST /api/cycles`` asks the consolidation runner to run, and the runner
-    writes as the in-process gardener because the gardener made those edits
-    (decision G4). That is a *domain* fact, not something the request chose:
-    the sweep therefore keeps asking its question of the thing a request could
-    actually influence — who **asked** — and asserts that every journal entry
-    the sweep produced records the session's human as the trigger, never the
-    agent identity every body, query and header claimed. The hole that
-    exemption could open is closed from the other side by
+    **It only proves anything about a route it actually entered** — a request
+    refused before the handler (404 on a wrong-id family, a 400 on a body the
+    handler never saw) writes nothing and proves nothing. The sweep therefore
+    seeds a real id per route family — a second human for ``/api/humans``, an
+    agent for ``/api/agents``, a space for ``/api/spaces``, a cycle for
+    ``/api/cycles``, an asset hash for ``/api/assets``, live capability tokens
+    for the two token routes — plus a body shape each create route accepts, so
+    the handlers actually run. The reachability assertion then derives the
+    required set from the live route table itself: **every** write route must
+    be entered, or the test fails. The integer floors it replaces could not
+    see a sweep that lost every write route — the five required successes
+    could all be ``GET``s.
+
+    **Two principals besides the session's human may appear, and each is
+    named.** ``POST /api/cycles`` asks the consolidation runner to run, and the
+    runner writes as the in-process gardener because the gardener made those
+    edits (decision G4); ``assets.EXTRACT_ACTOR`` (``"system"``) stamps the
+    ``asset.extract`` event an ingest's extraction writes, and is a module
+    constant no request can name. Both are *domain* facts, not something the
+    request could choose: the sweep therefore keeps asking its question of the
+    thing a request could actually influence — who **asked** — and asserts that
+    every journal entry the sweep produced records the session's human (or one
+    of the two fixed actors) as the trigger, never the agent identity every
+    body, query and header claimed. The hole that the gardener exemption could
+    open is closed from the other side by
     ``test_the_only_credential_path_is_the_session``, which forbids this module
     from minting the gardener itself.
     """
@@ -812,7 +895,37 @@ def test_writes_are_attributed_to_the_sessions_human_and_nothing_else(fresh_db):
     node = service.create_node(type="concept", title="Sweep target", principal=owner())
     other = service.create_node(type="concept", title="Sweep other", principal=owner())
     proposal = service.create_node(type="note", title="Sweep proposal", principal=agent(AGENT))
-    ids = {"node": node.id, "other": other.id, "proposal": proposal.id}
+    # Real ids of the right kind per route family: a node id in any of these
+    # slots is a 404 before the handler, which is precisely what the sweep is
+    # here to notice (review B10). The tokens are minted as the sweep's second
+    # human so the capability routes attribute their writes inside the allowed
+    # set. The cycle is `curative`, not a consolidation trigger, so the sweep's
+    # own `POST /api/cycles` runs can still open beside it.
+    target = service.create_human("target", principal=owner())
+    swept_agent = agent("swept-agent")
+    space = service.create_space("sweep-seed", principal=owner())
+    cycle = service.open_cycle(trigger="curative", principal=owner())
+    seed_file = tmp_path / "seed.txt"
+    seed_file.write_text("sweep asset bytes", encoding="utf-8")
+    seeded_asset = assets.register_asset(seed_file, name="seed.txt")
+    second_principal = auth.principal_from_actor(second_actor)
+    download = urls.mint_download(seeded_asset.hash, principal=second_principal)
+    upload = urls.mint_upload(
+        "swept.bin", "application/octet-stream", 32 * 1024, principal=second_principal
+    )
+    assert upload.grant is not None, "a mint without sha256 always grants a URL"
+    ids = {
+        "node": node.id,
+        "other": other.id,
+        "proposal": proposal.id,
+        "human": target.id,
+        "agent": swept_agent.id,
+        "space": space.id,
+        "cycle": cycle.id,
+        "asset": seeded_asset.hash,
+        "download-token": download.token,
+        "upload-token": upload.grant.token,
+    }
 
     before_seq = max((event.seq for event in service.list_events(owner(), limit=5000)), default=0)
     before_nodes = {row.id for row in service.list_nodes(principal=owner(), limit=5000)}
@@ -821,9 +934,48 @@ def test_writes_are_attributed_to_the_sessions_human_and_nothing_else(fresh_db):
 
     fired = _swept_requests(app, ids, "second", "second-pw")
 
-    # A sweep that never reached a handler would pass vacuously.
-    assert len(fired) >= 40, fired
-    assert sum(1 for _, _, status in fired if status < 300) >= 5, fired
+    # The sweep's own upload token is spent by the *refused* multipart attempt
+    # (a refusal still spends the token by design), and the spend is logged as
+    # an `asset.upload` event — so a redemption that never ingests is already
+    # inside the allowed-set check above. What is not: a *successful*
+    # redemption, whose describing nodes are written by the re-minted grant
+    # principal. Redeem a fresh token with bytes the type policy admits, and
+    # pin both ends — the audit event and the write itself.
+    redeemed = urls.mint_upload("redeemed.txt", "text/plain", 32, principal=second_principal).grant
+    assert redeemed is not None, "a mint without sha256 always grants a URL"
+    redemption = Client(app).put(redeemed.url, guard=False, content=b"redeemed by the sweep")
+    assert redemption.status_code == 200, redemption.text
+    redeemed_envelope = redemption.json()
+    # The request carried no session and claimed no identity, so the write is
+    # attributed to the grant's minting principal, the sweep's second human —
+    # never to the owner, never to the agent identity every other request in
+    # the sweep claimed.
+    assert redeemed_envelope["source"]["created_by"] == second_actor
+    assert redeemed_envelope["asset_ref"]["created_by"] == second_actor
+    redeem_uploads = [
+        event
+        for event in service.list_events(owner(), limit=5000)
+        if event.seq > before_seq and event.op == "asset.upload"
+    ]
+    assert [event.actor for event in redeem_uploads] == [second_actor, second_actor], (
+        "both upload-token redemptions of this sweep — the refused attempt and "
+        "the successful one — are attributed to the grant's minting principal"
+    )
+
+    # Reachability, derived from the route table rather than guessed: every
+    # write route must have at least one fire that got past the router and the
+    # middleware into the handler. A 400 the handler's own validation produces
+    # counts as entered (the handler ran); 404/405 mean the request never
+    # reached the handler (a wrong-id family, or a verb the route does not
+    # declare), 401/415 are the session gate and the media-type guard, and a
+    # 5xx is a handler that crashed — all of them fail the sweep.
+    entered = {
+        (method, path.removesuffix(" (multipart)"))
+        for method, path, status in fired
+        if status < 500 and status not in (401, 404, 405, 415)
+    }
+    missing = writable_pairs(app) - entered - UNREACHABLE_BY_DESIGN
+    assert missing == set(), f"the sweep never reached these write handlers: {sorted(missing)}"
     # And the multipart pass really did register an asset, rather than 415ing
     # at the guard the way the JSON bodies do (review N9).
     assert any(path.endswith("(multipart)") and status < 300 for _, path, status in fired), fired
@@ -832,7 +984,7 @@ def test_writes_are_attributed_to_the_sessions_human_and_nothing_else(fresh_db):
         event for event in service.list_events(owner(), limit=5000) if event.seq > before_seq
     ]
     assert new_events, "the sweep wrote nothing, so it proves nothing"
-    allowed = {second_actor, GARDENER_ACTOR}
+    allowed = {second_actor, GARDENER_ACTOR, assets.EXTRACT_ACTOR}
     offenders = [
         (event.op, event.seq, event.actor) for event in new_events if event.actor not in allowed
     ]
@@ -1168,17 +1320,24 @@ def test_a_smuggled_actor_is_ignored_not_honored(client, fresh_db, smuggled):
     assert [row.actor for row in accepts] == [OWNER_ACTOR]
 
 
-def test_a_smuggled_actor_on_a_create_is_ignored(client, fresh_db):
-    payload = _ok(
-        client.post(
-            "/api/nodes?actor=agent:query",
-            json={"type": "note", "title": "Smuggled", "actor": AGENT, "created_by": AGENT},
-            headers={"X-Actor": AGENT},
-        )
+def test_a_smuggled_actor_on_a_create_is_refused(client, fresh_db):
+    """Property 2 on the create route: a smuggled identity field is refused.
+
+    The create body is validated against an input model with ``extra="forbid"``
+    (finding M1), so an ``actor``/``created_by`` key is a 400 — refused rather
+    than the "inert" the other routes still are, and never honored: nothing is
+    written at all, so nothing can be attributed to the smuggled identity.
+    """
+    before = _events()
+    response = client.post(
+        "/api/nodes?actor=agent:query",
+        json={"type": "note", "title": "Smuggled", "actor": AGENT, "created_by": AGENT},
+        headers={"X-Actor": AGENT},
     )
-    assert payload["created_by"] == OWNER_ACTOR
-    # Landing `active` *is* the human attribution: an agent write lands proposed.
-    assert payload["state"] == "active"
+    assert response.status_code == 400
+    # The refusal wrote nothing — no row, no event — so no identity stuck.
+    assert service.list_nodes(principal=owner()) == []
+    assert _events() == before
 
 
 def test_an_agent_proposal_accepted_over_http_is_a_human_write(client, fresh_db):
@@ -1341,6 +1500,146 @@ def test_logout_kills_the_session_and_clears_the_cookie(client, fresh_db):
     # The row is gone server-side: the same cookie is now worthless.
     assert client.get("/api/types").status_code == 401
     assert Client(http_api.create_app(), session=session).get("/api/types").status_code == 401
+
+
+def test_a_successful_login_writes_a_human_login_event(fresh_db):
+    """The auth half of the audit trail: a successful login is on record.
+
+    M5: the finding was that a password login wrote nothing at all — success
+    or failure — to the events table the service calls "the audit trail".
+    """
+    service.set_human_password("owner", OWNER_PASSWORD, principal=owner())
+    anonymous = Client(http_api.create_app())
+
+    response = anonymous.post("/api/login", json={"name": "owner", "password": OWNER_PASSWORD})
+
+    assert response.status_code == 200, response.text
+    (login,) = _events("human.login")
+    assert login.actor == OWNER_ACTOR
+    assert login.payload == {"human_id": "owner"}
+
+
+def test_a_refused_login_writes_a_human_login_failed_event(fresh_db):
+    """Wrong credentials stay an indistinguishable 401 and land on the log.
+
+    The event's actor is the *attempted* name: a failed login has no verified
+    principal, and the payload carries no password material.
+    """
+    service.set_human_password("owner", OWNER_PASSWORD, principal=owner())
+    anonymous = Client(http_api.create_app())
+
+    response = anonymous.post("/api/login", json={"name": "owner", "password": "wrong"})
+
+    assert response.status_code == 401
+    (failed,) = _events("human.login_failed")
+    assert failed.actor == "owner"
+    assert failed.payload == {"name": "owner", "reason": "invalid credentials"}
+
+
+def test_five_failed_attempts_lock_a_name_until_the_window_slides(fresh_db):
+    """M5: the lockout refuses the next attempt — correct password or not.
+
+    The refusal is itself recorded, with the lockout as its reason, so the
+    audit trail says what happened. The window is real: once it slides past
+    the failures, the correct password works again.
+    """
+    service.set_human_password("owner", OWNER_PASSWORD, principal=owner())
+    anonymous = Client(http_api.create_app())
+    for _ in range(service.LOGIN_MAX_FAILED_ATTEMPTS):
+        assert (
+            anonymous.post("/api/login", json={"name": "owner", "password": "wrong"}).status_code
+            == 401
+        )
+
+    refused = anonymous.post("/api/login", json={"name": "owner", "password": OWNER_PASSWORD})
+    assert refused.status_code == 429
+    assert refused.json()["error"]["type"] == "LoginLocked"
+    assert _events("human.login_failed")[0].payload["reason"] == "locked"
+    assert service.login_is_locked("owner") is True
+
+    conn = db.connect()
+    try:
+        conn.execute(
+            "UPDATE events SET created_at = datetime('now', '-30 minutes')"
+            " WHERE op = 'human.login_failed'"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    assert service.login_is_locked("owner") is False
+    assert (
+        anonymous.post("/api/login", json={"name": "owner", "password": OWNER_PASSWORD}).status_code
+        == 200
+    )
+
+
+def test_the_lockout_is_not_an_existence_oracle(fresh_db):
+    """A nonexistent name locks exactly like a real one — no way to probe.
+
+    The failed attempts are counted by the name the attempt claimed, so
+    nothing about the answer discloses whether the name exists.
+    """
+    anonymous = Client(http_api.create_app())
+    for _ in range(service.LOGIN_MAX_FAILED_ATTEMPTS):
+        assert (
+            anonymous.post("/api/login", json={"name": "nobody", "password": "wrong"}).status_code
+            == 401
+        )
+
+    refused = anonymous.post("/api/login", json={"name": "nobody", "password": "anything"})
+    assert refused.status_code == 429
+    assert refused.json()["error"]["type"] == "LoginLocked"
+    assert _events("human.login_failed")[0].payload["reason"] == "locked"
+
+
+def test_a_successful_login_resets_the_failure_count(fresh_db):
+    """Consecutive misses are real: a success clears the failures before it.
+
+    Three misses, a correct login, three more misses: only the last three
+    count, so the name is not locked — without the reset it would be six
+    failures and the seventh attempt would be refused.
+    """
+    service.set_human_password("owner", OWNER_PASSWORD, principal=owner())
+    anonymous = Client(http_api.create_app())
+    for _ in range(3):
+        assert (
+            anonymous.post("/api/login", json={"name": "owner", "password": "wrong"}).status_code
+            == 401
+        )
+    assert (
+        anonymous.post("/api/login", json={"name": "owner", "password": OWNER_PASSWORD}).status_code
+        == 200
+    )
+    for _ in range(3):
+        assert (
+            anonymous.post("/api/login", json={"name": "owner", "password": "wrong"}).status_code
+            == 401
+        )
+    assert (
+        anonymous.post("/api/login", json={"name": "owner", "password": OWNER_PASSWORD}).status_code
+        == 200
+    )
+
+
+def test_logout_records_the_human_logout_event_and_removes_the_session(client, fresh_db):
+    """Logout is the last entry a session writes, and the row is really gone."""
+    session = client.session
+
+    response = client.post("/api/logout")
+
+    assert response.status_code == 200
+    (logout,) = _events("human.logout")
+    assert logout.actor == OWNER_ACTOR
+    assert logout.payload == {"human_id": "owner"}
+    conn = db.connect()
+    try:
+        remaining = conn.execute(
+            "SELECT count(*) AS n FROM sessions WHERE id = ?",
+            (hashlib.sha256(session.encode()).hexdigest(),),
+        ).fetchone()["n"]
+    finally:
+        conn.close()
+    assert remaining == 0
 
 
 def test_a_dead_session_cookie_is_cleared_on_the_401(fresh_db):
@@ -2292,6 +2591,127 @@ def test_every_download_refusal_reads_identically(client, fresh_db, tmp_path):
     assert urls.consume(upload["token"], kind="upload")["kind"] == "upload"
 
 
+def test_a_head_probe_does_not_spend_a_download_token(client, fresh_db, tmp_path):
+    """HEAD must never redeem the capability: a probe is not a download.
+
+    Starlette answers HEAD on a GET route by running the handler with the
+    body suppressed, so a bare route would *spend the single-use token* on a
+    request that asked for no bytes — and the real GET behind it would come
+    back refused. The route refuses HEAD with 405 (``Allow: GET``), the probe
+    is not event-logged, and the token survives for the GET that wants it.
+    """
+    original = b"%PDF-1.4\nprobe me not\n"
+    ingested = _ingest_file(client, tmp_path, original)
+    grant = _mint_download(client, ingested["asset"]["hash"])
+    assert _events("asset.download") == []
+
+    probe = client.request("HEAD", grant["url"])
+
+    assert probe.status_code == 405
+    assert set(probe.headers["allow"].split(", ")) == {"GET"}
+    assert probe.content == b""  # HEAD carries no body — the status is the refusal
+    assert _events("asset.download") == []  # the probe spent nothing
+
+    # The same refusal through a body-bearing method, so the error is readable:
+    # the app's own 405 machinery (``MethodNotAllowed``), not an accidental one.
+    delete = client.delete(grant["url"])
+    assert delete.status_code == 405
+    assert delete.json()["error"]["type"] == "MethodNotAllowed"
+    assert _events("asset.download") == []
+
+    response = client.get(grant["url"])
+
+    assert response.status_code == 200
+    assert response.content == original
+    assert len(_events("asset.download")) == 1  # spent by the GET, exactly once
+
+
+def test_the_download_response_closes_the_database_before_streaming(
+    client, fresh_db, tmp_path, monkeypatch
+):
+    """M15: the client-paced stream holds no database handle, WAL pin included.
+
+    The blob copy finishes inside :func:`_original_response`, so the
+    connection it used is closed before a single chunk streams — and with the
+    connection, the blob's open read transaction and its WAL snapshot, which a
+    stalled client would otherwise pin for the whole (potentially gigabyte,
+    client-paced) transfer.
+    """
+    original = b"%PDF-1.4\nspooled, never pinned\n"
+    ingested = _ingest_file(client, tmp_path, original)
+    real_connect = db.connect
+    seen: list[sqlite3.Connection] = []
+
+    def tracking_connect(path=None):
+        conn = real_connect(path)
+        seen.append(conn)
+        return conn
+
+    monkeypatch.setattr(http_api.db, "connect", tracking_connect)
+    response = http_api._original_response(ingested["asset"]["hash"], fresh_db)
+
+    assert len(seen) == 1
+    with pytest.raises(sqlite3.ProgrammingError):
+        seen[0].execute("SELECT 1")  # closed before the stream even started
+
+    async def drain() -> bytes:
+        return b"".join([chunk async for chunk in response.body_iterator])
+
+    assert asyncio.run(drain()) == original
+
+
+def test_the_download_spool_is_unlinked_once_the_stream_is_served(
+    client, fresh_db, tmp_path, monkeypatch
+):
+    """M15: the spooled temp file dies with the response, not with the handler.
+
+    The temp file is the one artifact a download leaves behind, so it must be
+    gone once the response is done — the alternative is a gigabyte-scale temp
+    file per download accumulating until a reboot.
+    """
+    original = b"%PDF-1.4\nspool lifecycle\n"
+    ingested = _ingest_file(client, tmp_path, original)
+    real_tnf = http_api.tempfile.NamedTemporaryFile
+    spooled: list[str] = []
+
+    def tracking_tnf(*args, **kwargs):
+        handle = real_tnf(*args, **kwargs)
+        spooled.append(handle.name)
+        return handle
+
+    monkeypatch.setattr(http_api.tempfile, "NamedTemporaryFile", tracking_tnf)
+    grant = _mint_download(client, ingested["asset"]["hash"])
+
+    response = client.get(grant["url"])
+
+    assert response.status_code == 200
+    assert response.content == original
+    assert len(spooled) == 1
+    assert not Path(spooled[0]).exists(), "the spool must be unlinked after the stream"
+
+
+def test_closing_the_download_stream_mid_transfer_unlinks_the_spool(tmp_path):
+    """M15: a client hang-up closes the generator; the finally must still unlink.
+
+    Starlette closes a streaming response's generator instead of draining it
+    when the client disconnects, so the unlink lives in the generator's
+    ``finally`` — this drives exactly that: consume one chunk, close, and the
+    file is gone.
+    """
+    spool = tmp_path / "spool.tmp"
+    spool.write_bytes(b"z" * (2 * http_api.UPLOAD_CHUNK_BYTES + 7))
+
+    async def drive() -> None:
+        chunks = http_api._spooled_chunks(spool)
+        first = await chunks.__anext__()
+        assert len(first) == http_api.UPLOAD_CHUNK_BYTES
+        await chunks.aclose()
+
+    asyncio.run(drive())
+
+    assert not spool.exists()
+
+
 def test_an_upload_url_ingests_the_bytes_the_grant_was_minted_for(client, fresh_db):
     """A PUT with no cookie, no origin headers and no content type at all.
 
@@ -2300,12 +2720,22 @@ def test_an_upload_url_ingests_the_bytes_the_grant_was_minted_for(client, fresh_
     dead-ends, because no surface can turn a stored hash into a subgraph.
     """
     payload = b"scanned page bytes"
-    grant = _mint_upload(client, "scan.txt", len(payload))["grant"]
-    assert grant["url"].startswith(f"{BASE_URL}{urls.TOKEN_PATHS['upload']}/")
-    assert grant["max_bytes"] == len(payload)
+    # Minted by a **second** human, not the owner session: the redemption
+    # presents no identity of its own, so its attribution comes from the token
+    # row's `created_by`. Asserting the owner's own actor three times over
+    # could not tell a handler that hardcoded `owner_principal()` from one
+    # that re-mints the grant's authoriser (review MAJOR-4).
+    second = service.create_human("second", principal=owner())
+    second_actor = f"human:{second.id}"
+    grant = urls.mint_upload(
+        "scan.txt", "text/plain", len(payload), principal=auth.principal_from_actor(second_actor)
+    ).grant
+    assert grant is not None, "a mint without sha256 always grants a URL"
+    assert grant.url.startswith(f"{BASE_URL}{urls.TOKEN_PATHS['upload']}/")
+    assert grant.max_bytes == len(payload)
     anonymous = Client(client.app)
 
-    result = _ok(anonymous.put(grant["url"], guard=False, content=payload))
+    result = _ok(anonymous.put(grant.url, guard=False, content=payload))
 
     assert result["asset"]["hash"] == hashlib.sha256(payload).hexdigest()
     assert result["asset"]["size_bytes"] == len(payload)
@@ -2316,11 +2746,14 @@ def test_an_upload_url_ingests_the_bytes_the_grant_was_minted_for(client, fresh_
     assert result["source"]["content"] == "scanned page bytes"
     assert result["created"] is True
     # Everything is attributed to the principal who minted the grant — stored
-    # state, since the request itself carries no identity.
-    assert result["asset_ref"]["created_by"] == OWNER_ACTOR
-    assert [event.actor for event in _events("asset.upload")] == [OWNER_ACTOR]
+    # state, since the request itself carries no identity. The second human is
+    # named and the owner is ruled out, so a handler that minted under the
+    # owner would fail here rather than pass in triplicate.
+    assert result["asset_ref"]["created_by"] == second_actor
+    assert result["asset_ref"]["created_by"] != OWNER_ACTOR
+    assert [event.actor for event in _events("asset.upload")] == [second_actor]
     # Single use, exactly like the download side.
-    assert anonymous.put(grant["url"], guard=False, content=payload).status_code == 400
+    assert anonymous.put(grant.url, guard=False, content=payload).status_code == 400
 
 
 def test_an_upload_grant_dies_with_the_account_that_minted_it(client, fresh_db):
@@ -2346,6 +2779,36 @@ def test_an_upload_grant_dies_with_the_account_that_minted_it(client, fresh_db):
     assert response.json()["error"]["type"] == "PrincipalDisabled"
     assert "storage error" not in response.text
     assert service.list_nodes(type="source", principal=owner()) == []
+
+
+def test_a_grant_revoked_before_redemption_stores_no_bytes(client, fresh_db):
+    """Review B6: a write grant revoked between mint and redeem must not leave bytes.
+
+    ``mint_upload`` probes the grant before the transfer, but the gap is the
+    window *after* the mint: a grant revoked there used to store the body
+    anyway, because the refusal arrived from the node write, after
+    ``register_asset`` had committed the bytes. The redemption re-mints the
+    grant's principal and ``ingest_upload`` runs the same pre-registration
+    probe, so the refused PUT answers 403 with ``asset_blobs`` still empty.
+    """
+    payload = b"revoked before redemption"
+    courier = agent("courier", grants={"meta": "read", "main": "suggest"})
+    grant = urls.mint_upload("drop.txt", "text/plain", len(payload), principal=courier).grant
+    # The write grant is gone by redemption time, while the read grant that
+    # keeps the space resolvable stays — the exact case the old code refused
+    # only after storing the bytes.
+    service.grant("courier", "main", "read", principal=owner())
+
+    response = Client(client.app).put(grant.url, guard=False, content=payload)
+
+    assert response.status_code == 403, response.text
+    assert response.json()["error"]["type"] == "GrantNotPermitted"
+    assert assets.list_assets(principal=owner()) == []
+    conn = db.connect(fresh_db)
+    try:
+        assert conn.execute("SELECT count(*) AS n FROM asset_blobs").fetchone()["n"] == 0
+    finally:
+        conn.close()
 
 
 def test_a_grant_for_a_space_archived_since_the_mint_stores_no_bytes(client, fresh_db):
@@ -2683,6 +3146,79 @@ def test_a_page_raster_reaches_the_rendition_route_through_its_colon(client, fre
     assert client.get(f"{base}/thumb").status_code == 400
 
 
+def test_the_blocking_routes_run_their_service_call_off_the_event_loop(
+    client, fresh_db, tmp_path, fixture_server, monkeypatch
+):
+    """M22: the upload, ingest and rendition service calls never run on the loop.
+
+    There is no way to assert "the loop was not blocked" from inside the
+    process, but there is a way to assert the mechanism that keeps it free:
+    each blocking service call must run on a worker thread, never the loop's.
+    Every one of them is wrapped in a recorder that runs the real function and
+    remembers the thread it ran on; the harness drives one ``asyncio.run`` per
+    request on the main thread, so a call that stayed inline would record the
+    main thread and fail the final assertion.
+    """
+    recordings: list[tuple[str, threading.Thread]] = []
+
+    def off_loop(name: str):
+        def decorate(func):
+            def wrapper(*args, **kwargs):
+                recordings.append((name, threading.current_thread()))
+                return func(*args, **kwargs)
+
+            return wrapper
+
+        return decorate
+
+    # POST /api/assets — registration streams the whole file into the store.
+    monkeypatch.setattr(assets, "register_asset", off_loop("register_asset")(assets.register_asset))
+    payload = _png_bytes()
+    uploaded = _ok(client.post("/api/assets", files={"file": ("photo.png", payload, "image/png")}))
+    assert uploaded["hash"] == hashlib.sha256(payload).hexdigest()
+
+    # GET /api/assets/{id}/rendition/thumb — a miss renders (Pillow/pypdfium2).
+    monkeypatch.setattr(assets, "get_rendition", off_loop("get_rendition")(assets.get_rendition))
+    rendition = client.get(f"/api/assets/{uploaded['hash']}/rendition/thumb")
+    assert rendition.status_code == 200, rendition.text
+    assert Image.open(io.BytesIO(rendition.content)).format == "WEBP"
+
+    # POST /api/ingest — both branches: a local path, then a server-side fetch.
+    source = tmp_path / "hydrology.txt"
+    source.write_text("Vercingetorix basin hydrology", encoding="utf-8")
+    monkeypatch.setattr(ingest, "ingest_file", off_loop("ingest_file")(ingest.ingest_file))
+    ingested = _ok(client.post("/api/ingest", json={"path": str(source), "title": "Basin"}))
+    assert ingested["created"] is True
+    assert ingested["source"]["title"] == "Basin"
+    fixture_server.canned = (
+        b"<html><body><p>Basin hydrology</p></body></html>",
+        "text/html; charset=utf-8",
+    )
+    monkeypatch.setattr(ingest, "ingest_url", off_loop("ingest_url")(ingest.ingest_url))
+    fetched = _ok(
+        client.post("/api/ingest", json={"url": _fixture_url(fixture_server, "/article")})
+    )
+    assert fetched["extraction"]["handler"] == "html"
+
+    # PUT /api/uploads/{token} — the capability route: no session at all.
+    grant = _mint_upload(client, "scan.png", len(payload))["grant"]
+    monkeypatch.setattr(ingest, "ingest_upload", off_loop("ingest_upload")(ingest.ingest_upload))
+    redemption = _ok(Client(client.app).put(grant["url"], guard=False, content=payload))
+    assert redemption["asset"]["hash"] == uploaded["hash"]  # same bytes: dedup
+
+    recorded = {name for name, _ in recordings}
+    assert recorded == {
+        "register_asset",
+        "get_rendition",
+        "ingest_file",
+        "ingest_url",
+        "ingest_upload",
+    }, f"every blocking call must have run: {recorded}"
+    main = threading.main_thread()
+    inline = [name for name, thread in recordings if thread is main]
+    assert inline == [], f"blocking calls ran on the event loop: {inline}"
+
+
 def test_healthz_reports_liveness_and_not_the_database_path(fresh_db):
     """A probe needs ``status``, not a filesystem tour.
 
@@ -2875,6 +3411,127 @@ def test_edges_list_and_create(client, fresh_db):
     assert bad.status_code == 400
 
 
+def test_edges_as_of_reads_the_validity_window(client, fresh_db):
+    """The D2/B8 gate through the HTTP surface: `?as_of=` places a retired
+    edge at the instants its window covered, and nowhere else."""
+    a = service.create_node(type="concept", title="A", principal=owner())
+    b = service.create_node(type="concept", title="B", principal=owner())
+    edge = _ok(
+        client.post(
+            "/api/edges",
+            json={"src_id": a.id, "dst_id": b.id, "type": "relates_to", "confidence": 0.5},
+        )
+    )
+    # Edges retire through the service (no archive route on this surface).
+    retired = service.transition(edge["id"], "archive", principal=owner())
+    assert retired.valid_to
+
+    conn = db.connect()
+    try:
+        conn.execute(
+            "UPDATE edges SET valid_from = ?, valid_to = ? WHERE id = ?",
+            ("2026-08-01 10:00:00", "2026-08-01 10:00:10", edge["id"]),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    assert _ok(client.get("/api/edges?state=active"))["edges"] == []
+    mid = _ok(client.get("/api/edges?as_of=2026-08-01%2010:00:05"))
+    assert [e["id"] for e in mid["edges"]] == [edge["id"]]
+    assert _ok(client.get("/api/edges?as_of=2026-08-01%2010:00:20"))["edges"] == []
+
+
+def test_subgraph_as_of_reads_the_validity_window(client, fresh_db):
+    """`GET /api/graph/subgraph?as_of=` follows a retired edge at the instants
+    its window covered; the default read stays the live graph."""
+    a = service.create_node(type="concept", title="A", principal=owner())
+    b = service.create_node(type="concept", title="B", principal=owner())
+    edge = service.create_edge(a.id, b.id, "relates_to", principal=owner())
+    service.transition(edge.id, "archive", principal=owner())
+    conn = db.connect()
+    try:
+        conn.execute(
+            "UPDATE edges SET valid_from = ?, valid_to = ? WHERE id = ?",
+            ("2026-08-01 10:00:00", "2026-08-01 10:00:10", edge.id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    live = _ok(client.get(f"/api/graph/subgraph?root={a.id}&depth=1"))
+    assert {node["id"] for node in live["nodes"]} == {a.id}
+    mid = _ok(client.get(f"/api/graph/subgraph?root={a.id}&depth=1&as_of=2026-08-01%2010:00:05"))
+    assert {node["id"] for node in mid["nodes"]} == {a.id, b.id}
+    later = _ok(client.get(f"/api/graph/subgraph?root={a.id}&depth=1&as_of=2026-08-01%2010:00:20"))
+    assert {node["id"] for node in later["nodes"]} == {a.id}
+
+
+def test_node_create_rejects_malformed_field_types(client, fresh_db):
+    """M1: caller input that used to reach SQLite as a 500 is a 400 at the boundary.
+
+    A dict body field was bound into SQLite directly, where a list or a dict
+    is an ``InterfaceError`` — a 500 with a "database error" line. Now the
+    input     model refuses the shapes first, and nothing is written either.
+    """
+    before = _events()
+    for body in (
+        {"type": "note", "props": ["a"]},
+        {"type": {"a": 1}},
+        {"type": "note", "content": {"x": 1}},
+        {"type": "note", "title": ["x"]},
+        {"type": "note", "surprise": 1},  # extra="forbid" on the input model
+    ):
+        assert client.post("/api/nodes", json=body).status_code == 400, body
+    assert service.list_nodes(principal=owner()) == []
+    assert _events() == before
+
+
+def test_edge_create_rejects_malformed_confidence_and_props(client, fresh_db):
+    """M1: a non-numeric ``confidence`` and a non-object ``props`` are 400s, and
+    nothing is written (the old ``0 <= "abc"`` was a 500)."""
+    a = service.create_node(type="concept", title="A", principal=owner())
+    b = service.create_node(type="concept", title="B", principal=owner())
+    before = _events()
+
+    for body in (
+        {"src_id": a.id, "dst_id": b.id, "type": "relates_to", "confidence": "abc"},
+        {"src_id": a.id, "dst_id": b.id, "type": "relates_to", "props": ["x"]},
+        {"dst_id": b.id, "type": "relates_to"},  # missing src_id stays a 400
+        {"src_id": a.id, "dst_id": b.id, "type": "relates_to", "surprise": 1},
+    ):
+        assert client.post("/api/edges", json=body).status_code == 400, body
+    assert service.list_edges(principal=owner()) == []
+    assert _events() == before
+
+
+def test_patch_null_semantics(client, fresh_db):
+    """M2: ``title: null`` clears the title; ``content: null``/``props: null``
+    are refused, and absent is distinct from null.
+
+    ``title`` is nullable in the read model, so nulling it is the documented
+    "clears the title" web affordance. ``content`` and ``props`` are not
+    nullable — a null would corrupt read-back, so it is refused rather than
+    stored.
+    """
+    node = _ok(client.post("/api/nodes", json={"type": "note", "title": "T", "content": "c"}))
+    node_id = node["id"]
+
+    cleared = _ok(client.patch(f"/api/nodes/{node_id}", json={"title": None}))
+    assert cleared["title"] is None
+
+    for body in ({"content": None}, {"props": None}, {"title": "x", "bogus": 1}):
+        assert client.patch(f"/api/nodes/{node_id}", json=body).status_code == 400, body
+    still = _ok(client.get(f"/api/nodes/{node_id}"))
+    assert (still["title"], still["content"]) == (None, "c")  # the refusals wrote nothing
+
+    retitled = _ok(client.patch(f"/api/nodes/{node_id}", json={"title": "Back"}))
+    assert retitled["title"] == "Back"
+    only_content = _ok(client.patch(f"/api/nodes/{node_id}", json={"content": "c2"}))
+    assert only_content["title"] == "Back"  # a patch that does not name the title leaves it
+    assert only_content["content"] == "c2"
+
+
 def test_search_and_link_suggestions(client, fresh_db):
     service.create_node(
         type="note", title="Osmosis in plants", content="water moves", principal=owner()
@@ -2892,6 +3549,70 @@ def test_search_and_link_suggestions(client, fresh_db):
     assert suggestions["nodes"][0]["title"] == "Osmosis in plants"
     assert _ok(client.get("/api/links/suggest?prefix="))["count"] == 1
     assert client.get("/api/links/suggest?prefix=a&limit=0").status_code == 400
+
+
+def test_state_param_absent_is_the_service_default():
+    """B7: ``_state_param`` returns the service default for an absent parameter
+    and ``None`` only for an explicit ``any`` — absent must not mean "every
+    state" the way it did when ``None`` reached the service."""
+    from starlette.datastructures import QueryParams
+
+    param = http_api._state_param
+    assert param(QueryParams("")) == "active"
+    assert param(QueryParams("q=zebra")) == "active"
+    assert param(QueryParams("state=active")) == "active"
+    assert param(QueryParams("state=proposed")) == "proposed"
+    assert param(QueryParams("state=archived")) == "archived"
+    assert param(QueryParams("state=any")) is None
+
+
+def test_search_defaults_to_active_until_state_any_is_said(client, fresh_db):
+    """B7: a bare ``GET /api/search`` must not include proposed or archived rows.
+
+    The HTTP surface used to hand ``state=None`` to the service for an absent
+    parameter — the service's "every state" — where the CLI and the MCP server
+    both default to ``active``. Absent is now the CLI's default, and ``any`` is
+    the explicit opt-in to every state, exactly as on the other surfaces.
+    """
+    proposed = service.create_node(
+        type="note", title="Zebra proposed", content="zebra stripes", principal=agent(AGENT)
+    )
+    archived = service.create_node(
+        type="note", title="Zebra archived", content="zebra hooves", principal=owner()
+    )
+    service.transition(archived.id, "archive", principal=owner())
+    active = service.create_node(
+        type="note", title="Zebra active", content="zebra mane", principal=owner()
+    )
+
+    assert service.get_node(proposed.id, principal=owner()).state == "proposed"
+    assert service.get_node(archived.id, principal=owner()).state == "archived"
+
+    default_hits = _ok(client.get("/api/search?q=zebra"))["hits"]
+    assert [hit["node_id"] for hit in default_hits] == [active.id]
+
+    active_hits = _ok(client.get("/api/search?q=zebra&state=active"))["hits"]
+    assert [hit["node_id"] for hit in active_hits] == [active.id]
+
+    every_hits = _ok(client.get("/api/search?q=zebra&state=any"))["hits"]
+    assert {hit["node_id"] for hit in every_hits} == {proposed.id, archived.id, active.id}
+
+
+def test_nl_search_keeps_the_active_default(client, fresh_db):
+    """B7: the rewrite branch shares ``_search_filters`` with the plain branch,
+    so it keeps the same state default — one fixed source, two call sites."""
+    proposed = service.create_node(
+        type="note", title="Zebra proposed", content="zebra stripes", principal=agent(AGENT)
+    )
+    active = service.create_node(
+        type="note", title="Zebra active", content="zebra mane", principal=owner()
+    )
+    llm.set_provider(_FakeLLM(_fake_completion({"terms": ["zebra"]})))
+
+    body = _ok(client.get("/api/search?q=zebra+stripes&nl=1"))
+
+    assert proposed.id not in {hit["node_id"] for hit in body["hits"]}
+    assert [hit["node_id"] for hit in body["hits"]] == [active.id]
 
 
 def test_graph_subgraph_and_path(client, fresh_db):

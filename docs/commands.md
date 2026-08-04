@@ -42,16 +42,17 @@ write over
 MCP, never the CLI, and land per their grants (`suggest` → `proposed`, `edit` →
 `active`).
 
-**Human-only operations** — `accept`, `reject`, `archive`, `undo`, `rollback`,
-`cycle-abandon`, `cycle-list`, `cycle-get`, every
-`review` subcommand, and all account/grant administration (`human`, `agent`,
-`grant`, `revoke`, `space-*` commands) require a human principal. Review
-(`accept`/`reject`/`archive`) and the curative tier (`merge-nodes`, `retype`,
-`supersede-edge`, `bulk-relink`, `consolidate`) can also be exercised by an
-agent holding `edit` on the spaces involved — over the service API, not the
-CLI. `undo` and `rollback` stay human-only: both write a recorded payload back
-verbatim, `state = 'active'` included, and `rollback` does it for a whole cycle
-at once.
+**Human-only operations** — `archive`, `undo`, `rollback`, `cycle-abandon`,
+`cycle-list`, `cycle-get`, and all account/grant administration (`human`,
+`agent`, `grant`, `revoke`, `space-*` commands) require a human principal at
+the service layer, whatever the surface. `accept`/`reject` and the curative
+tier (`merge-nodes`, `retype`, `supersede-edge`, `bulk-relink`, `consolidate`)
+can also be exercised by an agent holding `edit` on the spaces involved — over
+the service API, not the CLI, which is human-only. The line is live state:
+`archive` retires it, and `undo`/`rollback` write a recorded payload back
+verbatim, `state = 'active'` included — `rollback` for a whole cycle at once —
+so none of the three is in-space authority. Accepting within a granted space
+is a different act from either.
 
 **Rejections need a reason** — both `reject <id> --reason` and `review reject
 … --reason` require it and record it in the reject event's payload.
@@ -334,15 +335,18 @@ does not resolve). With no provider configured the refusal names
 ### Consolidation and the curative tier
 
 - `consolidate` — Run a consolidation cycle: the gardener's deterministic
-  jobs (including **queue curation** — each proposer's acceptance rate over the
-  last 90 days, computed from row state and recorded as a convention note in
-  the `conventions` space plus one annotation per queue item; it never accepts
-  or rejects, and nothing gates a write on the proposer's own confidence),
-  the abstraction job (5b-ii's first — it synthesizes a `concept` node
+  jobs (including **queue curation** — each proposer's acceptance rate over
+  its proposals in the last 90 days: row state measures the outcomes, the
+  event log classifies which rows were proposals — recorded as a convention
+  note in the `conventions` space plus one annotation per queue item; it never
+  accepts or rejects, and nothing gates a write on the proposer's own
+  confidence), the abstraction job (5b-ii's first — it synthesizes a `concept` node
   from a dense, sized cluster of related notes, but only when
   `NODUM_LLM_CYCLE_BUDGET` funds it and a provider is configured), and the
   report. `--scope` confines it to one space, `--job` selects jobs
-  (repeatable; default is all of them, in order), `--dry-run` computes
+  (repeatable, each name at most once — a repeated name is refused, since a
+  repeat would spend a second full cycle budget on the same work; default is
+  all of them, in order), `--dry-run` computes
   everything and emits **no** event at all.
 - `cycle-list` — List cycles, newest first: the dream journal. Human-only.
 - `cycle-get <id>` — One journal entry: what ran, what it measured, how it

@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 from helpers import OWNER_ACTOR, agent, owner
 
-from nodum import db, service
+from nodum import auth, db, service
 from nodum.service import InvalidTransition, VersionNotFound
 
 AGENT = "agent:researcher"
@@ -149,6 +149,122 @@ def test_applied_update_is_undoable(fresh_db):
     update_event = next(e for e in service.list_events(owner(), limit=10) if e.op == "node.update")
     service.undo(update_event.seq, principal=owner())
     assert service.get_node(note.id, principal=owner()).content == "See [[Graph Theory]]."
+
+
+# ── The accept writes a true snapshot of the node (finding M9) ────────────────
+
+
+def test_accept_writes_a_true_snapshot_of_the_node_as_it_stands(fresh_db):
+    """History gets the state the accept *landed*, not the proposal's copy.
+
+    The proposal row is a record of what was proposed: the fields the agent did
+    not name are copies from proposal time. Marking it ``applied`` made history
+    read those stale copies as the accepted state — the proposal row, relabeled,
+    never matched the node at accept. The accept now writes a genuine snapshot,
+    every field of the node as it stands; the human's interim title included.
+    """
+    _, note = _graph()
+    version = service.update_node(note.id, content="Bot rewrite.", principal=agent(AGENT))
+    # A human fixes the title while the proposal waits; the accept must not
+    # replay the proposal-time title, and the snapshot must record the truth.
+    service.update_node(note.id, title="Human-corrected title", principal=owner())
+
+    service.transition(str(version.id), "accept", principal=owner())
+
+    history = service.history(note.id, principal=owner())
+    # [create snapshot, proposal (now applied), true accept snapshot]
+    proposal = next(v for v in history if v.id == version.id)
+    snapshot = history[-1]
+    assert proposal.state == "applied"
+    # The proposal row is the *record* of the proposal: its un-named title is
+    # the proposal-time copy, not the state the accept landed.
+    assert proposal.title == "My note"
+    # The new snapshot is the truth: every field of the node at accept.
+    assert snapshot.id != version.id
+    assert snapshot.state == "applied"
+    node = service.get_node(note.id, principal=owner())
+    assert (snapshot.title, snapshot.content, snapshot.props) == (
+        node.title,
+        node.content,
+        node.props,
+    )
+    assert snapshot.actor == OWNER_ACTOR
+    # It is stamped with the accept's own event.
+    accept_event = next(e for e in service.list_events(owner(), limit=10) if e.op == "node.update")
+    assert snapshot.event_seq == accept_event.seq
+
+
+def test_diff_versions_reads_the_accepted_state_true(fresh_db):
+    """The accept snapshot is a real version a diff can read (finding M9)."""
+    _, note = _graph()
+    version = service.update_node(
+        note.id, content="A longer, rewritten body.", principal=agent(AGENT)
+    )
+    service.transition(str(version.id), "accept", principal=owner())
+
+    history = service.history(note.id, principal=owner())
+    create_snapshot, accept_snapshot = history[0], history[-1]
+    diff = service.diff_versions(create_snapshot.id, accept_snapshot.id, principal=owner())
+    assert diff.changed_fields == ["content"]
+    assert "A longer, rewritten body." in diff.diff
+
+
+def _accepted_in_a_cycle(version_id):
+    """Accept one proposal inside a closed cycle, as the gardener; return the id."""
+    cycle = service.open_cycle(trigger="manual", principal=owner())
+    with service.in_cycle(cycle.id):
+        service.transition(str(version_id), "accept", principal=auth.internal_principal())
+    service.close_cycle(cycle.id, status="completed", report={}, principal=owner())
+    return cycle.id
+
+
+def test_undoing_an_accept_removes_the_snapshot_row_it_wrote(fresh_db):
+    """Reversing the accept takes its snapshot with it (finding M9).
+
+    The snapshot records the exact state the reversal exists to take back;
+    leaving it would show history a state the accept was already undone from.
+    The undo removes the row — recorded in its payload so the involution puts
+    it back — and writes its own snapshot of the restored node, like every
+    other node reversal.
+    """
+    _, note = _graph()
+    version = service.update_node(note.id, content="Bot rewrite.", principal=agent(AGENT))
+    service.transition(str(version.id), "accept", principal=owner())
+    snapshot = service.history(note.id, principal=owner())[-1]
+    assert snapshot.id != version.id
+
+    accept_event = next(e for e in service.list_events(owner(), limit=10) if e.op == "node.update")
+    service.undo(accept_event.seq, principal=owner())
+
+    after = service.history(note.id, principal=owner())
+    assert all(v.id != snapshot.id for v in after), (
+        "the accept's snapshot must not survive its reversal"
+    )
+    proposal = next(v for v in after if v.id == version.id)
+    assert proposal.state == "proposed"
+    assert service.get_node(note.id, principal=owner()).content == "See [[Graph Theory]]."
+
+
+def test_rolling_back_an_accept_removes_the_snapshot_row_it_wrote(fresh_db):
+    """The cycle-reversal spelling of the same rule (finding M9)."""
+    _, note = _graph()
+    version = service.update_node(note.id, content="Bot rewrite.", principal=agent(AGENT))
+    before = service.history(note.id, principal=owner())
+
+    cycle_id = _accepted_in_a_cycle(version.id)
+    snapshot = service.history(note.id, principal=owner())[-1]
+    assert snapshot.id != version.id
+
+    service.rollback_cycle(cycle_id, principal=owner())
+
+    after = service.history(note.id, principal=owner())
+    assert all(v.id != snapshot.id for v in after), (
+        "the accept's snapshot must not survive the rollback"
+    )
+    proposal = next(v for v in after if v.id == version.id)
+    assert proposal.state == "proposed"
+    # Every pre-cycle row is back, in order — plus the rollback's own snapshot.
+    assert [v.id for v in before] == [v.id for v in after[: len(before)]]
 
 
 # ── Accepting applies only what the agent proposed ───────────────────────────

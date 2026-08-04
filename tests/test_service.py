@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import ast
 import inspect
+import json
 
 import pytest
 from helpers import OWNER_ACTOR, agent, owner
+from pydantic import ValidationError
 
-from nodum import auth, search, service
+from nodum import auth, db, search, service
 from nodum.migrations import GARDENER_AGENT_ID
 from nodum.service import (
     EdgeNotFound,
@@ -238,6 +240,67 @@ def test_propose_edges_reports_an_escalation_as_a_failed_suggestion(fresh_db):
     assert service.list_edges(principal=owner()) == []
 
 
+def test_propose_edges_rejects_an_unknown_suggestion_key(fresh_db):
+    """M32: an unknown key is refused with the key named, not silently dropped.
+
+    ``enabled`` is the scar from the batch's own docstring era: the edge used
+    to be written and the key quietly ignored.
+    """
+    a, b = _pair()
+    result = service.propose_edges(
+        [
+            {"src": a.id, "dst": b.id, "edge_type": "relates_to"},
+            {"src": a.id, "dst": b.id, "edge_type": "supports", "enabled": True},
+        ],
+        principal=owner(),
+    )
+    assert [edge.state for edge in result.created] == ["active"]
+    assert len(result.failed) == 1
+    assert result.failed[0].index == 1
+    assert "unknown suggestion key(s): enabled" in result.failed[0].error
+    assert service.list_edges(principal=owner()) == [result.created[0]]
+
+
+def test_propose_edges_a_bad_props_suggestion_writes_nothing(fresh_db):
+    """M32 (B3-adjacent): a bad ``props`` shape fails validation before the insert.
+
+    It used to pass the old per-suggestion parsing, get inserted, then fail
+    ``_edge_out`` — leaving a bricked row that the single batch commit then
+    persisted (the corruption the single-edge path already guards against).
+    """
+    a, b = _pair()
+    before = _count_rows("edges")
+    result = service.propose_edges(
+        [
+            {"src": a.id, "dst": b.id, "edge_type": "relates_to"},
+            {"src": a.id, "dst": b.id, "edge_type": "supports", "props": ["a"]},
+        ],
+        principal=owner(),
+    )
+    assert len(result.created) == 1
+    assert len(result.failed) == 1
+    assert result.failed[0].index == 1
+    # The whole batch committed exactly the one valid edge — no bricked row.
+    assert _count_rows("edges") == before + 1
+    assert [edge.src_id for edge in service.list_edges(principal=owner())] == [a.id]
+
+
+def test_propose_edges_a_bad_confidence_is_a_failed_suggestion_not_a_crash(fresh_db):
+    """M32: ``confidence: "abc"`` used to raise ``TypeError`` inside the loop,
+    uncaught by the per-suggestion handlers — it killed the whole batch."""
+    a, b = _pair()
+    result = service.propose_edges(
+        [
+            {"src": a.id, "dst": b.id, "edge_type": "relates_to"},
+            {"src": a.id, "dst": b.id, "edge_type": "supports", "confidence": "abc"},
+        ],
+        principal=owner(),
+    )
+    assert len(result.created) == 1
+    assert len(result.failed) == 1
+    assert result.failed[0].index == 1
+
+
 def test_a_landing_state_a_write_cannot_land_in_is_refused_once(fresh_db):
     """`archived` is not a landing state, and a batch-level argument fails once."""
     a, b = _pair()
@@ -335,6 +398,288 @@ def test_transition_applies_to_edges_too(fresh_db):
     accepted = service.transition(edge.id, "accept", principal=owner())
     assert accepted.state == "active"
     assert accepted.id == edge.id
+
+
+# ── Synthesis: the flag is verified against the create event (M21) ────────────
+
+
+def _synthesis_unit(gardener, member_ids=(), *, title="Concept"):
+    """A concept and its membership edges, written the way the abstraction job
+    writes them: by the gardener, filed ``proposed``, the synthesis marker in
+    the props of the same call that emits the create event."""
+    node = service.create_node(
+        type="concept",
+        title=title,
+        content="synthesised from the members",
+        landing="proposed",
+        props={"synthesized": True, "members": list(member_ids), "job": "abstraction"},
+        principal=gardener,
+    )
+    edges = [
+        service.create_edge(node.id, member, "derived_from", landing="proposed", principal=gardener)
+        for member in member_ids
+    ]
+    return node, edges
+
+
+def test_is_synthesis_verifies_the_create_event_not_current_props(fresh_db):
+    """M21's contract, at the reader itself: ``synthesized`` is a fact about
+    the event that wrote the node. A flag forged at create, or bolted on by a
+    later update, is not a synthesis; only the gardener's abstraction write
+    is."""
+    gardener = auth.internal_principal()
+
+    forged_at_create = service.create_node(
+        type="concept",
+        title="forged",
+        content="c",
+        landing="proposed",
+        props={"synthesized": True},
+        principal=agent("intruder", grants={"meta": "read", "main": "edit"}),
+    )
+    assert service.is_synthesis(forged_at_create.id) is False
+
+    plain = service.create_node(type="note", title="plain", principal=owner())
+    service.update_node(plain.id, props={"synthesized": True}, principal=owner())
+    assert service.is_synthesis(plain.id) is False
+
+    real = service.create_node(
+        type="concept",
+        title="real",
+        content="c",
+        landing="proposed",
+        props={"synthesized": True, "members": [], "job": "abstraction"},
+        principal=gardener,
+    )
+    assert service.is_synthesis(real.id) is True
+    assert service.is_synthesis("no-such-node") is False
+
+
+def test_accepting_a_real_synthesis_activates_its_membership_edges(fresh_db):
+    """The privileged settle survives M21: a synthesis the gardener actually
+    wrote (its create event names the gardener and the marker) settles its
+    ``derived_from`` edges with the review — active on accept, as before."""
+    gardener = auth.internal_principal()
+    member = service.create_node(type="note", title="M", principal=owner())
+    concept, edges = _synthesis_unit(gardener, [member.id])
+    assert [edge.state for edge in edges] == ["proposed"]
+
+    service.transition(concept.id, "accept", principal=owner())
+
+    settled = service.list_edges(node_id=concept.id, type="derived_from", principal=owner())
+    assert [edge.state for edge in settled] == ["active"]
+
+
+def test_rejecting_a_real_synthesis_archives_its_membership_edges(fresh_db):
+    """The reject arm of the same unit: a rejected concept's membership edges
+    are archived with it, never left as orphaned proposals."""
+    gardener = auth.internal_principal()
+    member = service.create_node(type="note", title="M", principal=owner())
+    concept, edges = _synthesis_unit(gardener, [member.id])
+    assert [edge.state for edge in edges] == ["proposed"]
+
+    service.transition(concept.id, "reject", principal=owner())
+
+    settled = service.list_edges(node_id=concept.id, type="derived_from", principal=owner())
+    assert [edge.state for edge in settled] == ["archived"]
+
+
+def test_a_forged_synthesized_flag_does_not_settle_membership_edges(fresh_db):
+    """M21's regression on the accept path: ``props.synthesized`` on a node an
+    ordinary writer created is a forge, and accepting it must not sweep its
+    ``derived_from`` edges to ``active``. The flag alone used to gate the
+    settle; it is now held against the create event, whose actor is not the
+    gardener."""
+    intruder = agent("intruder", grants={"meta": "read", "main": "edit"})
+    member = service.create_node(type="note", title="M", principal=owner())
+    forged = service.create_node(
+        type="concept",
+        title="forged",
+        content="not written by the gardener",
+        landing="proposed",
+        props={"synthesized": True, "members": [member.id]},
+        principal=intruder,
+    )
+    edge = service.create_edge(
+        forged.id, member.id, "derived_from", landing="proposed", principal=intruder
+    )
+    assert edge.state == "proposed"
+
+    service.transition(forged.id, "accept", principal=owner())
+
+    untouched = service.list_edges(node_id=forged.id, type="derived_from", principal=owner())
+    assert [edge.state for edge in untouched] == ["proposed"]
+
+
+# ── Edge temporality (D2/B8) ──────────────────────────────────────────────────
+
+
+def _set_validity(edge_id, valid_from, valid_to):
+    """Stamp an edge's window directly, past the writers, for read-predicate tests.
+
+    The writers record SQLite's second-resolution wall clock; a test that
+    needs *exact* instants (a between-instant inside a one-second window is
+    not representable) sets the window by hand and asserts the reads against
+    it. The writer tests above assert the writers fire at all.
+    """
+    conn = db.connect()
+    try:
+        conn.execute(
+            "UPDATE edges SET valid_from = ?, valid_to = ? WHERE id = ?",
+            (valid_from, valid_to, edge_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_create_edge_sets_valid_from_when_it_lands_active(fresh_db):
+    """An active edge IS true at creation, so its window opens with it (D2)."""
+    a = service.create_node(type="claim", title="A", principal=owner())
+    b = service.create_node(type="claim", title="B", principal=owner())
+    edge = service.create_edge(a.id, b.id, "supports", principal=owner())
+    assert edge.state == "active"
+    assert edge.valid_from is not None
+    assert edge.valid_to is None
+
+
+def test_create_edge_landing_proposed_opens_no_window(fresh_db):
+    """A proposed edge is not yet true — its window opens only on accept."""
+    a = service.create_node(type="claim", title="A", principal=owner())
+    b = service.create_node(type="claim", title="B", principal=owner())
+    edge = service.create_edge(a.id, b.id, "supports", principal=agent("researcher"))
+    assert edge.state == "proposed"
+    assert edge.valid_from is None
+    assert edge.valid_to is None
+
+
+def test_accepting_a_proposed_edge_sets_valid_from(fresh_db):
+    """Accept is when the edge became true, so accept writes `valid_from`."""
+    a = service.create_node(type="claim", title="A", principal=owner())
+    b = service.create_node(type="claim", title="B", principal=owner())
+    edge = service.create_edge(a.id, b.id, "supports", principal=agent("researcher"))
+    accepted = service.transition(edge.id, "accept", principal=owner())
+    assert accepted.state == "active"
+    assert accepted.valid_from is not None
+
+
+def test_rejecting_a_proposed_edge_closes_no_window(fresh_db):
+    """A rejected proposal was never true, so no window opens or closes."""
+    a = service.create_node(type="claim", title="A", principal=owner())
+    b = service.create_node(type="claim", title="B", principal=owner())
+    edge = service.create_edge(a.id, b.id, "supports", principal=agent("researcher"))
+    rejected = service.transition(edge.id, "reject", reason="not true", principal=owner())
+    assert rejected.state == "archived"
+    assert rejected.valid_from is None
+    assert rejected.valid_to is None
+
+
+def test_archiving_an_edge_sets_valid_to(fresh_db):
+    """Retiring a live edge closes its window at the archive instant (D2)."""
+    a = service.create_node(type="claim", title="A", principal=owner())
+    b = service.create_node(type="claim", title="B", principal=owner())
+    edge = service.create_edge(a.id, b.id, "supports", principal=owner())
+    archived = service.transition(edge.id, "archive", principal=owner())
+    assert archived.state == "archived"
+    assert archived.valid_from is not None
+    assert archived.valid_to is not None
+
+
+def test_as_of_lists_edges_inside_their_validity_window(fresh_db):
+    """The D2/B8 gate, list_edges form: a closed window hides an edge from the
+    default read but an as-of read places it at the instants the window
+    covered, and nowhere else."""
+    a = service.create_node(type="claim", title="A", principal=owner())
+    b = service.create_node(type="claim", title="B", principal=owner())
+    edge = service.create_edge(a.id, b.id, "supports", principal=owner())
+    service.transition(edge.id, "archive", principal=owner())
+    # Window: valid from 10:00:00 to 10:00:10 (exclusive of the close).
+    _set_validity(edge.id, "2026-08-01 10:00:00", "2026-08-01 10:00:10")
+
+    # Default live-graph read: archived, so gone (already true before D2).
+    assert service.list_edges(state="active", principal=owner()) == []
+    # As-of between creation and archive: present.
+    mid = service.list_edges(as_of="2026-08-01 10:00:05", principal=owner())
+    assert [e.id for e in mid] == [edge.id]
+    # As-of after the window closed: absent.
+    assert service.list_edges(as_of="2026-08-01 10:00:20", principal=owner()) == []
+    # As-of exactly at the close: the window is (valid_from, valid_to], so the
+    # closed instant itself is outside it.
+    assert service.list_edges(as_of="2026-08-01 10:00:10", principal=owner()) == []
+
+
+def test_as_of_places_a_proposed_edge_only_after_its_accept(fresh_db):
+    """The D2/B8 gate, accept form: `valid_from` opens at the accept instant,
+    so an as-of read before the accept does not show the edge, and one after
+    does."""
+    a = service.create_node(type="claim", title="A", principal=owner())
+    b = service.create_node(type="claim", title="B", principal=owner())
+    edge = service.create_edge(a.id, b.id, "supports", principal=agent("researcher"))
+    accepted = service.transition(edge.id, "accept", principal=owner())
+    _set_validity(accepted.id, "2026-08-01 10:00:10", None)
+
+    assert service.list_edges(as_of="2026-08-01 10:00:05", principal=owner()) == []
+    after = service.list_edges(as_of="2026-08-01 10:00:15", principal=owner())
+    assert [e.id for e in after] == [edge.id]
+
+
+def test_as_of_legacy_active_edge_is_valid_since_the_beginning(fresh_db):
+    """A pre-D2 active edge has no window; as-of at "now" must agree with the
+    default read, so NULL `valid_from` reads as "valid since the beginning"."""
+    a = service.create_node(type="claim", title="A", principal=owner())
+    b = service.create_node(type="claim", title="B", principal=owner())
+    edge = service.create_edge(a.id, b.id, "supports", principal=owner())
+    _set_validity(edge.id, None, None)  # a pre-D2 row: neither column set
+
+    assert [e.id for e in service.list_edges(principal=owner())] == [edge.id]
+    assert [e.id for e in service.list_edges(as_of="2020-01-01 00:00:00", principal=owner())] == [
+        edge.id
+    ]
+    assert [e.id for e in service.list_edges(as_of="2026-08-01 10:00:00", principal=owner())] == [
+        edge.id
+    ]
+
+
+def test_as_of_legacy_archived_edge_with_no_window_is_not_placed(fresh_db):
+    """A pre-D2 archived edge has NULL `valid_to` — its closure is unknown, so
+    no instant can be placed inside its window. The default read hides it by
+    state; an as-of read must not resurrect it at any instant."""
+    a = service.create_node(type="claim", title="A", principal=owner())
+    b = service.create_node(type="claim", title="B", principal=owner())
+    edge = service.create_edge(a.id, b.id, "supports", principal=owner())
+    service.transition(edge.id, "archive", principal=owner())
+    _set_validity(edge.id, None, None)  # a pre-D2 retirement: no window
+
+    assert service.list_edges(state="active", principal=owner()) == []
+    assert service.list_edges(as_of="2020-01-01 00:00:00", principal=owner()) == []
+    assert service.list_edges(as_of="2026-08-01 10:00:00", principal=owner()) == []
+    # Even the archived-state read of the past cannot place it.
+    archived_past = service.list_edges(
+        state="archived", as_of="2026-08-01 10:00:00", principal=owner()
+    )
+    assert archived_past == []
+
+
+def test_as_of_composes_with_an_explicit_state_filter(fresh_db):
+    """A state filter under as-of narrows the live part; the window still
+    rules, and a window-covered archived edge is admitted regardless."""
+    a = service.create_node(type="claim", title="A", principal=owner())
+    b = service.create_node(type="claim", title="B", principal=owner())
+    live = service.create_edge(a.id, b.id, "supports", principal=owner())
+    retired = service.create_edge(a.id, b.id, "contradicts", principal=owner())
+    service.transition(retired.id, "archive", principal=owner())
+    _set_validity(live.id, "2026-08-01 09:00:00", None)
+    _set_validity(retired.id, "2026-08-01 10:00:00", "2026-08-01 10:00:10")
+
+    # As-of with no state filter: the live edge and the window-covered retired
+    # one both placed.
+    both = service.list_edges(as_of="2026-08-01 10:00:05", principal=owner())
+    assert {e.id for e in both} == {live.id, retired.id}
+    # As-of with a state filter still admits the window-covered archived edge.
+    with_archive = service.list_edges(
+        state="active", as_of="2026-08-01 10:00:05", principal=owner()
+    )
+    assert {e.id for e in with_archive} == {live.id, retired.id}
 
 
 def test_transition_unknown_id_raises_the_kind_agnostic_base(fresh_db):
@@ -658,3 +1003,98 @@ def test_a_missing_agent_is_named_the_same_way_on_every_path_that_looks_one_up(f
             call()
         assert str(missing.value) == "agent not found: nope"
         assert "agents row" not in str(missing.value)
+
+
+# ── Commit-before-validate (B3): a response model that fails to build must ────
+# ── never leave the write committed ───────────────────────────────────────────
+
+
+def _count_rows(table: str) -> int:
+    """Row count for one table, read straight from the database file."""
+    conn = db.connect()
+    try:
+        return conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+    finally:
+        conn.close()
+
+
+def _corrupt_props(record_id: str, *, table: str = "nodes") -> None:
+    """Write a props value ``props: dict`` models reject, as an older buggy
+    release would have left it: a JSON array survives ``json.dumps``."""
+    conn = db.connect()
+    try:
+        conn.execute(
+            f"UPDATE {table} SET props = ? WHERE id = ?",
+            (json.dumps(["a", "b"]), record_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_create_node_bad_props_raises_without_committing(fresh_db):
+    """A props shape `NodeOut` rejects must fail pre-commit, or the bad row
+    bricks every later `list_nodes` on the space (the reviewer repro: the
+    commit landed first, then the response model raised forever after)."""
+    before = (_count_rows("nodes"), _count_rows("versions"), _count_rows("events"))
+    with pytest.raises(ValidationError):
+        service.create_node(type="note", title="bad", props=["a", "b"], principal=owner())
+    # The space still lists — the row, event, and version were all rolled back.
+    assert service.list_nodes(principal=owner()) == []
+    assert (_count_rows("nodes"), _count_rows("versions"), _count_rows("events")) == before
+
+
+def test_update_node_bad_props_raises_without_committing_human_path(fresh_db):
+    """The apply path: a bad `props` update must fail pre-commit, leaving the
+    node, its version history, and the event log exactly as they were."""
+    node = service.create_node(type="note", title="t", props={"k": 1}, principal=owner())
+    before = (_count_rows("versions"), _count_rows("events"))
+    with pytest.raises(ValidationError):
+        service.update_node(node.id, props=["a", "b"], principal=owner())
+    # Nothing was committed: the stored row still holds the old, valid props.
+    assert service.get_node(node.id, principal=owner()).props == {"k": 1}
+    assert service.get_node(node.id, principal=owner()).title == "t"
+    assert (_count_rows("versions"), _count_rows("events")) == before
+
+
+def test_update_node_bad_props_raises_without_committing_agent_path(fresh_db):
+    """The propose path: an agent's proposed update that fails to model must
+    not leave a `version.propose` event or a proposed version behind."""
+    node = service.create_node(type="note", title="t", principal=owner())
+    before = (_count_rows("versions"), _count_rows("events"))
+    with pytest.raises(ValidationError):
+        service.update_node(node.id, props=["a", "b"], principal=agent("researcher"))
+    assert (_count_rows("versions"), _count_rows("events")) == before
+    # The node itself is untouched, and the review queue holds nothing new.
+    assert service.get_node(node.id, principal=owner()).props == {}
+    assert service.list_proposals(principal=owner()) == []
+
+
+def test_create_edge_bad_props_raises_without_committing(fresh_db):
+    """A bad `props` edge must fail pre-commit, or the row bricks `list_edges`."""
+    a = service.create_node(type="claim", title="A", principal=owner())
+    b = service.create_node(type="claim", title="B", principal=owner())
+    before_events = _count_rows("events")
+    with pytest.raises(ValidationError):
+        service.create_edge(a.id, b.id, "supports", props=["x"], principal=owner())
+    assert service.list_edges(principal=owner()) == []
+    assert _count_rows("edges") == 0
+    assert _count_rows("events") == before_events
+
+
+def test_transition_bad_props_raises_without_committing(fresh_db):
+    """A transition of a row whose props no longer model must fail pre-commit:
+    the state flip, event, and version all roll back (the row is corrupted
+    directly, the way the pre-fix `create_node`/`update_node` left rows)."""
+    node = service.create_node(type="note", title="t", principal=owner())
+    _corrupt_props(node.id)
+    before = (_count_rows("versions"), _count_rows("events"))
+    with pytest.raises(ValidationError):
+        service.transition(node.id, "archive", principal=owner())
+    conn = db.connect()
+    try:
+        state = conn.execute("SELECT state FROM nodes WHERE id = ?", (node.id,)).fetchone()[0]
+    finally:
+        conn.close()
+    assert state == "active"  # still active: the flip was rolled back
+    assert (_count_rows("versions"), _count_rows("events")) == before

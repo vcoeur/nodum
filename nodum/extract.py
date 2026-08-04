@@ -33,7 +33,15 @@ a use for one; until then an unclaimed MIME says so honestly
 Every result is capped at :data:`MAX_TEXT_CHARS`, because the extracted text
 becomes a database row and one pathological file must not be able to make that
 row unbounded. When the cap bites it is reported in ``detail`` — truncation is
-never silent.
+never silent. Two further ceilings keep the *parse* itself bounded, not just
+the row it fills: the ``pdf`` handler parses at most :data:`MAX_PDF_PAGES`
+pages (pages past the cap are never parsed at all, since ``pypdf``'s page
+sequence is lazy), and the ``text``/``html`` handlers read at most
+``MAX_TEXT_CHARS + 4`` bytes off disk before decoding — the read is the memory
+bound, so a 200 MB file peaks at the size of the window it is allowed to have
+rather than at three times its own length (findings M23/M24). The ``image``
+handler refuses a decompression bomb from the image header before any OCR
+decode (finding M28). All three cuts are reported in ``detail`` too.
 """
 
 from __future__ import annotations
@@ -48,6 +56,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import Protocol
 
+from nodum import assets
 from nodum.models import HandlerStatus
 
 #: Largest extracted text kept from one asset.
@@ -57,6 +66,26 @@ from nodum.models import HandlerStatus
 #: FTS insert, and the chunking pass over it stay cheap. Beyond it the text is
 #: truncated and ``detail`` says so.
 MAX_TEXT_CHARS = 2_000_000
+
+#: Ceiling on how many pages of one PDF the ``pdf`` handler parses.
+#:
+#: The real bound on a pathological PDF is the *parse*, not the row it fills:
+#: a 50,000-page file whose pages all extract to one character still costs a
+#: full parse of every page object before :func:`_cap_pages` gets to cap the
+#: result. 2000 pages is far beyond any real document — a 1500-page reference
+#: work is a rare shelf-ender — while still bounding the pathological parse.
+#: The cut is reported in ``detail``; because ``reader.pages`` is lazy
+#: (``get_page(n)`` parses page ``n`` only when the iteration reaches it), the
+#: pages past the cap are never parsed at all (finding M23).
+MAX_PDF_PAGES = 2000
+
+#: Widest single UTF-8 character, in bytes.
+#:
+#: A read of ``MAX_TEXT_CHARS + _MAX_UTF8_CHAR_BYTES`` bytes therefore holds
+#: the character that straddles the byte boundary whole in every encoding, and
+#: the decode can produce at most ``MAX_TEXT_CHARS + 4`` characters — the read
+#: window, not the file, is what the memory bound is (finding M24).
+_MAX_UTF8_CHAR_BYTES = 4
 
 #: The two MIME types the ``html`` handler owns. Named here because the
 #: ``text`` handler has to exclude them from its ``text/*`` claim.
@@ -119,15 +148,37 @@ class Handler(Protocol):
     mimes: tuple[str, ...]
 
     def handles(self, mime: str) -> bool:
-        """Return whether this handler claims ``mime``."""
+        """Return whether this handler claims ``mime``.
+
+        Args:
+            mime: The file's MIME type; parameters are ignored.
+
+        Returns:
+            ``True`` when this handler claims the type.
+        """
         ...
 
     def availability(self) -> tuple[bool, str | None]:
-        """Return ``(available, reason)`` — ``reason`` explains an unavailable handler."""
+        """Return ``(available, reason)`` — ``reason`` explains an unavailable handler.
+
+        Returns:
+            ``(True, None)`` when the handler can run; otherwise
+            ``(False, reason)`` naming what is missing and how to fix it.
+        """
         ...
 
     def extract(self, source: Path, *, mime: str) -> Extraction:
-        """Extract text from ``source``, which the caller has checked this handler claims."""
+        """Extract text from ``source``, which the caller has checked this handler claims.
+
+        Args:
+            source: The file to read.
+            mime: The file's full MIME type, parameters included — the
+                handler may read ``charset=`` itself.
+
+        Returns:
+            The extraction result: ``text`` is ``""`` whenever nothing came
+            out, and ``detail`` then says why.
+        """
         ...
 
 
@@ -188,10 +239,22 @@ class _BaseHandler:
 # ── Result construction (the text cap lives here) ────────────────────────────
 
 
-def _cap_text(text: str) -> tuple[str, str | None]:
-    """Truncate ``text`` to :data:`MAX_TEXT_CHARS`, explaining the cut when there was one."""
+def _cap_text(text: str, source_size: int | None = None) -> tuple[str, str | None]:
+    """Truncate ``text`` to :data:`MAX_TEXT_CHARS`, explaining the cut when there was one.
+
+    ``source_size`` is the file's byte length when the caller read a *window*
+    of it rather than the whole file (the streaming handlers below): the
+    explanation then names both ends of the cut — how big the source is and
+    how much of it was read — instead of reporting the window's own length as
+    if it were the source's.
+    """
     if len(text) <= MAX_TEXT_CHARS:
         return text, None
+    if source_size is not None:
+        return text[:MAX_TEXT_CHARS], (
+            f"text truncated to the {MAX_TEXT_CHARS}-character cap "
+            f"(the source holds {source_size} bytes; {len(text)} characters were read)"
+        )
     return text[:MAX_TEXT_CHARS], (
         f"text truncated to the {MAX_TEXT_CHARS}-character cap "
         f"(the source held {len(text)} characters)"
@@ -224,14 +287,57 @@ def _cap_pages(pages: list[str]) -> tuple[list[str], str | None]:
     return kept, None
 
 
-def _flat_extraction(handler_name: str, text: str, *, empty_detail: str) -> Extraction:
-    """Build an unpaginated result: cap the text, and explain an empty one."""
-    capped, detail = _cap_text(text)
+def _flat_extraction(
+    handler_name: str,
+    text: str,
+    *,
+    empty_detail: str,
+    source_size: int | None = None,
+    read_cut: bool = False,
+) -> Extraction:
+    """Build an unpaginated result: cap the text, and explain an empty one.
+
+    ``source_size`` and ``read_cut`` are the streaming read's answers — the
+    file's byte length, and whether it continued past the read window. A read
+    cut the character cap did not itself explain (a dense multibyte file
+    reaches the byte window in far fewer than :data:`MAX_TEXT_CHARS`
+    characters) is reported rather than left silent.
+    """
+    capped, detail = _cap_text(text, source_size)
+    if detail is None and read_cut:
+        detail = (
+            f"text cut at the {MAX_TEXT_CHARS}-character read window "
+            f"(the source holds {source_size} bytes; {len(text)} characters were read)"
+        )
     if detail is None and not capped.strip():
         # "Nothing came out" is `text == ""`, never a body of whitespace: a
         # caller testing the text must not have to strip it first.
         return Extraction(handler=handler_name, text="", detail=empty_detail)
     return Extraction(handler=handler_name, text=capped, detail=detail)
+
+
+def _read_text_window(source: Path, *, charset: str = "utf-8") -> tuple[str, int, bool]:
+    """Read a bounded window of ``source`` as text.
+
+    At most :data:`MAX_TEXT_CHARS` + :data:`_MAX_UTF8_CHAR_BYTES` bytes are
+    pulled off disk and decoded with replacement. The window is the memory
+    bound: it is enough to *exceed* the character cap in the sparsest encoding
+    (1 byte per character) and to hold the character that straddles the
+    boundary whole in every encoding (4 bytes is the widest UTF-8 character),
+    so the pathological file peaks at the size of the window it is allowed to
+    have rather than at the whole file — the read is the bound, not the
+    decode (finding M24).
+
+    Returns:
+        ``(text, source_size, cut)`` — the decoded window, the source's byte
+        length, and whether the source continues past the window. A caller
+        must report ``cut``: a read that stops early is truncation, and
+        truncation is never silent.
+    """
+    size = source.stat().st_size
+    with source.open("rb") as handle:
+        raw = handle.read(MAX_TEXT_CHARS + _MAX_UTF8_CHAR_BYTES)
+    return raw.decode(charset, errors="replace"), size, len(raw) < size
 
 
 # ── Handlers ─────────────────────────────────────────────────────────────────
@@ -247,19 +353,38 @@ class TextHandler(_BaseHandler):
     """
 
     name = "text"
-    mimes = ("text/*", "application/json")
+    mimes: tuple[str, ...] = ("text/*", "application/json")
 
     def handles(self, mime: str) -> bool:
-        """Claim the text family and JSON — but leave HTML to the ``html`` handler."""
+        """Claim the text family and JSON — but leave HTML to the ``html`` handler.
+
+        Args:
+            mime: A MIME type; parameters are ignored.
+
+        Returns:
+            ``True`` for ``text/*`` and ``application/json``; ``False`` for
+            HTML, which is the ``html`` handler's.
+        """
         normalized = _normalize_mime(mime)
         if normalized in HTML_MIMES:
             return False
         return super().handles(normalized)
 
     def extract(self, source: Path, *, mime: str) -> Extraction:
-        """Read ``source`` as UTF-8 text, replacing undecodable bytes."""
-        text = source.read_bytes().decode("utf-8", errors="replace")
-        return _flat_extraction(self.name, text, empty_detail="the file holds no text")
+        """Read ``source`` as UTF-8 text, replacing undecodable bytes.
+
+        Args:
+            source: The file to read.
+            mime: Accepted for the interface; this handler always reads UTF-8.
+
+        Returns:
+            The extracted text; ``detail`` names the cut when the read was
+            bounded short of the source.
+        """
+        text, size, cut = _read_text_window(source)
+        return _flat_extraction(
+            self.name, text, empty_detail="the file holds no text", source_size=size, read_cut=cut
+        )
 
 
 #: Any run of whitespace in HTML text, which renders as a single space.
@@ -333,7 +458,7 @@ class HtmlHandler(_BaseHandler):
     """
 
     name = "html"
-    mimes = HTML_MIMES
+    mimes: tuple[str, ...] = HTML_MIMES
 
     def extract(self, source: Path, *, mime: str) -> Extraction:
         """Parse ``source`` and return its visible text.
@@ -343,14 +468,30 @@ class HtmlHandler(_BaseHandler):
         replacement characters exactly where its accents were, which is silent
         corruption of the text the whole pipeline then indexes. An unknown or
         absent charset falls back to UTF-8 with replacement, which is the right
-        guess for the modern web.
+        guess for the modern web. The *read* is bounded like the ``text``
+        handler's: at most :data:`MAX_TEXT_CHARS` + 4 bytes of markup are
+        pulled off disk before decoding, whatever the charset's width.
+
+        Args:
+            source: The HTML file to read.
+            mime: The file's full ``Content-Type``; its ``charset`` parameter
+                selects the decode, and an absent or unknown charset falls
+                back to UTF-8.
+
+        Returns:
+            The document's visible text — markup, ``script`` and ``style``
+            bodies never reach it.
         """
-        markup = source.read_bytes().decode(_declared_charset(mime), errors="replace")
+        markup, size, cut = _read_text_window(source, charset=_declared_charset(mime))
         parser = _HtmlTextParser()
         parser.feed(markup)
         parser.close()
         return _flat_extraction(
-            self.name, parser.text(), empty_detail="the document holds no visible text"
+            self.name,
+            parser.text(),
+            empty_detail="the document holds no visible text",
+            source_size=size,
+            read_cut=cut,
         )
 
 
@@ -363,21 +504,56 @@ class PdfHandler(_BaseHandler):
     """
 
     name = "pdf"
-    mimes = ("application/pdf",)
+    mimes: tuple[str, ...] = ("application/pdf",)
 
     def availability(self) -> tuple[bool, str | None]:
-        """Available when ``pypdf`` imports."""
+        """Available when ``pypdf`` imports.
+
+        Returns:
+            ``(True, None)`` with the ``pdf`` extra installed; otherwise
+            ``(False, reason)`` naming the extra.
+        """
         return _probe(self.name, _probe_pypdf)
 
     def extract(self, source: Path, *, mime: str) -> Extraction:
-        """Return per-page text, and the pages joined by a blank line as ``text``."""
+        """Return per-page text, and the pages joined by a blank line as ``text``.
+
+        Args:
+            source: The PDF file to read.
+            mime: Accepted for the interface; this handler reads the whole
+                document.
+
+        Returns:
+            One extraction with per-page text in ``pages`` — empty pages kept
+            so ``pages[n - 1]`` stays page ``n`` — and those pages joined by
+            a blank line as ``text``. A document with no embedded text (a
+            scan) comes back with empty ``text`` and a ``detail`` pointing at
+            the image handler's OCR.
+        """
         from pypdf import PdfReader
 
         reader = PdfReader(str(source))
-        # Empty pages are kept: `pages[n - 1]` has to stay page n for the
-        # per-page blocks and `page:<n>` rasters built on top of this.
-        pages = [(page.extract_text() or "").strip() for page in reader.pages]
-        kept, detail = _cap_pages(pages)
+        # `reader.pages` is lazy: `get_page(n)` parses page n only when the
+        # iteration reaches it (verified against the installed pypdf — it is a
+        # `_VirtualList` over `get_num_pages`/`get_page`), so the break below
+        # means the pages past the cap are **never parsed at all**. The
+        # pathological PDF pays for the pages it is allowed to have, and the
+        # parse itself — not just the row it fills — is bounded (finding M23).
+        total_pages = len(reader.pages)
+        parsed: list[str] = []
+        for page in reader.pages:
+            if len(parsed) >= MAX_PDF_PAGES:
+                break
+            # Empty pages are kept: `pages[n - 1]` has to stay page n for the
+            # per-page blocks and `page:<n>` rasters built on top of this.
+            parsed.append((page.extract_text() or "").strip())
+        kept, detail = _cap_pages(parsed)
+        if total_pages > MAX_PDF_PAGES:
+            page_cut = (
+                f"stopped after page {MAX_PDF_PAGES} of {total_pages}: the "
+                f"{MAX_PDF_PAGES}-page parse cap was reached"
+            )
+            detail = f"{page_cut}; {detail}" if detail else page_cut
         text = PAGE_SEPARATOR.join(kept)
         if not text.strip():
             # A document of empty pages joins into separators; "nothing came
@@ -385,7 +561,7 @@ class PdfHandler(_BaseHandler):
             text = ""
             if detail is None:
                 detail = (
-                    f"no embedded text in {len(pages)} page(s) — a scanned PDF "
+                    f"no embedded text in {len(parsed)} page(s) — a scanned PDF "
                     f"needs the image handler's OCR pass"
                 )
         return Extraction(handler=self.name, text=text, pages=kept, detail=detail)
@@ -401,16 +577,45 @@ class ImageHandler(_BaseHandler):
     """
 
     name = "image"
-    mimes = ("image/*",)
+    mimes: tuple[str, ...] = ("image/*",)
 
     def availability(self) -> tuple[bool, str | None]:
-        """Available when ``pytesseract`` imports *and* the tesseract binary is on PATH."""
+        """Available when ``pytesseract`` imports *and* the tesseract binary is on PATH.
+
+        Returns:
+            ``(True, None)`` when both hold; otherwise ``(False, reason)``
+            naming whichever is missing — the binary is a system package, not
+            an extra.
+        """
         return _probe(self.name, _probe_pytesseract)
 
     def extract(self, source: Path, *, mime: str) -> Extraction:
-        """Run OCR over the image and return the recognised text."""
-        import pytesseract
+        """Run OCR over the image and return the recognised text.
+
+        The pixel budget is checked from the header **before** any decode —
+        the same refusal the rendition path gives a decompression bomb
+        (finding M28) — and the refusal is a returned result, not an
+        exception: a 68-byte PNG declaring 150 megapixels must not wedge the
+        pipeline. The check runs before the ``pytesseract`` import so it
+        answers for the image alone, OCR availability notwithstanding.
+
+        Args:
+            source: The image file to OCR.
+            mime: Accepted for the interface; this handler does not use it.
+
+        Returns:
+            The recognised text; ``detail`` explains when the image was
+            refused (pixel budget) or OCR recognised nothing.
+        """
         from PIL import Image
+
+        try:
+            assets.check_image_pixel_budget(source)
+        except (assets.ImageTooLarge, assets.UnsupportedRendition) as exc:
+            return _flat_extraction(
+                self.name, "", empty_detail=_bounded_detail(f"image not OCR'd: {exc}")
+            )
+        import pytesseract  # pyright: ignore[reportMissingImports] degraded-mode
 
         with Image.open(source) as image:
             text = pytesseract.image_to_string(image)
@@ -421,10 +626,15 @@ class AudioHandler(_BaseHandler):
     """Speech-to-text through ``faster-whisper`` (the ``audio`` extra)."""
 
     name = "audio"
-    mimes = ("audio/*",)
+    mimes: tuple[str, ...] = ("audio/*",)
 
     def availability(self) -> tuple[bool, str | None]:
-        """Available when ``faster_whisper`` imports."""
+        """Available when ``faster_whisper`` imports.
+
+        Returns:
+            ``(True, None)`` with the ``audio`` extra installed; otherwise
+            ``(False, reason)`` naming the extra.
+        """
         return _probe(self.name, _probe_faster_whisper)
 
     def extract(self, source: Path, *, mime: str) -> Extraction:
@@ -435,8 +645,19 @@ class AudioHandler(_BaseHandler):
         ``NODUM_AUDIO_DOWNLOAD=1`` faster-whisper is confined to its local
         cache, and an uncached model raises here, which :func:`extract` turns
         into a ``detail`` naming the flag rather than a silent download.
+
+        Args:
+            source: The audio file to transcribe.
+            mime: Accepted for the interface; this handler does not use it.
+
+        Returns:
+            The recognised speech as one text; ``detail`` explains an empty
+            transcript, and an uncached model surfaces as the exception
+            :func:`extract` turns into a ``detail``.
         """
-        from faster_whisper import WhisperModel
+        from faster_whisper import (  # pyright: ignore[reportMissingImports] degraded-mode
+            WhisperModel,
+        )
 
         model = WhisperModel(
             os.environ.get(ENV_AUDIO_MODEL_VAR, AUDIO_MODEL),
@@ -491,7 +712,7 @@ def _probe_pypdf() -> tuple[bool, str | None]:
 def _probe_pytesseract() -> tuple[bool, str | None]:
     """Check for the OCR wrapper and, separately, the binary it drives."""
     try:
-        import pytesseract  # noqa: F401
+        import pytesseract  # noqa: F401  # pyright: ignore[reportMissingImports] degraded-mode
     except ImportError:
         return False, "pytesseract is not installed (install the 'ocr' extra)"
     if shutil.which(TESSERACT_BINARY) is None:
@@ -505,7 +726,7 @@ def _probe_pytesseract() -> tuple[bool, str | None]:
 def _probe_faster_whisper() -> tuple[bool, str | None]:
     """Check for the speech-to-text dependency."""
     try:
-        import faster_whisper  # noqa: F401
+        import faster_whisper  # noqa: F401  # pyright: ignore[reportMissingImports] degraded-mode
     except ImportError:
         return False, "faster-whisper is not installed (install the 'audio' extra)"
     return True, None

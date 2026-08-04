@@ -14,6 +14,7 @@ import ast
 from pathlib import Path
 
 import pytest
+from helpers import nodum_imports
 
 import nodum
 from nodum import auth
@@ -42,10 +43,14 @@ MINTING_FUNCTIONS = {
 #: all, so an absent entry is a denial rather than a hole. It used to be the
 #: other way round — the property iterated the map — which meant a module could
 #: mint whatever it liked simply by never being listed, and two already did.
+#: Entries name only functions that actually mint a principal: ``delete_session``
+#: is a session *sink*, not a source (it returns no principal), so it is not a
+#: minting function and is out of this guard's scope — the map is the record of
+#: where identity enters, not of every ``auth`` call a module makes.
 IDENTITY_SOURCES = {
     "cli.py": {"owner_principal"},  # trusted-local: --as names the human
     "mcp_server.py": {"verify_agent_token"},  # the agent's token
-    "http_api.py": {"verify_login", "principal_for_session", "delete_session"},
+    "http_api.py": {"verify_login", "principal_for_session"},  # the session pair
     # The consolidation runner: the internal agent authenticates by being
     # in-process and holds no credential to present, and `principal_from_actor`
     # re-mints *who asked* from the stored string the journal row carries.
@@ -73,6 +78,141 @@ def _modules() -> list[Path]:
 
 def _tree(path: Path) -> ast.Module:
     return ast.parse(path.read_text(encoding="utf-8"))
+
+
+def _dotted(node: ast.AST | None) -> str | None:
+    """The dotted name an Attribute/Name chain spells, or None for anything else.
+
+    ``auth.owner_principal`` → ``"auth.owner_principal"``; a call target that
+    is not a name or attribute chain (a ``**`` unpack, a subscript) spells
+    nothing and resolves to nothing.
+    """
+    parts: list[str] = []
+    current = node
+    while isinstance(current, ast.Attribute):
+        parts.append(current.attr)
+        current = current.value
+    if not isinstance(current, ast.Name):
+        return None
+    parts.append(current.id)
+    return ".".join(reversed(parts))
+
+
+def _import_from_base(node: ast.ImportFrom) -> str | None:
+    """The absolute module an ImportFrom names, or None for one outside the package."""
+    if node.level:
+        if node.level > 1:
+            return None  # a relative level beyond the flat package escapes it
+        return "nodum" if node.module is None else f"nodum.{node.module}"
+    if node.module == "nodum" or (node.module or "").startswith("nodum."):
+        return node.module or ""
+    return None
+
+
+def _auth_bindings(tree: ast.Module) -> dict[str, str]:
+    """Every name a module binds to :mod:`nodum.auth` or one of its functions.
+
+    The import spellings plus the dynamic ones that bind by assignment
+    (``importlib.import_module`` / ``__import__`` with a string) — the same
+    reach :func:`helpers.nodum_imports` claims, seen from the side of the
+    names the calls are spelled under. ``auth`` from ``from nodum import
+    auth``, the alias in ``import nodum.auth as identity``, the ``nodum``
+    chain from ``import nodum``, and the function itself from ``from
+    nodum.auth import owner_principal as resolve`` all land here.
+    """
+    bindings: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if not (alias.name == "nodum" or alias.name.startswith("nodum.")):
+                    continue
+                if alias.asname:
+                    bindings[alias.asname] = alias.name
+                else:
+                    # `import nodum.auth` binds `nodum`, and the chain
+                    # `nodum.auth.<fn>` resolves through it.
+                    bindings["nodum"] = "nodum"
+        elif isinstance(node, ast.ImportFrom):
+            base = _import_from_base(node)
+            if base is None:
+                continue
+            for alias in node.names:
+                if alias.name == "*":
+                    continue
+                target = alias.asname or alias.name
+                bindings[target] = f"{base}.{alias.name}"
+        elif isinstance(node, ast.Assign) and len(node.targets) == 1:
+            value = node.value
+            if not isinstance(value, ast.Call):
+                continue
+            function = (
+                value.func.attr
+                if isinstance(value.func, ast.Attribute)
+                else value.func.id
+                if isinstance(value.func, ast.Name)
+                else None
+            )
+            if function not in {"import_module", "__import__"}:
+                continue
+            target = node.targets[0]
+            if not isinstance(target, ast.Name):
+                continue
+            for argument in [*value.args, *(keyword.value for keyword in value.keywords)]:
+                if (
+                    isinstance(argument, ast.Constant)
+                    and isinstance(argument.value, str)
+                    and (argument.value == "nodum" or argument.value.startswith("nodum."))
+                ):
+                    bindings[target.id] = argument.value
+    return bindings
+
+
+def _resolve_chain(dotted: str | None, bindings: dict[str, str]) -> str | None:
+    """What a dotted call target resolves to through the module's bindings.
+
+    ``auth.owner_principal`` with ``auth`` bound to ``nodum.auth`` resolves to
+    ``nodum.auth.owner_principal``; a chain no binding is a prefix of
+    (``service.create_node`` in a module that imports auth) resolves to
+    nothing, so no minting call is counted in it.
+    """
+    if dotted is None:
+        return None
+    for prefix, path in bindings.items():
+        if dotted == prefix:
+            return path
+        if dotted.startswith(prefix + "."):
+            return path + dotted[len(prefix) :]
+    return None
+
+
+def _minting_calls(source: str) -> set[str]:
+    """Every minting function a module uses — called, or passed by reference.
+
+    The older matcher read only ``auth.<fn>`` **call** nodes on the bare name
+    ``auth`` — a refactor that aliased the import (``import nodum.auth as
+    identity``), reached it through the package chain (``nodum.auth.<fn>``),
+    imported the function directly (``from nodum.auth import
+    owner_principal``), or passed the loader as a value (``_run(auth.
+    owner_principal, human_id)`` — the CLI's ``--as``) moved the same minting
+    use out from under it, and a module that stopped importing ``auth`` at all
+    made the guard vacuous. Any reference counts, called or handed on, because
+    both are "using" the loader; the identity-rail spelling test
+    (:func:`test_the_identity_rail_sees_every_spelling_of_the_import`) pins
+    that every spelling is seen. This is the extractor it checks.
+    """
+    if "nodum.auth" not in nodum_imports(source):
+        return set()
+    tree = ast.parse(source)
+    bindings = _auth_bindings(tree)
+    used: set[str] = set()
+    for node in ast.walk(tree):
+        resolved = _resolve_chain(_dotted(node), bindings)
+        if resolved is None:
+            continue
+        for function in MINTING_FUNCTIONS:
+            if resolved == f"nodum.auth.{function}":
+                used.add(function)
+    return used
 
 
 def test_the_package_has_modules_to_check():
@@ -134,12 +274,21 @@ def test_no_module_reconstructs_an_identity_from_a_dataclass_replace(path: Path)
 
 @pytest.mark.parametrize("path", _modules(), ids=lambda path: path.name)
 def test_every_module_binds_only_the_identity_it_is_allowed(path: Path):
-    """Each module has exactly the identity sources the map gives it, and no other.
+    """Each module calls exactly the identity sources the map gives it, and no other.
 
     The HTTP module's own guards pin it to the session; this states the weaker
     property every other module must also satisfy — an identity enters through
     ``nodum.auth`` and nowhere else, and only where a human wrote down that it
-    may.
+    may. **Exactly**, not at most: a module whose map entry names a loader it
+    never calls is a permission waiting to be used, so the assertion is
+    equality with the allowed set, matching the first sentence of this
+    docstring (it used to be a subset check that let an allowed function go
+    uncalled).
+
+    The minting calls are matched through **any** binding of ``nodum.auth`` —
+    aliased imports, the ``nodum.auth.`` chain, direct function imports —
+    via :func:`_minting_calls`, whose reach
+    :func:`test_the_identity_rail_sees_every_spelling_of_the_import` pins.
 
     **The input is the tree, not the map.** This used to iterate
     :data:`IDENTITY_SOURCES`, so a module could mint anything it liked by simply
@@ -154,17 +303,10 @@ def test_every_module_binds_only_the_identity_it_is_allowed(path: Path):
     if path.name in MINTING_MODULES:
         return
     allowed = IDENTITY_SOURCES.get(path.name, set())
-    calls = {
-        node.func.attr
-        for node in ast.walk(_tree(path))
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and isinstance(node.func.value, ast.Name)
-        and node.func.value.id == "auth"
-    }
-    minting = calls & MINTING_FUNCTIONS
-    assert minting <= allowed, (
-        f"{path.name} mints principals through {sorted(minting - allowed)}: "
+    minting = _minting_calls(path.read_text(encoding="utf-8"))
+    assert minting == allowed, (
+        f"{path.name} mints through {sorted(minting - allowed)} and never calls "
+        f"{sorted(allowed - minting)}: "
         "add the module to IDENTITY_SOURCES with a reason, or stop minting there"
     )
 
@@ -221,24 +363,59 @@ def test_every_module_that_mints_at_all_is_in_the_map():
     re-mints who asked; neither was in the map, and the property that reads it
     therefore said nothing about either. This is the same question asked from
     the other side — walk the tree, find every caller of a minting function, and
-    require that the map already knows about it.
+    require that the map already knows about it. Minting calls are matched
+    through any binding of auth, exactly as the property above does.
     """
     minters = set()
     for path in _modules():
         if path.name in MINTING_MODULES:
             continue
-        calls = {
-            node.func.attr
-            for node in ast.walk(_tree(path))
-            if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and isinstance(node.func.value, ast.Name)
-            and node.func.value.id == "auth"
-        }
-        if calls & MINTING_FUNCTIONS:
+        if _minting_calls(path.read_text(encoding="utf-8")):
             minters.add(path.name)
 
     assert minters, "no module mints a principal; this property has gone vacuous"
     assert minters <= set(IDENTITY_SOURCES), (
         f"these modules mint a principal and are in no identity map: {sorted(minters)}"
     )
+
+
+def test_the_identity_rail_sees_every_spelling_of_the_import():
+    """The identity guard's own coverage — one case per way to bind auth.
+
+    A rail is only as strong as what it can see, and a rail that read
+    ``auth.`` attribute calls alone would have a documented way around it: a
+    module that aliased the import, reached the loader through the package
+    chain, imported the function outright, or loaded the module dynamically
+    mints through the same loader while the old matcher went on passing. Each
+    line below is a spelling a refactor might reach for, with the minting call
+    that spelling makes; the assertion is that the extractor sees the call in
+    all of them. The spellings are the LLM rail's twelve
+    (:func:`test_llm.test_the_rail_sees_every_spelling_of_the_import`),
+    pointed at :mod:`nodum.auth` and each carrying its call.
+    """
+    spellings = {
+        "plain": "import nodum.auth\nnodum.auth.owner_principal()",
+        "aliased": "import nodum.auth as identity\nidentity.owner_principal()",
+        "from-package": "from nodum import auth\nauth.owner_principal()",
+        "from-module": "from nodum.auth import owner_principal\nowner_principal()",
+        "from-module-aliased": ("from nodum.auth import owner_principal as resolve\nresolve()"),
+        "relative-package": "from . import auth\nauth.owner_principal()",
+        "relative-module": "from .auth import owner_principal\nowner_principal()",
+        "importlib": (
+            "import importlib\n"
+            "identity = importlib.import_module('nodum.auth')\n"
+            "identity.owner_principal()"
+        ),
+        "importlib-keyword": (
+            "import importlib\n"
+            "identity = importlib.import_module(name='nodum.auth')\n"
+            "identity.owner_principal()"
+        ),
+        "dunder-import": "identity = __import__('nodum.auth')\nidentity.owner_principal()",
+        "dunder-keyword": "identity = __import__(name='nodum.auth')\nidentity.owner_principal()",
+        "attribute-chain": "import nodum\nnodum.auth.owner_principal()",
+    }
+    blind = [
+        name for name, source in spellings.items() if _minting_calls(source) != {"owner_principal"}
+    ]
+    assert blind == [], f"the rail cannot see these spellings: {blind}"

@@ -27,7 +27,7 @@ from nodum.assets import AssetNotFound, AssetSourceChanged, AssetTooLarge, Unsup
 from nodum.cli_schema import build_cli_schema
 from nodum.db import ENV_DB_VAR
 from nodum.envelope import envelope, list_envelope, render_json
-from nodum.models import RollbackOut, TransitionFailure
+from nodum.models import ItemFailure, RollbackOut, TransitionFailure
 from nodum.principal import Principal
 from nodum.service import (
     EventNotFound,
@@ -37,6 +37,16 @@ from nodum.service import (
     RollbackConflict,
     TypeNotFound,
     UndoNotPossible,
+)
+from nodum.vocab import (
+    DIRECTIONS,
+    GRANT_LEVEL_NAMES,
+    PROPOSAL_KINDS,
+    STATES,
+    Direction,
+    GrantLevel,
+    NodeState,
+    ProposalKind,
 )
 
 app = typer.Typer(
@@ -116,7 +126,7 @@ def _emit_list(key: str, results: Sequence[BaseModel]) -> None:
     _print_json(list_envelope(key, results))
 
 
-def _emit_batch(result: BaseModel, failures: Sequence[TransitionFailure]) -> None:
+def _emit_batch(result: BaseModel, failures: Sequence[TransitionFailure | ItemFailure]) -> None:
     """Print a batch result, name each per-item failure on stderr, exit 1 if any failed.
 
     ``ingest file``'s rule, and it is the same rule for the same reason. A batch
@@ -140,11 +150,15 @@ def _emit_batch(result: BaseModel, failures: Sequence[TransitionFailure]) -> Non
             is what let ``bulk-relink`` join this rule at all. Its **dry run**
             passes nothing here on purpose — a rehearsal's ``skipped`` is a
             prediction, nothing was attempted and nothing was lost, so exit 1
-            would report a failure that has not happened.
+            would report a failure that has not happened. ``edge create-batch``
+            is the one list keyed by input index rather than id — an
+            :class:`ItemFailure` names ``index`` — and that index is what the
+            stderr line names there.
     """
     _emit(result)
     for failure in failures:
-        typer.echo(f"  failed {failure.id}: {failure.error}", err=True)
+        label = failure.id if isinstance(failure, TransitionFailure) else failure.index
+        typer.echo(f"  failed {label}: {failure.error}", err=True)
     if failures:
         raise typer.Exit(1)
 
@@ -219,6 +233,12 @@ def _run(func, *args, **kwargs):
         # call it feeds — see that function for why the argument-list position
         # made it a traceback.
         auth.UnknownPrincipal,
+        # A login name refused by the failed-login lockout (M5, 429 over
+        # HTTP). No CLI command verifies a password today, so nothing here can
+        # raise it yet — it is named so the surfaces' exception tables stay in
+        # lockstep and a future command that does verify one inherits the
+        # one-readable-line contract instead of a traceback.
+        auth.LoginLocked,
         AssetNotFound,
         AssetTooLarge,
         AssetSourceChanged,
@@ -268,6 +288,62 @@ def _principal(as_human: str) -> Principal:
     return _run(auth.owner_principal, human_id)
 
 
+def _state_value(state: str | None) -> NodeState | None:
+    """Narrow a ``--state`` string to the node-state vocabulary.
+
+    Refused with the service's own sentence, so a bad value reads identically
+    whether this helper or the service raises it. Callers route it through
+    :func:`_run`, the same error boundary every service refusal goes through.
+    """
+    if state is not None and state not in STATES:
+        raise ValueError(f"state must be one of {STATES}, got {state!r}")
+    return state
+
+
+def _search_state_value(state: str) -> NodeState | None:
+    """The ``search --state`` value: ``any`` translates to "no filter" here.
+
+    ``any`` is this adapter's documented pseudo-value and is accepted exactly
+    as before; every other value must be a real state.
+    """
+    if state == "any":
+        return None
+    return _state_value(state)
+
+
+def _edge_states_value(edge_states: list[str] | None) -> list[NodeState] | None:
+    """Narrow repeatable ``--edge-state`` values to the node-state vocabulary."""
+    if edge_states is None:
+        return None
+    narrowed: list[NodeState] = []
+    for edge_state in edge_states:
+        if edge_state not in STATES:
+            raise ValueError(f"state must be one of {STATES}, got {edge_state!r}")
+        narrowed.append(edge_state)
+    return narrowed
+
+
+def _kind_value(kind: str | None) -> ProposalKind | None:
+    """Narrow a ``--kind`` string to the proposal-kind vocabulary."""
+    if kind is not None and kind not in PROPOSAL_KINDS:
+        raise ValueError(f"kind must be 'node', 'edge', or 'update', got {kind!r}")
+    return kind
+
+
+def _direction_value(direction: str) -> Direction:
+    """Narrow a ``--direction`` string to the traversal-direction vocabulary."""
+    if direction not in DIRECTIONS:
+        raise ValueError(f"direction must be one of {DIRECTIONS}, got {direction!r}")
+    return direction
+
+
+def _level_value(level: str) -> GrantLevel:
+    """Narrow a ``grant`` level argument to the grant-level vocabulary."""
+    if level not in GRANT_LEVEL_NAMES:
+        raise ValueError(f"level must be one of {GRANT_LEVEL_NAMES}, got {level!r}")
+    return level
+
+
 SET_OPTION = typer.Option(None, "--set", help="Repeatable key=value props (values parsed as JSON).")
 
 #: The two read-side space controls, shared by `node list` and `search`. They
@@ -285,6 +361,52 @@ INCLUDE_META_OPTION = typer.Option(
 def init() -> None:
     """Create the database (if needed) and apply pending migrations."""
     _emit(_run(service.init))
+
+
+def _backup_to(destination: str, path: str | None) -> dict[str, str | int]:
+    """Write a consistent snapshot of the graph to ``destination``.
+
+    ``VACUUM INTO`` copies the source as one consistent snapshot, folding
+    whatever committed rows still live in the ``-wal`` file into the new file —
+    the rows a plain ``copyfile`` of the ``.db`` alone would silently lose
+    while a connection is open. It refuses to run inside a transaction, so the
+    source connection is a fresh ``db.connect`` with no DML before it: only
+    DML opens an implicit DEFERRED transaction (``isolation_level`` is ``""``),
+    never a bare ``SELECT`` or ``PRAGMA``.
+
+    Raises:
+        ValueError: If the source database does not exist, if the destination
+            resolves to the source file itself, or if the destination already
+            exists and is not empty.
+    """
+    source = db.db_path() if path is None else Path(path).expanduser()
+    if not source.is_file():
+        raise ValueError(f"no database at {source} — run 'nodum init' first")
+    dest = Path(destination).expanduser()
+    if source.resolve() == dest.resolve():
+        raise ValueError(f"destination is the source database itself: {dest}")
+    if dest.exists() and dest.stat().st_size > 0:
+        raise ValueError(f"destination already exists and is not empty: {dest}")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    conn = db.connect(source)
+    try:
+        conn.execute("VACUUM INTO ?", (str(dest),))
+    finally:
+        conn.close()
+    with sqlite3.connect(str(dest)) as check:
+        integrity = check.execute("PRAGMA integrity_check").fetchone()[0]
+    return {"destination": str(dest), "bytes": dest.stat().st_size, "integrity": integrity}
+
+
+@app.command("backup")
+def backup(
+    destination: str = typer.Argument(..., help="Path to write the backup database to."),
+    path: str | None = typer.Option(
+        None, "--path", help=f"Source graph path (defaults to ${ENV_DB_VAR})."
+    ),
+) -> None:
+    """Write a consistent snapshot of the graph to another file (VACUUM INTO)."""
+    _print_json(_run(_backup_to, destination, path))
 
 
 @node_app.command("create")
@@ -371,7 +493,7 @@ def node_list(
     nodes = _run(
         service.list_nodes,
         type=type,
-        state=state,
+        state=_run(_state_value, state),
         parent_id=parent,
         space=space,
         include_meta=include_meta,
@@ -418,6 +540,9 @@ def edge_list(
     node: str | None = typer.Option(None, "--node", help="Filter by incident node id."),
     type: str | None = typer.Option(None, "--type", "-t", help="Filter by edge type."),
     state: str | None = typer.Option(None, "--state", help="Filter by state."),
+    as_of: str | None = typer.Option(
+        None, "--as-of", help="Read the edges true at this timestamp (validity window)."
+    ),
     limit: int = typer.Option(500, "--limit", help="Maximum rows."),
     as_human: str = AS_OPTION,
 ) -> None:
@@ -426,7 +551,8 @@ def edge_list(
         service.list_edges,
         node_id=node,
         type=type,
-        state=state,
+        state=_run(_state_value, state),
+        as_of=as_of,
         principal=_principal(as_human),
         limit=limit,
     )
@@ -440,7 +566,13 @@ def edge_create_batch(
     ),
     as_human: str = AS_OPTION,
 ) -> None:
-    """Propose a batch of edges; bad suggestions are reported, not fatal."""
+    """Propose a batch of edges; bad suggestions are reported, not fatal.
+
+    The batch rule: the envelope is printed whatever happened, each refused
+    suggestion is named on stderr by its input index, and the exit code is 1 if
+    any suggestion failed — a run that wrote nothing must not report success to
+    a script that only reads the code.
+    """
     # Through `_run`, so a missing or unreadable file is the contract's one line
     # on stderr rather than a Rich traceback — the same reason `_read_content`
     # and `_principal` read through it.
@@ -453,7 +585,8 @@ def edge_create_batch(
     if not isinstance(suggestions, list):
         typer.echo("expected a JSON array of edge suggestions", err=True)
         raise typer.Exit(1)
-    _emit(_run(service.propose_edges, suggestions, principal=_principal(as_human)))
+    result = _run(service.propose_edges, suggestions, principal=_principal(as_human))
+    _emit_batch(result, result.failed)
 
 
 @app.command()
@@ -571,6 +704,11 @@ def search(
     expand: bool = typer.Option(
         False, "--expand", help="Append one-hop active-edge neighbors of the hits."
     ),
+    as_of: str | None = typer.Option(
+        None,
+        "--as-of",
+        help="With --expand, follow the edges true at this timestamp instead of the live graph.",
+    ),
     nl: bool = typer.Option(
         False,
         "--nl",
@@ -592,7 +730,7 @@ def search(
     """
     shared = {
         "k": k,
-        "state": None if state == "any" else state,
+        "state": _run(_search_state_value, state),
         "type": type,
         "created_by": created_by,
         "created_after": created_after,
@@ -600,6 +738,7 @@ def search(
         "include_meta": include_meta,
         "space": space,
         "expand": expand,
+        "as_of": as_of,
         "principal": _principal(as_human),
     }
     search_call = answers.natural_search if nl else search_module.search
@@ -752,7 +891,7 @@ def traverse(
             start_id,
             edge_types=edge_type,
             depth=depth,
-            direction=direction,
+            direction=_run(_direction_value, direction),
             principal=_principal(as_human),
         )
     )
@@ -777,6 +916,11 @@ def subgraph(
     node_type: list[str] | None = typer.Option(
         None, "--node-type", help="Only include nodes of these types (repeatable)."
     ),
+    as_of: str | None = typer.Option(
+        None,
+        "--as-of",
+        help="Read the subgraph as it was true at this timestamp (validity window).",
+    ),
     limit: int = typer.Option(200, "--limit", help="Maximum nodes, root included."),
     as_human: str = AS_OPTION,
 ) -> None:
@@ -794,10 +938,11 @@ def subgraph(
             root_id,
             depth=depth,
             edge_types=edge_type,
-            edge_states=edge_state,
+            edge_states=_run(_edge_states_value, edge_state),
             min_confidence=min_confidence,
             created_by=created_by,
             node_types=node_type,
+            as_of=as_of,
             principal=_principal(as_human),
             limit=limit,
         )
@@ -861,6 +1006,12 @@ def projector_status() -> None:
     """Show every projector's checkpoint, backlog, and derived-store size."""
     statuses = _run(projectors.projector_status)
     _emit_list("projectors", statuses)
+
+
+@projector_app.command("skips")
+def projector_skips() -> None:
+    """List events the projectors quarantined instead of applying."""
+    _emit_list("skips", _run(projectors.list_skips))
 
 
 # ── Assets and renditions ─────────────────────────────────────────────────────
@@ -1245,8 +1396,10 @@ def serve(
 
     A non-loopback bind is allowed — login is the boundary, not the bind —
     and the session cookie gains ``Secure`` there. Either way, any process
-    that can reach the port may *attempt* a login, so the human's password
-    is the whole defence; the banner says so rather than leaving it implicit.
+    that can reach the port may *attempt* a login — throttled only by the
+    failed-login lockout, five misses per name per quarter-hour then a 429
+    until the window slides past them — so the human's password is still the
+    heart of the defence; the banner says so rather than leaving it implicit.
     """
     import uvicorn
 
@@ -1340,7 +1493,7 @@ def review_queue(
         service.list_proposals,
         created_by=created_by,
         type=type,
-        kind=kind,
+        kind=_run(_kind_value, kind),
         created_before=created_before,
         created_after=created_after,
         principal=_principal(as_human),
@@ -1354,8 +1507,15 @@ def review_accept(
     ids: list[str] = typer.Argument(..., help="Node, edge, or proposed-version ids to accept."),
     as_human: str = AS_OPTION,
 ) -> None:
-    """Accept proposals by id (proposed → active); bad ids are reported, not fatal."""
-    _emit(_run(service.accept_proposals, ids, principal=_principal(as_human)))
+    """Accept proposals by id (proposed → active); bad ids are reported, not fatal.
+
+    The batch rule: the envelope is printed whatever happened, each refused id
+    is named on stderr, and the exit code is 1 if any id was skipped — a run
+    that accomplished nothing must not report success to a script that only
+    reads the code.
+    """
+    result = _run(service.accept_proposals, ids, principal=_principal(as_human))
+    _emit_batch(result, result.failed)
 
 
 @review_app.command("reject")
@@ -1364,8 +1524,14 @@ def review_reject(
     reason: str = typer.Option(..., "--reason", help="Recorded in every reject event."),
     as_human: str = AS_OPTION,
 ) -> None:
-    """Reject proposals by id (proposed → archived); bad ids are reported, not fatal."""
-    _emit(_run(service.reject_proposals, ids, reason=reason, principal=_principal(as_human)))
+    """Reject proposals by id (proposed → archived); bad ids are reported, not fatal.
+
+    The reason is recorded in every reject event's payload. The batch rule: the
+    envelope is printed whatever happened, each refused id is named on stderr,
+    and the exit code is 1 if any id was skipped.
+    """
+    result = _run(service.reject_proposals, ids, reason=reason, principal=_principal(as_human))
+    _emit_batch(result, result.failed)
 
 
 @review_app.command("accept-all")
@@ -1377,18 +1543,22 @@ def review_accept_all(
     created_after: str | None = CREATED_AFTER_OPTION,
     as_human: str = AS_OPTION,
 ) -> None:
-    """Accept every proposal matching the filters (e.g. one agent's whole run)."""
-    _emit(
-        _run(
-            service.accept_matching,
-            created_by=created_by,
-            type=type,
-            kind=kind,
-            created_before=created_before,
-            created_after=created_after,
-            principal=_principal(as_human),
-        )
+    """Accept every proposal matching the filters (e.g. one agent's whole run).
+
+    Each match transitions with its own event. The batch rule: the envelope is
+    printed whatever happened, each refused id is named on stderr, and the exit
+    code is 1 if any proposal was skipped.
+    """
+    result = _run(
+        service.accept_matching,
+        created_by=created_by,
+        type=type,
+        kind=_run(_kind_value, kind),
+        created_before=created_before,
+        created_after=created_after,
+        principal=_principal(as_human),
     )
+    _emit_batch(result, result.failed)
 
 
 @review_app.command("reject-all")
@@ -1401,19 +1571,23 @@ def review_reject_all(
     created_after: str | None = CREATED_AFTER_OPTION,
     as_human: str = AS_OPTION,
 ) -> None:
-    """Reject every proposal matching the filters, recording the reason."""
-    _emit(
-        _run(
-            service.reject_matching,
-            reason=reason,
-            created_by=created_by,
-            type=type,
-            kind=kind,
-            created_before=created_before,
-            created_after=created_after,
-            principal=_principal(as_human),
-        )
+    """Reject every proposal matching the filters, recording the reason.
+
+    Each match transitions with its own event carrying the reason. The batch
+    rule: the envelope is printed whatever happened, each refused id is named
+    on stderr, and the exit code is 1 if any proposal was skipped.
+    """
+    result = _run(
+        service.reject_matching,
+        reason=reason,
+        created_by=created_by,
+        type=type,
+        kind=_run(_kind_value, kind),
+        created_before=created_before,
+        created_after=created_after,
+        principal=_principal(as_human),
     )
+    _emit_batch(result, result.failed)
 
 
 # ── Accounts, grants, and spaces (Q13) ────────────────────────────────────────
@@ -1526,7 +1700,7 @@ def agent_disable(
     agent_id: str = typer.Argument(..., help="Agent to disable."),
     as_human: str = AS_OPTION,
 ) -> None:
-    """Disable an agent (its token dies immediately; its proposals stay, reviewable)."""
+    """Disable an agent (its token stops verifying; its proposals stay, reviewable)."""
     _run(service.disable_agent, agent_id, principal=_principal(as_human))
     _print_json({"ok": True, "agent_id": agent_id, "disabled": True})
 
@@ -1549,7 +1723,15 @@ def grant(
     as_human: str = AS_OPTION,
 ) -> None:
     """Grant (or re-level) an agent's access to a space; event-logged."""
-    _emit(_run(service.grant, agent_id, space, level, principal=_principal(as_human)))
+    _emit(
+        _run(
+            service.grant,
+            agent_id,
+            space,
+            _run(_level_value, level),
+            principal=_principal(as_human),
+        )
+    )
 
 
 @app.command()
@@ -1626,7 +1808,9 @@ def consolidate(
         None, "--scope", help="Confine the cycle to one space (id or name); default: every space."
     ),
     job: list[str] | None = typer.Option(
-        None, "--job", help="Job to run (repeatable; default: every registered job, in order)."
+        None,
+        "--job",
+        help="Job to run (repeatable, each name at most once; default: all jobs, in order).",
     ),
     dry_run: bool = typer.Option(
         False, "--dry-run", help="Compute every job and write nothing but the journal entry."

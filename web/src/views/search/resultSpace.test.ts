@@ -17,12 +17,12 @@
  */
 
 import { describe, expect, it } from "vitest";
-import type { NodeOut, SearchHit } from "../../api/types";
+import type { NodeOut, NodeState, SearchHit } from "../../api/types";
 import { ANY_SPACE } from "../../components";
 import { hitSpaceName, hitSpaceTitle } from "./resultSpace";
 
 /** A space node, trimmed to what the name lookup reads. */
-function space(id: string, title: string, state = "active"): NodeOut {
+function space(id: string, title: string, state: NodeState = "active"): NodeOut {
   return {
     id,
     space_id: "meta",

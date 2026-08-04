@@ -36,10 +36,12 @@ Every write result carries the ``space_id`` it actually landed in, which is the
 other half of that: it can be checked rather than assumed.
 
 **Three tiers are never registered, and each one is a named absence.** The
-review tools (``accept``, ``reject`` — :data:`REVIEW_TOOLS`) belong to the §8.1
-"write (human)" tier: accepting is a *destructive* effect (it makes proposed
-structure live and archives what that structure replaces), so it stays with the
-human, on the CLI and the review API. The curative tools (``merge_nodes``,
+review tools (``accept``, ``reject`` — :data:`REVIEW_TOOLS`) are the §8.1
+review tier: the service gates them with ``Store.require_review`` — a human,
+or ``edit`` on the item's space — and retiring the live structure an accept
+replaces is the human tier, but either way they do not belong on an agent's
+surface, so the CLI and the review API are where they live. The curative tools
+(``merge_nodes``,
 ``retype``, ``supersede_edge``, ``bulk_relink``, ``consolidate`` —
 :data:`CURATIVE_TOOLS`) are §8.2. And reversal plus the journal that records it
 (``undo``, ``rollback``, ``abandon_cycle``, ``get_cycle``, ``list_cycles`` —
@@ -54,9 +56,11 @@ tiers means adding its name to a list, never to the registry.
 
 Identity: the agent's bearer token, from the ``NODUM_AGENT_TOKEN``
 environment variable (the shape MCP client configs carry in their ``env``
-blocks — a command-line token would leak into ``ps``). Verification mints
-the agent's principal, and its grant set confines every tool call. Transport
-is stdio — what MCP clients actually launch.
+blocks — a command-line token would leak into ``ps``). The token is verified
+once at launch as a fail-fast gate and **re-verified on every tool call**:
+the principal is re-minted per call, so disabling the agent or its owner, or
+archiving a space it holds a grant on, bites at the next call rather than at
+the next restart. Transport is stdio — what MCP clients actually launch.
 
 Every tool delegates to :mod:`nodum.service`, :mod:`nodum.search`,
 :mod:`nodum.assets`, :mod:`nodum.ingest` or :mod:`nodum.urls`; there is no
@@ -67,8 +71,9 @@ from __future__ import annotations
 
 import os
 import urllib.parse
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, overload
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.utilities.types import Image
@@ -77,6 +82,8 @@ from pydantic import BaseModel
 
 from nodum import assets, auth, ingest, service, urls
 from nodum import search as search_module
+from nodum.principal import Principal
+from nodum.vocab import DIRECTIONS, STATES, NodeState
 
 #: Tool annotations per registered tier (design §8). Reads are read-only.
 #: Additive writes only ever *add* state — a node, an edge, a proposed
@@ -112,10 +119,12 @@ _OVERWRITING = ToolAnnotations(readOnlyHint=False, destructiveHint=True)
 #: Curative tools (design §8.2) — asserted absent from the registry in tests.
 CURATIVE_TOOLS = ("merge_nodes", "retype", "supersede_edge", "bulk_relink", "consolidate")
 
-#: Review tools (design §8.1 "write (human)" tier). Like the curative
-#: tools these are **never registered** — asserted absent in tests. Accepting
-#: archives the active structure a proposal replaces, so it is destructive and
-#: human-only; the CLI (``nodum review …``) is where it lives.
+#: Review tools (design §8.1) — gated by ``Store.require_review`` (a human,
+#: or ``edit`` on the item's space) and **never registered** here: asserted
+#: absent in tests. Accepting makes proposed structure live, and retiring the
+#: live structure an accept replaces is the human tier — both enforced by the
+#: service, not by this registry. The CLI (``nodum review …``) and the review
+#: API are where they live.
 REVIEW_TOOLS = ("accept", "reject")
 
 #: The third named absence: reversal, and the journal that records it. Never
@@ -209,20 +218,57 @@ OVERWRITING_TOOLS = ("update_node",)
 MAX_EXTRACTED_TEXT_CHARS = ingest.SOURCE_CONTENT_CHARS
 
 
-def _dump(result: BaseModel | list[BaseModel]) -> dict[str, Any] | list[dict[str, Any]]:
+@overload
+def _dump(result: BaseModel) -> dict[str, Any]: ...
+
+
+@overload
+def _dump(result: Sequence[BaseModel]) -> list[dict[str, Any]]: ...
+
+
+def _dump(result: BaseModel | Sequence[BaseModel]) -> dict[str, Any] | list[dict[str, Any]]:
     """Serialise service results exactly like every other adapter."""
-    if isinstance(result, list):
+    if isinstance(result, Sequence):
         return [item.model_dump(mode="json") for item in result]
     return result.model_dump(mode="json")
 
 
+def _ingest_result(out: ingest.IngestOut) -> dict[str, Any]:
+    """Serialise an ingestion result with the extracted text left behind.
+
+    The write is the tool's job and its result is the describing subgraph —
+    ids, spaces, states, extraction statistics — that tells the agent where
+    its work landed. The text itself does not cross this surface: the asset's
+    ``extracted_text`` and the ``source``/page nodes' content are the full
+    extraction, and echoing them would hand any token-bearing agent the
+    contents of any file the server can read or URL it can fetch. Omitted
+    rather than blanked, so a missing key can never be mistaken for a document
+    that extracted nothing; once a describing node is readable, ``get_asset``
+    returns the text, scoped by the same grant set that confined the write.
+    """
+    return out.model_dump(
+        mode="json",
+        exclude={
+            "asset": {"extracted_text"},
+            "source": {"content"},
+            "pages": {"__all__": {"content"}},
+        },
+    )
+
+
 def create_server(*, token: str, db_path: str | Path | None = None) -> FastMCP:
-    """Build the nodum MCP server bound to one verified agent principal.
+    """Build the nodum MCP server bound to one agent token.
+
+    The token is verified once here — a server that could never serve fails
+    at launch — and **re-verified on every tool call**: each call re-mints
+    the agent's principal from stored state, so disabling the agent or its
+    owner, or archiving a space it holds a grant on, bites at the next call
+    rather than at the next restart (revocation is verification-time, R3).
 
     Args:
         token: The agent's bearer token (``ndm_…``, minted by
             ``nodum agent create`` / ``token-rotate``). Verified against its
-            stored hash; the agent's grants then confine every tool call.
+            stored hash on every tool call; the agent's grants confine it.
         db_path: Explicit database path; defaults to ``NODUM_DB`` resolution.
 
     Returns:
@@ -233,7 +279,25 @@ def create_server(*, token: str, db_path: str | Path | None = None) -> FastMCP:
     Raises:
         auth.InvalidCredentials: If the token verifies no enabled agent.
     """
-    principal = auth.verify_agent_token(token, path=db_path)
+    # Fail-fast at launch: a token that verifies no enabled agent today is a
+    # configuration error worth refusing before the client is ever connected.
+    # This is only the gate — `_principal` below is the authority, so the
+    # discard is deliberate: revocation must not wait for a restart.
+    auth.verify_agent_token(token, path=db_path)
+
+    def _principal() -> Principal:
+        """Re-verify the token and re-mint the agent's principal for this call.
+
+        Revocation is verification-time (:mod:`nodum.auth` R3): disabling the
+        agent, disabling its owner, or archiving a space it holds a grant on
+        must bite at the **next tool call**, not at the next server start.
+        ``verify_agent_token`` re-reads ``agents.disabled`` and reloads the
+        grant set (which drops grants on archived spaces) every time, so one
+        small SELECT per call is the honest price of
+        revocation-by-verification.
+        """
+        return auth.verify_agent_token(token, path=db_path)
+
     server = FastMCP(
         "nodum",
         instructions=(
@@ -255,12 +319,14 @@ def create_server(*, token: str, db_path: str | Path | None = None) -> FastMCP:
     @server.tool(annotations=_READ)
     def get_node(id: str, depth: int = 1) -> dict[str, Any]:
         """Fetch a node plus its active-edge neighborhood out to `depth` hops (0 = node alone)."""
-        return _dump(service.get_neighborhood(id, depth=depth, principal=principal, path=db_path))
+        return _dump(
+            service.get_neighborhood(id, depth=depth, principal=_principal(), path=db_path)
+        )
 
     @server.tool(annotations=_READ)
     def get_children(id: str) -> list[dict[str, Any]]:
         """List a node's children in position order (the document tree)."""
-        return _dump(service.list_children(id, principal=principal, path=db_path))
+        return _dump(service.list_children(id, principal=_principal(), path=db_path))
 
     @server.tool(annotations=_READ)
     def search(
@@ -285,16 +351,23 @@ def create_server(*, token: str, db_path: str | Path | None = None) -> FastMCP:
         if unknown:
             raise ValueError(f"unknown search filter(s): {', '.join(unknown)}")
         state = filters.pop("state", "active")
+        if state in (None, "any"):
+            narrowed_state: NodeState | None = None
+        else:
+            state = str(state)
+            if state not in STATES:
+                raise ValueError(f"state must be one of {STATES}, got {state!r}")
+            narrowed_state = state
         result = search_module.search(
             query,
             k=k,
-            state=None if state in (None, "any") else str(state),
+            state=narrowed_state,
             type=filters.pop("type", None),
             created_by=filters.pop("created_by", None),
             created_after=filters.pop("created_after", None),
             created_before=filters.pop("created_before", None),
             expand=expand,
-            principal=principal,
+            principal=_principal(),
             path=db_path,
         )
         return _dump(result)
@@ -311,13 +384,15 @@ def create_server(*, token: str, db_path: str | Path | None = None) -> FastMCP:
         `edge_types` restricts the walk (ids or names), `depth` caps hops,
         `direction` is "out" / "in" / "both".
         """
+        if direction not in DIRECTIONS:
+            raise ValueError(f"direction must be one of {DIRECTIONS}, got {direction!r}")
         return _dump(
             service.traverse(
                 start_id,
                 edge_types=edge_types,
                 depth=depth,
                 direction=direction,
-                principal=principal,
+                principal=_principal(),
                 path=db_path,
             )
         )
@@ -325,27 +400,27 @@ def create_server(*, token: str, db_path: str | Path | None = None) -> FastMCP:
     @server.tool(annotations=_READ)
     def list_types() -> dict[str, Any]:
         """List the full type catalog (node types and edge types)."""
-        return _dump(service.list_types(principal=principal, path=db_path))
+        return _dump(service.list_types(principal=_principal(), path=db_path))
 
     @server.tool(annotations=_READ)
     def get_schema(type: str) -> dict[str, Any]:
         """Fetch one node or edge type's catalog entry (id or name), incl. its JSON schema."""
-        return _dump(service.get_schema(type, principal=principal, path=db_path))
+        return _dump(service.get_schema(type, principal=_principal(), path=db_path))
 
     @server.tool(annotations=_READ)
     def find_path(a: str, b: str) -> dict[str, Any]:
         """Find the shortest path between two nodes over active edges (any type)."""
-        return _dump(service.find_path(a, b, principal=principal, path=db_path))
+        return _dump(service.find_path(a, b, principal=_principal(), path=db_path))
 
     @server.tool(annotations=_READ)
     def history(node_id: str) -> list[dict[str, Any]]:
         """List a node's version history (applied snapshots and proposed/rejected updates)."""
-        return _dump(service.history(node_id, principal=principal, path=db_path))
+        return _dump(service.history(node_id, principal=_principal(), path=db_path))
 
     @server.tool(annotations=_READ)
     def diff(a: int, b: int) -> dict[str, Any]:
         """Unified diff between two versions of one node (ids from `history`)."""
-        return _dump(service.diff_versions(a, b, principal=principal, path=db_path))
+        return _dump(service.diff_versions(a, b, principal=_principal(), path=db_path))
 
     @server.tool(annotations=_READ, structured_output=False)
     def get_asset(id_or_hash: str, rendition: str = "preview") -> list[Any]:
@@ -379,7 +454,7 @@ def create_server(*, token: str, db_path: str | Path | None = None) -> FastMCP:
                 f"unsupported rendition {rendition!r}: MCP serves "
                 f"{', '.join(sorted(assets.PROFILES))} and page:<n> only — originals never"
             ) from exc
-        asset = assets.get_asset(id_or_hash, principal=principal, path=db_path)
+        asset = assets.get_asset(id_or_hash, principal=_principal(), path=db_path)
         text = asset.extracted_text
         metadata: dict[str, Any] = {
             "asset": asset.model_dump(mode="json", exclude={"extracted_text"}),
@@ -392,7 +467,7 @@ def create_server(*, token: str, db_path: str | Path | None = None) -> FastMCP:
                 id_or_hash,
                 profile=rendition,
                 include_data=True,
-                principal=principal,
+                principal=_principal(),
                 path=db_path,
             )
         except assets.UnsupportedRendition:
@@ -444,7 +519,7 @@ def create_server(*, token: str, db_path: str | Path | None = None) -> FastMCP:
             urls.mint_download(
                 id_or_hash,
                 ttl_seconds=ttl_seconds,
-                principal=principal,
+                principal=_principal(),
                 path=db_path,
             )
         )
@@ -484,7 +559,7 @@ def create_server(*, token: str, db_path: str | Path | None = None) -> FastMCP:
                 parent_id=parent,
                 props=props,
                 space=space,
-                principal=principal,
+                principal=_principal(),
                 path=db_path,
             )
         )
@@ -515,7 +590,7 @@ def create_server(*, token: str, db_path: str | Path | None = None) -> FastMCP:
             kwargs["content"] = content
         if props is not None:
             kwargs["props"] = props
-        return _dump(service.update_node(id, principal=principal, path=db_path, **kwargs))
+        return _dump(service.update_node(id, principal=_principal(), path=db_path, **kwargs))
 
     @server.tool(annotations=_ADDITIVE)
     def link(
@@ -540,7 +615,7 @@ def create_server(*, token: str, db_path: str | Path | None = None) -> FastMCP:
                 edge_type,
                 props=props,
                 confidence=confidence,
-                principal=principal,
+                principal=_principal(),
                 path=db_path,
             )
         )
@@ -553,7 +628,7 @@ def create_server(*, token: str, db_path: str | Path | None = None) -> FastMCP:
         live under `edit` on both endpoint spaces. Bad suggestions are
         reported in `failed` by index; the rest still write.
         """
-        return _dump(service.propose_edges(suggestions, principal=principal, path=db_path))
+        return _dump(service.propose_edges(suggestions, principal=_principal(), path=db_path))
 
     @server.tool(annotations=_ADDITIVE)
     def ingest_file(
@@ -589,6 +664,15 @@ def create_server(*, token: str, db_path: str | Path | None = None) -> FastMCP:
         optional dependency is not installed on the server. An asset no
         handler could read is still registered and still described.
 
+        **The text itself is never in this result.** The asset's
+        `extracted_text` and the `source`/page nodes' content are the full
+        extraction, and echoing them would hand any token-bearing agent the
+        contents of any file this server can read — so the describing
+        subgraph comes back, the text does not. `extraction.chars` (and
+        `extracted_chars` on the `asset_ref`'s props) say how much there is,
+        and `get_asset` returns the text itself once a describing node is
+        readable, scoped by the same grants that confined this write.
+
         `name` overrides the recorded filename, **and with it the extension
         that picks the extraction handler**; `title` names the `source` node.
         """
@@ -596,23 +680,23 @@ def create_server(*, token: str, db_path: str | Path | None = None) -> FastMCP:
         # URL is not silently fetched — it falls through to the path branch and
         # is refused there as "not a file", which is the truthful answer.
         if urllib.parse.urlparse(path_or_url).scheme in ingest.FETCHABLE_SCHEMES:
-            return _dump(
+            return _ingest_result(
                 ingest.ingest_url(
                     path_or_url,
                     name=name,
                     space=space,
                     title=title,
-                    principal=principal,
+                    principal=_principal(),
                     path=db_path,
                 )
             )
-        return _dump(
+        return _ingest_result(
             ingest.ingest_file(
                 path_or_url,
                 name=name,
                 space=space,
                 title=title,
-                principal=principal,
+                principal=_principal(),
                 path=db_path,
             )
         )
@@ -635,16 +719,18 @@ def create_server(*, token: str, db_path: str | Path | None = None) -> FastMCP:
         A page served from an extensionless path still extracts: the
         response's own content type picks the handler. Only the URL's bytes
         are ingested, so a link that returns a login page ingests the login
-        page — check `extraction.chars` and the `source` content before
-        treating the result as the document you meant.
+        page — check `extraction.chars` (and the `source` content via
+        `get_asset` once a describing node is readable, since the text
+        itself never comes back in this result) before treating the outcome
+        as the document you meant.
         """
-        return _dump(
+        return _ingest_result(
             ingest.ingest_url(
                 url,
                 name=name,
                 space=space,
                 title=title,
-                principal=principal,
+                principal=_principal(),
                 path=db_path,
             )
         )
@@ -684,15 +770,17 @@ def create_server(*, token: str, db_path: str | Path | None = None) -> FastMCP:
                 size,
                 sha256=sha256,
                 space=space,
-                principal=principal,
+                principal=_principal(),
                 path=db_path,
             )
         )
 
-    # ── Review tier (§8.1 "write (human)") is deliberately absent ──
-    # `accept`/`reject` are not registered here: accepting makes proposed
-    # structure live and archives what it replaces, which is destructive and
-    # the human's call. The human works the queue through `nodum review …`.
+    # ── Review tier (§8.1) is deliberately absent ──
+    # `accept`/`reject` are not registered here: they are the review tier,
+    # gated by `Store.require_review` (a human, or `edit` on the item's
+    # space) — and this is an agent surface, so they live on `nodum review …`
+    # and the review API instead. Retiring the live structure an accept
+    # replaces is the human tier, enforced by the service either way.
 
     return server
 

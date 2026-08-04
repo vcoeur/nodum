@@ -84,4 +84,32 @@ else
     echo "    (set NODUM_SMOKE_REQUIRE_WEB=1 to make that fatal)"
 fi
 
+# The whole installed package must import. The CLI checks above never touch a
+# module cli.py imports lazily — `nodum mcp serve` imports nodum.mcp_server
+# inside its command body — so the mcp 2.0.0 removal of mcp.server.fastmcp
+# sailed past --version/schema-dump/--help while killing every fresh install.
+# Walking every module of the INSTALLED wheel fails the moment any cannot
+# import, which is that class of break.
+echo "==> every module of the installed package imports"
+"$venv/bin/python" - <<'PY'
+import importlib
+import pathlib
+import sys
+
+import nodum
+
+pkg_dir = pathlib.Path(nodum.__file__).parent
+modules = sorted(p.stem for p in pkg_dir.glob("*.py") if p.name != "__init__.py")
+failed = []
+for name in modules:
+    try:
+        importlib.import_module(f"nodum.{name}")
+    except Exception as exc:  # any import-time failure is a broken install
+        failed.append(f"nodum.{name}: {type(exc).__name__}: {exc}")
+if failed:
+    print("\n".join(f"    FAIL {line}" for line in failed), file=sys.stderr)
+    raise SystemExit(f"{len(failed)} nodum module(s) failed to import from the installed wheel")
+print(f"    {len(modules)} nodum modules import cleanly")
+PY
+
 echo "OK: clean install of ${wheels[0]##*/} runs and self-describes."

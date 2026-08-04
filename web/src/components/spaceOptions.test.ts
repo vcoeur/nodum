@@ -21,7 +21,7 @@
  */
 
 import { describe, expect, it } from "vitest";
-import type { NodeOut } from "../api/types";
+import type { NodeOut, NodeState } from "../api/types";
 import {
   ANY_SPACE,
   resolveSpaceValue,
@@ -32,7 +32,7 @@ import {
 import { nameSpace } from "./spaceNaming";
 
 /** A space node, trimmed to what the picker reads. */
-function space(id: string, title: string | null, state = "active"): NodeOut {
+function space(id: string, title: string | null, state: NodeState = "active"): NodeOut {
   return {
     id,
     space_id: "meta",

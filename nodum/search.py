@@ -27,19 +27,15 @@ got the corpus to say it with. They never decide a search on their own: a query
 the graph knows no content word of answers with **nothing from the keyword
 arm**, rather than with the notes that happen to share its phrasing.
 
-**That refusal is the keyword arm's, and it is not the whole of `search`.**
-:func:`_search_vector` has no similarity threshold — the ANN list is always
-``k`` deep — so on an install that *has* an embedding provider the vector arm
-answers the query the keyword arm just refused, and the caller gets ``k`` hits
-each carrying the ``vector`` signal alone. On the default install, which has no
-provider, the refusal is the whole answer. Both are pinned:
-``tests/test_search.py`` for the keyword arm, ``tests/test_hybrid_search.py``
-for what the vector arm does beside it. Closing the gap means a similarity
-floor, and a floor is a number nothing here can measure yet: it needs a real
-embedding model over a real graph, because the test provider's similarity is
-token overlap and every threshold measured against it would look free while
-costing the paraphrase recall the vector arm exists for. Until then the
-disagreement is stated rather than papered over.
+**The refusal is the whole of `search`.** :func:`_search_vector` carries a
+similarity floor (:data:`_VECTOR_MIN_SIMILARITY`): a chunk whose cosine to
+the query is below the bar never enters the KNN result, so on an install
+that *has* an embedding provider a query the keyword arm just refused
+answers with nothing from the vector arm either — the nearest unrelated
+chunks are no longer "evidence" for a term the graph has never seen. Both
+arms are pinned: ``tests/test_search.py`` for the keyword arm,
+``tests/test_hybrid_search.py`` for the vector floor and what each arm
+contributes beside the other.
 
 Both projectors are caught up before querying, so search always reflects the
 latest committed events without a manual projector run.
@@ -59,7 +55,9 @@ from nodum import db, embeddings, projectors
 from nodum.migrations import META_SPACE_ID
 from nodum.models import SearchHit, SearchResult
 from nodum.principal import READ, Principal
-from nodum.service import require_positive_limit
+from nodum.service import _as_of_edge_clause, require_positive_limit
+from nodum.store import node_readable, node_scope_clause
+from nodum.vocab import NodeState
 
 #: bm25() column weights for (node_id, title, content, extracted_text): node_id
 #: is unindexed (weight ignored); a title hit outranks a body hit.
@@ -72,6 +70,42 @@ _RRF_K = 60
 #: ANN candidates fetched per query before aggregating chunks to nodes —
 #: several chunks can belong to the same node, so the raw list is wider.
 _VECTOR_CANDIDATES = 32
+
+#: The vector signal's similarity floor, in cosine-similarity units: a chunk
+#: is evidence only when its embedding's cosine to the query is at least this
+#: high, and everything below it never enters the KNN result. That is what
+#: stops the vector arm from answering a query the graph has never seen one
+#: content word of (finding M20): with no floor the ANN list is always ``k``
+#: deep, so an absent term was answered ``k`` deep from the nearest unrelated
+#: chunks, which /ask then cited as confident fact.
+#:
+#: **The metric.** ``node_vec`` is a vec0 table declared with
+#: ``distance_metric=cosine`` (migration 0006), and sqlite-vec's cosine
+#: distance is ``1 - cosine_similarity`` — measured, not assumed: identical
+#: vectors land at 0.0, orthogonal at 1.0, opposite at 2.0. The stored chunk
+#: vectors are the provider's raw output (``VecProjector`` embeds without
+#: normalising) and the query vector comes from the same provider; cosine
+#: distance is scale-invariant, so neither normalisation enters the metric.
+#: The floor is stated here in similarity and applied as
+#: :data:`_VECTOR_MAX_DISTANCE`, in the ``distance`` column's units.
+#:
+#: **The value.** 0.5 means a returned chunk shares at least half of its
+#: direction with the query (angle ≤ 60°): it agrees more than it disagrees.
+#: A 0.6 floor would be the honest first guess for the default model
+#: (``paraphrase-multilingual-MiniLM-L12-v2``, whose paraphrase pairs land
+#: well above it), but it would drop the test provider's genuine seeded
+#: matches: ``HashEmbedder`` similarity *is* token overlap, so the weakest
+#: genuine match in this suite sits at exactly 0.5 ("xylem" against a
+#: four-token "xylem vessels carry water") with "xylem carries sap" at 0.577.
+#: Measured against that provider, 0.5 keeps every genuine seeded match and
+#: drops every disjoint one (all at cosine 0.0); the absent-term shape lands
+#: at 0.0 as well. The constant is tunable per model: a model whose
+#: unrelated-pair distribution overlaps 0.5 should raise it.
+_VECTOR_MIN_SIMILARITY = 0.5
+
+#: The floor in the ``distance`` column's units — ``1 - cos_sim`` for the
+#: vec0 cosine metric (see :data:`_VECTOR_MIN_SIMILARITY`).
+_VECTOR_MAX_DISTANCE = 1.0 - _VECTOR_MIN_SIMILARITY
 
 #: One-hop graph-expansion weights by edge type (design §7); unlisted types
 #: default to 0.5. The edge's confidence (default 1.0) multiplies the weight.
@@ -572,7 +606,7 @@ def _resolve_space(conn: sqlite3.Connection, space_ref: str, principal: Principa
 
 
 def _node_filters(
-    state: str | None,
+    state: NodeState | None,
     type_id: str | None,
     created_by: str | None,
     created_after: str | None,
@@ -585,6 +619,11 @@ def _node_filters(
 
     An agent principal is confined to its read set (Q13); a human (or the
     trusted-local default) just skips the meta space unless ``include_meta``.
+    The clause comes from :func:`nodum.store.node_scope_clause` — the same
+    boundary :meth:`nodum.store.Store.node_scope` computes — so a ``space``-
+    typed row is scoped to its own id rather than to ``meta``: a meta reader
+    sees the space nodes of spaces it holds a grant on, and none of the others
+    (M3).
 
     ``space_id`` narrows further and never wider: it is ANDed onto whichever
     of those two clauses applies, so an agent asking for a space outside its
@@ -596,12 +635,9 @@ def _node_filters(
     clauses: list[str] = []
     params: list = []
     if principal is not None and not principal.is_human:
-        spaces = sorted(principal.read_spaces or ())
-        if not spaces:
-            clauses.append("1 = 0")
-        else:
-            clauses.append(f"n.space_id IN ({','.join('?' * len(spaces))})")
-            params.extend(spaces)
+        clause, space_params = node_scope_clause(principal.read_spaces or frozenset(), "n.")
+        clauses.append(clause)
+        params.extend(space_params)
     elif not include_meta and space_id is None:
         clauses.append("n.space_id != ?")
         params.append(META_SPACE_ID)
@@ -651,7 +687,7 @@ def _search_bm25(
     terms: list[str],
     *,
     k: int,
-    state: str | None,
+    state: NodeState | None,
     type_id: str | None,
     created_by: str | None,
     created_after: str | None,
@@ -710,8 +746,9 @@ def _search_vector(
     conn: sqlite3.Connection,
     query_vector: list[float],
     *,
+    model_id: str,
     k: int,
-    state: str | None,
+    state: NodeState | None,
     type_id: str | None,
     created_by: str | None,
     created_after: str | None,
@@ -724,19 +761,28 @@ def _search_vector(
 
     The raw KNN pulls :data:`_VECTOR_CANDIDATES` chunks (a node can own
     several), then each node keeps its closest chunk's distance and text.
-    There is no similarity threshold — the ANN list is always ``k`` deep,
-    which is exactly what RRF expects: a weak vector hit still fuses, just
-    with a small contribution.
+    The KNN is floored by similarity: a chunk within
+    :data:`_VECTOR_MIN_SIMILARITY` of the query enters the join, and one
+    below it never does — the predicate sits on the ANN itself, so a node
+    whose *best* chunk is below the bar has no group and no hit, and the
+    list can come back shorter than ``k``, or empty. That is what makes the
+    keyword arm's refusal the whole of ``search`` (finding M20): a query
+    whose content words the graph has never seen is no longer answered
+    ``k`` deep from the nearest unrelated chunks, and fusion sees only hits
+    that cleared the bar.
 
-    The cost of that is :func:`_compile_match`'s refusal not reaching here: a
-    query whose content words the graph has never seen is answered ``k`` deep
-    by this function, vector-signal-only, while the keyword arm returns
-    nothing. See the module docstring for why a floor is not simply added.
+    **Only the active provider's chunks enter the join** (finding M13):
+    ``model_id`` is the id of the provider that embedded ``query_vector`` —
+    the caller passes it so the filter and the query can never disagree — and
+    a chunk some *other* model wrote lives in a different vector space, where
+    a cosine against this query means nothing. Mixed-model chunks are simply
+    invisible to search; making them searchable again is a
+    ``projector rebuild vec``, which is the model-change path (design D6).
     """
     filters, params = _node_filters(
         state, type_id, created_by, created_after, created_before, include_meta, space_id, principal
     )
-    clauses = filters or ["1=1"]
+    clauses = ["c.model_id = ?", *(filters or ["1=1"])]
     rows = conn.execute(
         f"""
         SELECT n.id, n.space_id, n.type_id, n.title, c.text AS chunk_text,
@@ -744,7 +790,7 @@ def _search_vector(
         FROM (
             SELECT rowid AS chunk_id, distance
             FROM node_vec
-            WHERE embedding MATCH ? AND k = ?
+            WHERE embedding MATCH ? AND k = ? AND distance <= ?
         ) AS knn
         JOIN chunks c ON c.id = knn.chunk_id
         JOIN nodes n ON n.id = c.node_id
@@ -756,6 +802,8 @@ def _search_vector(
         (
             sqlite_vec.serialize_float32(query_vector),
             max(k * 4, _VECTOR_CANDIDATES),
+            _VECTOR_MAX_DISTANCE,
+            model_id,
             *params,
             k,
         ),
@@ -825,11 +873,12 @@ def _expand_hits(
     hits: list[SearchHit],
     *,
     k: int,
-    state: str | None,
+    state: NodeState | None,
     type_id: str | None,
     include_meta: bool,
     space_id: str | None,
     principal: Principal | None,
+    as_of: str | None = None,
 ) -> list[SearchHit]:
     """One-hop graph expansion: active-edge neighbors of the fused hits.
 
@@ -844,14 +893,26 @@ def _expand_hits(
     different question — there the far endpoint is drawn dimmed rather than
     dropped, because a graph asserting a connection ends is asserting
     something false. A ranked list asserts nothing of the sort.)
+
+    ``as_of`` follows the edges true at an instant instead of the live graph
+    (D2): ``archived`` edges whose validity window covered it are followed
+    alongside ``active`` ones (the same window
+    :func:`nodum.service._as_of_edge_clause` encodes).
     """
     seen = {hit.node_id for hit in hits}
     weights: dict[str, float] = {}
     for hit in hits:
-        rows = conn.execute(
-            "SELECT * FROM edges WHERE state = 'active' AND (src_id = ? OR dst_id = ?)",
-            (hit.node_id, hit.node_id),
-        ).fetchall()
+        if as_of is not None:
+            clause, params = _as_of_edge_clause(as_of, ("active",))
+            rows = conn.execute(
+                f"SELECT * FROM edges WHERE {clause} AND (src_id = ? OR dst_id = ?)",
+                [*params, hit.node_id, hit.node_id],
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM edges WHERE state = 'active' AND (src_id = ? OR dst_id = ?)",
+                (hit.node_id, hit.node_id),
+            ).fetchall()
         for edge in rows:
             other = edge["dst_id"] if edge["src_id"] == hit.node_id else edge["src_id"]
             if other in seen:
@@ -865,7 +926,7 @@ def _expand_hits(
         if row is None:
             continue
         if principal is not None and not principal.is_human:
-            if row["space_id"] not in (principal.read_spaces or ()):
+            if not node_readable(principal.read_spaces or frozenset(), row):
                 continue
         elif not include_meta and space_id is None and row["space_id"] == META_SPACE_ID:
             continue
@@ -893,7 +954,7 @@ def search(
     query: str,
     *,
     k: int = 10,
-    state: str | None = "active",
+    state: NodeState | None = "active",
     type: str | None = None,
     created_by: str | None = None,
     created_after: str | None = None,
@@ -901,6 +962,7 @@ def search(
     include_meta: bool = False,
     space: str | None = None,
     expand: bool = False,
+    as_of: str | None = None,
     principal: Principal,
     path: str | Path | None = None,
 ) -> SearchResult:
@@ -927,7 +989,9 @@ def search(
         created_after: Only nodes created after this timestamp.
         created_before: Only nodes created before this timestamp.
         include_meta: Include meta-space nodes (the type vocabulary, the
-            spaces themselves) in an unnarrowed search.
+            spaces themselves) in an unnarrowed search. For an agent the
+            spaces themselves are grant-scoped regardless (M3): only the space
+            nodes of spaces it holds grants on are in its read set.
         space: Optional space id or name to narrow the search to. It composes
             with the principal's scope — an agent is still confined to its
             grants, and a space it holds none on does not resolve — so this is
@@ -936,6 +1000,12 @@ def search(
         expand: Append one-hop active-edge neighbors of the fused hits
             (design §7 graph expansion), scored by edge type weight ×
             confidence.
+        as_of: Follow, for the ``expand`` half, the edges true at an instant
+            instead of the live graph (D2): ``archived`` edges whose validity
+            window covered it join the ``active`` ones. Node retrieval itself
+            is timeless — nodes carry no validity window — so ``as_of`` only
+            changes which edges expansion crosses, and the default (``None``)
+            leaves the search exactly as it was.
         path: Explicit database path.
 
     Returns:
@@ -994,6 +1064,9 @@ def search(
             vector_rows = _search_vector(
                 conn,
                 query_vector,
+                # The filter is the same model that produced the query vector:
+                # the two can never disagree, because there is only one `provider`.
+                model_id=provider.model_id,
                 k=k,
                 state=state,
                 type_id=type_id,
@@ -1015,6 +1088,7 @@ def search(
                 include_meta=include_meta,
                 space_id=space_id,
                 principal=principal,
+                as_of=as_of,
             )
         return SearchResult(query=query, k=k, hits=hits)
     finally:

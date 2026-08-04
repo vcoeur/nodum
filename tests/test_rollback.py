@@ -333,6 +333,27 @@ def test_a_supersede_comes_back_including_the_valid_to_it_closed(fresh_db):
     assert _graph() == before, "the replacement edge outlived the cycle that created it"
 
 
+def test_an_edge_accept_rolls_back_its_valid_from(fresh_db):
+    """A proposal accepted inside a cycle carries its `valid_from` on the same
+    row, so the reversal restores the NULL with it — the window opens with the
+    accept and closes with its rollback."""
+    first, second = _node("A"), _node("B")
+    edge = service.create_edge(first.id, second.id, "supports", principal=agent())
+    assert _edge(edge.id)["valid_from"] is None
+
+    cycle = service.open_cycle(trigger="manual", principal=owner())
+    with service.in_cycle(cycle.id):
+        service.transition(edge.id, "accept", principal=owner())
+    service.close_cycle(cycle.id, status="completed", report={}, principal=owner())
+    assert _edge(edge.id)["state"] == "active"
+    assert _edge(edge.id)["valid_from"] is not None
+
+    service.rollback_cycle(cycle.id, principal=owner())
+
+    assert _edge(edge.id)["state"] == "proposed"
+    assert _edge(edge.id)["valid_from"] is None
+
+
 # ── Refusing rather than clobbering (decision C4) ─────────────────────────────
 
 
@@ -1066,6 +1087,42 @@ def test_a_version_review_is_re_applied_by_rolling_its_rollback_back(fresh_db):
     assert service.get_node(node.id, principal=owner()).content == "first"
 
 
+def test_a_version_row_moved_outside_the_cycle_is_a_conflict(fresh_db):
+    """Finding M10: a review moved a `versions` row inside the cycle, and a
+    later review moved it again — that is a conflict like any other.
+
+    The conflict scan used to read only node/edge rows off event payloads, so a
+    version row another writer moved since was invisible and the rollback
+    clobbered the later decision. Here: the first reject is taken back by its
+    own rollback (the proposal is ``proposed`` again), a second cycle rejects it
+    once more, and rolling the first rollback back — which would re-apply the
+    first reject over the second cycle's decision — must refuse, naming the
+    version row and the second cycle's event.
+    """
+    node = _node("Alpha", content="first")
+    version = _proposal(node.id)
+
+    first = _reviewed_in_a_cycle(version.id, "reject")
+    assert _version_state(version.id) == "archived"
+    reversal = service.rollback_cycle(first, principal=owner())
+    assert _version_state(version.id) == "proposed"
+    # The same proposal, rejected again outside the first cycle's reversal.
+    second = _reviewed_in_a_cycle(version.id, "reject")
+    assert _version_state(version.id) == "archived"
+
+    with pytest.raises(RollbackConflict) as refusal:
+        service.rollback_cycle(reversal.rollback_cycle_id, principal=owner())
+    conflicts = refusal.value.conflicts
+    assert [conflict.kind for conflict in conflicts] == ["version"], (
+        f"only the version row stands in the way, got {conflicts!r}"
+    )
+    assert conflicts[0].row_id == str(version.id)
+    assert conflicts[0].conflicting_op == "version.reject"
+    assert conflicts[0].conflicting_cycle_id == second
+    # The second cycle's decision is still standing, untouched by the refusal.
+    assert _version_state(version.id) == "archived"
+
+
 def test_a_proposal_staged_and_reviewed_inside_one_cycle_comes_back(fresh_db):
     """The node's create and the review of a proposal on it, in one reversal.
 
@@ -1545,6 +1602,127 @@ def test_a_dry_run_does_not_call_the_cycles_own_rows_blockers(fresh_db):
     service.rollback_cycle(cycle.id, principal=owner())
     with pytest.raises(NodeNotFound):
         service.get_node(page.id, principal=owner())
+
+
+def test_a_rollback_is_blocked_by_edges_typed_by_the_type_node_the_cycle_created(fresh_db):
+    """`edges.type_id` is a foreign key into `nodes(id)` since 0009 — an edge's
+    type is a node — and it was the one the guard used to miss.
+
+    The guard that missed it answered `blockers: []` and then died on a bare
+    `IntegrityError` mid-rollback: the 500 the refusals exist to prevent (B9).
+    The preflight names the edge, and the run refuses on the same sentence
+    rather than dying on the constraint.
+    """
+    cycle = service.open_cycle(trigger="manual", principal=owner())
+    with service.in_cycle(cycle.id):
+        link = service.create_node(
+            type="type",
+            title="link",
+            space="meta",
+            props={"type_kind": "edge"},
+            principal=owner(),
+        )
+    service.close_cycle(cycle.id, status="completed", report={}, principal=owner())
+    a, b = _node("A"), _node("B")
+    edge = service.create_edge(a.id, b.id, link.id, principal=owner())
+
+    plan = service.rollback_cycle(cycle.id, dry_run=True, principal=owner())
+
+    assert plan.conflicts == []
+    blocked = {blocker.row_id: blocker for blocker in plan.blockers}
+    assert set(blocked) == {link.id}
+    assert blocked[link.id].dependants == [edge.id]
+    assert "still types 1 edge" in blocked[link.id].reason
+    with pytest.raises(UndoNotPossible) as refused:
+        service.rollback_cycle(cycle.id, principal=owner())
+    assert str(refused.value).endswith(blocked[link.id].reason)
+    # A refused rollback is all of it or none of it: the type node and the edge
+    # wearing it both still stand.
+    assert service.get_node(link.id, principal=owner()).id == link.id
+    assert _edge(edge.id)["type_id"] == link.id
+
+
+def test_a_dry_run_does_not_call_edges_the_reversal_removes_blockers(fresh_db):
+    """The reversal deletes every edge wearing a doomed type node, so none block.
+
+    An edge the cycle typed with its own type node is gone before the type's
+    create is reversed — a rollback reverses newest first, and the edge had to
+    come after its type — and an edge incident to a doomed node goes with the
+    node. A preflight that counted either would refuse a rollback that in fact
+    works, which is the exact false positive the `doomed_*` sets exist to
+    prevent.
+    """
+    cycle = service.open_cycle(trigger="manual", principal=owner())
+    with service.in_cycle(cycle.id):
+        link = service.create_node(
+            type="type",
+            title="link",
+            space="meta",
+            props={"type_kind": "edge"},
+            principal=owner(),
+        )
+        a = service.create_node(type="claim", title="A", principal=owner())
+        service.create_edge(a.id, link.id, link.id, principal=owner())
+    service.close_cycle(cycle.id, status="completed", report={}, principal=owner())
+    before = _graph()
+
+    plan = service.rollback_cycle(cycle.id, dry_run=True, principal=owner())
+    assert plan.blockers == []
+    assert _graph() == before
+
+    service.rollback_cycle(cycle.id, principal=owner())
+    with pytest.raises(NodeNotFound):
+        service.get_node(link.id, principal=owner())
+
+
+def test_every_non_cascading_foreign_key_into_nodes_is_guarded(fresh_db):
+    """The delete guards' completeness is pinned to the schema, not to a docstring.
+
+    `_delete_blocker`'s claim is only as good as the list it was written from,
+    and a hand-written list rots the day a migration adds a foreign key into
+    `nodes(id)` — the guard that missed it answers `blockers: []` and the run
+    dies on a bare `IntegrityError`, which is exactly what `edges.type_id` did
+    until this phase added it (B9). So the schema is the source of truth: every
+    non-cascading foreign key into `nodes(id)` must be owned by a guard, and
+    the one cascade is exempted *by name*, so a future migration that adds an
+    unguarded reference fails here on the commit that adds it.
+
+    The ownership split, as the code implements it:
+
+    - `_delete_blocker` refuses on what survives the delete: `nodes.parent_id`
+      (children), `nodes.space_id` (occupants), `nodes.type_id` (typed nodes),
+      `merge_redirects.tombstone_id`/`into_id` (redirects), `grants.space_id`
+      (grants) and `edges.type_id` (typed edges).
+    - `_delete_created_row` deletes what goes with the row: `edges.src_id`/
+      `dst_id` (incident edges) and `versions.node_id` — so no guard over them,
+      or a delete that in fact succeeds would be refused.
+    - `annotations.target_node_id` cascades (migration 0016): derived judgement
+      can never hold a node's undo.
+    """
+    conn = db.connect()
+    try:
+        live = db.foreign_keys_into(conn, "nodes")
+    finally:
+        conn.close()
+
+    refused_by_blocker = {
+        ("nodes", "parent_id"),
+        ("nodes", "space_id"),
+        ("nodes", "type_id"),
+        ("merge_redirects", "tombstone_id"),
+        ("merge_redirects", "into_id"),
+        ("grants", "space_id"),
+        ("edges", "type_id"),
+    }
+    deleted_with_the_row = {("edges", "src_id"), ("edges", "dst_id"), ("versions", "node_id")}
+    cascades = {("annotations", "target_node_id")}
+
+    assert live == refused_by_blocker | deleted_with_the_row | cascades, (
+        "a migration changed the foreign keys into `nodes(id)` without updating the "
+        "delete guards: every non-cascading reference must be refused by "
+        "`_delete_blocker` or deleted by `_delete_created_row`, and only "
+        "`annotations.target_node_id` may be exempt (it cascades)"
+    )
 
 
 def test_a_dry_run_still_refuses_what_cannot_be_planned(fresh_db):

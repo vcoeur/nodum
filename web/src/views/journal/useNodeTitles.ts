@@ -106,6 +106,7 @@ export function useNodeTitles(ids: readonly string[]): ReadonlyMap<string, strin
     // render. `titles` is one, because it is the record of what has already
     // been asked: settling it re-runs this effect exactly once, to find nothing
     // left to do.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [wantedKey, titles]);
 
   return titles;

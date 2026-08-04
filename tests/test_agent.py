@@ -881,10 +881,9 @@ def test_a_report_built_from_the_environment_is_strict_json(monkeypatch):
     assert "Infinity" not in rendered
 
 
-def test_the_report_key_and_the_props_key_are_named_once():
-    """The later waves splice these in; a second spelling would be a second home."""
+def test_the_report_key_is_named_once():
+    """The later waves splice it in; a second spelling would be a second home."""
     assert agent.REPORT_KEY == "llm"
-    assert agent.GENERATED_BY_PROP == "generated_by"
 
 
 # ── Provenance (A1–A3) ────────────────────────────────────────────────────────
@@ -896,13 +895,6 @@ def test_generated_by_carries_three_fields_and_no_cost():
         provider="fake://provider", model_id="fake-model", prompt_version="abc123def456"
     )
     assert set(provenance.model_dump()) == {"provider", "model_id", "prompt_version"}
-    assert provenance.as_props() == {
-        "generated_by": {
-            "provider": "fake://provider",
-            "model_id": "fake-model",
-            "prompt_version": "abc123def456",
-        }
-    }
 
 
 def test_a_prompt_version_changes_when_and_only_when_the_template_does():
@@ -973,7 +965,7 @@ def test_an_unparseable_budget_falls_back_to_the_default_rather_than_raising(
 def test_a_zero_request_budget_names_the_variable_that_actually_funds_a_request(monkeypatch):
     """``NODUM_LLM_REQUEST_BUDGET=0 nodum ask`` used to advise setting
     ``NODUM_LLM_CYCLE_BUDGET``, which does nothing for a request: ``for_request``
-    reads the request variable and never looks at the cycle one. AGENTS.md
+    reads the request variable and never looks at the cycle one. docs/decisions.md
     promises the refusal names the variable to set, and "turn the LLM jobs on"
     is cycle vocabulary for something a human asked for by hand.
     """
@@ -1427,8 +1419,8 @@ def test_a_report_field_that_is_a_claim_carries_no_default(model: type, field: s
     *affirmative claim* ("this run is not a cycle and has no stop row"), so a
     future construction site that omitted it on a **cycle** run would file a
     report saying the kill switch was not there on precisely the runs where it
-    was — and ``AGENTS.md`` says "no stop was requested" and "there was no stop
-    to request" are different facts.
+    was — and ``STOP_SWITCH_NONE``'s own docstring says "no stop was requested"
+    and "there was no stop to request" are different facts.
 
     The line, stated so it can be applied to the next field somebody adds: a
     default belongs where the docstring gives the zero a meaning of its own.

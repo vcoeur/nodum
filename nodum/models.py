@@ -8,7 +8,94 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
+
+from nodum.vocab import (
+    AgentKind,
+    CycleStatus,
+    CycleTrigger,
+    GrantLevel,
+    NodeState,
+    ProposalKind,
+    RollbackKind,
+    TransitionAction,
+    TransitionKind,
+    UrlGrantKind,
+    VersionState,
+)
+
+
+class NodeCreateIn(BaseModel):
+    """A node as a client asks to create it.
+
+    ``type`` is required; the other fields mirror :func:`nodum.service.create_node`
+    and its defaults. ``extra="forbid"`` makes a misspelled key a 400 rather
+    than a silently dropped field — the web client sends exactly the keys
+    above, and anything else is a caller bug (finding M1).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: str
+    title: str | None = None
+    content: str = ""
+    parent_id: str | None = None
+    props: dict[str, Any] = {}
+    space: str | None = None
+
+
+class EdgeCreateIn(BaseModel):
+    """An edge as a client asks to create it.
+
+    ``confidence`` is deliberately unbounded here: the ``[0, 1]`` range is the
+    service's rule, kept there so the refusal message is the service's own
+    (finding M1). ``extra="forbid"`` for the same reason as :class:`NodeCreateIn`.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    src_id: str
+    dst_id: str
+    type: str
+    props: dict[str, Any] | None = None
+    confidence: float | None = None
+
+
+class NodeUpdateIn(BaseModel):
+    """The fields a node update may change — an allowlist, as the handler's.
+
+    Absent and null are deliberately distinct, and pydantic records which
+    fields were actually sent (``model_fields_set``) so the handler can tell
+    "don't touch this" from "clear this". A null ``title`` clears the title —
+    a documented web affordance — while a null ``content`` or ``props`` is
+    refused by the handler, since those fields are non-nullable in
+    :class:`NodeOut` (finding M2).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    title: str | None = None
+    content: str | None = None
+    props: dict[str, Any] | None = None
+
+
+class EdgeSuggestionIn(BaseModel):
+    """One edge suggestion in a batch proposal (``propose_edges``).
+
+    The same inputs as :class:`EdgeCreateIn` under the batch's key names
+    (``src``/``dst``/``edge_type``). Every suggestion is validated against
+    this model **before any write**, so a malformed one fails with nothing
+    persisted, and unknown keys are refused (``extra="forbid"``) rather than
+    silently dropped — the defect finding M32 exists to close.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    src: str
+    dst: str
+    edge_type: str
+    props: dict[str, Any] | None = None
+    confidence: float | None = None
 
 
 class NodeOut(BaseModel):
@@ -22,7 +109,7 @@ class NodeOut(BaseModel):
     title: str | None
     content: str
     props: dict[str, Any]
-    state: str
+    state: NodeState
     created_by: str
     created_at: str
     updated_at: str
@@ -38,7 +125,7 @@ class EdgeOut(BaseModel):
     props: dict[str, Any]
     confidence: float | None
     created_by: str
-    state: str
+    state: NodeState
     valid_from: str | None
     valid_to: str | None
     created_at: str
@@ -64,7 +151,7 @@ class VersionOut(BaseModel):
     props: dict[str, Any]
     actor: str
     event_seq: int
-    state: str
+    state: VersionState
     proposed_fields: list[str] | None = None
     created_at: str
 
@@ -146,7 +233,9 @@ class ProjectorStatus(BaseModel):
     the size of its derived store (index rows for the FTS projector, chunks
     for the vector projector). ``available`` is false when the projector
     cannot make progress (e.g. no embedding provider for ``vec``); ``detail``
-    then carries the reason.
+    then carries the reason. ``skipped`` counts the events this projector has
+    quarantined instead of applying (finding M12) — ``nodum projector skips``
+    lists the rows behind the count.
     """
 
     name: str
@@ -155,6 +244,7 @@ class ProjectorStatus(BaseModel):
     rows: int
     available: bool = True
     detail: str | None = None
+    skipped: int = 0
 
 
 class ProjectorRun(BaseModel):
@@ -163,7 +253,10 @@ class ProjectorRun(BaseModel):
     ``applied`` counts the events consumed in this call; ``from_seq`` /
     ``to_seq`` are the checkpoint before and after. When a projector is
     unavailable the run is a no-op (``applied`` 0, checkpoint unmoved) and
-    ``detail`` carries the reason.
+    ``detail`` carries the reason. ``skipped`` counts the events this run
+    quarantined rather than applied (finding M12): a malformed event is
+    recorded in ``projector_skips`` and the checkpoint advances past it, so
+    the next run starts after it instead of failing on it forever.
     """
 
     name: str
@@ -171,6 +264,25 @@ class ProjectorRun(BaseModel):
     from_seq: int
     to_seq: int
     detail: str | None = None
+    skipped: int = 0
+
+
+class ProjectorSkip(BaseModel):
+    """One event a projector quarantined instead of applying (finding M12).
+
+    ``projector`` / ``seq`` name the event (the pair is the table's primary
+    key), ``op`` the operation it carried, and ``error`` why ``apply``
+    refused it. The projector's checkpoint has already advanced past ``seq``,
+    so the row is the record of a skip that happened — this is the read
+    surface behind the ``skipped`` counts on :class:`ProjectorRun` and
+    :class:`ProjectorStatus`.
+    """
+
+    projector: str
+    seq: int
+    op: str
+    error: str
+    created_at: str
 
 
 class SearchHit(BaseModel):
@@ -223,7 +335,7 @@ class ProposalOut(BaseModel):
     when the item has none.
     """
 
-    kind: str
+    kind: ProposalKind
     id: str
     type: str
     created_by: str
@@ -248,7 +360,7 @@ class AnnotationOut(BaseModel):
     """
 
     id: str
-    target_kind: str
+    target_kind: TransitionKind
     target_id: str
     body: dict[str, Any]
     actor: str
@@ -271,7 +383,7 @@ class BatchTransitionOut(BaseModel):
     the required state — a batch never aborts on a single bad id.
     """
 
-    action: str
+    action: TransitionAction
     actor: str
     reason: str | None = None
     transitioned: list[str]
@@ -457,7 +569,7 @@ class UrlGrantOut(BaseModel):
     ready-to-use address the token is embedded in.
     """
 
-    kind: str
+    kind: UrlGrantKind
     token: str
     url: str
     asset_hash: str | None
@@ -492,7 +604,7 @@ class AgentOut(BaseModel):
     """An agent account. ``has_token`` is all anyone ever learns of the token."""
 
     id: str
-    kind: str
+    kind: AgentKind
     name: str
     owner_human_id: str | None
     has_token: bool
@@ -512,7 +624,7 @@ class GrantOut(BaseModel):
 
     agent_id: str
     space_id: str
-    level: str
+    level: GrantLevel
     created_at: str
 
 
@@ -546,11 +658,11 @@ class CycleOut(BaseModel):
     """
 
     id: str
-    trigger: str
+    trigger: CycleTrigger
     triggered_by: str
     scope: str | None
     dry_run: bool
-    status: str
+    status: CycleStatus
     report: dict[str, Any] | None
     started_at: str
     finished_at: str | None
@@ -737,12 +849,14 @@ class RollbackConflictOut(BaseModel):
     the row since — because a human told *which* rows are in the way can act,
     and one told "rollback failed" cannot.
 
-    ``kind`` is ``node`` or ``edge``; ``conflicting_cycle_id`` is set when the
+    ``kind`` is ``node``, ``edge`` or ``version`` (a review decision the cycle
+    made moves a ``versions`` row, and another writer moving that row since is
+    a conflict like any other); ``conflicting_cycle_id`` is set when the
     later work was itself a cycle's (still "outside this cycle", and still a
     conflict).
     """
 
-    kind: str
+    kind: RollbackKind
     row_id: str
     cycle_event_seq: int
     cycle_event_op: str
@@ -766,11 +880,12 @@ class RollbackBlockerOut(BaseModel):
     ``row_id`` is the row the cycle created, named by ``cycle_event_seq`` /
     ``cycle_event_op``. ``dependants`` are the ids in the way — children of a
     node, occupants of a space, nodes typed by a type node, agents granted on a
-    space, merge redirects naming a node — and ``reason`` is the guard's own
+    space, merge redirects naming a node, edges typed by a type node — and
+    ``reason`` is the guard's own
     sentence, which is what the refusal says if the rollback is attempted.
     """
 
-    kind: str
+    kind: RollbackKind
     row_id: str
     cycle_event_seq: int
     cycle_event_op: str

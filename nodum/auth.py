@@ -63,6 +63,19 @@ class InvalidCredentials(PermissionError):
     """Raised when a password, token, or session does not verify."""
 
 
+class LoginLocked(PermissionError):
+    """Raised when a login name is refused for too many failed attempts.
+
+    The HTTP surface raises this instead of running another argon2
+    verification: a name under lockout is refused up front (429), which is
+    both the honest answer and the point of the lockout — an attacker's
+    attempts stop costing a password check, and the account stops being
+    reachable by one. The refusal is about the *attempt* (too many of them),
+    never about the account: a name that does not exist locks exactly like a
+    real one, so the lockout is not an existence oracle.
+    """
+
+
 def _connect(path: str | Path | None) -> sqlite3.Connection:
     conn = db.connect(path)
     db.init_db(conn)

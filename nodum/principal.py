@@ -19,9 +19,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from nodum.migrations import META_SPACE_ID
+from nodum.vocab import GRANT_LEVELS, PrincipalKind
 
 #: Grant levels, ordered: read ⊂ suggest ⊂ edit (design §5.2 as amended).
-GRANT_LEVELS = {"read": 1, "suggest": 2, "edit": 3}
+GRANT_LEVELS = GRANT_LEVELS
 
 #: Level integers for the checks below.
 READ, SUGGEST, EDIT = GRANT_LEVELS["read"], GRANT_LEVELS["suggest"], GRANT_LEVELS["edit"]
@@ -35,12 +36,15 @@ class Principal:
         kind: ``human``, ``external`` or ``internal`` (the two agent kinds).
         id: The account id — ``humans.id`` or ``agents.id``.
         grants: Space id → level name (``read``/``suggest``/``edit``); empty
-            for humans, who need none.
+            for humans, who need none. The values stay plain ``str`` because
+            they arrive from the ``grants`` table through
+            :func:`nodum.auth._grant_set` and the database CHECK is the gate;
+            the Literal lives at the service boundary.
         meta_space_id: The meta space's node id, for the cross-space edge
             type rule.
     """
 
-    kind: str
+    kind: PrincipalKind
     id: str
     grants: dict[str, str] = field(default_factory=dict)
     meta_space_id: str = META_SPACE_ID
@@ -66,7 +70,10 @@ class Principal:
             return EDIT
         if space_id is None:
             return 0
-        return GRANT_LEVELS.get(self.grants.get(space_id, ""), 0)
+        level = self.grants.get(space_id, "")
+        if level not in GRANT_LEVELS:
+            return 0
+        return GRANT_LEVELS[level]
 
     @property
     def read_spaces(self) -> frozenset[str] | None:
