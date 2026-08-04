@@ -1606,30 +1606,29 @@ def _refuse_unsupported_upload(
 # ── Serving original bytes ────────────────────────────────────────────────────
 
 
-async def _blob_chunks(conn: sqlite3.Connection, blob: sqlite3.Blob) -> AsyncIterator[bytes]:
-    """Yield an open blob's bytes in bounded chunks, closing both handles after.
+async def _spooled_chunks(spool: Path) -> AsyncIterator[bytes]:
+    """Yield a spooled original's bytes in bounded chunks, unlinking the file after.
 
     The point of the generator: an original may be a gigabyte, and reading it
     into a ``bytes`` to hand to a ``Response`` would put all of it in the
-    server's memory to send a copy the client reads at its own pace. The
-    connection outlives the handler that opened it — a blob handle is only
-    valid while its connection is — so this owns the close, including the one
-    that matters, when a client hangs up mid-transfer and Starlette closes the
-    generator instead of draining it.
+    server's memory to send a copy the client reads at its own pace. The file
+    outlives the handler that spooled it — :func:`_original_response` wrote it
+    and closed its handle before returning — so this owns the deletion,
+    including the one that matters, when a client hangs up mid-transfer and
+    Starlette closes the generator instead of draining it.
 
     Args:
-        conn: The connection the blob was opened on; closed on the way out.
-        blob: An open, readable blob handle positioned at its start.
+        spool: The temporary file holding the original's bytes.
 
     Yields:
         Successive chunks of at most :data:`UPLOAD_CHUNK_BYTES`.
     """
     try:
-        with blob:
-            while chunk := blob.read(UPLOAD_CHUNK_BYTES):
+        with spool.open("rb") as handle:
+            while chunk := handle.read(UPLOAD_CHUNK_BYTES):
                 yield chunk
     finally:
-        conn.close()
+        spool.unlink(missing_ok=True)
 
 
 def _original_response(asset_hash: str, path: str | Path | None) -> Response:
@@ -1642,6 +1641,16 @@ def _original_response(asset_hash: str, path: str | Path | None) -> Response:
     is the whole game on a file host). The filename is the content address run
     through :data:`_SAFE_FILENAME_RE` — the one name attached to these bytes
     that no stranger chose.
+
+    The bytes are **spooled to a temporary file before anything streams**: the
+    blob copy is one tight loop on a short-lived connection, and the
+    client-paced response then serves a plain file with no database handle
+    open. Streaming the blob directly would hold its open read transaction —
+    and with it the WAL snapshot, since ``conn.in_transaction`` stays False —
+    for the whole transfer, which a stalled client could pin for the life of
+    the connection. The spool is disk, not memory, and the connection is
+    closed before the response is returned (:func:`_spooled_chunks` owns the
+    file's deletion, client disconnect included).
 
     ``no-store`` keeps a shared proxy from retaining a private document that
     was reachable for one request under a URL that is now spent.
@@ -1660,16 +1669,32 @@ def _original_response(asset_hash: str, path: str | Path | None) -> Response:
     # only caller reached this through `urls.consume`, which just read and
     # updated a row in this database, so the schema is present by construction
     # and a migration pass on a download would be a second writer for nothing.
-    conn = db.connect(path)
+    # A NamedTemporaryFile rather than the TemporaryDirectory the upload
+    # routes use: this file must outlive the handler that created it, so its
+    # deletion is the streaming generator's job, not a ``with`` block's.
+    # (SIM115: the close below is a real ``with spool:``, just not on this line —
+    # a plain context manager would delete the file at block exit.)
+    spool = tempfile.NamedTemporaryFile(prefix="nodum-download-", suffix=".tmp", delete=False)  # noqa: SIM115
+    spool_path = Path(spool.name)
     try:
-        blob = assets.open_original(conn, asset_hash)
-        size = len(blob)
+        with spool:
+            conn = db.connect(path)
+            try:
+                blob = assets.open_original(conn, asset_hash)
+                with blob:
+                    while chunk := blob.read(UPLOAD_CHUNK_BYTES):
+                        spool.write(chunk)
+                size = spool.tell()
+            finally:
+                conn.close()
     except Exception:
-        conn.close()
+        # The spool outlives this call, so a failure before the response
+        # exists must not leave it behind.
+        spool_path.unlink(missing_ok=True)
         raise
     filename = f"nodum-{_SAFE_FILENAME_RE.sub('-', asset_hash)[:64]}"
     return StreamingResponse(
-        _blob_chunks(conn, blob),
+        _spooled_chunks(spool_path),
         media_type=DOWNLOAD_CONTENT_TYPE,
         headers={
             "content-length": str(size),
@@ -2432,8 +2457,9 @@ def create_app(
         upload route. Distinguishing them would tell whoever is guessing which
         of the four they just achieved.
 
-        The bytes are streamed out of the blob rather than read whole, and
-        served as an opaque attachment nothing will render: see
+        The bytes are spooled to a temp file and streamed back rather than
+        held in memory or pinned to the database for the client-paced
+        transfer, and served as an opaque attachment nothing will render: see
         :data:`DOWNLOAD_CONTENT_TYPE`.
         """
         row = urls.consume(request.path_params["token"], kind="download", path=db_path)

@@ -21,6 +21,20 @@ MIGRATION_NAME_RE = re.compile(r"^[0-9a-z_]+$")
 #: Default database location when ``NODUM_DB`` is not set.
 DEFAULT_DB_PATH = Path("~/.local/share/nodum/nodum.db").expanduser()
 
+#: How long a connection waits for SQLite's single write lock before failing
+#: with "database is locked".
+#:
+#: The 5 s default Python applies (the ``timeout`` argument to
+#: ``sqlite3.connect``) is shorter than a big registration can hold the lock
+#: for: :func:`nodum.assets.register_asset` deliberately streams a whole asset
+#: in one write transaction, and the measured 200 MB → 1.22 s copy rate
+#: extrapolates to ≈ 6 s of write-lock hold at the documented 1 GB ceiling
+#: (``SQLITE_LIMIT_LENGTH``). 15 s is >2× headroom over that projected worst
+#: case, so a writer that collides with a big registration waits it out
+#: instead of failing — which is what the architecture doc's "Known
+#: limitation" on registration (docs/architecture.md) now promises.
+BUSY_TIMEOUT_MS = 15000
+
 
 class SchemaConsistencyError(RuntimeError):
     """Raised when the live schema contradicts the recorded migrations.
@@ -52,10 +66,11 @@ def connect(path: str | Path | None = None) -> sqlite3.Connection:
             directory is created if needed. Use ``":memory:"`` for tests.
 
     Returns:
-        A connection with row access by column name, an 8 KiB page size, WAL
-        journaling, foreign-key enforcement enabled, and the sqlite-vec
-        extension loaded (the ``node_vec`` vec0 table and its KNN queries
-        need it).
+        A connection with row access by column name, a busy timeout of
+        :data:`BUSY_TIMEOUT_MS` (see there for why it is not Python's 5 s
+        default), an 8 KiB page size, WAL journaling, foreign-key enforcement
+        enabled, and the sqlite-vec extension loaded (the ``node_vec`` vec0
+        table and its KNN queries need it).
     """
     db_file = Path(path).expanduser() if path is not None else db_path()
     if str(db_file) != ":memory:":
@@ -65,6 +80,9 @@ def connect(path: str | Path | None = None) -> sqlite3.Connection:
     conn.enable_load_extension(True)
     sqlite_vec.load(conn)
     conn.enable_load_extension(False)
+    # First pragma on purpose: ``busy_timeout`` is a silent no-op once a
+    # transaction is open, and nothing before this point opens one.
+    conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
     # Asset bytes live in this file, and sqlite.org's blob benchmarks put peak
     # blob I/O at 8-16 KiB pages. This only takes effect on an empty database
     # and is silently ignored once WAL is on, so it must precede the WAL pragma

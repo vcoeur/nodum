@@ -2474,6 +2474,92 @@ def test_a_head_probe_does_not_spend_a_download_token(client, fresh_db, tmp_path
     assert len(_events("asset.download")) == 1  # spent by the GET, exactly once
 
 
+def test_the_download_response_closes_the_database_before_streaming(
+    client, fresh_db, tmp_path, monkeypatch
+):
+    """M15: the client-paced stream holds no database handle, WAL pin included.
+
+    The blob copy finishes inside :func:`_original_response`, so the
+    connection it used is closed before a single chunk streams — and with the
+    connection, the blob's open read transaction and its WAL snapshot, which a
+    stalled client would otherwise pin for the whole (potentially gigabyte,
+    client-paced) transfer.
+    """
+    original = b"%PDF-1.4\nspooled, never pinned\n"
+    ingested = _ingest_file(client, tmp_path, original)
+    real_connect = db.connect
+    seen: list[sqlite3.Connection] = []
+
+    def tracking_connect(path=None):
+        conn = real_connect(path)
+        seen.append(conn)
+        return conn
+
+    monkeypatch.setattr(http_api.db, "connect", tracking_connect)
+    response = http_api._original_response(ingested["asset"]["hash"], fresh_db)
+
+    assert len(seen) == 1
+    with pytest.raises(sqlite3.ProgrammingError):
+        seen[0].execute("SELECT 1")  # closed before the stream even started
+
+    async def drain() -> bytes:
+        return b"".join([chunk async for chunk in response.body_iterator])
+
+    assert asyncio.run(drain()) == original
+
+
+def test_the_download_spool_is_unlinked_once_the_stream_is_served(
+    client, fresh_db, tmp_path, monkeypatch
+):
+    """M15: the spooled temp file dies with the response, not with the handler.
+
+    The temp file is the one artifact a download leaves behind, so it must be
+    gone once the response is done — the alternative is a gigabyte-scale temp
+    file per download accumulating until a reboot.
+    """
+    original = b"%PDF-1.4\nspool lifecycle\n"
+    ingested = _ingest_file(client, tmp_path, original)
+    real_tnf = http_api.tempfile.NamedTemporaryFile
+    spooled: list[str] = []
+
+    def tracking_tnf(*args, **kwargs):
+        handle = real_tnf(*args, **kwargs)
+        spooled.append(handle.name)
+        return handle
+
+    monkeypatch.setattr(http_api.tempfile, "NamedTemporaryFile", tracking_tnf)
+    grant = _mint_download(client, ingested["asset"]["hash"])
+
+    response = client.get(grant["url"])
+
+    assert response.status_code == 200
+    assert response.content == original
+    assert len(spooled) == 1
+    assert not Path(spooled[0]).exists(), "the spool must be unlinked after the stream"
+
+
+def test_closing_the_download_stream_mid_transfer_unlinks_the_spool(tmp_path):
+    """M15: a client hang-up closes the generator; the finally must still unlink.
+
+    Starlette closes a streaming response's generator instead of draining it
+    when the client disconnects, so the unlink lives in the generator's
+    ``finally`` — this drives exactly that: consume one chunk, close, and the
+    file is gone.
+    """
+    spool = tmp_path / "spool.tmp"
+    spool.write_bytes(b"z" * (2 * http_api.UPLOAD_CHUNK_BYTES + 7))
+
+    async def drive() -> None:
+        chunks = http_api._spooled_chunks(spool)
+        first = await chunks.__anext__()
+        assert len(first) == http_api.UPLOAD_CHUNK_BYTES
+        await chunks.aclose()
+
+    asyncio.run(drive())
+
+    assert not spool.exists()
+
+
 def test_an_upload_url_ingests_the_bytes_the_grant_was_minted_for(client, fresh_db):
     """A PUT with no cookie, no origin headers and no content type at all.
 
