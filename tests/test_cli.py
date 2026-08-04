@@ -2288,8 +2288,11 @@ def test_no_help_text_anywhere_still_states_the_conjunctive_rule():
 #: Every prose file that spells commands at a reader. `schema-dump` is the
 #: authority they are checked against, which is the point: the CLI describes
 #: itself, so the docs can be checked against the surface rather than against a
-#: second list of it.
-DOC_SOURCES = ("README.md", "AGENTS.md", "docs")
+#: second list of it. The split docs are named explicitly so the coverage is
+#: visible: the `docs` directory sweep already includes them, and a future
+#: split must add its new files here too or the sweep silently stops covering
+#: them.
+DOC_SOURCES = ("README.md", "AGENTS.md", "docs", "docs/decisions.md", "docs/http-api.md")
 
 #: Hyphenated lowercase tokens the docs write in backticks that are *not*
 #: commands — a CSP directive, an HTTP header, a package, an agent id, a CI job.

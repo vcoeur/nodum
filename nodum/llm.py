@@ -638,7 +638,8 @@ class Completion(BaseModel):
         paid for.
 
         **What this one cannot see**, stated because both this docstring and
-        ``AGENTS.md`` used to claim the opposite: it compares the server's report
+        the decision log (``docs/decisions.md``) used to claim the opposite:
+        it compares the server's report
         against :attr:`context_tokens`, which is the number *the operator
         configured*. Configure 32 768 against a server serving 4 096 — the
         ordinary ollama case, where ``num_ctx`` binds and the model card does not

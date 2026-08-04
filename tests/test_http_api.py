@@ -393,8 +393,9 @@ def test_an_os_error_is_mapped_and_does_not_echo_the_path(client, fresh_db, monk
 def test_every_exception_cli_run_catches_is_mapped():
     """The docstring's claim, asserted rather than repeated.
 
-    ``AGENTS.md`` and the module docstring both said the table held "exactly the
-    ones ``cli._run`` catches". It did not: ``cli._run`` catches ``sqlite3.Error``
+    ``docs/architecture.md`` records the first cut of the table claiming to
+    hold "exactly the ones ``cli._run`` catches" — the module docstring says
+    the same today. It did not: ``cli._run`` catches ``sqlite3.Error``
     and ``OSError``, and the table listed only ``sqlite3.OperationalError``, so
     ``DatabaseError``, ``IntegrityError``, ``ProgrammingError``, ``DataError``
     and every ``OSError`` were unmapped 500s.

@@ -148,7 +148,7 @@ def test_the_absent_term_answers_with_nothing_even_with_a_provider(fresh_db, fak
     arms now return the same empty result, and this test makes the pair
     fail loudly the moment either half changes: deleting the floor puts the
     prose back on the vector list, and deleting the keyword refusal puts it
-    on the BM25 list. At that point `nodum/search.py`, `AGENTS.md` and
+    on the BM25 list. At that point `nodum/search.py`, `docs/decisions.md` and
     `web/src/views/search/noResults.ts` all need the qualifier taken back
     out.
 

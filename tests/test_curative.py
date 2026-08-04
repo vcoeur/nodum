@@ -392,9 +392,9 @@ def test_an_edge_that_would_become_a_self_loop_is_retired_with_its_reason(fresh_
     )
     archive_event = next(event for event in _events() if event.op == "edge.archive")
     assert "self-loop" in archive_event.payload["reason"]
-    # And in the return value, not only in the log: `AGENTS.md` says each
-    # retired edge is "reported with its reason", and a caller holding the
-    # result should not have to go to the event log to learn which rule bit.
+    # And in the return value, not only in the log: `RetiredEdgeOut`'s docstring
+    # says each retired edge is "reported with its reason", and a caller holding
+    # the result should not have to go to the event log to learn which rule bit.
     assert "self-loop" in result.retired[0].reason
     assert result.retired[0].reason == archive_event.payload["reason"]
 

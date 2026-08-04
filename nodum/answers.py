@@ -316,8 +316,9 @@ REWRITE_OUTPUT_TOKENS = 2048
 #:
 #: 2 048 is therefore 3.9x the worst sample, and it is chosen at that distance
 #: rather than closer for two reasons that are not margin-for-its-own-sake.
-#: It is the number ``AGENTS.md`` records as the measured cure for ``qwen3:8b``
-#: answering with an empty body, so nothing below it may be shipped to the local
+#: It is the number ``docs/decisions.md`` records as the measured cure for
+#: ``qwen3:8b`` answering with an empty body, so nothing below it may be
+#: shipped to the local
 #: half. And on ollama's 4 096-token window it is **exactly what /ask already
 #: gets**: :data:`~nodum.llm.OUTPUT_RESERVATION_FRACTION` clamps the blanket
 #: 4 096 to 2 048 there, so this can regress no local install at all.

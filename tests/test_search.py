@@ -963,8 +963,8 @@ def test_the_refusal_closes_half_the_invented_subject_shape_and_the_number_is_th
 ):
     """What the gate tests is *knownness*, not discrimination — measured.
 
-    `AGENTS.md` claims the refusal for "a query whose content words the graph
-    has simply never seen", and a reader takes that to cover every question
+    `docs/decisions.md` claims the refusal for "a query whose content words the
+    graph has simply never seen", and a reader takes that to cover every question
     built around an invented subject. It does not. The gate fires only when
     **no** content word of the query is in the index, and the questions people
     actually type carry ordinary English nouns and verbs that a technical graph
@@ -974,7 +974,8 @@ def test_the_refusal_closes_half_the_invented_subject_shape_and_the_number_is_th
 
     So the honest number: **six of these twelve** answer with nothing, and the
     six that still answer are the six whose non-invented content words the
-    graph genuinely holds. That count is the number `AGENTS.md` quotes, which
+    graph genuinely holds. That count is the number `docs/decisions.md`
+    records, which
     is the whole reason it is asserted exactly rather than as a floor: change
     `_QUERY_STOPWORDS` or the ordering and this fails, and the prose has to be
     re-derived rather than left to drift. Against 0 of 12 silent under the
@@ -996,7 +997,9 @@ def test_the_refusal_closes_half_the_invented_subject_shape_and_the_number_is_th
         for query, _ in _INVENTED_SUBJECT_QUESTIONS
     }
     silent = {query for query, hits in answered.items() if not hits}
-    assert len(silent) == 6, f"AGENTS.md says six of twelve; measured {len(silent)}: {answered}"
+    assert len(silent) == 6, (
+        f"docs/decisions.md says six of twelve; measured {len(silent)}: {answered}"
+    )
     # Deleting the invented subject leaves the same ranked list. Read that for
     # what it is — a **fixture guard**, not evidence about the gate. A term
     # with `df == 0` is dropped before any weight is computed and `match` is

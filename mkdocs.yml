@@ -91,6 +91,7 @@ nav:
   - Quick start: quick-start.md
   - Concepts: concepts.md
   - Architecture: architecture.md
+  - Decisions: decisions.md
   - Commands: commands.md
   - HTTP API: http-api.md
   - Legal: legal.md

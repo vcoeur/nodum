@@ -262,7 +262,7 @@ DEFAULT_CALL_TIMEOUT = 120.0
 #: answer come out of one KV cache — it would have eaten the whole thing, which
 #: is why :data:`nodum.llm.OUTPUT_RESERVATION_FRACTION` caps what is actually
 #: reserved and sent at a share of the window. On ollama this number therefore
-#: lands at 2 048, which is the value ``AGENTS.md`` already records as the
+#: lands at 2 048, which is the value ``docs/decisions.md`` records as the
 #: measured cure for ``qwen3:8b`` answering with an empty body.
 DEFAULT_MAX_OUTPUT_TOKENS = 4096
 

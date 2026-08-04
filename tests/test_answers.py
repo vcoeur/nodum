@@ -1276,8 +1276,8 @@ def test_ask_is_reachable_only_from_a_surface_a_human_types_at():
     ``getattr``, to ``importlib.import_module`` and to a re-export through
     ``__init__``. ``_nodum_imports`` sees all of those and carries its own
     meta-test (:func:`test_llm.test_the_rail_sees_every_spelling_of_the_import`)
-    asserting so, after ``AGENTS.md`` recorded having to fix exactly this hole
-    in exactly this way once already.
+    asserting so, after ``docs/decisions.md`` recorded having to fix exactly
+    this hole in exactly this way once already.
 
     Two claims, and the second is the transitive one:
 
@@ -2726,8 +2726,8 @@ def test_ask_asks_for_its_own_measured_ceiling_rather_than_the_blanket_one(graph
     Measured over 24 samples on the real template — ``deepseek-v4-flash`` at
     ``high`` and at ``low``, and ``qwen3:8b`` on ollama — the worst output was
     **528** tokens. :data:`~nodum.answers.ASK_OUTPUT_TOKENS` is 2 048, which is
-    3.9x that and is also the number ``AGENTS.md`` records as ``qwen3:8b``'s
-    cure, so nothing local can regress.
+    3.9x that and is also the number ``docs/decisions.md`` records as
+    ``qwen3:8b``'s cure, so nothing local can regress.
     """
     provider = FakeProvider(_reply("compaction keeps the latest value", ["1"]))
     llm.set_provider(provider)

@@ -698,8 +698,9 @@ cycle quietly drop the vector signal until you re-run the download.
   than passed on, and `nodum llm status` shows whether your endpoint actually
   accepts it, since `ollama` takes only `none`.
 
-See [docs/architecture.md](docs/architecture.md) for the module map and
-[AGENTS.md](AGENTS.md) for contributor/agent workflow rules.
+See [docs/architecture.md](docs/architecture.md) for the module map,
+[docs/decisions.md](docs/decisions.md) for the decision log, and
+[AGENTS.md](AGENTS.md) for the contributor/agent contract and workflow rules.
 
 ## Development
 
