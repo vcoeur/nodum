@@ -145,7 +145,10 @@ export default function App() {
               </div>
             </div>
           ) : (
-            <ErrorBoundary>
+            // Keyed on the pathname so a route change remounts the boundary:
+            // without a key, React never resets a crashed boundary on
+            // navigation and the crash panel survives every route change.
+            <ErrorBoundary key={location.pathname}>
               <Outlet />
             </ErrorBoundary>
           )}

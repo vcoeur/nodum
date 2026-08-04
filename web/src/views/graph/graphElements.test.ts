@@ -17,7 +17,7 @@
 
 import { describe, expect, it } from "vitest";
 import type { EdgeOut, NodeOut, NodeState, SubgraphOut } from "../../api/types";
-import { incidentEdges, nodeLabel, toElements } from "./graphElements";
+import { incidentEdges, nodeLabel, nodeListItems, toElements } from "./graphElements";
 import type { GraphEdgeData, GraphNodeData } from "./graphElements";
 
 /** A node carrying only what the element builder reads. */
@@ -84,6 +84,26 @@ describe("nodeLabel", () => {
     const label = nodeLabel({ ...node("n", "sp-a"), title: "x".repeat(200) });
     expect(label.length).toBeLessThan(50);
     expect(label.endsWith("…")).toBe(true);
+  });
+});
+
+describe("nodeListItems", () => {
+  it("maps every node to the id/label pair the keyboard list renders", () => {
+    const items = nodeListItems([node("a", "sp-a"), node("b", "sp-b")]);
+    expect(items).toEqual([
+      { id: "a", label: "a" },
+      { id: "b", label: "b" },
+    ]);
+  });
+
+  it("labels each row like the canvas node, including the no-title fallback", () => {
+    const items = nodeListItems([{ ...node("0123456789abcdef", "sp-a"), title: null }]);
+    expect(items[0]!.label).toBe("⟨01234567⟩");
+  });
+
+  it("keeps response order, so tab order matches the order the graph was read", () => {
+    const items = nodeListItems([node("first", "sp-a"), node("second", "sp-b")]);
+    expect(items.map((item) => item.id)).toEqual(["first", "second"]);
   });
 });
 

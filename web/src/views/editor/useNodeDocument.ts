@@ -311,6 +311,17 @@ export function useNodeDocument({
     return contentRef.current !== saved.content || titleRef.current !== saved.title;
   }, []);
 
+  /**
+   * The debounced saver, read through a ref.
+   *
+   * `scheduleSave` is declared below `persist`, and the two form a cycle —
+   * `persist`'s drain re-arms the debounce — so no dependency array can name
+   * it. The ref is this file's own pattern for that (see `flushBufferRef`),
+   * and reading it late is safe because `scheduleSave` is stable: both of its
+   * dependencies (`cancelTimer`, `runPersist`) are []-dep callbacks.
+   */
+  const scheduleSaveRef = useRef<() => void>(() => {});
+
   /* ---------------------------------------------------------------- */
   /* Saving                                                            */
   /* ---------------------------------------------------------------- */
@@ -478,7 +489,7 @@ export function useNodeDocument({
     function drainPending(): void {
       if (!pendingRef.current) return;
       pendingRef.current = false;
-      scheduleSave();
+      scheduleSaveRef.current();
     }
   }, [cancelTimer, hasUnsaved]);
 
@@ -591,6 +602,8 @@ export function useNodeDocument({
       void runPersist();
     }, AUTOSAVE_MS);
   }, [cancelTimer, runPersist]);
+
+  scheduleSaveRef.current = scheduleSave;
 
   const handleContentChange = useCallback(
     (content: string) => {

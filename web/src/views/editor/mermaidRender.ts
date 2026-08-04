@@ -153,6 +153,9 @@ const URL_ATTRIBUTES = ["href", "src", "xlink:href"];
  * Characters a browser strips from a URL attribute before acting on it — the
  * same set DOMPurify normalises with, so a prefix test sees the same string.
  */
+// The control-character range is the point: it is exactly what a browser
+// strips from a URL attribute before acting on it, so the check must match it.
+// eslint-disable-next-line no-control-regex
 const ATTRIBUTE_WHITESPACE = /[\u0000-\u0020\u00a0\u1680\u180e\u2000-\u2029\u205f\u3000]/g;
 
 /**

@@ -62,6 +62,26 @@ export function nodeLabel(node: NodeOut): string {
   return title.length > LABEL_LIMIT ? `${title.slice(0, LABEL_LIMIT - 1)}…` : title;
 }
 
+/** One row of the keyboard node list: the focusable twin of a canvas node. */
+export interface NodeListItem {
+  id: string;
+  label: string;
+}
+
+/**
+ * The rows of the keyboard node list: every rendered node, in response order.
+ *
+ * The canvas paints into a `<canvas>` whose only interaction is a pointer tap,
+ * so the view gives each node a focusable twin in a plain list (review
+ * 08-frontend, MAJOR 3); this is the pure mapping that twin renders from.
+ *
+ * @param nodes The rendered subgraph's nodes.
+ * @returns One `{id, label}` row per node, labelled like the canvas node.
+ */
+export function nodeListItems(nodes: readonly NodeOut[]): NodeListItem[] {
+  return nodes.map((node) => ({ id: node.id, label: nodeLabel(node) }));
+}
+
 /** The classes carrying a node's state and its root-ness. */
 function nodeClasses(node: NodeOut, rootId: string): string {
   const classes = [`state-${node.state}`];

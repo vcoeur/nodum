@@ -267,6 +267,21 @@ expected instants do not move between summer and winter.
 Since the harness is unit-only, anything React renders is still verified by
 type-checking it and driving it in a browser.
 
+## Linting
+
+```bash
+make web-lint              # or: cd web && npx eslint src
+```
+
+ESLint 9 (flat config in `web/eslint.config.js`) over `src/`, with
+`react-hooks/rules-of-hooks` and `react-hooks/exhaustive-deps` at error — the
+latter is the mechanical catch for a stale hook closure, which type-checking
+cannot see. TypeScript is parsed with `@babel/eslint-parser` rather than
+typescript-eslint: this package pins typescript@7 (the native compiler), which
+exposes no JS API, and typescript-eslint's peer range stops below it. Babel
+only needs the parser plugins (`typescript`, `jsx`), which is enough for the
+syntactic rules above; type-level guarantees remain with `tsc`.
+
 ## Module map
 
 | Path | What lives there |

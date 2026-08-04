@@ -34,6 +34,10 @@ type DiffState =
   | { status: "ready"; diff: DiffOut }
   | { status: "failed"; failure: FailureDescription };
 
+/** The stable empty list a not-yet-loaded view reads: a literal `[]` would be
+ * a fresh identity every render, re-running the `ordinals` memo for nothing. */
+const EMPTY_VERSIONS: VersionOut[] = [];
+
 export default function HistoryView() {
   const { nodeId } = useParams<{ nodeId: string }>();
   const [load, setLoad] = useState<LoadState>({ status: "loading" });
@@ -66,7 +70,7 @@ export default function HistoryView() {
     return () => controller.abort();
   }, [nodeId, attempt]);
 
-  const versions = load.status === "ready" ? load.versions : [];
+  const versions = load.status === "ready" ? load.versions : EMPTY_VERSIONS;
 
   const ordinals = useMemo(
     () => new Map(versions.map((version, index) => [version.id, index + 1])),

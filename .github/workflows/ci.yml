@@ -92,6 +92,10 @@ jobs:
       # src/lib/time.ts fixes is invisible in UTC.
       - name: Frontend unit tests
         run: make web-test
+      # ESLint over web/src (react-hooks/exhaustive-deps at error), so a
+      # stale hook closure fails here instead of in review.
+      - name: Frontend lint
+        run: make web-lint
       # `web-build` runs `tsc --noEmit` before Vite, so this step is the type
       # check as well as the build — the frontend cannot rot silently.
       - name: Build the UI bundle

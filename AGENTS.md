@@ -2721,11 +2721,16 @@ Phase-1 decision log.
 - **Line length 100**; ruff rules `E, F, I, UP, B, SIM`.
 - **Frontend**: `make web-install` once, then `make web-build` (which runs
   `tsc --noEmit` first, so the build is the type gate) or `make web-dev` for
-  the Vite server on 5700 proxying to `nodum serve` on 8600. Two gates, both in
-  CI: `tsc --noEmit` over the whole tree, and **`make web-test`** — Vitest over
-  the pure modules in `web/src` (`*.test.ts` beside the module it covers).
-  There is no ESLint and no component/DOM harness, so anything React renders is
-  still verified by type-checking it and driving it in a browser.
+  the Vite server on 5700 proxying to `nodum serve` on 8600. Three gates, all
+  in CI: `tsc --noEmit` over the whole tree, **`make web-test`** — Vitest over
+  the pure modules in `web/src` (`*.test.ts` beside the module it covers) —
+  and **`make web-lint`** — ESLint over `web/src`, where
+  `react-hooks/exhaustive-deps` at error catches stale hook closures. `web/`
+  parses TypeScript with Babel's parser rather than typescript-eslint because
+  the pinned typescript@7 (the native compiler) has no JS API for
+  typescript-eslint's peer range. There is no component/DOM harness, so
+  anything React renders is still verified by type-checking it and driving it
+  in a browser.
   **The Vitest run pins `TZ` to a non-UTC zone** (`web/vitest.config.ts`) and
   `time.test.ts` asserts the pin took: the zone-less-timestamp bug `lib/time.ts`
   fixes is invisible in UTC, so an ambient-timezone run would pass while the
@@ -2751,9 +2756,12 @@ Phase-1 decision log.
   script now uses plain `uv build`.
 - **Docs site.** `docs/` + `mkdocs.yml` build the mkdocs-material site at
   <https://nodum.vcoeur.com/>, deployed by `.github/workflows/docs.yml` on any
-  push to `main` that touches those paths. The build runs `--strict`, so a
-  broken internal link or a page missing from `nav` **fails CI** — check a docs
-  change locally with `uv run --with mkdocs-material mkdocs build --strict`.
+  push to `main` that touches those paths, and built (not deployed) on any
+  pull request that touches them. The build runs `--strict`; `mkdocs.yml`'s
+  `validation` block raises the orphan-page and broken-anchor checks from
+  INFO to WARN, which is what makes a broken internal link or a page missing
+  from `nav` **fail CI** — check a docs change locally with
+  `uv run --with "mkdocs==1.6.1" --with "mkdocs-material==9.7.7" mkdocs build --strict`.
   `docs/CNAME` carries the custom domain and must survive any docs
   reorganisation. **`docs/llms.txt`** is the agent-facing summary published at
   `/llms.txt` (mkdocs copies non-Markdown files through verbatim); it states the
@@ -2761,6 +2769,11 @@ Phase-1 decision log.
   change to any of those belongs in it as well as in this file. `docs/architecture.md` is both the in-repo architecture doc
   and a site page, so links out of it must be absolute URLs — a relative link
   to something outside `docs/` resolves in the repo but breaks the site build.
+  `docs/http-api.md` is **generated** from the live HTTP route table
+  (`api_routes` in `nodum.http_api`) by `scripts/gen-http-api-docs.py` and
+  never hand-edited — regenerate it (`uv run python scripts/gen-http-api-docs.py`)
+  after any route-table change and commit the result; `tests/test_docs.py`
+  fails if the committed page is not the generator's output.
 
 ## CLI contract (for agents driving the CLI)
 
@@ -3216,6 +3229,12 @@ Phase-1 decision log.
   server is not on the default address.
 
 ## HTTP contract (for agents touching `nodum serve`)
+
+The complete route reference is the generated `docs/http-api.md` — every
+route, its handler, its auth class, and one line on what it does, derived
+from the live route table (`uv run python scripts/gen-http-api-docs.py`
+after a route-table change; `tests/test_docs.py` holds the lock). The rules
+below are the parts that do not fit a route table.
 
 - **The HTTP surface is the human's.** Every write it makes is attributed to
   the session's human principal; the identity is never read from a request.

@@ -337,6 +337,57 @@
   background: var(--nd-surface-overlay);
 }
 
+/* --- Keyboard node list (a11y) ----------------------------------------- */
+
+/* Every canvas node has a focusable twin (review 08-frontend, MAJOR 3): the
+   canvas is a <canvas> with no text alternative and pointer-only selection,
+   so a keyboard or screen-reader user cannot reach node data any other way.
+   The list is hidden with the global .nd-sr-only recipe; the :focus-within
+   state (higher specificity) re-opens it over the canvas while a node button
+   has focus, so a sighted keyboard user sees where they are. */
+.nd-graph__node-list {
+  position: absolute;
+  top: var(--nd-space-6);
+  left: var(--nd-space-6);
+  z-index: 10;
+  margin: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: var(--nd-space-2);
+}
+
+.nd-graph__node-list:focus-within {
+  width: auto;
+  height: auto;
+  max-height: 60%;
+  padding: var(--nd-space-4);
+  overflow: auto;
+  clip-path: none;
+  white-space: normal;
+  border: 1px solid var(--nd-border-strong);
+  border-radius: var(--nd-radius-md);
+  background: var(--nd-surface-overlay);
+  box-shadow: var(--nd-shadow-overlay);
+}
+
+.nd-graph__node-button {
+  width: 100%;
+  padding: var(--nd-space-2) var(--nd-space-3);
+  border: 0;
+  border-radius: var(--nd-radius-sm);
+  background: transparent;
+  color: var(--nd-text);
+  font-size: var(--nd-text-xs);
+  text-align: left;
+  cursor: pointer;
+}
+
+.nd-graph__node-button:hover,
+.nd-graph__node-button:focus-visible {
+  background: var(--nd-surface-raised);
+}
+
 .nd-graph__legend {
   position: absolute;
   left: var(--nd-space-6);
