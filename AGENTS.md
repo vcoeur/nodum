@@ -2714,7 +2714,9 @@ Phase-1 decision log.
   exact tag because that job holds OIDC publish rights.
 - **Docstrings on public APIs**: one-line summary plus args/returns where
   applicable. Comment the *why*, not the *what*. Don't annotate code you
-  didn't change.
+  didn't change. ``cli.py`` is exempt: its docstrings *are* Typer's ``--help``
+  surface, and its parameters are documented with ``help=`` strings — an
+  ``Args:`` section there would leak into user-facing output.
 - **Keep adapters thin.** When you add or change a service operation, expose it
   through the CLI in the same change, and update `README.md`,
   `docs/architecture.md`, and this file in the same commit.

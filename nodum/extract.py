@@ -148,15 +148,37 @@ class Handler(Protocol):
     mimes: tuple[str, ...]
 
     def handles(self, mime: str) -> bool:
-        """Return whether this handler claims ``mime``."""
+        """Return whether this handler claims ``mime``.
+
+        Args:
+            mime: The file's MIME type; parameters are ignored.
+
+        Returns:
+            ``True`` when this handler claims the type.
+        """
         ...
 
     def availability(self) -> tuple[bool, str | None]:
-        """Return ``(available, reason)`` — ``reason`` explains an unavailable handler."""
+        """Return ``(available, reason)`` — ``reason`` explains an unavailable handler.
+
+        Returns:
+            ``(True, None)`` when the handler can run; otherwise
+            ``(False, reason)`` naming what is missing and how to fix it.
+        """
         ...
 
     def extract(self, source: Path, *, mime: str) -> Extraction:
-        """Extract text from ``source``, which the caller has checked this handler claims."""
+        """Extract text from ``source``, which the caller has checked this handler claims.
+
+        Args:
+            source: The file to read.
+            mime: The file's full MIME type, parameters included — the
+                handler may read ``charset=`` itself.
+
+        Returns:
+            The extraction result: ``text`` is ``""`` whenever nothing came
+            out, and ``detail`` then says why.
+        """
         ...
 
 
@@ -334,14 +356,31 @@ class TextHandler(_BaseHandler):
     mimes: tuple[str, ...] = ("text/*", "application/json")
 
     def handles(self, mime: str) -> bool:
-        """Claim the text family and JSON — but leave HTML to the ``html`` handler."""
+        """Claim the text family and JSON — but leave HTML to the ``html`` handler.
+
+        Args:
+            mime: A MIME type; parameters are ignored.
+
+        Returns:
+            ``True`` for ``text/*`` and ``application/json``; ``False`` for
+            HTML, which is the ``html`` handler's.
+        """
         normalized = _normalize_mime(mime)
         if normalized in HTML_MIMES:
             return False
         return super().handles(normalized)
 
     def extract(self, source: Path, *, mime: str) -> Extraction:
-        """Read ``source`` as UTF-8 text, replacing undecodable bytes."""
+        """Read ``source`` as UTF-8 text, replacing undecodable bytes.
+
+        Args:
+            source: The file to read.
+            mime: Accepted for the interface; this handler always reads UTF-8.
+
+        Returns:
+            The extracted text; ``detail`` names the cut when the read was
+            bounded short of the source.
+        """
         text, size, cut = _read_text_window(source)
         return _flat_extraction(
             self.name, text, empty_detail="the file holds no text", source_size=size, read_cut=cut
@@ -432,6 +471,16 @@ class HtmlHandler(_BaseHandler):
         guess for the modern web. The *read* is bounded like the ``text``
         handler's: at most :data:`MAX_TEXT_CHARS` + 4 bytes of markup are
         pulled off disk before decoding, whatever the charset's width.
+
+        Args:
+            source: The HTML file to read.
+            mime: The file's full ``Content-Type``; its ``charset`` parameter
+                selects the decode, and an absent or unknown charset falls
+                back to UTF-8.
+
+        Returns:
+            The document's visible text — markup, ``script`` and ``style``
+            bodies never reach it.
         """
         markup, size, cut = _read_text_window(source, charset=_declared_charset(mime))
         parser = _HtmlTextParser()
@@ -458,11 +507,29 @@ class PdfHandler(_BaseHandler):
     mimes: tuple[str, ...] = ("application/pdf",)
 
     def availability(self) -> tuple[bool, str | None]:
-        """Available when ``pypdf`` imports."""
+        """Available when ``pypdf`` imports.
+
+        Returns:
+            ``(True, None)`` with the ``pdf`` extra installed; otherwise
+            ``(False, reason)`` naming the extra.
+        """
         return _probe(self.name, _probe_pypdf)
 
     def extract(self, source: Path, *, mime: str) -> Extraction:
-        """Return per-page text, and the pages joined by a blank line as ``text``."""
+        """Return per-page text, and the pages joined by a blank line as ``text``.
+
+        Args:
+            source: The PDF file to read.
+            mime: Accepted for the interface; this handler reads the whole
+                document.
+
+        Returns:
+            One extraction with per-page text in ``pages`` — empty pages kept
+            so ``pages[n - 1]`` stays page ``n`` — and those pages joined by
+            a blank line as ``text``. A document with no embedded text (a
+            scan) comes back with empty ``text`` and a ``detail`` pointing at
+            the image handler's OCR.
+        """
         from pypdf import PdfReader
 
         reader = PdfReader(str(source))
@@ -513,7 +580,13 @@ class ImageHandler(_BaseHandler):
     mimes: tuple[str, ...] = ("image/*",)
 
     def availability(self) -> tuple[bool, str | None]:
-        """Available when ``pytesseract`` imports *and* the tesseract binary is on PATH."""
+        """Available when ``pytesseract`` imports *and* the tesseract binary is on PATH.
+
+        Returns:
+            ``(True, None)`` when both hold; otherwise ``(False, reason)``
+            naming whichever is missing — the binary is a system package, not
+            an extra.
+        """
         return _probe(self.name, _probe_pytesseract)
 
     def extract(self, source: Path, *, mime: str) -> Extraction:
@@ -525,6 +598,14 @@ class ImageHandler(_BaseHandler):
         exception: a 68-byte PNG declaring 150 megapixels must not wedge the
         pipeline. The check runs before the ``pytesseract`` import so it
         answers for the image alone, OCR availability notwithstanding.
+
+        Args:
+            source: The image file to OCR.
+            mime: Accepted for the interface; this handler does not use it.
+
+        Returns:
+            The recognised text; ``detail`` explains when the image was
+            refused (pixel budget) or OCR recognised nothing.
         """
         from PIL import Image
 
@@ -548,7 +629,12 @@ class AudioHandler(_BaseHandler):
     mimes: tuple[str, ...] = ("audio/*",)
 
     def availability(self) -> tuple[bool, str | None]:
-        """Available when ``faster_whisper`` imports."""
+        """Available when ``faster_whisper`` imports.
+
+        Returns:
+            ``(True, None)`` with the ``audio`` extra installed; otherwise
+            ``(False, reason)`` naming the extra.
+        """
         return _probe(self.name, _probe_faster_whisper)
 
     def extract(self, source: Path, *, mime: str) -> Extraction:
@@ -559,6 +645,15 @@ class AudioHandler(_BaseHandler):
         ``NODUM_AUDIO_DOWNLOAD=1`` faster-whisper is confined to its local
         cache, and an uncached model raises here, which :func:`extract` turns
         into a ``detail`` naming the flag rather than a silent download.
+
+        Args:
+            source: The audio file to transcribe.
+            mime: Accepted for the interface; this handler does not use it.
+
+        Returns:
+            The recognised speech as one text; ``detail`` explains an empty
+            transcript, and an uncached model surfaces as the exception
+            :func:`extract` turns into a ``detail``.
         """
         from faster_whisper import (  # pyright: ignore[reportMissingImports] degraded-mode
             WhisperModel,

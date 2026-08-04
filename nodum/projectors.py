@@ -68,7 +68,13 @@ class Projector:
         raise NotImplementedError
 
     def apply(self, conn: sqlite3.Connection, event: sqlite3.Row) -> None:
-        """Fold one event-log row into the derived state."""
+        """Fold one event-log row into the derived state.
+
+        Args:
+            conn: The open database connection.
+            event: A raw ``events`` row; events irrelevant to this projector
+                are ignored.
+        """
         raise NotImplementedError
 
     def count(self, conn: sqlite3.Connection) -> int:
@@ -125,7 +131,15 @@ class FtsProjector(Projector):
         return int(row["n"])
 
     def apply(self, conn: sqlite3.Connection, event: sqlite3.Row) -> None:
-        """Index the node affected by one event, if any."""
+        """Index the node affected by one event, if any.
+
+        Args:
+            conn: The open database connection.
+            event: A raw ``events`` row: ``node.*`` upsert or delete the
+                affected node's row, ``asset.extract`` re-projects the
+                describing nodes, and ``undo`` mirrors the reversed event.
+                Edge events carry no node text and are ignored.
+        """
         op = event["op"]
         payload = json.loads(event["payload"])
         if op == "undo":
@@ -319,7 +333,14 @@ class VecProjector(Projector):
         return int(row["n"])
 
     def apply(self, conn: sqlite3.Connection, event: sqlite3.Row) -> None:
-        """Re-embed the node affected by one event, if any."""
+        """Re-embed the node affected by one event, if any.
+
+        Args:
+            conn: The open database connection.
+            event: A raw ``events`` row: ``node.*`` re-chunk and re-embed the
+                affected node, ``undo`` drops its chunks and vectors, and
+                edge events are ignored.
+        """
         op = event["op"]
         payload = json.loads(event["payload"])
         if op == "undo":

@@ -719,11 +719,32 @@ class LLMProvider(Protocol):
     def estimate_prompt_tokens(
         self, messages: Sequence[Message], *, schema: dict[str, Any] | None = None
     ) -> int:
-        """An over-count of what these messages will cost as a prompt."""
+        """An over-count of what these messages will cost as a prompt.
+
+        Never an under-count: the refusal this number feeds must not ship a
+        silently truncated prompt (see :func:`estimate_tokens`).
+
+        Args:
+            messages: The prompt, in order.
+            schema: A schema the caller will pass to :meth:`chat`. It must be
+                passed here too — under :data:`STRUCTURED_JSON_OBJECT` the
+                schema is stated in the prompt and costs tokens.
+
+        Returns:
+            A token count the real prompt cannot exceed.
+        """
         ...
 
     def output_reservation(self, max_output_tokens: int) -> int:
-        """What this call will really reserve, and really send as ``max_tokens``."""
+        """What this call will really reserve, and really send as ``max_tokens``.
+
+        Args:
+            max_output_tokens: The output ceiling asked for.
+
+        Returns:
+            The reservation: a share of the context window capped by the
+            ceiling, and at least 1.
+        """
         ...
 
     def chat(
@@ -735,7 +756,31 @@ class LLMProvider(Protocol):
         timeout: float,
         thinking: str | None = None,
     ) -> Completion:
-        """Send one prompt and return one completion, or raise :class:`LLMError`."""
+        """Send one prompt and return one completion, or raise :class:`LLMError`.
+
+        Args:
+            messages: The prompt, in order.
+            schema: A JSON schema for ``response_format``; ``None`` sends
+                none. How strong the schema's hold on the body is depends on
+                :attr:`structured_mode`.
+            max_output_tokens: The output ceiling asked for — what is really
+                sent is :meth:`output_reservation` of it.
+            timeout: Per-call wall-clock ceiling in seconds, bounding the
+                whole call including any capability negotiation.
+            thinking: Per-call-site reasoning level, overriding the provider's
+                configured one; ``None`` keeps the configured level.
+
+        Returns:
+            One completion, whatever ``finish_reason`` it carries.
+
+        Raises:
+            ValueError: If ``max_output_tokens`` or ``thinking`` is unusable.
+            PromptTooLong: If the prompt's estimate exceeds what is left of
+                the window — raised before anything is sent.
+            ProviderTimeout: If ``timeout`` elapsed.
+            ProviderUnavailable: If the endpoint could not be reached, refused
+                the call, or answered something unreadable.
+        """
         ...
 
 
@@ -1163,10 +1208,12 @@ class OpenAICompatProvider:
 
     @property
     def model_id(self) -> str:
+        """What produced the text — the configured model id (A1 provenance)."""
         return self._model
 
     @property
     def context_tokens(self) -> int:
+        """The window a prompt is refused against, output reservation included."""
         return self._context_tokens
 
     @property

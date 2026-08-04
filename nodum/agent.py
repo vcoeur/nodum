@@ -910,10 +910,12 @@ class AgentRun:
 
     @property
     def model_id(self) -> str | None:
+        """The provider's model id, or ``None`` with no provider configured."""
         return self._provider.model_id if self._provider is not None else None
 
     @property
     def provider_id(self) -> str | None:
+        """The provider's identifier, or ``None`` with no provider configured."""
         return self._provider.provider_id if self._provider is not None else None
 
     @property

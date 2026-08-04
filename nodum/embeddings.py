@@ -109,7 +109,14 @@ class EmbeddingProvider(Protocol):
         ...
 
     def embed(self, texts: list[str]) -> list[list[float]]:
-        """Embed a batch of texts, one vector per input, in input order."""
+        """Embed a batch of texts, one vector per input, in input order.
+
+        Args:
+            texts: The texts to embed.
+
+        Returns:
+            One vector per input text, in input order.
+        """
         ...
 
 
@@ -145,14 +152,23 @@ class FastembedProvider:
 
     @property
     def model_id(self) -> str:
+        """The model name, recorded per chunk for provenance (D6)."""
         return self._model_id
 
     @property
     def dimensions(self) -> int:
+        """Vector dimensionality, probed from the loaded model at construction."""
         return self._dimensions
 
     def embed(self, texts: list[str]) -> list[list[float]]:
-        """Embed a batch of texts with the local ONNX model."""
+        """Embed a batch of texts with the local ONNX model.
+
+        Args:
+            texts: The texts to embed.
+
+        Returns:
+            One vector per input text, in input order.
+        """
         return [vector.tolist() for vector in self._model.embed(texts)]
 
 
