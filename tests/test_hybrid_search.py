@@ -2,7 +2,16 @@
 
 from __future__ import annotations
 
-from helpers import agent, owner
+from helpers import (
+    REPLAY_DECOY_MIGRATION,
+    REPLAY_DECOY_ROUTES,
+    REPLAY_FARTHEST,
+    REPLAY_MIDDLE,
+    REPLAY_NEAREST,
+    REPLAY_QUERY,
+    agent,
+    owner,
+)
 
 # The prose the keyword refusal exists to suppress, imported rather than copied
 # so that editing it in one place cannot leave this file's fixture silently
@@ -184,3 +193,52 @@ def test_degrades_to_bm25_when_no_provider(fresh_db):
     result = search.search("xylem", principal=owner())
     assert [hit.node_id for hit in result.hits] == [target.id]
     assert set(result.hits[0].signals) == {"bm25"}
+
+
+def test_the_vector_arm_recalls_a_paraphrase_a_lexical_decoy_cannot(fresh_db, replay_embedder):
+    """The vector signal's differentiator, pinned: recall without token overlap.
+
+    ``HashEmbedder`` is a bag-of-words embedder whose cosine **is** token
+    overlap — every vector test built on it ranks by the same signal BM25
+    uses, so nothing asserts the recall the real arm exists for: a chunk that
+    shares no word with the query still wins because its embedding sits near
+    the query's. ``ReplayEmbedder`` answers from a frozen table whose geometry
+    the test controls, so this can be stated directly:
+
+    * the query's two content words appear only in the two decoy rows — each
+      in exactly one, which is what the keyword arm's quorum needs to exclude
+      them both (a row carrying both would be a genuine BM25 hit);
+    * the three paraphrases share **no word** with the query, so the keyword
+      arm cannot name them at all;
+    * the nearest paraphrase's frozen cosine clears the similarity floor and
+      the decoys' cosines do not, so the vector arm names the paraphrases and
+      nothing else.
+
+    The nearest paraphrase therefore wins on the ``vector`` signal alone,
+    ahead of rows that carry the query's own words — the ranking is semantic,
+    not lexical, and a test built on the hash embedder could never have
+    expressed that.
+    """
+    near = service.create_node(type="note", content=REPLAY_NEAREST, principal=owner())
+    middle = service.create_node(type="note", content=REPLAY_MIDDLE, principal=owner())
+    farthest = service.create_node(type="note", content=REPLAY_FARTHEST, principal=owner())
+    decoy_migration = service.create_node(
+        type="note", content=REPLAY_DECOY_MIGRATION, principal=owner()
+    )
+    decoy_routes = service.create_node(type="note", content=REPLAY_DECOY_ROUTES, principal=owner())
+    # The fixture is not a tautology: each decoy really does carry one of the
+    # query's words (a naive keyword search would match them), and no
+    # paraphrase carries either.
+    assert "migration" in decoy_migration.content
+    assert "routes" in decoy_routes.content
+    assert not any(word in near.content for word in ("migration", "routes"))
+
+    result = search.search(REPLAY_QUERY, k=5, principal=owner())
+
+    assert result.hits[0].node_id == near.id, [hit.node_id for hit in result.hits]
+    assert set(result.hits[0].signals) == {"vector"}
+    # The paraphrases rank by frozen cosine (the nearest first); the lexical
+    # decoys are not hits at all — below the similarity floor and under the
+    # keyword quorum alike.
+    assert [hit.node_id for hit in result.hits] == [near.id, middle.id, farthest.id]
+    assert all(set(hit.signals) == {"vector"} for hit in result.hits)

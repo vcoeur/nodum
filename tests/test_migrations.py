@@ -2150,56 +2150,265 @@ def _rendered_at(width, error, *, with_frames=False):
     return console.file.getvalue()
 
 
-def _repair_out_of(text):
-    """The rebuild as it appears in rendered `text`, or None if it is not there."""
-    lines = [line.rstrip() for line in text.splitlines()]
-    if "PRAGMA foreign_keys=off;" not in lines or "PRAGMA foreign_keys=on;" not in lines:
-        return None
-    start = lines.index("PRAGMA foreign_keys=off;")
-    end = len(lines) - 1 - lines[::-1].index("PRAGMA foreign_keys=on;")
-    return "\n".join(lines[start : end + 1])
+def _repair_block_out_of(text, block):
+    """One repair statement as it appears in rendered `text`, cut out by lines.
 
-
-def test_the_repair_survives_the_renderer_it_ships_through_at_every_width(fresh_db):
-    """Pin the mangle where it happened: in the terminal, not in the constant.
-
-    Both repair tests here run `db.CYCLE_STOP_CHECK_REBUILD_SQL` directly, so
-    they pass whatever the human actually sees. This one takes the SQL back out
-    of the rendered refusal, at every width from 58 to 200, and requires it to
-    be byte-identical to the statement the module meant to give — and then runs
-    one of those pastes, a statement at a time, against a real drifted file.
+    A repair that is not there — a renderer that broke a line, or the wrong
+    drift — raises ``IndexError``, so callers that assert the cut equals the
+    statement fail loudly rather than paste something misshapen.
     """
-    conn = db.connect()
+    lines = [line.rstrip() for line in text.splitlines()]
+    block_lines = [line.rstrip() for line in block.splitlines()]
+    start = lines.index(block_lines[0])
+    return "\n".join(lines[start : start + len(block_lines)])
+
+
+def _drift_missing_cycles_index(path):
+    """A file recording 0014 with the lock index gone — the 0014 first-cut drift.
+
+    The one drift this repo has ever produced (0014 was amended in place while
+    unreleased); the index is derived state the one-statement remedy puts back.
+    """
+    conn = db.connect(path)
     try:
-        _stop_columns_without_the_check(conn)
-        _insert_cycle(conn, "kept", "curative", status="completed")
+        conn.execute("DROP INDEX idx_cycles_one_running_consolidation")
         conn.commit()
-        with pytest.raises(db.SchemaConsistencyError) as refused:
-            db.init_db(conn)
     finally:
         conn.close()
 
-    mangled = [
-        width
-        for width in range(58, 201)
-        if _repair_out_of(_rendered_at(width, refused.value)) != db.CYCLE_STOP_CHECK_REBUILD_SQL
-    ]
-    assert mangled == [], f"the terminal changed the repair at {len(mangled)} widths: {mangled[:5]}"
-    # The full rendering, frames and all, says the same thing at a width that
-    # used to break — so the sweep above is measuring the real channel.
-    paste = _repair_out_of(_rendered_at(61, refused.value, with_frames=True))
-    assert paste == db.CYCLE_STOP_CHECK_REBUILD_SQL
 
-    # And that paste is a repair, run the way a console runs it.
-    errors = _run_as_a_console_does(fresh_db, paste, stop_at_the_first_error=False)
-    assert errors == []
-    conn = db.connect()
+def _drift_missing_stop_columns(path):
+    """A file recording 0015 with neither stop column — an externally drifted schema.
+
+    Not a shape this repo has produced (0015 landed complete), but the check
+    guards exactly this: a hand-edited schema or an externally applied
+    migration. The CHECK travels on the second column, so the drop order is
+    second-first, then the first.
+    """
+    conn = db.connect(path)
+    try:
+        conn.execute("ALTER TABLE cycles DROP COLUMN stop_requested_by")
+        conn.execute("ALTER TABLE cycles DROP COLUMN stop_requested_at")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _drift_missing_stop_check(path):
+    """A file recording 0015 with the columns and not the CHECK under them."""
+    conn = db.connect(path)
+    try:
+        _stop_columns_without_the_check(conn)
+        # A cycle to carry across the rebuild: the whole point of the parked
+        # copy is that no way of running the repair loses it.
+        _insert_cycle(conn, "kept", "curative", status="completed")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _drift_half_stops(path):
+    """A file recording 0015 whose rows already hold half-stops.
+
+    The columns-without-CHECK shape again, plus one row the CHECK would have
+    refused — which is what stops the rebuild's copy and hands the refusal
+    the clear-them statement first.
+    """
+    conn = db.connect(path)
+    try:
+        _stop_columns_without_the_check(conn)
+        _insert_cycle(conn, "half", "curative")
+        conn.execute("UPDATE cycles SET stop_requested_at = datetime('now') WHERE id = 'half'")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _drift_missing_annotations(path):
+    """A file recording 0016 without the annotations table."""
+    conn = db.connect(path)
+    try:
+        conn.execute("DROP TABLE annotations")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _drift_missing_conventions_space(path):
+    """A file recording 0016 without the conventions space node."""
+    conn = db.connect(path)
+    try:
+        # The grant's `space_id` foreign key forbids the delete under normal
+        # enforcement — the drift is exactly what a writer with FKs off leaves
+        # behind, so take it back off for the delete, as the 0016 tests do.
+        conn.execute("PRAGMA foreign_keys = OFF")
+        conn.execute("DELETE FROM nodes WHERE id = ?", (db.CONVENTIONS_SPACE_ID,))
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _drift_missing_conventions_grant(path):
+    """A file recording 0016 without the gardener's edit grant on conventions."""
+    conn = db.connect(path)
+    try:
+        conn.execute(
+            "DELETE FROM grants WHERE agent_id = ? AND space_id = ?",
+            (db.GARDENER_AGENT_ID, db.CONVENTIONS_SPACE_ID),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _finish_drop_parked_copy(path):
+    """The rebuild parks a copy; the refusal's own next step removes it.
+
+    Also asserts the row the rebuild had to carry across survived it — the
+    rebuild's whole point.
+    """
+    conn = db.connect(path)
     try:
         _drop_the_parked_copy(conn)
         assert db.init_db(conn) == []
         assert [row["id"] for row in conn.execute("SELECT id FROM cycles")] == ["kept"]
     finally:
         conn.close()
+
+
+def _finish_after_half_stop_clear(path):
+    """Clearing the half-stops is step one; the refusal directs the rebuild next.
+
+    The message prints the clear and says "Then run 'nodum init' again for the
+    rebuild" — so following it means re-running init, applying the rebuild it
+    then prints, and removing the parked copy that leaves behind.
+    """
+    conn = db.connect(path)
+    try:
+        with pytest.raises(db.SchemaConsistencyError) as refused:
+            db.init_db(conn)
+        rebuild = _script_from_message(
+            str(refused.value), "PRAGMA foreign_keys=off;", "PRAGMA foreign_keys=on;"
+        )
+        conn.executescript(rebuild)
+        conn.commit()
+        _drop_the_parked_copy(conn)
+        assert db.init_db(conn) == []
+        assert {row["id"] for row in conn.execute("SELECT id FROM cycles")} == {"half"}
+    finally:
+        conn.close()
+
+
+#: Every repair the consistency refusals ship, as the statements a human is
+#: told to paste, the drift each one is the cure for, and any step the refusal
+#: directs after the statement itself. One entry per refusal-printed remedy:
+#: the six `db.<CONSTANT>` SQL statements plus 0015's two ALTERs (which the
+#: refusal prints separately, so they travel as two blocks here).
+REPAIR_CASES = [
+    ("CYCLES_RUNNING_INDEX_SQL", [db.CYCLES_RUNNING_INDEX_SQL], _drift_missing_cycles_index, None),
+    (
+        "CYCLE_STOP_COLUMN_SQL",
+        [sql for _, sql in db.CYCLE_STOP_COLUMN_SQL],
+        _drift_missing_stop_columns,
+        None,
+    ),
+    (
+        "CYCLE_STOP_CHECK_REBUILD_SQL",
+        [db.CYCLE_STOP_CHECK_REBUILD_SQL],
+        _drift_missing_stop_check,
+        _finish_drop_parked_copy,
+    ),
+    (
+        "CYCLE_STOP_CLEAR_HALF_STOP_SQL",
+        [db.CYCLE_STOP_CLEAR_HALF_STOP_SQL],
+        _drift_half_stops,
+        _finish_after_half_stop_clear,
+    ),
+    ("ANNOTATIONS_TABLE_SQL", [db.ANNOTATIONS_TABLE_SQL], _drift_missing_annotations, None),
+    ("CONVENTIONS_SPACE_SQL", [db.CONVENTIONS_SPACE_SQL], _drift_missing_conventions_space, None),
+    ("CONVENTIONS_GRANT_SQL", [db.CONVENTIONS_GRANT_SQL], _drift_missing_conventions_grant, None),
+]
+
+
+@pytest.mark.parametrize(
+    ("name", "repair_blocks", "drift", "finish"),
+    REPAIR_CASES,
+    ids=[case[0] for case in REPAIR_CASES],
+)
+def test_every_repair_survives_the_renderer_it_ships_through_at_every_width(
+    fresh_db, tmp_path, name, repair_blocks, drift, finish
+):
+    """Pin the mangle where it happened: in the terminal, not in the constant.
+
+    The repair tests here run the `db.<CONSTANT>` statements directly, so they
+    pass whatever the human actually sees. This one takes each repair back out
+    of the rendered refusal, at every width from 58 to 200, requires it to be
+    byte-identical to the statement the module meant to give, and then runs
+    the paste — a statement at a time, the way a console runs it, under both
+    bail models — against a real drifted file, following it all the way back
+    to a passing ``init_db``.
+
+    **The parametrisation is every remedy, not just the rebuild.** The rebuild
+    was the one repair that had been exercised through the renderer; the
+    other five statements (and 0015's two ALTERs) reach a human through the
+    same rich channel, and a renderer that mangled any of them would fail in
+    the same terminal. Each entry's drift is the exact state its refusal names
+    the statement for, so the fidelity sweep is not comparing a statement to a
+    message that never printed it.
+    """
+    # One drifted file per console model: a repair changes the file it runs
+    # against, and the second model needs a fresh instance of the same drift,
+    # not a re-run over the first model's outcome.
+    second_path = tmp_path / f"{name}-second.db"
+    service.init(path=second_path)
+    for path in (fresh_db, second_path):
+        drift(path)
+
+    conn = db.connect(fresh_db)
+    try:
+        with pytest.raises(db.SchemaConsistencyError) as refused:
+            db.init_db(conn)
+        message = str(refused.value)
+    finally:
+        conn.close()
+    for block in repair_blocks:
+        assert block in message, f"the refusal for {name} did not print its own remedy"
+
+    mangled = [
+        width
+        for width in range(58, 201)
+        if [
+            _repair_block_out_of(_rendered_at(width, refused.value), block)
+            for block in repair_blocks
+        ]
+        != repair_blocks
+    ]
+    assert mangled == [], f"the terminal changed {name} at {len(mangled)} widths: {mangled[:5]}"
+    # The full rendering, frames and all, says the same thing at a width that
+    # used to break — so the sweep above is measuring the real channel.
+    paste_blocks = [
+        _repair_block_out_of(_rendered_at(61, refused.value, with_frames=True), block)
+        for block in repair_blocks
+    ]
+    assert paste_blocks == repair_blocks
+    paste = "\n".join(paste_blocks)
+
+    # And that paste is a repair, run the way a console runs it — both models:
+    # a driver that stops at the first error and one that reads on, each
+    # against its own drifted file.
+    for path, stop_at_the_first_error in ((fresh_db, False), (second_path, True)):
+        errors = _run_as_a_console_does(
+            path, paste, stop_at_the_first_error=stop_at_the_first_error
+        )
+        assert errors == [], f"{name} failed under the console: {errors}"
+        if finish is not None:
+            finish(path)
+        conn = db.connect(path)
+        try:
+            assert db.init_db(conn) == [], f"{name} left the file refusing init"
+        finally:
+            conn.close()
 
 
 def test_a_constraint_name_a_renderer_already_broke_still_answers_to_the_name(fresh_db):
@@ -2431,6 +2640,11 @@ def test_a_database_recorded_at_0016_without_the_table_is_refused(tmp_path, monk
         conn.execute(
             "INSERT INTO schema_migrations (name) VALUES ('0016_conventions_and_annotations')"
         )
+        # The space and the grant are the other two 0016 guarantees, and this
+        # test is about the table: seed them whole so the refusal fires only
+        # the problem being pinned, exactly as the pair below do.
+        conn.execute(db.CONVENTIONS_SPACE_SQL)
+        conn.execute(db.CONVENTIONS_GRANT_SQL)
         conn.commit()
     finally:
         conn.close()
@@ -2443,6 +2657,12 @@ def test_a_database_recorded_at_0016_without_the_table_is_refused(tmp_path, monk
         message = str(refused.value)
         assert "delete the database file" not in message, "it told a human to bin their graph"
         assert db.ANNOTATIONS_TABLE_SQL in message
+        # Follow the refusal: the printed statement, run as printed, is the
+        # cure — the file goes back to passing init, and 0017 applies like
+        # any later migration over a whole schema.
+        conn.executescript(db.ANNOTATIONS_TABLE_SQL)
+        conn.commit()
+        assert db.init_db(conn) == ["0017_projector_skips"]
     finally:
         conn.close()
 
@@ -2486,6 +2706,19 @@ def test_a_database_recorded_at_0016_without_the_conventions_space_is_refused(
         # check* by its phrasing: it must not have fired — the table exists.
         assert "table 'annotations' is missing" not in message
         assert db.CONVENTIONS_SPACE_SQL in message
+        # Follow the refusal: the printed INSERT, run as printed, restores
+        # the space node and the file passes init again — with the gardener's
+        # grant intact, since it was the space that was missing, not the row.
+        conn.execute(db.CONVENTIONS_SPACE_SQL)
+        conn.commit()
+        assert db.init_db(conn) == ["0017_projector_skips"]
+        assert (
+            conn.execute(
+                "SELECT 1 FROM nodes WHERE id = ? AND type_id = 'space'",
+                (db.CONVENTIONS_SPACE_ID,),
+            ).fetchone()
+            is not None
+        )
     finally:
         conn.close()
 
@@ -2522,6 +2755,14 @@ def test_a_database_recorded_at_0016_without_the_gardener_grant_is_refused(tmp_p
         message = str(refused.value)
         assert "conventions" in message
         assert db.CONVENTIONS_GRANT_SQL in message
+        # Follow the refusal: the printed INSERT, run as printed, restores
+        # the gardener's edit row and the file passes init again — and the
+        # repaired grant is live, making the conventions workspace writeable
+        # by the cycle the way 0016 designed it.
+        conn.execute(db.CONVENTIONS_GRANT_SQL)
+        conn.commit()
+        assert db.init_db(conn) == ["0017_projector_skips"]
+        assert auth.internal_principal().level_on("conventions") == EDIT
     finally:
         conn.close()
 

@@ -28,7 +28,7 @@ import { describeSpaceFilterFailure } from "./spaceFailure";
 import type { SpaceFilterFailure } from "./spaceFailure";
 import { SIGNAL_HELP, SIGNAL_KEYS, describeSignals, readVectorEvidence } from "./signals";
 import type { SignalKey } from "./signals";
-import { queryTerms } from "./snippet";
+import { queryTerms } from "./snippetTerms";
 import "./search.css";
 
 /**

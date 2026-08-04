@@ -6,6 +6,7 @@ import hashlib
 import math
 
 import pytest
+from helpers import ReplayEmbedder
 
 from nodum import db, embeddings, llm, service
 
@@ -94,6 +95,21 @@ def _no_embedding_provider():
 def fake_embedder():
     """Install the deterministic hashing embedder as the provider for one test."""
     provider = HashEmbedder()
+    embeddings.set_provider(provider)
+    return provider
+
+
+@pytest.fixture()
+def replay_embedder():
+    """Install the frozen-table embedder as the provider for one test.
+
+    The hash embedder's cosine *is* token overlap, so the vector arm's real
+    differentiator — recalling a paraphrase sharing no word with the query —
+    needs a provider whose vectors are chosen, not derived from vocabulary.
+    :class:`helpers.ReplayEmbedder` is that: a frozen sentence → vector table
+    whose geometry the test controls directly.
+    """
+    provider = ReplayEmbedder()
     embeddings.set_provider(provider)
     return provider
 

@@ -933,6 +933,34 @@ def test_writes_are_attributed_to_the_sessions_human_and_nothing_else(fresh_db, 
 
     fired = _swept_requests(app, ids, "second", "second-pw")
 
+    # The sweep's own upload token is spent by the *refused* multipart attempt
+    # (a refusal still spends the token by design), and the spend is logged as
+    # an `asset.upload` event — so a redemption that never ingests is already
+    # inside the allowed-set check above. What is not: a *successful*
+    # redemption, whose describing nodes are written by the re-minted grant
+    # principal. Redeem a fresh token with bytes the type policy admits, and
+    # pin both ends — the audit event and the write itself.
+    redeemed = urls.mint_upload("redeemed.txt", "text/plain", 32, principal=second_principal).grant
+    assert redeemed is not None, "a mint without sha256 always grants a URL"
+    redemption = Client(app).put(redeemed.url, guard=False, content=b"redeemed by the sweep")
+    assert redemption.status_code == 200, redemption.text
+    redeemed_envelope = redemption.json()
+    # The request carried no session and claimed no identity, so the write is
+    # attributed to the grant's minting principal, the sweep's second human —
+    # never to the owner, never to the agent identity every other request in
+    # the sweep claimed.
+    assert redeemed_envelope["source"]["created_by"] == second_actor
+    assert redeemed_envelope["asset_ref"]["created_by"] == second_actor
+    redeem_uploads = [
+        event
+        for event in service.list_events(owner(), limit=5000)
+        if event.seq > before_seq and event.op == "asset.upload"
+    ]
+    assert [event.actor for event in redeem_uploads] == [second_actor, second_actor], (
+        "both upload-token redemptions of this sweep — the refused attempt and "
+        "the successful one — are attributed to the grant's minting principal"
+    )
+
     # Reachability, derived from the route table rather than guessed: every
     # write route must have at least one fire that got past the router and the
     # middleware into the handler. A 400 the handler's own validation produces
@@ -2691,12 +2719,22 @@ def test_an_upload_url_ingests_the_bytes_the_grant_was_minted_for(client, fresh_
     dead-ends, because no surface can turn a stored hash into a subgraph.
     """
     payload = b"scanned page bytes"
-    grant = _mint_upload(client, "scan.txt", len(payload))["grant"]
-    assert grant["url"].startswith(f"{BASE_URL}{urls.TOKEN_PATHS['upload']}/")
-    assert grant["max_bytes"] == len(payload)
+    # Minted by a **second** human, not the owner session: the redemption
+    # presents no identity of its own, so its attribution comes from the token
+    # row's `created_by`. Asserting the owner's own actor three times over
+    # could not tell a handler that hardcoded `owner_principal()` from one
+    # that re-mints the grant's authoriser (review MAJOR-4).
+    second = service.create_human("second", principal=owner())
+    second_actor = f"human:{second.id}"
+    grant = urls.mint_upload(
+        "scan.txt", "text/plain", len(payload), principal=auth.principal_from_actor(second_actor)
+    ).grant
+    assert grant is not None, "a mint without sha256 always grants a URL"
+    assert grant.url.startswith(f"{BASE_URL}{urls.TOKEN_PATHS['upload']}/")
+    assert grant.max_bytes == len(payload)
     anonymous = Client(client.app)
 
-    result = _ok(anonymous.put(grant["url"], guard=False, content=payload))
+    result = _ok(anonymous.put(grant.url, guard=False, content=payload))
 
     assert result["asset"]["hash"] == hashlib.sha256(payload).hexdigest()
     assert result["asset"]["size_bytes"] == len(payload)
@@ -2707,11 +2745,14 @@ def test_an_upload_url_ingests_the_bytes_the_grant_was_minted_for(client, fresh_
     assert result["source"]["content"] == "scanned page bytes"
     assert result["created"] is True
     # Everything is attributed to the principal who minted the grant — stored
-    # state, since the request itself carries no identity.
-    assert result["asset_ref"]["created_by"] == OWNER_ACTOR
-    assert [event.actor for event in _events("asset.upload")] == [OWNER_ACTOR]
+    # state, since the request itself carries no identity. The second human is
+    # named and the owner is ruled out, so a handler that minted under the
+    # owner would fail here rather than pass in triplicate.
+    assert result["asset_ref"]["created_by"] == second_actor
+    assert result["asset_ref"]["created_by"] != OWNER_ACTOR
+    assert [event.actor for event in _events("asset.upload")] == [second_actor]
     # Single use, exactly like the download side.
-    assert anonymous.put(grant["url"], guard=False, content=payload).status_code == 400
+    assert anonymous.put(grant.url, guard=False, content=payload).status_code == 400
 
 
 def test_an_upload_grant_dies_with_the_account_that_minted_it(client, fresh_db):

@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from helpers import nodum_imports
 
 import nodum
 from nodum import llm
@@ -75,69 +76,12 @@ def _package_modules() -> dict[str, Path]:
 def _nodum_imports(source: str) -> set[str]:
     """Every ``nodum.*`` module this source can reach *directly*, however spelled.
 
-    The spellings, all of which reach the same module and all of which a
-    refactor might reach for:
-
-    ``import nodum.llm`` / ``import nodum.llm as anything``
-        A plain import, aliased or not — the alias is irrelevant, the module is
-        what matters.
-    ``from nodum import llm``
-        Names the submodule as an attribute of the package.
-    ``from nodum.llm import chat``
-        Names it as the module being imported from.
-    ``from . import llm`` / ``from .llm import chat``
-        The relative spellings. This package is flat, so one level is all there
-        is, and a relative import is exactly as reaching as an absolute one.
-    ``importlib.import_module("nodum.llm")`` / ``__import__("nodum.llm")``
-        The dynamic spellings, which no AST walk over *imports* would see —
-        which is precisely why a rail that only read ``ast.Import`` would be a
-        rail with a documented way around it. **Positionally or by keyword**:
-        both take ``name``, and a walk over ``node.args`` alone was blind to
-        ``import_module(name="nodum.llm")`` — a constant string this claims to
-        catch, spelled the way an IDE's signature help suggests it.
-    ``nodum.llm.something`` after a bare ``import nodum``
-        An attribute chain. It only resolves if something else has already
-        imported the submodule, so it is not on its own a working import — but
-        it is a *reach*, and the rail is about reaching.
+    Shared with the identity rail: the helper lives in ``tests/helpers.py``
+    (:func:`helpers.nodum_imports`), so the two rails read imports with the
+    same extractor and cannot disagree about what reaches a module. This alias
+    keeps the historical name the surrounding prose refers to.
     """
-    tree = ast.parse(source)
-    reached: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                if alias.name == "nodum" or alias.name.startswith("nodum."):
-                    reached.add(alias.name)
-        elif isinstance(node, ast.ImportFrom):
-            if node.level:
-                # Flat package: any level resolves to `nodum`.
-                base = "nodum" if node.module is None else f"nodum.{node.module}"
-            elif node.module == "nodum" or (node.module or "").startswith("nodum."):
-                base = node.module or ""
-            else:
-                continue
-            reached.add(base)
-            if base == "nodum":
-                reached |= {f"nodum.{alias.name}" for alias in node.names}
-        elif isinstance(node, ast.Call):
-            name = node.func.attr if isinstance(node.func, ast.Attribute) else None
-            if isinstance(node.func, ast.Name):
-                name = node.func.id
-            if name in {"import_module", "__import__"}:
-                arguments = [*node.args, *(keyword.value for keyword in node.keywords)]
-                for argument in arguments:
-                    if (
-                        isinstance(argument, ast.Constant)
-                        and isinstance(argument.value, str)
-                        and (argument.value == "nodum" or argument.value.startswith("nodum."))
-                    ):
-                        reached.add(argument.value)
-        elif (
-            isinstance(node, ast.Attribute)
-            and isinstance(node.value, ast.Name)
-            and node.value.id == "nodum"
-        ):
-            reached.add(f"nodum.{node.attr}")
-    return reached
+    return nodum_imports(source)
 
 
 def _import_graph() -> dict[str, set[str]]:

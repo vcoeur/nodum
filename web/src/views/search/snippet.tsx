@@ -28,32 +28,9 @@ import type { ReactNode } from "react";
 /** Matched pairs of `**…**`, non-greedy so adjacent marks do not merge. */
 const MARKER_PATTERN = /\*\*([\s\S]+?)\*\*/g;
 
-/** Beyond this, term highlighting stops being a reading aid and starts being noise. */
-const MAX_TERMS = 8;
-
 /** Escape a query term for literal use inside a RegExp. */
 function escapeForRegExp(term: string): string {
   return term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-/**
- * Split the query into the terms worth highlighting.
- *
- * Mirrors `search._match_query`'s tokenisation (whitespace-separated, all
- * required), minus the FTS quoting, which is a server concern.
- *
- * @param query The raw query text.
- * @returns Distinct non-empty terms, capped.
- */
-export function queryTerms(query: string): string[] {
-  const seen = new Set<string>();
-  for (const token of query.split(/\s+/)) {
-    const term = token.trim();
-    if (term.length === 0) continue;
-    seen.add(term.toLowerCase());
-    if (seen.size >= MAX_TERMS) break;
-  }
-  return [...seen];
 }
 
 /** Build the alternation that matches any query term, or null when there is none. */

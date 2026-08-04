@@ -12,6 +12,14 @@ import { defineConfig } from "vitest/config";
  * `@testing-library`. Everything under test here is a plain function over plain
  * data; a component harness is a much heavier dependency set and would be a
  * separate decision.
+ *
+ * Both test suffixes are collected, `.test.ts` and `.test.tsx` — the latter
+ * only so a pure helper that happens to live in a `.tsx` file (a component
+ * file that also exports a plain function) can be tested where it sits. It is
+ * not an opening for component tests: the no-DOM scope above binds a `.tsx`
+ * test exactly as it binds a `.ts` one, and the convention stays "extract
+ * pure logic to a `.ts` module" when the helper is worth more than one test
+ * (`src/views/search/snippetTerms.ts` is the most recent such extraction).
  */
 
 /**
@@ -34,7 +42,7 @@ const TEST_TZ = "Asia/Kathmandu";
 export default defineConfig({
   test: {
     environment: "node",
-    include: ["src/**/*.test.ts"],
+    include: ["src/**/*.test.ts", "src/**/*.test.tsx"],
     env: { TZ: TEST_TZ },
   },
 });
