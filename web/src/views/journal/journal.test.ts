@@ -239,6 +239,7 @@ function rollback(overrides: Partial<RollbackOut> = {}): RollbackOut {
     skipped_events: [],
     restored_nodes: [],
     restored_edges: [],
+    restored_versions: [],
     deleted_nodes: [],
     deleted_edges: [],
     redirects_removed: [],
@@ -1190,7 +1191,7 @@ describe("abandonAvailability", () => {
   it("refuses a cycle that has already said how it ended, in those words", () => {
     // `service.abandon_cycle`'s one refusal, stated in front of the button
     // rather than met after clicking it.
-    for (const status of ["completed", "failed", "rolled_back"]) {
+    for (const status of ["completed", "failed", "rolled_back"] as const) {
       const verdict = abandonAvailability(cycle({ status }));
       expect(verdict.available).toBe(false);
       expect(verdict.reason).toContain(`closed ${status}`);
@@ -1243,7 +1244,7 @@ describe("stopAvailability", () => {
   });
 
   it("refuses a cycle that has already said how it ended, and says a stop needs a live run", () => {
-    for (const status of ["completed", "failed", "rolled_back"]) {
+    for (const status of ["completed", "failed", "rolled_back"] as const) {
       const verdict = stopAvailability(cycle({ status }));
       expect(verdict.available).toBe(false);
       expect(verdict.reason).toContain(`closed ${status}`);

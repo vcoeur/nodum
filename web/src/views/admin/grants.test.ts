@@ -11,11 +11,11 @@
  */
 
 import { describe, expect, it } from "vitest";
-import type { GrantOut, NodeOut } from "../../api/types";
+import type { GrantLevel, GrantOut, NodeOut } from "../../api/types";
 import { GRANT_LEVELS, grantableSpaces, grantsForAgent } from "./grants";
 
 /** A grant row with only the fields these functions read. */
-function grant(agentId: string, spaceId: string, level = "read"): GrantOut {
+function grant(agentId: string, spaceId: string, level: GrantLevel = "read"): GrantOut {
   return { agent_id: agentId, space_id: spaceId, level, created_at: "2026-07-26 10:00:00" };
 }
 

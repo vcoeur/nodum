@@ -10,7 +10,8 @@
  * - Field names are copied verbatim; do not camelCase them.
  *
  * Keep this file in lockstep with `nodum/models.py`. Mirrored against the
- * principals tree (migrations 0001–0011).
+ * principals tree (migrations 0001–0016). `tests/test_types_contract.py` is
+ * the lock: it fails when this file drifts from the pydantic models.
  */
 
 /** Arbitrary JSON object, as `dict[str, Any]` dumps. */
@@ -38,7 +39,7 @@ export interface NodeOut {
   title: string | null;
   content: string;
   props: JsonObject;
-  state: string;
+  state: NodeState;
   created_by: string;
   created_at: string;
   updated_at: string;
@@ -53,7 +54,7 @@ export interface EdgeOut {
   props: JsonObject;
   confidence: number | null;
   created_by: string;
-  state: string;
+  state: NodeState;
   valid_from: string | null;
   valid_to: string | null;
   created_at: string;
@@ -74,7 +75,7 @@ export interface VersionOut {
   props: JsonObject;
   actor: string;
   event_seq: number;
-  state: string;
+  state: VersionState;
   proposed_fields: string[] | null;
   created_at: string;
 }
@@ -124,6 +125,8 @@ export interface UndoResult {
   undone_op: string;
   restored: JsonObject | null;
   deleted: JsonObject[];
+  /** The versions row a reversal also moved (an undone accept/reject), when it moved one. */
+  restored_version: JsonObject | null;
   undo_event_seq: number;
 }
 
@@ -194,7 +197,7 @@ export interface SearchResult {
  * `window_days`, `counts`) — or `null` when the item has none.
  */
 export interface ProposalOut {
-  kind: string;
+  kind: ProposalKind;
   id: string;
   type: string;
   created_by: string;
@@ -212,6 +215,9 @@ export interface TransitionFailure {
   error: string;
 }
 
+/** The state-machine actions a batch transition may perform (server's `TransitionAction`). */
+export type TransitionAction = "accept" | "reject" | "archive" | "retype";
+
 /**
  * The outcome of a batch accept/reject.
  *
@@ -220,7 +226,7 @@ export interface TransitionFailure {
  * aborts on a single bad id.
  */
 export interface BatchTransitionOut {
-  action: string;
+  action: TransitionAction;
   actor: string;
   reason: string | null;
   transitioned: string[];
@@ -381,6 +387,9 @@ export interface IngestOut {
   event_seq: number;
 }
 
+/** Capability-URL kinds (the server's `UrlGrantKind` in `nodum.vocab`). */
+export type UrlGrantKind = "download" | "upload";
+
 /**
  * A short-lived, single-use capability URL (design §5.7 rule 4).
  *
@@ -395,7 +404,7 @@ export interface IngestOut {
  */
 export interface UrlGrantOut {
   /** `"download"` or `"upload"`. */
-  kind: string;
+  kind: UrlGrantKind;
   token: string;
   url: string;
   asset_hash: string | null;
@@ -430,10 +439,13 @@ export interface HumanOut {
   created_at: string;
 }
 
+/** Agent account kinds (the server's `AgentKind` in `nodum.vocab`). */
+export type AgentKind = "external" | "internal";
+
 /** An agent account. `has_token` is all anyone ever learns of the token. */
 export interface AgentOut {
   id: string;
-  kind: string;
+  kind: AgentKind;
   name: string;
   owner_human_id: string | null;
   has_token: boolean;
@@ -451,7 +463,7 @@ export interface AgentCreatedOut {
 export interface GrantOut {
   agent_id: string;
   space_id: string;
-  level: string;
+  level: GrantLevel;
   created_at: string;
 }
 
@@ -512,17 +524,18 @@ export type CycleStatus = "running" | "completed" | "failed" | "rolled_back";
  * dead process's entry from outside, and a `failed` cycle reads differently
  * depending on which.
  *
- * `trigger` and `status` are typed as plain strings for the same reason every
- * other enum-shaped field here is: the server may add a value, and a union that
- * silently excludes it would make a real row unrepresentable.
+ * `trigger` and `status` are the `CycleTrigger` and `CycleStatus` vocab
+ * aliases, pinned to `nodum.vocab` by the M31 contract test — when the server
+ * gains a value the Python Literal changes first and the test forces this
+ * union along, so a real row can never hit a union that silently excludes it.
  */
 export interface CycleOut {
   id: string;
-  trigger: string;
+  trigger: CycleTrigger;
   triggered_by: string;
   scope: string | null;
   dry_run: boolean;
-  status: string;
+  status: CycleStatus;
   report: JsonObject | null;
   started_at: string;
   finished_at: string | null;
@@ -582,6 +595,9 @@ export interface RunCycleBody {
   dry_run?: boolean;
 }
 
+/** The row kinds a rollback conflict or blocker can name (server's `RollbackKind`). */
+export type RollbackKind = "node" | "edge";
+
 /**
  * One row standing between a cycle and its rollback (decision C4).
  *
@@ -591,7 +607,7 @@ export interface RunCycleBody {
  * was itself a cycle's — still outside this cycle, and still a conflict.
  */
 export interface RollbackConflictOut {
-  kind: string;
+  kind: RollbackKind;
   row_id: string;
   cycle_event_seq: number;
   cycle_event_op: string;
@@ -619,7 +635,7 @@ export interface RollbackConflictOut {
  * what the run refuses with if the rollback is attempted anyway.
  */
 export interface RollbackBlockerOut {
-  kind: string;
+  kind: RollbackKind;
   row_id: string;
   cycle_event_seq: number;
   cycle_event_op: string;
@@ -652,6 +668,8 @@ export interface RollbackOut {
   skipped_events: number[];
   restored_nodes: string[];
   restored_edges: string[];
+  /** The versions rows the reversal put back — review decisions inside the cycle. */
+  restored_versions: number[];
   deleted_nodes: string[];
   deleted_edges: string[];
   redirects_removed: string[];

@@ -47,7 +47,15 @@
  */
 
 import { describe, expect, it } from "vitest";
-import type { GrantOut, NodeOut, ProposalOut, SpaceOut, VersionOut } from "../../api/types";
+import type {
+  GrantLevel,
+  GrantOut,
+  NodeOut,
+  ProposalKind,
+  ProposalOut,
+  SpaceOut,
+  VersionOut,
+} from "../../api/types";
 import {
   BATCH_GAP_MS,
   describeCounts,
@@ -82,7 +90,7 @@ let sequence = 0;
 function proposal(
   created_by: string,
   msAfterT0: number,
-  kind: string = "node",
+  kind: ProposalKind = "node",
   created_at = at(msAfterT0),
 ): ProposalOut {
   sequence += 1;
@@ -186,7 +194,7 @@ function updateProposal(
 }
 
 /** One `(agent, space, level)` grant row. */
-function grant(agentId: string, spaceId: string, level: string): GrantOut {
+function grant(agentId: string, spaceId: string, level: GrantLevel): GrantOut {
   return { agent_id: agentId, space_id: spaceId, level, created_at: at(0) };
 }
 
@@ -203,8 +211,11 @@ describe("proposalKind", () => {
   });
 
   it("returns null for a kind this build does not know", () => {
-    // A future proposal kind must not be counted as one of these three.
-    expect(proposalKind(proposal("agent:a", 0, "merge"))).toBeNull();
+    // A future proposal kind must not be counted as one of these three. The
+    // union type now forbids it at compile time; the cast keeps the runtime
+    // robustness assertion alive for the window between the server gaining a
+    // value and this union being updated.
+    expect(proposalKind(proposal("agent:a", 0, "merge" as unknown as ProposalKind))).toBeNull();
   });
 });
 
@@ -320,7 +331,7 @@ describe("groupProposals", () => {
   });
 
   it("counts an unknown kind into nothing rather than into a wrong bucket", () => {
-    const groups = groupProposals([proposal("agent:a", 0, "merge")]);
+    const groups = groupProposals([proposal("agent:a", 0, "merge" as unknown as ProposalKind)]);
     expect(groups[0]!.counts).toEqual({ node: 0, edge: 0, update: 0 });
     expect(groups[0]!.total).toBe(1);
   });

@@ -12,7 +12,7 @@
 
 import { describe, expect, it } from "vitest";
 import { ApiError, UnknownSpaceError } from "../../api/client";
-import type { GrantOut, SpaceOut } from "../../api/types";
+import type { GrantLevel, GrantOut, SpaceOut } from "../../api/types";
 import { describeFailure } from "../../lib";
 import {
   archiveConsequences,
@@ -25,7 +25,7 @@ import {
 } from "./spaces";
 
 /** A grant row with only the fields the screen reads. */
-function grant(agentId: string, spaceId: string, level: string): GrantOut {
+function grant(agentId: string, spaceId: string, level: GrantLevel): GrantOut {
   return { agent_id: agentId, space_id: spaceId, level, created_at: "2026-07-26 10:00:00" };
 }
 

@@ -29,10 +29,10 @@ import {
   describeLanding,
   describeWriteFailure,
 } from "./createOutcome";
-import type { NodeOut } from "../../api/types";
+import type { NodeOut, NodeState } from "../../api/types";
 
 /** A space as `GET /api/spaces` renders it — a node of type `space` in meta. */
-function space(id: string, title: string, state = "active"): NodeOut {
+function space(id: string, title: string, state: NodeState = "active"): NodeOut {
   return {
     id,
     space_id: "meta",

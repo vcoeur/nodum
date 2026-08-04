@@ -16,7 +16,7 @@
  */
 
 import { describe, expect, it } from "vitest";
-import type { EdgeOut, NodeOut, SubgraphOut } from "../../api/types";
+import type { EdgeOut, NodeOut, NodeState, SubgraphOut } from "../../api/types";
 import { incidentEdges, nodeLabel, toElements } from "./graphElements";
 import type { GraphEdgeData, GraphNodeData } from "./graphElements";
 
@@ -39,7 +39,7 @@ function node(id: string, spaceId: string | null): NodeOut {
 }
 
 /** An edge carrying only what the element builder reads. */
-function edge(id: string, src: string, dst: string, state = "active"): EdgeOut {
+function edge(id: string, src: string, dst: string, state: NodeState = "active"): EdgeOut {
   return {
     id,
     src_id: src,

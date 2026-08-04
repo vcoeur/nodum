@@ -23,10 +23,10 @@
 import { describe, expect, it } from "vitest";
 import { ApiError, UnknownSpaceError } from "../../api/client";
 import { describeSpaceFilterFailure } from "./spaceFailure";
-import type { NodeOut } from "../../api/types";
+import type { NodeOut, NodeState } from "../../api/types";
 
 /** A space as `GET /api/spaces` renders it. */
-function space(id: string, title: string, state = "active"): NodeOut {
+function space(id: string, title: string, state: NodeState = "active"): NodeOut {
   return {
     id,
     space_id: "meta",
