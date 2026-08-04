@@ -42,16 +42,17 @@ write over
 MCP, never the CLI, and land per their grants (`suggest` → `proposed`, `edit` →
 `active`).
 
-**Human-only operations** — `accept`, `reject`, `archive`, `undo`, `rollback`,
-`cycle-abandon`, `cycle-list`, `cycle-get`, every
-`review` subcommand, and all account/grant administration (`human`, `agent`,
-`grant`, `revoke`, `space-*` commands) require a human principal. Review
-(`accept`/`reject`/`archive`) and the curative tier (`merge-nodes`, `retype`,
-`supersede-edge`, `bulk-relink`, `consolidate`) can also be exercised by an
-agent holding `edit` on the spaces involved — over the service API, not the
-CLI. `undo` and `rollback` stay human-only: both write a recorded payload back
-verbatim, `state = 'active'` included, and `rollback` does it for a whole cycle
-at once.
+**Human-only operations** — `archive`, `undo`, `rollback`, `cycle-abandon`,
+`cycle-list`, `cycle-get`, and all account/grant administration (`human`,
+`agent`, `grant`, `revoke`, `space-*` commands) require a human principal at
+the service layer, whatever the surface. `accept`/`reject` and the curative
+tier (`merge-nodes`, `retype`, `supersede-edge`, `bulk-relink`, `consolidate`)
+can also be exercised by an agent holding `edit` on the spaces involved — over
+the service API, not the CLI, which is human-only. The line is live state:
+`archive` retires it, and `undo`/`rollback` write a recorded payload back
+verbatim, `state = 'active'` included — `rollback` for a whole cycle at once —
+so none of the three is in-space authority. Accepting within a granted space
+is a different act from either.
 
 **Rejections need a reason** — both `reject <id> --reason` and `review reject
 … --reason` require it and record it in the reject event's payload.

@@ -171,7 +171,7 @@ commands on a saved node for exactly this reason.
   materialization, the review queue (proposal listing, batch accept/reject),
   and grant enforcement through the scope-bound store (`suggest` lands
   `proposed`, `edit` lands `active` and carries in-space
-  accept/reject/archive; `undo` stays human-only), and the curated graph reads
+  accept/reject; `archive` and `undo` stay human-only), and the curated graph reads
   (`get_neighborhood`, `traverse`, `find_path`, `get_schema`,
   `diff_versions`, `propose_edges`). Two reads exist for interactive clients
   rather than agents: **`subgraph`** — `traverse` plus edge state/confidence/
@@ -644,7 +644,8 @@ commands on a saved node for exactly this reason.
   on bites at the next call rather than at the next restart, and every read
   and write is confined to the then-current grants. **Three tiers are never registered,
   and each one is a named absence**: the review tools
-  (`accept`, `reject` — `REVIEW_TOOLS`, the §8.1 "write (human)" tier), the
+  (`accept`, `reject` — `REVIEW_TOOLS`, gated by `Store.require_review` — a
+  human, or `edit` on the item's space — but not an agent-surface tool), the
   curative tools (`merge_nodes`, `retype`, `supersede_edge`, `bulk_relink`,
   `consolidate` — `CURATIVE_TOOLS`, §8.2), and **reversal plus the journal that
   records it** (`undo`, `rollback`, `abandon_cycle`, `get_cycle`, `list_cycles`
@@ -2744,14 +2745,19 @@ Phase-1 decision log.
   materialises a `proposed` `mentions` edge; accepting the node brings it to
   `active` — but only for the edges the acceptor could review directly, so a
   mention into a space they hold nothing on stays queued. Re-materialisation
-  is gated the same way: retiring a `mentions` edge needs `edit` on **both**
-  endpoint spaces, and a target the writer cannot read is never treated as a
+  is gated in two layers: retiring a `mentions` edge needs `edit` on **both**
+  endpoint spaces, and retiring a **live** one (the archive half) is the human
+  tier — an `edit` grant is in-space authority, not the right to retire live
+  state, so an agent's content change leaves a stale active mention for a
+  human. A target the writer cannot read is never treated as a
   link that disappeared.
 - **Review authority is a human, or `edit` on the item's space** (Q13):
-  `accept`, `reject`, `archive`, every `review` subcommand, and — since Phase
+  `accept`, `reject`, every `review` subcommand, and — since Phase
   5a — the curative tier (`merge-nodes`, `retype`, `supersede-edge`,
   `bulk-relink`) and `consolidate`, which ask the identical question through the
   identical check (`Store.require_review`) and add no new permission concept.
+  `archive` is not in that set: it retires live state, which an `edit` grant is
+  in-space authority over, not a right to, so it is the human tier with `undo`.
   `undo` stays human-only — restoring an event's payload can write
   `state = 'active'` back, and no grant delegates that — and `rollback` is
   human-only for a stronger version of the same reason: it does that for a whole

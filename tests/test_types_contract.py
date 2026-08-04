@@ -330,9 +330,7 @@ def _ts_union_parts(type_str: str) -> set[str]:
     return {part.strip() for part in _split_top_level(type_str, "|") if part.strip()}
 
 
-def _ts_string_members(
-    type_str: str, unions: dict[str, set[str]]
-) -> set[str] | None:
+def _ts_string_members(type_str: str, unions: dict[str, set[str]]) -> set[str] | None:
     """The string members a TS type names, or None if it is not a string union."""
     members: set[str] = set()
     for part in _ts_union_parts(type_str) - {"null", "undefined"}:

@@ -36,10 +36,12 @@ Every write result carries the ``space_id`` it actually landed in, which is the
 other half of that: it can be checked rather than assumed.
 
 **Three tiers are never registered, and each one is a named absence.** The
-review tools (``accept``, ``reject`` — :data:`REVIEW_TOOLS`) belong to the §8.1
-"write (human)" tier: accepting is a *destructive* effect (it makes proposed
-structure live and archives what that structure replaces), so it stays with the
-human, on the CLI and the review API. The curative tools (``merge_nodes``,
+review tools (``accept``, ``reject`` — :data:`REVIEW_TOOLS`) are the §8.1
+review tier: the service gates them with ``Store.require_review`` — a human,
+or ``edit`` on the item's space — and retiring the live structure an accept
+replaces is the human tier, but either way they do not belong on an agent's
+surface, so the CLI and the review API are where they live. The curative tools
+(``merge_nodes``,
 ``retype``, ``supersede_edge``, ``bulk_relink``, ``consolidate`` —
 :data:`CURATIVE_TOOLS`) are §8.2. And reversal plus the journal that records it
 (``undo``, ``rollback``, ``abandon_cycle``, ``get_cycle``, ``list_cycles`` —
@@ -117,10 +119,12 @@ _OVERWRITING = ToolAnnotations(readOnlyHint=False, destructiveHint=True)
 #: Curative tools (design §8.2) — asserted absent from the registry in tests.
 CURATIVE_TOOLS = ("merge_nodes", "retype", "supersede_edge", "bulk_relink", "consolidate")
 
-#: Review tools (design §8.1 "write (human)" tier). Like the curative
-#: tools these are **never registered** — asserted absent in tests. Accepting
-#: archives the active structure a proposal replaces, so it is destructive and
-#: human-only; the CLI (``nodum review …``) is where it lives.
+#: Review tools (design §8.1) — gated by ``Store.require_review`` (a human,
+#: or ``edit`` on the item's space) and **never registered** here: asserted
+#: absent in tests. Accepting makes proposed structure live, and retiring the
+#: live structure an accept replaces is the human tier — both enforced by the
+#: service, not by this registry. The CLI (``nodum review …``) and the review
+#: API are where they live.
 REVIEW_TOOLS = ("accept", "reject")
 
 #: The third named absence: reversal, and the journal that records it. Never
@@ -771,10 +775,12 @@ def create_server(*, token: str, db_path: str | Path | None = None) -> FastMCP:
             )
         )
 
-    # ── Review tier (§8.1 "write (human)") is deliberately absent ──
-    # `accept`/`reject` are not registered here: accepting makes proposed
-    # structure live and archives what it replaces, which is destructive and
-    # the human's call. The human works the queue through `nodum review …`.
+    # ── Review tier (§8.1) is deliberately absent ──
+    # `accept`/`reject` are not registered here: they are the review tier,
+    # gated by `Store.require_review` (a human, or `edit` on the item's
+    # space) — and this is an agent surface, so they live on `nodum review …`
+    # and the review API instead. Retiring the live structure an accept
+    # replaces is the human tier, enforced by the service either way.
 
     return server
 

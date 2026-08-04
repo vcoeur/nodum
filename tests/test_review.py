@@ -371,13 +371,71 @@ def test_edit_agent_reviews_within_its_granted_space(fresh_db):
     assert result.actor == "agent:editor"
 
 
-def test_suggest_agent_cannot_archive_live_state(fresh_db):
-    """Archiving retires live structure, so it needs edit too."""
-    a, _, _, _ = _seed_proposals()
-    with pytest.raises(service.GrantNotPermitted):
-        service.transition(a.id, "archive", principal=agent("researcher"))
+def test_only_a_human_can_archive_live_state(fresh_db):
+    """Archiving retires live structure, so it is the human tier.
+
+    An ``edit`` grant is in-space authority, not the right to retire live
+    state: not even an editor on the node's own space may archive it, while
+    accepting in that same space stays open to it.
+    """
+    a, _, note, edge = _seed_proposals()
+    editor = agent("editor", grants={"meta": "read", "main": "edit"})
+    for who in (editor, agent("researcher")):
+        with pytest.raises(service.GrantNotPermitted, match="only a human"):
+            service.transition(a.id, "archive", principal=who)
     assert service.get_node(a.id, principal=owner()).state == "active"
+    # The half that stays: accepting within a granted space is not the human
+    # tier, so the same editor accepts the queued proposals.
+    accepted = service.accept_proposals([note.id, edge.id], principal=editor)
+    assert set(accepted.transitioned) == {note.id, edge.id}
+    # And a human archives.
     assert service.transition(a.id, "archive", principal=owner()).state == "archived"
+
+
+def test_an_edit_grant_accepts_but_never_reaches_archive_or_undo(fresh_db):
+    """The D1 line, end to end: retiring or resurrecting live state is human.
+
+    An agent holding ``edit`` on a space can accept its proposals — that is
+    Q13's grant design, unchanged — but cannot reach ``archive`` or ``undo``
+    by any service spelling, and a content edit cannot retire a live mention
+    either. Each refusal leaves the state it would have moved untouched.
+    """
+    _, _, note, edge = _seed_proposals()
+    editor = agent("editor", grants={"meta": "read", "main": "edit"})
+    accepted = service.accept_proposals([note.id, edge.id], principal=editor)
+    assert set(accepted.transitioned) == {note.id, edge.id}
+
+    # No archive route: the direct transition, the space archive, and — the
+    # back path — a content edit that drops a wikilink to a live mention.
+    with pytest.raises(service.GrantNotPermitted, match="only a human"):
+        service.transition(note.id, "archive", principal=editor)
+    with pytest.raises(service.GrantNotPermitted, match="only a human"):
+        service.archive_space("main", principal=editor)
+    mention_target = service.create_node(type="concept", title="Mentioned", principal=owner())
+    source = service.create_node(
+        type="note", title="Source", content="sees [[Mentioned]]", principal=owner()
+    )
+    service.update_node(source.id, content="dropped the link", principal=editor)
+    assert [
+        e.dst_id
+        for e in service.list_edges(
+            node_id=source.id, type="mentions", state="active", principal=owner()
+        )
+    ] == [mention_target.id]  # still live — an agent's edit left it for a human
+
+    # No undo route either.
+    undo_seq = service.list_events(limit=1, principal=owner())[0].seq
+    with pytest.raises(service.GrantNotPermitted, match="only a human"):
+        service.undo(undo_seq, principal=editor)
+
+    # The HTTP surface offers no agent identity at all (session human only),
+    # so the service refusals above are the whole agent reach; a human then
+    # retires what the agent could not.
+    service.update_node(source.id, content="dropped the link", principal=owner())
+    assert (
+        service.list_edges(node_id=source.id, type="mentions", state="active", principal=owner())
+        == []
+    )
 
 
 def test_agent_cannot_undo(fresh_db):

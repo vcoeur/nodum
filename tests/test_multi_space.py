@@ -96,7 +96,13 @@ def test_dropping_the_link_does_not_retire_a_cross_space_mention_either(fresh_db
     assert _edge_states(note.id) == {target.id: "active"}
 
 
-def test_a_writer_granted_both_spaces_still_retires_the_mention(fresh_db):
+def test_an_edit_grant_cannot_retire_a_live_cross_space_mention(fresh_db):
+    """Q13 review B2 narrows to the reject half: the archive is the human tier.
+
+    ``edit`` on both endpoint spaces is what lets a writer reject a *proposed*
+    mention; archiving a **live** one retires live state, so the agent's
+    content change leaves it in place, and only a human's edit retires it.
+    """
     target = _far_space()
     note = service.create_node(
         type="note", title="S", content="See [[B thing]].", principal=owner()
@@ -104,11 +110,14 @@ def test_a_writer_granted_both_spaces_still_retires_the_mention(fresh_db):
     editor = agent("editor", grants={"meta": "read", "main": "edit", "b": "edit"})
 
     service.update_node(note.id, content="Nothing here.", principal=editor)
+    assert _edge_states(note.id) == {target.id: "active"}  # left for a human
 
+    service.update_node(note.id, content="Nothing here.", principal=owner())
     assert _edge_states(note.id) == {target.id: "archived"}
 
 
 def test_in_space_mentions_still_come_and_go_under_a_single_grant(fresh_db):
+    """A live mention lands with the grant and leaves only with a human."""
     _far_space()
     target = service.create_node(type="concept", title="A thing", principal=owner())
     editor = agent("editor", grants={"meta": "read", "main": "edit"})
@@ -116,7 +125,9 @@ def test_in_space_mentions_still_come_and_go_under_a_single_grant(fresh_db):
     assert _edge_states(note.id) == {target.id: "active"}
 
     service.update_node(note.id, content="Nothing here.", principal=editor)
+    assert _edge_states(note.id) == {target.id: "active"}  # the agent cannot archive it
 
+    service.update_node(note.id, content="Nothing here.", principal=owner())
     assert _edge_states(note.id) == {target.id: "archived"}
 
 
@@ -167,7 +178,9 @@ def test_accept_matching_ignores_proposals_outside_the_read_scope(fresh_db):
     far_proposal = service.create_node(type="note", title="far", space="b", principal=far)
     near = agent("near", grants={"meta": "read", "main": "edit"})
     near_proposal = service.create_node(type="note", title="near", principal=near)
-    service.transition(near_proposal.id, "archive", principal=near)
+    # Archiving is the human tier (an `edit` grant cannot retire live state),
+    # so the setup archive is the owner's.
+    service.transition(near_proposal.id, "archive", principal=owner())
 
     result = service.accept_matching(principal=near)
 

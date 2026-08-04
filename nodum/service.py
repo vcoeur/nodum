@@ -924,12 +924,17 @@ def _materialize_mentions(
     none. A pending edge goes live when a reviewer accepts the proposing
     node (:func:`_activate_pending_mentions`) or the edge itself.
 
-    **Archival is authority-gated the same way** (Q13 review B2): an existing
-    edge is only retired when the writer holds ``edit`` on *both* endpoint
-    spaces. Without it the edge is left untouched — a writer who cannot see
+    **Retirement is gated in two layers.** Q13 review B2: an existing edge is
+    only retired when the writer holds ``edit`` on *both* endpoint spaces.
+    Without it the edge is left untouched — a writer who cannot see
     the far endpoint cannot tell the link "disappeared" (its target does not
     resolve for them), and must not be able to strip another principal's
-    cross-space mentions out of a node it may otherwise edit.
+    cross-space mentions out of a node it may otherwise edit. On top of that,
+    retiring a **live** edge (the ``archive`` half) is the human tier: it
+    retires live state, which an ``edit`` grant is in-space authority over,
+    not a right to — so a non-human's content change leaves a stale active
+    mention in place for a human (:meth:`Store.require_human` at the call
+    site, with the edit-on-both bar underneath).
 
     Idempotent: re-running on unchanged content changes nothing, whichever
     state the existing edges are in — pending edges count as already
@@ -978,24 +983,39 @@ def _materialize_mentions(
     for dst_id, edge in current_by_dst.items():
         if dst_id in resolved:
             continue
-        if not _may_retire_mention(conn, node["space_id"], dst_id, store):
-            continue
         # A pending edge leaves `proposed`, so its op is `reject`, not
         # `archive` — the state machine allows only one of the two.
         action = "archive" if edge["state"] == "active" else "reject"
+        if action == "archive":
+            # Archiving an edge is retiring live state, the human tier: an
+            # `edit` grant is in-space authority, not the right to retire it,
+            # so a non-human's content change leaves the stale active mention
+            # in place for a human rather than pruning it.
+            try:
+                store.require_human("archive a mention")
+            except GrantNotPermitted:
+                continue
+        if not _may_retire_mention(conn, node["space_id"], dst_id, store):
+            continue
         _set_edge_state(conn, dict(edge), "archived", action, actor, cycle_id=cycle_id)
 
 
 def _may_retire_mention(
     conn: sqlite3.Connection, src_space: str | None, dst_id: str, store: Store
 ) -> bool:
-    """May this writer archive/reject a ``mentions`` edge into ``dst_id``?
+    """May this writer reject a ``mentions`` edge into ``dst_id``?
 
     Retiring an edge is a state-machine action on both endpoint spaces, so it
     needs ``edit`` on both — the same bar :meth:`Store.require_review` sets
-    for reviewing the edge directly. Unreadable far endpoints fail it too
+    for rejecting the edge directly. Unreadable far endpoints fail it too
     (no grant, no level), which is what keeps an under-granted writer from
     silently pruning links it cannot see.
+
+    This is the gate for the ``reject`` half only. The ``archive`` half —
+    retiring a **live** edge — is the human tier (it retires live state, which
+    an ``edit`` grant is in-space authority over, not a right to), so the
+    caller gates it on :meth:`Store.require_human` first and consults this for
+    humans alone.
     """
     row = conn.execute("SELECT space_id FROM nodes WHERE id = ?", (dst_id,)).fetchone()
     if row is None:
@@ -2089,9 +2109,11 @@ def _transition_row(
         ``"version"``.
 
     Raises:
-        GrantNotPermitted: If the principal is not a human and holds no
-            ``edit`` grant on the item's space (both endpoint spaces for an
-            edge).
+        GrantNotPermitted: If the principal may not make the transition:
+            accept/reject need a human or an ``edit`` grant on the item's
+            space (both endpoint spaces for an edge); archive needs a human
+            outright, unless it is made inside a consolidation cycle, where
+            the cycle's own review bar applies (:data:`_CURRENT_CYCLE`).
         RecordNotFound: If the id resolves to neither a node, an edge, nor a
             version the principal can read — the id alone does not say which
             kind was meant, so the base class is what is raised.
@@ -2115,7 +2137,17 @@ def _transition_row(
         space in (store.principal.read_spaces or ()) for space in spaces
     ):
         raise RecordNotFound(f"no node, edge, or version with id: {record_id}")
-    store.require_review(spaces, action)
+    # accept/reject are the review tier (a human, or `edit` on the item's
+    # space); archive is the human tier — it retires live state, which an
+    # `edit` grant is in-space authority over, not a right to. The exception
+    # is an archive made *inside* a consolidation cycle: the pruning half and
+    # the curative tier retire edges as part of the cycle's work — gated at
+    # `open_cycle` and reversed by `rollback`, not by a reviewer's archive —
+    # so those stay at the cycle's own review bar.
+    if action == "archive" and not _CURRENT_CYCLE.get():
+        store.require_human("archive")
+    else:
+        store.require_review(spaces, action)
     # The structural spaces are not archivable by any spelling. This sits here
     # rather than in `archive_space` because `archive <id>` and
     # `POST /api/nodes/{id}/archive` reach the same row without going near it.
@@ -2172,15 +2204,20 @@ def transition(
         reason: Recorded in the event payload — the same audit trail a batch
             :func:`reject_proposals` writes, so reviewing one item and
             reviewing a hundred leave the same record.
-        actor: Who performs the transition. Every transition is the human
-            tier (:data:`HUMAN_ONLY_ACTIONS`) and refuses any other actor.
+        actor: Who performs the transition. ``accept`` and ``reject`` are the
+            review tier: a human, or an agent holding ``edit`` on every space
+            the item touches. ``archive`` is the human tier
+            (:meth:`Store.require_human`): it retires live state, and an
+            ``edit`` grant is in-space authority, not the right to retire it.
         path: Explicit database path.
 
     Returns:
         The updated node, edge, or version.
 
     Raises:
-        GrantNotPermitted: If the principal may not review this item.
+        GrantNotPermitted: If the principal may not make this transition —
+            no human and no ``edit`` grant on the item's spaces for
+            accept/reject; not a human for archive.
         RecordNotFound: If the id resolves to no node, edge, or version.
         InvalidTransition: If the transition is not allowed from the current
             state.
@@ -5159,7 +5196,7 @@ def open_cycle(
     it did.
 
     Opening one is curative-tier authority, gated by the same
-    :meth:`~nodum.store.Store.require_review` check accept/reject/archive use —
+    :meth:`~nodum.store.Store.require_review` check accept/reject use —
     a human, or ``edit`` on the space in question (see
     :func:`_cycle_authority_spaces` for what an unscoped cycle checks against).
     Humans hold it everywhere by construction.

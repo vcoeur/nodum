@@ -256,16 +256,18 @@ cycle quietly drop the vector signal until you re-run the download.
   brings the pending `mentions` edges its wikilinks materialized to `active` —
   those the acceptor could have reviewed directly, that is; a mention into a
   space they hold nothing on stays queued for someone who can.
-- **Live state is the human's, structurally.** Review (`accept`, `reject`,
-  `archive`) and the curative tier (`merge-nodes`, `retype`, `supersede-edge`,
+- **Live state is the human's, structurally.** Review (`accept`, `reject`) and
+  the curative tier (`merge-nodes`, `retype`, `supersede-edge`,
   `bulk-relink`, `consolidate`)
   require a human principal or an agent holding `edit` on the item's space;
-  `undo` and `rollback` are human-only. Either way is refused with
-  `GrantNotPermitted`.
-  Reviewing turns proposed structure into live structure, archiving retires it,
-  and `undo` writes an event's prior payload back verbatim — `state = 'active'`
-  included — so leaving any of them open would hand an agent the live state it
-  may not write directly. `rollback` does exactly that for a whole cycle at
+  `archive` — which retires live state — and `undo` and `rollback` — which
+  write an event's prior payload back verbatim, `state = 'active'` included —
+  are human-only. Either way is refused with `GrantNotPermitted`.
+  Accepting turns proposed structure into live structure, which an `edit`
+  grant is in-space authority over; archiving retires live state and `undo`
+  resurrects it, and neither is in-space authority — leaving either open would
+  hand an agent the live state it may not write directly. `rollback` does
+  exactly what `undo` does for a whole cycle at
   once, which is why it cannot be gated more weakly than `undo`. None of them is
   an MCP tool either: agents may only *grow* the graph.
 - **Grants, not policies.** Each agent holds one grant per space at `read`,

@@ -245,11 +245,15 @@ class Store:
         """Gate review and curative work: human, or ``edit`` on every space touched.
 
         Q13 note 03 Q1: an ``edit`` grant carries full in-space state-machine
-        authority. Humans pass unconditionally.
+        authority. Humans pass unconditionally. The ``archive`` transition is
+        the exception to the exception: at the review choke point it is the
+        human tier (:meth:`require_human`), because it retires live state —
+        except inside a consolidation cycle, where the transition is part of
+        the cycle's work and stays here at the cycle's own bar.
 
-        Its callers are accept/reject/archive and the consolidation cycle
+        Its callers are accept/reject and the consolidation cycle
         lifecycle (:func:`nodum.service.open_cycle` /
-        :func:`nodum.service.close_cycle`), which asks the identical question —
+        :func:`nodum.service.close_cycle`), which ask the identical question —
         may this principal exercise state-machine authority over these spaces?
         — and so must not grow a second copy of the answer. What a cycle passes
         as ``spaces`` is where the two differ, and that decision lives at the
@@ -265,11 +269,15 @@ class Store:
         )
 
     def require_human(self, action: str) -> None:
-        """Gate what only a human may do (undo, grant administration).
+        """Gate what only a human may do (undo, archive, grant administration).
 
-        Undo writes an event's prior payload back verbatim — ``state =
-        'active'`` included, across spaces — so it is exactly the live-state
-        back door an ``edit`` grant must not become.
+        The line is live state. Undo writes an event's prior payload back
+        verbatim — ``state = 'active'`` included, across spaces — so it is
+        exactly the live-state back door an ``edit`` grant must not become.
+        Archive is the same line from the other side: it retires live state,
+        and an ``edit`` grant is in-space authority, not the right to retire
+        it. Accepting within a space the grant covers is a different act from
+        either and stays open (see :meth:`require_review`).
         """
         if not self.principal.is_human:
             raise GrantNotPermitted(f"only a human may {action}")
