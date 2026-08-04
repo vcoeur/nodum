@@ -24,8 +24,12 @@ jobs:
         run: uv run --locked ruff check .
       - name: Ruff format check
         run: uv run --locked ruff format --check .
+      # Pyright resolves optional-extras imports (pypdf/pypdfium2 in the `pdf`
+      # extra) the same way the test job installs them, so a fresh CI venv sees
+      # what a developer's pdf-enabled venv sees — an import the lint leg cannot
+      # resolve is a real gap, not an absent-extra artifact.
       - name: Pyright typecheck
-        run: uv run --locked pyright nodum
+        run: uv run --locked --extra pdf pyright nodum
 
   test:
     name: Tests (py${{ matrix.python-version }})
