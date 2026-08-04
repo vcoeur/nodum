@@ -1338,6 +1338,29 @@ def test_consolidate_selects_jobs_and_a_scope(fresh_db):
     assert scoped["report"]["scope"] == "main"
 
 
+def test_consolidate_refuses_a_repeated_job_name(fresh_db):
+    """M18: `--job abstraction --job abstraction` is the same work twice.
+
+    Each invocation mints a fresh full budget, so a repeat would spend 2x
+    `NODUM_LLM_CYCLE_BUDGET` and file a second report over the same graph —
+    refused before any cycle opens, like a misspelled job name.
+    """
+    result = runner.invoke(
+        app, ["consolidate", "--job", "abstraction", "--job", "abstraction", "--as", "owner"]
+    )
+
+    assert result.exit_code == 1
+    assert "duplicate consolidation job(s): abstraction" in result.stderr
+    assert isinstance(result.exception, SystemExit)
+
+
+def test_consolidate_accepts_distinct_job_names(fresh_db):
+    """M18: repeats are refused, distinct names still run, in the order given."""
+    outcome = _run_json("consolidate", "--job", "abstraction", "--job", "curation")
+
+    assert [job["name"] for job in outcome["report"]["jobs"]] == ["abstraction", "curation"]
+
+
 def test_cycle_list_and_cycle_get_are_the_journal(fresh_db):
     first = _run_json("consolidate", "--dry-run")["cycle"]
     second = _run_json("consolidate")["cycle"]

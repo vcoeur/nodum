@@ -429,10 +429,10 @@ export function readLlmReport(report: JsonObject | null | undefined): LlmReport 
  * One acceptance rate the curation job computed — `detail["acceptance"]`'s
  * row (L4).
  *
- * `kind` is the row state the rate was counted over — `edge` (an edge type),
- * `node` or `version` (a node type, for node and update proposals) — and
- * `rate` is accepted / (accepted + rejected), rounded by the runner to six
- * decimals. Only pairs with history appear: a cold-start proposer has no row.
+ * `kind` is what the rate was counted over — `edge` (an edge type), `node`
+ * or `version` (a node type, for node and update proposals) — and `rate` is
+ * accepted / (accepted + rejected), rounded by the runner to six decimals.
+ * Only pairs with history appear: a cold-start proposer has no row.
  */
 export interface AcceptanceEntry {
   proposer: string;

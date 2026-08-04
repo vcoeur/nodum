@@ -335,15 +335,18 @@ does not resolve). With no provider configured the refusal names
 ### Consolidation and the curative tier
 
 - `consolidate` — Run a consolidation cycle: the gardener's deterministic
-  jobs (including **queue curation** — each proposer's acceptance rate over the
-  last 90 days, computed from row state and recorded as a convention note in
-  the `conventions` space plus one annotation per queue item; it never accepts
-  or rejects, and nothing gates a write on the proposer's own confidence),
-  the abstraction job (5b-ii's first — it synthesizes a `concept` node
+  jobs (including **queue curation** — each proposer's acceptance rate over
+  its proposals in the last 90 days: row state measures the outcomes, the
+  event log classifies which rows were proposals — recorded as a convention
+  note in the `conventions` space plus one annotation per queue item; it never
+  accepts or rejects, and nothing gates a write on the proposer's own
+  confidence), the abstraction job (5b-ii's first — it synthesizes a `concept` node
   from a dense, sized cluster of related notes, but only when
   `NODUM_LLM_CYCLE_BUDGET` funds it and a provider is configured), and the
   report. `--scope` confines it to one space, `--job` selects jobs
-  (repeatable; default is all of them, in order), `--dry-run` computes
+  (repeatable, each name at most once — a repeated name is refused, since a
+  repeat would spend a second full cycle budget on the same work; default is
+  all of them, in order), `--dry-run` computes
   everything and emits **no** event at all.
 - `cycle-list` — List cycles, newest first: the dream journal. Human-only.
 - `cycle-get <id>` — One journal entry: what ran, what it measured, how it

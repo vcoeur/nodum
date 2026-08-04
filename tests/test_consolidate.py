@@ -1680,6 +1680,19 @@ def test_an_unknown_job_is_refused_by_name(fresh_db):
         _run(jobs=["polish"])
 
 
+def test_a_repeated_job_name_is_refused(fresh_db):
+    """M18: one name, one run — a repeat would spend a second full budget.
+
+    Each run mints a fresh cycle budget, so ``consolidate(jobs=["abstraction",
+    "abstraction"])`` is the same work twice at twice the price. ``Budget.split``
+    refuses a repeated share one layer up; the service refuses the duplicate
+    here, so every surface (CLI, HTTP, scheduler, tests) gets the same sentence
+    before any cycle opens.
+    """
+    with pytest.raises(ValueError, match="duplicate consolidation job"):
+        _run(jobs=["abstraction", "abstraction"])
+
+
 def test_no_job_at_all_still_produces_a_metrics_snapshot(fresh_db):
     report = _run(jobs=[]).report
 
@@ -2263,7 +2276,7 @@ def test_the_journal_carries_the_llm_report(fresh_db, monkeypatch):
     assert result.report.llm == stored, "the typed half of the report is the same data"
 
 
-# ── The curation job (§L1–§L4: rates from row state, conventions + annotations) ──
+# ── The curation job (§L1–§L4: rates over proposals, conventions + annotations) ──
 
 
 def _curation_outcome(report):
@@ -2271,7 +2284,9 @@ def _curation_outcome(report):
 
 
 def test_curation_computes_a_rate_from_row_state(fresh_db):
-    """The rate is the graph's measure: accepted rows active, rejected archived."""
+    """The rate is the graph's measure of a proposer: accepted proposals
+    active, rejected archived — every row seeded here is a genuine proposal
+    (the suggest grant files them ``proposed``), so all of them count (M19)."""
     proposer = agent("researcher")
     alpha = service.create_node(type="concept", title="Alpha", principal=owner())
     beta = service.create_node(type="concept", title="Beta", principal=owner())
@@ -2314,6 +2329,43 @@ def test_curation_computes_a_rate_from_row_state(fresh_db):
     assert entry["type"] == "supports"
     assert entry["accepted"] == 2 and entry["rejected"] == 1
     assert entry["rate"] == pytest.approx(2 / 3)
+
+
+def test_direct_edit_writes_do_not_count_as_proposals_in_the_rate(fresh_db):
+    """M19: the rate counts proposals, not rows.
+
+    A row is a proposal iff its creation event op was ``propose``. An
+    ``edit``-grant direct write lands ``active`` by ``edge.create`` and never
+    was a proposal, so it must not inflate a proposer's acceptance rate — even
+    though it is an ``active`` row of a type with a rate. A suggest-grant
+    write accepted by a human (op ``edge.propose``, then ``accept``) does
+    count.
+    """
+    writer = agent("editor", grants={"meta": "read", "main": "edit"})
+    proposer = agent("researcher")
+    alpha = service.create_node(type="concept", title="Alpha", principal=owner())
+    beta = service.create_node(type="concept", title="Beta", principal=owner())
+    direct = service.create_edge(alpha.id, beta.id, "supports", principal=writer)
+    proposed = service.create_edge(alpha.id, beta.id, "contradicts", principal=proposer)
+    accepted = service.transition(proposed.id, "accept", principal=owner())
+    assert direct.state == "active" and accepted.state == "active"
+
+    outcome = _curation_outcome(_run(jobs=[consolidate.JOB_CURATION]).report)
+
+    # One convention node, for the proposer whose proposal was accepted — the
+    # editor's direct write produced no proposal and no rate.
+    (convention_id,) = outcome.proposed
+    convention = service.get_node(convention_id, principal=owner())
+    assert convention.props["proposer"] == "agent:researcher"
+    assert convention.props["edge_type"] == "contradicts"
+    assert convention.props["accepted"] == 1
+    assert convention.props["rejected"] == 0
+    entries = [
+        (entry["proposer"], entry["type"], entry["accepted"], entry["rejected"])
+        for entry in outcome.detail["acceptance"]
+        if entry["kind"] == "edge" and entry["proposer"] in ("agent:editor", "agent:researcher")
+    ]
+    assert entries == [("agent:researcher", "contradicts", 1, 0)]
 
 
 def test_update_proposals_carry_a_version_rate(fresh_db):
@@ -2536,10 +2588,13 @@ def test_curation_dry_run_writes_nothing(fresh_db):
     assert service.list_proposals(principal=owner())[0].annotation is None
 
 
-def test_curation_reads_row_state_and_no_event_log():
-    """§L1's whole point: the job imports no agent runtime and reads no event
-    log — acceptance is computed from where the graph is now, never from what
-    happened (the gardener is `kind='internal'` and `list_events` refuses it)."""
+def test_curation_reads_outcomes_from_row_state_and_classifies_proposals_from_the_log():
+    """§L1's whole point, restated for M19: row state measures outcomes, the
+    event log classifies which rows were proposals. The one log read is the
+    narrow classification (:func:`nodum.service.list_proposal_creations`),
+    which answers only about the ids the job already holds — never the full
+    log (`list_events`, which refuses the gardener anyway) — and the job still
+    imports no agent runtime."""
     module = _module_ast()
     curation = next(
         node
@@ -2552,6 +2607,7 @@ def test_curation_reads_row_state_and_no_event_log():
         if isinstance(node, ast.Call)
     }
     assert "list_events" not in calls
+    assert "list_proposal_creations" in calls
     agent_uses = [
         node
         for node in ast.walk(curation)
@@ -2731,11 +2787,14 @@ def test_the_deterministic_runner_consults_no_stop_switch_and_the_copy_says_so(
 
     # Every call that consults the switch — the service read itself, the wiring
     # helper, the runtime's own check, the runtime's construction, and the one
-    # door that checks first — must live inside the abstraction job. The two
+    # door that checks first — must live inside the abstraction job. The
     # module-level uses of the `agent` name are excluded from the use check
     # below: `agent.prompt_version` is computed once at import time from the
-    # template string and consults nothing, and `agent.LLMReport` is the type
-    # of the context's report slot — an annotation rather than a call.
+    # template string and consults nothing, `agent.LLMReport` is the type
+    # of the context's report slot — an annotation rather than a call — and
+    # `agent.CycleStopped` is the exception the runner's guard re-raises when
+    # the abstraction job noticed the stop, a type mention rather than a
+    # check (M17).
     consulting = {"stop_requested", "cycle_stop_check", "check_stop", "for_cycle", "chat"}
     offside = [
         node
@@ -2758,7 +2817,7 @@ def test_the_deterministic_runner_consults_no_stop_switch_and_the_copy_says_so(
         if isinstance(node, ast.Attribute)
         and isinstance(node.value, ast.Name)
         and node.value.id == "agent"
-        and node.attr not in {"prompt_version", "LLMReport"}
+        and node.attr not in {"prompt_version", "LLMReport", "CycleStopped"}
     ]
     offside_uses = [use for use in agent_uses if not inside_abstraction(use)]
     assert offside_uses == [], (
@@ -2788,6 +2847,46 @@ def test_the_deterministic_runner_consults_no_stop_switch_and_the_copy_says_so(
     assert outcome.cycle.status == "completed", "and the run finished anyway"
     assert [job.name for job in outcome.report.jobs] == ran
     assert outcome.report.failed == []
+
+
+def test_a_stop_mid_run_propagates_and_no_later_job_writes(fresh_db, monkeypatch):
+    """M17: a stop noticed during a job is a stop, not a job error.
+
+    ``CycleStopped`` is "distinct from every failure": the run did what it was
+    told but not what it was asked. It therefore propagates out of the runner —
+    the blanket ``except Exception`` in ``_run_jobs`` must not file it as a
+    ``JobFailure`` and carry on to the next job — the cycle closes ``failed``,
+    and every job after the one that noticed it never runs. A job standing
+    where the abstraction job stands stops the cycle: curation is after it in
+    the job list, and its convention nodes and annotations are not written
+    after a human pressed stop.
+    """
+    proposer = agent("researcher")
+    alpha = service.create_node(type="concept", title="Alpha", principal=owner())
+    beta = service.create_node(type="concept", title="Beta", principal=owner())
+    accepted = service.create_edge(alpha.id, beta.id, "supports", principal=proposer)
+    service.transition(accepted.id, "accept", principal=owner())
+
+    def stopper(context):
+        (running,) = [
+            entry for entry in service.list_cycles(principal=owner()) if entry.status == "running"
+        ]
+        service.request_stop(running.id, principal=owner())
+        raise agent_runtime.CycleStopped("stopped: a human asked this run to stop")
+
+    monkeypatch.setitem(consolidate.JOBS, "stopper", stopper)
+    with pytest.raises(agent_runtime.CycleStopped):
+        consolidate.consolidate(
+            jobs=["stopper", consolidate.JOB_CURATION], triggered_by=auth.OWNER_ACTOR
+        )
+
+    (cycle,) = service.list_cycles(principal=owner())
+    assert cycle.status == "failed", "a stop still closes the cycle failed"
+    assert cycle.stop_requested is True
+    assert "CycleStopped" in cycle.report["failed"][0]["error"]
+    # Curation ran after the stopper in the job list and would have written a
+    # convention node for the accepted edge — it must not have run.
+    assert service.list_nodes(space=consolidate.CONVENTIONS_SPACE_ID, principal=owner()) == []
 
 
 def test_every_write_the_module_makes_names_the_gardener():

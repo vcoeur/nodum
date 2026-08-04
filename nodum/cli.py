@@ -1808,7 +1808,9 @@ def consolidate(
         None, "--scope", help="Confine the cycle to one space (id or name); default: every space."
     ),
     job: list[str] | None = typer.Option(
-        None, "--job", help="Job to run (repeatable; default: every registered job, in order)."
+        None,
+        "--job",
+        help="Job to run (repeatable, each name at most once; default: all jobs, in order).",
     ),
     dry_run: bool = typer.Option(
         False, "--dry-run", help="Compute every job and write nothing but the journal entry."

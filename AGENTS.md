@@ -89,8 +89,9 @@ seam** (`store.cap_landing` plus a keyword-only `landing=` on `create_edge` /
 `propose_edges` / `create_node`: §8.3's grant-is-a-ceiling, which is what puts
 the gardener's inferences in the review queue), the **consolidation runner**
 (`nodum.consolidate` — five deterministic jobs including **queue curation**
-(§L1–§L4: proposers' acceptance rates computed from row state, never the event
-log, and recorded as convention notes in the `conventions` space plus one
+(§L1–§L4: proposers' acceptance rates over their proposals — row state measures
+the outcomes, the event log classifies which rows were proposals — recorded as
+convention notes in the `conventions` space plus one
 `annotations` row per queue item — statistics and the record, never the
 judgement: nothing auto-accepts and nothing gates a write on the proposer's
 own `confidence`), the abstraction job (5b-ii's
@@ -145,8 +146,11 @@ still run on a machine with no model present; the abstraction job is the
 deliberate exception, gated on the cycle budget (`NODUM_LLM_CYCLE_BUDGET`, off
 by default) and on a configured provider. **Learned queue curation is also
 built, and it is a deterministic job, not one of the LLM jobs**: the curation
-job (§L1–§L4) computes each proposer's acceptance rate from **row state** —
-`active`/`archived` rows and `applied`/`archived` versions over the last
+job (§L1–§L4) computes each proposer's acceptance rate from **its proposals** —
+`active`/`archived` rows whose creation op was `propose` (row state measures
+the outcomes; the event log only classifies which rows were proposals, so a
+direct `edit` write, a materialised wikilink or an ingest subgraph never
+counts) and `applied`/`archived` versions over the last
 `CURATION_WINDOW_DAYS` (90) — and records the result twice: a convention note
 per `(proposer, edge type)` in the `conventions` space (the gardener's own,
 migration `0016`, where it holds `edit` alone), and one `annotations` row per
@@ -815,8 +819,9 @@ commands on a saved node for exactly this reason.
   duplicate edge and an edge incident to an archived node, both on `active`
   edges only, since retiring a `proposed` edge is a review decision that belongs
   to the human — then `relates_to` inference from embedding proximity and
-  co-citation), `curation` (§L1–§L4: proposers' acceptance rates from row
-  state — never the event log — filed as convention notes in the
+  co-citation), `curation` (§L1–§L4: proposers' acceptance rates over their proposals — row
+  state measures the outcomes, the event log classifies which rows were
+  proposals — filed as convention notes in the
   `conventions` space and one `annotations` row per queue item via
   `service.annotate`; statistics and the record, never the judgement: nothing
   auto-accepts and nothing gates a write on the proposer's own
@@ -1115,7 +1120,7 @@ commands on a saved node for exactly this reason.
   meets a 409 with a `conflicts` list, so it has to render *both* ends of each
   collision rather than a count. The journal also renders the curation job's
   **acceptance section** (L4): per proposer, per type, the accepted/rejected
-  counts and the rate the job computed from row state, with a note that
+  counts and the rate the job computed over its proposals, with a note that
   deltas between cycles are the convention nodes' own versions' diff. The
   review queue's cards render each item's **annotation** the same way — the
   proposer's rate on the item's type plus the signals their own props named,

@@ -3776,6 +3776,59 @@ def list_events(
         conn.close()
 
 
+def list_proposal_creations(
+    ids: list[str],
+    *,
+    path: str | Path | None = None,
+) -> set[str]:
+    """Which of ``ids`` were created by a ``propose`` op — a proposal, not a direct write.
+
+    The classification the curation job's acceptance rates need (M19): a
+    ``node.propose``/``edge.propose`` creation op means the row went through
+    the review queue, while a ``node.create``/``edge.create`` — an
+    ``edit``-grant write, a materialised wikilink, an ingest subgraph — landed
+    ``active`` directly and never was a proposal. Row state cannot tell the
+    two apart: both end ``active``, on accept or by grant. The creation
+    event's op is the distinction, so it is read here.
+
+    This is the **one deliberate exception to "the event log is a human
+    surface"** (:func:`list_events` refuses an agent), and it is shaped to
+    disclose nothing the caller does not already hold: it answers only about
+    the ids the caller supplies — the rows it read through its own grants —
+    one bit per id, no node, space or count beyond that. The parallel is
+    :func:`stop_requested`, the other deliberately not-human-only journal
+    read: a runner that cannot ask whether it was told to stop cannot obey,
+    and a curation job that cannot tell proposals from direct writes cannot
+    report an honest acceptance rate.
+
+    A row is classified by the op of the event that created it; a payload
+    with no ``after.id`` (an old or foreign event) classifies nothing.
+
+    Args:
+        ids: The row ids to classify. Ids with no ``propose`` creation event
+            are simply absent from the answer.
+        path: Explicit database path.
+
+    Returns:
+        The subset of ``ids`` whose creation event op was ``node.propose`` or
+        ``edge.propose``.
+    """
+    if not ids:
+        return set()
+    conn = _connect(path)
+    try:
+        created: set[str] = set()
+        for (payload,) in conn.execute(
+            "SELECT payload FROM events WHERE op IN ('node.propose', 'edge.propose')"
+        ).fetchall():
+            after = json.loads(payload).get("after")
+            if isinstance(after, dict) and isinstance(after.get("id"), str):
+                created.add(after["id"])
+        return created & set(ids)
+    finally:
+        conn.close()
+
+
 # ── Asset-pipeline events (design §5.5–§5.7): one named door into the log ─────
 
 #: The only ops :func:`record_asset_event` will write — an **allowlist**, not a

@@ -1526,14 +1526,24 @@ def _acceptance_counts(
     accepted_states: tuple[str, ...],
     rejected_states: tuple[str, ...],
     now: datetime,
+    proposal_created: set[str],
 ) -> dict[tuple[str, str], tuple[int, int]]:
     """Per ``(proposer, type)`` accepted/rejected counts over row state.
 
+    **Row state measures outcomes; the event log classifies which rows were
+    proposals (M19).** ``proposal_created`` is the set of row ids whose
+    creation event op was ``propose`` — a ``node.propose`` or
+    ``edge.propose`` — rather than ``create``, read by the curation job
+    through :func:`nodum.service.list_proposal_creations`. Only those rows
+    count: a direct ``edit``-grant write, a materialised wikilink or an
+    ingest subgraph lands ``active`` by ``create`` and never was a proposal,
+    so it must not inflate a proposer's acceptance rate.
+
     The window is measured from ``created_at`` — the **row's** creation
     timestamp, which is all row state records. The decision time of an accept
-    or reject lives only in the event log, which the gardener
-    (:func:`nodum.service.list_events`) refuses to read, so "the last quarter
-    of a proposer's record" is the quarter of rows created then; a row the
+    or reject lives only in the event log, which the gardener does not read
+    beyond the creation-op classification above, so "the last quarter of a
+    proposer's record" is the quarter of rows created then; a row the
     proposer filed this week and a human decided years later both count as
     fresh by their creation date. Accepted and rejected are the two terminal
     states, so a ``proposed`` row is history still in flight and counts for
@@ -1542,6 +1552,8 @@ def _acceptance_counts(
     counts: dict[tuple[str, str], tuple[int, int]] = {}
     for row in rows:
         if _age_days(row.created_at, now) > CURATION_WINDOW_DAYS:
+            continue
+        if row.id not in proposal_created:
             continue
         accepted = row.state in accepted_states
         rejected = row.state in rejected_states
@@ -1687,13 +1699,19 @@ def _job_curation(context: _Context) -> JobOutcome:
       A proposer with no history on that type gets **no** annotation: the §L1
       shape needs a rate, and a cold start has none.
 
-    **Row state, never the event log.** The gardener is ``kind="internal"``
-    and :func:`nodum.service.list_events` refuses it, which is the design's
-    whole point: acceptance is read from where the graph is now, not from what
-    happened. The window is measured from row ``created_at`` — the decision
-    time of an accept lives only in the log, so the quarter is a quarter of
-    rows created then (see :func:`_acceptance_counts`). A row in the
-    ``proposed`` state is history still in flight and counts for neither side.
+    **Row state measures outcomes; the event log classifies proposals.** The
+    gardener is ``kind="internal"`` and :func:`nodum.service.list_events`
+    refuses it, so outcomes are read from where the graph is now — ``active``
+    vs ``archived`` rows — never from what happened. The one event-log read is
+    :func:`nodum.service.list_proposal_creations`, which classifies which of
+    the rows the job already holds were proposals at all (their creation op
+    was ``propose``, not ``create``): a direct ``edit``-grant write, a
+    materialised wikilink or an ingest subgraph lands ``active`` without ever
+    being a proposal and must not count toward a proposer's rate. The window
+    is measured from row ``created_at`` — the decision time of an accept
+    lives only in the log, so the quarter is a quarter of rows created then
+    (see :func:`_acceptance_counts`). A row in the ``proposed`` state is
+    history still in flight and counts for neither side.
 
     **Nothing gates a write on ``confidence``.** The proposer's own
     self-reported ``confidence`` (edge props, the D6 seam) is indicative data
@@ -1738,21 +1756,33 @@ def _job_curation(context: _Context) -> JobOutcome:
     # Row state, read once and shared across proposers. Nodes and edges carry
     # their creator and type on the row; versions are read per node of the
     # types the queue's update proposals target (see `_version_counts`).
+    # Which rows were proposals at all is the one event-log read (M19): a row
+    # whose creation op was `propose` counts toward its proposer's rate, a
+    # direct `edit` write, a materialised wikilink or an ingest subgraph does
+    # not.
+    edges = context.edges()
+    nodes = context.nodes()
+    proposal_created = service.list_proposal_creations(
+        [edge.id for edge in edges] + [node.id for node in nodes],
+        path=context.path,
+    )
     edge_counts = _acceptance_counts(
-        context.edges(),
+        edges,
         proposer_key="created_by",
         type_key="type",
         accepted_states=("active",),
         rejected_states=("archived",),
         now=context.now,
+        proposal_created=proposal_created,
     )
     node_counts = _acceptance_counts(
-        context.nodes(),
+        nodes,
         proposer_key="created_by",
         type_key="type",
         accepted_states=("active",),
         rejected_states=("archived",),
         now=context.now,
+        proposal_created=proposal_created,
     )
     update_types = {proposal.type for proposal in proposals if proposal.kind == "update"}
     version_counts = _version_counts(context, update_types)
@@ -1794,8 +1824,8 @@ def _job_curation(context: _Context) -> JobOutcome:
         content = (
             f"{proposer} has {accepted} accepted and {rejected} rejected {edge_type} "
             f"edge(s) in the last {CURATION_WINDOW_DAYS} days — an acceptance rate of "
-            f"{rate:.1%}. Computed by the curation job from row state; nothing here "
-            "accepts or rejects."
+            f"{rate:.1%}. Computed by the curation job from the proposer's proposals; "
+            "nothing here accepts or rejects."
         )
         if context.dry_run:
             convention_entries.append(
@@ -2014,13 +2044,27 @@ def _metrics(context: _Context) -> dict[str, float]:
 
 
 def _resolve_jobs(names: list[str] | None) -> list[str]:
-    """Resolve job names against :data:`JOBS` (``None`` = all, in run order)."""
+    """Resolve job names against :data:`JOBS` (``None`` = all, in run order).
+
+    A name may appear once. A repeat would run the job twice — and since each
+    run mints a fresh full budget (:func:`nodum.agent.for_cycle` reads
+    ``NODUM_LLM_CYCLE_BUDGET`` per run), the same work at twice the price,
+    so it is a caller bug refused here, one layer above the identical refusal
+    :meth:`nodum.agent.Budget.split` makes for a repeated share name.
+    """
     if names is None:
         return list(JOBS)
     unknown = sorted(set(names) - set(JOBS))
     if unknown:
         raise ValueError(
             f"unknown consolidation job(s): {', '.join(unknown)} (registered: {', '.join(JOBS)})"
+        )
+    repeated = sorted({name for name in names if names.count(name) > 1})
+    if repeated:
+        raise ValueError(
+            f"duplicate consolidation job(s): {', '.join(repeated)} — a job may run once per "
+            "cycle: a repeat would spend a second full budget on the same work, and Budget.split "
+            "refuses a repeated share for the same reason"
         )
     return list(names)
 
@@ -2118,7 +2162,11 @@ def consolidate(
     cycle wrote before the failure stay — they are real, and a rollback is what
     takes them back. A failure *outside* a job (a scope the gardener holds no
     grant on, for instance) closes the cycle ``failed`` and re-raises: that is
-    not a job result, it is a caller error.
+    not a job result, it is a caller error. **A stop is neither** —
+    :class:`~nodum.agent.CycleStopped` propagates out of the runner exactly
+    like an interrupt, because a job that was told to stop is not a job that
+    failed: the jobs after the one that noticed it never run, and the cycle
+    closes ``failed`` with the stop recorded on its row.
 
     **``BaseException``, not ``Exception``.** Ctrl-C during ``nodum consolidate``
     raises :class:`KeyboardInterrupt`, which is not an ``Exception`` and used to
@@ -2126,7 +2174,10 @@ def consolidate(
     cycle cannot be rolled back while ``undo`` refuses every event it stamped,
     so the writes it had already made were irreversible on every surface. The
     cycle is closed ``failed`` and the interrupt re-raised, so the operator's
-    Ctrl-C still means what they pressed it for.
+    Ctrl-C still means what they pressed it for. A stop raised mid-run
+    (:class:`~nodum.agent.CycleStopped`) lands in the same guard and is
+    re-raised the same way: it is the *same request* as the interrupt, one the
+    kill switch noticed instead of the terminal.
 
     Args:
         scope: A space id or name to confine the cycle to, or ``None`` for the
@@ -2137,8 +2188,8 @@ def consolidate(
             row is still written, flagged ``dry_run``, and carries the report —
             the journal has to say which it was — but the cycle's event list is
             empty, which is the checkable form of "it changed nothing".
-        jobs: Job names to run (see :data:`JOBS`); ``None`` runs all of them in
-            registry order.
+        jobs: Job names to run (see :data:`JOBS`), each at most once; ``None``
+            runs all of them in registry order.
         triggered_by: Who asked — an actor string that has already
             authenticated, or the literal :data:`nodum.service.SCHEDULER_ACTOR`.
         path: Explicit database path.
@@ -2147,7 +2198,7 @@ def consolidate(
         The closed cycle and its report.
 
     Raises:
-        ValueError: If a job name is not registered.
+        ValueError: If a job name is not registered, or a job name is repeated.
         CycleInProgress: If a consolidation cycle is already running against
             this database — in this process or any other.
         UnknownPrincipal: If ``triggered_by`` names no account.
@@ -2155,6 +2206,8 @@ def consolidate(
             disabled — the supported way to stop it.
         GrantNotPermitted: If the trigger may not open a cycle over ``scope``,
             or if the gardener holds no grant on it.
+        CycleStopped: If a stop was requested while a job ran; the cycle
+            closes ``failed`` and the stop is re-raised (see above).
     """
     # Job names are resolved before anything else so a typo is still reported as
     # a typo while another cycle is running, rather than as "already running".
@@ -2194,6 +2247,11 @@ def _run_cycle(
         with service.in_cycle(cycle.id):
             report = _run_jobs(context, cycle, selected)
     except BaseException as failure:
+        # The landing for a stop too, not just a crash: a job that noticed the
+        # kill switch re-raises CycleStopped out of `_run_jobs` and lands
+        # here, where the cycle closes `failed` — the run did not do what it
+        # was asked to do — and the stop reaches the caller. Every write
+        # already made stays, stamped with the cycle, reversible by rollback.
         service.close_cycle(
             cycle.id,
             status="failed",
@@ -2236,6 +2294,14 @@ def _run_jobs(context: _Context, cycle: CycleOut, selected: list[str]) -> Consol
         # `Exception` and not `BaseException`, deliberately unlike the guard in
         # `_run_cycle`: one job falling over must not lose the others,
         # but an interrupt is a request to stop the *run*, not a job result.
+        except agent.CycleStopped:
+            # A stop is the same request as the interrupt, not a job error
+            # (its own docstring: "Distinct from every failure"). It
+            # propagates so the jobs after the one that noticed it — curation
+            # in particular — never write after the human pressed stop; the
+            # cycle still closes `failed`, in `_run_cycle`'s BaseException
+            # guard.
+            raise
         except Exception as failure:
             message = f"{type(failure).__name__}: {failure}"
             outcomes.append(JobOutcome(name=name, error=message))
