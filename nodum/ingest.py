@@ -33,16 +33,25 @@ recoverable.** Registration is content-addressed, and migration 0009's unique
 index allows one live ``asset_ref`` per ``(hash, space)`` — so a re-run finds
 the describing node instead of tripping the index. A run interrupted between
 the two node writes is repaired by running it again: the existing
-``asset_ref`` is reused and only the missing half is created.
+``asset_ref`` is reused and only the missing half is created. The repair
+covers the whole subgraph, not just the nodes: a re-run that finds both nodes
+but not the ``derived_from`` edge or the page blocks recreates the missing
+half too, so **re-running an interrupted ingestion converges on the complete
+subgraph** (finding M27).
 
 Network posture for :func:`ingest_url`: ``http``/``https`` only, one bounded
-read with a timeout, and redirects confined to the same two schemes (urllib
-would otherwise follow one to ``ftp:``). It does **not** block loopback or
-private-range addresses — the server is itself a loopback service and its own
-test fixture is one, so a blocklist would be theatre that broke the suite.
-Anything that can call ``ingest_url`` can already reach the machine's network
-position; that is a property of granting an agent ingestion, and it is stated
-here rather than half-defended.
+read with a per-read timeout **and a wall-clock deadline** — the socket
+timeout bounds one read, so a server dripping a chunk inside every window
+would otherwise hold the fetch open forever, and
+:data:`FETCH_DEADLINE_SECONDS` is what cuts that class off (finding M26).
+Redirects are confined to the same two schemes (urllib would otherwise follow
+one to ``ftp:``), and a **type policy** refuses a fetched body whose stored
+MIME no extraction handler claims, before any byte reaches the blob store.
+It does **not** block loopback or private-range addresses — the server is
+itself a loopback service and its own test fixture is one, so a blocklist
+would be theatre that broke the suite. Anything that can call ``ingest_url``
+can already reach the machine's network position; that is a property of
+granting an agent ingestion, and it is stated here rather than half-defended.
 """
 
 from __future__ import annotations
@@ -50,6 +59,7 @@ from __future__ import annotations
 import mimetypes
 import sqlite3
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -109,8 +119,19 @@ FETCHABLE_SCHEMES = frozenset({"http", "https"})
 #: Ceiling on a fetched body, enforced while streaming rather than after.
 MAX_FETCH_BYTES = 64 * 1024 * 1024
 
-#: Socket timeout for a fetch, in seconds.
+#: Socket timeout for one read of a fetch, in seconds.
 FETCH_TIMEOUT_SECONDS = 30
+
+#: Wall-clock cap on a whole fetch, independent of the per-read socket timeout.
+#:
+#: ``FETCH_TIMEOUT_SECONDS`` bounds one read, not the fetch: a server dripping
+#: one chunk inside every 30 s window keeps the read loop alive indefinitely,
+#: well past anything a reader could consume. 60 is a full socket timeout for
+#: the connect and headers, plus a body that must then deliver in good time —
+#: a legitimate document finishes in seconds, so the deadline only cuts the
+#: slow-drip class, and it cuts it at a bounded wall-clock rather than at the
+#: byte ceiling's mercy (finding M26).
+FETCH_DEADLINE_SECONDS = 60
 
 #: Name given to a fetched document whose URL and headers offer none.
 FALLBACK_FETCH_NAME = "download"
@@ -200,8 +221,10 @@ def ingest_url(
         The same result shape as :func:`ingest_file`.
 
     Raises:
-        IngestError: If the scheme is not fetchable, the fetch fails, or the
-            body passes :data:`MAX_FETCH_BYTES`.
+        IngestError: If the scheme is not fetchable, the fetch fails, the body
+            passes :data:`MAX_FETCH_BYTES`, the fetch does not finish within
+            :data:`FETCH_DEADLINE_SECONDS`, or the fetched body's stored type
+            no extraction handler claims (finding M26).
         GrantNotPermitted: If the principal may not write the target space.
     """
     parsed = urllib.parse.urlparse(url)
@@ -214,6 +237,7 @@ def ingest_url(
         spooled = Path(workspace) / "body"
         content_type, header_name = _fetch(url, spooled)
         resolved = name or _fetched_name(url, header_name, content_type)
+        _refuse_unsupported_fetch(spooled, resolved, url)
         return _ingest(
             spooled,
             name=resolved,
@@ -271,6 +295,49 @@ def ingest_upload(
     )
 
 
+#: The MIME types :func:`ingest_url` admits, as the handler registry's own
+#: claims (extract.py) restated for a refusal message. Derived rather than
+#: copied so a handler added or removed there changes the policy and its
+#: message together — ``handler_for`` decides admission, this only names it.
+FETCHABLE_MIME_CLAIMS: tuple[str, ...] = tuple(
+    sorted({mime for handler in extract.REGISTRY for mime in handler.mimes})
+)
+
+
+def _refuse_unsupported_fetch(source: Path, name: str, url: str) -> None:
+    """Refuse a fetched body whose stored type no extraction handler claims.
+
+    The type is decided the same way registration will record it — the sniff
+    weighed against the name (:func:`assets.stored_mime`) — because extraction
+    dispatches on the *stored* MIME: a misnamed URL is exactly the case where
+    the name and the bytes disagree, and the stored type is the one that
+    decides the pipeline's behaviour. The refusal runs **before** ``_ingest``
+    (and therefore before ``register_asset``), so no byte reaches the blob
+    store for a body the pipeline cannot act on — registration is the
+    irreversible half, and an unsupported type is not an absent dependency:
+    the URL is fetchable but not ingestible, and reporting an empty
+    extraction would claim success for a failed ingest. The file path
+    deliberately has no such policy (finding M26).
+
+    Args:
+        source: The spooled fetched body.
+        name: The name registration would record; its extension is the guess
+            ``_stored_mime`` weighs against the sniff.
+        url: The fetched URL, named in the refusal as the caller's input.
+
+    Raises:
+        IngestError: If :func:`extract.handler_for` claims no handler for the
+            type registration would store.
+    """
+    stored = assets.stored_mime(source, name=name)
+    if extract.handler_for(stored) is not None:
+        return
+    raise IngestError(
+        f"{url} is {stored}, which no extraction handler claims; "
+        f"ingest_url admits {', '.join(FETCHABLE_MIME_CLAIMS)}"
+    )
+
+
 def _ingest(
     source_file: Path,
     *,
@@ -313,12 +380,23 @@ def _ingest(
     )
     if existing_ref is not None and existing_source is not None:
         return _already_ingested(
-            asset, existing_ref, existing_source, principal=principal, path=path
+            asset,
+            existing_ref,
+            existing_source,
+            source_file=source_file,
+            principal=principal,
+            path=path,
         )
 
     extraction = extract.extract(source_file, mime=asset.mime)
     if extraction.text:
         assets.set_extracted_text(asset.hash, extraction.text, path=path)
+    # The page numbers this run will write, recorded before the writes so the
+    # describing node carries them: a later re-run can detect (cheaply) that
+    # the page half of an interrupted ingestion is missing, instead of
+    # re-running the handler to learn the same thing — the OCR/transcription
+    # cost the already-ingested branch exists to avoid (finding M27).
+    page_numbers = _page_block_numbers(extraction.pages)
 
     provenance: dict[str, Any] = {"asset_hash": asset.hash, "mime": asset.mime}
     if origin_kind == "url":
@@ -333,6 +411,7 @@ def _ingest(
             "original_name": asset.original_name,
             "extracted_by": extraction.handler,
             "extracted_chars": len(extraction.text),
+            "extracted_pages": page_numbers,
         },
         space=space,
         principal=principal,
@@ -408,19 +487,105 @@ def _already_ingested(
     asset_ref: NodeOut,
     source: NodeOut,
     *,
+    source_file: Path,
     principal: Principal,
     path: str | Path | None,
 ) -> IngestOut:
-    """Build the result for an asset this space already describes — no writes, no event.
+    """Build the result for an asset this space already describes — after
+    repairing the half an interrupted run may have left unwritten.
 
-    Extraction is skipped rather than repeated: the text is already on the
-    asset and in the source node, and re-running a handler would cost an OCR
-    pass or a transcription to arrive at the same bytes. The handler that did
-    run is read back from the describing node's props, so the report stays
-    truthful instead of claiming a fresh extraction.
+    The gate that reaches this branch checks the two nodes, not the whole
+    subgraph, and finding M27 is the difference that makes: a run interrupted
+    after both node writes but before the ``derived_from`` edge or the page
+    blocks leaves those halves missing, and this branch used to report
+    "already ingested" over the partial subgraph forever. It now reads the
+    graph for the two remaining halves and recreates whichever is missing —
+    the edge first, then each page block whose recorded number has no block
+    in any state (an archived block was *written*, and a human's archive is
+    curation, not an interruption to repair). The recorded ``extracted_pages``
+    prop is what makes the page half detectable without re-running the
+    handler; an asset registered before the prop existed cannot be page-
+    repaired, and its edge half still is. ``created`` reports what this call
+    actually wrote: true when it recreated the missing half, false when the
+    subgraph was complete and nothing was written — so a caller is never told
+    "complete" over a subgraph the repair just finished, nor "created" over
+    one it left untouched.
+
+    Extraction is skipped rather than repeated on the complete subgraph: the
+    text is already on the asset and in the source node, and re-running a
+    handler would cost an OCR pass or a transcription to arrive at the same
+    bytes. The repair re-runs it only when a recorded page number is missing,
+    because the page *text* is the one thing the graph cannot reconstruct
+    (the handler that did run is read back from the describing node's props,
+    so the report stays truthful instead of claiming a fresh extraction).
+    The repair writes no ``asset.ingest`` event of its own — the node and
+    edge creates it performs are logged individually, and this is a repair,
+    not a fresh ingest.
     """
     extracted = asset.extracted_text or ""
-    pages, blocks_ever_written = _existing_page_blocks(source, principal=principal, path=path)
+    pages, blocks_ever_written, page_numbers = _existing_page_blocks(
+        source, principal=principal, path=path
+    )
+    edges = service.list_edges(
+        node_id=source.id, type=PROVENANCE_EDGE, principal=principal, path=path
+    )
+    provenance = next(
+        (edge for edge in edges if edge.src_id == source.id and edge.dst_id == asset_ref.id),
+        None,
+    )
+    expected = [
+        number
+        for number in (asset_ref.props.get("extracted_pages") or [])
+        if isinstance(number, int)
+    ]
+    missing = [number for number in expected if number not in page_numbers]
+
+    detail = "already ingested into this space; nothing re-extracted"
+    pages_extracted = 0
+    created = False
+    if provenance is None or missing:
+        if provenance is None:
+            service.create_edge(
+                source.id, asset_ref.id, PROVENANCE_EDGE, principal=principal, path=path
+            )
+            created = True
+        if missing:
+            # The page text is the one thing the graph cannot reconstruct, so
+            # the repair re-runs the handler — the same cost the two-node
+            # repair already pays on its path — and writes only the blocks
+            # whose numbers are recorded but absent.
+            extraction = extract.extract(source_file, mime=asset.mime)
+            pages_extracted = len(extraction.pages)
+            for number in missing:
+                text = extraction.pages[number - 1] if number - 1 < len(extraction.pages) else ""
+                if not text.strip():
+                    continue
+                service.create_node(
+                    type=PAGE_TYPE,
+                    title=f"Page {number}",
+                    content=text,
+                    parent_id=source.id,
+                    props={"page": number, "asset_hash": source.props.get("asset_hash")},
+                    space=source.space_id,
+                    principal=principal,
+                    path=path,
+                )
+                created = True
+        repaired_parts = []
+        if provenance is None:
+            repaired_parts.append("the provenance edge")
+        if missing:
+            repaired_parts.append("the page blocks")
+        detail = (
+            "already ingested into this space; recreated "
+            f"{' and '.join(repaired_parts)} an interrupted run left behind"
+        )
+        pages, blocks_ever_written, page_numbers = _existing_page_blocks(
+            source, principal=principal, path=path
+        )
+        edges = service.list_edges(
+            node_id=source.id, type=PROVENANCE_EDGE, principal=principal, path=path
+        )
     return IngestOut(
         asset=asset,
         asset_ref=asset_ref,
@@ -435,23 +600,21 @@ def _already_ingested(
         # Counted over every page block ever written, archived included: retiring
         # one page of a truncated scan does not un-truncate it.
         pages_truncated=blocks_ever_written >= MAX_PAGE_BLOCKS,
-        edges=service.list_edges(
-            node_id=source.id, type=PROVENANCE_EDGE, principal=principal, path=path
-        ),
+        edges=edges,
         extraction=ExtractionOut(
             handler=str(asset_ref.props.get("extracted_by") or "none"),
             chars=len(extracted),
-            pages=0,
-            detail="already ingested into this space; nothing re-extracted",
+            pages=pages_extracted,
+            detail=detail,
         ),
-        created=False,
+        created=created,
         event_seq=0,
     )
 
 
 def _existing_page_blocks(
     source: NodeOut, *, principal: Principal, path: str | Path | None
-) -> tuple[list[NodeOut], int]:
+) -> tuple[list[NodeOut], int, set[int]]:
     """The page blocks a ``source`` node carries, and how many were ever written.
 
     ``service.list_children`` filters on neither type nor state, and a ``source``
@@ -468,16 +631,25 @@ def _existing_page_blocks(
     cap *did*, and it must include archived blocks: inferring the truncation flag
     from the filtered list let a single archived page turn a `true` into a
     `false` — reintroducing, through the very filter that fixed its sibling, the
-    silent truncation the flag exists to prevent.
+    silent truncation the flag exists to prevent. The page-number set is over
+    every block in any state for the same reason: an archived block was
+    *written*, so it is evidence the half exists and must not be recreated by
+    the interrupted-run repair (finding M27).
 
-    :returns: The live page blocks, and the number of page blocks in any state.
+    :returns: The live page blocks, the number of page blocks in any state, and
+        the page numbers carried by every block in any state.
     """
     page_blocks = [
         child
         for child in service.list_children(source.id, principal=principal, path=path)
         if child.type == PAGE_TYPE
     ]
-    return [child for child in page_blocks if child.state != ARCHIVED_STATE], len(page_blocks)
+    page_numbers = {child.props["page"] for child in page_blocks if "page" in child.props}
+    return (
+        [child for child in page_blocks if child.state != ARCHIVED_STATE],
+        len(page_blocks),
+        page_numbers,
+    )
 
 
 def _source_content(text: str) -> str:
@@ -485,6 +657,27 @@ def _source_content(text: str) -> str:
     if len(text) <= SOURCE_CONTENT_CHARS:
         return text
     return text[:SOURCE_CONTENT_CHARS] + TRUNCATION_MARKER
+
+
+def _page_block_numbers(pages: list[str]) -> list[int]:
+    """The 1-based page numbers the block loop would write for ``pages``.
+
+    The block loop's own rule, restated once so the recorded numbers and the
+    written blocks cannot drift: blank pages are skipped (the numbering stays
+    honestly sparse) and :data:`MAX_PAGE_BLOCKS` caps what gets written, the
+    overflow reported as truncation rather than dropped. Recorded on the
+    ``asset_ref`` as ``extracted_pages``, which is what lets the
+    already-ingested branch detect a missing page half without re-running the
+    handler (finding M27).
+    """
+    numbers: list[int] = []
+    for number, text in enumerate(pages, start=1):
+        if not text.strip():
+            continue
+        if len(numbers) >= MAX_PAGE_BLOCKS:
+            break
+        numbers.append(number)
+    return numbers
 
 
 def _create_page_blocks(
@@ -501,19 +694,14 @@ def _create_page_blocks(
     otherwise propose a hundred empty nodes — while the page number stays in
     props, so the numbering is honestly sparse rather than quietly renumbered.
     """
+    numbers = _page_block_numbers(pages)
     created: list[NodeOut] = []
-    truncated = False
-    for number, text in enumerate(pages, start=1):
-        if not text.strip():
-            continue
-        if len(created) >= MAX_PAGE_BLOCKS:
-            truncated = True
-            break
+    for number in numbers:
         created.append(
             service.create_node(
                 type=PAGE_TYPE,
                 title=f"Page {number}",
-                content=text,
+                content=pages[number - 1],
                 parent_id=parent.id,
                 props={"page": number, "asset_hash": parent.props.get("asset_hash")},
                 space=space,
@@ -521,7 +709,10 @@ def _create_page_blocks(
                 path=path,
             )
         )
-    return created, truncated
+    # The cap bit is the loop's own rule too: more non-blank pages existed than
+    # the cap let through.
+    non_blank = sum(1 for page in pages if page.strip())
+    return created, non_blank > MAX_PAGE_BLOCKS
 
 
 def _fetch(url: str, destination: Path) -> tuple[str | None, str | None]:
@@ -532,11 +723,13 @@ def _fetch(url: str, destination: Path) -> tuple[str | None, str | None]:
     ``http.server``.
 
     Raises:
-        IngestError: If the request fails, redirects off ``http``/``https``, or
-            the body passes :data:`MAX_FETCH_BYTES`.
+        IngestError: If the request fails, redirects off ``http``/``https``,
+            the body passes :data:`MAX_FETCH_BYTES`, or the fetch does not
+            finish within :data:`FETCH_DEADLINE_SECONDS` (finding M26).
     """
     request = urllib.request.Request(url, headers={"User-Agent": "nodum-ingest"})
     opener = urllib.request.build_opener(_SchemeBoundRedirectHandler)
+    started = time.monotonic()
     try:
         with opener.open(request, timeout=FETCH_TIMEOUT_SECONDS) as response:
             content_type = response.headers.get("Content-Type")
@@ -544,6 +737,18 @@ def _fetch(url: str, destination: Path) -> tuple[str | None, str | None]:
             written = 0
             with destination.open("wb") as handle:
                 while chunk := response.read(1 << 20):
+                    # The socket timeout bounds one read, so it never bounds
+                    # the fetch: a server dripping one chunk inside every 30 s
+                    # window keeps this loop alive indefinitely. The deadline
+                    # is the wall-clock cap that cuts that class off — checked
+                    # after the read, because an already-delivered chunk is
+                    # not the problem and the overrun from one blocking read
+                    # is bounded by the socket timeout itself.
+                    if time.monotonic() - started > FETCH_DEADLINE_SECONDS:
+                        raise IngestError(
+                            f"{url} did not finish within the {FETCH_DEADLINE_SECONDS}-second "
+                            "fetch deadline — download it and ingest the file instead"
+                        )
                     written += len(chunk)
                     if written > MAX_FETCH_BYTES:
                         raise IngestError(
