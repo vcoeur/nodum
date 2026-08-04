@@ -10,7 +10,13 @@ type rule, and the writer's own ceiling on where a write lands
 
 The leak rule is default-deny: an agent with no grant on a space cannot
 tell that space exists, so reads answer *not found* (never *permission
-denied*) for rows outside the read set.
+denied*) for rows outside the read set. A ``space``-typed node is scoped to
+its **own id** rather than to the space it sits in: space nodes live in the
+meta space, which every agent reads for the type vocabulary, so filtering a
+space node on ``space_id`` alone would hand every space in the file to any
+meta reader (M3). A space node is visible iff the principal holds a grant
+on that space — the one rule is computed in :meth:`Store.node_scope` (SQL)
+and :meth:`Store.node_visible` (rows), so every node read inherits it.
 """
 
 from __future__ import annotations
@@ -43,6 +49,57 @@ def require_landing_state(landing: LandingState | None) -> None:
         raise ValueError(f"landing must be one of {LANDING_STATES}, got {landing!r}")
 
 
+def node_scope_clause(spaces: frozenset[str], alias: str = "") -> tuple[str, list[str]]:
+    """The read-set clause for one agent's node reads (never ``None`` spaces).
+
+    A non-space node is visible iff its space is in the set; a ``space``-typed
+    node is visible iff its **own id** is. Space nodes live in the meta space,
+    which every agent reads for the type vocabulary, so a filter on ``space_id``
+    alone would hand every space in the file to any meta reader (M3): the node
+    itself is the scope, not the space it sits in. A grant on a space is the
+    proof of acquaintance with it, so a space node resolves through its own id
+    in the set — and never through another space's grant.
+
+    Args:
+        spaces: The principal's read set (``None`` — the unfiltered human case
+            — is the caller's to skip, exactly as the empty set is: the latter
+            is a boundary that must make the query match nothing).
+        alias: Column prefix, e.g. ``"n."`` when the query aliases the table.
+
+    Returns:
+        ``(clause, params)``: the ANDed boundary, and the params in the order
+        the clause's placeholders stand. The empty set yields ``"1 = 0"``.
+    """
+    if not spaces:
+        return "1 = 0", []
+    placeholders = ",".join("?" * len(spaces))
+    ordered = sorted(spaces)
+    # The whole disjunction is parenthesised, not just each arm: the clause is
+    # ANDed onto other filters (and an FTS ``MATCH``), and `A OR B AND C` binds
+    # as `A OR (B AND C)` — the trailing filters would apply to the space-node
+    # arm alone, and an FTS MATCH beside a top-level OR is refused outright.
+    clause = (
+        f"(({alias}type_id != 'space' AND {alias}space_id IN ({placeholders}))"
+        f" OR ({alias}type_id = 'space' AND {alias}id IN ({placeholders})))"
+    )
+    return clause, ordered * 2
+
+
+def node_readable(spaces: frozenset[str], row: sqlite3.Row | dict) -> bool:
+    """The read rule for one already-fetched row — :func:`node_scope_clause` as a predicate.
+
+    Args:
+        spaces: The principal's read set.
+        row: A ``nodes`` row.
+
+    Returns:
+        Whether the row is inside the read set.
+    """
+    if row["type_id"] == "space":
+        return row["id"] in spaces
+    return row["space_id"] in spaces
+
+
 class Store:
     """One principal's scoped handle on one connection."""
 
@@ -60,10 +117,8 @@ class Store:
         spaces = self.principal.read_spaces
         if spaces is None:
             return "", []
-        if not spaces:
-            return " AND 1 = 0", []
-        placeholders = ",".join("?" * len(spaces))
-        return f" AND {alias}space_id IN ({placeholders})", sorted(spaces)
+        clause, params = node_scope_clause(spaces, alias)
+        return f" AND {clause}", params
 
     def edge_scope(self, alias: str = "") -> tuple[str, list[str]]:
         """``(sql, params)`` restricting an edges query to readable edges.
@@ -88,7 +143,7 @@ class Store:
     def node_visible(self, row: sqlite3.Row | dict) -> bool:
         """Is this nodes row inside the principal's read set?"""
         spaces = self.principal.read_spaces
-        return spaces is None or row["space_id"] in spaces
+        return spaces is None or node_readable(spaces, row)
 
     # ── Writes ────────────────────────────────────────────────────────────
 

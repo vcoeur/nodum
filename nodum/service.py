@@ -468,15 +468,20 @@ def _require_space_lives_in_meta(space_id: str) -> None:
     territory while the grants that govern it are the *host* space's.
 
     It is also what made :func:`_require_space_name_free` an existence oracle.
-    That check is deliberately unscoped, on the premise that only a meta writer
-    can reach it and a meta reader can already list every space; the premise
-    held for creates (:func:`_resolve_node_type` needs READ on meta to resolve
-    the ``space`` type) but not for renames, which are gated on SUGGEST on the
-    space the node itself lives in. A ``space``-typed node in ``main`` therefore
-    let a principal holding nothing but ``main`` rename it onto a name and learn
-    from the refusal that some space it cannot list holds it — plus that space's
-    id. Keeping spaces in meta restores the premise instead of weakening the
-    refusal, which has to keep naming an archived holder to be usable at all.
+    That check is deliberately unscoped, on the premise that only a principal
+    that could already list every space can reach it; the premise held for
+    creates (:func:`_resolve_node_type` needs READ on meta to resolve the
+    ``space`` type, and a meta reader used to list every space) but not for
+    renames, which are gated on SUGGEST on the space the node itself lives in.
+    A ``space``-typed node in ``main`` therefore let a principal holding
+    nothing but ``main`` rename it onto a name and learn from the refusal that
+    some space it cannot list holds it — plus that space's id. Keeping spaces
+    in meta restores the premise instead of weakening the refusal, which has
+    to keep naming an archived holder to be usable at all. The premise is no
+    longer inherited from the placement: a space node now resolves through its
+    own id, not through ``meta`` (M3), so a meta reader sees only the space
+    nodes it holds grants on — and :func:`_require_space_name_free` therefore
+    checks the premise itself rather than trusting it.
 
     Migration ``0013``'s index stays deliberately unscoped to meta, and this
     does not contradict it: the index is the backstop for writers that never
@@ -521,26 +526,33 @@ def _require_space_name_free(
     An archived holder gets its own sentence, and both name the space. Nothing
     lists archived spaces — :func:`list_spaces` and ``GET /api/spaces`` return
     active ones — so a human would otherwise be refused a name held by
-    something they cannot see anywhere. Saying so is not an existence oracle,
-    but only because **the caller can read meta**, and a meta reader can already
-    list every space node in it, archived ones included.
+    something they cannot see anywhere. Naming the holder is not an existence
+    oracle only for a principal that can already list every space, and that
+    premise is checked here rather than trusted: the search spans every space
+    in the file regardless of scope, so the principal it answers has to be one
+    that could run the search itself. Reading meta used to buy that — a meta
+    reader could list every space node, archived ones included — but a space
+    node now resolves through its own id (M3), so a meta reader with a partial
+    grant set sees only the spaces it holds grants on. An agent that cannot
+    list every space is refused outright, identically for every name, so a
+    probe of a taken name and a free one answer the same — and the refusal
+    itself names no space at all.
 
-    That premise is checked here rather than trusted, and here rather than at
-    each call site, because this is the function that discloses: the search
-    spans every space in the file regardless of scope, so the principal it
-    answers has to be one that could run the search itself. `create_node` is
-    safe by construction (resolving the ``space`` type needs READ on meta), but
-    a rename is gated on SUGGEST on the space the node *already lives in* — and
-    a ``space``-typed node sitting in ``main`` therefore let a principal holding
-    nothing but ``main`` read a confirm/deny, plus the holder's id, for a space
-    it cannot list. :func:`_require_space_lives_in_meta` stops new ones being
-    made; this check covers the rows a database already holds, and covers the
-    accept path (:func:`_transition_version`) where the reviewer need not be the
-    proposer. The refusal is on the **grant**, so it reads identically whether
-    or not the name is taken — weakening the message was not the alternative,
-    since it has to keep naming an archived holder, the one space no listing
-    shows. Freeing that name means renaming it, an ordinary :func:`update_node`
-    by id — :func:`rename_space` will not reach it, since :func:`_resolve_space`
+    That premise is checked here rather than at each call site, because this
+    is the function that discloses. `create_node` is safe by construction
+    (resolving the ``space`` type needs READ on meta, and the grant gate below
+    needs every space), but a rename is gated on SUGGEST on the space the node
+    *already lives in* — and a ``space``-typed node sitting in ``main``
+    therefore let a principal holding nothing but ``main`` read a confirm/deny,
+    plus the holder's id, for a space it cannot list.
+    :func:`_require_space_lives_in_meta` stops new ones being made; this check
+    covers the rows a database already holds, and covers the accept path
+    (:func:`_transition_version`) where the reviewer need not be the proposer.
+    The refusal is on the **grant**, so it reads identically whether or not the
+    name is taken — weakening the message was not the alternative, since it has
+    to keep naming an archived holder, the one space no listing shows. Freeing
+    that name means renaming it, an ordinary :func:`update_node` by id —
+    :func:`rename_space` will not reach it, since :func:`_resolve_space`
     matches ``active`` only.
 
     Migration ``0013_unique_space_titles`` is the structural half of this and
@@ -552,12 +564,13 @@ def _require_space_name_free(
     Args:
         conn: Open connection.
         name: The proposed name; ``None`` (an untitled space) is always free.
-        principal: Who is asking — must be able to read the meta space, since
-            the answer describes every space in the file.
+        principal: Who is asking — must be able to list every space in the
+            file, since the answer describes all of them.
         exclude_id: The space being renamed, so it never clashes with itself.
 
     Raises:
-        GrantNotPermitted: If ``principal`` cannot read the meta space.
+        GrantNotPermitted: If ``principal`` cannot read the meta space, or —
+            for an agent — cannot list every space in the file.
         SpaceNameTaken: If any other space already answers to ``name``.
     """
     if principal.level_on(META_SPACE_ID) < READ:
@@ -566,6 +579,31 @@ def _require_space_name_free(
             "space is naming part of the vocabulary every space is named from, so it takes a "
             "grant on the space that holds it"
         )
+    if not principal.is_human:
+        # The search below spans every space in the file, and the refusal names
+        # the holder — so the caller must be able to list every space itself.
+        # Reading meta no longer buys that (M3): a space node is visible only
+        # to a principal granted on that space, so a meta reader with a partial
+        # grant set could probe create/rename refusals for spaces it cannot
+        # see. The gate is on the grant, so it reads identically whether or not
+        # any space holds the probed name.
+        readable = principal.read_spaces or frozenset()
+        if readable:
+            hidden = conn.execute(
+                "SELECT 1 FROM nodes WHERE type_id = 'space' AND id NOT IN ("
+                + ",".join("?" * len(readable))
+                + ") LIMIT 1",
+                sorted(readable),
+            ).fetchone()
+        else:
+            hidden = conn.execute("SELECT 1 FROM nodes WHERE type_id = 'space' LIMIT 1").fetchone()
+        if hidden is not None:
+            raise GrantNotPermitted(
+                f"{principal.actor_string} may not name a space: the name check spans every "
+                "space in the file, so only a principal that can already list every space may "
+                "run it — anything less could learn from the refusal that a space it cannot "
+                "see exists"
+            )
     if name is None:
         return
     # `IS NOT` rather than `!=` so a None exclusion compares against NULL.
@@ -1521,7 +1559,10 @@ def list_nodes(
     Meta-space nodes (the type vocabulary, spaces) are excluded unless
     ``include_meta`` — content listings are not the type catalog. An agent
     principal is additionally confined to its read set (which may include
-    meta, e.g. for the type vocabulary).
+    meta, e.g. for the type vocabulary), and the space nodes inside that read
+    set are the granted ones only: a ``space``-typed node resolves through its
+    own id (M3), so an agent holding ``meta: read`` lists the space nodes of
+    the spaces it holds grants on, and none of the others.
 
     ``space`` **narrows** that read set and can never widen it: it resolves
     through :func:`_resolve_space`, so a space the principal holds no grant on
@@ -2303,7 +2344,10 @@ def _proposal_rows(
             created_before=filters.get("created_before"),
             created_after=filters.get("created_after"),
         )
-        update_scope = node_scope.replace("space_id", "n.space_id") if node_scope else ""
+        # The version query joins `nodes n`, so the scope needs the `n.` alias
+        # on every column it names — the scope builder's own `alias` argument,
+        # not a string replace that would leave `type_id`/`id` unprefixed.
+        update_scope, _ = store.node_scope(alias="n.")
         results += [
             ("update", row)
             for row in conn.execute(
@@ -5591,7 +5635,7 @@ def _readable_edge(conn: sqlite3.Connection, store: Store, edge_id: str) -> sqli
     """
     row = _get_edge_row(conn, edge_id)
     for endpoint in (row["src_id"], row["dst_id"]):
-        node = conn.execute("SELECT space_id FROM nodes WHERE id = ?", (endpoint,)).fetchone()
+        node = _get_node_row(conn, endpoint)
         if node is None or not store.node_visible(node):
             raise EdgeNotFound(f"edge not found: {edge_id}")
     return row

@@ -9,6 +9,7 @@ and the "unreadable does not exist" rule into something a test can fail.
 
 from __future__ import annotations
 
+import re
 import sqlite3
 
 import pytest
@@ -408,6 +409,91 @@ def test_a_filtered_search_does_not_reach_out_of_the_space_through_expansion(fre
     assert nodes["b"].id in {hit.node_id for hit in everything.hits}
 
 
+# ── M3: a space node is visible iff the principal holds a grant on it ─────────
+
+
+def test_an_agent_without_a_grant_on_a_space_cannot_tell_it_exists(fresh_db):
+    """The fifth existence oracle: space nodes leaked through the meta read.
+
+    Space nodes live in the meta space, and every agent is seeded `meta: read`
+    for the type vocabulary — so a filter on `space_id` alone handed every
+    space in the file to any agent, while `resolve_space_id` still refused the
+    same space. A space node now resolves through its own id: an agent holding
+    no grant on `research` must answer on every node read exactly as if the
+    space did not exist, and its probe of the space's *name* stays a not-found.
+    """
+    # Created through the service, so the space node is event-logged and the
+    # search index actually holds its title — the filter is what is tested.
+    service.create_space("research", principal=owner())
+    default = agent("default", grants={"meta": "read"})
+    research_node_id = service.resolve_space_id("research", principal=owner())
+
+    # Search: the space node's title is indexed, but the row is outside the
+    # read set, so the hit is simply not there.
+    assert search.search("research", principal=default).hits == []
+
+    # Listing: the only space node in the default agent's world is meta's own
+    # (it holds `meta: read`); `research` and `main` are not listed.
+    space_nodes = {
+        node.title
+        for node in service.list_nodes(principal=default, limit=500)
+        if node.type == "space"
+    }
+    assert space_nodes == {"meta"}
+
+    # Children: the space node is not found, never denied — not-found
+    # semantics, like every other read.
+    with pytest.raises(service.NodeNotFound, match="node not found"):
+        service.list_children(research_node_id, principal=default)
+
+    # And the name does not resolve either — the same answer as a space that
+    # does not exist at all.
+    with pytest.raises(service.TypeNotFound, match="unknown space: research"):
+        service.resolve_space_id("research", principal=default)
+
+    # The human control: the space genuinely exists, and a human still sees it.
+    assert research_node_id in {
+        node.id for node in service.list_nodes(space="meta", principal=owner())
+    }
+
+
+def test_an_agent_granted_on_a_space_sees_its_space_node(fresh_db):
+    """The positive control: the grant is the proof of acquaintance.
+
+    An agent holding `research: read` can see the research space node through
+    the same reads — it needs to: the space is part of its world, and the node
+    is how it appears in listings and search results.
+    """
+    # Created through the service, so the space node is event-logged and the
+    # search index actually holds its title — the filter is what is tested.
+    service.create_space("research", principal=owner())
+    research_node_id = service.resolve_space_id("research", principal=owner())
+    research_note = service.create_node(
+        type="note", title="private note", space="research", principal=owner()
+    )
+    # The grant is on the space's node id (create_space generates one).
+    insider = agent("insider", grants={"meta": "read", research_node_id: "read"})
+
+    listed = {node.id for node in service.list_nodes(principal=insider, limit=500)}
+    assert research_node_id in listed
+    assert research_note.id in listed
+    assert "main" not in {node.id for node in service.list_nodes(principal=insider, limit=500)}
+
+    (space_hit,) = search.search("research", principal=insider).hits
+    assert space_hit.node_id == research_node_id
+    assert space_hit.type == "space"
+
+    # The meta read is intact: the type vocabulary still lists, so types still
+    # resolve, and the note-typed node in the granted space still lists.
+    type_nodes = {
+        node.id
+        for node in service.list_nodes(principal=insider, limit=500)
+        if node.space_id == "meta" and node.type == "type"
+    }
+    assert "note" in type_nodes
+    assert service.list_nodes(space="research", principal=insider, limit=500) == [research_note]
+
+
 # ── include_meta: off by default, and naming meta is the opt-in said precisely ─
 
 
@@ -754,11 +840,23 @@ def test_accepting_a_proposed_rename_onto_a_taken_name_is_refused_too(fresh_db):
     An agent proposes a rename while the name is free; a human takes the name
     before the review. The accept is the UPDATE that meets the unique index, so
     the reviewer gets the write path's sentence rather than an IntegrityError.
+    The proposer is granted on every space: the name check spans the whole
+    file and the refusal names the holder, so only a principal that can list
+    every space may run it (M3).
     """
     _three_spaces()
-    gardener = agent("gardener", grants={"meta": "suggest", "main": "read"})
+    proposer = agent(
+        "proposer",
+        grants={
+            "meta": "suggest",
+            "main": "read",
+            "b": "read",
+            "c": "read",
+            "conventions": "read",
+        },
+    )
     proposal = service.update_node(
-        service.resolve_space_id("b", principal=owner()), title="reading", principal=gardener
+        service.resolve_space_id("b", principal=owner()), title="reading", principal=proposer
     )
     service.create_space("reading", principal=owner())
 
@@ -784,31 +882,48 @@ def test_two_names_differing_only_in_case_are_two_names(fresh_db):
 
 
 def test_the_name_check_tells_a_meta_writer_nothing_it_cannot_already_list(fresh_db):
-    """The refusal names a space; the only principals that meet it already see it.
+    """The refusal names a space; the only principals that meet it see them all.
 
     `_require_space_name_free` is not scope-filtered, so in principle it could
     confirm a space exists to someone who cannot read it (Q13 review S3). It
-    cannot in practice: creating a space means writing meta, every space node
-    lives in meta, and reading meta lists all of them. The premise is asserted
-    here rather than assumed, because a future grant shape could break it.
+    used to be safe by inheritance: every space node lives in meta, and a meta
+    reader could list all of them. A space node now resolves through its own
+    id (M3), so a meta reader with a partial grant set sees only the spaces it
+    holds grants on — and the check enforces the premise itself: naming a
+    space takes a grant on every space in the file. The refusal is on the
+    grant, so a taken name, an archived one, and a free one all read
+    identically, and the refusal names no space at all.
 
-    It has to hold for **archived** spaces too now that a refusal can name one:
-    `list_nodes` filters by state only when asked to, so the same meta read
-    that shows the live spaces shows the retired ones.
+    The premise has to hold for **archived** spaces too now that a refusal can
+    name one: `list_nodes` filters by state only when asked to, so the same
+    listing that shows the live spaces shows the retired ones.
     """
     _three_spaces()
     service.archive_space("c", principal=owner())
     gardener = agent("gardener", grants={"meta": "edit", "main": "read"})
 
+    # The premise, asserted rather than assumed: the gardener lists exactly the
+    # space nodes it holds grants on — `meta` and `main`, live or retired — and
+    # none of the others.
     listed = {node.title for node in service.list_nodes(space="meta", principal=gardener)}
-    assert {"main", "b", "c"} <= listed, "a meta reader already sees every space, archived too"
+    assert {"meta", "main"} <= listed, "the granted spaces' nodes still list"
+    assert not {"b", "c", "conventions"} & listed, "a space without a grant does not list"
 
-    # So neither refusal below reveals anything: both spaces were in the list it
-    # just read, and the archived one is the case that could not be seen before.
-    with pytest.raises(service.SpaceNameTaken, match="a space already answers to 'b'"):
+    # So the name check refuses outright rather than answer: the taken name,
+    # the archived one, and a free one are word-for-word the same refusal, and
+    # it names no space at all — none of the probes can tell the gardener
+    # anything it could not list for itself.
+    with pytest.raises(GrantNotPermitted) as taken:
         service.create_space("b", principal=gardener)
-    with pytest.raises(service.SpaceNameTaken, match="archived space already answers to 'c'"):
+    with pytest.raises(GrantNotPermitted) as archived:
         service.create_space("c", principal=gardener)
+    with pytest.raises(GrantNotPermitted) as free:
+        service.create_space("definitely-free", principal=gardener)
+    assert str(taken.value) == str(archived.value) == str(free.value)
+    for name in ("b", "c", "definitely-free"):
+        # Whole-word match: "c" is a substring of "space", and the refusal
+        # necessarily says *space* — the probe names must not appear as words.
+        assert re.search(rf"\b{name}\b", str(taken.value)) is None
 
 
 def test_a_space_cannot_be_created_outside_meta(fresh_db):
@@ -845,12 +960,15 @@ def test_naming_a_space_tells_a_principal_that_cannot_read_meta_nothing(fresh_db
 
     `_require_space_name_free` searches every space in the file and names the
     holder — including an archived one, which no listing shows. That is safe
-    only for a principal that can already list every space, i.e. one that reads
-    meta. `create_node` gets there by construction (resolving the `space` type
-    needs READ on meta), but a rename is gated on `suggest` on the space the
-    node *lives in*, so a `space`-typed node sitting in `main` let an agent
-    holding nothing but `main` read a confirm/deny — plus the id — for a space
-    it cannot list.
+    only for a principal that can already list every space, which the check
+    now enforces itself. `create_node` gets there by construction (resolving
+    the `space` type needs READ on meta), but a rename is gated on `suggest`
+    on the space the node *lives in*, so a `space`-typed node sitting in
+    `main` let an agent holding nothing but `main` read a confirm/deny — plus
+    the id — for a space it cannot list. The rename of such a row is now
+    refused as *not found* before the name check can run: a space node
+    resolves through its own id (M3), and no principal holds a grant on the
+    decoy.
 
     Both halves are asserted, because a refusal is only not an oracle if the
     taken name and a free one are **indistinguishable**: it was the free name
@@ -878,20 +996,21 @@ def test_naming_a_space_tells_a_principal_that_cannot_read_meta_nothing(fresh_db
     with pytest.raises(service.NodeNotFound):
         service.get_node(secret.id, principal=outsider)
 
-    with pytest.raises(GrantNotPermitted) as taken:
+    # The decoy is a space node, so it resolves through its own id — which the
+    # outsider holds no grant on. The rename is refused as not found, for a
+    # taken name and a free one alike, and the refusal names nothing.
+    with pytest.raises(service.NodeNotFound) as taken:
         service.update_node("decoy", title="classified", principal=outsider)
-    with pytest.raises(GrantNotPermitted) as free:
+    with pytest.raises(service.NodeNotFound) as free:
         service.update_node("decoy", title="definitely-free", principal=outsider)
 
-    # Word for word the same refusal, and neither names a space or an id. The
-    # gate is on the grant, so it cannot depend on whether the name is taken.
+    # Word for word the same refusal, and neither names a space or an id.
     assert str(taken.value) == str(free.value)
-    assert "no read grant on space 'meta'" in str(taken.value)
     assert secret.id not in str(taken.value)
     assert "classified" not in str(taken.value)
-    # And the useful refusal survives for the principal it was written for.
-    gardener = agent("gardener", grants={"meta": "edit", "main": "edit"})
+    # And the useful refusal survives for the principal it was written for — a
+    # human, the one principal that can already list every space.
     with pytest.raises(service.SpaceNameTaken) as refused:
-        service.update_node("decoy", title="classified", principal=gardener)
+        service.update_node("decoy", title="classified", principal=owner())
     assert "archived space already answers to 'classified'" in str(refused.value)
     assert secret.id in str(refused.value)

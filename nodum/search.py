@@ -60,6 +60,7 @@ from nodum.migrations import META_SPACE_ID
 from nodum.models import SearchHit, SearchResult
 from nodum.principal import READ, Principal
 from nodum.service import require_positive_limit
+from nodum.store import node_readable, node_scope_clause
 from nodum.vocab import NodeState
 
 #: bm25() column weights for (node_id, title, content, extracted_text): node_id
@@ -586,6 +587,11 @@ def _node_filters(
 
     An agent principal is confined to its read set (Q13); a human (or the
     trusted-local default) just skips the meta space unless ``include_meta``.
+    The clause comes from :func:`nodum.store.node_scope_clause` — the same
+    boundary :meth:`nodum.store.Store.node_scope` computes — so a ``space``-
+    typed row is scoped to its own id rather than to ``meta``: a meta reader
+    sees the space nodes of spaces it holds a grant on, and none of the others
+    (M3).
 
     ``space_id`` narrows further and never wider: it is ANDed onto whichever
     of those two clauses applies, so an agent asking for a space outside its
@@ -597,12 +603,9 @@ def _node_filters(
     clauses: list[str] = []
     params: list = []
     if principal is not None and not principal.is_human:
-        spaces = sorted(principal.read_spaces or ())
-        if not spaces:
-            clauses.append("1 = 0")
-        else:
-            clauses.append(f"n.space_id IN ({','.join('?' * len(spaces))})")
-            params.extend(spaces)
+        clause, space_params = node_scope_clause(principal.read_spaces or frozenset(), "n.")
+        clauses.append(clause)
+        params.extend(space_params)
     elif not include_meta and space_id is None:
         clauses.append("n.space_id != ?")
         params.append(META_SPACE_ID)
@@ -866,7 +869,7 @@ def _expand_hits(
         if row is None:
             continue
         if principal is not None and not principal.is_human:
-            if row["space_id"] not in (principal.read_spaces or ()):
+            if not node_readable(principal.read_spaces or frozenset(), row):
                 continue
         elif not include_meta and space_id is None and row["space_id"] == META_SPACE_ID:
             continue
@@ -928,7 +931,9 @@ def search(
         created_after: Only nodes created after this timestamp.
         created_before: Only nodes created before this timestamp.
         include_meta: Include meta-space nodes (the type vocabulary, the
-            spaces themselves) in an unnarrowed search.
+            spaces themselves) in an unnarrowed search. For an agent the
+            spaces themselves are grant-scoped regardless (M3): only the space
+            nodes of spaces it holds grants on are in its read set.
         space: Optional space id or name to narrow the search to. It composes
             with the principal's scope — an agent is still confined to its
             grants, and a space it holds none on does not resolve — so this is
