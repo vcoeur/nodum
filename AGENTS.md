@@ -676,7 +676,9 @@ commands on a saved node for exactly this reason.
   `/api` request — reads included; only `/healthz`, `/api/login` and the
   static UI stay open. Every write is attributed to that principal and **no
   request field, header, or query parameter can set an identity** — a body
-  carrying `{"actor": "agent:x"}` is ignored, not honoured. That absence is
+  carrying `{"actor": "agent:x"}` is refused, never honoured: the typed
+  write routes forbid it outright, and a handler that forwarded one would
+  hit `_write`'s refusal. That absence is
   structural, not a filter: every `principal=` binding in the module is
   `_session_principal(request)`, which reads only what the middleware
   verified into the scope (no principal without a verified session), handlers

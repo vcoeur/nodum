@@ -1168,17 +1168,24 @@ def test_a_smuggled_actor_is_ignored_not_honored(client, fresh_db, smuggled):
     assert [row.actor for row in accepts] == [OWNER_ACTOR]
 
 
-def test_a_smuggled_actor_on_a_create_is_ignored(client, fresh_db):
-    payload = _ok(
-        client.post(
-            "/api/nodes?actor=agent:query",
-            json={"type": "note", "title": "Smuggled", "actor": AGENT, "created_by": AGENT},
-            headers={"X-Actor": AGENT},
-        )
+def test_a_smuggled_actor_on_a_create_is_refused(client, fresh_db):
+    """Property 2 on the create route: a smuggled identity field is refused.
+
+    The create body is validated against an input model with ``extra="forbid"``
+    (finding M1), so an ``actor``/``created_by`` key is a 400 — refused rather
+    than the "inert" the other routes still are, and never honored: nothing is
+    written at all, so nothing can be attributed to the smuggled identity.
+    """
+    before = _events()
+    response = client.post(
+        "/api/nodes?actor=agent:query",
+        json={"type": "note", "title": "Smuggled", "actor": AGENT, "created_by": AGENT},
+        headers={"X-Actor": AGENT},
     )
-    assert payload["created_by"] == OWNER_ACTOR
-    # Landing `active` *is* the human attribution: an agent write lands proposed.
-    assert payload["state"] == "active"
+    assert response.status_code == 400
+    # The refusal wrote nothing — no row, no event — so no identity stuck.
+    assert service.list_nodes(principal=owner()) == []
+    assert _events() == before
 
 
 def test_an_agent_proposal_accepted_over_http_is_a_human_write(client, fresh_db):
@@ -2873,6 +2880,71 @@ def test_edges_list_and_create(client, fresh_db):
         "/api/edges", json={"src_id": a.id, "dst_id": b.id, "type": "relates_to", "confidence": 5}
     )
     assert bad.status_code == 400
+
+
+def test_node_create_rejects_malformed_field_types(client, fresh_db):
+    """M1: caller input that used to reach SQLite as a 500 is a 400 at the boundary.
+
+    A dict body field was bound into SQLite directly, where a list or a dict
+    is an ``InterfaceError`` — a 500 with a "database error" line. Now the
+    input     model refuses the shapes first, and nothing is written either.
+    """
+    before = _events()
+    for body in (
+        {"type": "note", "props": ["a"]},
+        {"type": {"a": 1}},
+        {"type": "note", "content": {"x": 1}},
+        {"type": "note", "title": ["x"]},
+        {"type": "note", "surprise": 1},  # extra="forbid" on the input model
+    ):
+        assert client.post("/api/nodes", json=body).status_code == 400, body
+    assert service.list_nodes(principal=owner()) == []
+    assert _events() == before
+
+
+def test_edge_create_rejects_malformed_confidence_and_props(client, fresh_db):
+    """M1: a non-numeric ``confidence`` and a non-object ``props`` are 400s, and
+    nothing is written (the old ``0 <= "abc"`` was a 500)."""
+    a = service.create_node(type="concept", title="A", principal=owner())
+    b = service.create_node(type="concept", title="B", principal=owner())
+    before = _events()
+
+    for body in (
+        {"src_id": a.id, "dst_id": b.id, "type": "relates_to", "confidence": "abc"},
+        {"src_id": a.id, "dst_id": b.id, "type": "relates_to", "props": ["x"]},
+        {"dst_id": b.id, "type": "relates_to"},  # missing src_id stays a 400
+        {"src_id": a.id, "dst_id": b.id, "type": "relates_to", "surprise": 1},
+    ):
+        assert client.post("/api/edges", json=body).status_code == 400, body
+    assert service.list_edges(principal=owner()) == []
+    assert _events() == before
+
+
+def test_patch_null_semantics(client, fresh_db):
+    """M2: ``title: null`` clears the title; ``content: null``/``props: null``
+    are refused, and absent is distinct from null.
+
+    ``title`` is nullable in the read model, so nulling it is the documented
+    "clears the title" web affordance. ``content`` and ``props`` are not
+    nullable — a null would corrupt read-back, so it is refused rather than
+    stored.
+    """
+    node = _ok(client.post("/api/nodes", json={"type": "note", "title": "T", "content": "c"}))
+    node_id = node["id"]
+
+    cleared = _ok(client.patch(f"/api/nodes/{node_id}", json={"title": None}))
+    assert cleared["title"] is None
+
+    for body in ({"content": None}, {"props": None}, {"title": "x", "bogus": 1}):
+        assert client.patch(f"/api/nodes/{node_id}", json=body).status_code == 400, body
+    still = _ok(client.get(f"/api/nodes/{node_id}"))
+    assert (still["title"], still["content"]) == (None, "c")  # the refusals wrote nothing
+
+    retitled = _ok(client.patch(f"/api/nodes/{node_id}", json={"title": "Back"}))
+    assert retitled["title"] == "Back"
+    only_content = _ok(client.patch(f"/api/nodes/{node_id}", json={"content": "c2"}))
+    assert only_content["title"] == "Back"  # a patch that does not name the title leaves it
+    assert only_content["content"] == "c2"
 
 
 def test_search_and_link_suggestions(client, fresh_db):

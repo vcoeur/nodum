@@ -240,6 +240,67 @@ def test_propose_edges_reports_an_escalation_as_a_failed_suggestion(fresh_db):
     assert service.list_edges(principal=owner()) == []
 
 
+def test_propose_edges_rejects_an_unknown_suggestion_key(fresh_db):
+    """M32: an unknown key is refused with the key named, not silently dropped.
+
+    ``enabled`` is the scar from the batch's own docstring era: the edge used
+    to be written and the key quietly ignored.
+    """
+    a, b = _pair()
+    result = service.propose_edges(
+        [
+            {"src": a.id, "dst": b.id, "edge_type": "relates_to"},
+            {"src": a.id, "dst": b.id, "edge_type": "supports", "enabled": True},
+        ],
+        principal=owner(),
+    )
+    assert [edge.state for edge in result.created] == ["active"]
+    assert len(result.failed) == 1
+    assert result.failed[0].index == 1
+    assert "unknown suggestion key(s): enabled" in result.failed[0].error
+    assert service.list_edges(principal=owner()) == [result.created[0]]
+
+
+def test_propose_edges_a_bad_props_suggestion_writes_nothing(fresh_db):
+    """M32 (B3-adjacent): a bad ``props`` shape fails validation before the insert.
+
+    It used to pass the old per-suggestion parsing, get inserted, then fail
+    ``_edge_out`` — leaving a bricked row that the single batch commit then
+    persisted (the corruption the single-edge path already guards against).
+    """
+    a, b = _pair()
+    before = _count_rows("edges")
+    result = service.propose_edges(
+        [
+            {"src": a.id, "dst": b.id, "edge_type": "relates_to"},
+            {"src": a.id, "dst": b.id, "edge_type": "supports", "props": ["a"]},
+        ],
+        principal=owner(),
+    )
+    assert len(result.created) == 1
+    assert len(result.failed) == 1
+    assert result.failed[0].index == 1
+    # The whole batch committed exactly the one valid edge — no bricked row.
+    assert _count_rows("edges") == before + 1
+    assert [edge.src_id for edge in service.list_edges(principal=owner())] == [a.id]
+
+
+def test_propose_edges_a_bad_confidence_is_a_failed_suggestion_not_a_crash(fresh_db):
+    """M32: ``confidence: "abc"`` used to raise ``TypeError`` inside the loop,
+    uncaught by the per-suggestion handlers — it killed the whole batch."""
+    a, b = _pair()
+    result = service.propose_edges(
+        [
+            {"src": a.id, "dst": b.id, "edge_type": "relates_to"},
+            {"src": a.id, "dst": b.id, "edge_type": "supports", "confidence": "abc"},
+        ],
+        principal=owner(),
+    )
+    assert len(result.created) == 1
+    assert len(result.failed) == 1
+    assert result.failed[0].index == 1
+
+
 def test_a_landing_state_a_write_cannot_land_in_is_refused_once(fresh_db):
     """`archived` is not a landing state, and a batch-level argument fails once."""
     a, b = _pair()

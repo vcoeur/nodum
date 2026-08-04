@@ -24,6 +24,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, NamedTuple
 
+from pydantic import ValidationError
+
 from nodum import auth, db
 from nodum.migrations import BUILTIN_AGENT_PREFIX, MAIN_SPACE_ID, META_SPACE_ID
 from nodum.models import (
@@ -35,6 +37,7 @@ from nodum.models import (
     CycleOut,
     DiffOut,
     EdgeOut,
+    EdgeSuggestionIn,
     EdgeTypeOut,
     EventOut,
     GrantOut,
@@ -1710,6 +1713,26 @@ def create_edge(
         conn.close()
 
 
+def _suggestion_error(exc: ValidationError) -> str:
+    """Map one suggestion's validation failure to the per-suggestion message.
+
+    Unknown keys are named, mirroring the ``unknown search filter(s): …``
+    sentence the MCP server uses for the same kind of caller bug; a missing
+    field keeps the old ``missing key: …`` wording so batch callers matching
+    it keep working. Any other shape failure reports pydantic's own sentence.
+    """
+    errors = exc.errors()
+    unknown = sorted(
+        {str(error["loc"][0]) for error in errors if error["type"] == "extra_forbidden"}
+    )
+    if unknown:
+        return f"unknown suggestion key(s): {', '.join(unknown)}"
+    missing = sorted({str(error["loc"][0]) for error in errors if error["type"] == "missing"})
+    if missing:
+        return f"missing key: {missing[0]}"
+    return errors[0]["msg"]
+
+
 def propose_edges(
     suggestions: list[dict[str, Any]],
     *,
@@ -1720,10 +1743,14 @@ def propose_edges(
     """Write a batch of edge suggestions, one event per edge (design §8.1).
 
     Each suggestion names ``src``, ``dst``, and ``edge_type``, plus optional
-    ``props`` and ``confidence`` — the same inputs as :func:`create_edge`,
-    A malformed suggestion (missing key,
+    ``props`` and ``confidence`` — the same inputs as :func:`create_edge`.
+    A malformed suggestion (missing key, unknown key, bad value shape,
     unknown endpoint/type, bad confidence) lands in ``failed`` with its
     input index; the rest still write. One commit for the whole batch.
+
+    Every suggestion is validated against :class:`EdgeSuggestionIn` **before
+    any write**, so a malformed one can never leave a partial row behind in
+    the single batch commit (finding M32).
 
     Args:
         suggestions: The edges to write, one object each.
@@ -1749,20 +1776,23 @@ def propose_edges(
                 failed.append(ItemFailure(index=index, error="suggestion must be an object"))
                 continue
             try:
+                valid = EdgeSuggestionIn.model_validate(suggestion)
+            except ValidationError as exc:
+                failed.append(ItemFailure(index=index, error=_suggestion_error(exc)))
+                continue
+            try:
                 row = _create_edge_in_conn(
                     conn,
-                    str(suggestion["src"]),
-                    str(suggestion["dst"]),
-                    str(suggestion["edge_type"]),
-                    props=suggestion.get("props"),
-                    confidence=suggestion.get("confidence"),
+                    valid.src,
+                    valid.dst,
+                    valid.edge_type,
+                    props=valid.props,
+                    confidence=valid.confidence,
                     landing=landing,
                     actor=principal.actor_string,
                     store=store,
                 )
                 created.append(_edge_out(row))
-            except KeyError as exc:
-                failed.append(ItemFailure(index=index, error=f"missing key: {exc.args[0]}"))
             except (NodeNotFound, TypeNotFound, ValueError, GrantNotPermitted) as exc:
                 failed.append(ItemFailure(index=index, error=str(exc)))
         conn.commit()

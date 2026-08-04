@@ -156,7 +156,7 @@ from nodum.assets import (
     UnsupportedRendition,
 )
 from nodum.envelope import envelope, list_envelope, render_json
-from nodum.models import CycleDetailOut
+from nodum.models import CycleDetailOut, EdgeCreateIn, NodeCreateIn, NodeUpdateIn
 from nodum.principal import Principal
 from nodum.service import (
     AccountExists,
@@ -1806,15 +1806,16 @@ def create_app(
         field can say otherwise.
         """
         body = await _json_body(request)
+        payload = NodeCreateIn.model_validate(body)
         node = _write(
             request,
             service.create_node,
-            type=_required(body, "type"),
-            title=body.get("title"),
-            content=body.get("content") or "",
-            parent_id=body.get("parent_id"),
-            props=body.get("props"),
-            space=_optional_str(body, "space"),
+            type=payload.type,
+            title=payload.title,
+            content=payload.content,
+            parent_id=payload.parent_id,
+            props=payload.props,
+            space=payload.space,
             path=db_path,
         )
         return EnvelopeResponse(envelope(node))
@@ -1834,9 +1835,24 @@ def create_app(
         return EnvelopeResponse(envelope(result))
 
     async def update_node(request: Request) -> Response:
-        """Update the named fields of a node, and only those."""
+        """Update the named fields of a node, and only those.
+
+        Absent and null are distinct: pydantic records which fields were
+        actually sent, and the handler reads that. ``title: null`` clears the
+        title (a documented web affordance); ``content: null`` and
+        ``props: null`` are refused, because those fields are non-nullable in
+        the read models and a null would corrupt read-back.
+        """
         body = await _json_body(request)
-        fields = {name: body[name] for name in PATCHABLE_FIELDS if name in body}
+        payload = NodeUpdateIn.model_validate(body)
+        fields: dict[str, Any] = {}
+        for name in ("title", "content", "props"):
+            if name not in payload.model_fields_set:
+                continue
+            value = getattr(payload, name)
+            if value is None and name != "title":
+                raise ValueError(f"{name} cannot be null")
+            fields[name] = value
         if not fields:
             raise ValueError(
                 f"nothing to update: send one of {', '.join(repr(f) for f in PATCHABLE_FIELDS)}"
@@ -1885,14 +1901,15 @@ def create_app(
     async def create_edge(request: Request) -> Response:
         """Create a typed, directed edge between two nodes."""
         body = await _json_body(request)
+        payload = EdgeCreateIn.model_validate(body)
         edge = _write(
             request,
             service.create_edge,
-            str(_required(body, "src_id")),
-            str(_required(body, "dst_id")),
-            str(_required(body, "type")),
-            props=body.get("props"),
-            confidence=body.get("confidence"),
+            payload.src_id,
+            payload.dst_id,
+            payload.type,
+            props=payload.props,
+            confidence=payload.confidence,
             path=db_path,
         )
         return EnvelopeResponse(envelope(edge))

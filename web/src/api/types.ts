@@ -787,7 +787,8 @@ export interface CreateNodeBody {
  * Body for `PATCH /api/nodes/{id}` (mirrors `service.update_node`).
  *
  * Only the keys present are changed — omitting a key is not the same as
- * sending null, which clears it.
+ * sending one. Sending `title: null` clears the title; `content` and `props`
+ * are non-nullable and a null value for either is refused server-side.
  */
 export interface UpdateNodeBody {
   title?: string | null;

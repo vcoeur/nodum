@@ -8,7 +8,80 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
+
+
+class NodeCreateIn(BaseModel):
+    """A node as a client asks to create it.
+
+    ``type`` is required; the other fields mirror :func:`nodum.service.create_node`
+    and its defaults. ``extra="forbid"`` makes a misspelled key a 400 rather
+    than a silently dropped field — the web client sends exactly the keys
+    above, and anything else is a caller bug (finding M1).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: str
+    title: str | None = None
+    content: str = ""
+    parent_id: str | None = None
+    props: dict[str, Any] = {}
+    space: str | None = None
+
+
+class EdgeCreateIn(BaseModel):
+    """An edge as a client asks to create it.
+
+    ``confidence`` is deliberately unbounded here: the ``[0, 1]`` range is the
+    service's rule, kept there so the refusal message is the service's own
+    (finding M1). ``extra="forbid"`` for the same reason as :class:`NodeCreateIn`.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    src_id: str
+    dst_id: str
+    type: str
+    props: dict[str, Any] | None = None
+    confidence: float | None = None
+
+
+class NodeUpdateIn(BaseModel):
+    """The fields a node update may change — an allowlist, as the handler's.
+
+    Absent and null are deliberately distinct, and pydantic records which
+    fields were actually sent (``model_fields_set``) so the handler can tell
+    "don't touch this" from "clear this". A null ``title`` clears the title —
+    a documented web affordance — while a null ``content`` or ``props`` is
+    refused by the handler, since those fields are non-nullable in
+    :class:`NodeOut` (finding M2).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    title: str | None = None
+    content: str | None = None
+    props: dict[str, Any] | None = None
+
+
+class EdgeSuggestionIn(BaseModel):
+    """One edge suggestion in a batch proposal (``propose_edges``).
+
+    The same inputs as :class:`EdgeCreateIn` under the batch's key names
+    (``src``/``dst``/``edge_type``). Every suggestion is validated against
+    this model **before any write**, so a malformed one fails with nothing
+    persisted, and unknown keys are refused (``extra="forbid"``) rather than
+    silently dropped — the defect finding M32 exists to close.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    src: str
+    dst: str
+    edge_type: str
+    props: dict[str, Any] | None = None
+    confidence: float | None = None
 
 
 class NodeOut(BaseModel):
