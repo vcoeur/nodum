@@ -189,7 +189,13 @@ class VersionNotFound(RecordNotFound):
 
 
 class AccountExists(ValueError):
-    """Raised when an account id is already taken (a duplicate ``agent create``)."""
+    """Raised when an account name is already taken.
+
+    Both halves of the account model, for the same reason and mapped to the
+    same 409: an agent's name *is* its id (a duplicate ``agent create``), and a
+    human's name is its login handle (a duplicate ``human create``, which used
+    to be storable and killed HTTP login for that name outright).
+    """
 
 
 class SpaceNameTaken(ValueError):
@@ -4134,9 +4140,12 @@ def record_auth_event(
     actor filter to separate the forgeries out, and one would not help, because
     it would be filtering on a column the attempt chose. The log's other readers
     are worse ground to stand on, not better: they read it to *decide*
-    something — :func:`_gardener_created` classifies a node's provenance by
-    comparing ``events.actor`` to :data:`GARDENER_ACTOR`, migration
-    ``0010_principals`` derived the agent roster from ``actor LIKE 'agent:%'``,
+    something — :func:`_synthesized_creation_ids` settles whether a node is a
+    synthesis at all by requiring its create event's ``actor`` to equal
+    :data:`GARDENER_ACTOR` (that comparison is the whole of the check that
+    ``props.synthesized`` is not a forgery, and the review path settles a
+    synthesis's membership edges on its answer), migration ``0010_principals``
+    derived the agent roster from ``actor LIKE 'agent:%'``,
     :func:`login_failure_count` counts by ``op`` and the payload's name, and the
     undo/rollback readers select by ``seq`` and ``cycle_id`` — so a
     caller-chosen ``actor`` is a column machine decisions run on, not merely one
@@ -4985,6 +4994,15 @@ def create_human(name: str, *, principal: Principal, path: str | Path | None = N
             the same ceiling ``POST /api/login`` refuses a claimed name above,
             enforced here so a name this stores is always a name that route
             will look at.
+        AccountExists: If a human already answers to ``name``. The name is the
+            login handle — :func:`nodum.auth.verify_login` resolves an account
+            by it, ids being random hex nobody types at a prompt — and a name
+            two accounts share resolves to neither. Without this refusal
+            ``nodum human create owner`` killed HTTP login for ``owner``
+            permanently: no verb removes or renames a human, and the ambiguity
+            is refused ahead of the ``disabled`` check, so disabling the clone
+            was no cure either. Migration ``0019_unique_human_names`` is the
+            constraint under this check.
     """
     if len(name) > MAX_HUMAN_NAME_LENGTH:
         # Never echo the name back: a message quoting a 200 kB argument moves it
@@ -4993,6 +5011,12 @@ def create_human(name: str, *, principal: Principal, path: str | Path | None = N
     conn = _connect(path)
     try:
         actor = _admin_actor(conn, principal)
+        # Ahead of the INSERT so the answer is a 409 naming the conflict rather
+        # than 0019's index surfacing as a bare IntegrityError under a 500 —
+        # `create_agent`'s rule (Q13 review S14). Quoting the name back is safe
+        # here and not above: the ceiling has already been enforced.
+        if conn.execute("SELECT 1 FROM humans WHERE name = ?", (name,)).fetchone():
+            raise AccountExists(f"a human named {name!r} already exists")
         human_id = uuid.uuid4().hex[:12]
         conn.execute("INSERT INTO humans (id, name) VALUES (?, ?)", (human_id, name))
         row = conn.execute("SELECT * FROM humans WHERE id = ?", (human_id,)).fetchone()

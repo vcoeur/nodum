@@ -19,16 +19,20 @@ dependencies = [
     # the B1 shape, one dependency-tree change away from a fresh install that
     # cannot import.
     #
-    # The floor is 4.2 and it is **measured, not guessed**: `http_api` builds
-    # its login limiter at module level, and `anyio.CapacityLimiter(2)` outside
-    # a running event loop raises `AsyncLibraryNotFoundError` on 4.0 and 4.1
-    # and returns a `CapacityLimiterAdapter` from 4.2 on (checked by installing
-    # each). So `>=4` would let a resolver pick a version where importing
-    # `nodum.http_api` raises — `nodum serve` dead on a fresh install, which is
-    # precisely the failure this whole declaration exists to prevent. It was
-    # written as `>=4` for one commit, on the reasoning that the narrower bound
-    # was an unverified claim; the answer to an unverified bound is to verify
-    # it, not to widen it until it is vacuous.
+    # The floor is 4.2 because that is where the behaviour this package relies
+    # on arrives, measured by installing each: `http_api` builds its argon2
+    # limiter at module level, and `anyio.CapacityLimiter(2)` outside a running
+    # event loop raises `AsyncLibraryNotFoundError` on 4.0 and 4.1, returning a
+    # `CapacityLimiterAdapter` from 4.2 on.
+    #
+    # **It is inert today and declared anyway.** `mcp>=1.28.1` requires
+    # `anyio>=4.5` and `sse-starlette` requires `>=4.7.0`, so no resolution
+    # reachable from this file can land below 4.5 whatever this line says —
+    # `>=4` and `>=4.2` produce the identical lock. That is a fact about other
+    # people's metadata, which is the whole reason to write our own bound down:
+    # the day `mcp` relaxes its floor, this line is what stops the resolver
+    # walking into a version where importing `nodum.http_api` raises. A bound
+    # that is currently unreachable is not a bound that is wrong.
     "anyio>=4.2,<5",
     "argon2-cffi>=23",         # ceiling-tested: year-major versioning, API stable for a decade
     "mcp>=1.28.1,<2",          # mcp 2.0.0 removed mcp.server.fastmcp, which nodum.mcp_server imports
@@ -111,6 +115,13 @@ dev = [
     "pyright>=1.1.411",
     "pytest>=9.0.2",
     "pytest-cov>=6.0",
+    # Test-only, and deliberately not a runtime dependency: the one consumer is
+    # tests/test_docs.py, which reads .github/workflows/*.yml to assert the tag
+    # gate is not weaker than the PR gate. That test hand-parsed YAML with
+    # regexes to avoid this line, and the hand parser was caught silently
+    # mis-reading a workflow in three consecutive reviews — in the one test
+    # whose purpose is catching silent drift. See that module's docstring.
+    "pyyaml>=6,<7",            # 6.x since 2021; a 7.0 would be the breaking major
     "ruff>=0.15.2",
 ]
 # The docs gate, declared so `make docs` can run it the way CI does. Exact

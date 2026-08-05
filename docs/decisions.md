@@ -2330,3 +2330,44 @@ compared by their `run:` steps with the release side required to be a superset.
 Two exemptions are named and load-bearing rather than decorative — `npm audit`
 (an advisory published overnight must not block a tag) and `docs.yml`'s deploy
 job (never a PR check).
+
+## 2026-08-05 — the workflow gate stopped hand-parsing YAML, after three silent mis-reads
+
+`tests/test_docs.py` asserts a tag push runs every check a pull request runs. It
+read `.github/workflows/*.yml` with regexes, to avoid a dependency. Three
+consecutive adversarial reviews found it **silently mis-reading** the files it
+audits:
+
+- `run: |` matched the regex and recorded the command as the literal string
+  `"|"`, so two entirely different block scalars compared equal;
+- then nine more at once — a flow-mapping step dropped whole, a `uses:`-only job
+  read as running nothing, anchors and aliases compared as literal text, a
+  truncated quoted scalar, `run: |2`, a `with: run:` action input counted as a
+  shell command, a duplicate job id, two top-level `jobs:` keys;
+- then a plain multi-line `run:` truncated to its first line, which is the one
+  that decided it: `uv run --locked ruff check` continued with `.` on the next
+  line compared **equal** to a release side weakened to `--exit-zero`. The gate
+  reported parity while the tag ran a check the pull request did not.
+
+Each round the parser was made stricter and each round it was still wrong
+somewhere else, in the one test whose entire purpose is catching silent drift.
+That is the argument for the dependency, and it is worth more than the
+dependency costs: `pyyaml` is in the `dev` group — never `[project]
+.dependencies`, verified by reading `Requires-Dist` out of the built wheel — and
+the parser is 409 lines lighter.
+
+The switch also *widened* what the gate accepts. The hand parser refused flow
+mappings, anchors, a `run:` under `with:` and a quoted `"on":` key outright;
+those are legal workflow YAML and now pass. Two behaviours are deliberate rather
+than inherited: PyYAML is YAML 1.1, so a bare `on:` key parses as the boolean
+`True` and the trigger reader accepts both spellings while refusing a file
+carrying both; and the loader **raises on a duplicate mapping key** instead of
+taking YAML's last-wins, because either reading means the file says something
+other than what it runs.
+
+What is compared is job presence and the `run:` commands of same-named jobs,
+release required to be a superset. What is **not**: `shell:`,
+`working-directory:`, `env:`, `if:`, step names, `uses:` steps, matrix legs and
+step order. A release job could run byte-identical commands behind `if: false`
+and still count — stated in the test's own docstring rather than left for the
+next review to find.

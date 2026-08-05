@@ -103,11 +103,20 @@ a name inside fifteen minutes refuse further attempts for that name with a
 429 until the window slides past them — a guesser is limited to a handful
 of tries per name per quarter-hour, and a name that does not exist locks
 exactly like a real one, so the lockout cannot be used to probe the file.
-Every attempt, success and failure alike, is written to the event log
+Every attempt **that reaches a password check** is written to the event log
 (``human.login`` / ``human.login_failed`` / ``human.logout``) — the auth
 half of the audit trail — so who tried the password is on record even though
-the password itself never is. ``nodum serve`` says so at startup rather than
-leaving it implicit.
+the password itself never is. The qualifier is exact and load-bearing: the two
+refusals that never reach a check write nothing at all. A name already under
+lockout is refused with a 429 and no row, deliberately (see :func:`login`: an
+unauthenticated caller must not be able to append to an append-only log at
+will, and a guesser must not be able to hold the real human out by re-arming
+the window forever); and a body whose name or password is over the service's
+length cap is the ordinary 400 a malformed request gets, ahead of the lockout
+query and ahead of the log. Seven attempts against one name therefore leave
+five rows. What is on record is every attempt that cost an argon2 verification,
+which is the set the audit trail is for. ``nodum serve`` says so at startup
+rather than leaving it implicit.
 
 Most handlers call the service inline: the service opens one short-lived
 connection per call and SQLite has a single writer anyway, so a local
@@ -272,10 +281,19 @@ LOGIN_PATH = "/api/login"
 #: in the table above claimed a different one.
 #:
 #: Two, because the memory is the scarce thing and the latency is what this
-#: surface can afford to spend: a second token is enough that a login never
-#: waits on the *other* argon2 call — a password being set — and the worst case
-#: stays ~128 MiB of argon2 rather than gigabytes. What it does not buy is a
-#: queue-free login under load; that cost is stated where the limiter is.
+#: surface can afford to spend: the worst case stays ~128 MiB of argon2 rather
+#: than gigabytes, and a login sharing the process with a *single* password
+#: being set still finds the second token free.
+#:
+#: It does not make the login independent of that other caller, and this used to
+#: claim it did. The queue is one FIFO over both routes, and the password hop
+#: holds its token for the whole of :func:`_write` — the hash, the human-only
+#: check, the session delete, the event and the commit — not for the hash alone.
+#: Measured: 8 concurrent ``POST /api/humans/{id}/password`` put the owner's own
+#: correct login at **0.572 s**, against 0.10 s idle. That is the same queueing a
+#: flood of logins produces, from an authenticated caller instead of an anonymous
+#: one; what this number bounds is the memory, not the wait. What it does not buy
+#: is a queue-free login under load; that cost is stated where the limiter is.
 #: Raising it buys throughput on two routes nobody should be calling in bulk.
 ARGON2_CONCURRENCY = 2
 

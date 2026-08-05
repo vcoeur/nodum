@@ -4773,6 +4773,29 @@ def test_humans_list_and_create(client, fresh_db):
     assert client.post("/api/humans", json={}).status_code == 400
 
 
+def test_a_second_human_cannot_take_the_login_name_of_the_first(client, fresh_db):
+    """This route could end a human's login over HTTP, with one well-formed body.
+
+    `humans.name` is the login handle and `auth.verify_login` refuses a name
+    that resolves to two accounts, so `POST /api/humans {"name": "owner"}` used
+    to answer 200 and take `POST /api/login` away for `owner` for good — no
+    route here removes or renames a human, and disabling the clone is no cure
+    because the ambiguity is refused ahead of the `disabled` check.
+
+    A taken name is a **409**, not a 400: the request is well-formed and the
+    caller may retry with another one, exactly as a taken agent id and a taken
+    space name already are.
+    """
+    clash = client.post("/api/humans", json={"name": "owner"})
+
+    assert clash.status_code == 409
+    assert clash.json()["error"]["type"] == "AccountExists"
+    assert "a human named 'owner' already exists" in clash.json()["error"]["message"]
+    assert _ok(client.get("/api/humans"))["count"] == 1
+    # And the login the duplicate would have killed still answers.
+    _login(client.app, "owner", OWNER_PASSWORD)
+
+
 def test_human_password_disable_enable(client, fresh_db):
     second = service.create_human("second", principal=owner())
 

@@ -320,6 +320,7 @@ def test_0012_applies_to_a_populated_database_already_at_0011(tmp_path, monkeypa
             "0016_conventions_and_annotations",
             "0017_projector_skips",
             "0018_events_op_index",
+            "0019_unique_human_names",
         ]
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
         conn.execute(
@@ -440,6 +441,7 @@ def test_0013_applies_to_a_populated_database_holding_duplicate_space_titles(tmp
             "0016_conventions_and_annotations",
             "0017_projector_skips",
             "0018_events_op_index",
+            "0019_unique_human_names",
         ]
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
         titles = dict(
@@ -518,6 +520,7 @@ def test_0013_finds_a_free_name_when_the_deduping_rename_would_itself_collide(
             "0016_conventions_and_annotations",
             "0017_projector_skips",
             "0018_events_op_index",
+            "0019_unique_human_names",
         ]
         titles = dict(
             conn.execute("SELECT id, title FROM nodes WHERE id LIKE 'sp-%' ORDER BY id").fetchall()
@@ -570,6 +573,7 @@ def test_0013_deduplicates_a_title_that_is_another_spaces_id(tmp_path, monkeypat
             "0016_conventions_and_annotations",
             "0017_projector_skips",
             "0018_events_op_index",
+            "0019_unique_human_names",
         ]
         titles = dict(
             conn.execute("SELECT id, title FROM nodes WHERE id LIKE 'sp-%' ORDER BY id").fetchall()
@@ -872,6 +876,7 @@ def test_0014_applies_to_a_populated_database_already_at_0013(tmp_path, monkeypa
             "0016_conventions_and_annotations",
             "0017_projector_skips",
             "0018_events_op_index",
+            "0019_unique_human_names",
         ]
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
         conn.execute(
@@ -1000,6 +1005,7 @@ def test_0014_lets_an_ordinary_agent_id_through(tmp_path, monkeypatch):
             "0016_conventions_and_annotations",
             "0017_projector_skips",
             "0018_events_op_index",
+            "0019_unique_human_names",
         ]
     finally:
         conn.close()
@@ -1134,6 +1140,7 @@ def test_0015_applies_to_a_populated_database_already_at_0014(tmp_path, monkeypa
             "0016_conventions_and_annotations",
             "0017_projector_skips",
             "0018_events_op_index",
+            "0019_unique_human_names",
         ]
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
     finally:
@@ -1224,6 +1231,7 @@ def test_the_missing_stop_columns_are_refused_with_the_statements_that_add_them(
             "0016_conventions_and_annotations",
             "0017_projector_skips",
             "0018_events_op_index",
+            "0019_unique_human_names",
         ]
 
         # And the repaired file enforces the coherence the CHECK exists for, so
@@ -1278,6 +1286,7 @@ def test_a_half_applied_0015_is_repaired_without_re_adding_the_column_it_has(tmp
             "0016_conventions_and_annotations",
             "0017_projector_skips",
             "0018_events_op_index",
+            "0019_unique_human_names",
         ]
     finally:
         conn.close()
@@ -2492,6 +2501,7 @@ def test_0016_applies_to_a_populated_database_already_at_0015(tmp_path, monkeypa
             "0016_conventions_and_annotations",
             "0017_projector_skips",
             "0018_events_op_index",
+            "0019_unique_human_names",
         ]
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
     finally:
@@ -2681,7 +2691,11 @@ def test_a_database_recorded_at_0016_without_the_table_is_refused(tmp_path, monk
         # any later migration over a whole schema.
         conn.executescript(db.ANNOTATIONS_TABLE_SQL)
         conn.commit()
-        assert db.init_db(conn) == ["0017_projector_skips", "0018_events_op_index"]
+        assert db.init_db(conn) == [
+            "0017_projector_skips",
+            "0018_events_op_index",
+            "0019_unique_human_names",
+        ]
     finally:
         conn.close()
 
@@ -2730,7 +2744,11 @@ def test_a_database_recorded_at_0016_without_the_conventions_space_is_refused(
         # grant intact, since it was the space that was missing, not the row.
         conn.execute(db.CONVENTIONS_SPACE_SQL)
         conn.commit()
-        assert db.init_db(conn) == ["0017_projector_skips", "0018_events_op_index"]
+        assert db.init_db(conn) == [
+            "0017_projector_skips",
+            "0018_events_op_index",
+            "0019_unique_human_names",
+        ]
         assert (
             conn.execute(
                 "SELECT 1 FROM nodes WHERE id = ? AND type_id = 'space'",
@@ -2780,8 +2798,159 @@ def test_a_database_recorded_at_0016_without_the_gardener_grant_is_refused(tmp_p
         # by the cycle the way 0016 designed it.
         conn.execute(db.CONVENTIONS_GRANT_SQL)
         conn.commit()
-        assert db.init_db(conn) == ["0017_projector_skips", "0018_events_op_index"]
+        assert db.init_db(conn) == [
+            "0017_projector_skips",
+            "0018_events_op_index",
+            "0019_unique_human_names",
+        ]
         assert auth.internal_principal().level_on("conventions") == EDIT
+    finally:
+        conn.close()
+
+
+# ── 0019: one human per login name ───────────────────────────────────────────
+
+
+def _at_0018(tmp_path, monkeypatch, filename):
+    """Build a populated database stopped at ``0018``, and return its path."""
+    path = tmp_path / filename
+    monkeypatch.setenv("NODUM_DB", str(path))
+    monkeypatch.setattr(db, "MIGRATIONS", _prefix_through("0018_events_op_index"))
+    service.init()
+    return path
+
+
+def test_0019_applies_to_a_populated_database_holding_duplicate_login_names(tmp_path, monkeypatch):
+    """The upgrade has to cope with the very state the check above now forbids.
+
+    `nodum human create owner` was a supported write until this release, so a
+    real file can hold two accounts under one login name — and `CREATE UNIQUE
+    INDEX` over them fails with a bare IntegrityError, rolling the upgrade back
+    and leaving the login as dead as it found it. The migration dedupes first,
+    and it **renames** rather than disables: a duplicate name is no reason to
+    take an account away from whoever owns it.
+
+    The tie-break is what the fixture is built to pin, because it is a *choice*
+    rather than a preservation — nothing resolves to the duplicated name today,
+    which is the defect. It hands the name to the account that can use it for a
+    login: enabled before disabled, password-holding before passwordless, then
+    oldest. Both losing keys are seeded *older* than the winner here, so a
+    tie-break that ranked on `created_at` alone would take the name off the one
+    row that can present a password with it.
+    """
+    _at_0018(tmp_path, monkeypatch, "at0018.db")
+    service.set_human_password("owner", "owner-password", principal=owner())
+    conn = db.connect()
+    try:
+        conn.executescript(
+            "INSERT INTO humans (id, name, credential_hash, disabled, created_at) VALUES"
+            "  ('h-clone', 'owner',  NULL, 0, '2025-11-01'),"
+            "  ('h-off',   'shared', 'x',  1, '2025-11-02'),"
+            "  ('h-bare',  'shared', NULL, 0, '2025-11-03'),"
+            "  ('h-live',  'shared', 'x',  0, '2026-01-01');"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    # The state the migration is for: the seeded owner's own correct password
+    # answers with a refusal, and nothing but this upgrade takes it back.
+    with pytest.raises(auth.InvalidCredentials):
+        auth.verify_login("owner", "owner-password")
+
+    monkeypatch.setattr(db, "MIGRATIONS", MIGRATIONS)
+    conn = db.connect()
+    try:
+        assert db.init_db(conn) == ["0019_unique_human_names"]
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+        names = dict(conn.execute("SELECT id, name FROM humans ORDER BY id").fetchall())
+    finally:
+        conn.close()
+
+    # The account holding the password keeps the handle; the passwordless clone
+    # is renamed to something unique and self-explaining.
+    assert names["owner"] == "owner"
+    assert names["h-clone"] == "owner (h-clone)"
+    # And among three: the disabled row cannot log in at all and the
+    # passwordless one cannot log in over HTTP, so neither takes the name off
+    # the row that can — even though both are older than it.
+    assert names["h-live"] == "shared"
+    assert names["h-off"] == "shared (h-off)"
+    assert names["h-bare"] == "shared (h-bare)"
+
+    # Which is the point of the whole migration: the login the duplicate killed
+    # answers again, and it answers as the account it always meant.
+    assert auth.verify_login("owner", "owner-password").id == "owner"
+    # Every loser is still an account — administrable by id, and reachable under
+    # the name it came out with.
+    service.set_human_password("h-clone", "clone-password", principal=owner())
+    assert auth.verify_login("owner (h-clone)", "clone-password").id == "h-clone"
+
+
+def test_0019_finds_a_free_name_when_the_deduping_rename_would_itself_collide(
+    tmp_path, monkeypatch
+):
+    """`<name> (<id>)` is unique among losers, but not against what is there.
+
+    0013's second property, on the login-name half: a database holding two
+    accounts called `alice` plus one literally named `alice (h-b)` would make
+    the dedupe generate a name the index then refuses — the IntegrityError this
+    migration exists to prevent, arriving from the repair itself. So the free
+    name is searched, not assumed.
+    """
+    _at_0018(tmp_path, monkeypatch, "collide.db")
+    conn = db.connect()
+    try:
+        conn.executescript(
+            "INSERT INTO humans (id, name, created_at) VALUES"
+            "  ('h-a', 'alice',         '2026-01-01'),"
+            "  ('h-b', 'alice',         '2026-01-02'),"
+            "  ('h-c', 'alice (h-b)',   '2026-01-03'),"
+            "  ('h-d', 'alice (h-b) 1', '2026-01-04');"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    monkeypatch.setattr(db, "MIGRATIONS", MIGRATIONS)
+    conn = db.connect()
+    try:
+        assert db.init_db(conn) == ["0019_unique_human_names"]
+        names = dict(conn.execute("SELECT id, name FROM humans ORDER BY id").fetchall())
+    finally:
+        conn.close()
+
+    # The base and the first suffix are both taken, so the search walks past
+    # them rather than generating a name the index refuses.
+    assert names["h-a"] == "alice"
+    assert names["h-b"] == "alice (h-b) 2"
+    assert names["h-c"] == "alice (h-b)"
+    assert names["h-d"] == "alice (h-b) 1"
+
+
+def test_0019_guards_the_login_names_it_deduped(fresh_db):
+    """The service refuses a duplicate; this is the constraint under that check.
+
+    `service.create_human` reads the name free and inserts on a short-lived
+    connection of its own, so two concurrent creates can both pass the read. A
+    rule `auth.verify_login` depends on belongs in the schema, exactly as
+    `agents` takes its uniqueness from a key rather than from whichever writer
+    happens to be in front of it.
+    """
+    conn = db.connect()
+    try:
+        conn.execute("INSERT INTO humans (id, name) VALUES ('h-a', 'alice')")
+        with pytest.raises(sqlite3.IntegrityError, match="UNIQUE"):
+            conn.execute("INSERT INTO humans (id, name) VALUES ('h-b', 'alice')")
+        # A disabled account keeps its name inside the index: `enable_human` is
+        # supported, so a name freed by a disable would collide the moment the
+        # account came back.
+        conn.execute("UPDATE humans SET disabled = 1 WHERE id = 'h-a'")
+        with pytest.raises(sqlite3.IntegrityError, match="UNIQUE"):
+            conn.execute("INSERT INTO humans (id, name) VALUES ('h-c', 'alice')")
+        # Exact, never case-folded — as tight as `verify_login`'s `name = ?`
+        # under BINARY collation, and no tighter.
+        conn.execute("INSERT INTO humans (id, name) VALUES ('h-d', 'Alice')")
+        conn.commit()
     finally:
         conn.close()
 

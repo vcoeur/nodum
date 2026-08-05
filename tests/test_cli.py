@@ -723,6 +723,27 @@ def test_human_create_and_passwd_refuse_what_no_login_could_present(fresh_db):
     ]
 
 
+def test_human_create_refuses_a_name_that_is_already_a_login(fresh_db):
+    """One command could take a human's own login away, permanently.
+
+    `humans.name` is the login handle and `auth.verify_login` refuses a name
+    that resolves to two accounts, so `nodum human create owner` used to exit 0
+    and leave `POST /api/login` answering the seeded owner's own correct
+    password with a 401 — for good, since no verb removes or renames a human
+    and the ambiguity is refused ahead of the `disabled` check. It reads like a
+    taken agent id now: one readable line and exit 1, never a traceback.
+    """
+    service.set_human_password("owner", "owner-password", principal=owner())
+
+    refused = runner.invoke(app, ["human", "create", "owner", "--as", "owner"])
+
+    assert refused.exit_code == 1
+    assert "a human named 'owner' already exists" in refused.stderr
+    assert isinstance(refused.exception, SystemExit)
+    assert _run_json("human", "list", "--as", "owner")["count"] == 1
+    assert auth.verify_login("owner", "owner-password").id == "owner"
+
+
 def test_agent_create_has_no_kind_flag_at_all(fresh_db):
     """The flag's one non-default value became a permanent refusal, so it is gone.
 

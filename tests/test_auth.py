@@ -74,11 +74,64 @@ def test_verify_login_refuses_a_passwordless_account(fresh_db):
         auth.verify_login("owner", "anything")
 
 
+def test_a_second_human_cannot_take_a_name_that_is_already_a_login(fresh_db):
+    """A supported write must not be able to end a human's login for good.
+
+    `humans.name` is the login handle — `verify_login` resolves the account by
+    it, ids being random hex nobody types — and it refuses a name matching more
+    than one row, because "which human is this session?" has no other answer. So
+    `nodum human create owner`, an ordinary human-only write over the CLI or
+    `POST /api/humans`, used to end HTTP login for `owner` on the spot. And
+    permanently: the human verbs are create/list/passwd/disable/enable, none of
+    them removes or renames an account, and the ambiguity is refused *ahead* of
+    the `disabled` check, so disabling the clone freed nothing. Hand SQL was the
+    only way back.
+    """
+    service.set_human_password("owner", "owner-password", principal=owner())
+    assert auth.verify_login("owner", "owner-password").id == "owner"
+
+    with pytest.raises(service.AccountExists, match="owner"):
+        service.create_human("owner", principal=owner())
+
+    assert auth.verify_login("owner", "owner-password").id == "owner"
+    assert [human.id for human in service.list_humans(principal=owner())] == ["owner"]
+    # Exactly as tight as the lookup and no tighter: `verify_login` compares
+    # under SQLite's BINARY collation, so a name differing in case is a
+    # different name — refusing it would refuse a pair the login tells apart.
+    assert service.create_human("Owner", principal=owner()).name == "Owner"
+
+
+def _duplicate_the_owners_name(password: str) -> str:
+    """Give a second account the name `owner`, past the index that forbids it.
+
+    `service.create_human` refuses the duplicate and
+    `0019_unique_human_names` refuses it again underneath, so the only file
+    that can hold this state is one whose unique index somebody dropped by
+    hand — which is exactly the file `verify_login`'s ambiguity refusal is
+    left standing for. Returns the twin's id.
+    """
+    twin = service.create_human("twin", principal=owner())
+    service.set_human_password(twin.id, password, principal=owner())
+    conn = db.connect()
+    try:
+        conn.execute("DROP INDEX idx_humans_name")
+        conn.execute("UPDATE humans SET name = 'owner' WHERE id = ?", (twin.id,))
+        conn.commit()
+    finally:
+        conn.close()
+    return twin.id
+
+
 def test_verify_login_refuses_an_ambiguous_name(fresh_db):
-    """Two accounts sharing a name can neither log in: which human would it be?"""
-    human = service.create_human("owner", principal=owner())
+    """Two accounts sharing a name can neither log in: which human would it be?
+
+    Unreachable through any surface since `0019_unique_human_names`; this is the
+    hand-edited file the branch is belt and braces for. It stays a refusal
+    rather than relaxing to a `LIMIT 1`, and this is why: on that file, picking
+    a row hands out a session on an account whose password was never presented.
+    """
     service.set_human_password("owner", "first-pw", principal=owner())
-    service.set_human_password(human.id, "second-pw", principal=owner())
+    _duplicate_the_owners_name("second-pw")
 
     for password in ("first-pw", "second-pw"):
         with pytest.raises(auth.InvalidCredentials):
@@ -92,9 +145,8 @@ def _seed_login_failure(case: str) -> tuple[str, str]:
     if case == "passwordless":
         return "owner", "some-pw"
     if case == "ambiguous name":
-        twin = service.create_human("owner", principal=owner())
         service.set_human_password("owner", "first-pw", principal=owner())
-        service.set_human_password(twin.id, "second-pw", principal=owner())
+        _duplicate_the_owners_name("second-pw")
         return "owner", "first-pw"
     if case == "wrong password":
         service.set_human_password("owner", "right-pw", principal=owner())
