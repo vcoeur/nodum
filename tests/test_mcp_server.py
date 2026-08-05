@@ -206,7 +206,10 @@ def test_no_tool_description_advertises_a_tool_that_is_not_registered(fresh_db):
     # ``…`` roles this citation test reads, so the exemption is by section, not
     # by spelling).
     tier_paragraph = (mcp_server.__doc__ or "").split("**Four tiers are never")[0]
-    named = {ghost for ghost in UNREGISTERED_TOOLS if f"``{ghost}``" in tier_paragraph}
+    # Through `cited`, which matches one backtick or two: this paragraph carries
+    # no ghost in either spelling today, so the wider test is free and a
+    # single-backticked reintroduction cannot slip past it.
+    named = cited(tier_paragraph)
     assert not named, (
         f"the module docstring's contract paragraph names unregistered tool(s) {sorted(named)} — "
         "it is the first thing a maintainer reads about this surface"

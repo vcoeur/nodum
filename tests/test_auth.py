@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
+import threading
+import uuid
+from unittest import mock
 
 import pytest
 from helpers import OWNER_ACTOR, agent, owner
@@ -72,6 +76,69 @@ def test_verify_login_failures_are_all_invalid_credentials(fresh_db, name, passw
 def test_verify_login_refuses_a_passwordless_account(fresh_db):
     with pytest.raises(auth.InvalidCredentials):
         auth.verify_login("owner", "anything")
+
+
+def test_a_create_that_loses_the_name_race_is_a_409_and_not_a_500(fresh_db):
+    """The index, not the read, is what holds uniqueness — and it answers the same way.
+
+    `create_human` reads the name free and INSERTs on its own short-lived
+    connection, so the two are separate lock acquisitions: two processes sharing
+    the file — a CLI beside a running server, or two servers — both find the name
+    free and both insert. `0019` refuses the second, and without translation that
+    refusal reached the caller as `sqlite3.IntegrityError`, which the HTTP map
+    renders as a **500** `database error: UNIQUE constraint failed: humans.name`
+    where the unraced duplicate gives a 409. Same outcome, described in a way the
+    caller cannot act on.
+
+    Threads rather than processes because they are enough: each call opens its
+    own connection, which is the whole mechanism. The branch was verified by hand
+    and had no test, in a change whose thesis is that a gate nobody checks is a
+    claim.
+    """
+    outcomes: list[str] = []
+
+    def create() -> None:
+        try:
+            service.create_human("racy", principal=owner())
+            outcomes.append("created")
+        except service.AccountExists:
+            outcomes.append("AccountExists")
+        except Exception as exc:  # noqa: BLE001 - the point is which class arrives
+            outcomes.append(type(exc).__name__)
+
+    threads = [threading.Thread(target=create) for _ in range(6)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert outcomes.count("created") == 1, outcomes
+    assert set(outcomes) == {"created", "AccountExists"}, (
+        f"a lost race must be the same refusal the read gives, got {sorted(set(outcomes))}"
+    )
+    racy = [human for human in service.list_humans(principal=owner()) if human.name == "racy"]
+    assert len(racy) == 1
+
+
+def test_a_create_whose_id_collides_is_not_reported_as_a_taken_name(fresh_db):
+    """The translation is scoped to the name index; any other integrity failure is a bug.
+
+    `create_human` narrows its `IntegrityError` on `humans.name`, so a primary-key
+    collision — a different failure entirely — still surfaces as itself rather
+    than as a name somebody else holds.
+    """
+    taken = service.create_human("first", principal=owner())
+
+    with (
+        mock.patch.object(service.uuid, "uuid4", return_value=uuid.UUID(int=0)),
+        pytest.raises(sqlite3.IntegrityError, match="humans.id"),
+    ):
+        # Both creates mint the same id; the second collides on the primary key.
+        service.create_human("second", principal=owner())
+        service.create_human("third", principal=owner())
+
+    assert {human.name for human in service.list_humans(principal=owner())} >= {"first"}
+    assert taken.name == "first"
 
 
 def test_a_second_human_cannot_take_a_name_that_is_already_a_login(fresh_db):
