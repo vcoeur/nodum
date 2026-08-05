@@ -4,13 +4,17 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
+import threading
+import uuid
+from unittest import mock
 
 import pytest
 from helpers import OWNER_ACTOR, agent, owner
 
 from nodum import auth, db, service
 from nodum.migrations import GARDENER_AGENT_ID
-from nodum.store import GrantNotPermitted
+from nodum.store import GrantNotPermitted, Store
 
 #: Cookie by session-row id, so a test can key the table and still present the
 #: cookie the caller was handed (the row holds only the hash — review S9).
@@ -74,11 +78,127 @@ def test_verify_login_refuses_a_passwordless_account(fresh_db):
         auth.verify_login("owner", "anything")
 
 
+def test_a_create_that_loses_the_name_race_is_a_409_and_not_a_500(fresh_db):
+    """The index, not the read, is what holds uniqueness — and it answers the same way.
+
+    `create_human` reads the name free and INSERTs on its own short-lived
+    connection, so the two are separate lock acquisitions: two processes sharing
+    the file — a CLI beside a running server, or two servers — both find the name
+    free and both insert. `0019` refuses the second, and without translation that
+    refusal reached the caller as `sqlite3.IntegrityError`, which the HTTP map
+    renders as a **500** `database error: UNIQUE constraint failed: humans.name`
+    where the unraced duplicate gives a 409. Same outcome, described in a way the
+    caller cannot act on.
+
+    Threads rather than processes because they are enough: each call opens its
+    own connection, which is the whole mechanism. The branch was verified by hand
+    and had no test, in a change whose thesis is that a gate nobody checks is a
+    claim.
+    """
+    outcomes: list[str] = []
+
+    def create() -> None:
+        try:
+            service.create_human("racy", principal=owner())
+            outcomes.append("created")
+        except service.AccountExists:
+            outcomes.append("AccountExists")
+        except Exception as exc:  # noqa: BLE001 - the point is which class arrives
+            outcomes.append(type(exc).__name__)
+
+    threads = [threading.Thread(target=create) for _ in range(6)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert outcomes.count("created") == 1, outcomes
+    assert set(outcomes) == {"created", "AccountExists"}, (
+        f"a lost race must be the same refusal the read gives, got {sorted(set(outcomes))}"
+    )
+    racy = [human for human in service.list_humans(principal=owner()) if human.name == "racy"]
+    assert len(racy) == 1
+
+
+def test_a_create_whose_id_collides_is_not_reported_as_a_taken_name(fresh_db):
+    """The translation is scoped to the name index; any other integrity failure is a bug.
+
+    `create_human` narrows its `IntegrityError` on `humans.name`, so a primary-key
+    collision — a different failure entirely — still surfaces as itself rather
+    than as a name somebody else holds.
+    """
+    taken = service.create_human("first", principal=owner())
+
+    with (
+        mock.patch.object(service.uuid, "uuid4", return_value=uuid.UUID(int=0)),
+        pytest.raises(sqlite3.IntegrityError, match="humans.id"),
+    ):
+        # Both creates mint the same id; the second collides on the primary key.
+        service.create_human("second", principal=owner())
+        service.create_human("third", principal=owner())
+
+    assert {human.name for human in service.list_humans(principal=owner())} >= {"first"}
+    assert taken.name == "first"
+
+
+def test_a_second_human_cannot_take_a_name_that_is_already_a_login(fresh_db):
+    """A supported write must not be able to end a human's login for good.
+
+    `humans.name` is the login handle — `verify_login` resolves the account by
+    it, ids being random hex nobody types — and it refuses a name matching more
+    than one row, because "which human is this session?" has no other answer. So
+    `nodum human create owner`, an ordinary human-only write over the CLI or
+    `POST /api/humans`, used to end HTTP login for `owner` on the spot. And
+    permanently: the human verbs are create/list/passwd/disable/enable, none of
+    them removes or renames an account, and the ambiguity is refused *ahead* of
+    the `disabled` check, so disabling the clone freed nothing. Hand SQL was the
+    only way back.
+    """
+    service.set_human_password("owner", "owner-password", principal=owner())
+    assert auth.verify_login("owner", "owner-password").id == "owner"
+
+    with pytest.raises(service.AccountExists, match="owner"):
+        service.create_human("owner", principal=owner())
+
+    assert auth.verify_login("owner", "owner-password").id == "owner"
+    assert [human.id for human in service.list_humans(principal=owner())] == ["owner"]
+    # Exactly as tight as the lookup and no tighter: `verify_login` compares
+    # under SQLite's BINARY collation, so a name differing in case is a
+    # different name — refusing it would refuse a pair the login tells apart.
+    assert service.create_human("Owner", principal=owner()).name == "Owner"
+
+
+def _duplicate_the_owners_name(password: str) -> str:
+    """Give a second account the name `owner`, past the index that forbids it.
+
+    `service.create_human` refuses the duplicate and
+    `0019_unique_human_names` refuses it again underneath, so the only file
+    that can hold this state is one whose unique index somebody dropped by
+    hand — which is exactly the file `verify_login`'s ambiguity refusal is
+    left standing for. Returns the twin's id.
+    """
+    twin = service.create_human("twin", principal=owner())
+    service.set_human_password(twin.id, password, principal=owner())
+    conn = db.connect()
+    try:
+        conn.execute("DROP INDEX idx_humans_name")
+        conn.execute("UPDATE humans SET name = 'owner' WHERE id = ?", (twin.id,))
+        conn.commit()
+    finally:
+        conn.close()
+    return twin.id
+
+
 def test_verify_login_refuses_an_ambiguous_name(fresh_db):
-    """Two accounts sharing a name can neither log in: which human would it be?"""
-    human = service.create_human("owner", principal=owner())
+    """Two accounts sharing a name can neither log in: which human would it be?
+
+    Unreachable through any surface since `0019_unique_human_names`; this is the
+    hand-edited file the branch is belt and braces for. It stays a refusal
+    rather than relaxing to a `LIMIT 1`, and this is why: on that file, picking
+    a row hands out a session on an account whose password was never presented.
+    """
     service.set_human_password("owner", "first-pw", principal=owner())
-    service.set_human_password(human.id, "second-pw", principal=owner())
+    _duplicate_the_owners_name("second-pw")
 
     for password in ("first-pw", "second-pw"):
         with pytest.raises(auth.InvalidCredentials):
@@ -92,9 +212,8 @@ def _seed_login_failure(case: str) -> tuple[str, str]:
     if case == "passwordless":
         return "owner", "some-pw"
     if case == "ambiguous name":
-        twin = service.create_human("owner", principal=owner())
         service.set_human_password("owner", "first-pw", principal=owner())
-        service.set_human_password(twin.id, "second-pw", principal=owner())
+        _duplicate_the_owners_name("second-pw")
         return "owner", "first-pw"
     if case == "wrong password":
         service.set_human_password("owner", "right-pw", principal=owner())
@@ -403,6 +522,38 @@ def test_a_password_under_the_floor_is_refused(fresh_db):
             service.set_human_password("owner", password, principal=owner())
 
 
+def test_a_name_or_password_over_the_ceiling_is_refused_at_the_write(fresh_db):
+    """The ceiling to S11's floor, and the write side is where it has to bite.
+
+    ``POST /api/login`` caps both fields before it touches the database — the
+    name because a refused attempt appends it to the append-only event log
+    verbatim, the password because argon2 hashes whatever it is handed at the
+    full work factor. Those caps landed on the *read* side alone, and a cap one
+    end honours is worse than no cap: a 300-character ``create_human`` and a
+    5000-character ``set_human_password`` both succeeded, and the account then
+    answered its own correct credentials with a 400. So the numbers are the
+    service's, and a name or password this stores is always one login will
+    still look at.
+    """
+    longest_name = "n" * service.MAX_HUMAN_NAME_LENGTH
+    longest_password = "p" * service.MAX_PASSWORD_LENGTH
+    at_ceiling = service.create_human(longest_name, principal=owner())
+    service.set_human_password(at_ceiling.id, longest_password, principal=owner())
+    assert auth.verify_login(longest_name, longest_password).id == at_ceiling.id
+
+    with pytest.raises(ValueError, match=f"at most {service.MAX_HUMAN_NAME_LENGTH}"):
+        service.create_human(longest_name + "n", principal=owner())
+    with pytest.raises(ValueError, match=f"at most {service.MAX_PASSWORD_LENGTH}"):
+        service.set_human_password(at_ceiling.id, longest_password + "p", principal=owner())
+
+    # Refused is refused: no extra row, and the credential that worked still does.
+    assert {human.name for human in service.list_humans(principal=owner())} == {
+        "owner",
+        longest_name,
+    }
+    assert auth.verify_login(longest_name, longest_password).id == at_ceiling.id
+
+
 def test_the_last_enabled_human_cannot_disable_itself(fresh_db):
     """S13: no enabled human means no principal at all — not even from the CLI."""
     with pytest.raises(GrantNotPermitted, match="last enabled human"):
@@ -418,7 +569,13 @@ def test_the_last_enabled_human_cannot_disable_itself(fresh_db):
 
 
 def test_record_auth_event_writes_the_three_auth_ops_with_derived_actors(fresh_db):
-    """The actor comes from the op: the verified human, or the attempted name."""
+    """The actor comes from the op: the verified human, or nobody.
+
+    A failure has no verified principal, so it records
+    ``UNAUTHENTICATED_ACTOR`` and keeps the attempted name in the payload. It
+    used to record the name itself, which made ``events.actor`` a field an
+    unauthenticated caller wrote (finding M2).
+    """
     service.record_auth_event("human.login", {"human_id": "owner"})
     service.record_auth_event(
         "human.login_failed", {"name": "owner", "reason": "invalid credentials"}
@@ -428,9 +585,12 @@ def test_record_auth_event_writes_the_three_auth_ops_with_derived_actors(fresh_d
     recorded = [e for e in service.list_events(owner(), limit=10) if e.op.startswith("human.")]
     assert [(e.op, e.actor) for e in recorded] == [
         ("human.logout", "human:owner"),
-        ("human.login_failed", "owner"),
+        ("human.login_failed", service.UNAUTHENTICATED_ACTOR),
         ("human.login", "human:owner"),
     ]
+    # The claimed name is evidence, not identity: it stays in the payload.
+    (failed,) = [e for e in recorded if e.op == "human.login_failed"]
+    assert failed.payload["name"] == "owner"
 
 
 def test_record_auth_event_refuses_ops_and_payloads_outside_its_allowlist(fresh_db):
@@ -546,3 +706,79 @@ def test_a_new_grant_takes_effect_immediately(fresh_db):
         type="note", title="reached", principal=auth.verify_agent_token(created.token)
     )
     assert node.state == "proposed"
+
+
+# ── The read set is two layers, not one SQL clause (finding M1) ───────────────
+
+
+def _notes_either_side_of_a_secret_space() -> tuple[str, str, str]:
+    """Two readable notes with an unreadable space node between them.
+
+    Wikilink materialisation writes the `mentions` edges: each note names the
+    space by title, so the only path from one note to the other runs through a
+    node `get_node` refuses — the exact shape M1 was found in.
+
+    Returns:
+        `(space id, left note id, right note id)`.
+    """
+    secret = service.create_space("secret-research", principal=owner())
+    left = service.create_node(
+        type="note", title="Left", content="see [[secret-research]]", principal=owner()
+    )
+    right = service.create_node(
+        type="note", title="Right", content="also [[secret-research]]", principal=owner()
+    )
+    return secret.id, left.id, right.id
+
+
+def _blind_the_edge_clause(monkeypatch) -> None:
+    """Take the SQL layer away, leaving only the per-row check under it.
+
+    `Store.edge_scope` is correct today, so neither test below is a live bug —
+    which is the whole reason the row check has to be tested this way. A second
+    layer that is only ever exercised behind a working first layer is a comment
+    about defence in depth rather than defence in depth, and `service._walk`
+    states the rule for the *module*: a node read there that does not pass
+    `Store.node_visible` is the shape of the defect, whatever the SQL says.
+    """
+    monkeypatch.setattr(Store, "edge_scope", lambda self, alias="": ("", []))
+
+
+def test_subgraph_drops_an_edge_whose_far_node_is_outside_the_read_set(fresh_db, monkeypatch):
+    """`subgraph` re-checks the endpoint row it loads, exactly as `_walk` does."""
+    secret_id, left_id, _ = _notes_either_side_of_a_secret_space()
+    scout = agent("scout", grants={"meta": "read", "main": "edit"})
+    _blind_the_edge_clause(monkeypatch)
+
+    walked = service.subgraph(left_id, depth=2, principal=scout)
+
+    assert secret_id not in {node.id for node in walked.nodes}
+    assert "secret-research" not in {node.title for node in walked.nodes}
+    # The edge is dropped whole rather than returned naming an endpoint the
+    # principal may not see.
+    assert all(secret_id not in (edge.src_id, edge.dst_id) for edge in walked.edges)
+    # This narrows an agent's read, not the graph: the human still sees it all.
+    seen = service.subgraph(left_id, depth=2, principal=owner())
+    assert secret_id in {node.id for node in seen.nodes}
+
+
+def test_find_path_refuses_a_path_that_runs_through_an_unreadable_node(fresh_db, monkeypatch):
+    """A path through a space the principal cannot read does not exist.
+
+    That is what `find_path` documents, and it was true only because the edge
+    clause held: the returned nodes were loaded with an unscoped row read.
+    """
+    secret_id, left_id, right_id = _notes_either_side_of_a_secret_space()
+    scout = agent("scout", grants={"meta": "read", "main": "edit"})
+    _blind_the_edge_clause(monkeypatch)
+
+    path = service.find_path(left_id, right_id, principal=scout)
+
+    assert path.found is False
+    assert path.nodes == []
+    assert path.edges == []
+    # The path really is there, and the human really does get it — two hops,
+    # the middle one being the node the agent may not see.
+    visible = service.find_path(left_id, right_id, principal=owner())
+    assert visible.found is True
+    assert [node.id for node in visible.nodes] == [left_id, secret_id, right_id]

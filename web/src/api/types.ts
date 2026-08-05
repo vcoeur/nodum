@@ -10,7 +10,7 @@
  * - Field names are copied verbatim; do not camelCase them.
  *
  * Keep this file in lockstep with `nodum/models.py`. Mirrored against the
- * principals tree (migrations 0001–0017). `tests/test_types_contract.py` is
+ * principals tree (migrations 0001–0019). `tests/test_types_contract.py` is
  * the lock: it fails when this file drifts from the pydantic models.
  */
 

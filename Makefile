@@ -35,6 +35,17 @@ format: ## Ruff auto-fix + format
 	uv run ruff check --fix .
 	uv run ruff format .
 
+# The docs gate, runnable locally. `--strict` turns every warning into a
+# failure and mkdocs.yml's `validation:` block raises the orphan-page and
+# broken-anchor checks to warnings, so this is what catches a page missing
+# from `nav` or a dead internal link. It was CI-only, which meant the one gate
+# AGENTS.md tells you to keep green was the one gate you could not run.
+docs: ## Build the documentation site the way CI does (mkdocs --strict)
+	uv run --group docs mkdocs build --strict
+
+docs-serve: ## Serve the docs site locally with live reload
+	uv run --group docs mkdocs serve
+
 # --- Frontend (web/) -------------------------------------------------------
 # Node is a build-time dependency only: the wheel ships the built bundle and the
 # runtime is pure Python. Run web-install once, then web-build before packaging.
@@ -69,4 +80,5 @@ web-clean: ## Drop the built bundle (nodum serve falls back to the placeholder)
 	rm -rf $(WEB_BUNDLE)
 
 .PHONY: help install dev-install cli init-db test coverage lint typecheck format \
+	docs docs-serve \
 	web-install web-build web-dev web-typecheck web-lint web-test web-clean

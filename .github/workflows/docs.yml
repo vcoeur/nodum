@@ -10,7 +10,9 @@ on:
   # Build the site on any PR touching the docs, so a broken build — and, via
   # mkdocs --strict + the validation block, a broken link or an orphan page —
   # fails the PR. The deploy job is gated to non-PR events, so a PR build can
-  # never publish to Pages.
+  # never publish to Pages. A tag push triggers neither this workflow nor
+  # ci.yml, so release.yml carries a `docs` job running the same command; keep
+  # the two build steps identical — tests/test_docs.py compares them verbatim.
   pull_request:
     paths:
       - "docs/**"

@@ -100,6 +100,17 @@ jobs:
       # stale hook closure fails here instead of in review.
       - name: Frontend lint
         run: make web-lint
+      # The frontend is the only half of this project with a dependency tree
+      # big enough to carry advisories nobody here will hear about otherwise —
+      # the Python side is eight direct runtime deps, all bounded and read at
+      # every review. `--audit-level=high` so a low-severity transitive finding
+      # is not a red build; `continue-on-error` because an advisory published
+      # overnight must not block an unrelated PR, and the annotation is the
+      # point. Reachability is still a judgement: a react-router RSC-mode
+      # advisory does not touch a router this SPA drives in browser mode.
+      - name: Frontend advisories
+        continue-on-error: true
+        run: cd web && npm audit --audit-level=high
       # `web-build` runs `tsc --noEmit` before Vite, so this step is the type
       # check as well as the build — the frontend cannot rot silently.
       - name: Build the UI bundle

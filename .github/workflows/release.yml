@@ -25,6 +25,113 @@ jobs:
       - name: Run test suite
         run: uv run --locked --extra pdf pytest -q
 
+  # The three legs ci.yml runs that this workflow used to skip (finding M3).
+  # A tag push does not trigger ci.yml, and the comment on `build-and-publish`
+  # claimed the tag gate was "not weaker than the PR gate" while ruff, pyright,
+  # the ceiling resolution and the whole frontend suite ran on neither. Usually
+  # a tag names a commit that already passed ci.yml on its PR — but "usually"
+  # is what a release gate exists to not depend on, and this project has
+  # already pushed a tag at a tree that was never the merged one (v0.12.0
+  # published a pre-merge state).
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0 # hatch-vcs needs full history + tags to derive the version
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+      - name: Ruff check
+        run: uv run --locked ruff check .
+      - name: Ruff format check
+        run: uv run --locked ruff format --check .
+      - name: Pyright typecheck
+        run: uv run --locked --extra pdf pyright nodum
+
+  # The leg that exists *for* the class of break a release ships: an unbounded
+  # dependency major that resolves differently for a user than for the lock.
+  # Running it anywhere but the release path was the gap — `smoke` catches the
+  # import half of that class, and a behavioural break at the ceiling imports
+  # fine.
+  test-highest:
+    name: Tests (highest resolution)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0 # hatch-vcs needs full history + tags to derive the version
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+      - name: Resolve dependencies at their highest allowed versions
+        run: uv sync --upgrade --extra pdf
+      - name: Run test suite
+        run: uv run --extra pdf pytest -q
+
+  # The docs gate. docs.yml runs `mkdocs build --strict` on every pull request
+  # touching docs/ or mkdocs.yml, and with mkdocs.yml's `validation:` block
+  # that build is what catches an orphan page or a dead internal link. A tag
+  # push triggers neither docs.yml (push-to-main, PR and dispatch only) nor
+  # ci.yml, so until this job existed a tag cut at a tree with a broken doc
+  # link published green. The command is docs.yml's, spelled out inline rather
+  # than `make docs`: identical text is what makes the parity assertion in
+  # tests/test_docs.py an exact one, and the --with pins build in an ephemeral
+  # env that does not depend on this project's dependency groups. (`make docs`
+  # runs the same build from the `docs` group, for local use.)
+  docs:
+    name: Docs build
+    runs-on: ubuntu-latest
+    steps:
+      # No `fetch-depth: 0`, unlike the uv legs above, and deliberately so:
+      # `uv run` does sync the project, so hatch-vcs runs — but the version it
+      # derives never reaches the built site (mkdocs.yml has no plugin that
+      # reads it), and pyproject.toml's `fallback_version` means a checkout
+      # without history resolves to 0.0.0 rather than failing. This checkout is
+      # docs.yml's, unchanged, for the same reason the build step below is:
+      # this job exists to re-run that check, not a variant of it.
+      - uses: actions/checkout@v6
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+      - name: Build site
+        run: uv run --locked --with "mkdocs==1.6.1" --with "mkdocs-material==9.7.7" mkdocs build --strict
+
+  web:
+    name: Frontend
+    runs-on: ubuntu-latest
+    steps:
+      # No `fetch-depth: 0` here either: this job runs npm and make only, so
+      # nothing in it asks hatch-vcs for a version.
+      - uses: actions/checkout@v6
+      - name: Set up Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Install the frontend dependencies
+        run: make web-install
+      - name: Frontend unit tests
+        run: make web-test
+      - name: Frontend lint
+        run: make web-lint
+      # `web-build` runs `tsc --noEmit` before Vite, so these two steps are the
+      # frontend type check, not a duplicate of the bundle `build-and-publish`
+      # makes for the wheel. Sharing the job id with ci.yml's `web` was never
+      # the same gate: the type check ran on the PR and, on a tag, only inside
+      # the publishing job — a check that runs *as* the release rather than
+      # before it. `npm audit` is deliberately not mirrored here (it is
+      # `continue-on-error` on the PR side for the same reason, and named in
+      # tests/test_docs.py's RELEASE_STEP_EXEMPT): an advisory published
+      # overnight must annotate a build, never stop a tag.
+      - name: Build the UI bundle
+        run: make web-build
+      - name: Check the bundle was emitted
+        run: test -f nodum/_web/index.html && test -d nodum/_web/assets
+
   smoke:
     name: Clean-install smoke
     runs-on: ubuntu-latest
@@ -57,9 +164,18 @@ jobs:
     name: Build and publish to PyPI
     # Never publish a wheel that fails tests, or one that fails to install and
     # self-describe clean — tag pushes do not trigger ci.yml, so the release
-    # workflow must gate on the suite itself. The matrix mirrors ci.yml's so the
-    # tag gate is not weaker than the PR gate.
-    needs: [test, smoke]
+    # workflow must gate on the suite itself.
+    #
+    # `needs` names a counterpart for every job of every workflow a pull
+    # request triggers — ci.yml and docs.yml — so the tag gate is not weaker
+    # than the PR gate. That is a checkable claim rather than a comment:
+    # `tests/test_docs.py` discovers the PR-triggered workflows, maps each of
+    # their jobs onto a job named in this list, and compares the two jobs'
+    # `run:` steps, so neither a new job nor a step quietly dropped from a
+    # counterpart can pass. It said this while ruff, pyright, the ceiling leg
+    # and the frontend suite ran on the PR only (finding M3), and again while
+    # the strict docs build did.
+    needs: [lint, test, test-highest, web, docs, smoke]
     runs-on: ubuntu-latest
     permissions:
       id-token: write   # required for OIDC trusted publishing

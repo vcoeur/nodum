@@ -189,7 +189,13 @@ class VersionNotFound(RecordNotFound):
 
 
 class AccountExists(ValueError):
-    """Raised when an account id is already taken (a duplicate ``agent create``)."""
+    """Raised when an account name is already taken.
+
+    Both halves of the account model, for the same reason and mapped to the
+    same 409: an agent's name *is* its id (a duplicate ``agent create``), and a
+    human's name is its login handle (a duplicate ``human create``, which used
+    to be storable and killed HTTP login for that name outright).
+    """
 
 
 class SpaceNameTaken(ValueError):
@@ -4090,6 +4096,14 @@ AUTH_EVENT_OPS = (
     "human.logout",
 )
 
+#: The ``events.actor`` value for something nobody authenticated did — today
+#: only a failed login. Deliberately not parseable as a principal: it carries
+#: neither the ``human:`` nor the ``agent:`` prefix
+#: :attr:`~nodum.principal.Principal.actor_string` mints, so it can never be
+#: mistaken for an account and :func:`nodum.auth.principal_from_actor` refuses
+#: it as malformed rather than resolving it to somebody.
+UNAUTHENTICATED_ACTOR = "unauthenticated"
+
 
 def record_auth_event(
     op: str,
@@ -4110,9 +4124,34 @@ def record_auth_event(
     must never be able to name an identity. ``human.login`` and
     ``human.logout`` record the verified human (the payload must carry its
     ``human_id``, and the actor is ``human:<id>``, exactly as the service's
-    own ``human.*`` events are attributed); ``human.login_failed`` carries
-    the **attempted** name — there is no verified principal on a failure, so
-    the actor column records the name the attempt claimed.
+    own ``human.*`` events are attributed).
+
+    ``human.login_failed`` records :data:`UNAUTHENTICATED_ACTOR`, and the
+    attempted name stays in the *payload* where it belongs. It used to be the
+    actor, on the reasoning that a failure has no verified principal so the
+    column should say what the attempt claimed — but this route is the one
+    ``/api`` path outside the session gate, so that made ``events.actor`` a
+    field an unauthenticated caller writes. ``{"name": "human:owner"}`` put
+    sixty rows attributed to the seeded owner in the log with no credential
+    presented, and :func:`list_events` returned them interleaved with the real
+    owner's and indistinguishable from them. That reader — the log's only human
+    one, what ``nodum events`` prints — offers nothing to tell them apart with:
+    it orders by ``seq`` and narrows on nothing but ``cycle_id``, so there is no
+    actor filter to separate the forgeries out, and one would not help, because
+    it would be filtering on a column the attempt chose. The log's other readers
+    are worse ground to stand on, not better: they read it to *decide*
+    something — :func:`_synthesized_creation_ids` settles whether a node is a
+    synthesis at all by requiring its create event's ``actor`` to equal
+    :data:`GARDENER_ACTOR` (that comparison is the whole of the check that
+    ``props.synthesized`` is not a forgery, and the review path settles a
+    synthesis's membership edges on its answer), migration ``0010_principals``
+    derived the agent roster from ``actor LIKE 'agent:%'``,
+    :func:`login_failure_count` counts by ``op`` and the payload's name, and the
+    undo/rollback readers select by ``seq`` and ``cycle_id`` — so a
+    caller-chosen ``actor`` is a column machine decisions run on, not merely one
+    a human reads. The actor column is this system's answer to *who did this*;
+    the only truthful answer on a failed login is *nobody*, and a claimed name
+    is data about the attempt rather than an identity.
 
     Payloads are metadata only: ids, the attempted name, a reason. Never a
     password, and never a credential hash.
@@ -4139,7 +4178,7 @@ def record_auth_event(
         name = payload.get("name")
         if not isinstance(name, str):
             raise ValueError("a 'human.login_failed' payload must carry the attempted 'name'")
-        actor = name
+        actor = UNAUTHENTICATED_ACTOR
     else:
         human_id = payload.get("human_id")
         if not isinstance(human_id, str):
@@ -4327,6 +4366,18 @@ def _walk(
     edge is followed only when **both** endpoints are readable by the
     principal, so the walk never crosses into an unreadable space (Q13).
 
+    **The endpoint rows are re-checked here, not assumed from that clause.**
+    Delegating the whole guarantee to :meth:`Store.edge_scope` is what let a
+    space node reach an agent holding no grant on it: that clause tested
+    ``space_id`` where the node rule tests a space node's *own id*, and this
+    loop then loaded both endpoints with an unscoped row read. The clause is
+    fixed, and the row check below is the second layer — a node read in this
+    module that does not pass :meth:`Store.node_visible` is the shape of that
+    defect, whatever the SQL upstream says. That is a claim about the module,
+    so the two other walks that load an endpoint the same way apply it too:
+    :func:`subgraph` drops the edge, :func:`find_path` drops the path. An
+    invariant applied at one of three sites is a comment, not an invariant.
+
     ``as_of`` swaps the lens from the live graph to the graph true at an
     instant (D2): the walk then follows ``active`` edges plus ``archived``
     ones whose validity window covered that instant (:func:`_as_of_edge_clause`).
@@ -4367,13 +4418,20 @@ def _walk(
             edge = _row_dict(edge_row)
             if edge["id"] in seen_edges:
                 continue
+            unseen = [end for end in (edge["src_id"], edge["dst_id"]) if end not in nodes]
+            fetched = {end: _get_node_row(conn, end) for end in unseen}
+            # The edge clause should already have excluded an edge with an
+            # unreadable endpoint; reaching here means the two rules
+            # disagreed, and the answer is to drop the edge whole rather than
+            # return it with an endpoint the principal may not see.
+            if not all(store.node_visible(row) for row in fetched.values()):
+                continue
             seen_edges.add(edge["id"])
             edges.append(edge)
-            for endpoint in (edge["src_id"], edge["dst_id"]):
-                if endpoint not in nodes:
-                    nodes[endpoint] = _row_dict(_get_node_row(conn, endpoint))
-                    order.append(endpoint)
-                    next_frontier.add(endpoint)
+            for endpoint, row in fetched.items():
+                nodes[endpoint] = _row_dict(row)
+                order.append(endpoint)
+                next_frontier.add(endpoint)
         frontier = next_frontier
     return [nodes[node_id] for node_id in order], edges
 
@@ -4646,7 +4704,16 @@ def subgraph(
                         # 10_000 spokes costs `limit` node reads, not 10_000.
                         truncated = True
                         continue  # the node cap bites here, mid-walk
-                    row = _row_dict(_get_node_row(conn, far))
+                    far_row = _get_node_row(conn, far)
+                    if not store.node_visible(far_row):
+                        # `_walk`'s second layer, applied here for the
+                        # same reason: `edge_scope` should already have
+                        # excluded an edge with an unreadable endpoint, so
+                        # reaching this is the two rules disagreeing — and the
+                        # answer is to drop the edge whole rather than return
+                        # it with an endpoint the principal may not see.
+                        continue
+                    row = _row_dict(far_row)
                     if admissible_types is not None and row["type_id"] not in admissible_types:
                         continue  # excluded node — its edge would dangle
                     nodes[far] = row
@@ -4767,10 +4834,20 @@ def find_path(
             node_ids.append(previous)
         node_ids.reverse()
         path_edges.reverse()
+        path_rows = [_get_node_row(conn, node_id) for node_id in node_ids]
+        if not all(store.node_visible(row) for row in path_rows):
+            # `_walk`'s second layer, applied here for the same reason:
+            # `edge_scope` should already have kept the walk out of every space
+            # this principal cannot read, so an unreadable row on the assembled
+            # path is the two rules disagreeing. The answer is the one this
+            # function already documents — a path through a space the principal
+            # cannot read does not exist — rather than a `NodeNotFound` naming
+            # an id the caller never asked about.
+            return PathOut(found=False, hops=0, nodes=[], edges=[])
         return PathOut(
             found=True,
             hops=len(path_edges),
-            nodes=[_node_out(_get_node_row(conn, node_id)) for node_id in node_ids],
+            nodes=[_node_out(row) for row in path_rows],
             edges=[_edge_out(edge) for edge in path_edges],
         )
     finally:
@@ -4836,9 +4913,39 @@ def diff_versions(
 #: Grant levels accepted by :func:`grant` (hierarchical: read ⊂ suggest ⊂ edit).
 GRANT_LEVEL_NAMES = GRANT_LEVEL_NAMES
 
+#: Longest name :func:`create_human` will store — and the longest a login may
+#: claim, because ``POST /api/login`` reads this constant for its own cap.
+#:
+#: The cap earns its keep at the *reader*: a refused login writes the name it
+#: claimed verbatim into the append-only ``events`` payload, so an uncapped
+#: field is an unauthenticated caller choosing the size of a row. But it has to
+#: be enforced **here**, at the write, and for a while it was not — a cap only
+#: one end honours is worse than no cap at all. A 300-character account was
+#: created over both surfaces, stored fine, and then answered its own correct
+#: password with a 400, because the login route refused the name before it
+#: could look it up. A supported write must not be able to mint an account
+#: nobody can log into, so the number lives with the writer and the adapter
+#: reads it from here rather than the reverse.
+#:
+#: 256 is past every name a human types and past the one the migrations seed.
+MAX_HUMAN_NAME_LENGTH = 256
+
 #: Shortest password :func:`set_human_password` accepts. A floor, not a policy:
 #: the empty string used to be storable over both surfaces and logged in fine.
 MIN_PASSWORD_LENGTH = 6
+
+#: Longest password :func:`set_human_password` accepts — the ceiling to
+#: :data:`MIN_PASSWORD_LENGTH`'s floor, and, like :data:`MAX_HUMAN_NAME_LENGTH`,
+#: the number ``POST /api/login`` reads for its own cap.
+#:
+#: argon2id hashes the whole of whatever it is handed at the full work factor,
+#: and the login route spends that on unknown names too through its
+#: constant-time path, so an uncapped password field is CPU an unauthenticated
+#: caller buys by the megabyte. And it failed one-sidedly the same way the name
+#: did: a 5000-character password set over ``POST /api/humans/{id}/password``
+#: hashed, stored, and could then never be presented again. 1024 is far above
+#: any passphrase or password-manager output.
+MAX_PASSWORD_LENGTH = 1024
 
 
 def _admin_actor(conn: sqlite3.Connection, principal: Principal) -> str:
@@ -4880,12 +4987,56 @@ def list_humans(*, principal: Principal, path: str | Path | None = None) -> list
 
 
 def create_human(name: str, *, principal: Principal, path: str | Path | None = None) -> HumanOut:
-    """Create a human account (passwordless until ``human passwd`` sets one)."""
+    """Create a human account (passwordless until ``human passwd`` sets one).
+
+    Raises:
+        ValueError: If the name is longer than :data:`MAX_HUMAN_NAME_LENGTH` —
+            the same ceiling ``POST /api/login`` refuses a claimed name above,
+            enforced here so a name this stores is always a name that route
+            will look at.
+        AccountExists: If a human already answers to ``name``. The name is the
+            login handle — :func:`nodum.auth.verify_login` resolves an account
+            by it, ids being random hex nobody types at a prompt — and a name
+            two accounts share resolves to neither. Without this refusal
+            ``nodum human create owner`` killed HTTP login for ``owner``
+            permanently: no verb removes or renames a human, and the ambiguity
+            is refused ahead of the ``disabled`` check, so disabling the clone
+            was no cure either. Migration ``0019_unique_human_names`` is the
+            constraint under this check.
+    """
+    if len(name) > MAX_HUMAN_NAME_LENGTH:
+        # Never echo the name back: a message quoting a 200 kB argument moves it
+        # into the caller's terminal and the server log instead of the table.
+        raise ValueError(f"name must be at most {MAX_HUMAN_NAME_LENGTH} characters")
     conn = _connect(path)
     try:
         actor = _admin_actor(conn, principal)
+        # Ahead of the INSERT so the common case answers 409 naming the conflict
+        # rather than surfacing 0019's index as a bare IntegrityError under a
+        # 500 — `create_agent`'s rule (Q13 review S14). Quoting the name back is
+        # safe here and not above: the ceiling has already been enforced.
+        #
+        # The read cannot be the whole answer, and the `except` below is not
+        # belt-and-braces. This function opens its own short-lived connection,
+        # so the read and the INSERT are two lock acquisitions with a window
+        # between them: two processes sharing the file — a CLI beside a running
+        # server, or two servers — can both find the name free and both insert.
+        # 0019 is what actually holds uniqueness; this translates its refusal
+        # back into the same 409 the read would have given, because a race
+        # losing with `database error: UNIQUE constraint failed: humans.name`
+        # under a 500 is the same outcome described in a way the caller cannot
+        # act on.
+        if conn.execute("SELECT 1 FROM humans WHERE name = ?", (name,)).fetchone():
+            raise AccountExists(f"a human named {name!r} already exists")
         human_id = uuid.uuid4().hex[:12]
-        conn.execute("INSERT INTO humans (id, name) VALUES (?, ?)", (human_id, name))
+        try:
+            conn.execute("INSERT INTO humans (id, name) VALUES (?, ?)", (human_id, name))
+        except sqlite3.IntegrityError as clash:
+            # Only the name index: an IntegrityError from anything else is a bug
+            # and must not be reported as a taken name.
+            if "humans.name" not in str(clash):
+                raise
+            raise AccountExists(f"a human named {name!r} already exists") from clash
         row = conn.execute("SELECT * FROM humans WHERE id = ?", (human_id,)).fetchone()
         _emit(
             conn, actor, "human.create", {"before": None, "after": {"id": human_id, "name": name}}
@@ -4907,11 +5058,18 @@ def set_human_password(
 
     Raises:
         ValueError: If the password is shorter than
-            :data:`MIN_PASSWORD_LENGTH`.
+            :data:`MIN_PASSWORD_LENGTH` or longer than
+            :data:`MAX_PASSWORD_LENGTH` — the ceiling ``POST /api/login``
+            refuses a presented password above, enforced here so a password
+            this stores is always a password that route will hash.
         RecordNotFound: If the account does not exist.
     """
     if len(password) < MIN_PASSWORD_LENGTH:
         raise ValueError(f"password must be at least {MIN_PASSWORD_LENGTH} characters")
+    if len(password) > MAX_PASSWORD_LENGTH:
+        # Length only — the password itself never reaches a message, a log, or
+        # a payload, here or anywhere else in this module.
+        raise ValueError(f"password must be at most {MAX_PASSWORD_LENGTH} characters")
     conn = _connect(path)
     try:
         actor = _admin_actor(conn, principal)

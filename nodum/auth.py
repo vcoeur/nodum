@@ -314,7 +314,12 @@ def verify_login(name: str, password: str, *, path: str | Path | None = None) ->
     The login handle is the account *name*: ids of CLI-created humans are
     random, and nobody types one at a login prompt. A name shared by two
     accounts resolves to no one — refusing keeps "which human is behind this
-    session?" unambiguous, and the operator disambiguates from the CLI.
+    session?" unambiguous. That used to be a live hazard rather than a
+    formality: ``human create`` would store a second ``owner`` and take that
+    name's login away for good. The lookup is single-valued at the source now —
+    :func:`nodum.service.create_human` refuses a taken name, and migration
+    ``0019_unique_human_names`` puts a unique index under the refusal — and what
+    is below is what stands behind both.
 
     Timing discipline: an unknown, ambiguous, or passwordless name runs the
     same argon2 verification against a dummy hash, so the failure path costs
@@ -330,6 +335,13 @@ def verify_login(name: str, password: str, *, path: str | Path | None = None) ->
         rows = conn.execute(
             "SELECT id, credential_hash, disabled FROM humans WHERE name = ?", (name,)
         ).fetchall()
+        # `!= 1` rather than `== 0`: since 0019 a name matches at most one row —
+        # every connection here runs the migrations — so in practice this is the
+        # unknown-name refusal, and the ambiguous half is belt and braces. It is
+        # kept as a *refusal* rather than relaxed to a `LIMIT 1` because the one
+        # file that can still reach it is one whose unique index was dropped by
+        # hand, and there the cheap reading picks a row: it would hand somebody
+        # a session on an account they did not present a password for.
         if len(rows) != 1 or rows[0]["credential_hash"] is None:
             _dummy_verify(password)
             raise InvalidCredentials("invalid credentials")

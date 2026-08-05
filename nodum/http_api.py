@@ -103,11 +103,20 @@ a name inside fifteen minutes refuse further attempts for that name with a
 429 until the window slides past them — a guesser is limited to a handful
 of tries per name per quarter-hour, and a name that does not exist locks
 exactly like a real one, so the lockout cannot be used to probe the file.
-Every attempt, success and failure alike, is written to the event log
+Every attempt **that reaches a password check** is written to the event log
 (``human.login`` / ``human.login_failed`` / ``human.logout``) — the auth
 half of the audit trail — so who tried the password is on record even though
-the password itself never is. ``nodum serve`` says so at startup rather than
-leaving it implicit.
+the password itself never is. The qualifier is exact and load-bearing: the two
+refusals that never reach a check write nothing at all. A name already under
+lockout is refused with a 429 and no row, deliberately (see :func:`login`: an
+unauthenticated caller must not be able to append to an append-only log at
+will, and a guesser must not be able to hold the real human out by re-arming
+the window forever); and a body whose name or password is over the service's
+length cap is the ordinary 400 a malformed request gets, ahead of the lockout
+query and ahead of the log. Seven attempts against one name therefore leave
+five rows. What is on record is every attempt that cost an argon2 verification,
+which is the set the audit trail is for. ``nodum serve`` says so at startup
+rather than leaving it implicit.
 
 Most handlers call the service inline: the service opens one short-lived
 connection per call and SQLite has a single writer anyway, so a local
@@ -115,9 +124,50 @@ single-user server gains nothing from concurrency for a read of a row or a
 single-row write, and the inline calls stay much easier to reason about. The
 exceptions are the work a single request can make the loop wait on for a
 perceptible time — one 20.8 MB ingest was measured holding it for 20.8 s and
-680 MB of RSS — and every one of them runs through
-:func:`~starlette.concurrency.run_in_threadpool`:
+680 MB of RSS — and every one of them runs off the loop: through
+:func:`~starlette.concurrency.run_in_threadpool`, or through
+:func:`anyio.to_thread.run_sync` for the two hops that need a limiter of their
+own, which is the only thing that call spells and ``run_in_threadpool`` does
+not:
 
+* **``POST /api/login``** — argon2id is ~100 ms of deliberate work, spent on
+  unknown names too so the failure path costs what the success path costs.
+  This is the one route reachable without a session, so inline it was a
+  denial-of-service anybody with a socket could run at ten requests a second.
+  It is also one of the two hops that needs a **bound of its own**.
+  The default thread limiter admits 40 blocking calls at once and argon2id's
+  default profile reserves 64 MiB for each, so moving the verification off the
+  loop and stopping there swapped a stalled loop for ~2.5 GiB of resident
+  memory an unauthenticated caller may ask for — and the failed-login lockout
+  bounds none of it, because it counts per attempted *name* and rotating the
+  name never trips it. So the login's blocking half runs under
+  :data:`ARGON2_CONCURRENCY` tokens of :data:`_ARGON2_LIMITER`, and the excess
+  **queues**. *Half*, not *hash*: what holds a token is
+  :func:`_verify_login`, which deliberately bundles the lockout query, the
+  argon2 verification and the failure event into one hop, so the token is held
+  for all three — the same span :data:`_ARGON2_LIMITER`'s other caller holds it
+  for, and the reason the figures below are per attempt rather than per hash. Queueing is a *trade*,
+  not a free lunch, and the honest statement of it is this: the queue is FIFO
+  and unbounded, so a flood does not fail — it waits in front of the human.
+  Measured against this handler, the owner's own correct login answered in
+  0.11 s idle, 3.4 s behind 64 queued attempts, and 13.4 s behind 256. A
+  sustained flood therefore still degrades the login the route exists for; what
+  the limiter bought is *which* denial-of-service that is. The memory one takes
+  the process — and with it the graph, the SPA and every other tab — and does
+  not come back on its own; the latency one is proportional to the flood, ends
+  when the flood does, and still lets the human in. Refusing above a threshold
+  instead would turn that wait into a 503, which is the same caller's switch
+  for denying the login outright. Every other blocking route here keeps the
+  default limiter — none of them runs argon2, and lowering the global one would
+  slow the whole app to bound two routes;
+* **``POST /api/humans/{id}/password``** — the second argon2 caller and the
+  second hop under :data:`_ARGON2_LIMITER`. It ran **inline** until the review
+  that wrote this bullet: ~100 ms of hashing on the single-threaded loop, at
+  the same 64 MiB profile, under no bound at all. Being behind the session gate
+  answers *who* may call it, not *how resident* the process may become while
+  they do — 40 default threads of it is the same ~2.5 GiB the limiter exists to
+  refuse — so an authenticated caller is not a reason to leave a second door
+  open onto the memory the first one is bounded for;
 * the **read-heavy routes** — ``GET /api/search`` (a 400-term query held the
   loop for 126 ms), ``POST /api/ask`` and ``POST /api/summarize``, each a model
   call on top of graph work;
@@ -144,6 +194,7 @@ itself, so the principal is still bound in the one place this module binds one.
 from __future__ import annotations
 
 import contextlib
+import functools
 import http.cookies
 import json
 import logging
@@ -157,6 +208,8 @@ from importlib import metadata
 from pathlib import Path
 from typing import Any
 
+import anyio
+import anyio.to_thread
 from starlette.applications import Starlette
 from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import Headers, QueryParams, UploadFile
@@ -207,6 +260,76 @@ SESSION_SCOPE_KEY = "nodum.session_principal"
 #: *makes* sessions). ``/healthz`` sits outside ``/api`` entirely: a liveness
 #: probe that needs credentials is not a liveness probe.
 LOGIN_PATH = "/api/login"
+
+#: How many argon2id hashes may be in flight at once, process-wide.
+#:
+#: argon2id's default profile reserves 64 MiB for the duration of every hash,
+#: and one of the two callers — ``POST /api/login`` — is the one route
+#: reachable without a session, so whatever number bounds this bounds how
+#: resident an unauthenticated caller can make the server. Unbounded (the
+#: default thread limiter's 40) that is ~2.5 GiB. Measured, concurrent
+#: unauthenticated attempts against a fresh process, peak RSS above the idle
+#: baseline:
+#:
+#: =========  =========  ========
+#: attempts   unbounded  bounded
+#: =========  =========  ========
+#: 16         +1032 MiB  +130 MiB
+#: 64         +2573 MiB  +131 MiB
+#: =========  =========  ========
+#:
+#: The second column stops moving, which is the whole property: the cost is a
+#: function of this number and not of how hard the route is hit. The
+#: failed-login lockout is no substitute for it — the lockout counts failures
+#: per attempted *name*, so rotating the name never trips it, and every attempt
+#: in the table above claimed a different one.
+#:
+#: Two, because the memory is the scarce thing and the latency is what this
+#: surface can afford to spend: the worst case stays ~128 MiB of argon2 rather
+#: than gigabytes, and a login sharing the process with a *single* password
+#: being set still finds the second token free.
+#:
+#: It does not make the login independent of that other caller, and this used to
+#: claim it did. The queue is one FIFO over both routes, and the password hop
+#: holds its token for the whole of :func:`_write` — the hash, the human-only
+#: check, the session delete, the event and the commit — not for the hash alone.
+#: Measured: 8 concurrent ``POST /api/humans/{id}/password`` put the owner's own
+#: correct login at **0.572 s**, against 0.10 s idle. That is the same queueing a
+#: flood of logins produces, from an authenticated caller instead of an anonymous
+#: one; what this number bounds is the memory, not the wait. What it does not buy
+#: is a queue-free login under load; that cost is stated where the limiter is.
+#: Raising it buys throughput on two routes nobody should be calling in bulk.
+ARGON2_CONCURRENCY = 2
+
+#: The limiter itself, over the two calls in this module that run argon2 —
+#: :func:`_verify_login` and the ``POST /api/humans/{id}/password`` write — and
+#: nothing else. Every other blocking route on this surface keeps the default
+#: thread limiter: none of them reserves 64 MiB to run, and lowering the global
+#: one would slow the whole app to bound two routes.
+#:
+#: **Running argon2 is what selects for this limiter, not being unauthenticated
+#: — and not being outside the session gate**, which two of the blocking routes
+#: also are: ``PUT /api/uploads/{token}`` and ``GET /api/download/{token}``
+#: redeem a capability URL, where the single-use token in the path *is* the
+#: credential. Both keep the default limiter, because what bounds them is the
+#: grant they redeem. The password-set route is the other way round — session
+#: gate, authenticated human, and still here, because the gate says who may
+#: hash, never how much memory the process holds while they do.
+#:
+#: Excess *queues* here rather than being refused. That buys a bounded,
+#: self-healing cost in place of an unbounded, permanent one, and it is not
+#: free: the queue is FIFO and unbounded, so 64 queued attempts put the owner's
+#: own correct login 3.4 s behind them and 256 put it 13.4 s behind, against
+#: 0.11 s idle. A sustained flood still degrades the login — the trade taken
+#: here is that a slow login the human completes beats a memory exhaustion that
+#: takes the process for good, and beats the 503 a bounded queue would answer
+#: with, which is that same caller's switch for denying the login outright.
+#:
+#: Constructed at import, outside any event loop, which is precisely when anyio
+#: hands back an adapter that materialises the real limiter on first use — so
+#: this needs no lifespan hook and belongs to no single app instance, which is
+#: right, because the memory it bounds belongs to the process.
+_ARGON2_LIMITER = anyio.CapacityLimiter(ARGON2_CONCURRENCY)
 
 #: Path prefixes of the capability-URL routes, taken from
 #: :data:`nodum.urls.TOKEN_PATHS` rather than spelled again here — the minted
@@ -1228,6 +1351,37 @@ def _required_str(body: dict[str, Any], key: str) -> str:
     return value
 
 
+def _bounded_str(body: dict[str, Any], key: str, *, max_chars: int) -> str:
+    """Return a required string body field, refused above ``max_chars``.
+
+    :func:`_required_str` with a ceiling, for the fields an **unauthenticated**
+    caller supplies. A length nobody states is a length the caller picks, and
+    the only limit under it here is :data:`MAX_REQUEST_BYTES`: a 32 MiB name is
+    a well-formed request that costs a 32 MiB row in an append-only table, and a
+    32 MiB password is 32 MiB fed to argon2 at the full work factor.
+
+    The ceilings themselves are :data:`nodum.service.MAX_HUMAN_NAME_LENGTH` and
+    :data:`nodum.service.MAX_PASSWORD_LENGTH` — the service's, read from there
+    rather than restated here, because they are the same numbers
+    :func:`nodum.service.create_human` and
+    :func:`nodum.service.set_human_password` refuse a *write* above. An adapter
+    that owned its own copy is how the caps came to be one-sided: a 300-char
+    name and a 5000-char password were both storable, and both then met this
+    function's 400 on the way back in.
+
+    The refusal never echoes the value — a message quoting a 200 kB name puts
+    it in the response body and the server log instead of the events table.
+
+    Raises:
+        ValueError: If the key is missing, null, not a string, or longer than
+            ``max_chars``.
+    """
+    value = _required_str(body, key)
+    if len(value) > max_chars:
+        raise ValueError(f"field {key!r} must be at most {max_chars} characters")
+    return value
+
+
 def _required_int(body: dict[str, Any], key: str) -> int:
     """Return a required body field that must be an integer.
 
@@ -1841,6 +1995,48 @@ def create_app(
         """
         return EnvelopeResponse({"status": "ok", "version": VERSION})
 
+    def _verify_login(name: str, password: str) -> Principal:
+        """The blocking half of :func:`login`: lockout, argon2, failure event.
+
+        Split out so the whole of it runs in one thread-pool hop rather than
+        three — the lockout query, the password verification and the failure
+        event are each a synchronous database or CPU call, and interleaving
+        them with the loop would put the argon2 work back on it.
+
+        Raises:
+            LoginLocked: If the name is under the failed-attempt lockout. No
+                event is written for this: see :func:`login`.
+            InvalidCredentials: If the name or password does not verify. This
+                one *is* written, as ``human.login_failed``.
+        """
+        if service.login_is_locked(name, path=db_path):
+            raise auth.LoginLocked(
+                f"login for {name!r} is locked: too many failed attempts, try again later"
+            )
+        try:
+            return auth.verify_login(name, password, path=db_path)
+        except auth.InvalidCredentials:
+            service.record_auth_event(
+                "human.login_failed",
+                {"name": name, "reason": "invalid credentials"},
+                path=db_path,
+            )
+            raise
+
+    def _complete_login(principal: Principal) -> str:
+        """The blocking tail of :func:`login`: the session row, then the event.
+
+        One hop for the same reason :func:`_verify_login` is one, and for one
+        more: :func:`service.record_auth_event` opens a connection, inserts and
+        commits, and it used to do all three **on the loop** after both
+        threadpool hops — under a docstring here that said the whole handler
+        ran off it. Either the write moves or the claim does; this is the write
+        moving.
+        """
+        session_id = auth.create_session(principal.id, path=db_path)
+        service.record_auth_event("human.login", {"human_id": principal.id}, path=db_path)
+        return session_id
+
     async def login(request: Request) -> Response:
         """Password login — the one ``/api`` route outside the session gate.
 
@@ -1852,37 +2048,60 @@ def create_app(
         their own job. Failure is a 401 with no cookie, indistinguishable
         between "no such name" and "wrong password".
 
-        Every attempt is event-logged: a success writes ``human.login``, a
-        refused credential ``human.login_failed`` (the auth half of the audit
-        trail, via :func:`service.record_auth_event`). The failed-login
-        **lockout** (M5) throttles brute force: a name with five failed
-        attempts inside fifteen minutes is refused up front with a 429,
-        correct password or not, until the window slides past the failures —
-        and the refusal is itself logged as a failed attempt, so a guesser
-        who keeps trying keeps the lockout fresh. The lockout keys on the
-        attempted name, so it applies identically to names that do not exist.
+        Every attempt that reaches a password check is event-logged: a success
+        writes ``human.login``, a refused credential ``human.login_failed``
+        (the auth half of the audit trail, via
+        :func:`service.record_auth_event`). The failed-login **lockout** (M5)
+        throttles brute force: a name with five failed attempts inside fifteen
+        minutes is refused up front with a 429, correct password or not, until
+        the window slides past the failures. The lockout keys on the attempted
+        name, so it applies identically to names that do not exist.
+
+        **A refusal by the lockout writes no event of its own** (M2). It used
+        to, on the reasoning that a guesser who keeps trying should keep the
+        lockout fresh — which is true and is also two defects. The lockout is
+        the one ``/api`` route outside the session gate, so that made an
+        unauthenticated request an unbounded append to the append-only event
+        log; and it handed any local process a permanent lockout of the real
+        human, by re-arming the window every fifteen minutes forever. The five
+        failures that *caused* the lockout are on the record, which is what the
+        audit trail needs; the refusals they earn are a rate limit, and a rate
+        limit that logs is a rate limit that can be turned around.
+
+        **Both fields are length-capped before anything else happens**, at
+        :data:`service.MAX_HUMAN_NAME_LENGTH` and
+        :data:`service.MAX_PASSWORD_LENGTH` — the *service's* ceilings, which
+        are also the ones :func:`service.create_human` and
+        :func:`service.set_human_password` refuse a write above, so a name or a
+        password any surface stores is one this route will still look at. The
+        refusal is the ordinary 400 a malformed body gets, and it lands ahead of
+        the lockout query, ahead of argon2, and ahead of the point where a
+        failure would have appended the claimed name to the event log — which is
+        the whole reason the cap has to be here *as well*, and not inside the
+        thread.
+
+        **Every blocking call this handler makes runs off the event loop, and
+        the argon2 one is bounded.** Argon2id is ~100 ms of deliberate work —
+        the constant-time path spends it on names that do not exist too — and
+        this is the one route an unauthenticated caller can reach, so inline it
+        is a stalled server at ten requests a second (see the module docstring's
+        list, which this route belongs on). Off the loop and *unbounded* it is
+        that same caller's memory-exhaustion primitive instead: the default
+        thread limiter admits 40 at once and each verification reserves 64 MiB
+        (measurements under :data:`ARGON2_CONCURRENCY`). So
+        :func:`_verify_login` runs under :data:`_ARGON2_LIMITER` — the excess
+        queues rather than being refused, which costs this route latency under
+        load and is argued through where the limiter is defined — and
+        :func:`_complete_login` takes the session row and the ``human.login``
+        event in one further hop on the default limiter.
         """
         body = await _json_body(request)
-        name = _required_str(body, "name")
-        password = _required_str(body, "password")
-        if service.login_is_locked(name, path=db_path):
-            service.record_auth_event(
-                "human.login_failed", {"name": name, "reason": "locked"}, path=db_path
-            )
-            raise auth.LoginLocked(
-                f"login for {name!r} is locked: too many failed attempts, try again later"
-            )
-        try:
-            principal = auth.verify_login(name, password, path=db_path)
-        except auth.InvalidCredentials:
-            service.record_auth_event(
-                "human.login_failed",
-                {"name": name, "reason": "invalid credentials"},
-                path=db_path,
-            )
-            raise
-        session_id = auth.create_session(principal.id, path=db_path)
-        service.record_auth_event("human.login", {"human_id": principal.id}, path=db_path)
+        name = _bounded_str(body, "name", max_chars=service.MAX_HUMAN_NAME_LENGTH)
+        password = _bounded_str(body, "password", max_chars=service.MAX_PASSWORD_LENGTH)
+        principal = await anyio.to_thread.run_sync(
+            _verify_login, name, password, limiter=_ARGON2_LIMITER
+        )
+        session_id = await run_in_threadpool(_complete_login, principal)
         response = EnvelopeResponse({"human": principal.id})
         response.set_cookie(
             SESSION_COOKIE,
@@ -2814,15 +3033,36 @@ def create_app(
         return EnvelopeResponse(envelope(human))
 
     async def set_human_password(request: Request) -> Response:
-        """Set or change a human's password; the hash never leaves the service."""
+        """Set or change a human's password; the hash never leaves the service.
+
+        **The second argon2 caller on this surface, and it runs where the first
+        one does**: off the loop, under :data:`_ARGON2_LIMITER`. It ran inline
+        until the review that wrote this — ~100 ms of hashing on the
+        single-threaded event loop at argon2id's 64 MiB profile, with no
+        limiter of any kind, because the session gate was read as answer enough.
+        It is not the same question: the gate says *who* may hash, and the
+        limiter says how much of the process's memory may be argon2's while they
+        do. Under the default limiter that is 40 × 64 MiB — the same ~2.5 GiB
+        ``POST /api/login`` is bounded away from, reachable here by an
+        authenticated human instead of an anonymous one, which changes who to
+        blame and nothing about the memory.
+
+        The password's own ceiling (:data:`service.MAX_PASSWORD_LENGTH`) is the
+        service's and is enforced there, so this route cannot store one the
+        login route would later refuse.
+        """
         body = await _json_body(request)
         human_id = request.path_params["id"]
-        _write(
-            request,
-            service.set_human_password,
-            human_id,
-            _required_str(body, "password"),
-            path=db_path,
+        await anyio.to_thread.run_sync(
+            functools.partial(
+                _write,
+                request,
+                service.set_human_password,
+                human_id,
+                _required_str(body, "password"),
+                path=db_path,
+            ),
+            limiter=_ARGON2_LIMITER,
         )
         return EnvelopeResponse({"ok": True, "human_id": human_id})
 

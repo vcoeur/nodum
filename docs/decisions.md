@@ -62,7 +62,7 @@ grant; idempotent per `(hash, space)`), **`page:<n>` PDF rasters** beside
 `0012_url_tokens` — short-lived, single-use, event-logged download and upload
 grants for a host that shares no filesystem with the graph). The surfaces:
 CLI `ingest file|url|handlers` and `asset download-url|upload-url`, MCP
-`ingest_file`/`ingest_url`/`request_upload_url`/`get_download_url`, and HTTP
+`ingest_url`/`request_upload_url`/`get_download_url`, and HTTP
 `POST /api/ingest`, `POST /api/assets/{id}/download-url`, `POST /api/uploads`,
 `GET /api/download/{token}`, `PUT /api/uploads/{token}`.
 
@@ -465,7 +465,7 @@ human cannot write a note.
 ## 2026-08-04 — `create_node` grew a `space` parameter because the SDK discards what it does not declare
 
 The MCP SDK discards a keyword this module does not declare instead of refusing
-it: `create_node` had no `space` parameter while `ingest_file`/`ingest_url`/
+it: `create_node` had no `space` parameter while the ingestion tools and
 `request_upload_url` did, so an agent asking for `research` got a 200-shaped
 response describing a node in `main` — no way to choose a space and no way to
 learn it had not got one. `create_node` now takes `space` (a space id or name,
@@ -2195,3 +2195,184 @@ review drove**: a consolidation stopped mid-run through
 `POST /api/cycles/{id}/stop` ran to `completed` with the stop kept on its
 entry, and the journal entry for it reads *"a stop was asked for on this run
 and it completed anyway"*.
+
+## 2026-08-05 — the MCP surface takes no path on the server's disk
+
+`ingest_file` accepted a path this server could read, and the grant model had
+nothing to say about it: grants scope the *graph*, and reading a file is not a
+graph read. An agent holding the minimal write grant — `suggest` on one space,
+what a new agent is given — named a path, the pipeline wrote the extraction to
+`assets.extracted_text`, a `proposed` describing node was enough to reach it,
+and `get_asset` returned it. Two calls, both auto-approved by a host
+(`destructiveHint=False`, then `readOnlyHint=True`), and `name` picks the
+extraction handler, so an extensionless secret reads as text by asking for it.
+
+**The first fix was the wrong one and is worth recording as such.** A review
+reported the capability through the path it noticed — the tool *echoed* the
+text in its own result — so the result stopped carrying it, and
+`_ingest_result` got a docstring naming the harm: "echoing them would hand any
+token-bearing agent the contents of any file this server can read". Two
+sentences later the same docstring documented the next call. The delivery
+vector closed; the capability never moved. Its own docstring now says it is a
+payload-size decision and not a boundary, and the test that pins it asserts the
+second call *does* return the text, so nobody reads the first half as a defence
+again.
+
+What bounds the surface is that nothing here names a file
+(`mcp_server.FILESYSTEM_TOOLS`, the fourth named absence beside the review,
+curative and human-only tiers). Nothing is lost: ingestion by reference (§5.7
+rule 2) keeps `ingest_url` for anything the server can fetch and
+`request_upload_url` for bytes the caller holds — which are the two doors a
+server the agent does not share a machine with needs anyway. `nodum ingest`
+still takes a path, on the CLI, where local access is already the trust
+boundary.
+
+## 2026-08-05 — `edge_scope` computes the node rule instead of restating it
+
+`node_scope_clause` scopes a `space`-typed node to its **own id**: space nodes
+live in meta, every agent reads meta for the type vocabulary, and filtering one
+on `space_id` alone hands every space in the file to any meta reader. That was
+M3. `edge_scope` kept the pre-M3 rule — `space_id IN (…)` for both endpoints —
+and `service._walk` loads both endpoints of every edge it follows, trusting
+that clause. So a `mentions` edge onto a space node, which wikilink
+materialisation writes whenever a readable note links a space by name, carried
+that space node's id *and its title* to an agent `get_node` refuses.
+
+Two copies of one rule, and the second was a year behind the first. `edge_scope`
+now calls `node_scope_clause` per endpoint, and `_walk` re-checks each endpoint
+row against `Store.node_visible` — the clause is the filter, the row check is
+the second layer, and a node read in the service that skips it is the shape of
+this defect. Both docstrings asserted the guarantee that did not hold; that is
+the tell, not the SQL.
+
+## 2026-08-05 — a failed login is nobody, and its refusal is not an event
+
+`events.actor` answers *who did this*. `human.login_failed` put the attempted
+name there, reasoning that a failure has no verified principal so the column
+should record what the attempt claimed — on the one `/api` route outside the
+session gate. `{"name": "human:owner"}` therefore wrote rows attributed to the
+seeded owner, with no credential presented, and `nodum events --actor
+human:owner` listed them beside the real owner's. The name is data about the
+attempt and lives in the payload; the actor is `UNAUTHENTICATED_ACTOR`, which
+carries neither identity prefix and so cannot be resolved to an account.
+
+A refusal by the lockout no longer writes an event either. It did, so that a
+guesser who kept trying kept the window fresh — true, and two defects: an
+unauthenticated request became an unbounded append to the append-only log, and
+any local process could hold the real human out forever by re-arming the window
+every quarter-hour. Sixty attempts on one name wrote sixty rows; they now write
+five, which are the failures that earned the lockout. Its refusals are a rate
+limit, and a rate limit that logs is a rate limit that can be turned around.
+
+Two things under it. `login` runs through `run_in_threadpool` like every other
+blocking route: argon2id is ~100 ms, spent on names that do not exist too, and
+this is the only route an unauthenticated caller reaches — inline, ten requests
+a second was a stopped server. And `0018` indexes `events(op, created_at)`,
+because `login_failure_count` runs on every attempt and was a full scan of the
+log with a `json_extract` per row: the check got slower with exactly the
+traffic it throttles. `EXPLAIN QUERY PLAN` reads `SEARCH events USING INDEX
+idx_events_op_created`, where it read `SCAN events`.
+
+**The residual, stated rather than defended**: the lockout is per name because
+it must not be an existence oracle, so an attacker cycling distinct names still
+appends a row per name — the same-name amplification is what closed, not the
+append. A global limit would fix that by handing the same attacker a way to
+lock the human out of their own graph, which is worse. The row's *size* is
+bounded separately: the login name and password are capped where they are read
+and where they are written, after an uncapped name wrote a 200 KB event row per
+unauthenticated request.
+
+**And the fix's own first cut traded one denial of service for another
+silently.** Moving argon2id off the event loop was right and was shipped with
+no bound, so anyio's default limiter ran 40 hashes at 64 MiB each: 64
+concurrent unauthenticated logins took **+2573 MiB** of RSS where the inline
+version took +64 MiB. A dedicated `CapacityLimiter(2)` puts that at +131 MiB
+and — the property that matters — stops it scaling with load at all. What
+replaces it is a latency cost the excess pays in a FIFO queue: 8 concurrent
+logins settle in 0.53 s, 256 in 13.78 s. That is the honest shape of the
+trade. It is the better half — a slow login recovers the moment the flood
+stops, while 2.5 GiB of RSS does not — and it is written down here because the
+first version of the comment justifying the queue described a property the
+code does not have.
+
+## 2026-08-05 — the tag gate runs what the PR gate runs, and a test says so
+
+`release.yml`'s comment read "the matrix mirrors ci.yml's so the tag gate is
+not weaker than the PR gate". True of the matrix, false of the gate: ruff,
+pyright, the highest-resolution resolution leg and the whole frontend suite ran
+on pull requests only, so the artifact users install was gated more weakly than
+the branch it came from. Usually a tag names a commit that already passed
+ci.yml — and "usually" is what a release gate exists not to depend on. This
+project has already pushed a tag at a tree that was never the merged one
+(`v0.12.0` published a pre-merge state).
+
+The missing jobs are in `release.yml` and in `build-and-publish`'s `needs`,
+and `tests/test_docs.py` asserts the cover: the claim is checkable now rather
+than written down, and a job added to a PR-gating workflow fails the suite
+until somebody decides whether a release needs it. The highest-resolution leg
+matters most of them — it is the leg that exists for an unbounded dependency
+major breaking a fresh resolution, which is a thing a *release* ships and a PR
+does not.
+
+**The first cut of that test asserted less than its own docstring claimed**,
+which is the defect it exists to prevent, arriving inside the fix for it. Four
+ways: it read `ci.yml` alone, so `docs.yml` — a third `pull_request`-triggered
+workflow, and the one that catches a broken internal link — was invisible, and
+a tag at a tree with a dead link published green; its job-id regex was
+`[a-z0-9-]+`, so a job named `type_check` was silently *not seen* rather than
+reported missing; it took the first `needs:` in the file and assumed it was
+`build-and-publish`'s; and it compared job *names*, while `release.yml`'s `web`
+job was in fact missing `make web-build` — the frontend typecheck — that
+`ci.yml`'s ran. All four are closed: workflows are discovered by their
+triggers, an unparseable job id is a loud failure rather than a skip, `needs:`
+is read out of the named job in both YAML spellings, and same-named jobs are
+compared by their `run:` steps with the release side required to be a superset.
+Two exemptions are named and load-bearing rather than decorative — `npm audit`
+(an advisory published overnight must not block a tag) and `docs.yml`'s deploy
+job (never a PR check).
+
+## 2026-08-05 — the workflow gate stopped hand-parsing YAML, after three silent mis-reads
+
+`tests/test_docs.py` asserts a tag push runs every check a pull request runs. It
+read `.github/workflows/*.yml` with regexes, to avoid a dependency. Three
+consecutive adversarial reviews found it **silently mis-reading** the files it
+audits:
+
+- `run: |` matched the regex and recorded the command as the literal string
+  `"|"`, so two entirely different block scalars compared equal;
+- then nine more at once — a flow-mapping step dropped whole, a `uses:`-only job
+  read as running nothing, anchors and aliases compared as literal text, a
+  truncated quoted scalar, `run: |2`, a `with: run:` action input counted as a
+  shell command, a duplicate job id, two top-level `jobs:` keys;
+- then a plain multi-line `run:` truncated to its first line, which is the one
+  that decided it: `uv run --locked ruff check` continued with `.` on the next
+  line compared **equal** to a release side weakened to `--exit-zero`. The gate
+  reported parity while the tag ran a check the pull request did not.
+
+Each round the parser was made stricter and each round it was still wrong
+somewhere else, in the one test whose entire purpose is catching silent drift.
+That is the argument for the dependency, and it is worth more than the
+dependency costs: `pyyaml` is in the `dev` group — never `[project]
+.dependencies`, verified by reading `Requires-Dist` out of the built wheel — and
+the file is 228 lines lighter (615 → 387), the parsing layer about 180.
+
+The switch also *widened* what the gate accepts. The hand parser refused flow
+mappings, anchors, a `run:` under `with:` and a quoted `"on":` key outright;
+those are legal workflow YAML and now pass. One shape does not: the strict
+loader rejects a `<<:` merge key, because it resolves every key before
+`flatten_mapping` runs. That is the commonest reason to reach for an anchor at
+all, so the widening is narrower than it sounds — it is a loud refusal rather
+than a mis-read, and GitHub Actions does not support merge keys either, so the
+file it refuses is one Actions would refuse too. Two behaviours are deliberate rather
+than inherited: PyYAML is YAML 1.1, so a bare `on:` key parses as the boolean
+`True` and the trigger reader accepts both spellings while refusing a file
+carrying both; and the loader **raises on a duplicate mapping key** instead of
+taking YAML's last-wins, because either reading means the file says something
+other than what it runs.
+
+What is compared is job presence and the `run:` commands of same-named jobs,
+release required to be a superset. What is **not**: `shell:`,
+`working-directory:`, `env:`, `if:`, step names, `uses:` steps, matrix legs and
+step order. A release job could run byte-identical commands behind `if: false`
+and still count — stated in the test's own docstring rather than left for the
+next review to find.

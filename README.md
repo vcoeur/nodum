@@ -183,8 +183,11 @@ uv run nodum supersede-edge <edge-id> --confidence 0.4 --as owner
 uv run nodum bulk-relink --dst <old> --to-dst <new> --dry-run --as owner
 
 # MCP server (stdio) for external agents — read + additive tiers only, no
-# review tools, no curative tools. The agent authenticates with its token in
-# NODUM_AGENT_TOKEN (minted by `nodum agent create`, shown once).
+# review tools, no curative tools, and no tool that takes a path on this
+# server's disk. The agent authenticates with its token in NODUM_AGENT_TOKEN
+# (minted by `nodum agent create`, shown once). Normally the MCP *client*
+# launches this for itself, carrying the token in its config's env block —
+# see docs/install.md; run it by hand only to check a token verifies.
 NODUM_AGENT_TOKEN=ndm_… uv run nodum mcp serve
 
 # HTTP server for the human: JSON API under /api plus the web UI at /.
@@ -412,7 +415,7 @@ cycle quietly drop the vector signal until you re-run the download.
   The registry is the design §8.1 read tier (`get_node`, `get_children`,
   `search`, `traverse`, `list_types`, `get_schema`, `find_path`, `history`,
   `diff`, `get_asset`, `get_download_url`) and additive tier (`create_node`,
-  `update_node`, `link`, `propose_edges`, `ingest_file`, `ingest_url`,
+  `update_node`, `link`, `propose_edges`, `ingest_url`,
   `request_upload_url`). Ingestion is **by reference** — the tool takes a path
   the server can read or a URL it can fetch, and no base64 ever crosses MCP; a
   host with no filesystem in common asks `request_upload_url` for somewhere to
@@ -474,8 +477,10 @@ cycle quietly drop the vector signal until you re-run the download.
   failed-login lockout throttles guessing — five misses for a name inside
   fifteen minutes refuse further attempts for it with a 429 until the window
   slides past them, applied identically to names that do not exist. Every
-  attempt is event-logged (`human.login` / `human.login_failed` /
-  `human.logout`), the auth half of the audit trail. A
+  attempt that reaches a password check is event-logged (`human.login` /
+  `human.login_failed` / `human.logout`), the auth half of the audit trail —
+  a refusal by the lockout writes nothing, so an unauthenticated caller cannot
+  grow the log with it. A
   non-loopback bind is allowed — login, not the bind, is the boundary — and
   marks the cookie `Secure` there. `nodum human passwd` sets the password;
   logout, expiry, and `human disable` kill the session at the next request.

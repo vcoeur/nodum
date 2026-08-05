@@ -1054,6 +1054,136 @@ CREATE UNIQUE INDEX idx_annotations_version
 """
 
 
+#: Index the two columns the failed-login lockout filters on (finding M2).
+#:
+#: ``service.login_failure_count`` runs on **every** password attempt, and the
+#: only index on ``events`` was ``idx_events_cycle`` — so the check was a full
+#: scan of the append-only log with a ``json_extract`` per row, on the one
+#: route reachable without a session. The log only grows, and failed attempts
+#: grow it, so the check got slower with exactly the traffic it exists to
+#: throttle.
+#:
+#: ``(op, created_at)`` in that order: ``op`` is the equality, ``created_at``
+#: the range, so the window scan happens inside the one op's rows. The
+#: ``json_extract`` on the name stays a per-row test — over five rows in a
+#: quarter-hour instead of the whole log.
+EVENT_OP_INDEX_DDL = """
+CREATE INDEX idx_events_op_created ON events(op, created_at);
+"""
+
+
+UNIQUE_HUMAN_NAMES_DDL = """
+-- One human per login name, for good (round-6 review, finding M1).
+--
+-- `humans.name` is the login handle. Ids of CLI-created humans are random hex
+-- and nobody types one at a prompt, so `auth.verify_login` looks an account up
+-- by name — and it refuses a name that matches more than one row, deliberately,
+-- because "which human is behind this session?" has no answer otherwise. Only
+-- nothing stopped two accounts carrying one name: `nodum human create owner`,
+-- or `POST /api/humans {"name": "owner"}`, both supported writes behind the
+-- ordinary human-only gate, and HTTP login for that name was dead from the
+-- moment the second row landed. Dead **for good**: the human verbs are
+-- create/list/passwd/disable/enable, none of them removes or renames an
+-- account, and the ambiguity check runs before the `disabled` one, so even
+-- disabling the clone brought nothing back. Recovery meant hand SQL.
+--
+-- `service.create_human` now refuses the duplicate the way `create_agent`
+-- refuses a taken agent id, and this is the constraint under that check for the
+-- same reason `agents` has one: the check and the INSERT are two statements on
+-- a short-lived connection of the service's own, so two concurrent creates can
+-- both read the name free and both write it. A rule a *reader* depends on
+-- belongs in the schema, not only in the writer that happens to be in front of
+-- it today.
+--
+-- What the index covers: `name`, exactly and always.
+--
+--   * Exact, never case-folded. `verify_login` compares `name = ?` under
+--     SQLite's default BINARY collation, so `Owner` and `owner` are two names
+--     that tell themselves apart perfectly, and a NOCASE index would refuse a
+--     pair the lookup handles. The constraint is exactly as tight as the lookup
+--     — 0013's rule for space titles, for 0013's reason.
+--   * No state predicate. A disabled account keeps its name: `enable_human` is
+--     supported, so a name freed by a disable would collide the instant the
+--     account came back — the mistake 0013 had to correct in itself. And
+--     `humans.name` is NOT NULL, so unlike a space title nothing sits outside
+--     the index at all.
+--
+-- Unlike a space title, a login name is *not* also an id: `verify_login`
+-- matches `name = ?` and nothing else, and no surface resolves a human by "id
+-- or name". 0013's third property — the title that is another row's id — has no
+-- analogue here, so ids are not part of the dedupe.
+--
+-- Dedupe first, or this fails with a bare IntegrityError on every database a
+-- duplicate was already created on, rolling the upgrade back and leaving the
+-- login exactly as dead as it found it. That is 0009's lesson, applied by 0013
+-- and applied again here — with 0013's tie-break rewritten for what a *login*
+-- name is for:
+--
+--   1. **The account the name is worth something to keeps it.** Enabled before
+--      disabled, then password-holding before passwordless, then oldest
+--      (`created_at`, `rowid`). A disabled account cannot log in at all and a
+--      passwordless one cannot log in over HTTP, so reserving the handle for
+--      either is reserving it for nobody. This preserves no live resolution —
+--      there is none to preserve, which is the whole defect: today the shared
+--      name resolves to no account whatever. It picks the row that can use it.
+--      In the case this was found on the seeded `owner` wins on both keys at
+--      once: it holds the password, and the clone was created passwordless.
+--   2. **The rename cannot itself collide.** `<name> (<id>)` is unique among
+--      losers because ids are, but a database can already hold a human
+--      literally called `owner (owner)` — and then the dedupe would generate
+--      that very string and the index would refuse it, which is the failure
+--      this migration exists to prevent. So the free name is searched, not
+--      assumed: the base, then `<base> 1`, `<base> 2`, … until one is free of
+--      every name that survives the statement. 0013's argument that two losers
+--      can never land on one string holds unchanged — distinct ids make the
+--      bases distinct, a base always ends in `)` while a suffixed name always
+--      ends in a digit, and two suffixed names split at that trailing digit.
+--
+-- The losers are **renamed, not disabled**: a duplicate name is no reason to
+-- take an account away from whoever owns it. Every loser stays administrable by
+-- id (`nodum human passwd <id>`, disable, enable), keeps its sessions, its
+-- agents and its history, and can log in under the name it comes out with.
+-- Names change here with no event and no version, as every migration's data
+-- repair does.
+--
+-- One case is left standing knowingly: a loser whose name was already at
+-- `service.MAX_HUMAN_NAME_LENGTH` comes out longer than the cap `POST
+-- /api/login` refuses a claimed name above, and no verb shortens it again. It
+-- costs that row nothing it had — a name shared by two accounts could not be
+-- logged in with before this ran either — and truncating to make room would
+-- throw away the name the rename exists to keep legible.
+WITH RECURSIVE
+ranked AS (
+    SELECT rowid AS rid, id, name, ROW_NUMBER() OVER (
+        PARTITION BY name
+        ORDER BY disabled, credential_hash IS NULL, created_at, rowid
+    ) AS rank
+    FROM humans
+),
+losers AS (
+    SELECT rid, name || ' (' || id || ')' AS base FROM ranked WHERE rank > 1
+),
+keepers AS (
+    SELECT name FROM ranked WHERE rank = 1
+),
+candidates(rid, base, suffix, name) AS (
+    SELECT rid, base, 0, base FROM losers
+    UNION ALL
+    SELECT rid, base, suffix + 1, base || ' ' || (suffix + 1)
+    FROM candidates
+    WHERE name IN (SELECT name FROM keepers)
+),
+resolved AS (
+    SELECT rid, name FROM candidates WHERE name NOT IN (SELECT name FROM keepers)
+)
+UPDATE humans
+SET name = (SELECT name FROM resolved WHERE resolved.rid = humans.rowid)
+WHERE rowid IN (SELECT rid FROM resolved);
+
+CREATE UNIQUE INDEX idx_humans_name ON humans(name);
+"""
+
+
 #: Ordered (name, SQL) migrations. Append-only — never edit a shipped entry.
 MIGRATIONS: list[tuple[str, str]] = [
     ("0001_core", CORE_DDL),
@@ -1073,4 +1203,6 @@ MIGRATIONS: list[tuple[str, str]] = [
     ("0015_cycle_stop_switch", CYCLE_STOP_SWITCH_DDL),
     ("0016_conventions_and_annotations", CONVENTIONS_AND_ANNOTATIONS_DDL),
     ("0017_projector_skips", PROJECTOR_SKIPS_DDL),
+    ("0018_events_op_index", EVENT_OP_INDEX_DDL),
+    ("0019_unique_human_names", UNIQUE_HUMAN_NAMES_DDL),
 ]

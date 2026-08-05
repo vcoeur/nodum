@@ -12,6 +12,29 @@ dependencies = [
     # "ceiling-tested" — the CI highest-resolution leg and the smoke install's
     # fresh resolution exercise the ceiling, so a break surfaces there instead
     # of on a fresh install.
+    # Declared because `nodum.http_api` imports it directly — for the login
+    # route's own `CapacityLimiter`, which bounds how many argon2 hashes may be
+    # in flight at once. It arrives transitively with starlette either way, and
+    # that is exactly the trap: an undeclared import that happens to resolve is
+    # the B1 shape, one dependency-tree change away from a fresh install that
+    # cannot import.
+    #
+    # The floor is 4.2 because that is where the behaviour this package relies
+    # on arrives, measured by installing each: `http_api` builds its argon2
+    # limiter at module level, and `anyio.CapacityLimiter(2)` outside a running
+    # event loop raises `AsyncLibraryNotFoundError` on 4.0 and 4.1, returning a
+    # `CapacityLimiterAdapter` from 4.2 on.
+    #
+    # **It is inert today and declared anyway.** `mcp>=1.28.1` requires
+    # `anyio>=4.5` and pulls `sse-starlette`, which requires `>=4.7.0`, so the
+    # reachable floor is 4.7 — no resolution from this file can land below it
+    # whatever this line says, and `>=4` and `>=4.2` select the same version
+    # (they do record different specifiers in `uv.lock`). That is a fact about other
+    # people's metadata, which is the whole reason to write our own bound down:
+    # the day `mcp` relaxes its floor, this line is what stops the resolver
+    # walking into a version where importing `nodum.http_api` raises. A bound
+    # that is currently unreachable is not a bound that is wrong.
+    "anyio>=4.2,<5",
     "argon2-cffi>=23",         # ceiling-tested: year-major versioning, API stable for a decade
     "mcp>=1.28.1,<2",          # mcp 2.0.0 removed mcp.server.fastmcp, which nodum.mcp_server imports
     "pillow>=11",              # ceiling-tested: mature, non-breaking majors; tiny API surface used
@@ -93,7 +116,24 @@ dev = [
     "pyright>=1.1.411",
     "pytest>=9.0.2",
     "pytest-cov>=6.0",
+    # Test-only, and deliberately not a runtime dependency: the one consumer is
+    # tests/test_docs.py, which reads .github/workflows/*.yml to assert the tag
+    # gate is not weaker than the PR gate. That test hand-parsed YAML with
+    # regexes to avoid this line, and the hand parser was caught silently
+    # mis-reading a workflow in three consecutive reviews — in the one test
+    # whose purpose is catching silent drift. See that module's docstring.
+    "pyyaml>=6,<7",            # 6.x since 2021; a 7.0 would be the breaking major
     "ruff>=0.15.2",
+]
+# The docs gate, declared so `make docs` can run it the way CI does. Exact
+# pins rather than ranges: this builds a published site, and mkdocs-material's
+# minor releases move theme markup — the point of the group is that the local
+# build and the CI build are the same build. `docs.yml` names the same two
+# versions inline, because the Pages job installs them into an ephemeral env
+# rather than syncing this project's groups.
+docs = [
+    "mkdocs==1.6.1",
+    "mkdocs-material==9.7.7",
 ]
 
 [tool.pytest.ini_options]
