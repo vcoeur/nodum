@@ -36,8 +36,9 @@ export function TokenDialog({ agentName, token, onClose }: TokenDialogProps) {
     <Modal title={`Token for ${agentName}`} onClose={onClose}>
       <p>
         This is the only time the token is shown — the server keeps its hash,
-        not the token. Put it in the agent's MCP client configuration as{" "}
-        <code>NODUM_AGENT_TOKEN</code> now; if it is lost, rotate the token.
+        not the token. Put it in the agent's MCP client configuration now, as{" "}
+        <code>Authorization: Bearer …</code> against this server's{" "}
+        <code>/mcp</code> URL; if it is lost, rotate the token.
       </p>
       <p className="nd-ad-token nd-mono">{token}</p>
       <div className="nd-row">

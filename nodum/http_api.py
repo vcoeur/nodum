@@ -220,7 +220,18 @@ from starlette.responses import FileResponse, JSONResponse, Response, StreamingR
 from starlette.routing import Match, Route
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from nodum import answers, assets, auth, consolidate, db, ingest, scheduler, service, urls
+from nodum import (
+    answers,
+    assets,
+    auth,
+    consolidate,
+    db,
+    ingest,
+    mcp_server,
+    scheduler,
+    service,
+    urls,
+)
 from nodum import search as search_module
 from nodum.assets import (
     AssetNotFound,
@@ -984,6 +995,45 @@ def _is_capability_path(path: str) -> bool:
     return path.startswith(TOKEN_PATH_PREFIXES)
 
 
+def _is_mcp_path(path: str) -> bool:
+    """Is this the agent surface, whose credential is a header it must present?
+
+    Exempt from the same two checks as :func:`_is_capability_path`, for the
+    same reason and no wider a one: **a bearer token is not an ambient
+    credential.** No browser attaches ``Authorization`` on its own, so there is
+    nothing here for a cross-origin page to spend — and a page that has somehow
+    been given an agent token could equally well have used ``curl``, which the
+    origin gate was never able to stop anyway. Requiring a same-origin proof of
+    a client that is not a browser would refuse every legitimate caller
+    (an MCP client sends no ``Origin`` and no ``Sec-Fetch-Site``) while adding
+    nothing an attacker has to defeat.
+
+    The exemption is deliberately *this narrow*. Do not widen it to "requests
+    with an ``Authorization`` header" — that would let any route opt out of CSRF
+    protection by attaching a header a hostile page can make the browser send in
+    some other flow. It is one path, and the path is a constant
+    (:data:`nodum.mcp_server.MCP_PATH`) rather than a prefix, so nothing nests
+    underneath it.
+
+    Not exempt, on purpose, and exactly as for a capability URL:
+
+    * the ``Host`` check — DNS rebinding is about which *server* was reached,
+      which the credential's shape changes nothing about; and
+    * the body ceiling.
+
+    What replaces the skipped checks is not nothing:
+    :class:`nodum.mcp_server.BearerGuard` refuses the request outright unless
+    it presents an enabled agent's token, before the transport answers at all.
+
+    Args:
+        path: The normalised request path.
+
+    Returns:
+        Whether the path is the MCP transport.
+    """
+    return path == mcp_server.MCP_PATH
+
+
 def _needs_a_session(path: str) -> bool:
     """Does this path require the session gate to have verified a human?
 
@@ -1104,11 +1154,13 @@ class RequestGuardMiddleware:
        the stream is then capped mid-read regardless of what that header
        claimed.
 
-    Checks 2 and 3 are skipped for the capability-URL routes, and only those
-    two: they are the checks that assume an ambient credential the request
-    would be spending, and a capability URL has none — see
-    :func:`_is_capability_path`. Checks 1 and 4 apply to every request this
-    server answers, those routes included.
+    Checks 2 and 3 are skipped for exactly two kinds of route, and only those
+    two checks: the capability URLs (:func:`_is_capability_path`) and the MCP
+    transport (:func:`_is_mcp_path`). Both are the checks that assume an
+    ambient credential the request would be spending, and neither route has
+    one — a capability URL's token is the whole authorisation, and an agent's
+    bearer header is not something a browser attaches on its own. Checks 1 and
+    4 apply to every request this server answers, those routes included.
 
     What it does **not** do: authenticate. Any local process can satisfy every
     check above with three ``curl`` headers. That is what the password session
@@ -1138,15 +1190,17 @@ class RequestGuardMiddleware:
         if scope["method"] in SAFE_METHODS:
             return None
 
-        if _is_capability_path(scope["path"]):
+        if _is_capability_path(scope["path"]) or _is_mcp_path(scope["path"]):
             # The CSRF checks below and the content-type check under them both
             # assume the request would arrive carrying an ambient credential.
-            # A capability URL has none: the token in the path is the entire
-            # authorisation, so there is nothing for a cross-origin page to
-            # ride and nothing a same-origin proof would add. See
-            # `_is_capability_path` for the full argument — and note that the
-            # `Host` check above has already run, and the body cap below still
-            # runs, because neither of those is about ambient credentials.
+            # Neither of these two has one. A capability URL's token *is* the
+            # entire authorisation, and the MCP surface's credential is a
+            # bearer header no browser attaches by itself — so in both cases
+            # there is nothing for a cross-origin page to ride and nothing a
+            # same-origin proof would add. See `_is_capability_path` and
+            # `_is_mcp_path` for the full argument, and note that the `Host`
+            # check above has already run and the body cap below still runs,
+            # because neither of those is about ambient credentials.
             return None
 
         origin = headers.get("origin")
@@ -3327,14 +3381,23 @@ def create_app(
         Route("/api/spaces/{id}/archive", archive_space, methods=["POST"]),
     ]
 
+    # The agent surface, on the same origin as the human one. It is built here
+    # rather than imported as a module-level app because it needs this server's
+    # database path and host list — the same list `RequestGuardMiddleware` uses,
+    # so the SDK's own DNS-rebinding check and nodum's cannot disagree.
+    mcp_surface = mcp_server.http_surface(db_path=db_path, allowed_hosts=hosts)
+
     routes = [
         Route("/healthz", healthz),
         *api_routes,
         # Order matters from here: an unmatched /api path is a JSON 404 (or a
-        # 405 when only the verb was wrong), then /favicon.ico is answered as an
-        # icon rather than as a document, and only then does everything else
-        # fall through to the single-page app.
+        # 405 when only the verb was wrong), then the MCP transport claims its
+        # own path, then /favicon.ico is answered as an icon rather than as a
+        # document, and only then does everything else fall through to the
+        # single-page app. `/mcp` has to precede that catch-all or the SPA
+        # swallows it and an agent gets HTML.
         Route("/api/{path:path}", api_not_found, methods=ALL_METHODS),
+        mcp_surface.route,
         Route("/favicon.ico", favicon),
         Route("/{path:path}", web_app),
     ]
@@ -3363,14 +3426,21 @@ def create_app(
         Shutdown is bounded by :meth:`~nodum.scheduler.ConsolidationScheduler.stop`
         rather than by the cycle: a server must not take minutes to stop because
         it happened to be tidying up when the signal arrived.
+
+        It also runs the MCP transport's session manager. That is not optional
+        and not cosmetic: Starlette does **not** run a sub-application's
+        lifespan, and the MCP route's own app carries its task group there — so
+        without this line ``/mcp`` answers 500 on every call, while the route
+        table still looks perfectly wired.
         """
-        if consolidation is not None:
-            consolidation.start()
-        try:
-            yield
-        finally:
+        async with mcp_surface.run():
             if consolidation is not None:
-                await consolidation.stop()
+                consolidation.start()
+            try:
+                yield
+            finally:
+                if consolidation is not None:
+                    await consolidation.stop()
 
     # Outermost first: the guard normalises the path every inner layer keys on,
     # and refuses cross-origin and oversized requests before auth even looks at

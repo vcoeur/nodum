@@ -119,38 +119,43 @@ Create an agent account first:
 nodum agent create researcher --as owner    # prints the token once — store it
 ```
 
-Then point your MCP client at it. **You do not run `nodum mcp serve` yourself**:
-the transport is stdio, so the client launches it as a subprocess and talks to
-it over that process's stdin and stdout. The token goes in the client
-configuration's `env` block, which is what the client injects into the process
-it starts:
+Then point your MCP client at the running server. **There is no subprocess to
+launch and no stdio transport**: the agent surface is a route on `nodum serve`,
+so the client needs a URL and a header, and the same server can be on this
+machine or on another one.
 
 ```json
 {
   "mcpServers": {
     "nodum": {
-      "command": "nodum",
-      "args": ["mcp", "serve"],
-      "env": {
-        "NODUM_AGENT_TOKEN": "ndm_…",
-        "NODUM_DB": "/home/you/.local/share/nodum/nodum.db"
+      "type": "http",
+      "url": "http://127.0.0.1:8600/mcp",
+      "headers": {
+        "Authorization": "Bearer ndm_…"
       }
     }
   }
 }
 ```
 
-That is the whole setup — there is no port, no daemon and no `--token` flag. A
-flag would put the token in `ps` and in shell history, which is why it is the
-environment or nothing. `NODUM_DB` is worth setting explicitly: the client
-launches the process, so it does not inherit the shell environment you set the
-variable in.
+Swap the host for your own to reach a deployed instance —
+`https://nodum.example.com/mcp` — and nothing else about the config changes.
+The database is the server's business, so there is no `NODUM_DB` here: the
+client no longer starts a process and has nothing to point at a file.
 
-To check the token before wiring it up, run the server by hand and press
-Ctrl-D — it will fail at startup on a token that verifies no enabled agent:
+`nodum serve` has to be running for any of this to resolve. That is the one
+real cost of dropping stdio, where the client started the server on demand.
+
+To check a token before wiring it up, ask the server for its tool list — a
+token that verifies no enabled agent gets a `401`, and a good one gets the
+read and additive tiers:
 
 ```sh
-NODUM_AGENT_TOKEN=ndm_… nodum mcp serve
+curl -sS -X POST http://127.0.0.1:8600/mcp \
+  -H 'Authorization: Bearer ndm_…' \
+  -H 'Accept: application/json, text/event-stream' \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 ```
 
 It exposes the read and additive tool tiers only, and confines every call to

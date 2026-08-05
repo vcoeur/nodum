@@ -571,9 +571,10 @@ that no text came out.
 
 ### Servers
 
-- `serve` — Serve the human web UI and its JSON API.
-- `mcp serve` — Launch the MCP server on stdio (read + additive tiers); the
-  agent token comes from `NODUM_AGENT_TOKEN`.
+- `serve` — Serve the web UI, the JSON API and the MCP surface: `/`, `/api`
+  and `/mcp` on one origin. Agents authenticate per request with
+  `Authorization: Bearer ndm_…`; there is no separate MCP command, because
+  there is no longer a stdio transport to launch.
 
 ## Serving
 

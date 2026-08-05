@@ -426,7 +426,8 @@ layer, each with its own identity rule and no logic of its own:
   with a required `--as human:<id>`, reads included.
 - **HTTP API** — every write is attributed to the session's human (password
   login, server-side session); no request field can say otherwise.
-- **MCP server** — one agent, authenticated by its token (`NODUM_AGENT_TOKEN`),
-  exposing the read and additive tool tiers *and nothing else*.
+- **MCP server** — any agent, authenticated per request by its bearer token,
+  exposing the read and additive tool tiers *and nothing else*. One server
+  serves many agents; the identity is re-read from each request, never cached.
 
 Because the logic lives in one place, the surfaces cannot drift apart.

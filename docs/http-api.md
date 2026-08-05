@@ -45,7 +45,7 @@ this gate.
 The method column lists the methods the route table configured; Starlette
 answers `HEAD` for any route configured `GET`.
 
-The tables below list **60 routes**, grouped by family.
+The tables below list **61 routes**, grouped by family.
 
 
 ### Session
@@ -181,6 +181,12 @@ The tables below list **60 routes**, grouped by family.
 | POST | `/api/spaces` | `create_space` | session | Create a space (a node of builtin type ``space``, living in meta). |
 | POST | `/api/spaces/{id}/rename` | `rename_space` | session | Rename a space — a space is a node, so this is a node-title update. |
 | POST | `/api/spaces/{id}/archive` | `archive_space` | session | Archive a space; its nodes keep their ``space_id`` and grants go inert. |
+
+### Agent surface (MCP)
+
+| Method | Path | Handler | Auth | Notes |
+|---|---|---|---|---|
+| POST, GET, DELETE | `/mcp` | `StreamableHTTPASGIApp` | bearer — an agent token, per request | The MCP surface for external agents: read and additive tiers only, streamable HTTP. |
 
 ### Health
 

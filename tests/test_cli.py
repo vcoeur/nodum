@@ -28,7 +28,7 @@ FIXTURE_PDF = Path(__file__).parent / "fixtures" / "sample.pdf"
 #: Commands that never touch a principal: init, schema-dump, --version,
 #: projector/asset plumbing, and the two server launches. Everything else
 #: requires an explicit `--as` — reads included, since reads take a principal.
-NO_AS_GROUPS = {"init", "schema-dump", "projector", "asset", "mcp", "serve"}
+NO_AS_GROUPS = {"init", "schema-dump", "projector", "asset", "serve"}
 
 #: The asset commands that read through the graph — they carry ``--as`` like
 #: every other read. ``register``/``purge`` touch the blob store alone.
@@ -650,7 +650,7 @@ def test_review_accept_applies_and_a_refused_batch_does_not_exit_zero(fresh_db):
     assert isinstance(refused.exception, SystemExit)
 
 
-# ── mcp serve: the actor is validated before anything is served ───────────────
+# ── Human and agent administration over the CLI ───────────────────────────────
 
 
 def test_human_and_agent_admin_over_the_cli(fresh_db):
@@ -971,11 +971,17 @@ def test_the_space_filter_and_meta_toggle_over_the_cli(fresh_db):
     assert [hit["title"] for hit in hits["hits"]] == ["filed"]
 
 
-def test_mcp_serve_requires_an_agent_token(fresh_db, monkeypatch):
-    monkeypatch.delenv("NODUM_AGENT_TOKEN", raising=False)
+def test_there_is_no_mcp_command_group(fresh_db):
+    """The stdio transport is gone, and so is the command that launched it.
+
+    ``nodum mcp serve`` was the only way to reach the agent surface and it
+    could only ever reach a database on the caller's own machine. The surface
+    now lives at ``/mcp`` on ``nodum serve``; a leftover command group would
+    advertise a transport that no longer exists.
+    """
     result = runner.invoke(app, ["mcp", "serve"])
-    assert result.exit_code == 1, result.output
-    assert "NODUM_AGENT_TOKEN" in result.output
+    assert result.exit_code != 0
+    assert "serve" in runner.invoke(app, ["--help"]).output
 
 
 # ── Assets and renditions ─────────────────────────────────────────────────────
@@ -2079,7 +2085,8 @@ def test_schema_dump_describes_command_surface():
     assert payload["version"]
 
     names = {command["name"] for command in payload["commands"]}
-    assert {"node", "edge", "search", "schema", "schema-dump", "mcp"} <= names
+    assert {"node", "edge", "search", "schema", "schema-dump"} <= names
+    assert "mcp" not in names, "the stdio command group was removed with its transport"
 
 
 def test_schema_dump_recurses_into_groups():

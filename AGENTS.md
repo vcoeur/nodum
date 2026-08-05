@@ -285,9 +285,10 @@ The invariants that must never be broken, whatever the section:
   `ask <question> [--k] [--space]` / `summarize <node-id> [--depth]` /
   `search … [--nl]` / `llm status [--probe/--no-probe]` (the read-only smart
   surface — see `nodum.answers`; none of the four writes anything),
-  `mcp serve` (the agent token comes from `NODUM_AGENT_TOKEN`, never a flag),
   `serve [--host 127.0.0.1] [--port 8600] [--allow-host NAME]
-  [--db PATH]`. `serve` prints the database path on stderr and translates
+  [--db PATH] [--behind-tls]`. **There is no `mcp` command group**: the
+  agent surface is a route on `serve` (`/mcp`), not a process a client
+  launches. `serve` prints the database path on stderr and translates
   uvicorn's own startup failure into the contract's exit 1. A non-loopback
   bind is allowed (password login, not the bind, is the boundary), marks the
   session cookie `Secure` there, and warns that uvicorn speaks plain HTTP.
@@ -614,10 +615,19 @@ below are the parts that do not fit a route table.
   `[^/]+`). Originals are served on **one** route only,
   `GET /api/download/{token}`, and only against a capability URL minted
   through `POST /api/assets/{id}/download-url` (design §5.7).
-## MCP contract (for agents touching `nodum mcp serve`)
+## MCP contract (for agents touching the `/mcp` surface)
 
-The MCP server (`nodum.mcp_server`) is the **external-agent** surface, launched
-by `nodum mcp serve`. It registers exactly two tiers and nothing else.
+The MCP server (`nodum.mcp_server`) is the **external-agent** surface, served
+at `POST /mcp` by `nodum serve` over streamable HTTP — the same origin and the
+same process as `/api` and the web UI. It registers exactly two tiers and
+nothing else.
+
+- **HTTP is the only transport.** The stdio server and the mcp command group
+  that launched it were both removed: a subprocess reaches only the launching
+  machine's database, and a deployable agent surface is the point. `http_surface()`
+  returns the route to register and the lifespan to run — **both**, because
+  Starlette does not run a sub-app's lifespan and a route wired without it
+  answers 500 while looking correct.
 
 - **The registry is the read + additive tiers, structurally.** The design §8.1
   read tier (`get_node`, `get_children`, `search`, `traverse`, `list_types`,
@@ -655,14 +665,25 @@ by `nodum mcp serve`. It registers exactly two tiers and nothing else.
 
 ### Authentication
 
-- **Auth is the agent token in `NODUM_AGENT_TOKEN`** — an `ndm_…` token minted
-  by `nodum agent create` / `token-rotate`, shown once and stored hashed —
-  carried in the environment, never a flag (a flag leaks into `ps` and shell
-  history). It is verified against the `agents` table once at launch (an
-  unknown or disabled agent is a startup error) and **re-verified on every tool
-  call**: each call re-mints the principal from stored state, so disabling the
-  agent or archiving a space it holds a grant on bites at the next call rather
-  than at the next restart.
+- **Auth is a per-request bearer token** — `Authorization: Bearer ndm_…`, minted
+  by `nodum agent create` / `token-rotate`, shown once and stored hashed. It is
+  never an environment variable on the server and never a flag: the server is
+  not bound to an agent at all.
+- **It is checked twice, on purpose.** `BearerGuard` refuses the *request* with
+  a 401 unless it presents an enabled agent's token — before `initialize` or
+  `tools/list` answers, so an unauthenticated peer cannot enumerate the
+  surface. `_principal()` then re-reads the same header off the SDK's
+  per-request context and re-mints the principal for the *call*. The guard is
+  the door; `_principal` is the identity.
+- **Nothing about a caller survives between calls.** One process serves many
+  agents, so a cached principal would be someone else's. Reading the token from
+  the live request each time is also what makes revocation verification-time:
+  disabling the agent or its owner, or archiving a space it holds a grant on,
+  bites at the next call rather than the next restart.
+- **The DNS-rebinding host list is nodum's, translated.** The SDK defaults to
+  loopback-only, which refuses every request on a deployed host; `http_surface`
+  derives its `TransportSecuritySettings` from `resolve_allowed_hosts` so one
+  policy feeds both enforcement points.
 - **Ingestion is by reference** (§5.7 rule 2), and by **URL or upload only**:
   `ingest_url` takes something this server can fetch, `request_upload_url`
   hands back somewhere to PUT bytes the caller holds. **No base64 ever crosses
