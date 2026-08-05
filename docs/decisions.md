@@ -2354,11 +2354,16 @@ somewhere else, in the one test whose entire purpose is catching silent drift.
 That is the argument for the dependency, and it is worth more than the
 dependency costs: `pyyaml` is in the `dev` group — never `[project]
 .dependencies`, verified by reading `Requires-Dist` out of the built wheel — and
-the parser is 409 lines lighter.
+the file is 228 lines lighter (615 → 387), the parsing layer about 180.
 
 The switch also *widened* what the gate accepts. The hand parser refused flow
 mappings, anchors, a `run:` under `with:` and a quoted `"on":` key outright;
-those are legal workflow YAML and now pass. Two behaviours are deliberate rather
+those are legal workflow YAML and now pass. One shape does not: the strict
+loader rejects a `<<:` merge key, because it resolves every key before
+`flatten_mapping` runs. That is the commonest reason to reach for an anchor at
+all, so the widening is narrower than it sounds — it is a loud refusal rather
+than a mis-read, and GitHub Actions does not support merge keys either, so the
+file it refuses is one Actions would refuse too. Two behaviours are deliberate rather
 than inherited: PyYAML is YAML 1.1, so a bare `on:` key parses as the boolean
 `True` and the trigger reader accepts both spellings while refusing a file
 carrying both; and the loader **raises on a duplicate mapping key** instead of

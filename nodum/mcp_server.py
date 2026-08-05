@@ -5,8 +5,8 @@ the graph. It exposes the design §8.1 v1 tool contract's **read tier**
 (``get_node``, ``get_children``, ``search``, ``traverse``, ``list_types``,
 ``get_schema``, ``find_path``, ``history``, ``diff``, ``get_asset``,
 ``get_download_url``) and **additive tier** (``create_node``, ``update_node``,
-``link``, ``propose_edges``, ``ingest_file``, ``ingest_url``,
-``request_upload_url``) — nothing else.
+``link``, ``propose_edges``, ``ingest_url``, ``request_upload_url``) — nothing
+else.
 
 ``get_asset`` enforces the §5.7 binary policy structurally: agents receive
 metadata, the text extraction, and a small derived rendition
@@ -24,7 +24,7 @@ in either direction, and **no server path does either**: see
 
 **A tool that writes a node takes a ``space``, because the SDK will not say a
 word if it does not.** ``create_node`` had no such parameter while
-``ingest_file``/``ingest_url``/``request_upload_url`` did, and an agent asking
+``ingest_url``/``request_upload_url`` did, and an agent asking
 for ``research`` got a 200-shaped response describing a node in ``main``: the
 generated argument model ignores unknown keys (``ArgModelBase`` is an ordinary
 pydantic model, so extras are dropped, and there is no per-tool hook to forbid

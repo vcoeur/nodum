@@ -26,9 +26,10 @@ dependencies = [
     # `CapacityLimiterAdapter` from 4.2 on.
     #
     # **It is inert today and declared anyway.** `mcp>=1.28.1` requires
-    # `anyio>=4.5` and `sse-starlette` requires `>=4.7.0`, so no resolution
-    # reachable from this file can land below 4.5 whatever this line says —
-    # `>=4` and `>=4.2` produce the identical lock. That is a fact about other
+    # `anyio>=4.5` and pulls `sse-starlette`, which requires `>=4.7.0`, so the
+    # reachable floor is 4.7 — no resolution from this file can land below it
+    # whatever this line says, and `>=4` and `>=4.2` select the same version
+    # (they do record different specifiers in `uv.lock`). That is a fact about other
     # people's metadata, which is the whole reason to write our own bound down:
     # the day `mcp` relaxes its floor, this line is what stops the resolver
     # walking into a version where importing `nodum.http_api` raises. A bound

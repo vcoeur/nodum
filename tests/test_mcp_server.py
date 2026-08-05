@@ -157,12 +157,12 @@ def test_ingestion_is_annotated_additive_because_it_only_ever_adds(fresh_db):
 def test_no_tool_description_advertises_a_tool_that_is_not_registered(fresh_db):
     """The descriptions are the only text an agent reads — they must not name a ghost.
 
-    When `ingest_file` was removed, the module docstring, the server
-    `instructions`, `ingest_url`'s docstring, `AGENTS.md`, `docs/architecture.md`,
-    `docs/decisions.md` and `docs/llms.txt` were all updated — and
-    `request_upload_url`'s docstring, which *is* its MCP tool description, was
-    missed. So every model with this server attached was still being told to
-    "reach for this only when `ingest_file` cannot do the job: the file sits on
+    When `ingest_file` was removed, the server `instructions`, `ingest_url`'s
+    docstring, `AGENTS.md`, `docs/architecture.md`, `docs/decisions.md` and
+    `docs/llms.txt` were all updated — and `request_upload_url`'s docstring,
+    which *is* its MCP tool description, was missed. So every model with this
+    server attached was still being told to "reach for this only when
+    `ingest_file` cannot do the job: the file sits on
     your host, **not on the server's filesystem**" — a removed tool named as the
     primary ingestion path, and a filesystem door advertised as existing, by the
     surface the agent actually reads.
@@ -171,6 +171,13 @@ def test_no_tool_description_advertises_a_tool_that_is_not_registered(fresh_db):
     docstring assertions grepped for "suggest"/"edit". This closes that gap
     from the other side — no registered tool may name an unregistered one, in
     its description or in the server's instructions.
+
+    **The module docstring is in scope too**, and the first version of this
+    test said it had been updated when it had not: `mcp_server.__doc__` still
+    listed `ingest_file` in the additive tier, fifteen lines above the sentence
+    saying no server path is reachable, for six commits. A test that names the
+    surfaces it checked is a claim like any other — this one now reads the
+    module's own text rather than asserting somebody remembered to.
     """
     tools = _run(lambda session: session.list_tools()).tools
     registered = {tool.name for tool in tools}
@@ -191,6 +198,19 @@ def test_no_tool_description_advertises_a_tool_that_is_not_registered(fresh_db):
     agent(AGENT, token=TOKEN)  # the server verifies its token at construction
     named = cited(create_server(token=TOKEN).instructions or "")
     assert not named, f"the server instructions name unregistered tool(s) {sorted(named)}"
+
+    # The module's own contract paragraph. Its tier listing is prose a reader
+    # trusts, so it must not name a tool the registry refuses to expose — the
+    # deliberate-absence block further down cites these names on purpose, and
+    # is exempt by the same backtick discipline (it writes them in :data: and
+    # ``…`` roles this citation test reads, so the exemption is by section, not
+    # by spelling).
+    tier_paragraph = (mcp_server.__doc__ or "").split("**Four tiers are never")[0]
+    named = {ghost for ghost in UNREGISTERED_TOOLS if f"``{ghost}``" in tier_paragraph}
+    assert not named, (
+        f"the module docstring's contract paragraph names unregistered tool(s) {sorted(named)} — "
+        "it is the first thing a maintainer reads about this surface"
+    )
     # And the registry is exactly the two tiers, so "no unregistered name is
     # cited" is a statement about a known set rather than about whatever
     # happens to be registered today.

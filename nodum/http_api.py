@@ -140,9 +140,13 @@ not:
   loop and stopping there swapped a stalled loop for ~2.5 GiB of resident
   memory an unauthenticated caller may ask for — and the failed-login lockout
   bounds none of it, because it counts per attempted *name* and rotating the
-  name never trips it. So the verification — that call alone, not the handler
-  and not the rest of this list — runs under :data:`ARGON2_CONCURRENCY` tokens
-  of :data:`_ARGON2_LIMITER`, and the excess **queues**. Queueing is a *trade*,
+  name never trips it. So the login's blocking half runs under
+  :data:`ARGON2_CONCURRENCY` tokens of :data:`_ARGON2_LIMITER`, and the excess
+  **queues**. *Half*, not *hash*: what holds a token is
+  :func:`_verify_login`, which deliberately bundles the lockout query, the
+  argon2 verification and the failure event into one hop, so the token is held
+  for all three — the same span :data:`_ARGON2_LIMITER`'s other caller holds it
+  for, and the reason the figures below are per attempt rather than per hash. Queueing is a *trade*,
   not a free lunch, and the honest statement of it is this: the queue is FIFO
   and unbounded, so a flood does not fail — it waits in front of the human.
   Measured against this handler, the owner's own correct login answered in

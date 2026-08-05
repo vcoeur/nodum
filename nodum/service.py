@@ -5011,14 +5011,32 @@ def create_human(name: str, *, principal: Principal, path: str | Path | None = N
     conn = _connect(path)
     try:
         actor = _admin_actor(conn, principal)
-        # Ahead of the INSERT so the answer is a 409 naming the conflict rather
-        # than 0019's index surfacing as a bare IntegrityError under a 500 —
-        # `create_agent`'s rule (Q13 review S14). Quoting the name back is safe
-        # here and not above: the ceiling has already been enforced.
+        # Ahead of the INSERT so the common case answers 409 naming the conflict
+        # rather than surfacing 0019's index as a bare IntegrityError under a
+        # 500 — `create_agent`'s rule (Q13 review S14). Quoting the name back is
+        # safe here and not above: the ceiling has already been enforced.
+        #
+        # The read cannot be the whole answer, and the `except` below is not
+        # belt-and-braces. This function opens its own short-lived connection,
+        # so the read and the INSERT are two lock acquisitions with a window
+        # between them: two processes sharing the file — a CLI beside a running
+        # server, or two servers — can both find the name free and both insert.
+        # 0019 is what actually holds uniqueness; this translates its refusal
+        # back into the same 409 the read would have given, because a race
+        # losing with `database error: UNIQUE constraint failed: humans.name`
+        # under a 500 is the same outcome described in a way the caller cannot
+        # act on.
         if conn.execute("SELECT 1 FROM humans WHERE name = ?", (name,)).fetchone():
             raise AccountExists(f"a human named {name!r} already exists")
         human_id = uuid.uuid4().hex[:12]
-        conn.execute("INSERT INTO humans (id, name) VALUES (?, ?)", (human_id, name))
+        try:
+            conn.execute("INSERT INTO humans (id, name) VALUES (?, ?)", (human_id, name))
+        except sqlite3.IntegrityError as clash:
+            # Only the name index: an IntegrityError from anything else is a bug
+            # and must not be reported as a taken name.
+            if "humans.name" not in str(clash):
+                raise
+            raise AccountExists(f"a human named {name!r} already exists") from clash
         row = conn.execute("SELECT * FROM humans WHERE id = ?", (human_id,)).fetchone()
         _emit(
             conn, actor, "human.create", {"before": None, "after": {"id": human_id, "name": name}}
