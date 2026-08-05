@@ -778,9 +778,12 @@ def create_server(*, token: str, db_path: str | Path | None = None) -> FastMCP:
         must be able to write it: a grant onto a space you cannot write is
         refused **now** rather than after the upload. Under `suggest` that
         describing node lands `proposed` like any other write; under `edit` it
-        lands live. Either way you can read the bytes back with `get_asset`
-        straight away — a describing node makes an asset reachable in any state
-        but `archived`, so a proposal you are still waiting on is enough.
+        lands live. Either way the asset is reachable straight away — a
+        describing node makes it readable in any state but `archived`, so a
+        proposal you are still waiting on is enough. What `get_asset` then
+        gives you is what it gives anyone: metadata, the extracted text and a
+        rendition, **never the original bytes** — those come back only through
+        `get_download_url`, which is logged.
 
         The mint is event-logged, the dedup shortcut included.
         """

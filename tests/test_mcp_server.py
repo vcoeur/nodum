@@ -191,8 +191,10 @@ def test_no_tool_description_advertises_a_tool_that_is_not_registered(fresh_db):
     agent(AGENT, token=TOKEN)  # the server verifies its token at construction
     named = cited(create_server(token=TOKEN).instructions or "")
     assert not named, f"the server instructions name unregistered tool(s) {sorted(named)}"
-    # And the instructions still describe the registry they front.
-    assert registered <= set(READ_TOOLS) | set(ADDITIVE_TOOLS)
+    # And the registry is exactly the two tiers, so "no unregistered name is
+    # cited" is a statement about a known set rather than about whatever
+    # happens to be registered today.
+    assert registered == set(READ_TOOLS) | set(ADDITIVE_TOOLS)
 
 
 def test_the_grown_registry_still_holds_no_review_or_curative_tool(fresh_db):

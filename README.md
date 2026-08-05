@@ -477,8 +477,10 @@ cycle quietly drop the vector signal until you re-run the download.
   failed-login lockout throttles guessing — five misses for a name inside
   fifteen minutes refuse further attempts for it with a 429 until the window
   slides past them, applied identically to names that do not exist. Every
-  attempt is event-logged (`human.login` / `human.login_failed` /
-  `human.logout`), the auth half of the audit trail. A
+  attempt that reaches a password check is event-logged (`human.login` /
+  `human.login_failed` / `human.logout`), the auth half of the audit trail —
+  a refusal by the lockout writes nothing, so an unauthenticated caller cannot
+  grow the log with it. A
   non-loopback bind is allowed — login, not the bind, is the boundary — and
   marks the cookie `Secure` there. `nodum human passwd` sets the password;
   logout, expiry, and `human disable` kill the session at the next request.

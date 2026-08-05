@@ -15,6 +15,16 @@ here instead of shipping as silent drift.
 Shelling out to the script rather than re-implementing the walk keeps the
 script the single source of truth: the lock exercises the same code path the
 regeneration command runs, so the two cannot drift apart.
+
+The second lock, ``test_the_tag_gate_is_not_weaker_than_the_pr_gate``, has no
+script to shell out to: it reads the workflow files here, by hand, rather than
+add a YAML dependency to the dev group for one assertion. Hand-parsing is
+bought at a price, and the price is paid in refusals — every helper below
+lists the shapes it reads, and anything else fails naming the file and line.
+That rule is not fussiness: a `run: |` step used to match the one-line `run:`
+pattern and be recorded as the command ``"|"``, which made two different
+scripts compare equal, and a workflow read wrong is worse than one not read at
+all because it reads green.
 """
 
 from __future__ import annotations
@@ -70,9 +80,21 @@ RELEASE_STEP_EXEMPT: dict[str, str] = {
 #: is that nothing key-shaped slips past unrecognised.
 _KEY = re.compile(r" *(?P<key>[A-Za-z0-9_.-]+):(?P<value>.*)$")
 
-#: A `run:` step, in either the `- run: cmd` or the `run: cmd` (named step)
-#: shape.
-_RUN = re.compile(r" +(?:- )?run: (?P<command>.+)$")
+#: The header a key writes when its value is a block scalar: the style (`|`
+#: literal, `>` folded) and the indicators that may follow it (chomping `-`/`+`,
+#: an explicit indentation digit). Captured rather than swallowed so the shapes
+#: this parser does not read can be refused by name: `run: |` used to match the
+#: one-line `run:` pattern and be recorded as the command `"|"`, so a step's
+#: whole body was dropped and two unrelated scripts compared equal.
+_BLOCK_SCALAR = re.compile(r"(?P<style>[|>])(?P<indicators>[0-9+-]*)")
+
+#: Characters a YAML plain scalar cannot begin with. Each opens a shape with
+#: reading rules of its own — alias `*`, anchor `&`, tag `!`, flow collection
+#: `{`/`[`, comment `#` — so a value starting with one is refused by name
+#: rather than taken for literal text. Quotes and block scalars open shapes of
+#: their own too, and those two are read: `_inline_command`,
+#: `_block_scalar_command`.
+_NOT_PLAIN = "*&!%@`{}[],#"
 
 
 def test_http_api_doc_matches_the_live_route_table(tmp_path) -> None:
@@ -108,6 +130,7 @@ def _indent(line: str) -> int:
 
 def _top_level_key(lines: list[str], key: str, source: str) -> int:
     """The index of the line declaring top-level ``key:``."""
+    found: int | None = None
     for index, line in enumerate(lines):
         if _is_ignorable(line) or _indent(line) != 0:
             continue
@@ -120,17 +143,35 @@ def _top_level_key(lines: list[str], key: str, source: str) -> int:
             "as a block, or teach the parser — an unread `on:`/`jobs:` block is a "
             "workflow this test would not know exists."
         )
-        return index
-    raise AssertionError(f"{source} has no top-level `{key}:` key")
+        # A duplicated top-level key has no one right answer — PyYAML keeps the
+        # last of the two, this scan used to return the first, and either way
+        # every job under the other one is invisible. Refusing is the answer.
+        if found is not None:
+            raise AssertionError(
+                f"{source} lines {found + 1} and {index + 1}: two top-level `{key}:` keys. "
+                "Which one wins is not a question this parser answers quietly."
+            )
+        found = index
+    assert found is not None, f"{source} has no top-level `{key}:` key"
+    return found
 
 
 def _nested_lines(lines: list[str], header_index: int) -> list[str]:
-    """Every line nested under the mapping key at ``header_index``."""
+    """Every line nested under the key at ``header_index``.
+
+    A block sequence may be written at its key's own indentation — `steps:`
+    with its `- uses:` items in the same column — which is YAML's rule and not
+    the style these workflows use. Reading those items as the *next* key's
+    problem would leave `steps:` looking empty and a job looking like it runs
+    nothing, so they are taken as the body they are.
+    """
     depth = _indent(lines[header_index])
     body: list[str] = []
     for line in lines[header_index + 1 :]:
         if not _is_ignorable(line) and _indent(line) <= depth:
-            break
+            stripped = line.strip()
+            if _indent(line) < depth or not (stripped == "-" or stripped.startswith("- ")):
+                break
         body.append(line)
     return body
 
@@ -171,6 +212,11 @@ def _child_keys(lines: list[str], header_index: int, source: str) -> dict[str, i
             "not understand fails here — a job id silently skipped is an ungated "
             "release."
         )
+        assert match.group("key") not in keys, (
+            f"{source} line {index + 1}: `{match.group('key')}:` is declared twice under "
+            f"{lines[header_index].strip()!r}. Keeping the second would hide the first — "
+            "a job in the file that is not in this test."
+        )
         keys[match.group("key")] = index
     return keys
 
@@ -183,12 +229,158 @@ def _job_ids(name: str) -> set[str]:
     return jobs
 
 
-def _job_lines(name: str, job_id: str) -> list[str]:
-    """The lines of one job's body."""
+def _job_lines(name: str, job_id: str) -> tuple[list[str], int]:
+    """One job's body, and the index in the file its first line sits at.
+
+    The offset is what turns a position inside the body back into the file
+    line a failure has to name.
+    """
     lines = _workflow_lines(name)
     jobs = _child_keys(lines, _top_level_key(lines, "jobs", name), name)
     assert job_id in jobs, f"{name} has no `{job_id}` job"
-    return _nested_lines(lines, jobs[job_id])
+    return _nested_lines(lines, jobs[job_id]), jobs[job_id] + 1
+
+
+def _location(source: str, offset: int, index: int) -> str:
+    """``<file> line N`` for the line at ``index`` of a body starting at ``offset``."""
+    return f"{source} line {offset + index + 1}"
+
+
+def _block_scalar_extent(lines: list[str], header_index: int, column: int) -> tuple[list[str], int]:
+    """The body of the block scalar opened at ``header_index``, and the index past it.
+
+    A block scalar ends at the first non-blank line indented no further than
+    the key that opened it — hence ``column``, that key's own indentation.
+    Everything between is text, not structure: a blank line is content, a `#`
+    line is content, and a line reading `run: ...` is part of the command
+    rather than a step of its own.
+    """
+    end = header_index + 1
+    while end < len(lines) and (not lines[end].strip() or _indent(lines[end]) > column):
+        end += 1
+    return lines[header_index + 1 : end], end
+
+
+def _block_scalar_command(header: str, body: list[str], where: str) -> str:
+    """The text of a literal block scalar — `run: |`, `run: |-`, `run: |+`.
+
+    The body is de-indented by the indentation of its first non-blank line
+    (YAML's own rule), joined with newlines, and stripped of leading and
+    trailing blank lines. That last step is why the chomping indicator needs no
+    handling of its own: two scripts differing only in a trailing newline are
+    the same check.
+
+    Folded scalars (`>`, `>-`, `>+`) and explicit indentation indicators
+    (`|2`) are refused, naming the file and line. Folding — a break becoming a
+    space here, staying a break there, blank lines counted — is a second parser
+    this file is not going to grow, and an indentation indicator moves the
+    de-indent column; getting either subtly wrong would put back exactly what
+    this function exists to remove, a `run:` step read as something it is not.
+    """
+    style, indicators = header[0], header[1:]
+    assert style == "|", (
+        f"{where}: `{header}` is a folded block scalar. This parser reads literal block "
+        "scalars (`|`, `|-`, `|+`) and refuses folded ones rather than guess where their "
+        "line breaks become spaces — write the command as `|`, or teach the folding "
+        "rules here."
+    )
+    assert not any(character.isdigit() for character in indicators), (
+        f"{where}: `{header}` carries an explicit indentation indicator. This parser "
+        "takes the block's indentation from its first line; write it that way, or teach "
+        "the indicator here."
+    )
+    first = next((line for line in body if line.strip()), None)
+    assert first is not None, f"{where}: `{header}` opens a block scalar with no content."
+    content_indent = _indent(first)
+    for line in body:
+        assert not line.strip() or _indent(line) >= content_indent, (
+            f"{where}: {line.strip()!r} is indented less than the first line of the block "
+            "scalar it belongs to. That is not a block this parser can de-indent."
+        )
+    text = "\n".join(line[content_indent:] if line.strip() else "" for line in body)
+    return text.strip("\n")
+
+
+def _inline_command(value: str, where: str) -> str:
+    """A `run:` value written on the key's own line — plain, or quoted.
+
+    A plain value ends where YAML ends it, at the ` #` that opens a comment. A
+    quoted value is unquoted when its quote closes on the same line and, for
+    `"..."`, carries no backslash escape to decode. Everything else is refused
+    by name: a quote left open is a multi-line flow scalar this parser would
+    truncate, and an alias, anchor, tag or flow collection is a value whose
+    text lives somewhere else entirely.
+    """
+    quote = value[0]
+    if quote in "'\"":
+        if quote == '"':
+            close = -1 if "\\" in value else value.find('"', 1)
+        else:
+            close = 1
+            while True:
+                close = value.find("'", close)
+                if close == -1 or value[close + 1 : close + 2] != "'":
+                    break
+                close += 2  # '' is an escaped quote, not the end of the scalar
+        assert close != -1, (
+            f"{where}: this parser reads a quoted `run:` only when the quote closes on "
+            f"the same line and needs no escape decoding — {value!r} does neither. Write "
+            "it plain, or as a `|` block."
+        )
+        trailer = value[close + 1 :].strip()
+        assert not trailer or trailer.startswith("#"), (
+            f"{where}: {trailer!r} follows the closing quote of {value!r}; a comment is "
+            "the only thing this parser reads there."
+        )
+        text = value[1:close]
+        return text.replace("''", "'") if quote == "'" else text
+    assert quote not in _NOT_PLAIN, (
+        f"{where}: {value!r} opens a shape this parser does not read — an alias, an "
+        "anchor, a tag, a flow collection or a comment. A `run:` whose text lives "
+        "somewhere else is a command this comparison would get wrong."
+    )
+    comment = value.find(" #")
+    return (value if comment == -1 else value[:comment]).strip()
+
+
+def _steps_lines(name: str, job_id: str) -> tuple[list[str], int]:
+    """One job's `steps:` sequence, and the index in the file its first line sits at.
+
+    A job whose steps this parser cannot find fails here rather than reading as
+    a job that runs nothing: a `uses:` job calling a reusable workflow and a
+    `steps: *anchor` are both lists of checks that would otherwise be invisible
+    to the comparison below. Either sequence indentation is read; see
+    `_nested_lines`.
+    """
+    body, offset = _job_lines(name, job_id)
+    child_indent: int | None = None
+    for index, line in enumerate(body):
+        if _is_ignorable(line):
+            continue
+        indent = _indent(line)
+        if child_indent is None:
+            child_indent = indent
+        if indent != child_indent:
+            continue
+        match = _KEY.fullmatch(line)
+        if match is None or match.group("key") != "steps":
+            continue
+        assert not match.group("value").strip(), (
+            f"{_location(name, offset, index)}: `steps:` is written as {line.strip()!r}; "
+            "this parser reads only the block form. An alias or a flow sequence here is "
+            "a list of checks it cannot see."
+        )
+        steps = _nested_lines(body, index)
+        assert any(not _is_ignorable(step) for step in steps), (
+            f"{_location(name, offset, index)}: `steps:` opens an empty block — a job "
+            "with no steps at all, or a shape this parser reads as none."
+        )
+        return steps, offset + index + 1
+    raise AssertionError(
+        f"{name}'s `{job_id}` job declares no `steps:` this parser can find. A job that "
+        "calls a reusable workflow with `uses:` runs checks this comparison cannot read; "
+        "teach the parser rather than let them go uncompared."
+    )
 
 
 def _job_run_steps(name: str, job_id: str) -> list[str]:
@@ -196,23 +388,85 @@ def _job_run_steps(name: str, job_id: str) -> list[str]:
 
     `run:` steps only: `uses:` steps name actions, and comparing those across
     two workflows would compare checkout pins rather than checks.
+
+    Read: `- run: cmd` and `run: cmd` (the named-step shape), plain or quoted,
+    with or without a trailing `#` comment, and the literal block scalars
+    `run: |`, `run: |-`, `run: |+`, whose bodies are de-indented and joined
+    with newlines. A block scalar's body is consumed as text, so a
+    `run:`-looking line inside a heredoc belongs to that command instead of
+    becoming a step, and a block scalar under any other key (`if: |`) is
+    skipped whole.
+
+    Refused, each naming the file and line: a folded `run: >`, an explicit
+    indentation indicator (`run: |2`), a quote that does not close on the line,
+    an alias, an anchor, a tag, a flow collection, a `run:` with nothing after
+    it, and a `run:` at a depth other than the one this job's steps sit at.
+    Nothing is skipped: `run: |` used to match the old one-line pattern and be
+    recorded as the command `"|"`, so a step's whole body vanished and two
+    unrelated scripts compared equal — a release could have dropped either.
     """
-    steps: list[str] = []
-    for line in _job_lines(name, job_id):
+    steps, offset = _steps_lines(name, job_id)
+    commands: list[str] = []
+    step_column: int | None = None
+    index = 0
+    while index < len(steps):
+        line = steps[index]
+        index += 1
         if _is_ignorable(line):
             continue
-        stripped = line.strip()
-        if not (stripped.startswith("run:") or stripped.startswith("- run:")):
+        where = _location(name, offset, index - 1)
+        column = _indent(line)
+        rest = line[column:]
+        while rest.startswith("-") and rest[1:2] in ("", " "):
+            # A sequence marker (`- `, or a bare `-` with the mapping below it)
+            # moves the key's column right by as much as it and its padding take.
+            marker = len(rest) - len(rest[1:].lstrip(" "))
+            column += marker
+            rest = rest[marker:]
+        if not rest:
             continue
-        match = _RUN.fullmatch(line)
-        assert match is not None, (
-            f"{name}'s `{job_id}` job has a `run:` step this parser cannot read: "
-            f"{stripped!r}. A block scalar (`run: |`) or any other shape has to be "
-            "taught here rather than skipped — a step this test cannot see is a step "
-            "a release may drop unnoticed."
+        if step_column is None:
+            step_column = column
+        match = _KEY.fullmatch(rest)
+        if match is None:
+            # A scalar sequence entry (`- "docs/**"`) or the continuation of a
+            # multi-line plain scalar: no key, so no step. A plain scalar cannot
+            # contain `: `, so no continuation line can look like one either.
+            assert rest[0] not in _NOT_PLAIN, (
+                f"{where}: {rest!r} opens a shape this parser does not read — an alias, "
+                "an anchor, a tag or a flow collection. A step written as a flow mapping "
+                "(`- {run: ...}`) is a step it would never see."
+            )
+            continue
+        key, value = match.group("key"), match.group("value").strip()
+        block = value[:1] in ("|", ">")
+        header, body = "", []
+        if block:
+            header = value.split(" ", 1)[0]
+            trailer = value[len(header) :].strip()
+            assert _BLOCK_SCALAR.fullmatch(header) and (not trailer or trailer.startswith("#")), (
+                f"{where}: {value!r} starts like a block scalar but is not a header this "
+                "parser recognises (`|`, `>`, a chomping indicator, an indentation digit, "
+                "then a comment at most)."
+            )
+            body, index = _block_scalar_extent(steps, index - 1, column)
+        if key != "run":
+            continue
+        assert column == step_column, (
+            f"{where}: a `run:` key at column {column}, where this job's steps start at "
+            f"{step_column}. If it is a step, indent it like the others; if it is an "
+            "input to an action (`with:`), this parser has to be taught the difference "
+            "rather than count it as a command."
         )
-        steps.append(match.group("command").strip())
-    return steps
+        if block:
+            commands.append(_block_scalar_command(header, body, where))
+            continue
+        assert value, (
+            f"{where}: `run:` with nothing after it and no block scalar opened. An empty "
+            "step is either a mistake or a shape this parser does not read."
+        )
+        commands.append(_inline_command(value, where))
+    return commands
 
 
 def _triggers_on_pull_request(name: str) -> bool:
@@ -244,7 +498,7 @@ def _publish_needs() -> set[str]:
     was correct only by declaration order, and a `needs:` added to any job
     above `build-and-publish` would silently become the list this test checked.
     """
-    body = _job_lines("release.yml", PUBLISH_JOB)
+    body, _ = _job_lines("release.yml", PUBLISH_JOB)
     for index, line in enumerate(body):
         if _is_ignorable(line):
             continue
@@ -284,6 +538,17 @@ def test_the_tag_gate_is_not_weaker_than_the_pr_gate() -> None:
     names, `uses:` steps, matrix legs, `if:` conditions and step order are NOT
     compared — the claim is about which commands run before a wheel is
     published, not about the two files being one file.
+
+    A command is compared as text, read by `_job_run_steps`: a one-line `run:`
+    (plain or quoted, comment stripped) or a literal block scalar (`|`, `|-`,
+    `|+`) de-indented and joined with newlines, so `run: cmd` and a one-line
+    `run: |` block of the same command are the same command, and only a
+    trailing-newline difference is normalised away. Every other shape — a
+    folded `>`, an indentation indicator, an unclosed quote, an alias, a flow
+    mapping, a job whose `steps:` cannot be found — fails naming the file and
+    line instead of being read wrong or skipped. A step this parser cannot see
+    is a step a release can drop unnoticed, which is why RELEASE_STEP_EXEMPT
+    exists: dropping one is a decision, spelled out, not a silence.
 
     A tag push triggers none of the PR workflows, so release.yml has to re-run
     their checks itself. It did not: ruff, pyright, the highest-resolution leg

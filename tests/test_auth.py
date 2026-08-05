@@ -403,6 +403,38 @@ def test_a_password_under_the_floor_is_refused(fresh_db):
             service.set_human_password("owner", password, principal=owner())
 
 
+def test_a_name_or_password_over_the_ceiling_is_refused_at_the_write(fresh_db):
+    """The ceiling to S11's floor, and the write side is where it has to bite.
+
+    ``POST /api/login`` caps both fields before it touches the database — the
+    name because a refused attempt appends it to the append-only event log
+    verbatim, the password because argon2 hashes whatever it is handed at the
+    full work factor. Those caps landed on the *read* side alone, and a cap one
+    end honours is worse than no cap: a 300-character ``create_human`` and a
+    5000-character ``set_human_password`` both succeeded, and the account then
+    answered its own correct credentials with a 400. So the numbers are the
+    service's, and a name or password this stores is always one login will
+    still look at.
+    """
+    longest_name = "n" * service.MAX_HUMAN_NAME_LENGTH
+    longest_password = "p" * service.MAX_PASSWORD_LENGTH
+    at_ceiling = service.create_human(longest_name, principal=owner())
+    service.set_human_password(at_ceiling.id, longest_password, principal=owner())
+    assert auth.verify_login(longest_name, longest_password).id == at_ceiling.id
+
+    with pytest.raises(ValueError, match=f"at most {service.MAX_HUMAN_NAME_LENGTH}"):
+        service.create_human(longest_name + "n", principal=owner())
+    with pytest.raises(ValueError, match=f"at most {service.MAX_PASSWORD_LENGTH}"):
+        service.set_human_password(at_ceiling.id, longest_password + "p", principal=owner())
+
+    # Refused is refused: no extra row, and the credential that worked still does.
+    assert {human.name for human in service.list_humans(principal=owner())} == {
+        "owner",
+        longest_name,
+    }
+    assert auth.verify_login(longest_name, longest_password).id == at_ceiling.id
+
+
 def test_the_last_enabled_human_cannot_disable_itself(fresh_db):
     """S13: no enabled human means no principal at all — not even from the CLI."""
     with pytest.raises(GrantNotPermitted, match="last enabled human"):

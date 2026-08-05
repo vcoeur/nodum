@@ -2275,8 +2275,25 @@ idx_events_op_created`, where it read `SCAN events`.
 
 **The residual, stated rather than defended**: the lockout is per name because
 it must not be an existence oracle, so an attacker cycling distinct names still
-appends a row per name. A global limit would fix that by handing the same
-attacker a way to lock the human out of their own graph, which is worse.
+appends a row per name — the same-name amplification is what closed, not the
+append. A global limit would fix that by handing the same attacker a way to
+lock the human out of their own graph, which is worse. The row's *size* is
+bounded separately: the login name and password are capped where they are read
+and where they are written, after an uncapped name wrote a 200 KB event row per
+unauthenticated request.
+
+**And the fix's own first cut traded one denial of service for another
+silently.** Moving argon2id off the event loop was right and was shipped with
+no bound, so anyio's default limiter ran 40 hashes at 64 MiB each: 64
+concurrent unauthenticated logins took **+2573 MiB** of RSS where the inline
+version took +64 MiB. A dedicated `CapacityLimiter(2)` puts that at +131 MiB
+and — the property that matters — stops it scaling with load at all. What
+replaces it is a latency cost the excess pays in a FIFO queue: 8 concurrent
+logins settle in 0.53 s, 256 in 13.78 s. That is the honest shape of the
+trade. It is the better half — a slow login recovers the moment the flood
+stops, while 2.5 GiB of RSS does not — and it is written down here because the
+first version of the comment justifying the queue described a property the
+code does not have.
 
 ## 2026-08-05 — the tag gate runs what the PR gate runs, and a test says so
 

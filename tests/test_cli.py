@@ -684,6 +684,45 @@ def test_human_and_agent_admin_over_the_cli(fresh_db):
     assert disabled["researcher"]["disabled"] is True
 
 
+def test_human_create_and_passwd_refuse_what_no_login_could_present(fresh_db):
+    """The CLI is a write surface too, and it wrote past the login route's caps.
+
+    ``POST /api/login`` refuses a name over
+    :data:`nodum.service.MAX_HUMAN_NAME_LENGTH` and a password over
+    :data:`nodum.service.MAX_PASSWORD_LENGTH`. Those caps started life in the
+    HTTP adapter, where neither of these commands could see them: `human create`
+    took a 300-character name and `human passwd` a 5000-character password, and
+    the account they produced then met a 400 on its own correct credentials. The
+    ceilings live in the service now, which is what makes both surfaces inherit
+    them — this asserts the CLI half, one readable line and exit 1, never a
+    traceback.
+    """
+    over_the_name_cap = "n" * (service.MAX_HUMAN_NAME_LENGTH + 1)
+    refused = runner.invoke(app, ["human", "create", over_the_name_cap, "--as", "owner"])
+
+    assert refused.exit_code == 1
+    assert f"at most {service.MAX_HUMAN_NAME_LENGTH}" in refused.stderr
+    assert isinstance(refused.exception, SystemExit)
+    assert _run_json("human", "list", "--as", "owner")["count"] == 1
+
+    alice = _run_json("human", "create", "alice", "--as", "owner")
+    over_the_password_cap = "p" * (service.MAX_PASSWORD_LENGTH + 1)
+    refused_password = runner.invoke(
+        app,
+        ["human", "passwd", alice["id"], "--as", "owner"],
+        input=f"{over_the_password_cap}\n{over_the_password_cap}\n",
+    )
+
+    assert refused_password.exit_code == 1
+    assert f"at most {service.MAX_PASSWORD_LENGTH}" in refused_password.stderr
+    # The prompt is hidden, so the refusal cannot have echoed what was typed.
+    assert "pppppppppp" not in refused_password.stderr
+    assert [human["has_password"] for human in _run_json("human", "list")["humans"]] == [
+        False,
+        False,
+    ]
+
+
 def test_agent_create_has_no_kind_flag_at_all(fresh_db):
     """The flag's one non-default value became a permanent refusal, so it is gone.
 

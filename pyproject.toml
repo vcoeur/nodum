@@ -17,13 +17,19 @@ dependencies = [
     # in flight at once. It arrives transitively with starlette either way, and
     # that is exactly the trap: an undeclared import that happens to resolve is
     # the B1 shape, one dependency-tree change away from a fresh install that
-    # cannot import. The floor is the 4.x major, whose `CapacityLimiter`
-    # constructs outside a running event loop (it returns a
-    # `CapacityLimiterAdapter` that materialises on first use) — which is what
-    # lets the limiter be a module-level constant instead of a lifespan hook.
-    # 4.14.2 is what the lock pins and what that behaviour was checked against;
-    # the CI highest-resolution leg covers the other end of the range.
-    "anyio>=4,<5",
+    # cannot import.
+    #
+    # The floor is 4.2 and it is **measured, not guessed**: `http_api` builds
+    # its login limiter at module level, and `anyio.CapacityLimiter(2)` outside
+    # a running event loop raises `AsyncLibraryNotFoundError` on 4.0 and 4.1
+    # and returns a `CapacityLimiterAdapter` from 4.2 on (checked by installing
+    # each). So `>=4` would let a resolver pick a version where importing
+    # `nodum.http_api` raises — `nodum serve` dead on a fresh install, which is
+    # precisely the failure this whole declaration exists to prevent. It was
+    # written as `>=4` for one commit, on the reasoning that the narrower bound
+    # was an unverified claim; the answer to an unverified bound is to verify
+    # it, not to widen it until it is vacuous.
+    "anyio>=4.2,<5",
     "argon2-cffi>=23",         # ceiling-tested: year-major versioning, API stable for a decade
     "mcp>=1.28.1,<2",          # mcp 2.0.0 removed mcp.server.fastmcp, which nodum.mcp_server imports
     "pillow>=11",              # ceiling-tested: mature, non-breaking majors; tiny API surface used

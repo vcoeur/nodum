@@ -4128,11 +4128,19 @@ def record_auth_event(
     field an unauthenticated caller writes. ``{"name": "human:owner"}`` put
     sixty rows attributed to the seeded owner in the log with no credential
     presented, and :func:`list_events` returned them interleaved with the real
-    owner's and indistinguishable from them. It is the log's only reader — what
-    ``nodum events`` prints — it orders by ``seq``, and it filters on nothing
-    but ``cycle_id``: there is no actor filter to separate the forgeries out
-    with, and one would not help, because it would be filtering on a column the
-    attempt chose. The actor column is this system's answer to *who did this*;
+    owner's and indistinguishable from them. That reader — the log's only human
+    one, what ``nodum events`` prints — offers nothing to tell them apart with:
+    it orders by ``seq`` and narrows on nothing but ``cycle_id``, so there is no
+    actor filter to separate the forgeries out, and one would not help, because
+    it would be filtering on a column the attempt chose. The log's other readers
+    are worse ground to stand on, not better: they read it to *decide*
+    something — :func:`_gardener_created` classifies a node's provenance by
+    comparing ``events.actor`` to :data:`GARDENER_ACTOR`, migration
+    ``0010_principals`` derived the agent roster from ``actor LIKE 'agent:%'``,
+    :func:`login_failure_count` counts by ``op`` and the payload's name, and the
+    undo/rollback readers select by ``seq`` and ``cycle_id`` — so a
+    caller-chosen ``actor`` is a column machine decisions run on, not merely one
+    a human reads. The actor column is this system's answer to *who did this*;
     the only truthful answer on a failed login is *nobody*, and a claimed name
     is data about the attempt rather than an identity.
 
@@ -4896,9 +4904,39 @@ def diff_versions(
 #: Grant levels accepted by :func:`grant` (hierarchical: read ⊂ suggest ⊂ edit).
 GRANT_LEVEL_NAMES = GRANT_LEVEL_NAMES
 
+#: Longest name :func:`create_human` will store — and the longest a login may
+#: claim, because ``POST /api/login`` reads this constant for its own cap.
+#:
+#: The cap earns its keep at the *reader*: a refused login writes the name it
+#: claimed verbatim into the append-only ``events`` payload, so an uncapped
+#: field is an unauthenticated caller choosing the size of a row. But it has to
+#: be enforced **here**, at the write, and for a while it was not — a cap only
+#: one end honours is worse than no cap at all. A 300-character account was
+#: created over both surfaces, stored fine, and then answered its own correct
+#: password with a 400, because the login route refused the name before it
+#: could look it up. A supported write must not be able to mint an account
+#: nobody can log into, so the number lives with the writer and the adapter
+#: reads it from here rather than the reverse.
+#:
+#: 256 is past every name a human types and past the one the migrations seed.
+MAX_HUMAN_NAME_LENGTH = 256
+
 #: Shortest password :func:`set_human_password` accepts. A floor, not a policy:
 #: the empty string used to be storable over both surfaces and logged in fine.
 MIN_PASSWORD_LENGTH = 6
+
+#: Longest password :func:`set_human_password` accepts — the ceiling to
+#: :data:`MIN_PASSWORD_LENGTH`'s floor, and, like :data:`MAX_HUMAN_NAME_LENGTH`,
+#: the number ``POST /api/login`` reads for its own cap.
+#:
+#: argon2id hashes the whole of whatever it is handed at the full work factor,
+#: and the login route spends that on unknown names too through its
+#: constant-time path, so an uncapped password field is CPU an unauthenticated
+#: caller buys by the megabyte. And it failed one-sidedly the same way the name
+#: did: a 5000-character password set over ``POST /api/humans/{id}/password``
+#: hashed, stored, and could then never be presented again. 1024 is far above
+#: any passphrase or password-manager output.
+MAX_PASSWORD_LENGTH = 1024
 
 
 def _admin_actor(conn: sqlite3.Connection, principal: Principal) -> str:
@@ -4940,7 +4978,18 @@ def list_humans(*, principal: Principal, path: str | Path | None = None) -> list
 
 
 def create_human(name: str, *, principal: Principal, path: str | Path | None = None) -> HumanOut:
-    """Create a human account (passwordless until ``human passwd`` sets one)."""
+    """Create a human account (passwordless until ``human passwd`` sets one).
+
+    Raises:
+        ValueError: If the name is longer than :data:`MAX_HUMAN_NAME_LENGTH` —
+            the same ceiling ``POST /api/login`` refuses a claimed name above,
+            enforced here so a name this stores is always a name that route
+            will look at.
+    """
+    if len(name) > MAX_HUMAN_NAME_LENGTH:
+        # Never echo the name back: a message quoting a 200 kB argument moves it
+        # into the caller's terminal and the server log instead of the table.
+        raise ValueError(f"name must be at most {MAX_HUMAN_NAME_LENGTH} characters")
     conn = _connect(path)
     try:
         actor = _admin_actor(conn, principal)
@@ -4967,11 +5016,18 @@ def set_human_password(
 
     Raises:
         ValueError: If the password is shorter than
-            :data:`MIN_PASSWORD_LENGTH`.
+            :data:`MIN_PASSWORD_LENGTH` or longer than
+            :data:`MAX_PASSWORD_LENGTH` — the ceiling ``POST /api/login``
+            refuses a presented password above, enforced here so a password
+            this stores is always a password that route will hash.
         RecordNotFound: If the account does not exist.
     """
     if len(password) < MIN_PASSWORD_LENGTH:
         raise ValueError(f"password must be at least {MIN_PASSWORD_LENGTH} characters")
+    if len(password) > MAX_PASSWORD_LENGTH:
+        # Length only — the password itself never reaches a message, a log, or
+        # a payload, here or anywhere else in this module.
+        raise ValueError(f"password must be at most {MAX_PASSWORD_LENGTH} characters")
     conn = _connect(path)
     try:
         actor = _admin_actor(conn, principal)

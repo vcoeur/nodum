@@ -86,6 +86,13 @@ jobs:
     name: Docs build
     runs-on: ubuntu-latest
     steps:
+      # No `fetch-depth: 0`, unlike the uv legs above, and deliberately so:
+      # `uv run` does sync the project, so hatch-vcs runs — but the version it
+      # derives never reaches the built site (mkdocs.yml has no plugin that
+      # reads it), and pyproject.toml's `fallback_version` means a checkout
+      # without history resolves to 0.0.0 rather than failing. This checkout is
+      # docs.yml's, unchanged, for the same reason the build step below is:
+      # this job exists to re-run that check, not a variant of it.
       - uses: actions/checkout@v6
       - name: Install uv
         uses: astral-sh/setup-uv@v7
@@ -96,6 +103,8 @@ jobs:
     name: Frontend
     runs-on: ubuntu-latest
     steps:
+      # No `fetch-depth: 0` here either: this job runs npm and make only, so
+      # nothing in it asks hatch-vcs for a version.
       - uses: actions/checkout@v6
       - name: Set up Node
         uses: actions/setup-node@v7

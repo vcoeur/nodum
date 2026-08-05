@@ -1712,7 +1712,7 @@ def test_concurrent_logins_never_exceed_the_login_verification_limiter(fresh_db,
     """
     service.set_human_password("owner", OWNER_PASSWORD, principal=owner())
     app = http_api.create_app()
-    attempts = 6 * http_api.LOGIN_VERIFY_CONCURRENCY
+    attempts = 6 * http_api.ARGON2_CONCURRENCY
 
     lock = threading.Lock()
     in_flight = 0
@@ -1751,9 +1751,9 @@ def test_concurrent_logins_never_exceed_the_login_verification_limiter(fresh_db,
 
     responses = asyncio.run(hammer())
 
-    assert peak <= http_api.LOGIN_VERIFY_CONCURRENCY, (
+    assert peak <= http_api.ARGON2_CONCURRENCY, (
         f"{peak} argon2 verifications were in flight at once, "
-        f"bound is {http_api.LOGIN_VERIFY_CONCURRENCY}"
+        f"bound is {http_api.ARGON2_CONCURRENCY}"
     )
     assert peak >= 1, "the wrapper never ran: this test asserted nothing"
     # Every one of them was still answered: the excess *queued* on the limiter
@@ -1792,10 +1792,10 @@ def test_an_over_long_login_name_is_refused_before_the_log_and_before_argon2(fre
     # The boundary is the constant, and a name exactly on it is ordinary input.
     at_cap = anonymous.post(
         "/api/login",
-        json={"name": "A" * http_api.MAX_LOGIN_NAME_CHARS, "password": OWNER_PASSWORD},
+        json={"name": "A" * service.MAX_HUMAN_NAME_LENGTH, "password": OWNER_PASSWORD},
     )
     assert at_cap.status_code == 401
-    assert verified == ["A" * http_api.MAX_LOGIN_NAME_CHARS]
+    assert verified == ["A" * service.MAX_HUMAN_NAME_LENGTH]
     assert len(_events("human.login_failed")) == 1
 
 
@@ -1822,10 +1822,152 @@ def test_an_over_long_login_password_is_refused_before_argon2(fresh_db, monkeypa
     # And a password exactly on the cap is verified like any other wrong one.
     at_cap = anonymous.post(
         "/api/login",
-        json={"name": "owner", "password": "p" * http_api.MAX_LOGIN_PASSWORD_CHARS},
+        json={"name": "owner", "password": "p" * service.MAX_PASSWORD_LENGTH},
     )
     assert at_cap.status_code == 401
     assert verified == ["owner"]
+
+
+def test_a_name_and_password_this_surface_can_store_are_ones_it_can_still_log_in(client, fresh_db):
+    """The login caps are the *service's*, so no write can outrun them.
+
+    They landed on the read side only, and a cap one end honours is worse than
+    no cap: ``POST /api/humans`` took a 300-character name and
+    ``POST /api/humans/{id}/password`` took a 5000-character password, both
+    answered 200, and the account then met a **400** on its own correct
+    credentials — ``field 'name' must be at most 256 characters`` — because the
+    login route refused the field before it could look the account up. A
+    supported write minted an account nobody could log into.
+
+    The property that closes it is a round trip, not a constant: whatever the
+    longest storable name and password are, logging in with them works. It
+    holds because both ends read one number
+    (:data:`nodum.service.MAX_HUMAN_NAME_LENGTH`,
+    :data:`nodum.service.MAX_PASSWORD_LENGTH`) — an adapter-owned copy is how
+    they came apart.
+    """
+    longest_name = "n" * service.MAX_HUMAN_NAME_LENGTH
+    longest_password = "p" * service.MAX_PASSWORD_LENGTH
+
+    created = _ok(client.post("/api/humans", json={"name": longest_name}))
+    human_id = created["id"]
+    assert (
+        client.post(
+            f"/api/humans/{human_id}/password", json={"password": longest_password}
+        ).status_code
+        == 200
+    )
+
+    logged_in = Client(client.app).post(
+        "/api/login", json={"name": longest_name, "password": longest_password}
+    )
+
+    assert logged_in.status_code == 200, logged_in.text
+    assert logged_in.json()["human"] == human_id
+
+    # One character past either ceiling is refused *at the write*, where the
+    # account would otherwise be created, and the value never comes back in the
+    # refusal.
+    too_long_name = client.post("/api/humans", json={"name": longest_name + "n"})
+    assert too_long_name.status_code == 400
+    assert too_long_name.json()["error"]["type"] == "ValueError"
+    assert "nnnnnnnnnn" not in too_long_name.text
+    assert {human.name for human in service.list_humans(principal=owner())} == {
+        "owner",
+        longest_name,
+    }
+
+    too_long_password = client.post(
+        f"/api/humans/{human_id}/password", json={"password": longest_password + "p"}
+    )
+    assert too_long_password.status_code == 400
+    assert too_long_password.json()["error"]["type"] == "ValueError"
+    assert "pppppppppp" not in too_long_password.text
+    # The refused set left the credential that already worked alone.
+    assert (
+        Client(client.app)
+        .post("/api/login", json={"name": longest_name, "password": longest_password})
+        .status_code
+        == 200
+    )
+
+
+def test_setting_a_password_hashes_off_the_loop_under_the_argon2_limiter(client, fresh_db):
+    """The session gate says who may hash, never how much memory hashing may hold.
+
+    This route is the second argon2 caller on the surface and ran **inline**:
+    ~100 ms at argon2id's 64 MiB profile on the single-threaded event loop, so
+    every other tab stalled for it — and with no limiter, 40 default threads of
+    it is the same ~2.5 GiB ``POST /api/login`` is bounded away from, reached by
+    an authenticated human instead of an anonymous one.
+
+    Both halves are asserted, because either alone is passable by the old code:
+    inline hashing trivially satisfies a concurrency bound (never more than one
+    at a time), and a threadpool hop on the *default* limiter satisfies "off the
+    loop" while reserving the memory. So the hash must run where no event loop
+    does, and several concurrent sets must genuinely overlap — up to
+    :data:`nodum.http_api.ARGON2_CONCURRENCY` and never past it.
+    """
+    humans = [
+        _ok(client.post("/api/humans", json={"name": f"human-{index}"}))["id"]
+        for index in range(3 * http_api.ARGON2_CONCURRENCY)
+    ]
+
+    lock = threading.Lock()
+    in_flight = 0
+    peak = 0
+    on_the_loop: list[str] = []
+    real_hash = auth.hash_password
+
+    def watched_hash(password: str) -> str:
+        nonlocal in_flight, peak
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        else:
+            # A running loop in this thread means the hash is holding it.
+            on_the_loop.append(password)
+        with lock:
+            in_flight += 1
+            peak = max(peak, in_flight)
+        try:
+            # Wide enough that concurrent callers demonstrably overlap; argon2's
+            # own ~100 ms would mostly do it, but not as a guarantee.
+            time.sleep(0.02)
+            return real_hash(password)
+        finally:
+            with lock:
+                in_flight -= 1
+
+    async def hammer() -> list[httpx.Response]:
+        transport = httpx.ASGITransport(app=client.app, raise_app_exceptions=False)
+        headers = {
+            "Cookie": f"{http_api.SESSION_COOKIE}={client.session}",
+            **CLIENT_HEADERS,
+        }
+        async with httpx.AsyncClient(transport=transport, base_url=BASE_URL) as concurrent:
+            return await asyncio.gather(
+                *(
+                    concurrent.post(
+                        f"/api/humans/{human_id}/password",
+                        json={"password": f"passphrase-{human_id}"},
+                        headers=headers,
+                    )
+                    for human_id in humans
+                )
+            )
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(auth, "hash_password", watched_hash)
+        responses = asyncio.run(hammer())
+
+    assert [response.status_code for response in responses] == [200] * len(humans)
+    assert on_the_loop == [], "argon2 ran on the event loop: every other request waited for it"
+    assert peak >= 2, "the sets never overlapped: this asserted nothing about the bound"
+    assert peak <= http_api.ARGON2_CONCURRENCY, (
+        f"{peak} argon2 hashes were in flight at once, bound is {http_api.ARGON2_CONCURRENCY}"
+    )
 
 
 def test_logout_records_the_human_logout_event_and_removes_the_session(client, fresh_db):

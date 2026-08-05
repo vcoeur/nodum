@@ -221,8 +221,18 @@ human principal on every `/api` request — reads included; only `/healthz`,
 `/api/login` and the static UI stay open. A failed-login **lockout** throttles
 brute force (M5): five failed attempts per name inside fifteen minutes refuse
 further attempts with a **429**, applied identically to names that do not
-exist. Every attempt is event-logged through `service.record_auth_event`
-(`human.login`/`human.login_failed`/`human.logout`).
+exist. Every attempt **that reaches a password check** is event-logged
+through `service.record_auth_event`
+(`human.login`/`human.login_failed`/`human.logout`) — the qualifier is
+load-bearing: an attempt the lockout refuses writes nothing (its refusals are
+a rate limit, and logging them let an unauthenticated caller append to the log
+without bound and hold the real human out forever), and neither does one
+refused for an over-long field. What is on the record is the five failures
+that earned the lockout. The actor on a failure is `unauthenticated`, never
+the attempted name — that name is in the payload, because on this route it is
+a string the caller chose. Verification runs off the event loop behind a
+`CapacityLimiter` of 2: argon2id is ~64 MiB a hash, and this is the one route
+reachable without a session.
 
 #### Identity is structural
 
