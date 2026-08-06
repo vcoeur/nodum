@@ -173,7 +173,7 @@ export default function AdminView() {
             {data.agents.length === 0 ? (
               <EmptyState
                 title="No agents yet"
-                body="An agent is an MCP client's identity. Create one, put its token in the client's NODUM_AGENT_TOKEN, then grant it spaces here."
+                body="An agent is an MCP client's identity. Create one, point the client at this server's /mcp URL with the token as its Authorization: Bearer header, then grant it spaces here."
               />
             ) : (
               data.agents.map((agent) => (

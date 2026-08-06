@@ -5310,10 +5310,10 @@ def disable_agent(agent_id: str, *, principal: Principal, path: str | Path | Non
     """Disable an agent: its token stops verifying; its proposals stay, flagged.
 
     Revocation is verification-time, so *when* it bites depends on the
-    surface (Q13 review S8): HTTP re-checks every request, and the MCP server
-    re-verifies its token on every tool call — a running ``nodum mcp serve``
-    refuses its next call after the disable, on every surface. There is no
-    longer anything that outlives the disable to kill.
+    surface (Q13 review S8): both surfaces re-check every request, and the MCP
+    one re-verifies the presented token on every tool call as well — a running
+    server refuses this agent's next call after the disable, on every surface.
+    There is no longer anything that outlives the disable to kill.
     """
     conn = _connect(path)
     try:

@@ -2376,3 +2376,73 @@ release required to be a superset. What is **not**: `shell:`,
 step order. A release job could run byte-identical commands behind `if: false`
 and still count — stated in the test's own docstring rather than left for the
 next review to find.
+
+## 2026-08-05 — stdio was removed rather than kept beside HTTP
+
+The MCP surface moved onto the server `nodum serve` already runs: `POST /mcp`,
+streamable HTTP, the same origin and the same process as `/api` and the web UI.
+The stdio serve command and the whole mcp command group went with the transport
+they existed for. They are named in plain prose here, without backticks, and
+that is the convention this log now follows for anything it records the removal
+of: `test_every_command_the_docs_name_exists` reads code spans across the docs
+and refuses a command that no longer resolves. The gate is right to — a reader
+who copies one gets "No such command" — and an append-only decision log is
+exactly where removed names accumulate, so the log spells them the one way that
+is not an invitation to type them.
+
+Keeping stdio alongside was the obvious cautious answer and it was the wrong
+one. The cost of two transports is not the second adapter, it is that **every
+invariant this surface holds has to be held twice** and can be true on the one
+under test while false on the one in use — the registry-disjointness assertions
+most of all. Removing it left one code path for the principal, one surface for
+the tier-absence tests, and no launch-time branch to keep in step with the
+per-request one.
+
+The removal was outright, not a deprecation stub. The command ships on PyPI at
+`v0.12.1` and sat in ten launcher configs, but the only consumer of those
+configs is the workspace that repointed them in the same change, so there was
+no third-party user to strand and a stub would have been dead code carrying a
+migration message nobody would read.
+
+What it costs, stated rather than discovered later: the endpoint is only alive
+while a server is running. Under stdio the *client* started the process on
+demand, so a laptop workflow had no daemon to keep up and now does. And the
+token stopped being a server-side environment variable — it is purely a
+client-side credential presented as `Authorization: Bearer`, which means it
+crosses a socket on every call rather than sitting in a subprocess environment.
+Remotely that socket is TLS-terminated at the proxy; locally it is loopback.
+
+Three consequences fell out of one process serving many agents:
+
+- **Identity is per request, never cached.** A principal held between calls
+  would be somebody else's. `_principal` re-reads the header off the SDK's
+  per-request context every call, which also keeps revocation
+  verification-time.
+- **The credential is checked twice on purpose.** `BearerGuard` refuses the
+  *request* with a 401 before `initialize` or `tools/list` answers, so an
+  unauthenticated peer cannot enumerate the surface; `_principal` decides who
+  is speaking for the *call*. The guard is the door, not the identity.
+- **`RequestGuardMiddleware` exempts `/mcp` from exactly the two checks it
+  exempts capability URLs from**, and for the same reason: a bearer token is
+  not an ambient credential, so there is nothing for a cross-origin page to
+  ride. The `Host` check and the body ceiling still apply. The exemption is one
+  constant path, not "requests carrying an `Authorization` header" — that shape
+  would let any route opt out of CSRF protection.
+
+Two smaller calls, both made because the alternative fails silently rather than
+loudly. `stateless_http` is **on**: a deployed instance is restarted and
+redeployed under short-lived agent processes, and each request carries its own
+credential already, so a session id that has to survive between calls is state
+both ends would have to keep. And the SDK's DNS-rebinding host list is
+**derived from nodum's own** `resolve_allowed_hosts` rather than configured
+separately — FastMCP defaults to loopback-only, which refuses every request on
+a deployed host and looks like a broken deployment rather than a policy. One
+policy, two enforcement points.
+
+The trap worth recording: `streamable_http_app()` returns a Starlette app whose
+lifespan starts the session manager, and **Starlette does not run a
+sub-application's lifespan**. A route wired without it answers 500 on every
+call while the route table looks perfectly correct. `http_surface()` returns
+the route *and* the lifespan for that reason, and the test helpers enter the
+app's lifespan explicitly — without it every negative assertion in those tests
+would pass against a route that is simply broken.

@@ -33,6 +33,7 @@ from starlette.routing import Route
 from nodum.http_api import (
     LOGIN_PATH,
     _is_capability_path,
+    _is_mcp_path,
     _needs_a_session,
     create_app,
 )
@@ -146,7 +147,13 @@ def _methods(route: Route) -> str:
     wrong for the download-token route, whose token a HEAD probe would
     spend); the reference lists what the table configured, not the implied
     HEAD.
+
+    The MCP route declares no methods at all — the SDK's ASGI app dispatches on
+    the verb itself — so an empty cell would read as "none" for the one route
+    that in fact answers three. Name them.
     """
+    if _is_mcp_path(getattr(route, "path", "")):
+        return "POST, GET, DELETE"
     methods = sorted(route.methods or ())
     return ", ".join(method for method in methods if method != "HEAD")
 
@@ -158,6 +165,12 @@ def _auth(path: str) -> str:
     predicates the middleware applies to real request paths — so the doc and
     the gate cannot disagree about what is open.
     """
+    if _is_mcp_path(path):
+        # Not "open", which is what `_needs_a_session` alone would imply: this
+        # route takes no session because it takes a *different* credential, and
+        # a reference that called it open would be describing the opposite of
+        # what `BearerGuard` does.
+        return "bearer — an agent token, per request"
     if not _needs_a_session(path):
         if _is_capability_path(path):
             return "token — the URL is the credential"
@@ -167,14 +180,22 @@ def _auth(path: str) -> str:
     return "session"
 
 
-def _notes(endpoint: Callable[..., object]) -> str:
-    """The handler docstring's first line — the one-line summary."""
+def _notes(endpoint: Callable[..., object], path: str = "") -> str:
+    """The handler docstring's first line — the one-line summary.
+
+    The MCP transport is written for us rather than by us, so its own docstring
+    describes the SDK's ASGI app and not what this route is. Say what it is.
+    """
+    if _is_mcp_path(path):
+        return "The MCP surface for external agents: read and additive tiers only, streamable HTTP."
     doc = inspect.getdoc(endpoint) or ""
     return doc.splitlines()[0].strip() if doc else ""
 
 
 def _family(path: str) -> str:
     """The doc family a route belongs to, derived from its path."""
+    if _is_mcp_path(path):
+        return "Agent surface (MCP)"
     if _is_capability_path(path):
         return "Capability URLs"
     parts = path.split("/")
@@ -195,9 +216,10 @@ def collect(app: Starlette) -> list[dict[str, str]]:
             {
                 "method": _methods(route),
                 "path": path,
-                "handler": endpoint.__name__,
+                # The MCP route's endpoint is an SDK object, not a function.
+                "handler": getattr(endpoint, "__name__", type(endpoint).__name__),
                 "auth": _auth(path),
-                "notes": _notes(endpoint),
+                "notes": _notes(endpoint, path),
             }
         )
     return rows

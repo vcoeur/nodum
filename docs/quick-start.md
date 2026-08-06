@@ -114,13 +114,19 @@ nodum agent create researcher --as owner     # prints a show-once token to stder
 nodum grant researcher main suggest --as owner
 ```
 
-Then give the token to the **MCP client**, which launches `nodum mcp serve` for
-itself over stdio — there is no daemon to start and no port:
+Then start the server and point the **MCP client** at its `/mcp` route. The
+agent surface is part of `nodum serve` — one origin for the UI, the API and
+every agent:
+
+```sh
+nodum serve        # http://127.0.0.1:8600 — UI at /, API at /api, agents at /mcp
+```
 
 ```json
 { "mcpServers": { "nodum": {
-    "command": "nodum", "args": ["mcp", "serve"],
-    "env": { "NODUM_AGENT_TOKEN": "ndm_…" }
+    "type": "http",
+    "url": "http://127.0.0.1:8600/mcp",
+    "headers": { "Authorization": "Bearer ndm_…" }
 } } }
 ```
 

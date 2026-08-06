@@ -53,9 +53,9 @@ The same service layer sits behind every surface, so they cannot drift:
 | Surface | For | Entry point |
 |---|---|---|
 | CLI | humans, scripts | `nodum …` — one JSON object per command |
-| HTTP API | the web UI | `nodum serve` |
-| MCP server | external agents | `nodum mcp serve` — agent token in `NODUM_AGENT_TOKEN` |
-| Web UI | humans | served by `nodum serve` |
+| HTTP API | the web UI | `nodum serve` — `/api`, session cookie |
+| MCP server | external agents | `nodum serve` — `POST /mcp`, `Authorization: Bearer ndm_…` |
+| Web UI | humans | `nodum serve` — `/` |
 
 The MCP server exposes the read and additive tool tiers **and nothing else** —
 an agent can propose, never dispose.

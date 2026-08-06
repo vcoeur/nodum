@@ -57,13 +57,33 @@ The lists exist so ``tests/test_mcp_server.py`` can assert the registry stays
 disjoint from :data:`UNREGISTERED_TOOLS`; adding an operation to any of those
 tiers means adding its name to a list, never to the registry.
 
-Identity: the agent's bearer token, from the ``NODUM_AGENT_TOKEN``
-environment variable (the shape MCP client configs carry in their ``env``
-blocks — a command-line token would leak into ``ps``). The token is verified
-once at launch as a fail-fast gate and **re-verified on every tool call**:
-the principal is re-minted per call, so disabling the agent or its owner, or
-archiving a space it holds a grant on, bites at the next call rather than at
-the next restart. Transport is stdio — what MCP clients actually launch.
+**Transport is HTTP, and only HTTP.** This surface is a route on the same
+Starlette app ``nodum serve`` builds — ``POST /mcp`` beside ``/api`` and the
+web UI — so one deployed instance serves the human and every agent from one
+origin. The stdio transport was removed with the ``nodum mcp serve`` command
+it existed for: a subprocess on the caller's machine cannot be deployed
+anywhere, which is the whole point of the change.
+
+Identity is therefore **per request, not per process**. The agent's bearer
+token arrives in ``Authorization: Bearer ndm_…`` on every call, and
+:class:`BearerGuard` refuses the request outright when it is missing or
+verifies no enabled agent — before ``initialize`` or ``tools/list`` answers,
+so an unauthenticated peer cannot even enumerate this surface. Inside a tool,
+:func:`_principal` re-reads that same header off the SDK's own per-request
+context and re-mints the principal, so disabling the agent or its owner, or
+archiving a space it holds a grant on, bites at the **next call** rather than
+at the next restart (revocation is verification-time, R3).
+
+That is two verifications per call and both are wanted: the guard decides
+whether the request may *reach* this surface, ``_principal`` decides *who is
+speaking*. Neither is expensive — agent tokens are stored as sha-256 (see
+:mod:`nodum.auth`), so each is one indexed SELECT, not an argon2 round.
+
+**One process now serves many agents**, which is the property the old design
+never had to hold: the token is read from the live request every time, never
+cached in a closure, so two agents on one server cannot see each other's
+grants. ``tests/test_mcp_server.py`` asserts exactly that with two agents
+whose grant sets do not overlap.
 
 Every tool delegates to :mod:`nodum.service`, :mod:`nodum.search`,
 :mod:`nodum.assets`, :mod:`nodum.ingest` or :mod:`nodum.urls`; there is no
@@ -72,15 +92,20 @@ logic here beyond argument mapping and JSON shaping.
 
 from __future__ import annotations
 
-import os
-from collections.abc import Sequence
+import json
+from collections.abc import Callable, Sequence
+from contextlib import AbstractAsyncContextManager
 from pathlib import Path
-from typing import Any, overload
+from typing import Any, NamedTuple, overload
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.utilities.types import Image
+from mcp.server.lowlevel.server import request_ctx
+from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel
+from starlette.routing import Route
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from nodum import assets, auth, ingest, service, urls
 from nodum import search as search_module
@@ -314,46 +339,276 @@ def _ingest_result(out: ingest.IngestOut) -> dict[str, Any]:
     )
 
 
-def create_server(*, token: str, db_path: str | Path | None = None) -> FastMCP:
-    """Build the nodum MCP server bound to one agent token.
+#: The HTTP path this surface answers on, relative to the server's origin.
+#: One constant so the route, the guard's exemption in :mod:`nodum.http_api`,
+#: and the documented URL cannot drift apart.
+MCP_PATH = "/mcp"
 
-    The token is verified once here — a server that could never serve fails
-    at launch — and **re-verified on every tool call**: each call re-mints
-    the agent's principal from stored state, so disabling the agent or its
-    owner, or archiving a space it holds a grant on, bites at the next call
-    rather than at the next restart (revocation is verification-time, R3).
+#: Authorization scheme this surface accepts, lowercased for comparison.
+BEARER_SCHEME = "bearer"
+
+
+def _bearer_token(header: str | None) -> str | None:
+    """Pull the token out of an ``Authorization: Bearer …`` header.
+
+    Returns ``None`` for a missing header, a different scheme, or an empty
+    token — every "no usable credential" case collapses to one, because the
+    caller's reply is the same 401 for all of them and distinguishing them in
+    the response would only tell an unauthenticated peer which half it got
+    right.
+    """
+    if not header:
+        return None
+    scheme, _, value = header.partition(" ")
+    if scheme.strip().lower() != BEARER_SCHEME:
+        return None
+    return value.strip() or None
+
+
+def _presented_token() -> str | None:
+    """Read the bearer token off the request the SDK is currently serving.
+
+    The SDK sets :data:`mcp.server.lowlevel.server.request_ctx` per request and
+    hands the underlying Starlette ``Request`` along on it. Reading the header
+    from there — rather than from a contextvar this module sets in an ASGI
+    wrapper — is deliberate: the session manager may run a tool call in a task
+    it spawned, and a contextvar set on the request's task would not
+    necessarily be visible there, whereas the SDK's own context is by
+    construction the context of *this* call.
+
+    Returns ``None`` outside any request, which is what makes the check in
+    :func:`_principal` meaningful rather than decorative.
+    """
+    try:
+        context = request_ctx.get()
+    except LookupError:
+        return None
+    request = context.request
+    if request is None:
+        return None
+    return _bearer_token(request.headers.get("authorization"))
+
+
+class BearerGuard:
+    """Refuse an MCP request that presents no enabled agent's token.
+
+    This runs in front of the whole surface, so ``initialize`` and
+    ``tools/list`` need a credential exactly as a tool call does: an
+    unauthenticated peer cannot enumerate what this server exposes, let alone
+    call it. Without it the transport would answer ``200`` with a JSON-RPC
+    error body, which reads as "your request was fine, the tool failed" — the
+    wrong thing to tell someone who has not authenticated at all.
+
+    The refusal is a real ``401`` carrying ``WWW-Authenticate: Bearer``, in the
+    same error envelope every other nodum surface uses, and it says nothing
+    about *why* — a missing header, a malformed one, a revoked token and a
+    token that never existed are one answer, because any finer grain is an
+    oracle (:mod:`nodum.auth` phrases its refusals the same way).
+
+    It does **not** decide who the caller is. :func:`_principal` does that, per
+    tool call, from the same header — this is the door, not the identity.
+    """
+
+    def __init__(self, app: ASGIApp, *, db_path: str | Path | None = None) -> None:
+        self.app = app
+        self.db_path = db_path
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        headers = {
+            key.decode("latin-1").lower(): value.decode("latin-1")
+            for key, value in scope.get("headers", [])
+        }
+        token = _bearer_token(headers.get("authorization"))
+        if token is None or not self._verifies(token):
+            await self._refuse(send)
+            return
+        await self.app(scope, receive, send)
+
+    def _verifies(self, token: str) -> bool:
+        """Whether this token verifies an enabled agent right now."""
+        try:
+            auth.verify_agent_token(token, path=self.db_path)
+        except auth.InvalidCredentials:
+            return False
+        return True
+
+    async def _refuse(self, send: Send) -> None:
+        """Send the 401 without touching the request body."""
+        body = json.dumps(
+            {
+                "error": {
+                    "type": "InvalidCredentials",
+                    "message": (
+                        "this surface authenticates with 'Authorization: Bearer ndm_…' — "
+                        "mint a token with 'nodum agent create <name>'"
+                    ),
+                }
+            }
+        ).encode()
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 401,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"content-length", str(len(body)).encode()),
+                    (b"www-authenticate", b"Bearer"),
+                ],
+            }
+        )
+        await send({"type": "http.response.body", "body": body})
+
+
+def _host_patterns(hosts: Sequence[str]) -> list[str]:
+    """Render nodum's host names in the shape the SDK's matcher compares against.
+
+    The two layers spell the same policy differently, and the difference is a
+    silent 421 rather than an error: :func:`nodum.http_api.bare_host` strips
+    the port before comparing, so nodum's list holds ``127.0.0.1``, while the
+    SDK compares the raw ``Host`` header and understands only an exact match or
+    a ``name:*`` port wildcard. Feeding it the bare name alone means
+    ``Host: 127.0.0.1:8600`` matches nothing and every request is refused.
+
+    Emitting both forms is what makes "one list, two enforcement points" true
+    rather than aspirational — the policy still comes from one place, and this
+    is only its translation.
+    """
+    return [pattern for host in hosts for pattern in (host, f"{host}:*")]
+
+
+class McpSurface(NamedTuple):
+    """The two things :func:`nodum.http_api.create_app` has to attach.
+
+    ``route`` goes in the router beside ``/api``; ``run`` goes in the app's
+    lifespan. Both are required, and forgetting the second is the trap:
+    Starlette does **not** run a sub-application's lifespan, so a route wired
+    without it answers **500** on every call — a failure that looks like a bug
+    in the transport rather than a missing line in ``create_app``.
+    """
+
+    route: Route
+    run: Callable[[], AbstractAsyncContextManager[None]]
+
+
+def http_surface(
+    *,
+    db_path: str | Path | None = None,
+    allowed_hosts: frozenset[str] | None = None,
+) -> McpSurface:
+    """Build the MCP surface as a route on the human server's own app.
 
     Args:
-        token: The agent's bearer token (``ndm_…``, minted by
-            ``nodum agent create`` / ``token-rotate``). Verified against its
-            stored hash on every tool call; the agent's grants confine it.
+        db_path: Explicit database path; defaults to ``NODUM_DB`` resolution.
+        allowed_hosts: Host names the server answers to, from
+            :func:`nodum.http_api.resolve_allowed_hosts`. Passed through to the
+            SDK's own DNS-rebinding protection so that both layers read the
+            **same** list — see below.
+
+    Returns:
+        The route to register and the lifespan context manager to run.
+
+    **Why the host list is threaded through rather than left to the SDK.**
+    FastMCP defaults ``transport_security`` to loopback-only
+    (``127.0.0.1:*``/``localhost:*``/``[::1]:*``, verified against
+    ``mcp 1.28.1``). Mounted as-is on a server reached at
+    ``nodum.vcoeur.com`` that default refuses **every** request, and the
+    failure looks like a broken deployment rather than a policy. Deriving the
+    SDK's list from nodum's own means the two enforcement points cannot
+    disagree: one source, checked twice. ``--allow-host '*'`` disables both
+    together, for the same reason.
+    """
+    server = create_server(db_path=db_path)
+    hosts = sorted(allowed_hosts or ())
+    disabled = "*" in hosts
+    server.settings.transport_security = TransportSecuritySettings(
+        enable_dns_rebinding_protection=not disabled,
+        allowed_hosts=_host_patterns(hosts),
+        # A browser is not a client of this surface, and a bearer token is not
+        # a credential a browser attaches on its own. Allowing the same names
+        # here keeps a same-origin page working without widening anything: the
+        # token still has to be presented explicitly.
+        allowed_origins=[
+            f"{scheme}://{pattern}"
+            for scheme in ("http", "https")
+            for pattern in _host_patterns(hosts)
+        ],
+    )
+    server.settings.streamable_http_path = MCP_PATH
+    # `stateless_http` because a deployed instance is restarted, redeployed and
+    # reached by short-lived agent processes: a session id that has to survive
+    # between calls is state this surface would have to keep and a client would
+    # have to replay. Each request carries its own credential already.
+    server.settings.stateless_http = True
+
+    app = server.streamable_http_app()
+    # `streamable_http_app()` returns a Starlette app whose single Route is the
+    # transport. Lifting that route out (rather than mounting the app) is what
+    # puts the endpoint at exactly `/mcp`: a `Mount` at `/mcp` would answer on
+    # `/mcp/` and redirect `/mcp` to it, and a 307 on the first POST is a body
+    # replay some client stacks will not do. The unpacking is deliberately
+    # strict so a shape change in the SDK fails here, loudly, rather than
+    # silently attaching nothing.
+    (route,) = [candidate for candidate in app.routes if isinstance(candidate, Route)]
+    if route.path != MCP_PATH:  # pragma: no cover — defensive against an SDK change
+        raise RuntimeError(f"MCP transport route is {route.path!r}, expected {MCP_PATH!r}")
+    route.app = BearerGuard(route.app, db_path=db_path)
+    return McpSurface(route=route, run=server.session_manager.run)
+
+
+def create_server(*, db_path: str | Path | None = None) -> FastMCP:
+    """Build the nodum MCP server. Agent identity comes from the request.
+
+    This server is **not bound to an agent**. One instance serves every agent
+    that presents a valid token, because it is one route on a deployed HTTP
+    app rather than a subprocess one client launched. The token is read off
+    the live request on every tool call by :func:`_principal`.
+
+    Args:
         db_path: Explicit database path; defaults to ``NODUM_DB`` resolution.
 
     Returns:
         A FastMCP server with the read and additive tools registered. Review
-        tools (§8.1 human tier) and curative tools (§8.2) are never
-        registered.
-
-    Raises:
-        auth.InvalidCredentials: If the token verifies no enabled agent.
+        tools (§8.1 human tier), curative tools (§8.2) and reversal are never
+        registered, and no tool names a path on the server's disk
+        (:data:`FILESYSTEM_TOOLS`).
     """
-    # Fail-fast at launch: a token that verifies no enabled agent today is a
-    # configuration error worth refusing before the client is ever connected.
-    # This is only the gate — `_principal` below is the authority, so the
-    # discard is deliberate: revocation must not wait for a restart.
-    auth.verify_agent_token(token, path=db_path)
 
     def _principal() -> Principal:
-        """Re-verify the token and re-mint the agent's principal for this call.
+        """Mint the calling agent's principal from *this request's* token.
 
-        Revocation is verification-time (:mod:`nodum.auth` R3): disabling the
-        agent, disabling its owner, or archiving a space it holds a grant on
-        must bite at the **next tool call**, not at the next server start.
+        Two properties ride on reading the header here rather than closing
+        over a token at construction:
+
+        **Isolation.** One process serves many agents, so a cached identity
+        would be another agent's identity. The token is re-read from the live
+        request every call; nothing about the caller survives between calls.
+
+        **Revocation is verification-time** (:mod:`nodum.auth` R3): disabling
+        the agent, disabling its owner, or archiving a space it holds a grant
+        on must bite at the **next tool call**, not at the next restart.
         ``verify_agent_token`` re-reads ``agents.disabled`` and reloads the
         grant set (which drops grants on archived spaces) every time, so one
-        small SELECT per call is the honest price of
-        revocation-by-verification.
+        indexed SELECT per call is the honest price of that.
+
+        :class:`BearerGuard` has already refused this request if the header is
+        absent or bad, so the raises below are the second layer rather than
+        the gate — the same reasoning ``service._walk`` applies to endpoint
+        rows it could have trusted the SQL for. An identity check that exists
+        at one of two sites is a comment, not a check.
+
+        Raises:
+            auth.InvalidCredentials: If the request carries no usable bearer
+                token, or one that verifies no enabled agent.
         """
+        token = _presented_token()
+        if token is None:
+            raise auth.InvalidCredentials(
+                "no agent token on this request: the MCP surface authenticates with "
+                "'Authorization: Bearer ndm_…' (mint one with 'nodum agent create <name>')"
+            )
         return auth.verify_agent_token(token, path=db_path)
 
     server = FastMCP(
@@ -816,21 +1071,8 @@ def create_server(*, token: str, db_path: str | Path | None = None) -> FastMCP:
     return server
 
 
-def serve(*, token: str | None = None, db_path: str | Path | None = None) -> None:
-    """Run the MCP server on stdio (blocking) — what MCP clients launch.
-
-    The token comes from the environment, never the command line (a flag
-    would leak into ``ps`` and shell history): ``NODUM_AGENT_TOKEN``, which
-    is exactly the shape MCP client configs carry in their ``env`` blocks.
-
-    Raises:
-        ValueError: If the environment carries no token.
-        auth.InvalidCredentials: If the token verifies no enabled agent.
-    """
-    token = token or os.environ.get("NODUM_AGENT_TOKEN")
-    if not token:
-        raise ValueError(
-            "NODUM_AGENT_TOKEN is not set: the MCP server authenticates with an "
-            "agent token (mint one with 'nodum agent create <name>')"
-        )
-    create_server(token=token, db_path=db_path).run()
+# ── There is no `serve` here ──────────────────────────────────────────────────
+# The stdio transport was removed with `nodum mcp serve`. This surface is a
+# route on the app `nodum serve` builds (`http_surface` above), because a
+# subprocess launched by the caller can only ever reach a database on the
+# caller's own machine — and reaching one that is not is the point.

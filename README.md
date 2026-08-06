@@ -19,7 +19,8 @@ re-ranking), **principals, spaces and grants** (Q13: human and agent accounts,
 store), the **review/accept API** for the proposal queue (a human, or `edit`
 on the item's space; `undo` stays human-only),
 **proposed updates** (agent edits stage as `proposed` versions), an **MCP
-server** (stdio) exposing the read + additive tool tiers *and nothing else*,
+server** (streamable HTTP, served at `/mcp` by `nodum serve`) exposing the
+read + additive tool tiers *and nothing else*,
 and **content-addressed assets** — binaries and
 their lazily generated `thumb`/`preview` renditions stored in the same file
 as the graph (agents get renditions, never originals). **Phase 3 (human UI)**
@@ -182,13 +183,16 @@ uv run nodum retype <id> --type claim --as owner
 uv run nodum supersede-edge <edge-id> --confidence 0.4 --as owner
 uv run nodum bulk-relink --dst <old> --to-dst <new> --dry-run --as owner
 
-# MCP server (stdio) for external agents — read + additive tiers only, no
-# review tools, no curative tools, and no tool that takes a path on this
-# server's disk. The agent authenticates with its token in NODUM_AGENT_TOKEN
-# (minted by `nodum agent create`, shown once). Normally the MCP *client*
-# launches this for itself, carrying the token in its config's env block —
-# see docs/install.md; run it by hand only to check a token verifies.
-NODUM_AGENT_TOKEN=ndm_… uv run nodum mcp serve
+# One server, three surfaces: the web UI at /, the human JSON API under /api,
+# and the MCP surface for external agents at /mcp — same origin, same process.
+# There is no separate MCP command: agents point at the URL and authenticate
+# per request with `Authorization: Bearer ndm_…` (mint one with
+# `nodum agent create`, shown once). See docs/install.md for a client config.
+curl -sS -X POST http://127.0.0.1:8600/mcp \
+  -H 'Authorization: Bearer ndm_…' \
+  -H 'Accept: application/json, text/event-stream' \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 
 # HTTP server for the human: JSON API under /api plus the web UI at /.
 # Every /api route needs a session — log in with a human name and password
@@ -407,11 +411,16 @@ cycle quietly drop the vector signal until you re-run the download.
   on it confers nothing at all, including on nodes reached by id. The grant rows
   are kept rather than deleted, so `grants` still lists them, `revoke` still
   removes them, and undoing the archive restores the delegation unchanged.
-- **MCP server.** `nodum mcp serve` runs a stdio MCP server (the official
-  Python SDK's FastMCP). The agent authenticates with its token in
-  `NODUM_AGENT_TOKEN` (minted by `nodum agent create`, shown once, stored
-  hashed) and is verified at launch and re-verified on every tool call; every
-  write is confined to its then-current grants.
+- **MCP server.** `nodum serve` exposes it at `/mcp` over streamable HTTP (the
+  official Python SDK's FastMCP), on the same origin as the API and the UI, so
+  one deployed instance serves every agent — local or remote. There is no
+  stdio transport and no mcp command group: a subprocess can only reach a
+  database on the machine that launched it. The agent authenticates per
+  request with `Authorization: Bearer ndm_…` (minted by `nodum agent create`,
+  shown once, stored hashed); the token is verified at the transport and the
+  principal re-minted on every tool call, so revocation bites at the next
+  call and every write is confined to its then-current grants. One process
+  serves many agents, and nothing about a caller survives between calls.
   The registry is the design §8.1 read tier (`get_node`, `get_children`,
   `search`, `traverse`, `list_types`, `get_schema`, `find_path`, `history`,
   `diff`, `get_asset`, `get_download_url`) and additive tier (`create_node`,

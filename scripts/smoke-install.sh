@@ -85,9 +85,10 @@ else
 fi
 
 # The whole installed package must import. The CLI checks above never touch a
-# module cli.py imports lazily — `nodum mcp serve` imports nodum.mcp_server
-# inside its command body — so the mcp 2.0.0 removal of mcp.server.fastmcp
-# sailed past --version/schema-dump/--help while killing every fresh install.
+# module cli.py imports lazily — `serve` imports nodum.http_api, and through it
+# nodum.mcp_server, inside its command body — so the mcp 2.0.0 removal of
+# mcp.server.fastmcp sailed past --version/schema-dump/--help while killing
+# every fresh install.
 # Walking every module of the INSTALLED wheel fails the moment any cannot
 # import, which is that class of break.
 echo "==> every module of the installed package imports"

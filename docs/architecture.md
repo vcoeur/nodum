@@ -9,7 +9,7 @@ event log or lazily generated.
 ```mermaid
 flowchart LR
     cli["nodum.cli (Typer)"] --> svc["nodum.service (deterministic, LLM-free)"]
-    mcp["nodum.mcp_server (FastMCP, stdio)"] --> svc
+    mcp["nodum.mcp_server (FastMCP, HTTP at /mcp)"] --> svc
     http["nodum.http_api (Starlette, human principal)"] --> svc
     cli --> qry["nodum.search (hybrid: BM25 + vector, RRF)"]
     mcp --> qry
@@ -195,7 +195,7 @@ replacing rather than accumulating per target) and read only by
 
 ### `nodum.mcp_server` — the external-agent surface
 
-The MCP adapter (stdio, official Python SDK FastMCP): registers the design
+The MCP adapter (streamable HTTP, official Python SDK FastMCP): registers the design
 §8.1 read + additive tiers and nothing else, each tool a thin delegate to a
 service/search/ingest function. The three never-registered tiers
 (`REVIEW_TOOLS`, `CURATIVE_TOOLS`, `HUMAN_ONLY_TOOLS`) are structural
@@ -204,9 +204,11 @@ absences, and `UNREGISTERED_TOOLS` is their union — see the MCP contract in
 `request_upload_url` (additive) plus `get_download_url` (read), and `get_asset`
 carries the **extracted text** (capped, with the real length and a truncation
 flag) and serves **`page:<n>` PDF rasters** beside `preview`/`thumb`.
-Annotations state each tool's worst case; auth is `NODUM_AGENT_TOKEN`,
-verified at launch and re-verified on every tool call. Launched by
-`nodum mcp serve`.
+Annotations state each tool's worst case. Auth is a per-request bearer
+token, refused at the transport by `BearerGuard` and re-verified per tool
+call by `_principal`. Served at `POST /mcp` by `nodum serve` over
+streamable HTTP — `http_surface()` returns the route and the lifespan the
+HTTP app must run.
 
 ### `nodum.http_api` — the human surface
 
@@ -641,7 +643,7 @@ sections to the code:
 | §15.1 D6 embedding lifecycle | `nodum.embeddings` chunking (512-word window, ~15% overlap — words approximate tokens) + `chunks.model_id` per embedding (migration `0006`) + `projector rebuild vec` as the full-rebuild-on-model-change path (reset + replay re-embeds everything with the new model). |
 | §15.1 D10 provider abstraction | `nodum.embeddings.EmbeddingProvider` — `model_id` / `dimensions` / `embed(texts)`. The default is local in-process fastembed (no daemon, no API key, no `agedum` dependency); an API-key provider slots in behind the same interface. |
 | §8.1 review/accept API — the review tier | `service.list_proposals` (filterable by actor, type, kind, age; reviewer context: edge endpoints, node parent, update target, each as `{id, title, space_id}` — the space is what the human UI's review queue groups by; plus each item's **annotation slot**, populated by `list_proposals` from the `annotations` table (migration `0016`): the parsed body of its row — what a proposer's acceptance signal judged and at what rate — or `None` when it has none; the write half is `service.annotate`, gated like a review by `Store.require_review`, resolving the target through the principal's read scope so it is no existence oracle, and replacing rather than accumulating per target) + `accept_proposals`/`reject_proposals` (by id, reject carries a `reason` into each event payload) + `accept_matching`/`reject_matching` (batch by filter — resolves to concrete ids, then one event per id). Reviewing needs a human or `edit` on the item's space (`GrantNotPermitted` otherwise); `undo` stays human-only. `transition` takes the same `reason` and writes it to the same place, so the single-item CLI `reject <id> --reason` is audited exactly like the batch one — the two spellings of a reject differ only in cardinality. CLI: the `review` group (and top-level `accept`/`reject`/`archive`/`undo`). **Not** an MCP tool. |
-| §8.1 tool contract (read + additive tiers) | `nodum.mcp_server` over stdio: read tier `get_node`/`get_children`/`search`/`traverse`/`list_types`/`get_schema`/`find_path`/`history`/`diff`/`get_asset`, `get_download_url` (a read where §8.1's own table puts it), additive tier `create_node`/`update_node`/`link`/`propose_edges`/`ingest_url`/`request_upload_url`. That is the whole registry — the review tier is a *different* tier and is not exposed here, and neither is anything that takes a **path on the server's disk**: `ingest_file` was registered until finding B1, where an agent holding the minimal write grant used it plus `get_asset` to read an arbitrary server file. Grants scope the graph; a filesystem read is not a graph read, so the grant model could not bound it (`mcp_server.FILESYSTEM_TOOLS`). All delegate to `nodum.service` / `nodum.search` / `nodum.assets` / `nodum.ingest` / `nodum.urls` with tool annotations (`readOnlyHint`, `destructiveHint`). Not yet: `get_context`, `export`, `schema_propose` (later phases). |
+| §8.1 tool contract (read + additive tiers) | `nodum.mcp_server` over streamable HTTP at `/mcp`: read tier `get_node`/`get_children`/`search`/`traverse`/`list_types`/`get_schema`/`find_path`/`history`/`diff`/`get_asset`, `get_download_url` (a read where §8.1's own table puts it), additive tier `create_node`/`update_node`/`link`/`propose_edges`/`ingest_url`/`request_upload_url`. That is the whole registry — the review tier is a *different* tier and is not exposed here, and neither is anything that takes a **path on the server's disk**: `ingest_file` was registered until finding B1, where an agent holding the minimal write grant used it plus `get_asset` to read an arbitrary server file. Grants scope the graph; a filesystem read is not a graph read, so the grant model could not bound it (`mcp_server.FILESYSTEM_TOOLS`). All delegate to `nodum.service` / `nodum.search` / `nodum.assets` / `nodum.ingest` / `nodum.urls` with tool annotations (`readOnlyHint`, `destructiveHint`). Not yet: `get_context`, `export`, `schema_propose` (later phases). |
 | §8.2 additive vs. curative | The curative tier is `service.merge_nodes` / `retype` / `supersede_edge` / `bulk_relink`, gated by the review path's own check (`Store.require_review` — a human, or `edit` on every space touched) and surfaced on the CLI as `merge-nodes` / `retype` / `supersede-edge` / `bulk-relink`. Each runs **inside a consolidation cycle**, including one a human invokes directly (`_curative_cycle` opens a one-op `trigger='curative'` cycle), because each writes several rows from one decision while `undo` reverses one row from one payload — so `rollback` is the single reverse for the tier and `undo` refuses a cycle-stamped event by name. Structural still: `nodum.mcp_server` never registers the curative tools nor the review tools (`accept`, `reject`) — they don't exist on the MCP surface at all; tests assert the registry stays disjoint from `UNREGISTERED_TOOLS` — `CURATIVE_TOOLS`, `REVIEW_TOOLS` and `HUMAN_ONLY_TOOLS` together. Nor are they on the HTTP API, which carries only the journal and rollback. |
 | §8.3 learned trust (Q13 — policies died) | There is no policy table and no rule engine. Two grant levels with agent self-governance: `suggest` queues everything, `edit` writes `active` and the agent self-governs with its own confidence (indicative data, triggering nothing hardcoded). Phase 5a gave that self-governance a seam: `Store.cap_landing` plus a keyword-only `landing=` on `create_edge`/`propose_edges`/`create_node`, so **a grant is a ceiling, not a mandate** — a writer holding `edit` may file a write it is unsure of as a proposal, and asking to land *above* the grant is refused rather than quietly downgraded. That is what puts the gardener's inferences in the review queue despite its `edit` grant. **The graduated middle gear — queue curation — shipped with 5b-ii**: `nodum.consolidate`'s curation job (§L1–§L4) computes each proposer's acceptance rate from **its proposals** (row state measures the outcomes; the one event-log read, `service.list_proposal_creations`, classifies which rows were proposals — `list_events` itself still refuses the gardener) and records it as convention notes in the `conventions` space plus one `annotations` row per queue item via `service.annotate`; nothing auto-accepts and nothing gates a write on the proposer's own `confidence` (auto-accept exists as an interface, read off the `auto_accept_above` props field of a conventions-space note, and stays OFF at `null`). Structural rails stay hardcoded: merges always human-approved (D9), no curative tools over MCP. |
 | §8.4 the internal agent + consolidation cycle | Migration `0014_cycles_and_gardener` (the `cycles` table, the `builtin-gardener` internal agent with `read` on `meta` and `edit` on `main` as ordinary grant rows, the reserved `builtin-` id prefix, refused on the whole prefix at upgrade) + `auth.internal_principal` (the one principal that authenticates by being in-process: no credential to present, none to steal, an ordinary grant set loaded exactly as an external agent's, so archiving a space cuts the gardener off like anyone else and `nodum revoke` reaches its grants) + `service.open_cycle`/`close_cycle`/`in_cycle` + `nodum.consolidate` (the runner, a **peer client** over the public service API — rule 1, asserted over the module's AST; the five deterministic jobs include **queue curation** (§L1–§L4: proposers' acceptance rates over their proposals — row state measures the outcomes, the event log classifies which rows were proposals — filed as convention notes in the `conventions` space and one `annotations` row per queue item via `service.annotate`; statistics and the record, never the judgement: nothing auto-accepts and nothing gates a write on the proposer's own `confidence`); serialised by `0014`'s partial unique index over `cycles(status)`, checks the *gardener's* grant on a scoped cycle right after `open_cycle` and names `nodum grant builtin-gardener <space> edit` instead of reporting an unknown space, and catches `BaseException` so Ctrl-C closes the cycle `failed` instead of stranding it `running` — a `running` cycle is un-rollbackable and `undo` refuses its events) + `nodum.scheduler` (decision J1: one asyncio task in `nodum serve`'s lifespan, `NODUM_CONSOLIDATE_AT`, off by default). **The serialisation is a row, not a lock**: one `running` consolidation cycle exists in the whole file, so `open_cycle` refuses the second opener on the INSERT (`CycleInProgress`, defined in `nodum.service` beside the guard and re-exported by `nodum.consolidate` as the same class) and the rule holds **across processes**. The module-level lock it replaced covered the HTTP route, the nightly task and an in-process caller, and covered a `nodum consolidate` typed at a terminal while the server ran one not at all: both completed, 1580 `duplicate_of` edges over 790 pairs, two journal rows for one human intention. `curative` and `rollback` cycles stay outside the index — each is one short human-driven operation, and blocking them for the length of a nightly sweep would take the curative tier offline every night — and the refusal names the blocking cycle plus the `nodum cycle-abandon <id>` that clears it, since a run a `SIGKILL` ended never closes itself and would otherwise block every later run behind advice nobody can carry out. `db._cycles_problems` asserts the index exists on any file recording `0014`, because `0014` was amended in place while unreleased and `init_db` skips a migration whose name it already has. The journal is `cycles` read by `list_cycles`/`get_cycle` (human-only) and the diff is `list_events(cycle_id=…)` — one record, never two that can disagree. `abandon_cycle` is the door out of a run a `SIGKILL`, a power cut or a mid-cycle shutdown left `running`: it closes the row `failed` through `close_cycle` with a report naming who abandoned it, which is what makes that run's writes rollback-able at all. **The kill switch is the other half of that pair and deliberately not the same verb** (K1): `service.request_stop` (human-only) stamps migration `0015`'s `stop_requested_at`/`stop_requested_by` on a `running` cycle and closes nothing, and `service.stop_requested` is the read the run obeys — not human-only, because a runner that cannot ask whether it was told to stop cannot obey, and scoped instead by the authority to close the cycle. An abandon is a human declaring somebody else's dead process dead from outside; a stop is an instruction a live run winds down under and answers for in its own report. Both leave a `failed` cycle, and the journal keeps them apart by which record is present (`report["abandoned"]` versus the two stamps) rather than by a sentence a reader has to parse. Surfaces: CLI `consolidate` / `cycle-list` / `cycle-get` / `cycle-abandon` / `events --cycle`, HTTP `GET|POST /api/cycles`, `GET /api/cycles/{id}` and `POST /api/cycles/{id}/abandon`, and the web UI's dream-journal view. **Not** MCP. |
@@ -856,19 +858,23 @@ sections to the code:
   that can be pointed elsewhere, and only when asked: `edge_states` defaults
   to `("active",)` like every other traversal, and a reviewer who passes
   `--edge-state proposed` is deliberately looking at what is pending.
-- **The MCP server authenticates exactly one agent per process.** The token
-  comes from `NODUM_AGENT_TOKEN` — the environment, never a flag, because a
-  flag leaks into `ps` and shell history — and is verified against the
-  `agents` table at startup; an unknown or disabled agent is a startup
-  error. The verified agent's principal is loaded with its grant set, and
-  every read and write the tools make is confined by the store to those
-  grants. An earlier interim took a configured `--actor` flag instead:
-  `--actor human` would have turned the whole server into a direct writer
-  into the live graph (and, while the review tools were registered, into a
-  self-approving one), and an empty or unprefixed actor was silently accepted
-  — the token closes both, since it can only ever name one enabled agent.
-  There is still no per-connection handshake identity — one stdio process,
-  one agent.
+- **The MCP server authenticates every agent per request.** The token arrives
+  as `Authorization: Bearer ndm_…` and is verified twice: `BearerGuard`
+  refuses the request with a 401 unless it presents an enabled agent (so an
+  unauthenticated peer cannot even list the tools), and `_principal` re-reads
+  the same header per call to mint the principal with its current grant set,
+  which the store then confines every read and write to. One process serves
+  many agents, so nothing about a caller is cached between calls — a cached
+  principal would be somebody else's. It used to be one agent per process,
+  from `NODUM_AGENT_TOKEN` in the environment, back when the transport was
+  stdio and a client launched the server itself. An earlier interim took a
+  configured `--actor` flag instead: `--actor human` would have turned the
+  whole server into a direct writer into the live graph (and, while the review
+  tools were registered, into a self-approving one), and an empty or unprefixed
+  actor was silently accepted — the token closes both, since it can only ever
+  name one enabled agent. There is no handshake identity either: `initialize`
+  establishes a session, not a principal, so a connection proves nothing that a
+  later call does not have to prove again.
 - **`accept`/`reject` are not MCP tools.** Registering them handed the review
   tier to the agent being reviewed: an agent could accept its own proposals
   and reject another agent's, and the tool was annotated
@@ -1053,10 +1059,13 @@ sections to the code:
   scanned but content is not. Archived nodes are excluded — a retired node is
   not a link target — while `proposed` ones are kept, matching how every other
   node read treats state.
-- **The HTTP surface is the human's, and says so structurally.** `nodum serve`
-  is the inverse of `mcp serve`: the MCP adapter authenticates exactly one
-  agent by token, while `nodum.http_api` never
-  reads an identity from a request at all. The temptation on an HTTP surface is a filter — "strip
+- **The human surface is the human's, and says so structurally.** `/api` and
+  `/mcp` are exact inverses on one origin: the MCP adapter mints only
+  `agent:<name>`, from a bearer header, and `nodum.http_api` never reads an
+  identity from a request at all. That split survives sharing a port because
+  the agent path is minted in `nodum.mcp_server` — `http_api` still calls no
+  credential function but the session one, which a test asserts over the
+  module's AST. The temptation on an HTTP surface is a filter — "strip
   `actor` from the body before forwarding it" — which is one forgotten endpoint
   away from failing. Instead the module binds `principal` in exactly one
   expression (`_write`, to `_session_principal(request)` — what the session

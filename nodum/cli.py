@@ -64,9 +64,6 @@ agent_app = typer.Typer(no_args_is_help=True, help="Agent account administration
 review_app = typer.Typer(
     no_args_is_help=True, help="The review queue: pending proposals (human actor only)."
 )
-mcp_app = typer.Typer(
-    no_args_is_help=True, help="MCP server for external agents (read + additive tiers, design §8)."
-)
 asset_app = typer.Typer(
     no_args_is_help=True, help="Content-addressed assets and derived image renditions."
 )
@@ -80,7 +77,6 @@ app.add_typer(projector_app, name="projector")
 app.add_typer(review_app, name="review")
 app.add_typer(human_app, name="human")
 app.add_typer(agent_app, name="agent")
-app.add_typer(mcp_app, name="mcp")
 app.add_typer(asset_app, name="asset")
 app.add_typer(ingest_app, name="ingest")
 app.add_typer(llm_app, name="llm")
@@ -1345,22 +1341,15 @@ def ingest_handlers() -> None:
     _emit_list("handlers", _run(extract.availability))
 
 
-# ── MCP server ────────────────────────────────────────────────────────────────
+# ── There is no `mcp serve` ───────────────────────────────────────────────────
+# The MCP surface is served by `nodum serve` at `/mcp`, on the same origin as
+# the API and the web UI, and agents authenticate per request with
+# `Authorization: Bearer ndm_…`. The stdio transport this command launched was
+# removed with it: a subprocess can only reach a database on the machine that
+# launched it, which is the constraint the unified server exists to lift.
 
 
-@mcp_app.command("serve")
-def mcp_serve() -> None:
-    """Launch the MCP server on stdio (read + additive tiers, design §8).
-
-    Authentication is the agent token in ``NODUM_AGENT_TOKEN`` — minted by
-    ``nodum agent create`` and carried in the MCP client config's env block.
-    """
-    from nodum import mcp_server
-
-    _run(mcp_server.serve)
-
-
-# ── HTTP server (the human surface) ──────────────────────────────────────────
+# ── HTTP server (the human and agent surfaces) ───────────────────────────────
 
 #: Default port for ``nodum serve``. The frontend dev server proxies ``/api``
 #: and ``/healthz`` here, so changing it means changing `web/vite.config.ts`.
@@ -1384,33 +1373,64 @@ def serve(
     db_path: str | None = typer.Option(
         None, "--db", help=f"Database path for this server (overrides ${ENV_DB_VAR})."
     ),
+    behind_tls: bool | None = typer.Option(
+        None,
+        "--behind-tls/--no-behind-tls",
+        help=(
+            "Whether a TLS proxy fronts this server. Decides the Secure flag on the "
+            "session cookie; defaults to whether the bind is non-loopback."
+        ),
+    ),
 ) -> None:
-    """Serve the human web UI and its JSON API (design §9).
+    """Serve the web UI, the JSON API and the MCP surface (design §9).
 
-    The inverse of ``mcp serve``: every write this surface makes is attributed
-    to the human behind an authenticated session, and no request field can
-    change that. Auth is password login (``POST /api/login``) backed by
-    server-side sessions; ``/healthz`` and the static UI stay open. Unbuilt
-    frontend? The API still serves; the UI is a "run make web-build"
-    placeholder.
+    All three on one origin: the SPA at ``/``, the human API at ``/api``, and
+    external agents at ``/mcp``. The two identities stay exact inverses, and
+    now they are inverses on the same port — every write through ``/api`` is
+    attributed to the human behind an authenticated session and no request
+    field can change that, while ``/mcp`` mints an ``agent:<name>`` from the
+    bearer token on each call and cannot reach a review, curative or reversal
+    operation at all, because those tools are not registered.
 
-    A non-loopback bind is allowed — login is the boundary, not the bind —
-    and the session cookie gains ``Secure`` there. Either way, any process
-    that can reach the port may *attempt* a login — throttled only by the
-    failed-login lockout, five misses per name per quarter-hour then a 429
-    until the window slides past them — so the human's password is still the
-    heart of the defence; the banner says so rather than leaving it implicit.
+    Auth is password login (``POST /api/login``) backed by server-side
+    sessions for the human, and ``Authorization: Bearer ndm_…`` per request
+    for an agent; ``/healthz`` and the static UI stay open. Unbuilt frontend?
+    The API still serves; the UI is a "run make web-build" placeholder.
+
+    A non-loopback bind is allowed — login is the boundary, not the bind. Any
+    process that can reach the port may *attempt* a login, throttled only by
+    the failed-login lockout (five misses per name per quarter-hour, then a
+    429 until the window slides past them), so the human's password is still
+    the heart of the defence; the banner says so rather than leaving it
+    implicit.
+
+    **``--behind-tls`` is the deployment switch.** It marks the session cookie
+    ``Secure``, and it is a separate question from where the socket binds:
+    behind a TLS-terminating proxy this server speaks plain HTTP on an
+    interface that may well be loopback, so inferring "no TLS" from "loopback
+    bind" would silently drop ``Secure`` on exactly the deployment that needs
+    it. The bind is only the *default*, and the flag is how a proxied server
+    says so.
     """
     import uvicorn
 
-    from nodum import http_api, scheduler
+    from nodum import http_api, mcp_server, scheduler
 
     resolved_db = Path(db_path) if db_path is not None else db.db_path()
     loopback = http_api.bare_host(host) in http_api.LOOPBACK_BIND_ADDRESSES
+    # The bind is the default answer, not the answer: a proxied server is plain
+    # HTTP on a possibly-loopback socket and still needs `Secure`.
+    proxied = (not loopback) if behind_tls is None else behind_tls
     typer.echo(f"nodum serve → http://{host}:{port}  (database: {resolved_db})", err=True)
     typer.echo(
         "auth: password login — any process that can reach this port may attempt one, "
         "so every /api request still needs a human password (nodum human passwd).",
+        err=True,
+    )
+    typer.echo(
+        f"agents: MCP at {mcp_server.MCP_PATH} — 'Authorization: Bearer ndm_…' per request "
+        "(nodum agent create <name>); review, curative and reversal tools are not "
+        "registered there.",
         err=True,
     )
     try:
@@ -1431,13 +1451,16 @@ def serve(
             "unasked; unset it to turn the schedule off.",
             err=True,
         )
-    if not loopback:
-        # uvicorn serves plain HTTP. The session cookie is marked Secure on a
-        # non-loopback bind and so fails closed without TLS, but the login body
-        # itself has already crossed the network by then (Q13 review S12).
+    if not loopback and not proxied:
+        # uvicorn serves plain HTTP. The session cookie is marked Secure when a
+        # proxy terminates TLS and so fails closed without it, but the login
+        # body itself has already crossed the network by then (Q13 review S12).
+        # An operator who passed --behind-tls has answered this already; saying
+        # it anyway would train them to ignore the line that matters.
         typer.echo(
             f"warning: {host} is not loopback and this server speaks plain HTTP — "
-            "passwords cross the network in the clear unless a TLS proxy fronts it.",
+            "passwords and agent tokens cross the network in the clear unless a TLS "
+            "proxy fronts it (pass --behind-tls when one does).",
             err=True,
         )
 
@@ -1447,9 +1470,11 @@ def serve(
             http_api.create_app(
                 db_path=db_path,
                 allowed_hosts=http_api.resolve_allowed_hosts(host, allow_host),
-                # Loopback is plain HTTP, where a Secure cookie would never be
-                # stored; a LAN bind fronts TLS, where it must be.
-                secure_cookies=not loopback,
+                # A browser drops a Secure cookie on plain HTTP, so this must be
+                # off for a bare loopback server and on wherever TLS terminates
+                # in front — which is a question about the deployment, not about
+                # the bind. `--behind-tls` answers it; the bind only guesses.
+                secure_cookies=proxied,
             ),
             host=host,
             port=port,

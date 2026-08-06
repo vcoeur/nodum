@@ -55,7 +55,19 @@ from starlette.requests import ClientDisconnect
 from typer.testing import CliRunner
 
 import nodum
-from nodum import assets, auth, cli, consolidate, db, http_api, ingest, llm, service, urls
+from nodum import (
+    assets,
+    auth,
+    cli,
+    consolidate,
+    db,
+    http_api,
+    ingest,
+    llm,
+    mcp_server,
+    service,
+    urls,
+)
 from nodum.migrations import GARDENER_AGENT_ID
 from nodum.principal import Principal
 
@@ -615,6 +627,44 @@ def _route_endpoints(app) -> list[tuple[str, object]]:
     return found
 
 
+def _handler_endpoints(app) -> list[tuple[str, object]]:
+    """Route endpoints the source-reading rails below can actually read.
+
+    Exactly one route on this app does not present a Python function: the MCP
+    transport, whose endpoint is an ASGI object the SDK built and
+    :func:`nodum.mcp_server.http_surface` spliced in. ``inspect.getsource``
+    cannot read it, so the source rails must leave it out.
+
+    **The exclusion is asserted, not shaped.** Skipping "anything that is not a
+    function" would quietly excuse the next raw ASGI app somebody attaches, and
+    the properties in this file would stop covering it without a single test
+    turning red — the failure mode this suite has been bitten by before
+    ([[structural-tests-dont-hold-invariants]]). So: at most one opaque
+    endpoint, and it must be ``/mcp``.
+
+    What covers that route instead is not nothing. It reads an identity from
+    the request *on purpose* — an agent's, from a bearer header — which is why
+    it cannot sit under the actor rails written for the human surface. Its own
+    guarantees are asserted over the live transport in ``test_mcp_server.py``,
+    and the property that matters here is still enforced module-wide by
+    ``test_the_only_credential_path_is_the_session``: the agent path is minted
+    in :mod:`nodum.mcp_server`, so :mod:`nodum.http_api` still mints no
+    principal without a verified session.
+    """
+    readable: list[tuple[str, object]] = []
+    opaque: list[str] = []
+    for path, endpoint in _route_endpoints(app):
+        if inspect.isfunction(endpoint) or inspect.ismethod(endpoint):
+            readable.append((path, endpoint))
+        else:
+            opaque.append(path)
+    assert sorted(opaque) == [mcp_server.MCP_PATH], (
+        "only the MCP transport may present a non-Python endpoint; "
+        f"found {sorted(opaque)} — a new one must be reviewed, not skipped"
+    )
+    return readable
+
+
 def _module_ast() -> ast.Module:
     """Parse the HTTP adapter's own source."""
     return ast.parse(Path(http_api.__file__).read_text(encoding="utf-8"))
@@ -1110,7 +1160,7 @@ def test_no_route_handler_can_read_an_actor_from_a_request(fresh_db):
     that forwards a body it never inspects, which is why it is no longer the
     test the guarantee rests on.
     """
-    endpoints = _route_endpoints(http_api.create_app())
+    endpoints = _handler_endpoints(http_api.create_app())
     offenders = [
         path for path, endpoint in endpoints if "actor" in inspect.getsource(endpoint).casefold()
     ]
@@ -3450,6 +3500,123 @@ def test_the_only_api_routes_outside_the_session_gate_are_login_and_the_capabili
     # The mint sits one slash away from its redemption and is *not* exempt.
     assert http_api._needs_a_session("/api/uploads") is True
     assert http_api._is_capability_path("/api/uploads") is False
+
+
+def _mcp_request(app, *, token: str | None = None, session: str | None = None, host: str = None):
+    """One raw request to ``/mcp`` with the app's lifespan actually running.
+
+    The lifespan is not optional here and the reason is worth stating: the MCP
+    transport's session manager is started there, and without it the route
+    answers **500**, not a hang and not a 404. That is a plausible-looking
+    green in a test that only ever asserts a refusal — every negative case
+    below would still "pass" against a route that is simply broken. Running the
+    lifespan is what makes the positive case available to prove otherwise.
+    """
+    headers = {
+        "Accept": "application/json, text/event-stream",
+        "Content-Type": "application/json",
+    }
+    if token is not None:
+        headers["Authorization"] = f"Bearer {token}"
+    if session is not None:
+        headers["Cookie"] = f"{http_api.SESSION_COOKIE}={session}"
+
+    async def run() -> httpx.Response:
+        async with app.router.lifespan_context(app):
+            transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+            async with httpx.AsyncClient(transport=transport, base_url=host or BASE_URL) as client:
+                return await client.post(
+                    mcp_server.MCP_PATH,
+                    headers=headers,
+                    json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+                )
+
+    return asyncio.run(run())
+
+
+# ── The two surfaces share an origin and must not share a credential ──────────
+#
+# Before the MCP transport moved onto this app, a session cookie and an agent
+# token could not be confused: they arrived at different processes over
+# different transports. Now they arrive at the same origin and the only thing
+# keeping them apart is that `/api` reads a cookie and `/mcp` reads a header.
+# That is sound, and it is now a *claim* — so it is swept, in both directions.
+
+
+def test_an_agent_token_opens_no_api_route(fresh_db):
+    """A bearer token is not a session, on every route, derived from the table.
+
+    An agent holding a perfectly valid token must get exactly as far on the
+    human surface as a stranger does: nowhere. The route list is the input, so
+    a route added tomorrow is covered without anyone remembering to add it —
+    the same reason the attribution sweep reads the table rather than a list.
+    """
+    created = service.create_agent("bearer-probe", owner_human_id="owner", principal=owner())
+    app = http_api.create_app()
+    gated = [
+        route.path
+        for route in app.routes
+        if route.path.startswith("/api") and http_api._needs_a_session(route.path)
+    ]
+    assert len(gated) >= 30, "the sweep must actually cover the API surface"
+
+    # The token has to be *good*, or this test passes on a typo: every route
+    # would 401 a nonsense credential too, and the sweep would be asserting
+    # nothing about the boundary it is named for. Proving it opens `/mcp` is
+    # what makes the 401s below mean "wrong surface" rather than "bad token".
+    opens_mcp = _mcp_request(app, token=created.token)
+    assert opens_mcp.status_code == 200, opens_mcp.text
+
+    client = Client(app)  # no session cookie: the token is the only credential offered
+    for path in gated:
+        concrete = (
+            path.replace("{id}", "whatever")
+            .replace("{type}", "note")
+            .replace("{path:path}", "x")
+            .replace("{profile}", "thumb")
+        )
+        response = client.get(concrete, headers={"Authorization": f"Bearer {created.token}"})
+        assert response.status_code == 401, (
+            f"{path} answered {response.status_code} to a bearer token"
+        )
+        assert response.json()["error"]["type"] in {"Unauthorized", "InvalidCredentials"}
+
+
+def test_a_session_cookie_opens_no_mcp_call(fresh_db):
+    """The inverse: a logged-in human's cookie is not an agent credential.
+
+    It matters because the cookie is the one credential a *browser* attaches by
+    itself. If `/mcp` accepted it, every page the human visits would be one
+    fetch away from the agent surface — which is the whole reason that surface
+    is exempt from the origin checks in the first place.
+    """
+    app = http_api.create_app()
+    service.set_human_password("owner", OWNER_PASSWORD, principal=owner())
+    response = _mcp_request(app, session=_login(app))
+    assert response.status_code == 401
+    assert response.headers["www-authenticate"] == "Bearer"
+    assert "get_node" not in response.text
+
+
+def test_the_mcp_path_is_exempt_from_exactly_two_checks_and_no_others(fresh_db):
+    """The exemption is one path, not a shape, and it does not widen the guard.
+
+    ``_is_mcp_path`` skips the same-origin proof and the content-type check.
+    It must not skip the ``Host`` check — that is the DNS-rebinding defence and
+    has nothing to do with which credential the request carries — and it must
+    not spread to paths that merely start with the same characters.
+    """
+    assert http_api._is_mcp_path(mcp_server.MCP_PATH) is True
+    for near_miss in ("/mcp/", "/mcp/x", "/mcpx", "/api/mcp", "/"):
+        assert http_api._is_mcp_path(near_miss) is False, near_miss
+
+    # The Host check still bites, credential or no credential.
+    created = service.create_agent("host-probe", owner_human_id="owner", principal=owner())
+    app = http_api.create_app()
+
+    rebound = _mcp_request(app, token=created.token, host="http://evil.example")
+    assert rebound.status_code == 400
+    assert rebound.json()["error"]["type"] == "UntrustedHost"
 
 
 def test_the_capability_routes_bind_no_identity_of_their_own(fresh_db):

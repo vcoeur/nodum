@@ -1,8 +1,20 @@
 """MCP server tests: every registered tool round-trips through the MCP layer.
 
-The server is exercised in-process over memory streams
-(``create_connected_server_and_client_session``) — the same handlers stdio
-clients reach, no subprocess needed.
+**The suite drives the real route, not the registry.** Every interaction goes
+over ``POST /mcp`` on the app ``nodum serve`` builds, through
+:class:`~nodum.http_api.RequestGuardMiddleware`, through
+:class:`~nodum.mcp_server.BearerGuard`, and back — carried by an in-process
+ASGI transport, so there is no socket and no subprocess but also nothing
+stubbed between the client and the handler.
+
+That matters more than it looks. The old suite talked to a ``FastMCP`` object
+over memory streams, which is a fine way to test tool bodies and a useless way
+to test the two things this surface actually promises: that the review,
+curative and reversal tiers are absent *on the transport agents reach*, and
+that the token on the wire is the identity the service sees. A registry
+assertion made against an object nobody connects to is the shape of
+[[claim-outliving-the-code]] — it stays green while the deployed surface says
+something else.
 """
 
 from __future__ import annotations
@@ -13,15 +25,18 @@ import importlib.util
 import io
 import json
 import threading
+from contextlib import asynccontextmanager
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
+import httpx
 import pytest
 from helpers import agent, owner, seed_space
-from mcp.shared.memory import create_connected_server_and_client_session
+from mcp.client.session import ClientSession
+from mcp.client.streamable_http import streamable_http_client
 from PIL import Image
 
-from nodum import assets, auth, ingest, mcp_server, service, urls
+from nodum import assets, http_api, ingest, mcp_server, service, urls
 from nodum.mcp_server import (
     ADDITIVE_TOOLS,
     CURATIVE_TOOLS,
@@ -46,8 +61,43 @@ INGEST_TOOLS = ("ingest_url", "request_upload_url")
 FIXTURE_PDF = Path(__file__).parent / "fixtures" / "sample.pdf"
 
 
+#: The origin the in-process transport presents. It has to be a host the guard
+#: answers to (`resolve_allowed_hosts` defaults to the loopback set), or every
+#: request here would be a 400 ``UntrustedHost`` before reaching the transport.
+BASE_URL = "http://127.0.0.1:8600"
+
+
+@asynccontextmanager
+async def mcp_session(*, token: str | None = TOKEN, app=None):
+    """An initialised MCP session over ``POST /mcp`` on the real app.
+
+    ``app.router.lifespan_context`` is entered explicitly because
+    ``ASGITransport`` does not run lifespan, and the MCP transport's session
+    manager lives there — without it the route answers 500 on every call,
+    which is the exact failure this context manager exists to make impossible
+    to reproduce accidentally.
+
+    ``token=None`` presents no ``Authorization`` header at all, for the tests
+    about what an unauthenticated peer can see.
+    """
+    app = http_api.create_app() if app is None else app
+    headers = {} if token is None else {"Authorization": f"Bearer {token}"}
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url=BASE_URL,
+            headers=headers,
+        ) as http_client:
+            async with streamable_http_client(
+                f"{BASE_URL}{mcp_server.MCP_PATH}", http_client=http_client
+            ) as (read, write, _):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+                    yield session
+
+
 def _run(fn, *, actor: str = AGENT, token: str = TOKEN, grants: dict[str, str] | None = None):
-    """Run an async MCP interaction against a fresh server bound to one agent.
+    """Run an async MCP interaction as one agent, over the real HTTP route.
 
     Defaults to AGENT with the helper's parity grants (``meta`` read, ``main``
     suggest); ``actor``/``token``/``grants`` mint a differently scoped agent for
@@ -56,8 +106,7 @@ def _run(fn, *, actor: str = AGENT, token: str = TOKEN, grants: dict[str, str] |
 
     async def runner():
         agent(actor, token=token, grants=grants)  # seed the account with a verifiable token
-        server = create_server(token=token)
-        async with create_connected_server_and_client_session(server) as session:
+        async with mcp_session(token=token) as session:
             return await fn(session)
 
     return asyncio.run(runner())
@@ -196,7 +245,7 @@ def test_no_tool_description_advertises_a_tool_that_is_not_registered(fresh_db):
         )
 
     agent(AGENT, token=TOKEN)  # the server verifies its token at construction
-    named = cited(create_server(token=TOKEN).instructions or "")
+    named = cited(create_server().instructions or "")
     assert not named, f"the server instructions name unregistered tool(s) {sorted(named)}"
 
     # The module's own contract paragraph. Its tier listing is prose a reader
@@ -270,50 +319,156 @@ def test_reversal_and_the_journal_are_a_named_absence_too(fresh_db):
 # ── Token authentication: the MCP surface verifies before it serves ───────────
 
 
-def test_create_server_rejects_an_unknown_token(fresh_db):
-    with pytest.raises(auth.InvalidCredentials):
-        create_server(token="ndm_not_a_real_token")
+def _post_mcp(token: str | None, body: dict | None = None) -> httpx.Response:
+    """One raw POST to ``/mcp``, bypassing the MCP client.
+
+    The credential checks below live in :class:`~nodum.mcp_server.BearerGuard`,
+    which refuses *before* the transport speaks JSON-RPC at all. Asserting them
+    through an MCP client would test the client's error plumbing; asserting the
+    status code tests the guard.
+    """
+    app = http_api.create_app()
+    headers = {
+        "Accept": "application/json, text/event-stream",
+        "Content-Type": "application/json",
+    }
+    if token is not None:
+        headers["Authorization"] = f"Bearer {token}"
+
+    async def run() -> httpx.Response:
+        async with app.router.lifespan_context(app):
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url=BASE_URL) as client:
+                return await client.post(
+                    mcp_server.MCP_PATH,
+                    headers=headers,
+                    json=body or {"jsonrpc": "2.0", "id": 1, "method": "ping"},
+                )
+
+    return asyncio.run(run())
 
 
-def test_create_server_rejects_a_disabled_agents_token(fresh_db):
+@pytest.mark.parametrize(
+    "header",
+    [None, "", "Bearer", "Bearer ", "Basic ndm_x", "ndm_no_scheme"],
+    ids=["absent", "empty", "scheme-only", "scheme-and-space", "wrong-scheme", "no-scheme"],
+)
+def test_the_mcp_route_refuses_a_request_with_no_usable_bearer_token(fresh_db, header):
+    """Every "no usable credential" shape is one 401, and says nothing more."""
+    app = http_api.create_app()
+    headers = {
+        "Accept": "application/json, text/event-stream",
+        "Content-Type": "application/json",
+    }
+    if header is not None:
+        headers["Authorization"] = header
+
+    async def run() -> httpx.Response:
+        async with app.router.lifespan_context(app):
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url=BASE_URL) as client:
+                return await client.post(
+                    mcp_server.MCP_PATH,
+                    headers=headers,
+                    json={"jsonrpc": "2.0", "id": 1, "method": "ping"},
+                )
+
+    response = asyncio.run(run())
+    assert response.status_code == 401
+    assert response.headers["www-authenticate"] == "Bearer"
+    assert response.json()["error"]["type"] == "InvalidCredentials"
+
+
+def test_the_mcp_route_refuses_an_unknown_token(fresh_db):
+    assert _post_mcp("ndm_not_a_real_token").status_code == 401
+
+
+def test_the_mcp_route_refuses_a_disabled_agents_token(fresh_db):
     created = service.create_agent("bot", owner_human_id="owner", principal=owner())
     service.disable_agent("bot", principal=owner())
-    with pytest.raises(auth.InvalidCredentials):
-        create_server(token=created.token)
+    assert _post_mcp(created.token).status_code == 401
 
 
-def test_create_server_rejects_a_token_whose_owner_is_disabled(fresh_db):
+def test_the_mcp_route_refuses_a_token_whose_owner_is_disabled(fresh_db):
     created = service.create_agent("bot", owner_human_id="owner", principal=owner())
     service.create_human("second", principal=owner())  # the owner is not the last one
     service.disable_human("owner", principal=owner())
-    with pytest.raises(auth.InvalidCredentials):
-        create_server(token=created.token)
+    assert _post_mcp(created.token).status_code == 401
 
 
-def test_a_disabled_agent_stops_writing_at_its_next_call(fresh_db):
-    """B5 regression: the principal is re-verified per call, not snapshotted.
+def test_an_unauthenticated_peer_cannot_even_list_the_tools(fresh_db):
+    """The guard runs before ``initialize``, so the surface is not enumerable.
 
-    ``create_server`` used to verify the token once and capture the principal
-    in the closure, so ``disable_agent`` never bit a running server — a
-    disabled agent kept writing until the process exited. Every tool call now
-    re-verifies the token, so the disable lands on the next call, writes and
-    reads alike.
+    Without it the transport would answer ``200`` with a JSON-RPC error, which
+    tells an anonymous caller both that this endpoint is an MCP server and what
+    it exposes.
     """
+    agent(AGENT, token=TOKEN)
+    response = _post_mcp(None, {"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+    assert response.status_code == 401
+    assert "get_node" not in response.text
 
-    async def scenario(session):
-        first = await _call(session, "create_node", {"type": "note", "title": "Before disable"})
-        service.disable_agent("tester", principal=owner())
-        write = await _call(session, "create_node", {"type": "note", "title": "After disable"})
-        read = await _call(session, "get_node", {"id": "whatever"})
-        return first, write, read
 
-    first, write, read = _run(scenario)
+def test_a_disabled_agent_is_refused_at_the_transport_on_its_next_call(fresh_db):
+    """B5 regression: the credential is re-checked per request, not snapshotted.
 
-    assert not first.isError
-    assert write.isError and "invalid credentials" in write.content[0].text
-    assert read.isError
-    # Refused means refused: only the pre-disable write exists.
-    assert [n.title for n in service.list_nodes(principal=owner(), limit=50)] == ["Before disable"]
+    ``create_server`` used to verify the token once and capture the principal in
+    a closure, so ``disable_agent`` never bit a running server — a disabled
+    agent kept writing until the process exited. Now every request carries its
+    own credential and every one is verified, so the disable lands on the next
+    call. Under HTTP that refusal is a 401 from the guard rather than a tool
+    error, which is the honest place for it: the caller has no identity here
+    any more, so there is nothing to run a tool *as*.
+    """
+    agent(AGENT, token=TOKEN)
+    before = _post_mcp(TOKEN)
+    assert before.status_code == 200
+
+    service.disable_agent("tester", principal=owner())
+    assert _post_mcp(TOKEN).status_code == 401
+    # Refused means refused: the disabled agent wrote nothing.
+    assert service.list_nodes(principal=owner(), limit=50) == []
+
+
+def test_two_agents_on_one_server_do_not_see_each_others_spaces(fresh_db):
+    """The property the per-process design never had to hold.
+
+    One server now serves many agents, so an identity cached anywhere between
+    calls would be *another agent's* identity. Each holds a grant the other
+    does not, and each must reach exactly its own — asserted in both
+    directions, because a check that only ever probes the granted side is
+    vacuous ([[authz-fixtures-need-an-unreachable-case]]).
+    """
+    seed_space("research")
+    seed_space("private")
+    agent("agent:alpha", token="ndm_alpha_token", grants={"meta": "read", "research": "suggest"})
+    agent("agent:beta", token="ndm_beta_token", grants={"meta": "read", "private": "suggest"})
+
+    async def write_as(token, space):
+        async with mcp_session(token=token) as session:
+            return await _call(
+                session, "create_node", {"type": "note", "title": f"in {space}", "space": space}
+            )
+
+    async def scenario():
+        return (
+            await write_as("ndm_alpha_token", "research"),
+            await write_as("ndm_alpha_token", "private"),
+            await write_as("ndm_beta_token", "private"),
+            await write_as("ndm_beta_token", "research"),
+        )
+
+    alpha_own, alpha_other, beta_own, beta_other = asyncio.run(scenario())
+
+    assert not alpha_own.isError, alpha_own.content[0].text
+    assert not beta_own.isError, beta_own.content[0].text
+    assert alpha_other.isError, "alpha reached beta's space"
+    assert beta_other.isError, "beta reached alpha's space"
+
+    landed = {
+        node.title: node.created_by for node in service.list_nodes(principal=owner(), limit=50)
+    }
+    assert landed == {"in research": "agent:alpha", "in private": "agent:beta"}
 
 
 def test_archiving_a_space_stops_the_grant_at_the_next_call(fresh_db):
