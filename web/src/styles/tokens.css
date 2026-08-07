@@ -126,6 +126,10 @@
   --nd-header-height: 3rem;
   --nd-content-max: 68rem;
   --nd-focus-ring: 0 0 0 2px var(--nd-bg), 0 0 0 4px var(--nd-accent);
+  /* The peek card floats above view content but below the transient surfaces:
+     toasts announce state changes, modals demand attention, a peek is a
+     convenience that must never cover either. */
+  --nd-z-peek: 90;
   --nd-z-toast: 100;
   --nd-z-modal: 200;
 }

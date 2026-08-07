@@ -1,0 +1,56 @@
+/*
+ * The peek card and its trigger wrapper.
+ *
+ * The card is a fixed-position portal so no ancestor's `overflow` can clip
+ * it; the wrapper is `display: contents` so it adds enter/leave/focus
+ * handlers without a box of its own.
+ */
+
+.nd-peek-trigger {
+  display: contents;
+}
+
+.nd-peek {
+  position: fixed;
+  z-index: var(--nd-z-peek);
+  width: 22rem;
+  max-width: calc(100vw - 1rem);
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  gap: var(--nd-space-6);
+  padding: var(--nd-space-12);
+  border: 1px solid var(--nd-border-strong);
+  border-radius: var(--nd-radius-lg);
+  background: var(--nd-surface-overlay);
+  box-shadow: var(--nd-shadow-overlay);
+  font-size: var(--nd-text-sm);
+}
+
+.nd-peek__header {
+  white-space: nowrap;
+  --nd-row-gap: var(--nd-space-4);
+}
+
+.nd-peek__title {
+  font-size: var(--nd-text-md);
+  font-weight: var(--nd-weight-semibold);
+  color: var(--nd-text);
+}
+
+.nd-peek__excerpt {
+  margin: 0;
+  line-height: var(--nd-leading-normal);
+  color: var(--nd-text);
+}
+
+.nd-peek__meta {
+  margin: 0;
+  line-height: var(--nd-leading-normal);
+}
+
+.nd-peek__actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--nd-space-4);
+}
