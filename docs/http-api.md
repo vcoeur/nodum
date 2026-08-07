@@ -45,7 +45,7 @@ this gate.
 The method column lists the methods the route table configured; Starlette
 answers `HEAD` for any route configured `GET`.
 
-The tables below list **61 routes**, grouped by family.
+The tables below list **62 routes**, grouped by family.
 
 
 ### Session
@@ -68,6 +68,7 @@ The tables below list **61 routes**, grouped by family.
 |---|---|---|---|---|
 | GET | `/api/nodes` | `list_nodes` | session | List nodes in creation order, optionally filtered. |
 | POST | `/api/nodes` | `create_node` | session | Create a node. It lands ``active``: this is the human surface. |
+| GET | `/api/nodes/resolve` | `resolve_nodes` | session | Resolve ``[[wikilink]]`` titles to node ids — exact, casefolded, batch. |
 | GET | `/api/nodes/{id}` | `get_node` | session | One node, or its active-edge neighborhood when ``depth`` is given. |
 | PATCH | `/api/nodes/{id}` | `update_node` | session | Update the named fields of a node, and only those. |
 | GET | `/api/nodes/{id}/children` | `list_children` | session | A node's children in ``position`` order (the document tree). |

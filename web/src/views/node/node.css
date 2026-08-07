@@ -1,0 +1,117 @@
+/* --- Reading view (/node/:nodeId) ---------------------------------------- */
+
+.nd-node__heading {
+  display: flex;
+  flex-direction: column;
+  gap: var(--nd-space-4);
+  min-width: 0;
+}
+
+.nd-node__heading h1 {
+  overflow-wrap: anywhere;
+}
+
+.nd-node__timestamps {
+  font-size: var(--nd-text-2xs);
+}
+
+.nd-node__actions {
+  display: flex;
+  gap: var(--nd-space-4);
+  flex-wrap: wrap;
+}
+
+.nd-node__body {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  gap: var(--nd-space-12);
+  align-items: flex-start;
+}
+
+.nd-node__content {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* The rail is the neighbourhood, not the whole graph: a fixed width keeps it
+ * from crowding the prose, and it scrolls with the page rather than pinning. */
+.nd-node__rail {
+  width: 19rem;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--nd-space-6);
+  padding: var(--nd-space-8);
+  border: 1px solid var(--nd-border);
+  border-radius: var(--nd-radius-md);
+  background: var(--nd-surface);
+}
+
+.nd-node__edge-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--nd-space-2);
+}
+
+.nd-node__edge-row {
+  width: 100%;
+  display: grid;
+  grid-template-columns: auto auto minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: var(--nd-space-4);
+  padding: var(--nd-space-2) var(--nd-space-3);
+  border: 0;
+  border-radius: var(--nd-radius-sm);
+  background: transparent;
+  color: var(--nd-text-muted);
+  font-size: var(--nd-text-2xs);
+  text-align: left;
+  text-decoration: none;
+}
+
+a.nd-node__edge-row:hover {
+  background: var(--nd-surface-raised);
+  color: var(--nd-text);
+}
+
+.nd-node__edge-row--disabled {
+  cursor: default;
+}
+
+.nd-node__edge-dir {
+  color: var(--nd-text-faint);
+}
+
+.nd-node__edge-type {
+  color: var(--nd-accent-dim);
+}
+
+.nd-node__edge-far {
+  overflow-wrap: anywhere;
+}
+
+/* The crossing hue, same one the graph outlines a cross-space edge with. */
+.nd-node__crossing-mark {
+  color: var(--nd-crossing);
+  font-size: var(--nd-text-2xs);
+  letter-spacing: var(--nd-tracking-label);
+  text-transform: uppercase;
+}
+
+/* --- Narrow screens ------------------------------------------------------- */
+
+@media (max-width: 46rem) {
+  .nd-node__body {
+    flex-direction: column;
+  }
+
+  .nd-node__rail {
+    width: 100%;
+  }
+}

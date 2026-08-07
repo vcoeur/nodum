@@ -239,7 +239,9 @@ The invariants that must never be broken, whatever the section:
   `archive <id>` (each takes a node, edge, or proposed-version id), `undo [seq]`,
   `history <node-id>`, `events [--cycle <id>]`, `types`, `schema <type>`,
   `schema-dump`, `search <query>`, `traverse`, `subgraph <root-id>`,
-  `suggest-links <prefix>`, `find-path`, `diff`, `projector run/status/rebuild`,
+  `suggest-links <prefix>`, `resolve-titles <title>… [--space]` (the exact,
+  case-insensitive sibling — each title answers `resolved`/`ambiguous`/`not-found`),
+  `find-path`, `diff`, `projector run/status/rebuild`,
   `review queue/accept/reject/accept-all/reject-all`,
   `asset register/get/list/rendition/purge/download-url/upload-url`
   (everything except `register`/`purge` takes `--as`),

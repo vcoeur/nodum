@@ -32,6 +32,15 @@ export type { FailureDescription, FailureKind } from "./failure";
 export { pageWindow } from "./paging";
 export type { PageWindow } from "./paging";
 
+export {
+  actionForResolution,
+  attachWikilinkClicks,
+  titleFromWikilinkHref,
+  wikilinkHref,
+  WIKILINK_TITLE_PATH,
+} from "./wikilinks";
+export type { WikilinkAction } from "./wikilinks";
+
 export { onUnauthorized, reportUnauthorized } from "./session";
 export type { UnauthorizedListener } from "./session";
 

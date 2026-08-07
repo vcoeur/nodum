@@ -273,6 +273,61 @@ describe("ordinary Markdown still renders", () => {
   });
 });
 
+describe("wikilinks", () => {
+  it("renders [[Title]] as an anchor to the reading view", () => {
+    const host = preview("see [[The safety spine]] here");
+    const anchor = host.querySelector<HTMLAnchorElement>("a.nd-wikilink");
+
+    expect(anchor).not.toBeNull();
+    expect(anchor?.getAttribute("href")).toBe("/node/title/The%20safety%20spine");
+    expect(anchor?.className).toBe("nd-wikilink");
+    expect(anchor?.textContent).toBe("The safety spine");
+  });
+
+  it("renders the label when a wikilink has a |label half", () => {
+    const host = preview("[[loopback API is not a boundary|loopback]]");
+    const anchor = host.querySelector<HTMLAnchorElement>("a.nd-wikilink");
+
+    expect(anchor?.getAttribute("href")).toBe("/node/title/loopback%20API%20is%20not%20a%20boundary");
+    expect(anchor?.textContent).toBe("loopback");
+  });
+
+  it("URL-encodes the title so it never leaks into the route or the query", () => {
+    const host = preview("[[a/b?c#d&e]]");
+    const anchor = host.querySelector<HTMLAnchorElement>("a.nd-wikilink");
+
+    expect(anchor?.getAttribute("href")).toBe("/node/title/a%2Fb%3Fc%23d%26e");
+  });
+
+  it("keeps ordinary markdown links untouched", () => {
+    const host = preview("[a label](https://example.com) and [[a node]]");
+    const anchors = [...host.querySelectorAll("a")];
+
+    expect(anchors).toHaveLength(2);
+    expect(anchors[0]?.getAttribute("href")).toBe("https://example.com");
+    expect(anchors[0]?.getAttribute("class")).toBeNull();
+    expect(anchors[1]?.className).toBe("nd-wikilink");
+    expect(anchors[1]?.getAttribute("rel")).toBeNull(); // site-relative: not external
+  });
+
+  it("does not tokenise inside a code span or a fenced block", () => {
+    const span = preview("`[[not a link]]`");
+    expect(span.querySelector("a.nd-wikilink")).toBeNull();
+    expect(span.querySelector("code")?.textContent).toBe("[[not a link]]");
+
+    const fence = preview("```\n[[not a link]]\n```");
+    expect(fence.querySelector("a.nd-wikilink")).toBeNull();
+  });
+
+  it("never emits a data attribute, whatever the title", () => {
+    const host = preview("[[x]]");
+    const anchor = host.querySelector<HTMLAnchorElement>("a.nd-wikilink");
+
+    const names = [...(anchor?.attributes ?? [])].map((attribute) => attribute.name);
+    expect(names.some((name) => name.startsWith("data-"))).toBe(false);
+  });
+});
+
 describe("the mermaid output policy", () => {
   it("keeps the structure and theming a rendered diagram needs", () => {
     const svg = sanitiseDiagramSvg(

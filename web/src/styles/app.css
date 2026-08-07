@@ -246,6 +246,155 @@
   overflow-x: auto;
 }
 
+/* --- Rendered Markdown ------------------------------------------------
+ * Shared by the editor's preview pane and the reading view; promoted here on
+ * the second user, verbatim, so the two render the same prose.
+ */
+/* --- Rendered Markdown ---------------------------------------------------
+ * Element selectors are scoped under `.nd-preview` because this subtree is
+ * generated HTML, not authored JSX — there is no class to hang them on.
+ */
+
+.nd-preview {
+  max-width: 46rem;
+  color: var(--nd-text);
+  font-size: var(--nd-text-md);
+  line-height: var(--nd-leading-prose);
+}
+
+.nd-preview > * + * {
+  margin-top: var(--nd-space-8);
+}
+
+.nd-preview h1,
+.nd-preview h2,
+.nd-preview h3,
+.nd-preview h4,
+.nd-preview h5,
+.nd-preview h6 {
+  margin-top: var(--nd-space-16);
+  color: var(--nd-text);
+}
+
+.nd-preview > :first-child {
+  margin-top: 0;
+}
+
+.nd-preview h2 {
+  padding-bottom: var(--nd-space-2);
+  border-bottom: 1px solid var(--nd-border);
+}
+
+.nd-preview ul,
+.nd-preview ol {
+  padding-inline-start: var(--nd-space-12);
+}
+
+.nd-preview li + li {
+  margin-top: var(--nd-space-2);
+}
+
+.nd-preview blockquote {
+  padding-left: var(--nd-space-8);
+  border-left: 3px solid var(--nd-border-strong);
+  color: var(--nd-text-muted);
+}
+
+.nd-preview pre {
+  padding: var(--nd-space-6) var(--nd-space-8);
+  border: 1px solid var(--nd-border);
+  border-radius: var(--nd-radius-md);
+  background: var(--nd-surface);
+  overflow-x: auto;
+  font-size: var(--nd-text-xs);
+  line-height: var(--nd-leading-normal);
+}
+
+.nd-preview :not(pre) > code {
+  padding: 0.1em 0.35em;
+  border-radius: var(--nd-radius-sm);
+  background: var(--nd-surface-raised);
+  color: var(--nd-accent-bright);
+}
+
+.nd-preview table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--nd-text-sm);
+}
+
+.nd-preview th,
+.nd-preview td {
+  padding: var(--nd-space-3) var(--nd-space-6);
+  border: 1px solid var(--nd-border);
+  text-align: left;
+}
+
+.nd-preview th {
+  background: var(--nd-surface);
+  color: var(--nd-text-muted);
+  font-weight: var(--nd-weight-semibold);
+}
+
+.nd-preview img {
+  max-width: 100%;
+  height: auto;
+  border-radius: var(--nd-radius-md);
+}
+
+.nd-preview hr {
+  border-top: 1px solid var(--nd-border);
+}
+
+/* --- Diagrams ------------------------------------------------------------ */
+
+.nd-preview__diagram {
+  display: flex;
+  justify-content: center;
+  padding: var(--nd-space-8);
+  border: 1px solid var(--nd-border);
+  border-radius: var(--nd-radius-md);
+  background: var(--nd-surface);
+  overflow-x: auto;
+}
+
+.nd-preview__diagram svg {
+  max-width: 100%;
+  height: auto;
+}
+
+.nd-preview__diagram--pending {
+  color: var(--nd-text-faint);
+  font-size: var(--nd-text-xs);
+}
+
+.nd-preview__diagram--failed {
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--nd-space-4);
+  justify-content: flex-start;
+  border-color: var(--nd-danger);
+  background: var(--nd-danger-wash);
+}
+
+.nd-preview__diagram-title {
+  color: var(--nd-danger);
+  font-size: var(--nd-text-sm);
+  font-weight: var(--nd-weight-semibold);
+}
+
+.nd-preview__diagram-message {
+  width: 100%;
+  margin: 0;
+  padding: var(--nd-space-4) var(--nd-space-6);
+  border-radius: var(--nd-radius-sm);
+  background: var(--nd-bg);
+  color: var(--nd-text-muted);
+  font-size: var(--nd-text-xs);
+  white-space: pre-wrap;
+  overflow-x: auto;
+}
+
 /* --- Small screens ------------------------------------------------------ */
 
 @media (max-width: 46rem) {

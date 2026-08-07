@@ -2384,6 +2384,7 @@ NOT_COMMANDS = frozenset(
         "deepseek-v3",
         "faster-whisper",  # the audio extra's package
         "no-store",  # a Cache-Control directive
+        "not-found",  # a title-resolution outcome value, not a verb
         "off-only",  # a rung of the reasoning-capability ladder in `nodum.llm`
         "script-src",  # a CSP directive
         # the systemd component whose `D /tmp …` rule empties the directory on

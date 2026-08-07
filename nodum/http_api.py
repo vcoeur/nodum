@@ -2466,6 +2466,29 @@ def create_app(
         )
         return EnvelopeResponse(list_envelope("nodes", nodes))
 
+    async def resolve_nodes(request: Request) -> Response:
+        """Resolve ``[[wikilink]]`` titles to node ids — exact, casefolded, batch.
+
+        One call for a whole rendered document. Each title answers
+        ``resolved`` (with the node's id and space), ``ambiguous`` (several
+        non-archived nodes share the title), or ``not-found`` — and the two
+        failure outcomes cannot tell an absent node from one in a space the
+        session cannot read, so this route is no existence oracle.
+        ``space`` is the read-side preference for breaking ties, the same
+        filter ``GET /api/nodes`` takes.
+        """
+        params = request.query_params
+        titles = _list_param(params, "titles")
+        if not titles:
+            raise ValueError("titles is required: repeat ?titles= per title")
+        resolutions = service.resolve_titles(
+            titles,
+            space=params.get("space"),
+            principal=_session_principal(request),
+            path=db_path,
+        )
+        return EnvelopeResponse(list_envelope("resolutions", resolutions))
+
     # ── Graph ─────────────────────────────────────────────────────────────
 
     async def get_subgraph(request: Request) -> Response:
@@ -3312,6 +3335,10 @@ def create_app(
         Route("/api/schema/{type}", get_schema),
         Route("/api/nodes", list_nodes),
         Route("/api/nodes", create_node, methods=["POST"]),
+        # Registered ahead of `/api/nodes/{id}`: a `resolve` path segment is an
+        # id to that route, so a literal match must be tried first (Starlette
+        # answers with the first full match, not the most specific).
+        Route("/api/nodes/resolve", resolve_nodes),
         Route("/api/nodes/{id}", get_node),
         Route("/api/nodes/{id}", update_node, methods=["PATCH"]),
         Route("/api/nodes/{id}/children", list_children),

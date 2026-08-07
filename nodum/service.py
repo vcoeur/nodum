@@ -59,6 +59,7 @@ from nodum.models import (
     SpaceOut,
     SubgraphOut,
     SupersedeOut,
+    TitleResolution,
     TransitionFailure,
     TypeOut,
     TypesOut,
@@ -1817,6 +1818,97 @@ def suggest_links(
         )
         # Only the survivors are read in full — titles are cheap, content is not.
         return [_node_out(_get_node_row(conn, row["id"])) for row in matches[:limit]]
+    finally:
+        conn.close()
+
+
+def resolve_titles(
+    titles: list[str],
+    *,
+    space: str | None = None,
+    principal: Principal,
+    path: str | Path | None = None,
+) -> list[TitleResolution]:
+    """Resolve ``[[wikilink]]`` titles to node ids — exact, casefolded, batch.
+
+    The read side of :func:`suggest_links`: where that answers a prefix typed
+    so far, this answers whole titles exactly, so a render pass with N
+    wikilinks asks once instead of N prefix searches. Matching is the same
+    Python-side fold (:func:`_match_key` — case- and Unicode-normalisation-
+    insensitive, since SQLite's ``lower()`` folds ASCII only and titles here
+    are multilingual), over the same non-archived states
+    (:data:`SUGGEST_STATES`). A node in a space the principal cannot read does
+    not exist — it can neither resolve nor make a title ambiguous — so this
+    endpoint is no existence oracle, exactly like :func:`_resolve_wikilink`.
+
+    ``space`` is the read-side **preference** for breaking ties, the same
+    filter :func:`list_nodes` takes (a space the principal holds no grant on
+    does not resolve, answering identically to a nonexistent one): matches in
+    that space win when there are any, otherwise the title resolves across
+    every space in scope. Ambiguity is reported, never guessed — a wrong
+    confident navigation is the regression a clickable wikilink must not
+    introduce.
+
+    Args:
+        titles: The wikilink targets to resolve.
+        space: Space id or name to prefer; ``None`` spans every space in scope.
+        principal: Who is asking.
+        path: Explicit database path.
+
+    Raises:
+        TypeNotFound: If ``space`` resolves to nothing the principal can read.
+    """
+    conn = _connect(path)
+    try:
+        store = Store(conn, principal)
+        space_id = _resolve_space(conn, space, principal) if space is not None else None
+        # The preference is applied in Python below, never in SQL: narrowing
+        # the query itself would make a title outside the preferred space
+        # "not found" instead of resolving across every space in scope. Meta
+        # stays excluded unless the preference names it — the same opt-in
+        # `list_nodes` reads off an unnarrowed listing.
+        clauses, params = _node_list_filters(
+            store,
+            state=None,
+            type_id=None,
+            parent_id=None,
+            space_id=None,
+            include_meta=space_id == META_SPACE_ID,
+        )
+        placeholders = ",".join("?" * len(SUGGEST_STATES))
+        where = "WHERE title IS NOT NULL AND state IN (" + placeholders + ")"
+        if clauses:
+            where += " AND " + " AND ".join(clauses)
+        rows = conn.execute(
+            f"SELECT id, title, space_id FROM nodes {where}",
+            (*SUGGEST_STATES, *params),
+        ).fetchall()
+        by_folded_title: dict[str, list[sqlite3.Row]] = {}
+        for row in rows:
+            by_folded_title.setdefault(_match_key(row["title"]), []).append(row)
+
+        resolutions: list[TitleResolution] = []
+        for title in titles:
+            candidates = by_folded_title.get(_match_key(title), [])
+            if space_id is not None:
+                preferred = [row for row in candidates if row["space_id"] == space_id]
+                if preferred:
+                    candidates = preferred
+            if len(candidates) == 1:
+                row = candidates[0]
+                resolutions.append(
+                    TitleResolution(
+                        title=title,
+                        outcome="resolved",
+                        node_id=row["id"],
+                        space_id=row["space_id"],
+                    )
+                )
+            elif len(candidates) > 1:
+                resolutions.append(TitleResolution(title=title, outcome="ambiguous"))
+            else:
+                resolutions.append(TitleResolution(title=title, outcome="not-found"))
+        return resolutions
     finally:
         conn.close()
 

@@ -70,6 +70,7 @@ import type {
   SpaceOut,
   SubgraphOut,
   SubgraphParams,
+  TitleResolution,
   TypeOut,
   TypesOut,
   UndoResult,
@@ -921,6 +922,33 @@ export function suggestLinks(
   );
 }
 
+/**
+ * `GET /api/nodes/resolve` — resolve `[[wikilink]]` titles to node ids, batch.
+ *
+ * One call for a whole rendered document. Matching is exact and casefolded
+ * over non-archived nodes, with ambiguity reported rather than guessed, so a
+ * click on a wikilink never travels somewhere arbitrary.
+ *
+ * `options.space` is the read-side **preference** for breaking ties — the
+ * same filter {@link listNodes} takes — and a space the server will not
+ * resolve throws {@link UnknownSpaceError} exactly as it does there.
+ */
+export async function resolveTitles(
+  titles: string[],
+  options?: { space?: string },
+  signal?: AbortSignal,
+): Promise<TitleResolution[]> {
+  try {
+    return await requestList<TitleResolution>(
+      "resolutions",
+      `/nodes/resolve${query({ titles, space: options?.space })}`,
+      signal ? { signal } : {},
+    );
+  } catch (error) {
+    throw asUnknownSpace(error, options?.space);
+  }
+}
+
 /* ------------------------------------------------------------------ */
 /* Graph                                                                */
 /* ------------------------------------------------------------------ */
@@ -1488,6 +1516,7 @@ export const api = {
   createEdge,
   search,
   suggestLinks,
+  resolveTitles,
   getSubgraph,
   findPath,
   getReviewQueue,

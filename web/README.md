@@ -5,12 +5,15 @@ TypeScript, built by Vite into
 `../nodum/_web/`, which the Python process serves at `/` — one process, one
 origin, no CORS.
 
-Eleven views ship: **login** (`/login`), **editor** (`/editor`,
+Twelve views ship: **login** (`/login`), **editor** (`/editor`,
 `/editor/:nodeId`), **search** (`/search`, also the landing view), **review**
 (`/review`), **journal** (`/journal`) with one entry in full
 (`/journal/:cycleId`), **graph** (`/graph`, `/graph/:rootId`), **assets**
-(`/assets`), **spaces** (`/spaces`), **admin** (`/admin`), and **history**
-(`/history/:nodeId`).
+(`/assets`), **spaces** (`/spaces`), **admin** (`/admin`), **history**
+(`/history/:nodeId`), and the **node reading view** (`/node/:nodeId`, with
+`/node/title/:title` as the direct-entry form of a wikilink URL — a middle
+click, a bookmark, or a paste lands there, resolves the title, and redirects
+to the node).
 
 **A space is two independent controls, not a mode** (design decision D1), and
 that shape runs through most of the tree: a *read filter* per view, defaulting
@@ -235,7 +238,10 @@ a verb), `lib/time.ts`,
 `views/editor/createOutcome.ts`, `views/journal/journal.ts`,
 `views/assets/uploadOutcome.ts`, `views/assets/uploadQueue.ts`,
 `views/editor/markdownRender.ts` + `views/editor/mermaidRender.ts` (the
-sanitising policies), and `views/editor/leftoverBuffer.ts`.
+sanitising policies), `lib/wikilinks.ts` (the href contract a rendered
+`[[…]]` and its click interceptor must share), `views/node/nodeEdges.ts`
+(the reading-view rail's narrowing of a depth-1 neighbourhood), and
+`views/editor/leftoverBuffer.ts`.
 
 `components/useSpaces.ts`, `components/useArchivedSpaces.ts` and
 `views/journal/useNodeTitles.ts` are deliberately
@@ -301,6 +307,7 @@ syntactic rules above; type-level guarantees remain with `tsc`.
 | `src/views/spaces/` | the space lifecycle: list with node counts and grant holders, create, rename, archive — and `spaces.ts`'s `archiveConsequences`, the one place the archive dialog's promises are written, every line of which has to be something the server actually delivers |
 | `src/views/admin/` | accounts and grants administration, show-once token dialog |
 | `src/views/history/` | per-node version timeline and side-by-side diff |
+| `src/views/node/` | the reading view (`/node/:nodeId`): rendered Markdown + Mermaid via the editor's pure renderer, clickable `[[wikilinks]]`, and the incident-edge rail (`nodeEdges.ts` narrows the depth-1 neighbourhood to the root's edges) — plus `NodeTitleRedirect.tsx`, the resolver behind `/node/title/:title` |
 | `package.json`, `vite.config.ts`, `vitest.config.ts`, `tsconfig.json` | toolchain |
 | `**/*.test.ts` | Vitest unit tests, beside the module each covers |
 
@@ -461,7 +468,10 @@ Conventions that hold across the tree:
 ## The API client
 
 `src/api/client.ts` is the only place that calls `fetch`. It covers the whole
-Phase-3 endpoint surface plus the six consolidation-cycle routes, typed, and
+Phase-3 endpoint surface plus the six consolidation-cycle routes and the
+wikilink title-resolution route (`resolveTitles`, one batch call for the N
+`[[…]]` titles a rendered document holds — the click interceptor behind a
+wikilink, which never navigates on a guess), typed, and
 every route it names is served by `nodum.http_api`.
 
 What it handles for you:

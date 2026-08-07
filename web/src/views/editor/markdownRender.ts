@@ -14,8 +14,10 @@
  */
 
 import { Marked } from "marked";
+import type { TokenizerAndRendererExtension, Tokens } from "marked";
 import DOMPurify from "dompurify";
 import type { Config as PurifyConfig, DOMPurify as Purifier } from "dompurify";
+import { wikilinkHref } from "../../lib/wikilinks";
 
 /** One rendered Markdown document plus the diagram sources lifted out of it. */
 export interface RenderedMarkdown {
@@ -40,9 +42,64 @@ const DIAGRAM_INDEX_ATTRIBUTE = "data-diagram";
  */
 let collected: string[] = [];
 
+/**
+ * One parsed `[[Title]]` (or `[[Title|label]]`) inline token.
+ *
+ * `label` is null when the wikilink has no `|label` half; the renderer falls
+ * back to the title then, so `[[Title]]` and `[[Title|Title]]` render the
+ * same anchor.
+ */
+interface WikilinkToken extends Tokens.Generic {
+  type: "wikilink";
+  title: string;
+  label: string | null;
+}
+
+/**
+ * `[[Title]]` → an anchor to the reading view.
+ *
+ * The grammar mirrors the write-side materialisation's
+ * (`service.WIKILINK_RE` — no brackets, no newline), with the display-only
+ * `|label` half layered on top: the first `|` splits title from label, and a
+ * label never affects resolution. The target title travels in a site-relative
+ * href (`/node/title/<Title>`) — not a `data-*` attribute, which the preview
+ * policy strips by design — so the anchor survives {@link PREVIEW_POLICY}
+ * unchanged and a click can resolve the title back out of the href. The
+ * title is URL-encoded whole, so `#`, `?` and `/` in a title never leak into
+ * the route or the query string.
+ */
+const WIKILINK_TOKEN = /^\[\[([^[\]\n]+?)(?:\|([^[\]\n]*))?\]\]/;
+
+const wikilinkExtension: TokenizerAndRendererExtension = {
+  name: "wikilink",
+  level: "inline",
+  start(src) {
+    return src.indexOf("[[");
+  },
+  tokenizer(src): WikilinkToken | undefined {
+    const match = WIKILINK_TOKEN.exec(src);
+    if (match === null) return undefined;
+    // The regex guarantees both groups; the `?? ""` fallbacks are for the
+    // unchecked-index narrowing only.
+    return {
+      type: "wikilink",
+      raw: match[0] ?? "",
+      title: match[1] ?? "",
+      label: match[2] ?? null,
+    };
+  },
+  renderer(token) {
+    const wikilink = token as WikilinkToken;
+    return `<a href="${wikilinkHref(wikilink.title)}" class="nd-wikilink">${escapeHtml(
+      wikilink.label || wikilink.title,
+    )}</a>`;
+  },
+};
+
 const markdown = new Marked({
   gfm: true,
   breaks: false,
+  extensions: [wikilinkExtension],
   renderer: {
     code({ text, lang }) {
       const language = (lang ?? "").trim().split(/\s+/)[0] ?? "";
