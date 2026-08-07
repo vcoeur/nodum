@@ -20,6 +20,7 @@ import { Link, useNavigate, useParams } from "react-router-dom";
 import { api, getNode } from "../../api/client";
 import {
   EmptyState,
+  LinkDialog,
   NodeBadge,
   NodePeekScope,
   Spinner,
@@ -56,6 +57,11 @@ export default function NodeView() {
   // Bumped by the retry button; the only thing that re-runs the load for an
   // unchanged node id.
   const [attempt, setAttempt] = useState(0);
+  // Bumped when an edge is created from this view, so the rail refetches and
+  // shows the new edge on the next render.
+  const [refresh, setRefresh] = useState(0);
+  /** Which node a create-link dialog is anchored on, or null while closed. */
+  const [linkSource, setLinkSource] = useState<NodeOut | null>(null);
   const contentRef = useRef<HTMLDivElement | null>(null);
   /** Bumped per render pass, so a slow diagram cannot land in a newer document. */
   const generation = useRef(0);
@@ -71,7 +77,7 @@ export default function NodeView() {
         setLoad({ status: "failed", failure: describeFailure(error, "this node") });
       });
     return () => controller.abort();
-  }, [nodeId, attempt]);
+  }, [nodeId, attempt, refresh]);
 
   const root = load.status === "ready" ? load.subgraph.nodes[0] : null;
 
@@ -188,6 +194,13 @@ export default function NodeView() {
         </div>
         {root ? (
           <div className="nd-node__actions">
+            <button
+              type="button"
+              className="nd-button nd-button--small"
+              onClick={() => setLinkSource(root)}
+            >
+              Link
+            </button>
             <Link className="nd-button nd-button--small" to={`/editor/${encodeURIComponent(root.id)}`}>
               Edit
             </Link>
@@ -258,6 +271,14 @@ export default function NodeView() {
             <p className="nd-meta">Click an edge to travel to the far node.</p>
           </aside>
         </div>
+      ) : null}
+
+      {linkSource ? (
+        <LinkDialog
+          source={linkSource}
+          onClose={() => setLinkSource(null)}
+          onCreated={() => setRefresh((value) => value + 1)}
+        />
       ) : null}
     </div>
   );

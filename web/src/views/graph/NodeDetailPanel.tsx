@@ -45,6 +45,8 @@ interface NodeDetailPanelProps {
   onSetPathEnd: (end: "a" | "b", nodeId: string) => void;
   /** Which path role this node already fills, if any. */
   pathRole: "a" | "b" | null;
+  /** Open the create-edge dialog anchored on this node. */
+  onCreateEdge: () => void;
   onClose: () => void;
 }
 
@@ -68,6 +70,7 @@ export function NodeDetailPanel({
   onSelect,
   onSetPathEnd,
   pathRole,
+  onCreateEdge,
   onClose,
 }: NodeDetailPanelProps) {
   const preview = peekExcerpt(node.content, EXCERPT_LIMIT);
@@ -163,6 +166,9 @@ export function NodeDetailPanel({
         <Link className="nd-button nd-button--small" to={`/editor/${encodeURIComponent(node.id)}`}>
           Open in editor
         </Link>
+        <button type="button" className="nd-button nd-button--small" onClick={onCreateEdge}>
+          Create edge
+        </button>
         {isRoot ? null : (
           <Link className="nd-button nd-button--small nd-button--primary" to={rerootTo}>
             Re-root here

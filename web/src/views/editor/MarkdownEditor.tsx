@@ -54,6 +54,16 @@ export interface MarkdownEditorHandle {
    * @param text The Markdown to insert, without surrounding blank lines.
    */
   insertBlockAt(position: number, text: string): void;
+  /**
+   * Insert `[[Title]]` at the caret.
+   *
+   * What the create-link dialog writes when it was invoked from the editor:
+   * the dialog's slash command leaves the caret where `/link` was, so the
+   * wikilink lands in place. The caret ends up after the closing `]]`.
+   *
+   * @param title The chosen target's title.
+   */
+  insertWikilink(title: string): void;
 }
 
 interface MarkdownEditorProps {
@@ -172,6 +182,18 @@ export function MarkdownEditor(props: MarkdownEditorProps) {
         current.dispatch({
           changes: { from, insert },
           selection: { anchor: from + insert.length },
+          scrollIntoView: true,
+        });
+        current.focus();
+      },
+      insertWikilink: (title) => {
+        const current = view.current;
+        if (!current) return;
+        const anchor = current.state.selection.main.head;
+        const insert = `[[${title}]]`;
+        current.dispatch({
+          changes: { from: anchor, insert },
+          selection: { anchor: anchor + insert.length },
           scrollIntoView: true,
         });
         current.focus();
