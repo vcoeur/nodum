@@ -17,7 +17,7 @@ from nodum.service import InvalidTransition
 runner = CliRunner()
 
 
-NO_AS_GROUPS = {"init", "schema-dump", "projector", "asset", "mcp", "serve"}
+NO_AS_GROUPS = {"init", "schema-dump", "projector", "asset", "serve"}
 
 
 def _maybe_as(args):

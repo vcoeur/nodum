@@ -57,7 +57,7 @@ import json, sys
 
 schema = json.load(open(sys.argv[1]))
 names = {c["name"] for c in schema.get("commands", [])}
-required = {"node", "edge", "search", "schema", "schema-dump", "projector", "review", "mcp", "asset"}
+required = {"node", "edge", "search", "schema", "schema-dump", "projector", "review", "serve", "asset"}
 missing = required - names
 assert not missing, (
     f"nodum schema-dump is missing {sorted(missing)} (introspected {len(names)} commands). "
