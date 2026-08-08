@@ -88,6 +88,38 @@ export function preferredEdgeType(edgeTypes: readonly EdgeTypeOut[]): string | n
   return sorted.find((entry) => entry.id === "relates_to")?.id ?? sorted[0]?.id ?? null;
 }
 
+/** The outcome of picking an edge-type chip. */
+export interface EdgeTypePick {
+  /** The picked type id. */
+  edgeType: string;
+  /**
+   * The direction to display after the pick. A type the catalog declares no
+   * inverse for is direction-locked, so picking one while flipped to
+   * incoming resets the direction to outgoing — the alternative strands the
+   * dialog with a directed type under `in`: both toggle buttons disabled,
+   * and a submit that swaps the endpoints under the directed label.
+   */
+  direction: LinkDirection;
+}
+
+/**
+ * Pick an edge-type chip: the type itself, with the direction reset to
+ * outgoing when the picked type is direction-locked.
+ *
+ * @param edgeTypes The live edge-type catalog.
+ * @param currentDirection The direction before the pick.
+ * @param typeId The picked type.
+ * @returns The type and the direction to display.
+ */
+export function pickEdgeType(
+  edgeTypes: readonly EdgeTypeOut[],
+  currentDirection: LinkDirection,
+  typeId: string,
+): EdgeTypePick {
+  const locked = inverseEdgeType(edgeTypes, typeId) === null;
+  return { edgeType: typeId, direction: locked ? "out" : currentDirection };
+}
+
 /**
  * Build the `POST /api/edges` body from the dialog's form.
  *

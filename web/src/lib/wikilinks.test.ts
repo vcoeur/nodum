@@ -19,6 +19,7 @@ import {
   titleFromWikilinkHref,
   wikilinkHref,
   wikilinkInsertion,
+  wikilinkTargetId,
   WIKILINK_TITLE_PATH,
 } from "./wikilinks";
 
@@ -97,6 +98,26 @@ describe("the resolution mapping", () => {
   });
 });
 
+describe("the id form", () => {
+  // `uuid4().hex`, exactly as the store generates every id (migrations.py,
+  // service.py) — 32 lowercase hex digits.
+  const ID = "0123456789abcdef0123456789abcdef";
+
+  it("returns a 32-lowercase-hex target as the node id", () => {
+    expect(wikilinkTargetId(ID)).toBe(ID);
+  });
+
+  it("refuses anything but the generated id shape", () => {
+    // Uppercase, wrong length, a non-hex char, and an ordinary title are all
+    // titles, never ids — a title that happens to look like one must still
+    // go through title resolution.
+    expect(wikilinkTargetId(ID.toUpperCase())).toBeNull();
+    expect(wikilinkTargetId(ID.slice(1))).toBeNull();
+    expect(wikilinkTargetId(`${ID}g`)).toBeNull();
+    expect(wikilinkTargetId("Q13 principals design")).toBeNull();
+  });
+});
+
 describe("the insertion choice", () => {
   it("inserts the title when it is safe in the wikilink grammar", () => {
     expect(wikilinkInsertion("Q13 principals design", "abc123")).toBe("[[Q13 principals design]]");
@@ -128,7 +149,7 @@ describe("the click interceptor", () => {
     try {
       const anchor = container.querySelector<HTMLAnchorElement>("a.nd-wikilink");
       anchor?.dispatchEvent(new MouseEvent("click", { bubbles: true, button: 0 }));
-      expect(onWikilink).toHaveBeenCalledWith("the target");
+      expect(onWikilink).toHaveBeenCalledWith("the target", null);
 
       // A click on a non-wikilink link is left alone.
       onWikilink.mockClear();
@@ -136,6 +157,27 @@ describe("the click interceptor", () => {
         .querySelector<HTMLAnchorElement>('a:not(.nd-wikilink)')
         ?.dispatchEvent(new MouseEvent("click", { bubbles: true, button: 0 }));
       expect(onWikilink).not.toHaveBeenCalled();
+    } finally {
+      detach();
+      container.remove();
+    }
+  });
+
+  it("reports an id-form wikilink's node id, so the consumer can skip resolution", () => {
+    // `[[<id>]]` (the insertion fallback for a title the grammar cannot
+    // carry) renders with the id as target; the click must hand the consumer
+    // the id so it can navigate directly instead of resolving it as a title.
+    const id = "0123456789abcdef0123456789abcdef";
+    const container = document.createElement("div");
+    container.innerHTML = `<a class="nd-wikilink" href="${wikilinkHref(id)}">${id}</a>`;
+    document.body.append(container);
+
+    const onWikilink = vi.fn();
+    const detach = attachWikilinkClicks(container, onWikilink);
+    try {
+      const anchor = container.querySelector<HTMLAnchorElement>("a.nd-wikilink");
+      anchor?.dispatchEvent(new MouseEvent("click", { bubbles: true, button: 0 }));
+      expect(onWikilink).toHaveBeenCalledWith(id, id);
     } finally {
       detach();
       container.remove();

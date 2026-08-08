@@ -32,6 +32,7 @@ import {
   fetchTargetCandidates,
   inverseEdgeType,
   parseConfidence,
+  pickEdgeType,
   preferredEdgeType,
   targetCrossing,
 } from "../lib/linkDialog";
@@ -135,7 +136,12 @@ export function LinkDialog({ source, onClose, onCreated }: LinkDialogProps) {
   );
   const [searchError, setSearchError] = useState<string | null>(null);
   const debouncer = useRef(createDebouncer(SEARCH_DEBOUNCE_MS));
-  // Bumped per request so a slow earlier search cannot overwrite a newer one.
+  // Bumped on every query change (in `handleQueryChange`, before the debounce)
+  // and again per request, so a slow earlier search can never overwrite a
+  // newer one. The bump has to precede the debounce: the debounced callback
+  // runs 250 ms late, by which time a response to the *previous* query may
+  // already have landed — a clear must invalidate it at the keystroke, not at
+  // the callback.
   const searchSequence = useRef(0);
 
   useEffect(() => () => debouncer.current.cancel(), []);
@@ -143,10 +149,9 @@ export function LinkDialog({ source, onClose, onCreated }: LinkDialogProps) {
   const runSearch = useCallback(
     (query: string) => {
       if (query.trim() === "") {
-        // Bump the sequence like a real request would: an in-flight search
-        // started under the previous query must not repopulate results under
-        // an empty one.
-        searchSequence.current += 1;
+        // The sequence was already bumped when the query was cleared (in
+        // `handleQueryChange`), so any in-flight search is stale by now; this
+        // branch just drops the results it would have shown.
         setResults([]);
         setSearchState("idle");
         return;
@@ -174,6 +179,12 @@ export function LinkDialog({ source, onClose, onCreated }: LinkDialogProps) {
 
   const handleQueryChange = (value: string) => {
     setTargetQuery(value);
+    // Bumped here, on every change, *before* the debounce: an in-flight
+    // search started under the previous query must not repopulate results
+    // under a new — or empty — one. The debounced callback runs 250 ms
+    // later, so by the time it fires a slow response may already have
+    // landed; invalidating at the keystroke closes that window.
+    searchSequence.current += 1;
     // The selection is tied to the query it was picked under; a new query
     // starts a new pick.
     setTarget(null);
@@ -331,7 +342,16 @@ export function LinkDialog({ source, onClose, onCreated }: LinkDialogProps) {
                       ? "nd-link-dialog__type nd-link-dialog__type--selected"
                       : "nd-link-dialog__type"
                   }
-                  onClick={() => setEdgeType(entry.id)}
+                  onClick={() => {
+                    // A direction-locked type (no catalog inverse) cannot
+                    // pair with an incoming direction — the toggle would be
+                    // disabled under it and the submit would swap the
+                    // endpoints under the directed label — so picking one
+                    // resets the direction to outgoing.
+                    const pick = pickEdgeType(edgeTypes, direction, entry.id);
+                    setEdgeType(pick.edgeType);
+                    setDirection(pick.direction);
+                  }}
                 >
                   {entry.id}
                 </button>

@@ -6,6 +6,7 @@ import {
   fetchTargetCandidates,
   inverseEdgeType,
   parseConfidence,
+  pickEdgeType,
   preferredEdgeType,
   targetCrossing,
 } from "./linkDialog";
@@ -97,6 +98,55 @@ describe("preferredEdgeType", () => {
 
   it("returns null for an empty catalog", () => {
     expect(preferredEdgeType([])).toBeNull();
+  });
+});
+
+describe("pickEdgeType", () => {
+  // A user-created directed type: the catalog row exists with `inverse_name`
+  // null, so it is direction-locked (the same row `inverseEdgeType` refuses
+  // to flip).
+  const directed: EdgeTypeOut = {
+    id: "influences",
+    name: "influences",
+    inverse_name: null,
+    json_schema: {},
+    is_builtin: false,
+  };
+  const WITH_DIRECTED = [...EDGE_TYPES, directed];
+
+  it("keeps the current direction when the picked type has an inverse", () => {
+    expect(pickEdgeType(EDGE_TYPES, "in", "supports")).toEqual({
+      edgeType: "supports",
+      direction: "in",
+    });
+    expect(pickEdgeType(EDGE_TYPES, "out", "supports")).toEqual({
+      edgeType: "supports",
+      direction: "out",
+    });
+  });
+
+  it("resets an incoming direction to outgoing when the picked type is direction-locked", () => {
+    // Picking a directed type while flipped to incoming would otherwise
+    // strand the dialog: both toggle buttons disabled, and a submit that
+    // swaps the endpoints under the directed label.
+    expect(pickEdgeType(WITH_DIRECTED, "in", "influences")).toEqual({
+      edgeType: "influences",
+      direction: "out",
+    });
+  });
+
+  it("leaves an outgoing direction alone for a direction-locked type", () => {
+    expect(pickEdgeType(WITH_DIRECTED, "out", "influences")).toEqual({
+      edgeType: "influences",
+      direction: "out",
+    });
+  });
+
+  it("keeps the direction when the catalog has no row for the picked type", () => {
+    expect(pickEdgeType(EDGE_TYPES, "in", "made_up")).toEqual({
+      edgeType: "made_up",
+      direction: "in",
+    });
   });
 });
 

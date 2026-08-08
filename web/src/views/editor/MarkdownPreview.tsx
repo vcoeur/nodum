@@ -46,7 +46,13 @@ export function MarkdownPreview({ source }: MarkdownPreviewProps) {
   useEffect(() => {
     const container = target.current;
     if (!container) return;
-    return attachWikilinkClicks(container, (title) => {
+    return attachWikilinkClicks(container, (title, nodeId) => {
+      // An id-form wikilink (`[[<id>]]`) names its node directly; the
+      // resolution read is title-only and would miss it, so navigate.
+      if (nodeId !== null) {
+        navigate(`/node/${nodeId}`);
+        return;
+      }
       void (async () => {
         try {
           const [resolution] = await api.resolveTitles([title]);

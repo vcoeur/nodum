@@ -131,7 +131,13 @@ export default function NodeView() {
       });
     }
 
-    const detach = attachWikilinkClicks(container, (title) => {
+    const detach = attachWikilinkClicks(container, (title, nodeId) => {
+      // An id-form wikilink (`[[<id>]]`) names its node directly; the
+      // resolution read is title-only and would miss it, so navigate.
+      if (nodeId !== null) {
+        navigate(`/node/${nodeId}`);
+        return;
+      }
       void (async () => {
         try {
           // The node's own space breaks ties: reading a note in `research`

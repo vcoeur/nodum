@@ -896,10 +896,13 @@ Full conventions: `web/README.md`. The rules below are the ones that bind.
   made, reachable from the reading view's header, the graph panel's actions,
   and the editor's `/link` slash command. Its edge-type chips come from the
   live `GET /api/types` catalog, never a hardcoded list; direction is a
-  first-class toggle that swaps the selected type for its catalog inverse
-  (`supports` ↔ `supported_by`, so outgoing and incoming describe the same
-  fact), and is locked with a reason when the selected type declares no
-  inverse (a user-created directed type has no flipped form); the target
+   first-class toggle that swaps the selected type for its catalog inverse
+   (`supports` ↔ `supported_by`, so outgoing and incoming describe the same
+   fact), and is locked with a reason when the selected type declares no
+   inverse (a user-created directed type has no flipped form) — picking such
+   a chip while flipped to incoming resets the direction to outgoing, so a
+   directed type is never stranded under `in` with both toggle buttons
+   disabled; the target
   search reuses `suggestLinks` (title-prefix) and falls back
   to a full `search` when the prefix matches nothing; confidence is optional,
   unset by default, and refused client-side outside `[0, 1]` exactly as the
