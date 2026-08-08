@@ -35,6 +35,7 @@ import {
   MENU_KEYS,
 } from "../lib/contextMenu";
 import type { MenuAnchor } from "../lib/contextMenu";
+import { focusProgrammatically, isProgrammaticFocus } from "../lib/programmaticFocus";
 import "./ContextMenu.css";
 
 /**
@@ -159,10 +160,6 @@ export function ContextMenu({ label, anchor, items, onClose }: ContextMenuProps)
   const panelRef = useRef<HTMLDivElement | null>(null);
   const itemRefs = useRef<(HTMLButtonElement | null)[]>([]);
   const restoreTo = useRef<HTMLElement | null>(null);
-  /** True while this component is handing focus back, so its own move is not read as a dismissal. */
-  const restoring = useRef(false);
-  /** True once a pointer press outside the panel has dismissed it. See the close cleanup. */
-  const closedByPointer = useRef(false);
   const [focused, setFocused] = useState(-1);
 
   const states = items.map((item) => ({ disabled: item.unavailable !== undefined }));
@@ -192,14 +189,6 @@ export function ContextMenu({ label, anchor, items, onClose }: ContextMenuProps)
       // and Ctrl-K put the caret in the query box — and grabbing it back from
       // there is worse than never having taken it.
       if (!panel.contains(document.activeElement)) return;
-      // And **not for a dismissal a pointer caused**. The restore exists for a
-      // keyboard reader who would otherwise land on `<body>`; someone who just
-      // pressed somewhere is already telling the page where they are going,
-      // and putting focus back costs more than it saves. Concretely, pressing
-      // the `⋯` closes at pointerdown while the panel still holds focus, so
-      // this would fire — re-focusing the search row's title link, which is a
-      // `NodePeek` trigger, and pinning a preview card open over the list.
-      if (closedByPointer.current) return;
       // And only if the opener is still in the document: focusing a detached
       // node drops focus onto `<body>`, which is the thing this prevents.
       const opener = restoreTo.current;
@@ -212,16 +201,12 @@ export function ContextMenu({ label, anchor, items, onClose }: ContextMenuProps)
       // leaves — a focused opener now off-screen — is only ever reached by a
       // pointer gesture, where no focus ring is drawn anyway.
       if (opener !== null && opener !== document.body && opener.isConnected) {
-        // The focusin watcher below reads a focus landing outside the panel as
-        // "dismiss", and this restore is exactly that shape — so it is marked
-        // as ours for the synchronous dispatch and the microtasks after it.
-        // `NodePeek.dismiss` suppresses its own re-arm the same way, for the
-        // same reason.
-        restoring.current = true;
-        opener.focus({ preventScroll: true });
-        queueMicrotask(() => {
-          restoring.current = false;
-        });
+        // Marked as the app's move, not the reader's. Two watchers would
+        // otherwise act on it as a user focus: this component's own focusin
+        // close, and — the case a private flag could not have covered —
+        // `NodePeek`, when the opener is a peek trigger, which is every search
+        // result title. That pinned a preview card open over the results.
+        focusProgrammatically(opener, { preventScroll: true });
       }
     };
   }, [anchor]);
@@ -256,13 +241,13 @@ export function ContextMenu({ label, anchor, items, onClose }: ContextMenuProps)
       target === null || panelRef.current?.contains(target) !== true;
 
     const onFocusIn = (event: FocusEvent) => {
-      if (restoring.current) return;
+      if (isProgrammaticFocus()) return;
       const target = event.target as Node | null;
       if (target !== null && !leftPanel(target)) return;
       onClose();
     };
     const onFocusOut = (event: FocusEvent) => {
-      if (restoring.current) return;
+      if (isProgrammaticFocus()) return;
       // Only the fell-to-nothing case; a move to a real element is `focusin`'s.
       if (event.relatedTarget !== null) return;
       // And only while this document still has focus — otherwise this is the
@@ -290,9 +275,6 @@ export function ContextMenu({ label, anchor, items, onClose }: ContextMenuProps)
     const onPointerDown = (event: PointerEvent) => {
       const target = event.target as Node;
       if (panelRef.current?.contains(target)) return;
-      // Recorded before the close so the unmount's focus hand-back can decline:
-      // a pointer dismissal has already said where the reader is going.
-      closedByPointer.current = true;
       onClose();
     };
     document.addEventListener("pointerdown", onPointerDown, true);

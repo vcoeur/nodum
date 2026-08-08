@@ -968,8 +968,15 @@ Full conventions: `web/README.md`. The rules below are the ones that bind.
   flag earlier only moved the race. Opening unconditionally has no ordering to
   get wrong — the press dismisses through the ordinary watchers, the click
   opens — and Escape, a selection, an outside click, a scroll and a focus move
-  all still dismiss. **Focus is handed back only if the panel still holds it**,
-  and with
+  all still dismiss. **Focus a surface moves itself goes through
+  `lib/programmaticFocus.ts`.** A DOM focus event does not say who caused it,
+  and watchers act on *user* focus — the peek card arms on focus with no intent
+  delay, the menu treats focus outside its panel as a dismissal. So a closing
+  menu handing focus back to a search row's title, which is a peek trigger,
+  pinned a preview card open over the results. Both components had grown the
+  same private flag for their *own* re-arm; shared, it covers the case neither
+  private one could. It counts rather than latches, because two hand-backs
+  overlap. **Focus is handed back only if the panel still holds it**, and with
   `preventScroll` — unlike a modal this overlay closes *on* scroll, so an
   unconditional restore both drags the viewport back and steals focus from
   wherever a shortcut deliberately put it.

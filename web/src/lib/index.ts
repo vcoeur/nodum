@@ -50,6 +50,8 @@ export type {
 export { pageWindow } from "./paging";
 export type { PageWindow } from "./paging";
 
+export { focusProgrammatically, isProgrammaticFocus } from "./programmaticFocus";
+
 export { undoableSeq } from "./undoTarget";
 export type { WriteJustMade } from "./undoTarget";
 
