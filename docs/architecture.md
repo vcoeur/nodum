@@ -1059,6 +1059,21 @@ sections to the code:
   scanned but content is not. Archived nodes are excluded — a retired node is
   not a link target — while `proposed` ones are kept, matching how every other
   node read treats state.
+- **Clickable wikilinks resolve by exact title, in one batch.**
+  `service.resolve_titles` is the read side of `suggest_links`: where that
+  answers a prefix typed so far, this answers whole `[[…]]` titles exactly, so
+  a rendered document with N wikilinks asks once. Matching is the same
+  Python-side casefold + NFC fold over the same non-archived states — and
+  unlike `_resolve_wikilink` (which writes mentions with an exact SQL `=`),
+  the click path *is* case- and normalisation-insensitive, so `[[étoile]]`
+  resolves a title stored `Étoile`. The optional `--space` is a read-side
+  **preference** for breaking ties, never a filter: matches in that space win
+  when there are any, otherwise the title resolves across every space in
+  scope, and a title with several visible copies is reported `ambiguous`
+  rather than guessed — a wrong confident navigation is the regression a
+  clickable wikilink must not introduce. A node in a space the reader cannot
+  see does not exist (it can neither resolve nor make a title ambiguous), so
+  the endpoint is no existence oracle.
 - **The human surface is the human's, and says so structurally.** `/api` and
   `/mcp` are exact inverses on one origin: the MCP adapter mints only
   `agent:<name>`, from a bearer header, and `nodum.http_api` never reads an

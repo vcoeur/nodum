@@ -7,9 +7,10 @@ import { EmptyState, Spinner } from "./components";
 /**
  * Every route in the app, registered up front.
  *
- * Sixteen routes over eleven views: login, editor (blank and per-node),
+ * Thirteen views: login, editor (blank and per-node),
  * search, review, journal (the cycle list and one cycle), graph (root picker and
- * per-root), assets, per-node history, admin, and spaces. `/` redirects to
+ * per-root), assets, per-node history, admin, spaces, and the node reading view
+ * (per-node, plus the title-resolution redirect). `/` redirects to
  * `/search`, and anything unmatched renders {@link NotFoundView} rather than a
  * blank screen.
  *
@@ -45,6 +46,8 @@ const HistoryView = lazy(() => import("./views/history/HistoryView"));
 const SpacesView = lazy(() => import("./views/spaces/SpacesView"));
 const JournalView = lazy(() => import("./views/journal/JournalView"));
 const CycleView = lazy(() => import("./views/journal/CycleView"));
+const NodeView = lazy(() => import("./views/node/NodeView"));
+const NodeTitleRedirect = lazy(() => import("./views/node/NodeTitleRedirect"));
 
 /** Shown while a view's chunk loads. */
 function ViewLoading() {
@@ -116,6 +119,14 @@ export const router = createBrowserRouter([
       // History — always per node. The editor links here by URL, so the path
       // is part of the contract between the two slices: `/history/:nodeId`.
       { path: "history/:nodeId", element: lazyView(<HistoryView />) },
+
+      // Reading — `/node/:nodeId` renders a note; `/node/title/:title` is the
+      // direct-entry form of a wikilink URL (a middle click, a bookmark, a
+      // paste), which resolves the title and redirects. The title route must
+      // be registered first: `:nodeId` would otherwise match the literal
+      // `title` segment.
+      { path: "node/title/:title", element: lazyView(<NodeTitleRedirect />) },
+      { path: "node/:nodeId", element: lazyView(<NodeView />) },
 
       { path: "*", element: <NotFoundView /> },
     ],

@@ -135,6 +135,10 @@ including every parameter.
 - `subgraph <root-id>` — Bounded, filtered neighborhood of a node — node and edge caps stop the walk.
 - `find-path` — Find the shortest path between two nodes over active edges.
 - `suggest-links <prefix>` — Suggest wikilink targets by title prefix (case-insensitive).
+- `resolve-titles <title>… [--space S]` — Resolve whole wikilink titles to node ids
+  (exact, case-insensitive): each answers `resolved` (with the node's id and
+  space), `ambiguous`, or `not-found`. `--space` prefers matches in one space
+  without hiding the rest.
 
 ### Asking the graph
 

@@ -734,6 +734,22 @@ export interface AgentStateOut {
  */
 export type LinkSuggestion = NodeOut;
 
+/**
+ * One wikilink title's resolution (server's `TitleResolution`).
+ *
+ * `resolved` carries the winning node's id and space; `ambiguous` says several
+ * non-archived nodes share the title (the caller may retry with a space
+ * preference); `not-found` says none did. The two failure outcomes name no
+ * node and no space, and deliberately cannot tell an absent node from one in a
+ * space the caller cannot read — the resolution is no existence oracle.
+ */
+export interface TitleResolution {
+  title: string;
+  outcome: "resolved" | "ambiguous" | "not-found";
+  node_id: string | null;
+  space_id: string | null;
+}
+
 /** The list envelope every nodum surface uses: `{"<plural>": [...], "count": n}`. */
 export type ListEnvelope<K extends string, T> = { [P in K]: T[] } & { count: number };
 

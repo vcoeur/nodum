@@ -16,6 +16,10 @@
  */
 
 import { useEffect, useRef } from "react";
+import { useNavigate } from "react-router-dom";
+import { api } from "../../api/client";
+import { useToast } from "../../components";
+import { actionForResolution, attachWikilinkClicks } from "../../lib";
 import { DIAGRAM_PLACEHOLDER_CLASS, renderMarkdown } from "./markdownRender";
 import { peekDiagram, renderDiagram } from "./mermaidRender";
 import type { DiagramResult } from "./mermaidRender";
@@ -31,6 +35,34 @@ export function MarkdownPreview({ source }: MarkdownPreviewProps) {
   const target = useRef<HTMLDivElement | null>(null);
   /** Bumped per render pass, so a slow diagram cannot land in a newer document. */
   const generation = useRef(0);
+
+  // A wikilink is a real link in the preview: clicking resolves the title and
+  // opens the reading view, exactly as it does there. The container is stable
+  // across source changes (only its `innerHTML` is replaced), so the listener
+  // attaches once on mount.
+  const navigate = useNavigate();
+  const toast = useToast();
+
+  useEffect(() => {
+    const container = target.current;
+    if (!container) return;
+    return attachWikilinkClicks(container, (title) => {
+      void (async () => {
+        try {
+          const [resolution] = await api.resolveTitles([title]);
+          if (resolution === undefined) return;
+          const action = actionForResolution(resolution);
+          if (action.kind === "navigate") {
+            navigate(`/node/${action.nodeId}`);
+          } else {
+            toast.show("info", action.toastTitle, action.toastDetail);
+          }
+        } catch (error) {
+          toast.showError(error);
+        }
+      })();
+    });
+  }, [navigate, toast]);
 
   useEffect(() => {
     const container = target.current;

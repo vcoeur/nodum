@@ -645,7 +645,11 @@ cycle quietly drop the vector signal until you re-run the download.
   the companion title-prefix lookup behind a `[[` autocomplete: it reads the
   node table directly, never a projector index, so it answers on a cold
   database — an empty list always means "no such title", never "the index has
-  not run".
+  not run". `nodum resolve-titles "Q13 principals design"` is its exact-match
+  sibling — one batch call for the N titles a rendered document holds, each
+  answering `resolved`, `ambiguous`, or `not-found`, with `--space` preferring
+  one space without hiding the rest. Both are case- and normalisation-
+  insensitive in Python, never in SQL.
 - **Event log + versions.** Every mutation appends an event (actor, op, full
   before/after JSON payload) and — for nodes — a version snapshot. `undo`
   reverses an event by restoring its `before` state. It never cascades beyond

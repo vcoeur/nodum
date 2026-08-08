@@ -6,7 +6,7 @@ identical data yields identical JSON across adapters.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict
 
@@ -971,3 +971,20 @@ class SpaceOut(NodeOut):
 
     node_count: int
     grants: list[GrantOut]
+
+
+class TitleResolution(BaseModel):
+    """The outcome of resolving one ``[[wikilink]]`` title to a node.
+
+    ``resolved`` carries the winning node's id and space; ``ambiguous`` says
+    several non-archived nodes share the title (the caller may retry with a
+    space preference); ``not-found`` says none did. The two failure outcomes
+    name no node and no space, and deliberately cannot tell an absent node
+    from one in a space the principal cannot read — the resolution is no
+    existence oracle.
+    """
+
+    title: str
+    outcome: Literal["resolved", "ambiguous", "not-found"]
+    node_id: str | None = None
+    space_id: str | None = None

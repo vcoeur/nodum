@@ -870,6 +870,26 @@ def suggest_links(
     _emit_list("nodes", nodes)
 
 
+@app.command(name="resolve-titles")
+def resolve_titles(
+    title: list[str] = typer.Argument(..., help="Wikilink title to resolve (repeatable)."),
+    space: str | None = typer.Option(
+        None, "--space", help="Prefer matches in this space (id or name)."
+    ),
+    as_human: str = AS_OPTION,
+) -> None:
+    """Resolve wikilink titles to node ids (exact, case-insensitive).
+
+    The read side of ``suggest-links``: a render pass with N wikilinks asks
+    once. Each title answers ``resolved`` (with the winning node's id and
+    space), ``ambiguous`` (several non-archived nodes share the title), or
+    ``not-found`` — the two failures are identical whether the node is absent
+    or merely in a space the reader cannot see.
+    """
+    resolutions = _run(service.resolve_titles, title, principal=_principal(as_human), space=space)
+    _emit_list("resolutions", resolutions)
+
+
 @app.command()
 def traverse(
     start_id: str = typer.Argument(..., help="Node id to start from."),

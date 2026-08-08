@@ -90,6 +90,7 @@ PY_TO_TS: dict[str, str] = {
     "RollbackBlockerOut": "RollbackBlockerOut",
     "RollbackOut": "RollbackOut",
     "SpaceOut": "SpaceOut",
+    "TitleResolution": "TitleResolution",
     # Defined in nodum/consolidate.py, not models.py: the `POST /api/cycles`
     # envelope. Its `report` field is a complex nested model
     # (ConsolidationReport), so the mirror types it `JsonObject` and the
