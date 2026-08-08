@@ -18,8 +18,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import type { KeyboardEvent } from "react";
 import { api } from "../../api/client";
-import type { TypeOut } from "../../api/types";
-import { EmptyState, Spinner, useSpaces, useToast } from "../../components";
+import type { NodeOut, TypeOut } from "../../api/types";
+import { EmptyState, LinkDialog, Spinner, useSpaces, useToast } from "../../components";
 import { MarkdownEditor } from "./MarkdownEditor";
 import type { MarkdownEditorHandle } from "./MarkdownEditor";
 import { MarkdownPreview } from "./MarkdownPreview";
@@ -84,6 +84,8 @@ export default function EditorView() {
   const uploadSequence = useRef(0);
   const [dragActive, setDragActive] = useState(false);
   const [linkFailure, setLinkFailure] = useState<string | null>(null);
+  /** Which node a create-link dialog is anchored on, or null while closed. */
+  const [linkSource, setLinkSource] = useState<NodeOut | null>(null);
 
   /* --- Type catalog ------------------------------------------------ */
 
@@ -133,6 +135,7 @@ export default function EditorView() {
     (): SlashPaletteState => ({
       nodeTypes: types,
       typeLocked: doc.node !== null,
+      nodeId: doc.node?.id ?? null,
       selectType: (typeId) => {
         setSelectedType(typeId);
         const chosen = types.find((candidate) => candidate.id === typeId);
@@ -141,6 +144,11 @@ export default function EditorView() {
           `Type set to ${chosen?.name ?? typeId}`,
           "Applied when this node is first saved.",
         );
+      },
+      openLinkDialog: () => {
+        // The palette only offers /link while the node exists, so the guard
+        // is belt and braces: an edge needs a real source node.
+        if (doc.node !== null) setLinkSource(doc.node);
       },
     }),
     [types, doc.node, toast],
@@ -370,6 +378,20 @@ export default function EditorView() {
           </section>
         ) : null}
       </div>
+
+      {linkSource ? (
+        <LinkDialog
+          source={linkSource}
+          onClose={() => setLinkSource(null)}
+          onCreated={(edge, targetTitle) => {
+            // The edge exists; the wikilink is the editor's half of the deal.
+            // The far endpoint is the target — the node the edge points at
+            // when outgoing, the node it points from when incoming.
+            const targetId = edge.src_id === linkSource.id ? edge.dst_id : edge.src_id;
+            editorRef.current?.insertWikilink(targetTitle, targetId);
+          }}
+        />
+      ) : null}
     </div>
   );
 }

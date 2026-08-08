@@ -53,6 +53,8 @@ export {
   attachWikilinkClicks,
   titleFromWikilinkHref,
   wikilinkHref,
+  wikilinkInsertion,
+  wikilinkTargetId,
   WIKILINK_TITLE_PATH,
 } from "./wikilinks";
 export type { WikilinkAction } from "./wikilinks";

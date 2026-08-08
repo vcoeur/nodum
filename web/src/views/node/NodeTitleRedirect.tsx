@@ -13,7 +13,7 @@ import { useEffect, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { resolveTitles } from "../../api/client";
 import { EmptyState, Spinner } from "../../components";
-import { actionForResolution, describeFailure } from "../../lib";
+import { actionForResolution, describeFailure, wikilinkTargetId } from "../../lib";
 import type { FailureDescription } from "../../lib";
 
 type RedirectState =
@@ -28,6 +28,14 @@ export default function NodeTitleRedirect() {
 
   useEffect(() => {
     if (title === undefined) return;
+    // An id-form wikilink URL (`/node/title/<id>`, from `[[<id>]]`) names
+    // its node directly; the title resolve would answer "No active node
+    // titled …" for an id, so redirect by id instead.
+    const nodeId = wikilinkTargetId(title);
+    if (nodeId !== null) {
+      navigate(`/node/${nodeId}`, { replace: true });
+      return;
+    }
     const controller = new AbortController();
     setState({ status: "resolving" });
     resolveTitles([title], undefined, controller.signal)

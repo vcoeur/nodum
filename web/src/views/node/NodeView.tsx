@@ -20,6 +20,7 @@ import { Link, useNavigate, useParams } from "react-router-dom";
 import { api, getNode } from "../../api/client";
 import {
   EmptyState,
+  LinkDialog,
   NodeBadge,
   NodePeekScope,
   Spinner,
@@ -56,6 +57,12 @@ export default function NodeView() {
   // Bumped by the retry button; the only thing that re-runs the load for an
   // unchanged node id.
   const [attempt, setAttempt] = useState(0);
+  // Bumped when an edge is created from this view, so the rail refetches in
+  // the background: the current subgraph stays on screen until the new one
+  // lands.
+  const [refresh, setRefresh] = useState(0);
+  /** Which node a create-link dialog is anchored on, or null while closed. */
+  const [linkSource, setLinkSource] = useState<NodeOut | null>(null);
   const contentRef = useRef<HTMLDivElement | null>(null);
   /** Bumped per render pass, so a slow diagram cannot land in a newer document. */
   const generation = useRef(0);
@@ -63,7 +70,14 @@ export default function NodeView() {
   useEffect(() => {
     if (!nodeId) return;
     const controller = new AbortController();
-    setLoad({ status: "loading" });
+    // A retry and a navigation to another node show the spinner; a refresh of
+    // the same node keeps the current subgraph on screen until the new one
+    // lands, so creating an edge never flashes the whole view away.
+    setLoad((current) =>
+      current.status === "ready" && current.subgraph.root === nodeId
+        ? current
+        : { status: "loading" },
+    );
     getNode(nodeId, { depth: 1 }, controller.signal)
       .then((subgraph) => setLoad({ status: "ready", subgraph }))
       .catch((error: unknown) => {
@@ -71,7 +85,7 @@ export default function NodeView() {
         setLoad({ status: "failed", failure: describeFailure(error, "this node") });
       });
     return () => controller.abort();
-  }, [nodeId, attempt]);
+  }, [nodeId, attempt, refresh]);
 
   const root = load.status === "ready" ? load.subgraph.nodes[0] : null;
 
@@ -117,7 +131,13 @@ export default function NodeView() {
       });
     }
 
-    const detach = attachWikilinkClicks(container, (title) => {
+    const detach = attachWikilinkClicks(container, (title, nodeId) => {
+      // An id-form wikilink (`[[<id>]]`) names its node directly; the
+      // resolution read is title-only and would miss it, so navigate.
+      if (nodeId !== null) {
+        navigate(`/node/${nodeId}`);
+        return;
+      }
       void (async () => {
         try {
           // The node's own space breaks ties: reading a note in `research`
@@ -190,6 +210,13 @@ export default function NodeView() {
         </div>
         {root ? (
           <div className="nd-node__actions">
+            <button
+              type="button"
+              className="nd-button nd-button--small"
+              onClick={() => setLinkSource(root)}
+            >
+              Link
+            </button>
             <Link className="nd-button nd-button--small" to={`/editor/${encodeURIComponent(root.id)}`}>
               Edit
             </Link>
@@ -260,6 +287,14 @@ export default function NodeView() {
             <p className="nd-meta">Click an edge to travel to the far node.</p>
           </aside>
         </div>
+      ) : null}
+
+      {linkSource ? (
+        <LinkDialog
+          source={linkSource}
+          onClose={() => setLinkSource(null)}
+          onCreated={() => setRefresh((value) => value + 1)}
+        />
       ) : null}
     </div>
   );

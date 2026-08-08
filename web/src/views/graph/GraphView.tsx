@@ -37,6 +37,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import {
   EmptyState,
+  LinkDialog,
   Spinner,
   nameSpace,
   resolveSpaceValue,
@@ -79,6 +80,8 @@ export default function GraphView() {
 
   const [reloadToken, setReloadToken] = useState(0);
   const canvasRef = useRef<GraphCanvasHandle | null>(null);
+  /** Which node a create-link dialog is anchored on, or null while closed. */
+  const [linkSource, setLinkSource] = useState<NodeOut | null>(null);
 
   const subgraph = useSubgraph(rootId, filters, reloadToken);
   const path = usePath(pathA, pathB);
@@ -625,6 +628,7 @@ export default function GraphView() {
               onSelect={selectFromList}
               onSetPathEnd={setPathEnd}
               pathRole={pathA === selectedNode.id ? "a" : pathB === selectedNode.id ? "b" : null}
+              onCreateEdge={() => setLinkSource(selectedNode)}
               onClose={() => setSelectedId(null)}
             />
           ) : (
@@ -644,6 +648,14 @@ export default function GraphView() {
           )}
         </aside>
       </div>
+
+      {linkSource ? (
+        <LinkDialog
+          source={linkSource}
+          onClose={() => setLinkSource(null)}
+          onCreated={() => setReloadToken((token) => token + 1)}
+        />
+      ) : null}
     </div>
   );
 }

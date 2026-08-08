@@ -891,6 +891,31 @@ Full conventions: `web/README.md`. The rules below are the ones that bind.
   edge-count derivation from the depth-1 read, the 300 ms intent state machine,
   and the per-session `getNode` cache. The card sits below `--nd-z-toast` and
   `--nd-z-modal` in the layer stack (`--nd-z-peek`).
+- **The create-link dialog is one shared component and the first caller of
+  `createEdge`.** `components/LinkDialog.tsx` is the one place a typed edge is
+  made, reachable from the reading view's header, the graph panel's actions,
+  and the editor's `/link` slash command. Its edge-type chips come from the
+  live `GET /api/types` catalog, never a hardcoded list; direction is a
+   first-class toggle that swaps the selected type for its catalog inverse
+   (`supports` ↔ `supported_by`, so outgoing and incoming describe the same
+   fact), and is locked with a reason when the selected type declares no
+   inverse (a user-created directed type has no flipped form) — picking such
+   a chip while flipped to incoming resets the direction to outgoing, so a
+   directed type is never stranded under `in` with both toggle buttons
+   disabled; the target
+  search reuses `suggestLinks` (title-prefix) and falls back
+  to a full `search` when the prefix matches nothing; confidence is optional,
+  unset by default, and refused client-side outside `[0, 1]` exactly as the
+  service refuses it. The pure model — the pairing, the fallback, the
+  confidence parse, the search debounce — lives in `lib/linkDialog.ts` with
+  its `linkDialog.test.ts`; a cross-space target is marked `crossing` in the
+  results, and the dialog names spaces through the shared vocabulary. A
+  human-created edge lands `active` over the HTTP surface, so the dialog has
+  no review-queue affordance. On success the host refetches what it holds (the
+  reading-view rail, the graph panel's subgraph); the editor inserts the
+  target's `[[Title]]` at the caret — or `[[id]]` when the title carries a `|`
+  or a bracket the wikilink grammar cannot (`lib/wikilinks.ts`
+  `wikilinkInsertion`).
 - **A dialog locks body scroll and hands focus somewhere real.** Both the
   review `Modal` and the assets lightbox set `body.style.overflow` on open and
   restore it on close. On close, focus returns to the opener *only if it is

@@ -42,8 +42,18 @@ export interface SlashPaletteState {
    * options entirely once the node is saved.
    */
   typeLocked: boolean;
+  /**
+   * The current document's node id, once the node exists in the database.
+   *
+   * The `/link` command needs a real source node — a typed edge cannot be
+   * anchored on a document that has not been saved yet — so the command is
+   * offered only while this is non-null.
+   */
+  nodeId: string | null;
   /** Set the type the first save will create the node with. */
   selectType(typeId: string): void;
+  /** Open the create-edge dialog with the current node as its From node. */
+  openLinkDialog(): void;
 }
 
 /** A `/` command at the very start of a line, with the letters typed so far. */
@@ -128,6 +138,18 @@ export function slashCommands(read: () => SlashPaletteState): CompletionSource {
       }
     }
 
+    if (state.nodeId !== null) {
+      options.push({
+        label: "/link",
+        detail: "typed edge",
+        type: "keyword",
+        info:
+          "Open the create-edge dialog with this node as the source. When the edge lands, " +
+          "the chosen target's [[wikilink]] is inserted here.",
+        apply: applyLinkCommand(state.openLinkDialog),
+      });
+    }
+
     for (const snippet of SNIPPETS) {
       options.push({
         label: `/${snippet.name}`,
@@ -148,6 +170,19 @@ function applyType(typeId: string, selectType: (typeId: string) => void) {
   return (view: EditorView, _completion: Completion, from: number, to: number): void => {
     selectType(typeId);
     view.dispatch({ changes: { from, to, insert: "" }, userEvent: "input.complete" });
+  };
+}
+
+/**
+ * Remove the command text and open the create-edge dialog.
+ *
+ * The caret stays where the `/link` text was, which is where the editor
+ * inserts the chosen target's `[[wikilink]]` once the edge lands.
+ */
+function applyLinkCommand(open: () => void) {
+  return (view: EditorView, _completion: Completion, from: number, to: number): void => {
+    view.dispatch({ changes: { from, to, insert: "" }, userEvent: "input.complete" });
+    open();
   };
 }
 
