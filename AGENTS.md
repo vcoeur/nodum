@@ -953,21 +953,23 @@ Full conventions: `web/README.md`. The rules below are the ones that bind.
   `focusout` covers exactly that gap, acting on a **null `relatedTarget` while
   `document.hasFocus()`**: null alone is also what a window losing focus
   reports, and acting on it dismissed a menu whenever the reader alt-tabbed
-  away. **Neither focus watcher exempts the opener**, so a mousedown on
-  `⋯` dismisses like any other focus move — exempting it left a
-  press-and-drag-off with the panel open and focus outside the portal, where
-  none of its keys reach. **`MenuButton` therefore acts on `click` but reads
-  the open flag on `mousedown`**: by click time the menu is already closed, and
-  the earlier read is what makes that a toggle rather than a close-then-reopen.
-  Acting on click (not `pointerdown`) is also what makes a drag-off and a touch
-  scroll starting on the button do nothing, and keeps the browser's own focus
-  default — which the panel's close needs to hand focus back to. Keyboard
-  activation reads the live flag, told apart by `detail === 0`; `mousedown`
-  rather than `pointerdown` because every environment fires it. The **document
-  pointerdown close is the one place that still exempts the opener**
-  (`ignore`): it precedes `mousedown`, and closing there would hand that
-  handler a flag already reading closed. **Focus is handed back only if the
-  panel still holds it**, and with
+  away. **`MenuButton` opens; it does not toggle, and no
+  dismissal is exempt for it.** This is the rule that cost the most to find:
+  four attempts at a toggling button produced eleven confirmed defects, every
+  one of them the same shape — whether the click should open or close depends
+  on whether the menu survived until the click, and that depends on an ordering
+  (document capture `pointerdown` → `mousedown` and the focus it moves →
+  React's synchronous flush → `click`) that varies with how the menu was
+  opened, with whether the press produced a click at all, and with the engine.
+  Exempting the opener from the focus watchers stranded a press-and-drag-off
+  with the panel open and focus outside the portal; deciding at `pointerdown`
+  removed the ordering and cost the focus default, the touch-scroll
+  cancellation and every environment without Pointer Events; snapshotting the
+  flag earlier only moved the race. Opening unconditionally has no ordering to
+  get wrong — the press dismisses through the ordinary watchers, the click
+  opens — and Escape, a selection, an outside click, a scroll and a focus move
+  all still dismiss. **Focus is handed back only if the panel still holds it**,
+  and with
   `preventScroll` — unlike a modal this overlay closes *on* scroll, so an
   unconditional restore both drags the viewport back and steals focus from
   wherever a shortcut deliberately put it.

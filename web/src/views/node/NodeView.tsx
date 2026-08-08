@@ -302,7 +302,6 @@ export default function NodeView() {
         <ContextMenu
           label="Actions for this node"
           anchor={headerMenu.anchor}
-          ignore={headerMenu.opener}
           items={headerActions}
           onClose={headerMenu.close}
         />
@@ -544,7 +543,6 @@ function EdgeRow({
         <ContextMenu
           label={`Actions for ${label}`}
           anchor={menu.anchor}
-          ignore={menu.opener}
           items={items}
           onClose={menu.close}
         />

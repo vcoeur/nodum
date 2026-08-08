@@ -93,15 +93,6 @@ export interface MenuAction {
 export interface ContextMenuController {
   /** Where the menu is open, or null while it is closed. */
   anchor: MenuAnchor | null;
-  /**
-   * The button the menu was opened from, when a button opened it.
-   *
-   * Handed to {@link ContextMenu} as `ignore`: without it the panel's
-   * outside-pointerdown close fires on the very button whose click is about to
-   * toggle the menu, so the two cancel out and `⋯` can open a menu it can
-   * never close.
-   */
-  opener: HTMLElement | null;
   /** Open at the pointer — pass a `contextmenu` event straight in. */
   openAt(event: ReactMouseEvent): void;
   /** Open under an element — the `⋯` button's path. */
@@ -110,50 +101,39 @@ export interface ContextMenuController {
   close(): void;
 }
 
-/** The controller's state: where it is open, and what opened it. */
-interface MenuOpening {
-  anchor: MenuAnchor;
-  opener: HTMLElement | null;
-}
-
 /**
  * The open/close half of a contextual menu.
+ *
+ * Every opening replaces whatever was open: a second right-click, or a press
+ * on the `⋯`, dismisses the current panel through the ordinary watchers and
+ * opens a new one at the new position. No dismissal is exempt for any element,
+ * which is what keeps the panel's behaviour independent of the order a
+ * browser happens to dispatch pointerdown, mousedown, focus and click in —
+ * see {@link MenuButton} for the four attempts that established the need.
  *
  * @returns The controller a surface hands to {@link ContextMenu}.
  */
 export function useContextMenu(): ContextMenuController {
-  const [opening, setOpening] = useState<MenuOpening | null>(null);
+  const [anchor, setAnchor] = useState<MenuAnchor | null>(null);
 
   const openAt = useCallback((event: ReactMouseEvent) => {
     // The browser's own menu would cover this one, and the surfaces that offer
     // this menu have nothing the native one can do for them.
     event.preventDefault();
     event.stopPropagation();
-    const target = event.currentTarget;
-    const rect = target.getBoundingClientRect();
-    // No opener: a second right-click *should* close and reopen at the new
-    // position, which is exactly what the outside-pointerdown close gives.
-    setOpening({ anchor: anchorForContextMenu(event, rect), opener: null });
+    const rect = event.currentTarget.getBoundingClientRect();
+    setAnchor(anchorForContextMenu(event, rect));
   }, []);
 
   const openFrom = useCallback((element: HTMLElement | null) => {
     if (element === null) return;
     const rect = element.getBoundingClientRect();
-    setOpening({
-      anchor: { x: rect.left, y: rect.bottom, anchorHeight: rect.height },
-      opener: element,
-    });
+    setAnchor({ x: rect.left, y: rect.bottom, anchorHeight: rect.height });
   }, []);
 
-  const close = useCallback(() => setOpening(null), []);
+  const close = useCallback(() => setAnchor(null), []);
 
-  return {
-    anchor: opening?.anchor ?? null,
-    opener: opening?.opener ?? null,
-    openAt,
-    openFrom,
-    close,
-  };
+  return { anchor, openAt, openFrom, close };
 }
 
 interface ContextMenuProps {
@@ -161,11 +141,6 @@ interface ContextMenuProps {
   label: string;
   /** Where it opens; from the controller. */
   anchor: MenuAnchor;
-  /**
-   * An element whose `pointerdown` must not close the menu — the controller's
-   * `opener`. Pass it whenever the surface renders a {@link MenuButton}.
-   */
-  ignore?: HTMLElement | null;
   /** The actions, in render order. */
   items: readonly MenuAction[];
   /** Called for Escape, a click outside, a scroll, and after a selection. */
@@ -177,11 +152,10 @@ interface ContextMenuProps {
  *
  * @param label The menu's accessible name.
  * @param anchor Where it opens.
- * @param ignore The opener whose pointerdown must not dismiss it.
  * @param items The actions.
  * @param onClose Dismissal handler.
  */
-export function ContextMenu({ label, anchor, ignore, items, onClose }: ContextMenuProps) {
+export function ContextMenu({ label, anchor, items, onClose }: ContextMenuProps) {
   const panelRef = useRef<HTMLDivElement | null>(null);
   const itemRefs = useRef<(HTMLButtonElement | null)[]>([]);
   const restoreTo = useRef<HTMLElement | null>(null);
@@ -260,12 +234,13 @@ export function ContextMenu({ label, anchor, ignore, items, onClose }: ContextMe
   // *also* what a window losing focus reports, so alt-tabbing away dismissed
   // open menus — `document.hasFocus()` is what tells those two apart.
   //
-  // **Neither watcher exempts the opener**, deliberately. Exempting it let
-  // focus come to rest on the `⋯` with the panel still open and outside the
-  // portal, where none of its keys reach — a press-and-drag-off stranded it
-  // there with no click coming to close it. So a mousedown on the opener
-  // dismisses like any other focus move, and `MenuButton` reads the open flag
-  // one event earlier to turn that into a toggle rather than a reopen.
+  // **No element is exempt from either watcher**, the `⋯` included. Exempting
+  // the opener let focus come to rest on it with the panel still open and
+  // outside the portal, where none of its keys reach; every scheme for
+  // reconciling that with a toggling button depended on an event ordering that
+  // is not stable across how the menu was opened or which engine is running.
+  // The button opens rather than toggles, so there is nothing left to
+  // reconcile — see {@link MenuButton}.
   useEffect(() => {
     const leftPanel = (target: Node | null): boolean =>
       target === null || panelRef.current?.contains(target) !== true;
@@ -298,20 +273,13 @@ export function ContextMenu({ label, anchor, ignore, items, onClose }: ContextMe
   // A menu is anchored to a point in the viewport, and a scroll moves the
   // content out from under it — so a scroll closes it rather than letting it
   // hover over an unrelated row. The pointerdown listener is on `document` in
-  // the capture phase: a click on another surface's trigger must close this
-  // menu before that surface opens its own.
-  //
-  // The opener **is** exempt here, and this is the one place it is. `pointerdown`
-  // precedes `mousedown`, and React re-renders synchronously for discrete
-  // events — so closing here would hand `MenuButton`'s `mousedown` a flag that
-  // already read closed, and the click would reopen what the press meant to
-  // dismiss. The focus watcher above does the closing instead, after that flag
-  // has been read.
+  // the capture phase: a press on another surface's trigger — or on the `⋯`
+  // that opened this one — must close this menu before that surface opens its
+  // own. Nothing is exempt.
   useEffect(() => {
     const onPointerDown = (event: PointerEvent) => {
       const target = event.target as Node;
       if (panelRef.current?.contains(target)) return;
-      if (ignore != null && ignore.contains(target)) return;
       onClose();
     };
     document.addEventListener("pointerdown", onPointerDown, true);
@@ -322,7 +290,7 @@ export function ContextMenu({ label, anchor, ignore, items, onClose }: ContextMe
       window.removeEventListener("scroll", onClose, true);
       window.removeEventListener("resize", onClose);
     };
-  }, [onClose, ignore]);
+  }, [onClose]);
 
   const moveTo = (index: number) => {
     if (index === -1) return;
@@ -446,54 +414,40 @@ interface MenuButtonProps {
  * leaves out: a touch user, who has no right-click, and anyone who has never
  * thought to try one on a row in a web app.
  *
- * It **acts on `click`, and remembers on `mousedown` whether the menu was
- * open.** Both halves are load-bearing, and each replaces an arrangement that
- * failed:
+ * **It opens the menu; it does not toggle it.** That is a deliberate
+ * narrowing, arrived at after four attempts at a toggle and eleven confirmed
+ * defects between them. Every one had the same shape: whether the click should
+ * open or close depends on whether the menu was still open by the time the
+ * click arrived, and that depends on an ordering — document capture
+ * `pointerdown`, then `mousedown` and the focus it moves, then React's
+ * synchronous flush, then `click` — that varies with how the menu was opened,
+ * whether the press produced a click at all, and which engine is running it.
+ * Deciding at pointer-down removed the ordering and cost the focus default,
+ * the touch-scroll cancellation, and every environment without Pointer Events.
+ * Snapshotting the flag earlier only moved the race.
  *
- * - Acting on click is what makes a **press-and-drag-off** — the gesture for
- *   cancelling a click — and a **touch scroll starting on this button** do
- *   nothing, because neither produces a click. Deciding at pointer-down
- *   instead opened the menu on a scroll flick and prevented the button from
- *   ever taking focus, which cost the panel's close its focus hand-back.
- * - The *live* open flag cannot drive the toggle, because by the time the
- *   click arrives the menu is already closed: the mousedown focused this
- *   button, and focus landing outside the panel is a dismissal. Reading the
- *   flag one event earlier is what turns that into a toggle instead of a
- *   close-then-reopen. Keyboard activation has no mousedown at all — and needs
- *   none, since nothing closed the menu — so it reads the live flag, told
- *   apart by `detail === 0`.
- *
- * `mousedown` rather than `pointerdown`: every environment fires it, including
- * the ones with no Pointer Events at all, and a toggle that silently stops
- * working there is a menu with no reachable surface on touch.
+ * Opening unconditionally has no ordering to get wrong. A press on this button
+ * dismisses any open menu the ordinary way — through the outside-pointerdown
+ * and focus watchers, which need no exemption for it — and the click that
+ * follows opens one here. Escape, a selection, a click elsewhere, a scroll and
+ * a focus move all still dismiss, so nothing is unreachable; what is gone is a
+ * second way to close that never worked in every configuration.
  *
  * @param label What the menu is for; the button's accessible name.
  * @param controller The menu controller.
  */
 export function MenuButton({ label, controller }: MenuButtonProps) {
   const ref = useRef<HTMLButtonElement | null>(null);
-  const open = controller.anchor !== null;
-  /** Whether the menu was open when this button was pressed. See the docblock. */
-  const openAtPress = useRef(false);
   return (
     <button
       ref={ref}
       type="button"
       className="nd-button nd-button--ghost nd-button--small nd-menu-button"
       aria-haspopup="menu"
-      aria-expanded={open}
+      aria-expanded={controller.anchor !== null}
       aria-label={label}
       title={label}
-      onMouseDown={() => {
-        openAtPress.current = open;
-      }}
-      onClick={(event) => {
-        // `detail === 0` is a keyboard activation: no mousedown ran, and
-        // nothing moved focus, so the live flag is the true one.
-        const wasOpen = event.detail === 0 ? open : openAtPress.current;
-        if (wasOpen) controller.close();
-        else controller.openFrom(ref.current);
-      }}
+      onClick={() => controller.openFrom(ref.current)}
     >
       ⋯
     </button>

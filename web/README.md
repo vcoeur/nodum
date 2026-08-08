@@ -470,13 +470,12 @@ Conventions that hold across the tree:
   two watchers** — `focusin` on `document` for focus moving to another element,
   and the panel's `focusout` on a null `relatedTarget` *while
   `document.hasFocus()`* for focus falling back to `<body>`, the guard being
-  what keeps alt-tabbing away from dismissing an open menu; **`MenuButton`
-  acts on `click` but reads the open flag on `mousedown`**, because by click
-  time the opener's own focus has already dismissed the menu — the earlier read
-  is what makes that a toggle rather than a close-then-reopen, and acting on
-  click is what makes a drag-off and a touch scroll starting on the button do
-  nothing (keyboard activation reads the live flag, told apart by
-  `detail === 0`); and focus
+  what keeps alt-tabbing away from dismissing an open menu; **`MenuButton` opens and does not toggle**, and no
+  dismissal is exempt for it — four attempts at a toggling button produced
+  eleven defects, all of them turning on an event ordering that is not stable
+  across how the menu was opened or which engine runs it, so the button opens
+  unconditionally and the press dismisses through the ordinary watchers; and
+  focus
   is **handed back only if the panel still holds it**, with `preventScroll`
   because this overlay closes on scroll.
 - **A space is not an ordinary node to a surface offering `archiveNode`.** A
