@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { EdgeOut, NodeOut, SubgraphOut } from "../../api/types";
-import { incidentRows } from "./nodeEdges";
+import { edgeCountLabel, incidentRows } from "./nodeEdges";
 
 function node(id: string, overrides: Partial<NodeOut> = {}): NodeOut {
   return {
@@ -40,6 +40,17 @@ function edge(id: string, src: string, dst: string, overrides: Partial<EdgeOut> 
 function subgraph(root: NodeOut, nodes: NodeOut[], edges: EdgeOut[]): SubgraphOut {
   return { root: root.id, depth: 1, nodes: [root, ...nodes], edges, truncated: false };
 }
+
+describe("edgeCountLabel", () => {
+  it("pluralises a full count, and states a truncated one as a floor", () => {
+    expect(edgeCountLabel(1, false)).toBe("1 edge");
+    expect(edgeCountLabel(2, false)).toBe("2 edges");
+    // A truncated read's count is the walk's cap, not the neighbourhood's
+    // size — the header must not present it as fact.
+    expect(edgeCountLabel(200, true)).toBe("200+ edges");
+    expect(edgeCountLabel(1, true)).toBe("1+ edges");
+  });
+});
 
 describe("incidentRows", () => {
   it("orients every incident edge of the root", () => {

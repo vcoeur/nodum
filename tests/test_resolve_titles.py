@@ -167,6 +167,15 @@ def test_ambiguous_without_a_preference_stays_ambiguous(fresh_db):
     assert entry.outcome == "ambiguous"
 
 
+def test_two_matches_inside_the_preferred_space_stay_ambiguous(fresh_db):
+    """The preference narrows, never decides: two copies in it are still ambiguous."""
+    service.create_space("research", principal=owner())
+    service.create_node(type="note", title="duplicate", space="research", principal=owner())
+    service.create_node(type="note", title="duplicate", space="research", principal=owner())
+    (entry,) = service.resolve_titles(["duplicate"], space="research", principal=owner())
+    assert entry.outcome == "ambiguous"
+
+
 def test_a_preference_space_the_principal_cannot_read_does_not_resolve(fresh_db):
     service.create_space("research", principal=owner())
     outsider = agent("outsider", grants={"meta": "read"})
@@ -233,7 +242,7 @@ def test_the_cli_prints_one_envelope_per_title(fresh_db):
     }
 
 
-def test_the_http_route_is_byte_identical_to_the_cli(fresh_db):
+def test_the_http_route_matches_the_cli(fresh_db):
     """Both adapters render one envelope, so their JSON cannot drift."""
     _library()
     cli = runner.invoke(app, ["resolve-titles", "Graph Theory", "--as", "owner"])

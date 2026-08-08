@@ -57,8 +57,12 @@ function edge(overrides: Partial<EdgeOut> = {}): EdgeOut {
   };
 }
 
-function subgraph(nodes: NodeOut[], edges: EdgeOut[]): SubgraphOut {
-  return { root: nodes[0]?.id ?? "", depth: 1, nodes, edges, truncated: false };
+function subgraph(
+  nodes: NodeOut[],
+  edges: EdgeOut[],
+  rootId: string = nodes[0]?.id ?? "",
+): SubgraphOut {
+  return { root: rootId, depth: 1, nodes, edges, truncated: false };
 }
 
 /* ------------------------------------------------------------------ */
@@ -99,6 +103,14 @@ describe("peekExcerpt", () => {
     expect(excerpt).toHaveLength(10);
     expect(excerpt?.endsWith("…")).toBe(true);
   });
+
+  it("never splits an astral-plane character at the cap", () => {
+    const content = "a".repeat(8) + "😀".repeat(3) + "b".repeat(60);
+    const excerpt = peekExcerpt(content, 10);
+    expect(excerpt).toBe("aaaaaaaa😀…");
+    // Capped on code points, not UTF-16 units: no dangling surrogate pair.
+    expect(Array.from(excerpt ?? "")).toHaveLength(10);
+  });
 });
 
 /* ------------------------------------------------------------------ */
@@ -136,6 +148,23 @@ describe("edgeCounts", () => {
       [edge({ id: "e1", src_id: "n2", dst_id: "n1" })],
     );
     expect(edgeCounts(graph)).toEqual({ in: 1, out: 0 });
+  });
+
+  it("uses the walk's declared root, wherever it sits in the node list", () => {
+    const graph = subgraph(
+      [node({ id: "n2" }), node(), node({ id: "n3" })],
+      [
+        edge({ id: "e1", src_id: "n1", dst_id: "n2" }),
+        edge({ id: "e2", src_id: "n3", dst_id: "n1" }),
+      ],
+      "n1",
+    );
+    expect(edgeCounts(graph)).toEqual({ in: 1, out: 1 });
+  });
+
+  it("counts a self-loop as outgoing, like the reading view's rail", () => {
+    const graph = subgraph([node()], [edge({ id: "e1", src_id: "n1", dst_id: "n1" })]);
+    expect(edgeCounts(graph)).toEqual({ in: 0, out: 1 });
   });
 });
 
