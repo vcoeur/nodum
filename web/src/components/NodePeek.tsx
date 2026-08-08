@@ -182,6 +182,13 @@ function usePeek() {
   const shownByRef = useRef<ShownBy>("hover");
   /** Set by `focusEnter(…, focusCard)`: the next shown card takes focus. */
   const focusCardOnShowRef = useRef(false);
+  /**
+   * Set while `dismiss()` hands focus back to the trigger: both focus paths
+   * would read that programmatic focus as a user focus and re-arm the card
+   * over the dismissal just requested. Cleared after the synchronous dispatch
+   * and the microtasks it queues — see `dismiss`.
+   */
+  const suppressFocusRearmRef = useRef(false);
 
   const clearIntentTimer = useCallback(() => {
     if (intentTimerRef.current !== null) window.clearTimeout(intentTimerRef.current);
@@ -218,6 +225,9 @@ function usePeek() {
    *  end of `document.body` in tab order). */
   const focusEnter = useCallback(
     (nodeId: string, anchor: Element | null, focusCard = false) => {
+      // A focus returned to the trigger by an Esc-in-card dismissal is that
+      // dismissal, not a new focus — re-arming would reopen the card over it.
+      if (suppressFocusRearmRef.current) return;
       clearGrace();
       clearIntentTimer();
       anchorRef.current = anchor;
@@ -249,12 +259,24 @@ function usePeek() {
 
   /** Escape, a click outside, leaving the card: hide now. When the card held
    *  the focus, hand it back to the trigger — an Esc-in-card must not drop a
-   *  keyboard user on `<body>`. */
+   *  keyboard user on `<body>`. That focus return fires `focusin` on the
+   *  trigger, which the focus paths would otherwise read as a user focus and
+   *  re-arm the card; the re-arm is suppressed for the dispatch and the
+   *  microtasks it queues. */
   const dismiss = useCallback(() => {
     const card = cardRef.current;
     if (card !== null && card.contains(document.activeElement)) {
       const anchor = anchorRef.current;
-      if (anchor instanceof HTMLElement && anchor.isConnected) anchor.focus();
+      if (anchor instanceof HTMLElement && anchor.isConnected) {
+        suppressFocusRearmRef.current = true;
+        anchor.focus();
+        // `focus()` dispatches `focusin` synchronously, and the scope's
+        // title-resolution callback re-checks focus in a microtask — clear
+        // after both, so a genuine later focus is never suppressed.
+        queueMicrotask(() => {
+          suppressFocusRearmRef.current = false;
+        });
+      }
     }
     clearGrace();
     clearIntentTimer();
