@@ -944,16 +944,23 @@ Full conventions: `web/README.md`. The rules below are the ones that bind.
   killed every `document`/`window` shortcut in the app, search's `/` and Ctrl-K
   among them; Space is the exception inside the set — on a focused `menuitem` its
   default action *is* the activation ARIA requires, so it is prevented only on
-  the panel itself. **Focus landing outside the panel closes it**, because a
-  shortcut outside the set is exactly a thing that moves focus without
-  dismissing anything, and a panel left painted over the page had no keyboard
-  route out. Watched as a `focusin` on `document`, never the panel's own
-  `blur`: blur fires with a null `relatedTarget` both when focus moves to
-  something unfocusable *and* when the whole window loses focus, so alt-tabbing
-  away dismissed open menus. **Both close paths exempt the opener** (`ignore`)
-  — a mousedown on `⋯` focuses the button, and closing on either the
-  pointerdown or that focus leaves the click to reopen what it meant to
-  dismiss. **Focus is handed back only if the panel still holds it**, and with
+  the panel itself. **Focus leaving the panel closes it, and that takes two
+  watchers**, because neither DOM event says it alone. `focusin` on `document`
+  fires when something *else* takes focus — which is what a shortcut outside
+  the set does, and a panel left painted over the page had no keyboard route
+  out — but it is silent when focus falls back to `<body>`, which is what a
+  focused menu item going `disabled` under a refetch produces. The panel's own
+  `focusout` covers exactly that gap, acting on a **null `relatedTarget` while
+  `document.hasFocus()`**: null alone is also what a window losing focus
+  reports, and acting on it dismissed a menu whenever the reader alt-tabbed
+  away. **`MenuButton` toggles on `pointerdown` and prevents its default**, so
+  a pointer never moves focus onto the opener and neither watcher needs an
+  exemption for it — deciding on click instead left a press-and-drag-off with
+  the panel open and focus outside the portal, where none of its keys reach.
+  Enter and Space still arrive as a click, told apart by `detail === 0`. The
+  **pointerdown close still exempts the opener** (`ignore`), so the button's
+  own handler is what decides. **Focus is handed back only if the panel still
+  holds it**, and with
   `preventScroll` — unlike a modal this overlay closes *on* scroll, so an
   unconditional restore both drags the viewport back and steals focus from
   wherever a shortcut deliberately put it.

@@ -242,32 +242,56 @@ export function ContextMenu({ label, anchor, ignore, items, onClose }: ContextMe
     };
   }, [anchor]);
 
-  // Focus landing anywhere else dismisses the menu. Without it, any shortcut
-  // outside `MENU_KEYS` that moves focus — search's `/` and Ctrl-K put the
-  // caret in the query box — left the panel painted over the page with no
-  // keyboard route out.
+  // Focus leaving the panel dismisses the menu, and it takes **two** watchers
+  // to say that, because neither DOM event covers it alone.
   //
-  // A `focusin` watcher and not the panel's own `blur`, because blur cannot
-  // tell the two cases apart: it fires with a null `relatedTarget` both when
-  // focus moves to something unfocusable *and* when the whole document loses
-  // focus, so alt-tabbing away dismissed an open menu. `focusin` fires only
-  // when something in this document actually takes focus.
+  // `focusin` on `document` is the one that fires when something else takes
+  // focus — which is what any shortcut outside `MENU_KEYS` does (search's `/`
+  // and Ctrl-K put the caret in the query box), and leaving the panel painted
+  // over the page with no keyboard route out was the bug. But `focusin` fires
+  // only when an *element* takes focus, so it is silent for the case where
+  // focus falls back to `<body>` — a focused menu item that becomes `disabled`
+  // under a refetch does exactly that, and the assets lightbox documents the
+  // same browser behaviour.
   //
-  // The opener is exempt for the same reason it is exempt from the
-  // pointerdown close: a mousedown on `⋯` focuses the button, and closing on
-  // that would leave the click to reopen what it meant to dismiss.
+  // The panel's own `focusout` covers that gap, and only that gap: it acts on
+  // a null `relatedTarget` alone, which is the fall-back-to-nothing case. The
+  // reason it cannot be the whole answer is that a null `relatedTarget` is
+  // *also* what a window losing focus reports, so alt-tabbing away dismissed
+  // open menus — `document.hasFocus()` is what tells those two apart.
+  //
+  // Neither watcher exempts the opener. It does not need one: `MenuButton`
+  // toggles on `pointerdown` and prevents that event's default, so a pointer
+  // never moves focus onto the `⋯` at all — which also closes the hole where a
+  // press-and-drag-off left the panel open with focus outside it.
   useEffect(() => {
+    const leftPanel = (target: Node | null): boolean =>
+      target === null || panelRef.current?.contains(target) !== true;
+
     const onFocusIn = (event: FocusEvent) => {
       if (restoring.current) return;
       const target = event.target as Node | null;
-      if (target === null) return;
-      if (panelRef.current?.contains(target)) return;
-      if (ignore != null && ignore.contains(target)) return;
+      if (target !== null && !leftPanel(target)) return;
+      onClose();
+    };
+    const onFocusOut = (event: FocusEvent) => {
+      if (restoring.current) return;
+      // Only the fell-to-nothing case; a move to a real element is `focusin`'s.
+      if (event.relatedTarget !== null) return;
+      // And only while this document still has focus — otherwise this is the
+      // reader alt-tabbing away, and their menu should be here when they come
+      // back.
+      if (!document.hasFocus()) return;
       onClose();
     };
     document.addEventListener("focusin", onFocusIn);
-    return () => document.removeEventListener("focusin", onFocusIn);
-  }, [onClose, ignore]);
+    const panel = panelRef.current;
+    panel?.addEventListener("focusout", onFocusOut);
+    return () => {
+      document.removeEventListener("focusin", onFocusIn);
+      panel?.removeEventListener("focusout", onFocusOut);
+    };
+  }, [onClose]);
 
   // A menu is anchored to a point in the viewport, and a scroll moves the
   // content out from under it — so a scroll closes it rather than letting it
@@ -414,10 +438,18 @@ interface MenuButtonProps {
  * leaves out: a touch user, who has no right-click, and anyone who has never
  * thought to try one on a row in a web app.
  *
- * It **toggles**, which only works because the open panel exempts its own
- * opener from the outside-pointerdown close: without that exemption the
- * pointerdown closes and the click reopens in the same render, and the button
- * can open a menu it can never dismiss.
+ * It **toggles on `pointerdown`, not on click**, and prevents that event's
+ * default. Both halves matter. Deciding on pointerdown means a
+ * press-and-drag-off — the gesture for cancelling a click — has already
+ * resolved, instead of leaving the panel open with no click coming to close
+ * it. Preventing the default keeps the pointer from moving focus onto this
+ * button at all, so the panel's dismiss-on-focus watchers need no exemption
+ * for it: without that, focus came to rest on the opener with the menu still
+ * open and outside the portal, where none of its keys reach.
+ *
+ * A pointerdown is not a keyboard activation, so Enter and Space still arrive
+ * as a click — with `detail === 0`, which is how that click is told apart from
+ * the pointer's own.
  *
  * @param label What the menu is for; the button's accessible name.
  * @param controller The menu controller.
@@ -425,6 +457,7 @@ interface MenuButtonProps {
 export function MenuButton({ label, controller }: MenuButtonProps) {
   const ref = useRef<HTMLButtonElement | null>(null);
   const open = controller.anchor !== null;
+  const toggle = () => (open ? controller.close() : controller.openFrom(ref.current));
   return (
     <button
       ref={ref}
@@ -434,7 +467,19 @@ export function MenuButton({ label, controller }: MenuButtonProps) {
       aria-expanded={open}
       aria-label={label}
       title={label}
-      onClick={() => (open ? controller.close() : controller.openFrom(ref.current))}
+      onPointerDown={(event) => {
+        // Primary button only: a right-click here belongs to whatever surface
+        // the button sits on, exactly as it does on the rest of the row.
+        if (event.button !== 0) return;
+        event.preventDefault();
+        toggle();
+      }}
+      onClick={(event) => {
+        // `detail === 0` is a keyboard activation (Enter/Space); a pointer's
+        // click has already been handled on pointerdown.
+        if (event.detail !== 0) return;
+        toggle();
+      }}
     >
       ⋯
     </button>

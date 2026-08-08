@@ -466,14 +466,16 @@ Conventions that hold across the tree:
   panel; but React's `stopPropagation` forwards to the native event, so
   stopping *every* key kills the app's `document`/`window` shortcuts while a
   menu is open — the set is pure and tested in `lib/contextMenu.ts` because
-  both edges are silent regressions); **focus landing outside the panel closes
-  it**, watched as `focusin` rather than the panel's `blur` because blur cannot
-  tell "focus moved elsewhere in the document" from "the window lost focus",
-  and alt-tabbing away was dismissing open menus; the close
-  **exempts the opener** on both paths, or the `⋯` button
-  closes what its own click reopens; and focus is **handed back only if the
-  panel still holds it**, with `preventScroll` because this overlay closes on
-  scroll.
+  both edges are silent regressions); **focus leaving the panel closes it, via
+  two watchers** — `focusin` on `document` for focus moving to another element,
+  and the panel's `focusout` on a null `relatedTarget` *while
+  `document.hasFocus()`* for focus falling back to `<body>`, the guard being
+  what keeps alt-tabbing away from dismissing an open menu; **`MenuButton`
+  toggles on `pointerdown` and prevents its default**, so a pointer never
+  focuses the opener and a press-and-drag-off cannot strand the panel (Enter
+  and Space still arrive as a click, told apart by `detail === 0`); and focus
+  is **handed back only if the panel still holds it**, with `preventScroll`
+  because this overlay closes on scroll.
 - **A space is not an ordinary node to a surface offering `archiveNode`.** A
   space is a node of type `space` in `meta` and the node archive route reaches
   the same row the space route does, so the server would perform it — while the
