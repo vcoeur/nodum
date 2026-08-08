@@ -23,6 +23,22 @@ export interface IncidentRow {
 }
 
 /**
+ * The rail header's count text.
+ *
+ * A truncated neighbourhood read (`SubgraphOut.truncated`) means the count is
+ * the walk's cap, not the neighbourhood's size, so it is stated as a floor
+ * ("200+ edges") rather than presented as fact.
+ *
+ * @param count The number of incident rows.
+ * @param truncated Whether the neighbourhood read hit a cap.
+ * @returns The header text, pluralised unless truncated makes it approximate.
+ */
+export function edgeCountLabel(count: number, truncated: boolean): string {
+  if (truncated) return `${count}+ edges`;
+  return `${count} edge${count === 1 ? "" : "s"}`;
+}
+
+/**
  * The root's incident edges, outgoing first, in edge-creation order.
  *
  * @param subgraph The `depth: 1` neighborhood read.
