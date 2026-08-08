@@ -12,9 +12,12 @@
  * - `NodePeek` wraps a trigger element directly (hover/focus on it shows the
  *   card) — the search title and the graph panel title;
  * - `NodePeekScope` owns a rendered-Markdown container and delegates
- *   `mouseover`/`focusin`/`mouseout` on it, the same way
+ *   `mouseover`/`focusin`/`mouseout`/`focusout` on it, the same way
  *   `lib/wikilinks.ts`'s click interceptor does — the anchors inside sanitised
- *   `innerHTML` cannot host React props, so the container can.
+ *   `innerHTML` cannot host React props, so the container can. It also watches
+ *   the container for mutations, so a preview re-render that detaches the
+ *   armed anchor dismisses the card instead of leaving it pinned to a dead
+ *   element.
  *
  * Everything testable about the card lives in `lib/peek.ts`; this file is the
  * wiring: the intent timers, the fetch through a per-session cache, the
@@ -73,6 +76,15 @@ const titleToId = new Map<string, string | null>();
 const titleResolutions = new Map<string, Promise<string | null>>();
 
 /**
+ * The cache key for a title resolution: the space preference counts, because
+ * `resolveTitles` tie-breaks on it and the surfaces differ (the reading view
+ * passes the node's own space, the editor preview none).
+ */
+function titleCacheKey(title: string, space: string | undefined): string {
+  return `${space ?? ""}\u0000${title}`;
+}
+
+/**
  * Resolve a wikilink title to a node id, per session, with the click path's
  * space preference.
  *
@@ -81,9 +93,10 @@ const titleResolutions = new Map<string, Promise<string | null>>();
  * @returns The node id, or null when the title does not resolve.
  */
 function resolveTitleId(title: string, space: string | undefined): Promise<string | null> {
-  const cached = titleToId.get(title);
+  const key = titleCacheKey(title, space);
+  const cached = titleToId.get(key);
   if (cached !== undefined) return Promise.resolve(cached);
-  const pending = titleResolutions.get(title);
+  const pending = titleResolutions.get(key);
   if (pending !== undefined) return pending;
   const started = resolveTitles([title], space === undefined ? undefined : { space })
     .then(([resolution]) => {
@@ -91,13 +104,13 @@ function resolveTitleId(title: string, space: string | undefined): Promise<strin
         resolution !== undefined && resolution.outcome === "resolved" && resolution.node_id !== null
           ? resolution.node_id
           : null;
-      titleToId.set(title, nodeId);
+      titleToId.set(key, nodeId);
       return nodeId;
     })
     .finally(() => {
-      titleResolutions.delete(title);
+      titleResolutions.delete(key);
     });
-  titleResolutions.set(title, started);
+  titleResolutions.set(key, started);
   return started;
 }
 
@@ -167,6 +180,8 @@ function usePeek() {
   const intentTimerRef = useRef<number | null>(null);
   const graceTimerRef = useRef<number | null>(null);
   const shownByRef = useRef<ShownBy>("hover");
+  /** Set by `focusEnter(…, focusCard)`: the next shown card takes focus. */
+  const focusCardOnShowRef = useRef(false);
 
   const clearIntentTimer = useCallback(() => {
     if (intentTimerRef.current !== null) window.clearTimeout(intentTimerRef.current);
@@ -196,13 +211,18 @@ function usePeek() {
     [clearGrace, clearIntentTimer, dispatch],
   );
 
-  /** A trigger received focus: show immediately — keyboard users do not hover. */
+  /** A trigger received focus: show immediately — keyboard users do not hover.
+   *  With `focusCard`, focus moves into the card once it is on screen, making
+   *  its actions the next tab stops after the trigger (the scope's anchors sit
+   *  inside `innerHTML`, so their card would otherwise sit unreachable at the
+   *  end of `document.body` in tab order). */
   const focusEnter = useCallback(
-    (nodeId: string, anchor: Element | null) => {
+    (nodeId: string, anchor: Element | null, focusCard = false) => {
       clearGrace();
       clearIntentTimer();
       anchorRef.current = anchor;
       shownByRef.current = "focus";
+      focusCardOnShowRef.current = focusCard;
       dispatch({ type: "enter", trigger: nodeId });
       dispatch({ type: "confirm" });
     },
@@ -210,10 +230,13 @@ function usePeek() {
   );
 
   /** A pointer left a trigger: hide after the grace window, unless the card
-   *  was entered in time. */
+   *  was entered in time. A focus-shown card survives a stray mouseleave —
+   *  the pointer is not the interaction that summoned it (mirror of the blur
+   *  rule below). */
   const leave = useCallback(
     (nodeId: string) => {
       if (stateRef.current.trigger !== nodeId) return;
+      if (shownByRef.current === "focus") return;
       clearGrace();
       graceTimerRef.current = window.setTimeout(() => {
         if (stateRef.current.trigger !== nodeId) return;
@@ -224,8 +247,15 @@ function usePeek() {
     [clearGrace, clearIntentTimer, dispatch],
   );
 
-  /** Escape, a click outside, leaving the card: hide now. */
+  /** Escape, a click outside, leaving the card: hide now. When the card held
+   *  the focus, hand it back to the trigger — an Esc-in-card must not drop a
+   *  keyboard user on `<body>`. */
   const dismiss = useCallback(() => {
+    const card = cardRef.current;
+    if (card !== null && card.contains(document.activeElement)) {
+      const anchor = anchorRef.current;
+      if (anchor instanceof HTMLElement && anchor.isConnected) anchor.focus();
+    }
     clearGrace();
     clearIntentTimer();
     dispatch({ type: "dismiss" });
@@ -254,6 +284,40 @@ function usePeek() {
       if (card !== null && card.contains(document.activeElement)) return;
       dismiss();
     }, 0);
+  }, [dismiss]);
+
+  /** A delegated focusout from the scope's container.
+   *
+   * The scope's anchors cannot host React handlers, so focus leaving one
+   * routes here. Unlike the wrapper's blur rule, a focus-shown card does not
+   * survive a move-on: in a rendered-Markdown container, Tab moving on means
+   * the peek is over. The one survivor is focus landing inside the card
+   * itself — the hop from the anchor onto its first action when a focus-show
+   * summons it. */
+  const scopeBlur = useCallback(
+    (nodeId: string) => {
+      window.setTimeout(() => {
+        if (stateRef.current.trigger !== nodeId) return;
+        const card = cardRef.current;
+        if (card !== null && card.contains(document.activeElement)) return;
+        clearIntentTimer();
+        dispatch({ type: "leave", trigger: nodeId });
+      }, 0);
+    },
+    [clearIntentTimer, dispatch],
+  );
+
+  /** Dismiss when the armed anchor left the DOM.
+   *
+   * The editor preview rewrites `container.innerHTML` on its debounce, which
+   * detaches the wikilink anchors without firing mouseout; the open card
+   * would otherwise keep a dead anchor and jump to the viewport corner on the
+   * next reposition. The scope's MutationObserver calls this on every
+   * mutation; the connection check makes it a no-op while the anchor is still
+   * live. */
+  const dismissIfAnchorDetached = useCallback(() => {
+    const anchor = anchorRef.current;
+    if (anchor !== null && !anchor.isConnected) dismiss();
   }, [dismiss]);
 
   // Load the peek's data when the state machine confirms. The data stays
@@ -286,12 +350,22 @@ function usePeek() {
 
   // Place the card when it appears — and again if its content changes height
   // (the space name resolving flips the meta line). Painted before the
-  // browser does, so the card never flashes at the wrong spot.
+  // browser does, so the card never flashes at the wrong spot. A focus-show
+  // that asked for it hands focus to the card's first action here.
   useLayoutEffect(() => {
     const card = cardRef.current;
     const anchor = anchorRef.current;
-    if (shown && card !== null && anchor !== null) positionCard(anchor, card);
-  }, [shown, data]);
+    if (!shown || card === null || anchor === null) return;
+    if (!anchor.isConnected) {
+      dismiss();
+      return;
+    }
+    positionCard(anchor, card);
+    if (focusCardOnShowRef.current) {
+      focusCardOnShowRef.current = false;
+      card.querySelector<HTMLElement>("a, button")?.focus();
+    }
+  }, [shown, data, dismiss]);
 
   // While shown: Escape dismisses, a click anywhere outside the card dismisses
   // (a focus-shown card survives focus moving elsewhere, not a pointer click),
@@ -309,7 +383,15 @@ function usePeek() {
     const reposition = () => {
       const card = cardRef.current;
       const anchor = anchorRef.current;
-      if (card !== null && anchor !== null) positionCard(anchor, card);
+      if (card === null || anchor === null) return;
+      // The trigger may be gone — the editor preview replaced its `innerHTML`
+      // — without a mouseout. Positioned against a detached node, the card
+      // would jump to the viewport corner; dismiss instead.
+      if (!anchor.isConnected) {
+        dismiss();
+        return;
+      }
+      positionCard(anchor, card);
     };
     document.addEventListener("keydown", onKeyDown);
     document.addEventListener("mousedown", onMouseDown);
@@ -346,7 +428,16 @@ function usePeek() {
         )
       : null;
 
-  return { enter, focusEnter, leave, dismiss, onTriggerBlur, card };
+  return {
+    enter,
+    focusEnter,
+    leave,
+    dismiss,
+    onTriggerBlur,
+    scopeBlur,
+    dismissIfAnchorDetached,
+    card,
+  };
 }
 
 /* ------------------------------------------------------------------ */
@@ -478,15 +569,18 @@ interface NodePeekScopeProps {
  *
  * The anchors live in sanitised `innerHTML`, so they cannot carry React
  * props; the container can. Delegation mirrors `lib/wikilinks.ts`'s click
- * interceptor: `mouseover`/`mouseout`/`focusin` on the container, matched
- * through `closest("a.nd-wikilink")`, with the title resolved to a node id
- * before the peek arms.
+ * interceptor: `mouseover`/`mouseout`/`focusin`/`focusout` on the container,
+ * matched through `closest("a.nd-wikilink")`, with the title resolved to a
+ * node id before the peek arms. A focus-show moves focus into the card, so
+ * its actions follow the anchor in tab order; `focusout` hides a focus-peek
+ * on Tab-away. A MutationObserver dismisses the card when the armed anchor is
+ * destroyed by a preview re-render.
  *
  * @param containerRef The rendered-content element.
  * @param space The title-resolution space preference.
  */
 export function NodePeekScope({ containerRef, space }: NodePeekScopeProps) {
-  const { enter, focusEnter, leave, card } = usePeek();
+  const { enter, focusEnter, leave, scopeBlur, dismissIfAnchorDetached, card } = usePeek();
 
   useEffect(() => {
     const container = containerRef.current;
@@ -511,7 +605,7 @@ export function NodePeekScope({ containerRef, space }: NodePeekScopeProps) {
       if (title === null) return;
       // Only a wikilink that actually armed has an id to leave — the map is
       // what enter's resolution wrote, so an unarmed one is a no-op.
-      const nodeId = titleToId.get(title);
+      const nodeId = titleToId.get(titleCacheKey(title, space));
       if (nodeId !== null && nodeId !== undefined) leave(nodeId);
     };
 
@@ -523,19 +617,42 @@ export function NodePeekScope({ containerRef, space }: NodePeekScopeProps) {
       void resolveTitleId(title, space).then((nodeId) => {
         if (nodeId === null) return;
         if (!anchor.contains(document.activeElement)) return; // focus moved on
-        focusEnter(nodeId, anchor);
+        focusEnter(nodeId, anchor, true);
       });
+    };
+
+    const onFocusOut = (event: FocusEvent) => {
+      const anchor = wikilinkAnchor(event.target);
+      if (anchor === null) return;
+      const title = titleFromWikilinkHref(anchor.getAttribute("href") ?? "");
+      if (title === null) return;
+      const nodeId = titleToId.get(titleCacheKey(title, space));
+      if (nodeId === null || nodeId === undefined) return;
+      // A move onto another anchor in this container is the incoming
+      // focusin's re-aim, not a Tab-away — leave the card to it.
+      const movedTo = event.relatedTarget;
+      if (movedTo instanceof Node && container.contains(movedTo)) return;
+      scopeBlur(nodeId);
     };
 
     container.addEventListener("mouseover", onMouseOver);
     container.addEventListener("mouseout", onMouseOut);
     container.addEventListener("focusin", onFocusIn);
+    container.addEventListener("focusout", onFocusOut);
+    // The editor preview rewrites `innerHTML` per debounced keystroke,
+    // detaching the armed anchor without a mouseout — the open card would
+    // keep a dead anchor and jump to the viewport corner on the next
+    // reposition. Dismiss as soon as the anchor is gone.
+    const observer = new MutationObserver(() => dismissIfAnchorDetached());
+    observer.observe(container, { childList: true, subtree: true });
     return () => {
       container.removeEventListener("mouseover", onMouseOver);
       container.removeEventListener("mouseout", onMouseOut);
       container.removeEventListener("focusin", onFocusIn);
+      container.removeEventListener("focusout", onFocusOut);
+      observer.disconnect();
     };
-  }, [containerRef, space, enter, focusEnter, leave]);
+  }, [containerRef, space, enter, focusEnter, leave, scopeBlur, dismissIfAnchorDetached]);
 
   return card;
 }

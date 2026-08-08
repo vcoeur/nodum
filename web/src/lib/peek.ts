@@ -14,6 +14,17 @@
  * card has to re-aim: hovering from one trigger straight onto another must
  * cancel the first peek's intent and start the second's, and a leave for a
  * trigger the peek is not about must be a no-op.
+ *
+ * Two limits are deliberate. The cache is **session-scoped**: what a card
+ * shows is the node as it was the first time it was peeked, so a node edited
+ * elsewhere in this session stays stale until the page reloads. That trade-off
+ * is the point — a peek is a transient glance, and refreshing per hover would
+ * cost a round trip to buy a freshness nobody sees; the alternative
+ * (invalidating on mutation) would couple this module to the write path. And
+ * loads are **not cancellable**: the card has no AbortSignal, because the
+ * fetch is shared per session and aborting one hover would poison the cache
+ * for the next. A stale arrival is discarded by the caller's render guard,
+ * while the cache entry itself stays good for the next show.
  */
 
 import type { NodeOut, SubgraphOut } from "../api/types";
@@ -44,7 +55,10 @@ export const PEEK_LEAVE_GRACE_MS = 150;
 export function peekExcerpt(content: string, limit: number = PEEK_LIMIT): string | null {
   const flattened = content.replace(/\s+/g, " ").trim();
   if (!flattened) return null;
-  return flattened.length > limit ? `${flattened.slice(0, limit - 1)}…` : flattened;
+  // Cap on code points, not UTF-16 units: `slice` on the string would cut an
+  // astral-plane character (an emoji, say) in half at the boundary.
+  const chars = [...flattened];
+  return chars.length > limit ? `${chars.slice(0, limit - 1).join("")}…` : flattened;
 }
 
 /** How many active edges point at a node and away from it. */
@@ -62,13 +76,15 @@ export interface EdgeCounts {
  * @returns The counts; both zero when the walk returned nothing.
  */
 export function edgeCounts(subgraph: SubgraphOut): EdgeCounts {
-  const root = subgraph.nodes[0];
-  if (root === undefined) return { in: 0, out: 0 };
+  const root = subgraph.root;
+  if (root === "") return { in: 0, out: 0 };
   let incoming = 0;
   let outgoing = 0;
   for (const edge of subgraph.edges) {
-    if (edge.src_id === root.id) outgoing += 1;
-    else if (edge.dst_id === root.id) incoming += 1;
+    // A self-loop is the root's own edge, so it counts as outgoing — the
+    // same convention the reading view's rail uses.
+    if (edge.src_id === root) outgoing += 1;
+    else if (edge.dst_id === root) incoming += 1;
   }
   return { in: incoming, out: outgoing };
 }
