@@ -214,6 +214,20 @@ export interface NodeDocument {
   handleContentChange(content: string): void;
   /** Save immediately, skipping the debounce. */
   saveNow(): void;
+  /**
+   * Save anything outstanding and wait for it to land.
+   *
+   * {@link NodeDocument.saveNow} fires and forgets, which is right for a
+   * keyboard shortcut and wrong in front of a write that has to happen *after*
+   * the save. Archiving is that write: the buffer's flush is detached, so an
+   * archive with unsaved text lands a `node.update` on an already-archived row
+   * and makes it the event-log head — which costs the archive the undo it just
+   * promised.
+   *
+   * @returns True when the buffer is on disk; false when the save failed, in
+   *   which case `saveError` says why and the caller must not go on.
+   */
+  persistNow(): Promise<boolean>;
   /** Re-fetch the node from the server. */
   reload(): void;
 }
@@ -630,6 +644,18 @@ export function useNodeDocument({
     void runPersist();
   }, [runPersist]);
 
+  const persistNow = useCallback(async () => {
+    // Whatever is already on the wire lands first: scheduling a second write
+    // over it would race the one in flight, and `persist` reads `savedRef`,
+    // which the in-flight response is about to move.
+    await inFlightRef.current;
+    await runPersist();
+    // Read after the run rather than from `saveState`, which is React state a
+    // render behind. `hasUnflushed` is the buffer-versus-wire comparison the
+    // flush itself uses, so agreeing with it is the point.
+    return !hasUnflushed();
+  }, [hasUnflushed, runPersist]);
+
   const reload = useCallback(() => {
     // Before `ownedIdRef` is cleared: a flush after it would read a null id and
     // create a second node out of the document being re-fetched.
@@ -770,6 +796,7 @@ export function useNodeDocument({
     savedAt,
     handleContentChange,
     saveNow,
+    persistNow,
     reload,
   };
 }

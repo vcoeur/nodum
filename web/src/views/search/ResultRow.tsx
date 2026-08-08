@@ -163,6 +163,7 @@ export function ResultRow({
         <ContextMenu
           label={`Actions for ${title}`}
           anchor={menu.anchor}
+          ignore={menu.opener}
           items={items}
           onClose={menu.close}
         />

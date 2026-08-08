@@ -297,6 +297,7 @@ export default function NodeView() {
         <ContextMenu
           label="Actions for this node"
           anchor={headerMenu.anchor}
+          ignore={headerMenu.opener}
           items={headerActions}
           onClose={headerMenu.close}
         />
@@ -378,7 +379,11 @@ export default function NodeView() {
       {archiving ? (
         <ArchiveNodeDialog
           node={archiving}
-          edgeCount={rows.length}
+          // `rows` is the *root's* neighbourhood. An edge row's menu archives
+          // the far node, whose own edge count this view has never read —
+          // stating the root's there would put a number from another node in a
+          // dialog whose every line has to be a fact about this one.
+          edgeCount={archiving.id === root?.id ? rows.length : null}
           onConfirm={() => nodeArchive.archive(archiving)}
           onClose={() => setArchiving(null)}
         />
@@ -416,10 +421,15 @@ function BacklinksSection({ backlinks }: { backlinks: readonly Backlink[] }) {
               <span className="nd-node__crossing-mark">crossing</span>
             ) : null}
             {backlink.context === null ? (
-              // The edge is live and its wikilink is not in the content any
-              // more. Saying so beats an empty row that looks like a bug.
+              // Says what was observed and stops. Why the link is not findable
+              // is not knowable from here: the target may have been renamed
+              // since (the mention edge survives until that node is next
+              // written), the text may have been edited, or the edge may never
+              // have come from a wikilink at all — `mentions` is a selectable
+              // type in the link dialog and over MCP. Naming one of those would
+              // be inventing a cause.
               <p className="nd-meta nd-node__backlink-context">
-                The link is no longer in that node's text — the edge is still active.
+                Active edge; no wikilink to this node in that text as it stands.
               </p>
             ) : (
               <p className="nd-node__backlink-context">{backlink.context}</p>
@@ -476,7 +486,11 @@ function EdgeRow({
   );
 
   if (far === null) {
-    return <li className="nd-node__edge-row nd-node__edge-row--disabled">{cells}</li>;
+    return (
+      <li className="nd-node__edge-line">
+        <span className="nd-node__edge-row nd-node__edge-row--disabled">{cells}</span>
+      </li>
+    );
   }
 
   const refusal = archiveRefusal(far);
@@ -495,7 +509,11 @@ function EdgeRow({
   ];
 
   return (
-    <li>
+    // The row is a link and the button is its sibling, not its child: an
+    // interactive control inside an anchor is invalid and unreachable. The
+    // button is not optional — a right-click does not exist on touch, and
+    // these neighbour actions are the whole point of the rail's menu.
+    <li className="nd-node__edge-line">
       <Link
         className="nd-node__edge-row"
         to={`/node/${encodeURIComponent(far.id)}`}
@@ -503,10 +521,12 @@ function EdgeRow({
       >
         {cells}
       </Link>
+      <MenuButton label={`Actions for ${label}`} controller={menu} />
       {menu.anchor !== null ? (
         <ContextMenu
           label={`Actions for ${label}`}
           anchor={menu.anchor}
+          ignore={menu.opener}
           items={items}
           onClose={menu.close}
         />

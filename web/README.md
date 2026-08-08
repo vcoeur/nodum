@@ -460,7 +460,17 @@ Conventions that hold across the tree:
   hidden, so the refusal is readable once instead of being met as a 400. And
   nothing destructive happens in the menu itself: a `danger` item opens a
   confirm, which is what lets the menu close on Enter without a keypress ever
-  moving live state.
+  moving live state. Three wiring rules ride under it, each of which was a bug
+  first: the menu **stops propagation on every key** (a portal bubbles through
+  the React tree, so the list's own roving `onKeyDown` sits above the panel);
+  the outside-pointerdown close **exempts the opener**, or the `⋯` button
+  closes what its own click reopens; and focus is **taken and handed back** to
+  a still-connected opener, the same rule the modals follow.
+- **A space is not an ordinary node to a surface offering `archiveNode`.** A
+  space is a node of type `space` in `meta` and the node archive route reaches
+  the same row the space route does, so the server would perform it — while the
+  consequences are `archive_space`'s, not the node ones. `archiveRefusal`
+  refuses it on the surface's own authority and points at `/spaces`.
 - **An undo names one event, never "the latest".** `POST /api/undo` with no
   `seq` reverses whatever the log head happens to be, and in a store four
   surfaces write to that is not necessarily the thing the human is looking at.

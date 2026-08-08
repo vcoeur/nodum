@@ -60,18 +60,27 @@ export function useNodeArchive(onChanged: () => void): NodeArchiveApi {
 
       const label = node.title?.trim() ? node.title : node.id;
       let seq: number | null = null;
+      // Two different reasons the Undo can be missing, and they must not be
+      // reported as one: "somebody else wrote" is a claim about the graph, and
+      // making it because a read failed tells the human something happened
+      // that did not.
+      let logRead = true;
       try {
         seq = undoableSeq(await api.listEvents(1), { op: ARCHIVE_OP, rowId: node.id });
       } catch {
         // The archive is done; the log read is only what the Undo hangs off.
+        logRead = false;
       }
 
       if (seq === null) {
         toast.show(
           "success",
           "Node archived",
-          `${label} is archived. Another write landed after it, so the undo is not offered here — ` +
-            "reverse it by seq on the CLI.",
+          logRead
+            ? `${label} is archived. Something else was written after it, so the undo is not ` +
+              "offered here — reverse the archive event by seq on the CLI."
+            : `${label} is archived. The event log could not be read, so this cannot tell which ` +
+              "event to undo — reverse the archive event by seq on the CLI.",
         );
         return;
       }

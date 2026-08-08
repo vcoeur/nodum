@@ -40,6 +40,25 @@ describe("archiveRefusal", () => {
     // proposal, and the refusal has to say where that lives.
     expect(archiveRefusal(node({ state: "proposed" }))).toContain("review queue");
   });
+
+  it("refuses a space and points at the Spaces screen", () => {
+    // The server would perform this: a space is a node in `meta`, and
+    // `POST /api/nodes/{id}/archive` reaches the same row the space route
+    // does. What it costs — every grant on the space going inert, the name
+    // reserved for good — is nothing the node-scale copy states, so the
+    // node-scale control refuses rather than describing the wrong write.
+    const refusal = archiveRefusal(node({ id: "abc", type: "space", title: "research" }));
+    expect(refusal).toContain("Spaces");
+    expect(refusal).toContain("grant");
+  });
+
+  it("refuses a space before it refuses its state", () => {
+    // A proposed space would otherwise get the review-queue sentence, which
+    // is the wrong destination for the wrong reason.
+    expect(archiveRefusal(node({ id: "abc", type: "space", state: "proposed" }))).toContain(
+      "Spaces",
+    );
+  });
 });
 
 describe("archiveConsequences", () => {
@@ -81,8 +100,14 @@ describe("archiveConsequences", () => {
     expect(lines.some((line) => line.includes("not archived with it"))).toBe(true);
   });
 
-  it("promises the undo the dialog actually offers", () => {
-    expect(archiveConsequences(node(), 2).some((line) => line.includes("reversible"))).toBe(true);
+  it("says the archive is reversible without promising the button", () => {
+    // The toast withholds its Undo whenever the log head is no longer this
+    // write, so a line promising "the confirmation that follows offers an
+    // undo" would be a promise the next screen sometimes breaks.
+    const line = archiveConsequences(node(), 2).find((text) => text.includes("reversible"));
+    expect(line).toBeDefined();
+    expect(line).toContain("CLI");
+    expect(line).not.toContain("offers an undo");
   });
 
   it("never claims search still reaches it", () => {

@@ -20,7 +20,18 @@
  *   that makes archiving a node different from the cliff archiving a space is.
  *
  * {@link archiveRefusal} is the other half — the transitions the service will
- * not make, said before the click rather than as a 400 after it.
+ * not make, said before the click rather than as a 400 after it, **plus one
+ * refusal that is this module's own**: a space.
+ *
+ * A space is an ordinary node of type `space` living in `meta`, and
+ * `POST /api/nodes/{id}/archive` reaches the same row `POST /api/spaces/…`
+ * does — `_transition_row` says so in as many words. The server would perform
+ * it. What it costs is nothing like what these lines say: every grant on the
+ * space goes inert, the space stops resolving so nothing can be written or
+ * granted there again, and its name stays reserved for good. That copy exists,
+ * counted from the space's own row, and it lives in `views/spaces/spaces.ts`
+ * where the screen that can show it is. So the node-scale control refuses and
+ * points there rather than describing a write it would be describing wrongly.
  */
 
 import type { NodeOut } from "../api/types";
@@ -34,13 +45,20 @@ import type { NodeOut } from "../api/types";
  */
 const STRUCTURAL_SPACE_IDS: readonly string[] = ["main", "meta"];
 
+/** The node type every space carries (`service.create_space`). */
+const SPACE_TYPE = "space";
+
 /**
- * Why this node cannot be archived, or null when it can.
+ * Why this node cannot be archived *here*, or null when it can.
  *
- * Three refusals, all the service's own. The state one is
+ * Three of the four refusals are the service's own. The state one is
  * `_transition_row`'s `from_state` check: `archive` runs `active → archived`
  * and nothing else, so a proposed node is retired by rejecting it in the review
  * queue and an archived one is already there.
+ *
+ * The fourth — a space — is this surface's, not the server's: the write would
+ * succeed and would mean something these consequence lines do not describe.
+ * See the module docblock.
  *
  * @param node The node the action would archive.
  * @returns One sentence naming the reason, for a disabled control.
@@ -48,6 +66,12 @@ const STRUCTURAL_SPACE_IDS: readonly string[] = ["main", "meta"];
 export function archiveRefusal(node: NodeOut): string | null {
   if (STRUCTURAL_SPACE_IDS.includes(node.id)) {
     return `${node.id} is a structural space — the server refuses to archive it.`;
+  }
+  if (node.type === SPACE_TYPE) {
+    return (
+      "This is a space, and archiving one cuts off every grant on it — a different action with " +
+      "different consequences. Archive it from the Spaces screen, which states them."
+    );
   }
   if (node.state === "archived") {
     return "Already archived.";
@@ -86,8 +110,15 @@ export function archiveConsequences(node: NodeOut, edgeCount: number | null): st
           `${edgeCount === 1 ? "it stays" : "they stay"} active, so the node still appears in its ` +
           "neighbours' edge rails and in the graph.",
   );
+  // Reversible is the fact; the *button* is not promised, because the toast
+  // withholds it whenever the log head is no longer this write (an agent's
+  // write landing in between, a cycle-stamped head, a failed log read). A
+  // confirm promising a control that then does not appear is exactly the kind
+  // of line this module exists to keep out.
   lines.push(
-    "This is reversible — the confirmation that follows offers an undo for exactly this event.",
+    "This is reversible: the archive is one event, and undoing that event puts the node back — " +
+      "from the confirmation that follows while it is still the last thing that happened, and by " +
+      "seq on the CLI after that.",
   );
 
   return lines;

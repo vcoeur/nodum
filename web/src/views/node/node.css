@@ -59,7 +59,18 @@
   gap: var(--nd-space-2);
 }
 
+/* The row and its actions button, side by side. The button is a sibling of
+ * the link rather than a child: a control inside an anchor is invalid markup
+ * and unreachable by keyboard. */
+.nd-node__edge-line {
+  display: flex;
+  align-items: center;
+  gap: var(--nd-space-2);
+}
+
 .nd-node__edge-row {
+  flex: 1;
+  min-width: 0;
   width: 100%;
   display: grid;
   grid-template-columns: auto auto minmax(0, 1fr) auto auto;
