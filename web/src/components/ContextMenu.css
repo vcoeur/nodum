@@ -80,3 +80,17 @@
 .nd-menu-button {
   line-height: 1;
 }
+
+/* A row that has no actions still holds the button's column, or the rail's
+ * right-hand edge — which is what it is scanned down — goes ragged. It is a
+ * span rather than a disabled button on purpose: a disabled control announces
+ * itself to assistive tech while being unable to say why it is disabled. */
+.nd-menu-button--absent {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--nd-space-2) var(--nd-space-6);
+  border: 1px solid transparent;
+  color: var(--nd-text-faint);
+  font-size: var(--nd-text-xs);
+}

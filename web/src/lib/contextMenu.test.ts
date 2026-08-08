@@ -6,8 +6,38 @@ import {
   nextMenuIndex,
   placeMenu,
   MENU_GAP,
+  MENU_KEYS,
   MENU_MARGIN,
 } from "./contextMenu";
+
+describe("MENU_KEYS", () => {
+  it("holds the keys the menu acts on", () => {
+    for (const key of ["Escape", "Tab", "Enter", " ", "ArrowUp", "ArrowDown", "Home", "End"]) {
+      expect(MENU_KEYS.has(key)).toBe(true);
+    }
+  });
+
+  it("holds the arrows the menu does not act on", () => {
+    // The list behind the panel does act on them: search treats ArrowRight as
+    // "open the subgraph", and an unhandled one navigated the reader away from
+    // an open menu. Dropping these is a silent regression of that bug.
+    expect(MENU_KEYS.has("ArrowLeft")).toBe(true);
+    expect(MENU_KEYS.has("ArrowRight")).toBe(true);
+  });
+
+  it("holds the keys that scroll, because a menu closes on scroll", () => {
+    expect(MENU_KEYS.has("PageUp")).toBe(true);
+    expect(MENU_KEYS.has("PageDown")).toBe(true);
+  });
+
+  it("holds no app-level shortcut key", () => {
+    // React's stopPropagation forwards to the native event and the panel is
+    // portalled into document.body, so anything in this set is dead app-wide
+    // while a menu is open. `/` and Ctrl-K are search's focus shortcuts.
+    expect(MENU_KEYS.has("/")).toBe(false);
+    expect(MENU_KEYS.has("k")).toBe(false);
+  });
+});
 
 const VIEWPORT = { width: 1000, height: 800 };
 const SIZE = { width: 200, height: 300 };

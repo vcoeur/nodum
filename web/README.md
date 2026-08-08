@@ -461,14 +461,17 @@ Conventions that hold across the tree:
   nothing destructive happens in the menu itself: a `danger` item opens a
   confirm, which is what lets the menu close on Enter without a keypress ever
   moving live state. Three wiring rules ride under it, each of which was a bug
-  first: the menu **owns its own key vocabulary and nothing else** (`MENU_KEYS`
-  — a portal bubbles through the React tree, so the list's roving `onKeyDown`
-  sits above the panel; but React's `stopPropagation` forwards to the native
-  event, so stopping *every* key kills the app's `document`/`window` shortcuts
-  while a menu is open); the outside-pointerdown close **exempts the opener**,
-  or the `⋯` button closes what its own click reopens; and focus is **taken and
-  handed back** to a still-connected opener, with `preventScroll` because this
-  overlay closes on scroll.
+  first: the menu **owns `MENU_KEYS` and nothing else** (a portal bubbles
+  through the React tree, so the list's roving `onKeyDown` sits above the
+  panel; but React's `stopPropagation` forwards to the native event, so
+  stopping *every* key kills the app's `document`/`window` shortcuts while a
+  menu is open — the set is pure and tested in `lib/contextMenu.ts` because
+  both edges are silent regressions); **focus leaving the panel closes it**,
+  since a shortcut outside the set moves focus without dismissing anything;
+  the outside-pointerdown close **exempts the opener**, or the `⋯` button
+  closes what its own click reopens; and focus is **handed back only if the
+  panel still holds it**, with `preventScroll` because this overlay closes on
+  scroll.
 - **A space is not an ordinary node to a surface offering `archiveNode`.** A
   space is a node of type `space` in `meta` and the node archive route reaches
   the same row the space route does, so the server would perform it — while the

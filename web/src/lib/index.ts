@@ -36,6 +36,7 @@ export {
   nextMenuIndex,
   placeMenu,
   MENU_GAP,
+  MENU_KEYS,
   MENU_MARGIN,
 } from "./contextMenu";
 export type {

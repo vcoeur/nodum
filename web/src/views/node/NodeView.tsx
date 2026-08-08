@@ -497,18 +497,16 @@ function EdgeRow({
     return (
       <li className="nd-node__edge-line">
         <span className="nd-node__edge-row nd-node__edge-row--disabled">{cells}</span>
-        {/* A disabled twin of the button every other row carries, for the
+        {/* A spacer the size of the button every other row carries, for the
             reason the cells above keep an empty crossing column: the rail is
             scanned down its right-hand edge, and one row without the control
-            would shift its state badge out of line with all the others. */}
-        <button
-          type="button"
-          className="nd-button nd-button--ghost nd-button--small nd-menu-button"
-          disabled
-          title="The far node did not come back with this walk, so there is nothing to act on."
-        >
+            would shift its state badge out of line with all the others. Not a
+            disabled button — a disabled control is unfocusable and its `title`
+            unreliable, so the reason would be readable by nobody. The row
+            already carries it: the far endpoint renders as "(missing)". */}
+        <span className="nd-menu-button nd-menu-button--absent" aria-hidden="true">
           ⋯
-        </button>
+        </span>
       </li>
     );
   }

@@ -928,22 +928,29 @@ Full conventions: `web/README.md`. The rules below are the ones that bind.
   opens a confirm — which is what lets the menu act on Enter while the `Modal`
   contract's "nothing confirms on a keypress" still holds. The placement and
   keyboard rules are pure in `lib/contextMenu.ts`; the component is wiring.
-  Three behaviours in that wiring are load-bearing and were each a bug first.
-  **The menu owns its own key vocabulary and nothing else** (`MENU_KEYS`). It
-  needs the vocabulary because a portal bubbles through the React tree and not
-  the DOM one: the search list's roving `onKeyDown` sits above the panel and
-  ran beside it, so ArrowDown moved the results *and* scrolled (firing the
-  scroll-closes listener), and an ArrowRight the menu ignores navigated away
-  with the menu open. It must own nothing beyond it because React's
-  `stopPropagation` forwards to the native event and the panel is portalled
-  into `document.body` — stopping every key killed every `document`/`window`
-  shortcut in the app while a menu was up, search's `/` and Ctrl-K and
-  `Modal`'s Escape and Tab trap included. **The outside-pointerdown close
-  exempts the opener** (`ignore`), or `MenuButton`'s pointerdown closes what
-  its own click is about to reopen and the button can never dismiss the menu it
-  opened. **Focus is taken and handed back** to a still-connected opener — the
-  `Modal` rule, but with `preventScroll`, because unlike a modal this overlay
-  closes *on* scroll and the restore would otherwise drag the viewport back.
+  Four behaviours in that wiring are load-bearing and were each a bug first.
+  **The menu owns `MENU_KEYS` and nothing else** — the set is pure, in
+  `lib/contextMenu.ts`, with tests, because both of its edges are regressions
+  a component-less harness could otherwise not see. It needs a *wide* set
+  because a portal bubbles through the React tree and not the DOM one: the
+  search list's roving `onKeyDown` sits above the panel and ran beside it, so
+  ArrowDown moved the results *and* scrolled (firing the scroll-closes
+  listener), and an ArrowRight the menu ignores navigated away with the menu
+  open — which is why arrows the menu does not act on are in the set too, and
+  why `Escape` and `Tab` stay in it (handing `Escape` back would let one
+  keypress close the menu and the dialog behind it). It must own nothing
+  *beyond* the set because React's `stopPropagation` forwards to the native
+  event and the panel is portalled into `document.body`: stopping every key
+  killed every `document`/`window` shortcut in the app, search's `/` and Ctrl-K
+  among them. **Focus leaving the panel closes it**, because a shortcut outside
+  the set is exactly a thing that moves focus without dismissing anything, and
+  a panel left painted over the page had no keyboard route out. **The
+  outside-pointerdown close exempts the opener** (`ignore`), or `MenuButton`'s
+  pointerdown closes what its own click is about to reopen and the button can
+  never dismiss the menu it opened. **Focus is handed back only if the panel
+  still holds it**, and with `preventScroll` — unlike a modal this overlay
+  closes *on* scroll, so an unconditional restore both drags the viewport back
+  and steals focus from wherever a shortcut deliberately put it.
 - **An undo affordance names one `seq`, never "the latest".** `POST /api/undo`
   with no `seq` reverses whatever the log head is, and four surfaces write to
   this store — an agent holding `edit` can land a write between a human's

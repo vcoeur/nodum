@@ -32,30 +32,25 @@ import {
   lastMenuIndex,
   nextMenuIndex,
   placeMenu,
+  MENU_KEYS,
 } from "../lib/contextMenu";
 import type { MenuAnchor } from "../lib/contextMenu";
 import "./ContextMenu.css";
 
 /**
- * The keys an open menu takes for itself.
+ * The subset of {@link MENU_KEYS} whose default action scrolls the page.
  *
- * Wider than the keys it acts on: the arrows it does not use are in here too,
- * because a list behind the panel treats them as navigation and an unhandled
- * ArrowRight was navigating the reader away from an open menu. Anything not in
- * this set reaches the rest of the app untouched — see {@link ContextMenu}'s
- * key handler for why that matters.
+ * Prevented rather than merely stopped, because the panel closes on scroll:
+ * a key that scrolls is a key that dismisses the menu.
  */
-const MENU_KEYS = new Set([
-  "Escape",
-  "Tab",
-  "Enter",
+const SCROLLING_KEYS: ReadonlySet<string> = new Set([
   " ",
-  "ArrowUp",
-  "ArrowDown",
-  "ArrowLeft",
-  "ArrowRight",
+  "PageUp",
+  "PageDown",
   "Home",
   "End",
+  "ArrowUp",
+  "ArrowDown",
 ]);
 
 /** One action in a menu. */
@@ -208,14 +203,23 @@ export function ContextMenu({ label, anchor, ignore, items, onClose }: ContextMe
     panel.style.top = `${at.top}px`;
     panel.focus();
     return () => {
-      // Only if it is still there: focusing a detached node drops focus onto
-      // `<body>`, which is the thing this restore exists to prevent.
+      // Restore **only if this panel still holds focus**. Anything else means
+      // focus was deliberately moved somewhere else while the menu was up — a
+      // shortcut outside `MENU_KEYS` reaching the app, say, since search's `/`
+      // and Ctrl-K put the caret in the query box — and grabbing it back from
+      // there is worse than never having taken it.
+      if (!panel.contains(document.activeElement)) return;
+      // And only if the opener is still in the document: focusing a detached
+      // node drops focus onto `<body>`, which is the thing this prevents.
       const opener = restoreTo.current;
       // `preventScroll`, because this menu closes *on* scroll: without it a
       // wheel gesture yanks the viewport back to the row the reader was
       // scrolling away from, and on the outside-click path the scroll can move
       // the page between pointerdown and pointerup so the click that closed
-      // the menu never lands anywhere.
+      // the menu never lands anywhere. The keys that would scroll while the
+      // panel has focus are prevented in the key handler, so the case this
+      // leaves — a focused opener now off-screen — is only ever reached by a
+      // pointer gesture, where no focus ring is drawn anyway.
       if (opener !== null && opener !== document.body && opener.isConnected) {
         opener.focus({ preventScroll: true });
       }
@@ -252,24 +256,16 @@ export function ContextMenu({ label, anchor, ignore, items, onClose }: ContextMe
   };
 
   const onKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
-    // The menu owns its own key vocabulary and **nothing else**, and both
-    // halves of that were bugs.
-    //
-    // It has to own that vocabulary because a portal bubbles through the
-    // React tree rather than the DOM one: a keydown in this panel reaches
-    // whatever list the menu was rendered inside, and that list's roving-focus
-    // handler then ran beside the menu's — the search results' ArrowDown moved
-    // the selection *and* scrolled, which fired the scroll listener above and
-    // closed the menu, while an ArrowRight the menu ignores navigated away
-    // with the menu still open.
-    //
-    // It must not own anything else because React's `stopPropagation`
-    // forwards to the native event, and the panel is portalled into
-    // `document.body` — so stopping every key silently killed every
-    // `document`/`window` shortcut in the app while a menu was up: search's
-    // `/` and Ctrl-K, `Modal`'s Escape and its Tab trap, the asset lightbox's
-    // arrows. Anything outside this set travels.
-    if (MENU_KEYS.has(event.key)) event.stopPropagation();
+    // The menu owns `MENU_KEYS` and nothing else; both edges of that set were
+    // bugs, and `lib/contextMenu.ts` carries the reasoning beside the set.
+    // Here: a key it owns is stopped, and a key that would scroll the page is
+    // also prevented — this panel closes *on* scroll, so letting Space or
+    // PageDown through would be letting the key dismiss the menu out from
+    // under the reader.
+    if (MENU_KEYS.has(event.key)) {
+      event.stopPropagation();
+      if (SCROLLING_KEYS.has(event.key)) event.preventDefault();
+    }
     switch (event.key) {
       case "Escape":
         onClose();
@@ -317,6 +313,15 @@ export function ContextMenu({ label, anchor, ignore, items, onClose }: ContextMe
       aria-orientation="vertical"
       tabIndex={-1}
       onKeyDown={onKeyDown}
+      // Focus leaving the panel closes it. Without this, any shortcut outside
+      // `MENU_KEYS` that moves focus — search's `/` and Ctrl-K put the caret
+      // in the query box — left the panel painted over the page with nothing
+      // able to dismiss it but a pointer.
+      onBlur={(event) => {
+        const next = event.relatedTarget;
+        if (next instanceof Node && panelRef.current?.contains(next)) return;
+        onClose();
+      }}
     >
       {items.map((item, index) => {
         const disabled = item.unavailable !== undefined;

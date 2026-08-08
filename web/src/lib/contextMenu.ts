@@ -22,6 +22,44 @@
  * asserting is here.
  */
 
+/**
+ * The keys an open menu takes for itself, and the exact boundary of what it
+ * takes.
+ *
+ * The panel is portalled into `document.body`, and React's `stopPropagation`
+ * forwards to the native event — so whatever the menu stops is stopped for the
+ * whole app, not merely for the list the panel is rendered inside. Both edges
+ * of this set were bugs:
+ *
+ * - **Too narrow** and a list's roving-focus handler runs beside the menu's,
+ *   because a portal bubbles through the React tree rather than the DOM one.
+ *   That is why the arrows the menu does *not* act on are in here too: the
+ *   search results treat ArrowRight as "open the subgraph", and an unhandled
+ *   one navigated the reader away from an open menu.
+ * - **Too wide** — everything — and every `document`/`window` shortcut in the
+ *   app goes dead while a menu is up.
+ *
+ * `Escape`, `Tab` and the arrows stay in the set deliberately: the menu owns
+ * them, and handing `Escape` back would let one keypress close both the menu
+ * and the dialog behind it. `PageUp`/`PageDown`/`Home`/`End`/`" "` are here
+ * because they scroll, and a menu closes on scroll — a page moving under an
+ * open panel is the panel disappearing.
+ */
+export const MENU_KEYS: ReadonlySet<string> = new Set([
+  "Escape",
+  "Tab",
+  "Enter",
+  " ",
+  "ArrowUp",
+  "ArrowDown",
+  "ArrowLeft",
+  "ArrowRight",
+  "Home",
+  "End",
+  "PageUp",
+  "PageDown",
+]);
+
 /** The minimum distance the panel keeps from a viewport edge, in px. */
 export const MENU_MARGIN = 8;
 
