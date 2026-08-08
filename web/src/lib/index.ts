@@ -29,8 +29,28 @@ export {
 } from "./failure";
 export type { FailureDescription, FailureKind } from "./failure";
 
+export {
+  anchorForContextMenu,
+  firstMenuIndex,
+  lastMenuIndex,
+  nextMenuIndex,
+  placeMenu,
+  MENU_GAP,
+  MENU_MARGIN,
+} from "./contextMenu";
+export type {
+  MenuAnchor,
+  MenuItemState,
+  MenuPlacement,
+  MenuSize,
+  MenuViewport,
+} from "./contextMenu";
+
 export { pageWindow } from "./paging";
 export type { PageWindow } from "./paging";
+
+export { undoableSeq } from "./undoTarget";
+export type { WriteJustMade } from "./undoTarget";
 
 export {
   createPeekCache,

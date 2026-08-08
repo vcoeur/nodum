@@ -5,17 +5,24 @@
  * view's directory, not here; this file is a coordination surface between the
  * view slices, and everything added to it is something all of them inherit.
  *
- * Four non-components live here too, and all four are here because they are
- * parts of the shared space vocabulary rather than free-standing utilities:
- * `spaceOptions.ts` is what {@link SpaceFilter} renders, `useSpaces.ts` is the
- * read that fills it, `spaceNaming.ts` resolves a space reference for a surface
- * that *displays* one, and `useArchivedSpaces.ts` is the lazy read that lets it
- * name a space `GET /api/spaces` deliberately does not list. The filter is
- * controlled and presentational on purpose, so its data and its option rules
- * have to live somewhere every view can reach — and splitting them into
- * `src/lib/` would put one control's parts in two directories. The naming pair
- * followed them here rather than into `src/lib/` for the same reason: half of
- * it is a hook, and the two halves are useless apart.
+ * Six non-components live here too, and each is here because it is part of a
+ * shared *vocabulary* rather than a free-standing utility. Four belong to the
+ * space vocabulary: `spaceOptions.ts` is what {@link SpaceFilter} renders,
+ * `useSpaces.ts` is the read that fills it, `spaceNaming.ts` resolves a space
+ * reference for a surface that *displays* one, and `useArchivedSpaces.ts` is
+ * the lazy read that lets it name a space `GET /api/spaces` deliberately does
+ * not list. The filter is controlled and presentational on purpose, so its data
+ * and its option rules have to live somewhere every view can reach — and
+ * splitting them into `src/lib/` would put one control's parts in two
+ * directories. The naming pair followed them here rather than into `src/lib/`
+ * for the same reason: half of it is a hook, and the two halves are useless
+ * apart.
+ *
+ * The other two are the retirement vocabulary, and they split the same way:
+ * `nodeArchive.ts` is what {@link ArchiveNodeDialog} says, and
+ * `useNodeArchive.ts` is the write plus the undo it promises. The undo has to
+ * outlive the dialog — it is offered after the dialog closes — so the flow
+ * belongs to whatever mounts it, not to the dialog.
  *
  * **`spaceLabel` is deliberately not re-exported.** It is the picker's own
  * fallback to the raw reference, correct inside a `<select>` and a bare 32-hex
@@ -25,10 +32,14 @@
  * waiting for a fifth. A view that wants to name a space wants `nameSpace`.
  */
 
+export { ArchiveNodeDialog } from "./ArchiveNodeDialog";
+export { ContextMenu, MenuButton, useContextMenu } from "./ContextMenu";
+export type { ContextMenuController, MenuAction } from "./ContextMenu";
 export { EmptyState } from "./EmptyState";
 export { ErrorBoundary } from "./ErrorBoundary";
 export { LinkDialog } from "./LinkDialog";
 export { Modal } from "./Modal";
+export { archiveConsequences, archiveRefusal } from "./nodeArchive";
 export { NodeBadge } from "./NodeBadge";
 export { NodePeek, NodePeekScope } from "./NodePeek";
 export { SpaceFilter } from "./SpaceFilter";
@@ -45,7 +56,9 @@ export type { SpaceOption } from "./spaceOptions";
 export { Spinner } from "./Spinner";
 export { useArchivedSpaces } from "./useArchivedSpaces";
 export type { ArchivedSpaces } from "./useArchivedSpaces";
+export { useNodeArchive } from "./useNodeArchive";
+export type { NodeArchiveApi } from "./useNodeArchive";
 export { useSpaces } from "./useSpaces";
 export type { SpaceList } from "./useSpaces";
 export { ToastProvider, useToast } from "./Toast";
-export type { Toast, ToastApi, ToastTone } from "./Toast";
+export type { Toast, ToastAction, ToastApi, ToastTone } from "./Toast";

@@ -19,7 +19,15 @@ import { Link, useParams } from "react-router-dom";
 import type { KeyboardEvent } from "react";
 import { api } from "../../api/client";
 import type { NodeOut, TypeOut } from "../../api/types";
-import { EmptyState, LinkDialog, Spinner, useSpaces, useToast } from "../../components";
+import {
+  ArchiveNodeDialog,
+  EmptyState,
+  LinkDialog,
+  Spinner,
+  useNodeArchive,
+  useSpaces,
+  useToast,
+} from "../../components";
 import { MarkdownEditor } from "./MarkdownEditor";
 import type { MarkdownEditorHandle } from "./MarkdownEditor";
 import { MarkdownPreview } from "./MarkdownPreview";
@@ -74,6 +82,13 @@ export default function EditorView() {
     writeTarget,
     spaces,
   });
+
+  // `reload` flushes the buffer before re-fetching, so an archive from here
+  // never costs an unsaved keystroke — and the state badge on the bar is the
+  // only thing that says the node is now retired.
+  const nodeArchive = useNodeArchive(doc.reload);
+  /** True while the archive confirm is up for the open node. */
+  const [archiving, setArchiving] = useState(false);
 
   const editorRef = useRef<MarkdownEditorHandle>(null);
   const [previewVisible, setPreviewVisible] = useState(true);
@@ -304,7 +319,19 @@ export default function EditorView() {
         onSaveNow={doc.saveNow}
         previewVisible={previewVisible}
         onTogglePreview={() => setPreviewVisible((visible) => !visible)}
+        onArchive={() => setArchiving(true)}
       />
+
+      {archiving && doc.node !== null ? (
+        <ArchiveNodeDialog
+          node={doc.node}
+          // The editor never reads the node's neighbourhood, so the count is
+          // genuinely unknown here rather than zero.
+          edgeCount={null}
+          onConfirm={() => nodeArchive.archive(doc.node as NodeOut)}
+          onClose={() => setArchiving(false)}
+        />
+      ) : null}
 
       <div className="nd-editor__panes">
         <section

@@ -1,0 +1,82 @@
+/*
+ * The shared contextual menu.
+ *
+ * A fixed-position portal so no ancestor's `overflow` can clip it, placed by
+ * `lib/contextMenu.ts` rather than by CSS. It sits at the peek layer: a menu
+ * and a peek card are both transient overlays, and a menu opened from a row
+ * whose title is peeking must not end up underneath it — the peek dismisses on
+ * the pointerdown that opens the menu, so they are never both on screen.
+ */
+
+.nd-menu {
+  position: fixed;
+  z-index: var(--nd-z-peek);
+  min-width: 12rem;
+  max-width: min(20rem, calc(100vw - 1rem));
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  padding: var(--nd-space-2);
+  border: 1px solid var(--nd-border-strong);
+  border-radius: var(--nd-radius-md);
+  background: var(--nd-surface-overlay);
+  box-shadow: var(--nd-shadow-overlay);
+}
+
+.nd-menu__item {
+  display: flex;
+  flex-direction: column;
+  gap: var(--nd-space-1);
+  width: 100%;
+  padding: var(--nd-space-3) var(--nd-space-6);
+  border: 0;
+  border-radius: var(--nd-radius-sm);
+  background: transparent;
+  color: var(--nd-text);
+  font: inherit;
+  font-size: var(--nd-text-sm);
+  text-align: left;
+  cursor: pointer;
+}
+
+.nd-menu__item:hover:not(:disabled),
+.nd-menu__item:focus-visible {
+  background: var(--nd-surface-raised);
+  outline: none;
+}
+
+.nd-menu__item:disabled {
+  color: var(--nd-text-faint);
+  cursor: default;
+}
+
+.nd-menu__item--danger:not(:disabled) {
+  color: var(--nd-danger);
+}
+
+.nd-menu__item--danger:hover:not(:disabled),
+.nd-menu__item--danger:focus-visible {
+  background: var(--nd-danger-wash);
+}
+
+/* A group boundary, drawn on the first item of each group after the first —
+ * what keeps travel actions visually apart from the ones that write. */
+.nd-menu__item--divided {
+  margin-top: var(--nd-space-2);
+  border-top: 1px solid var(--nd-border);
+  padding-top: var(--nd-space-4);
+  border-radius: 0 0 var(--nd-radius-sm) var(--nd-radius-sm);
+}
+
+/* Why a disabled item is disabled, in the item rather than in a `title`: a
+ * refusal nobody can read is the same as no explanation at all. */
+.nd-menu__reason {
+  color: var(--nd-text-faint);
+  font-size: var(--nd-text-2xs);
+  line-height: var(--nd-leading-normal);
+  white-space: normal;
+}
+
+.nd-menu-button {
+  line-height: 1;
+}

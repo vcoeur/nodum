@@ -916,6 +916,35 @@ Full conventions: `web/README.md`. The rules below are the ones that bind.
   target's `[[Title]]` at the caret — or `[[id]]` when the title carries a `|`
   or a bracket the wikilink grammar cannot (`lib/wikilinks.ts`
   `wikilinkInsertion`).
+- **There is one context menu, and a view contributes items rather than
+  building one.** `components/ContextMenu.tsx` is the only contextual-action
+  surface; `useContextMenu` opens it, and `MenuButton` is its twin — a surface
+  that offers a right-click **offers the button too**, because a right-click
+  does not exist on touch and is invisible to anyone who has not tried one on a
+  web app. An action the server would refuse is rendered **disabled carrying its
+  reason** (`archiveRefusal`, and the same shape for anything after it), never
+  hidden: the refusal is worth reading once, and a 400 after a click is where it
+  is otherwise met. Nothing destructive happens in the menu — a `danger` item
+  opens a confirm — which is what lets the menu act on Enter while the `Modal`
+  contract's "nothing confirms on a keypress" still holds. The placement and
+  keyboard rules are pure in `lib/contextMenu.ts`; the component is wiring.
+- **An undo affordance names one `seq`, never "the latest".** `POST /api/undo`
+  with no `seq` reverses whatever the log head is, and four surfaces write to
+  this store — an agent holding `edit` can land a write between a human's
+  archive and their reach for its undo, and the bare call would then reverse
+  *that*, under a label naming the human's own action. `lib/undoTarget.ts` is
+  the one place that decides: the head has to carry the same op, name the same
+  row, and carry no `cycle_id` (`service.undo` refuses a cycle-stamped event and
+  points at `rollback`). When it does not, the confirmation appears **with no
+  Undo on it** — that is the designed outcome, not a fallback.
+- **A retirement confirm states consequences the service actually delivers**,
+  the same rule `archiveConsequences` carries for a space, one scale down.
+  `components/nodeArchive.ts` owns the node copy, and its load-bearing line is
+  the counter-intuitive one: **archiving a node archives none of its edges**.
+  `_transition_row` settles synthesis edges on `accept`/`reject` only, and
+  `_walk` filters on *edge* state, so an archived node stays in the graph and in
+  every neighbour's rail. Search is the thing that stops finding it
+  (`search.search` defaults to `state = 'active'`). Do not soften either line.
 - **A dialog locks body scroll and hands focus somewhere real.** Both the
   review `Modal` and the assets lightbox set `body.style.overflow` on open and
   restore it on close. On close, focus returns to the opener *only if it is

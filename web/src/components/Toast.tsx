@@ -14,6 +14,19 @@ import { describeError, describeFailure } from "../lib";
 /** How a toast is coloured and how long it lives. */
 export type ToastTone = "info" | "success" | "error";
 
+/**
+ * One thing a toast lets you do about what it is reporting.
+ *
+ * Deliberately singular: a notification with a choice in it is a dialog that
+ * dismisses itself. The only caller so far is the archive confirmation's Undo.
+ */
+export interface ToastAction {
+  /** The button's text — a verb. */
+  label: string;
+  /** Runs on click; the toast dismisses first, so it never acts twice. */
+  onAct(): void;
+}
+
 /** One queued notification. */
 export interface Toast {
   id: number;
@@ -22,12 +35,19 @@ export interface Toast {
   title: string;
   /** Optional second line: the server's message, an id, a next step. */
   detail?: string;
+  /** Optional single action, e.g. undoing what the toast reports. */
+  action?: ToastAction;
 }
 
 /** What {@link useToast} hands back. */
 export interface ToastApi {
-  /** Show a notification. Returns its id, so a caller can dismiss it early. */
-  show(tone: ToastTone, title: string, detail?: string): number;
+  /**
+   * Show a notification. Returns its id, so a caller can dismiss it early.
+   *
+   * An `action` gives the toast a longer life than a bare one: an undo that
+   * scrolls away before it can be read is not an undo.
+   */
+  show(tone: ToastTone, title: string, detail?: string, action?: ToastAction): number;
   /**
    * Show an error toast for a thrown value.
    *
@@ -47,6 +67,14 @@ const ToastContext = createContext<ToastApi | null>(null);
 
 /** How long a self-dismissing toast stays up. */
 const AUTO_DISMISS_MS = 4500;
+
+/**
+ * How long a toast carrying an action stays up.
+ *
+ * Longer than a bare notice, because reading it is not the point — reaching
+ * the button is, and the reader's eyes are on the dialog that just closed.
+ */
+const ACTION_DISMISS_MS = 12_000;
 
 /**
  * Provide the toast API to the tree and render the toast region.
@@ -83,14 +111,22 @@ export function ToastProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const show = useCallback(
-    (tone: ToastTone, title: string, detail?: string) => {
+    (tone: ToastTone, title: string, detail?: string, action?: ToastAction) => {
       const id = nextId.current++;
-      setToasts((current) => [...current, detail === undefined
-        ? { id, tone, title }
-        : { id, tone, title, detail }]);
+      setToasts((current) => [
+        ...current,
+        {
+          id,
+          tone,
+          title,
+          ...(detail === undefined ? {} : { detail }),
+          ...(action === undefined ? {} : { action }),
+        },
+      ]);
       // Errors are not auto-dismissed: they usually need an action.
       if (tone !== "error") {
-        timers.current.set(id, window.setTimeout(() => dismiss(id), AUTO_DISMISS_MS));
+        const life = action === undefined ? AUTO_DISMISS_MS : ACTION_DISMISS_MS;
+        timers.current.set(id, window.setTimeout(() => dismiss(id), life));
       }
       return id;
     },
@@ -141,6 +177,21 @@ function ToastRegion({ toasts, onDismiss }: { toasts: Toast[]; onDismiss: (id: n
             <span className="nd-toast__title">{toast.title}</span>
             {toast.detail ? <span className="nd-toast__detail">{toast.detail}</span> : null}
           </div>
+          {toast.action ? (
+            <button
+              type="button"
+              className="nd-button nd-button--small nd-toast__action"
+              onClick={() => {
+                // Dismissed first: the action is a one-shot, and a second
+                // click on a toast still standing would send it twice.
+                const act = toast.action?.onAct;
+                onDismiss(toast.id);
+                act?.();
+              }}
+            >
+              {toast.action.label}
+            </button>
+          ) : null}
           <button
             type="button"
             className="nd-toast__dismiss"

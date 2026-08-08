@@ -330,3 +330,16 @@
   padding: var(--nd-space-8);
   border-top: 1px solid var(--nd-border);
 }
+
+/* A confirm dialog's list of what an action does and does not do. Promoted
+ * here from the spaces view on its second user: the space archive and the node
+ * archive make the same kind of promise, and two copies of the list is how
+ * they would stop looking like the same kind of promise. */
+.nd-consequences {
+  display: flex;
+  flex-direction: column;
+  gap: var(--nd-space-4);
+  padding-left: var(--nd-space-12);
+  list-style: disc;
+  line-height: var(--nd-leading-normal);
+}

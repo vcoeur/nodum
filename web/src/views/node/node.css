@@ -96,6 +96,47 @@ a.nd-node__edge-row:hover {
   overflow-wrap: anywhere;
 }
 
+/* --- Backlinks ------------------------------------------------------------ */
+
+/* Under the edge list in the same rail: the edges say *that* something links
+ * here, the backlinks say what it said. Separated by a rule rather than moved
+ * to its own panel — they are two narrowings of one read. */
+.nd-node__backlinks {
+  display: flex;
+  flex-direction: column;
+  gap: var(--nd-space-6);
+  padding-top: var(--nd-space-8);
+  border-top: 1px solid var(--nd-border);
+}
+
+.nd-node__backlink-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--nd-space-6);
+}
+
+.nd-node__backlink {
+  display: flex;
+  flex-direction: column;
+  gap: var(--nd-space-2);
+}
+
+.nd-node__backlink-title {
+  font-size: var(--nd-text-xs);
+  color: var(--nd-text);
+}
+
+.nd-node__backlink-context {
+  margin: 0;
+  font-size: var(--nd-text-2xs);
+  line-height: var(--nd-leading-normal);
+  color: var(--nd-text-muted);
+  overflow-wrap: anywhere;
+}
+
 /* The crossing hue, same one the graph outlines a cross-space edge with. */
 .nd-node__crossing-mark {
   color: var(--nd-crossing);

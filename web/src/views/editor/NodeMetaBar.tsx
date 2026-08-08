@@ -25,6 +25,7 @@ import {
   ANY_SPACE,
   NodeBadge,
   Spinner,
+  archiveRefusal,
   nameSpace,
   resolveSpaceValue,
   spaceNameNote,
@@ -67,6 +68,14 @@ interface NodeMetaBarProps {
   onSaveNow(): void;
   previewVisible: boolean;
   onTogglePreview(): void;
+  /**
+   * Opens the archive confirm for the saved node.
+   *
+   * Only meaningful on a saved node — an unsaved document has no row to
+   * retire — so the control renders on the same line as the rest of that
+   * node's facts, and not at all before the first save.
+   */
+  onArchive(): void;
 }
 
 /** Title, type, space, metadata, and save status for the open document. */
@@ -89,7 +98,9 @@ export function NodeMetaBar({
   onSaveNow,
   previewVisible,
   onTogglePreview,
+  onArchive,
 }: NodeMetaBarProps) {
+  const refusal = node === null ? null : archiveRefusal(node);
   return (
     <header className="nd-editor__meta">
       <div className="nd-editor__meta-line">
@@ -140,6 +151,18 @@ export function NodeMetaBar({
             <Link className="nd-editor__history-link" to={`/history/${node.id}`}>
               Version history
             </Link>
+            {/* Retirement beside the node's own facts, on the surface that
+                writes it. Disabled with its reason rather than hidden — the
+                server's refusals are worth reading once. */}
+            <button
+              type="button"
+              className="nd-button nd-button--small nd-button--danger"
+              onClick={onArchive}
+              disabled={refusal !== null}
+              title={refusal ?? undefined}
+            >
+              Archive
+            </button>
           </>
         ) : (
           <>
