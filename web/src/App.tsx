@@ -4,6 +4,7 @@ import { ErrorBoundary, Spinner, ToastProvider } from "./components";
 import { api, getHealth, ApiError } from "./api/client";
 import type { HumanOut } from "./api/types";
 import { clearWriteTarget, onUnauthorized } from "./lib";
+import { versionLabel } from "./versionLabel";
 
 /**
  * The app shell: header, view navigation, the routed outlet, and the two global
@@ -192,10 +193,13 @@ const HEALTH_POLL_MS = 30_000;
  *
  * Worth the poll: the UI is served by the same process as the API, so "offline"
  * almost always means the dev server is proxying to a backend that is not
- * running — a state that is otherwise only visible as failing requests.
+ * running — a state that is otherwise only visible as failing requests. While
+ * it answers, the label beside the pill names the version the process reports,
+ * so what is served is visible without a terminal.
  */
 function ServerStatus() {
   const [state, setState] = useState<Reachability>("checking");
+  const [version, setVersion] = useState<string | undefined>(undefined);
 
   useEffect(() => {
     let cancelled = false;
@@ -203,8 +207,11 @@ function ServerStatus() {
 
     const check = async () => {
       try {
-        await getHealth(controller.signal);
-        if (!cancelled) setState("online");
+        const health = await getHealth(controller.signal);
+        if (!cancelled) {
+          setState("online");
+          setVersion(health.version);
+        }
       } catch {
         if (!cancelled) setState("offline");
       }
@@ -222,14 +229,25 @@ function ServerStatus() {
   if (state === "checking") return null;
 
   const online = state === "online";
+  // The version renders only while the server is answering: next to "no
+  // server" a last-known value would read as current, and the pill alone is
+  // the whole truth there.
+  const label = online ? versionLabel(version) : null;
   return (
-    <span
-      className={online ? "nd-badge nd-badge--active" : "nd-badge nd-badge--archived"}
-      title={online ? "The nodum server is answering" : "No answer from the nodum server"}
-    >
-      <span className="nd-badge__dot" aria-hidden="true" />
-      {online ? "connected" : "no server"}
-    </span>
+    <>
+      <span
+        className={online ? "nd-badge nd-badge--active" : "nd-badge nd-badge--archived"}
+        title={online ? "The nodum server is answering" : "No answer from the nodum server"}
+      >
+        <span className="nd-badge__dot" aria-hidden="true" />
+        {online ? "connected" : "no server"}
+      </span>
+      {label ? (
+        <span className="nd-header__version" title="nodum version">
+          {label}
+        </span>
+      ) : null}
+    </>
   );
 }
 

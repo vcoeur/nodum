@@ -192,7 +192,10 @@ uv run nodum serve        # the API on http://127.0.0.1:8600, in another shell
 The dev server proxies `/api` and `/healthz` to `127.0.0.1:8600`, so develop
 against `http://127.0.0.1:5700` and let the proxy reach the Python process.
 The header shows a `connected` / `no server` pill so you can tell at a glance
-whether the backend is answering.
+whether the backend is answering — and, while it is, the version it serves
+(`v0.15.0`) beside the pill, so what is running is visible without a terminal.
+The version label hides the moment the pill says `no server`: a last-known
+value next to a dead pill would read as current.
 
 For the packaged path:
 
@@ -246,8 +249,9 @@ state machine, and the per-session cache),
 (the reading-view rail's narrowing of a depth-1 neighbourhood),
 `lib/linkDialog.ts` (the create-edge dialog's pure model — the
 direction↔edge-type pairing, the prefix-then-search target fallback, the
-confidence parse, and the search debounce), and
-`views/editor/leftoverBuffer.ts`.
+confidence parse, and the search debounce),
+`views/editor/leftoverBuffer.ts`, and `versionLabel.ts` (the header's
+server-version label — the `v` prefix and the render-nothing-until-known rule).
 
 `components/useSpaces.ts`, `components/useArchivedSpaces.ts` and
 `views/journal/useNodeTitles.ts` are deliberately
@@ -298,7 +302,7 @@ syntactic rules above; type-level guarantees remain with `tsc`.
 
 | Path | What lives there |
 |---|---|
-| `src/main.tsx`, `src/App.tsx`, `src/router.tsx` | entry, app shell (header, nav, toasts, crash boundary, health pill), route table |
+| `src/main.tsx`, `src/App.tsx`, `src/router.tsx` | entry, app shell (header, nav, toasts, crash boundary, health pill + server-version label), route table |
 | `src/api/client.ts`, `src/api/types.ts` | the only `fetch` in the app, and the types mirroring `nodum/models.py` |
 | `src/lib/` | cross-view plain functions: timestamp parsing (`time.ts`), failure classification (`failure.ts`), the 401 broadcast (`session.ts`), which slice of a long list to render (`paging.ts` — the journal's event diff and the review queue), the sticky write target (`writeTarget.ts`, the one module here that also exports a hook), the wikilink href contract and insertion choice (`wikilinks.ts` — the href both the renderer and the click interceptor agree on, and the `[[Title]]`-vs-`[[id]]` decision a title with a `|` or a bracket forces), the peek card's pure model (`peek.ts` — plain-text excerpt, in/out edge counts, the hover-intent state machine, and the per-session `getNode` cache), and the create-link dialog's pure model (`linkDialog.ts` — the direction↔edge-type pairing, the prefix-then-search target fallback, the confidence parse, and the search debounce) |
 | `src/components/` | shared React components: `NodeBadge`, `Toast`, `Spinner`, `EmptyState`, `ErrorBoundary`, `Modal`, `LinkDialog` (the create-edge dialog — the first caller of `createEdge`, reachable from the reading view, the graph panel, and the editor's `/link` command), the shared hover/focus peek card (`NodePeek` wraps a trigger element; `NodePeekScope` delegates on a rendered-Markdown container so the `a.nd-wikilink` anchors inside sanitised `innerHTML` can peek too), plus the whole space vocabulary — `SpaceFilter.tsx` with `spaceOptions.ts` (what a picker offers, which is the active list and never more) and `useSpaces.ts` (the `GET /api/spaces` read every space surface shares), and `spaceNaming.ts` with `useArchivedSpaces.ts` (what a surface that *displays* a space calls it, including one the active listing does not carry — and what names an archived value a picker is already holding) |
