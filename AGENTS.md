@@ -886,6 +886,26 @@ Full conventions: `web/README.md`. The rules below are the ones that bind.
   its line coverage. The global environment is `node`; a suite that genuinely
   needs a DOM says so in **its own** docblock
   (`// @vitest-environment jsdom`).
+  **Unit-only forbids rendering components; it does not forbid the DOM.** That
+  misreading is expensive — it once concluded that thirty-nine review findings
+  "could not have been a test" and argued for a component harness nobody needs.
+  Logic that touches real DOM but needs no React — focus management, listener
+  wiring, selection, measurement — goes in a plain-DOM `lib/` module that takes
+  the element as an argument, with a jsdom suite beside it.
+  `lib/dismissWatchers.ts` and `lib/programmaticFocus.ts` are the pattern. What
+  is left for `make web-e2e` is then only what jsdom genuinely cannot answer:
+  engine event ordering, touch, and synthesized clicks.
+- **A transient overlay that owns focus is the most expensive thing on this
+  surface.** Before writing a third one, decide build-versus-adopt **explicitly**
+  and record the decision — this repo already ships cytoscape, mermaid,
+  CodeMirror, marked and DOMPurify, so "we don't take dependencies" is not the
+  reason. If you build it, the dismissal logic is `lib/dismissWatchers.ts`
+  (extend it; do not write a second one) and the component keeps only the
+  rendering. **Two components holding the same private flag is a missing
+  module, not a coincidence** — `NodePeek` and `ContextMenu` each grew their own
+  "this focus move was mine" flag, and the bug that took five rounds to find was
+  one of them focusing into the other. The promote-on-the-second-user rule
+  applies to behaviour, not just CSS.
 - **Nothing reaches `innerHTML` without going through DOMPurify.** The preview
   renders Markdown that *agents* wrote, in the origin that may write to the API,
   so `markdownRender.ts` reduces it to an allowlist with **no SVG and no

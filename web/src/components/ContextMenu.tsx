@@ -35,7 +35,8 @@ import {
   MENU_KEYS,
 } from "../lib/contextMenu";
 import type { MenuAnchor } from "../lib/contextMenu";
-import { focusProgrammatically, isProgrammaticFocus } from "../lib/programmaticFocus";
+import { focusProgrammatically } from "../lib/programmaticFocus";
+import { attachDismissWatchers } from "../lib/dismissWatchers";
 import "./ContextMenu.css";
 
 /**
@@ -211,80 +212,17 @@ export function ContextMenu({ label, anchor, items, onClose }: ContextMenuProps)
     };
   }, [anchor]);
 
-  // Focus leaving the panel dismisses the menu, and it takes **two** watchers
-  // to say that, because neither DOM event covers it alone.
-  //
-  // `focusin` on `document` is the one that fires when something else takes
-  // focus — which is what any shortcut outside `MENU_KEYS` does (search's `/`
-  // and Ctrl-K put the caret in the query box), and leaving the panel painted
-  // over the page with no keyboard route out was the bug. But `focusin` fires
-  // only when an *element* takes focus, so it is silent for the case where
-  // focus falls back to `<body>` — a focused menu item that becomes `disabled`
-  // under a refetch does exactly that, and the assets lightbox documents the
-  // same browser behaviour.
-  //
-  // The panel's own `focusout` covers that gap, and only that gap: it acts on
-  // a null `relatedTarget` alone, which is the fall-back-to-nothing case. The
-  // reason it cannot be the whole answer is that a null `relatedTarget` is
-  // *also* what a window losing focus reports, so alt-tabbing away dismissed
-  // open menus — `document.hasFocus()` is what tells those two apart.
-  //
-  // **No element is exempt from either watcher**, the `⋯` included. Exempting
-  // the opener let focus come to rest on it with the panel still open and
-  // outside the portal, where none of its keys reach; every scheme for
-  // reconciling that with a toggling button depended on an event ordering that
-  // is not stable across how the menu was opened or which engine is running.
-  // The button opens rather than toggles, so there is nothing left to
-  // reconcile — see {@link MenuButton}.
+  // Every dismissal — focus leaving, a press outside, a scroll, a resize —
+  // lives in `lib/dismissWatchers.ts`, which documents why each of the five
+  // listeners is not redundant and why **nothing is exempt** from the outside
+  // press (the `⋯` included; see {@link MenuButton} for the four attempts that
+  // established it). None of that is React, and while it sat in this file the
+  // harness could not reach a single branch of it; there it has eleven jsdom
+  // tests, one per confirmed finding from the rounds that produced the rules.
   useEffect(() => {
-    const leftPanel = (target: Node | null): boolean =>
-      target === null || panelRef.current?.contains(target) !== true;
-
-    const onFocusIn = (event: FocusEvent) => {
-      if (isProgrammaticFocus()) return;
-      const target = event.target as Node | null;
-      if (target !== null && !leftPanel(target)) return;
-      onClose();
-    };
-    const onFocusOut = (event: FocusEvent) => {
-      if (isProgrammaticFocus()) return;
-      // Only the fell-to-nothing case; a move to a real element is `focusin`'s.
-      if (event.relatedTarget !== null) return;
-      // And only while this document still has focus — otherwise this is the
-      // reader alt-tabbing away, and their menu should be here when they come
-      // back.
-      if (!document.hasFocus()) return;
-      onClose();
-    };
-    document.addEventListener("focusin", onFocusIn);
     const panel = panelRef.current;
-    panel?.addEventListener("focusout", onFocusOut);
-    return () => {
-      document.removeEventListener("focusin", onFocusIn);
-      panel?.removeEventListener("focusout", onFocusOut);
-    };
-  }, [onClose]);
-
-  // A menu is anchored to a point in the viewport, and a scroll moves the
-  // content out from under it — so a scroll closes it rather than letting it
-  // hover over an unrelated row. The pointerdown listener is on `document` in
-  // the capture phase: a press on another surface's trigger — or on the `⋯`
-  // that opened this one — must close this menu before that surface opens its
-  // own. Nothing is exempt.
-  useEffect(() => {
-    const onPointerDown = (event: PointerEvent) => {
-      const target = event.target as Node;
-      if (panelRef.current?.contains(target)) return;
-      onClose();
-    };
-    document.addEventListener("pointerdown", onPointerDown, true);
-    window.addEventListener("scroll", onClose, true);
-    window.addEventListener("resize", onClose);
-    return () => {
-      document.removeEventListener("pointerdown", onPointerDown, true);
-      window.removeEventListener("scroll", onClose, true);
-      window.removeEventListener("resize", onClose);
-    };
+    if (panel === null) return;
+    return attachDismissWatchers(panel, { onDismiss: onClose });
   }, [onClose]);
 
   const moveTo = (index: number) => {
