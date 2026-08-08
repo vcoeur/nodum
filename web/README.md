@@ -460,15 +460,17 @@ Conventions that hold across the tree:
   hidden, so the refusal is readable once instead of being met as a 400. And
   nothing destructive happens in the menu itself: a `danger` item opens a
   confirm, which is what lets the menu close on Enter without a keypress ever
-  moving live state. Three wiring rules ride under it, each of which was a bug
+  moving live state. Four wiring rules ride under it, each of which was a bug
   first: the menu **owns `MENU_KEYS` and nothing else** (a portal bubbles
   through the React tree, so the list's roving `onKeyDown` sits above the
   panel; but React's `stopPropagation` forwards to the native event, so
   stopping *every* key kills the app's `document`/`window` shortcuts while a
   menu is open — the set is pure and tested in `lib/contextMenu.ts` because
-  both edges are silent regressions); **focus leaving the panel closes it**,
-  since a shortcut outside the set moves focus without dismissing anything;
-  the outside-pointerdown close **exempts the opener**, or the `⋯` button
+  both edges are silent regressions); **focus landing outside the panel closes
+  it**, watched as `focusin` rather than the panel's `blur` because blur cannot
+  tell "focus moved elsewhere in the document" from "the window lost focus",
+  and alt-tabbing away was dismissing open menus; the close
+  **exempts the opener** on both paths, or the `⋯` button
   closes what its own click reopens; and focus is **handed back only if the
   panel still holds it**, with `preventScroll` because this overlay closes on
   scroll.

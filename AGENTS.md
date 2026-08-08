@@ -942,15 +942,21 @@ Full conventions: `web/README.md`. The rules below are the ones that bind.
   *beyond* the set because React's `stopPropagation` forwards to the native
   event and the panel is portalled into `document.body`: stopping every key
   killed every `document`/`window` shortcut in the app, search's `/` and Ctrl-K
-  among them. **Focus leaving the panel closes it**, because a shortcut outside
-  the set is exactly a thing that moves focus without dismissing anything, and
-  a panel left painted over the page had no keyboard route out. **The
-  outside-pointerdown close exempts the opener** (`ignore`), or `MenuButton`'s
-  pointerdown closes what its own click is about to reopen and the button can
-  never dismiss the menu it opened. **Focus is handed back only if the panel
-  still holds it**, and with `preventScroll` — unlike a modal this overlay
-  closes *on* scroll, so an unconditional restore both drags the viewport back
-  and steals focus from wherever a shortcut deliberately put it.
+  among them; Space is the exception inside the set — on a focused `menuitem` its
+  default action *is* the activation ARIA requires, so it is prevented only on
+  the panel itself. **Focus landing outside the panel closes it**, because a
+  shortcut outside the set is exactly a thing that moves focus without
+  dismissing anything, and a panel left painted over the page had no keyboard
+  route out. Watched as a `focusin` on `document`, never the panel's own
+  `blur`: blur fires with a null `relatedTarget` both when focus moves to
+  something unfocusable *and* when the whole window loses focus, so alt-tabbing
+  away dismissed open menus. **Both close paths exempt the opener** (`ignore`)
+  — a mousedown on `⋯` focuses the button, and closing on either the
+  pointerdown or that focus leaves the click to reopen what it meant to
+  dismiss. **Focus is handed back only if the panel still holds it**, and with
+  `preventScroll` — unlike a modal this overlay closes *on* scroll, so an
+  unconditional restore both drags the viewport back and steals focus from
+  wherever a shortcut deliberately put it.
 - **An undo affordance names one `seq`, never "the latest".** `POST /api/undo`
   with no `seq` reverses whatever the log head is, and four surfaces write to
   this store — an agent holding `edit` can land a write between a human's

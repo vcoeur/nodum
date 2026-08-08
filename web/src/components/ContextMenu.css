@@ -92,5 +92,11 @@
   padding: var(--nd-space-2) var(--nd-space-6);
   border: 1px solid transparent;
   color: var(--nd-text-faint);
+  /* The real control's box, declaration for declaration: `.nd-button--small`'s
+   * padding and size, `.nd-button`'s weight, and a transparent border standing
+   * in for its visible one. Holding the same column is the only thing this
+   * element does, so a glyph one weight lighter than its twin's defeats it. */
   font-size: var(--nd-text-xs);
+  font-weight: var(--nd-weight-medium);
+  line-height: 1;
 }

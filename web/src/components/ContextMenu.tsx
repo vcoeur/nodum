@@ -42,9 +42,14 @@ import "./ContextMenu.css";
  *
  * Prevented rather than merely stopped, because the panel closes on scroll:
  * a key that scrolls is a key that dismisses the menu.
+ *
+ * **Space is deliberately not in here**, though it scrolls too. On a focused
+ * `<button role="menuitem">` its default action is the activation the ARIA
+ * menu pattern requires, and preventing it made every item unreachable by
+ * Space. It is handled on its own below: prevented only while focus is on the
+ * panel itself, where there is no item for it to activate.
  */
 const SCROLLING_KEYS: ReadonlySet<string> = new Set([
-  " ",
   "PageUp",
   "PageDown",
   "Home",
@@ -180,6 +185,8 @@ export function ContextMenu({ label, anchor, ignore, items, onClose }: ContextMe
   const panelRef = useRef<HTMLDivElement | null>(null);
   const itemRefs = useRef<(HTMLButtonElement | null)[]>([]);
   const restoreTo = useRef<HTMLElement | null>(null);
+  /** True while this component is handing focus back, so its own move is not read as a dismissal. */
+  const restoring = useRef(false);
   const [focused, setFocused] = useState(-1);
 
   const states = items.map((item) => ({ disabled: item.unavailable !== undefined }));
@@ -221,10 +228,46 @@ export function ContextMenu({ label, anchor, ignore, items, onClose }: ContextMe
       // leaves — a focused opener now off-screen — is only ever reached by a
       // pointer gesture, where no focus ring is drawn anyway.
       if (opener !== null && opener !== document.body && opener.isConnected) {
+        // The focusin watcher below reads a focus landing outside the panel as
+        // "dismiss", and this restore is exactly that shape — so it is marked
+        // as ours for the synchronous dispatch and the microtasks after it.
+        // `NodePeek.dismiss` suppresses its own re-arm the same way, for the
+        // same reason.
+        restoring.current = true;
         opener.focus({ preventScroll: true });
+        queueMicrotask(() => {
+          restoring.current = false;
+        });
       }
     };
   }, [anchor]);
+
+  // Focus landing anywhere else dismisses the menu. Without it, any shortcut
+  // outside `MENU_KEYS` that moves focus — search's `/` and Ctrl-K put the
+  // caret in the query box — left the panel painted over the page with no
+  // keyboard route out.
+  //
+  // A `focusin` watcher and not the panel's own `blur`, because blur cannot
+  // tell the two cases apart: it fires with a null `relatedTarget` both when
+  // focus moves to something unfocusable *and* when the whole document loses
+  // focus, so alt-tabbing away dismissed an open menu. `focusin` fires only
+  // when something in this document actually takes focus.
+  //
+  // The opener is exempt for the same reason it is exempt from the
+  // pointerdown close: a mousedown on `⋯` focuses the button, and closing on
+  // that would leave the click to reopen what it meant to dismiss.
+  useEffect(() => {
+    const onFocusIn = (event: FocusEvent) => {
+      if (restoring.current) return;
+      const target = event.target as Node | null;
+      if (target === null) return;
+      if (panelRef.current?.contains(target)) return;
+      if (ignore != null && ignore.contains(target)) return;
+      onClose();
+    };
+    document.addEventListener("focusin", onFocusIn);
+    return () => document.removeEventListener("focusin", onFocusIn);
+  }, [onClose, ignore]);
 
   // A menu is anchored to a point in the viewport, and a scroll moves the
   // content out from under it — so a scroll closes it rather than letting it
@@ -265,6 +308,10 @@ export function ContextMenu({ label, anchor, ignore, items, onClose }: ContextMe
     if (MENU_KEYS.has(event.key)) {
       event.stopPropagation();
       if (SCROLLING_KEYS.has(event.key)) event.preventDefault();
+      // Space on the panel itself would scroll the page out from under the
+      // menu — which closes it. Space on an item is that item's activation,
+      // and preventing it is how the whole menu became unreachable by Space.
+      if (event.key === " " && event.target === panelRef.current) event.preventDefault();
     }
     switch (event.key) {
       case "Escape":
@@ -313,15 +360,6 @@ export function ContextMenu({ label, anchor, ignore, items, onClose }: ContextMe
       aria-orientation="vertical"
       tabIndex={-1}
       onKeyDown={onKeyDown}
-      // Focus leaving the panel closes it. Without this, any shortcut outside
-      // `MENU_KEYS` that moves focus — search's `/` and Ctrl-K put the caret
-      // in the query box — left the panel painted over the page with nothing
-      // able to dismiss it but a pointer.
-      onBlur={(event) => {
-        const next = event.relatedTarget;
-        if (next instanceof Node && panelRef.current?.contains(next)) return;
-        onClose();
-      }}
     >
       {items.map((item, index) => {
         const disabled = item.unavailable !== undefined;
