@@ -15,9 +15,9 @@
  */
 
 import { Link } from "react-router-dom";
-import { NodeBadge, nameSpace, spaceNameNote } from "../../components";
+import { NodeBadge, NodePeek, nameSpace, spaceNameNote } from "../../components";
 import type { NodeOut } from "../../api/types";
-import { formatAbsolute, formatTimestampLong } from "../../lib";
+import { formatAbsolute, formatTimestampLong, peekExcerpt } from "../../lib";
 import type { IncidentEdge } from "./graphElements";
 
 interface NodeDetailPanelProps {
@@ -48,17 +48,8 @@ interface NodeDetailPanelProps {
   onClose: () => void;
 }
 
-/** How much node content the panel previews. */
+/** How much node content the panel previews (the peek card uses its own limit). */
 const EXCERPT_LIMIT = 260;
-
-/** Collapse the content to a single-paragraph preview. */
-function excerpt(content: string): string | null {
-  const flattened = content.replace(/\s+/g, " ").trim();
-  if (!flattened) return null;
-  return flattened.length > EXCERPT_LIMIT
-    ? `${flattened.slice(0, EXCERPT_LIMIT - 1)}…`
-    : flattened;
-}
 
 /**
  * Render the node detail panel.
@@ -79,7 +70,7 @@ export function NodeDetailPanel({
   pathRole,
   onClose,
 }: NodeDetailPanelProps) {
-  const preview = excerpt(node.content);
+  const preview = peekExcerpt(node.content, EXCERPT_LIMIT);
   const outsideFilter = filteredSpace !== "" && node.space_id !== filteredSpace;
   const crossings = incident.filter(({ crossing }) => crossing).length;
   // Through `nameSpace`, not `spaceLabel`: a subgraph reaches nodes in a space
@@ -92,7 +83,9 @@ export function NodeDetailPanel({
     <section className="nd-graph__panel-section" aria-label="Selected node">
       <header className="nd-graph__panel-header">
         <div className="nd-stack" style={{ ["--nd-stack-gap" as string]: "var(--nd-space-2)" }}>
-          <h2 className="nd-graph__panel-title">{node.title ?? "(untitled)"}</h2>
+          <NodePeek nodeId={node.id}>
+            <h2 className="nd-graph__panel-title">{node.title ?? "(untitled)"}</h2>
+          </NodePeek>
           <NodeBadge type={node.type} state={node.state} />
         </div>
         <button

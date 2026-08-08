@@ -29,6 +29,7 @@ export { EmptyState } from "./EmptyState";
 export { ErrorBoundary } from "./ErrorBoundary";
 export { Modal } from "./Modal";
 export { NodeBadge } from "./NodeBadge";
+export { NodePeek, NodePeekScope } from "./NodePeek";
 export { SpaceFilter } from "./SpaceFilter";
 export {
   findSpace,

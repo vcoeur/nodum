@@ -21,6 +21,7 @@ import { api, getNode } from "../../api/client";
 import {
   EmptyState,
   NodeBadge,
+  NodePeekScope,
   Spinner,
   nameSpace,
   spaceNameNote,
@@ -231,6 +232,12 @@ export default function NodeView() {
           <article className="nd-node__content" aria-label="Rendered content">
             <div className="nd-preview" ref={contentRef} />
           </article>
+          {/* Wikilinks in the rendered content peek on hover/focus; the space
+              preference is the node's own, exactly as the click path uses it. */}
+          <NodePeekScope
+            containerRef={contentRef}
+            space={load.subgraph.nodes[0]?.space_id ?? undefined}
+          />
 
           <aside className="nd-node__rail" aria-label="Edges">
             <h2 className="nd-label">

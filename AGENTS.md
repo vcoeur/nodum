@@ -879,6 +879,18 @@ Full conventions: `web/README.md`. The rules below are the ones that bind.
   covered by `markdownRender.test.ts`; a new sink means a new policy, not a
   new exception. `nodum.http_api.CONTENT_SECURITY_POLICY` is the runtime
   backstop under both — `script-src 'self'`, no `'unsafe-inline'`.
+- **The peek card is one shared component and its preview is plain text.**
+  `components/NodePeek.tsx` is the hover/focus quick preview — `NodePeek`
+  wraps a trigger element (search titles, the graph panel title), `NodePeekScope`
+  delegates `mouseover`/`focusin` on a rendered-Markdown container so the
+  `a.nd-wikilink` anchors inside sanitised `innerHTML` peek too, exactly the
+  shape of the wikilink click interceptor. Its excerpt is the node's opening
+  prose, whitespace-collapsed, from `lib/peek.ts` — **never** rendered HTML, so
+  a transient hover pays nothing for sanitisation or mermaid. Everything
+  testable lives there with its `peek.test.ts`: excerpt capping, in/out
+  edge-count derivation from the depth-1 read, the 300 ms intent state machine,
+  and the per-session `getNode` cache. The card sits below `--nd-z-toast` and
+  `--nd-z-modal` in the layer stack (`--nd-z-peek`).
 - **A dialog locks body scroll and hands focus somewhere real.** Both the
   review `Modal` and the assets lightbox set `body.style.overflow` on open and
   restore it on close. On close, focus returns to the opener *only if it is

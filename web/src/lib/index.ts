@@ -33,6 +33,22 @@ export { pageWindow } from "./paging";
 export type { PageWindow } from "./paging";
 
 export {
+  createPeekCache,
+  edgeCounts,
+  peekConfirm,
+  peekDismiss,
+  peekEnter,
+  peekExcerpt,
+  peekLeave,
+  peekReducer,
+  PEEK_DELAY_MS,
+  PEEK_IDLE,
+  PEEK_LEAVE_GRACE_MS,
+  PEEK_LIMIT,
+} from "./peek";
+export type { EdgeCounts, PeekCache, PeekData, PeekEvent, PeekLoader, PeekPhase, PeekState } from "./peek";
+
+export {
   actionForResolution,
   attachWikilinkClicks,
   titleFromWikilinkHref,

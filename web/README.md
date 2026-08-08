@@ -239,7 +239,10 @@ a verb), `lib/time.ts`,
 `views/assets/uploadOutcome.ts`, `views/assets/uploadQueue.ts`,
 `views/editor/markdownRender.ts` + `views/editor/mermaidRender.ts` (the
 sanitising policies), `lib/wikilinks.ts` (the href contract a rendered
-`[[…]]` and its click interceptor must share), `views/node/nodeEdges.ts`
+`[[…]]` and its click interceptor must share), `lib/peek.ts` (the peek
+card's pure model — excerpt capping, edge-count derivation, the intent
+state machine, and the per-session cache),
+`views/node/nodeEdges.ts`
 (the reading-view rail's narrowing of a depth-1 neighbourhood), and
 `views/editor/leftoverBuffer.ts`.
 
@@ -294,8 +297,8 @@ syntactic rules above; type-level guarantees remain with `tsc`.
 |---|---|
 | `src/main.tsx`, `src/App.tsx`, `src/router.tsx` | entry, app shell (header, nav, toasts, crash boundary, health pill), route table |
 | `src/api/client.ts`, `src/api/types.ts` | the only `fetch` in the app, and the types mirroring `nodum/models.py` |
-| `src/lib/` | cross-view plain functions: timestamp parsing (`time.ts`), failure classification (`failure.ts`), the 401 broadcast (`session.ts`), which slice of a long list to render (`paging.ts` — the journal's event diff and the review queue), and the sticky write target (`writeTarget.ts`, the one module here that also exports a hook) |
-| `src/components/` | shared React components: `NodeBadge`, `Toast`, `Spinner`, `EmptyState`, `ErrorBoundary`, `Modal`, plus the whole space vocabulary — `SpaceFilter.tsx` with `spaceOptions.ts` (what a picker offers, which is the active list and never more) and `useSpaces.ts` (the `GET /api/spaces` read every space surface shares), and `spaceNaming.ts` with `useArchivedSpaces.ts` (what a surface that *displays* a space calls it, including one the active listing does not carry — and what names an archived value a picker is already holding) |
+| `src/lib/` | cross-view plain functions: timestamp parsing (`time.ts`), failure classification (`failure.ts`), the 401 broadcast (`session.ts`), which slice of a long list to render (`paging.ts` — the journal's event diff and the review queue), the sticky write target (`writeTarget.ts`, the one module here that also exports a hook), the wikilink href contract (`wikilinks.ts`), and the peek card's pure model (`peek.ts` — plain-text excerpt, in/out edge counts, the hover-intent state machine, and the per-session `getNode` cache) |
+| `src/components/` | shared React components: `NodeBadge`, `Toast`, `Spinner`, `EmptyState`, `ErrorBoundary`, `Modal`, the shared hover/focus peek card (`NodePeek` wraps a trigger element; `NodePeekScope` delegates on a rendered-Markdown container so the `a.nd-wikilink` anchors inside sanitised `innerHTML` can peek too), plus the whole space vocabulary — `SpaceFilter.tsx` with `spaceOptions.ts` (what a picker offers, which is the active list and never more) and `useSpaces.ts` (the `GET /api/spaces` read every space surface shares), and `spaceNaming.ts` with `useArchivedSpaces.ts` (what a surface that *displays* a space calls it, including one the active listing does not carry — and what names an archived value a picker is already holding) |
 | `src/styles/` | `tokens.css`, `base.css`, `primitives.css`, `app.css` |
 | `src/views/editor/` | CodeMirror-6 Markdown source editor, slash commands, `[[` autocomplete, live Mermaid preview, autosave, the write-target picker and the landing/refusal copy (`createOutcome.ts`) |
 | `src/views/search/` | query box, ranked hits, per-signal breakdown, signal grouping, the space filter + show-meta toggle in the URL (`searchState.ts`), refused-filter copy (`spaceFailure.ts`), when a row names its space (`resultSpace.ts`) |

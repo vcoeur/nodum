@@ -1,6 +1,6 @@
 import type { KeyboardEvent } from "react";
 import { Link } from "react-router-dom";
-import { NodeBadge } from "../../components";
+import { NodeBadge, NodePeek } from "../../components";
 import type { SpaceName } from "../../components";
 import type { SearchHit } from "../../api/types";
 import { hitSpaceTitle } from "./resultSpace";
@@ -91,13 +91,15 @@ export function ResultRow({
       onKeyDown={(event) => onKeyDown(event, index)}
     >
       <div className="nd-search-hit__head">
-        <Link
-          ref={linkRef}
-          to={`/editor/${encodeURIComponent(hit.node_id)}`}
-          className="nd-search-hit__title"
-        >
-          {title}
-        </Link>
+        <NodePeek nodeId={hit.node_id}>
+          <Link
+            ref={linkRef}
+            to={`/editor/${encodeURIComponent(hit.node_id)}`}
+            className="nd-search-hit__title"
+          >
+            {title}
+          </Link>
+        </NodePeek>
         <span className="nd-row nd-search-hit__marks">
           {spaceName === null ? null : (
             <span className="nd-meta nd-search-hit__space" title={hitSpaceTitle(spaceName)}>

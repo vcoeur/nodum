@@ -18,7 +18,7 @@
 import { useEffect, useRef } from "react";
 import { useNavigate } from "react-router-dom";
 import { api } from "../../api/client";
-import { useToast } from "../../components";
+import { NodePeekScope, useToast } from "../../components";
 import { actionForResolution, attachWikilinkClicks } from "../../lib";
 import { DIAGRAM_PLACEHOLDER_CLASS, renderMarkdown } from "./markdownRender";
 import { peekDiagram, renderDiagram } from "./mermaidRender";
@@ -112,6 +112,9 @@ export function MarkdownPreview({ source }: MarkdownPreviewProps) {
         <p className="nd-editor__preview-idle">Nothing to preview yet.</p>
       ) : null}
       <div className="nd-preview" ref={target} />
+      {/* Wikilinks in the preview peek on hover/focus, like they do in the
+          reading view; the container owns the delegation. */}
+      <NodePeekScope containerRef={target} />
     </div>
   );
 }
