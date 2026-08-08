@@ -36,7 +36,7 @@ import { formatAbsolute, formatTimestampLong } from "../../lib/time";
 import { DIAGRAM_PLACEHOLDER_CLASS, renderMarkdown } from "../editor/markdownRender";
 import { peekDiagram, renderDiagram } from "../editor/mermaidRender";
 import type { DiagramResult } from "../editor/mermaidRender";
-import { incidentRows } from "./nodeEdges";
+import { incidentRows, edgeCountLabel } from "./nodeEdges";
 import type { IncidentRow } from "./nodeEdges";
 import "./node.css";
 
@@ -158,7 +158,9 @@ export default function NodeView() {
     <div className="nd-view nd-node">
       <header className="nd-view__header">
         <div className="nd-node__heading">
-          <h1>{root?.title ?? "(untitled)"}</h1>
+          {/* Gated on the loaded root: "(untitled)" is a fact about a node
+              with no title, never a placeholder for one that has not loaded. */}
+          {root ? <h1>{root.title ?? "(untitled)"}</h1> : null}
           <p className="nd-row" style={{ ["--nd-row-gap" as string]: "var(--nd-space-3)" }}>
             {root ? <NodeBadge type={root.type} state={root.state} /> : null}
             {spaceName ? (
@@ -232,7 +234,7 @@ export default function NodeView() {
 
           <aside className="nd-node__rail" aria-label="Edges">
             <h2 className="nd-label">
-              {rows.length} edge{rows.length === 1 ? "" : "s"}
+              {edgeCountLabel(rows.length, load.subgraph.truncated)}
             </h2>
             {rows.length === 0 ? (
               <p className="nd-meta">Nothing connects to it.</p>

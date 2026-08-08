@@ -326,6 +326,34 @@ describe("wikilinks", () => {
     const names = [...(anchor?.attributes ?? [])].map((attribute) => attribute.name);
     expect(names.some((name) => name.startsWith("data-"))).toBe(false);
   });
+
+  it("keeps a hostile title inert through the sanitiser", () => {
+    // A title is agent-authored text that lands in an anchor's href and text;
+    // crafted as markup it must stay text. The href is percent-encoded whole,
+    // so a `<`, `"` or `=` in the title can neither open a tag nor widen the
+    // attribute, and the rendered text is escaped, never re-parsed markup.
+    const host = preview(
+      '[[<img src=x onerror=alert(1)>]] and [[a"href="javascript:alert(1)]]',
+    );
+    const anchors = [...host.querySelectorAll<HTMLAnchorElement>("a.nd-wikilink")];
+
+    expect(anchors).toHaveLength(2);
+    expect(host.querySelector("img")).toBeNull();
+    expect(anchors[0]?.getAttribute("href")).toBe(
+      "/node/title/%3Cimg%20src%3Dx%20onerror%3Dalert(1)%3E",
+    );
+    expect(anchors[1]?.getAttribute("href")).toBe(
+      "/node/title/a%22href%3D%22javascript%3Aalert(1)",
+    );
+    expect(anchors[0]?.textContent).toBe("<img src=x onerror=alert(1)>");
+    expect(anchors[1]?.textContent).toBe('a"href="javascript:alert(1)');
+    // No live attribute survives anywhere in the rendered document.
+    for (const element of host.querySelectorAll("*")) {
+      for (const attribute of element.getAttributeNames()) {
+        expect(attribute.startsWith("on")).toBe(false);
+      }
+    }
+  });
 });
 
 describe("the mermaid output policy", () => {
