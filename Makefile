@@ -76,9 +76,18 @@ web-lint: ## Lint the frontend (eslint over web/src)
 web-test: ## Run the frontend unit tests (vitest)
 	cd $(WEB_DIR) && npm test
 
+# Playwright against a real Chrome, over a throwaway graph the fixture seeds and
+# serves (web/e2e/serve-fixture.mjs, which builds the bundle first — `nodum
+# serve` serves nodum/_web/, so a run without that build tests the code as it
+# was before the change). This is the harness for everything React renders:
+# web-test covers the pure modules and nothing renders a component, so the
+# browser is where a focus-owning overlay is actually verified.
+web-e2e: ## Run the end-to-end browser tests (Playwright, system Chrome)
+	cd $(WEB_DIR) && npm run e2e
+
 web-clean: ## Drop the built bundle (nodum serve falls back to the placeholder)
 	rm -rf $(WEB_BUNDLE)
 
 .PHONY: help install dev-install cli init-db test coverage lint typecheck format \
 	docs docs-serve \
-	web-install web-build web-dev web-typecheck web-lint web-test web-clean
+	web-install web-build web-dev web-typecheck web-lint web-test web-e2e web-clean

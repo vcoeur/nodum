@@ -128,8 +128,8 @@ The invariants that must never be broken, whatever the section:
   parses TypeScript with Babel's parser rather than typescript-eslint because
   the pinned typescript@7 (the native compiler) has no JS API for
   typescript-eslint's peer range. There is no component/DOM harness, so
-  anything React renders is still verified by type-checking it and driving it
-  in a browser.
+  anything React renders is verified by type-checking it and **running it** —
+  `make web-e2e`, the fourth gate (see the frontend contract's browser rule).
   **The Vitest run pins `TZ` to a non-UTC zone** (`web/vitest.config.ts`) and
   `time.test.ts` asserts the pin took: the zone-less-timestamp bug `lib/time.ts`
   fixes is invisible in UTC, so an ambient-timezone run would pass while the
@@ -863,6 +863,22 @@ Full conventions: `web/README.md`. The rules below are the ones that bind.
 - **A form control carries an `id` or a `name`** — a field with neither is one
   a browser cannot address. `SpaceFilter` takes `name` as a prop (default
   `space`).
+- **Anything React renders is verified by running it** (`make web-e2e`,
+  Playwright over `web/e2e/`). There is no component harness, so the browser
+  *is* the harness. The fixture (`web/e2e/serve-fixture.mjs`) builds the bundle,
+  seeds a throwaway graph in a temp directory, gives the migration-seeded
+  `owner` a password and starts `nodum serve` — **it builds first on purpose**,
+  because `serve` serves `nodum/_web/` and a run without that build tests the
+  code as it was before the change. Locally it uses the system Chrome; CI
+  installs chromium (`playwright.config.ts` switches on `CI`).
+  **A transient overlay owes four checks**, and they are not a general
+  checklist — they are the four things that actually failed across nine review
+  rounds on `ContextMenu`: focus lands where you claim on open, focus returns
+  where you claim on close, Escape *and* an outside press both dismiss, and a
+  document-level shortcut still reaches the surface behind. A new interactive
+  surface ships with its spec; verify the spec red before keeping it (comment
+  out the behaviour and watch it fail), because a browser test that cannot fail
+  is the most expensive kind of green.
 - **A pure module gets a `*.test.ts` beside it** (`make web-test`, Vitest). The
   harness is unit-only by design — no component rendering — so pull the logic
   worth testing out of the component and test it there. Assert the *semantics*

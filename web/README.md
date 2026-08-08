@@ -280,8 +280,37 @@ Kathmandu specifically because it is UTC+05:45 with no DST — a non-integer
 offset catches an hours-only assumption as well as a zone-less one, and the
 expected instants do not move between summer and winter.
 
-Since the harness is unit-only, anything React renders is still verified by
-type-checking it and driving it in a browser.
+## End-to-end
+
+```bash
+make web-e2e              # or: cd web && npx playwright test
+```
+
+Since the unit harness renders no components, anything React renders is verified
+by type-checking it and **running it**. `web/e2e/` is that run, in a real
+browser.
+
+`web/e2e/serve-fixture.mjs` is the whole fixture: it builds the bundle, seeds a
+throwaway graph in a temp directory, gives the migration-seeded `owner` a
+password, creates the nodes the specs act on, and starts `nodum serve`. The
+build step is deliberate — `serve` serves `nodum/_web/`, so a run that skipped it
+would test the code as it was before the change and pass. The database is
+per-run and deleted on exit, because these specs archive things.
+
+Locally the system Chrome is used, so nothing is downloaded; CI installs
+chromium instead (`playwright.config.ts` switches on `CI`).
+
+**A transient overlay owes four checks.** They are not a general checklist —
+they are the four things that actually failed across nine review rounds on
+`ContextMenu`, none of which a type check or a unit test could have caught:
+
+1. focus lands where you claim on open,
+2. focus returns where you claim on close,
+3. Escape *and* an outside press both dismiss,
+4. a document-level shortcut still reaches the surface behind.
+
+Verify a new spec **red** before keeping it — comment out the behaviour and watch
+it fail. A browser test that cannot fail is the most expensive kind of green.
 
 ## Linting
 
