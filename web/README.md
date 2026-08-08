@@ -471,9 +471,12 @@ Conventions that hold across the tree:
   and the panel's `focusout` on a null `relatedTarget` *while
   `document.hasFocus()`* for focus falling back to `<body>`, the guard being
   what keeps alt-tabbing away from dismissing an open menu; **`MenuButton`
-  toggles on `pointerdown` and prevents its default**, so a pointer never
-  focuses the opener and a press-and-drag-off cannot strand the panel (Enter
-  and Space still arrive as a click, told apart by `detail === 0`); and focus
+  acts on `click` but reads the open flag on `mousedown`**, because by click
+  time the opener's own focus has already dismissed the menu — the earlier read
+  is what makes that a toggle rather than a close-then-reopen, and acting on
+  click is what makes a drag-off and a touch scroll starting on the button do
+  nothing (keyboard activation reads the live flag, told apart by
+  `detail === 0`); and focus
   is **handed back only if the panel still holds it**, with `preventScroll`
   because this overlay closes on scroll.
 - **A space is not an ordinary node to a surface offering `archiveNode`.** A

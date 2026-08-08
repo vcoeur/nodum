@@ -953,14 +953,21 @@ Full conventions: `web/README.md`. The rules below are the ones that bind.
   `focusout` covers exactly that gap, acting on a **null `relatedTarget` while
   `document.hasFocus()`**: null alone is also what a window losing focus
   reports, and acting on it dismissed a menu whenever the reader alt-tabbed
-  away. **`MenuButton` toggles on `pointerdown` and prevents its default**, so
-  a pointer never moves focus onto the opener and neither watcher needs an
-  exemption for it — deciding on click instead left a press-and-drag-off with
-  the panel open and focus outside the portal, where none of its keys reach.
-  Enter and Space still arrive as a click, told apart by `detail === 0`. The
-  **pointerdown close still exempts the opener** (`ignore`), so the button's
-  own handler is what decides. **Focus is handed back only if the panel still
-  holds it**, and with
+  away. **Neither focus watcher exempts the opener**, so a mousedown on
+  `⋯` dismisses like any other focus move — exempting it left a
+  press-and-drag-off with the panel open and focus outside the portal, where
+  none of its keys reach. **`MenuButton` therefore acts on `click` but reads
+  the open flag on `mousedown`**: by click time the menu is already closed, and
+  the earlier read is what makes that a toggle rather than a close-then-reopen.
+  Acting on click (not `pointerdown`) is also what makes a drag-off and a touch
+  scroll starting on the button do nothing, and keeps the browser's own focus
+  default — which the panel's close needs to hand focus back to. Keyboard
+  activation reads the live flag, told apart by `detail === 0`; `mousedown`
+  rather than `pointerdown` because every environment fires it. The **document
+  pointerdown close is the one place that still exempts the opener**
+  (`ignore`): it precedes `mousedown`, and closing there would hand that
+  handler a flag already reading closed. **Focus is handed back only if the
+  panel still holds it**, and with
   `preventScroll` — unlike a modal this overlay closes *on* scroll, so an
   unconditional restore both drags the viewport back and steals focus from
   wherever a shortcut deliberately put it.

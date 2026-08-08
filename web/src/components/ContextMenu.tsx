@@ -260,10 +260,12 @@ export function ContextMenu({ label, anchor, ignore, items, onClose }: ContextMe
   // *also* what a window losing focus reports, so alt-tabbing away dismissed
   // open menus — `document.hasFocus()` is what tells those two apart.
   //
-  // Neither watcher exempts the opener. It does not need one: `MenuButton`
-  // toggles on `pointerdown` and prevents that event's default, so a pointer
-  // never moves focus onto the `⋯` at all — which also closes the hole where a
-  // press-and-drag-off left the panel open with focus outside it.
+  // **Neither watcher exempts the opener**, deliberately. Exempting it let
+  // focus come to rest on the `⋯` with the panel still open and outside the
+  // portal, where none of its keys reach — a press-and-drag-off stranded it
+  // there with no click coming to close it. So a mousedown on the opener
+  // dismisses like any other focus move, and `MenuButton` reads the open flag
+  // one event earlier to turn that into a toggle rather than a reopen.
   useEffect(() => {
     const leftPanel = (target: Node | null): boolean =>
       target === null || panelRef.current?.contains(target) !== true;
@@ -297,8 +299,14 @@ export function ContextMenu({ label, anchor, ignore, items, onClose }: ContextMe
   // content out from under it — so a scroll closes it rather than letting it
   // hover over an unrelated row. The pointerdown listener is on `document` in
   // the capture phase: a click on another surface's trigger must close this
-  // menu before that surface opens its own. The one exemption is the button
-  // that opened this menu, whose click is the toggle that closes it.
+  // menu before that surface opens its own.
+  //
+  // The opener **is** exempt here, and this is the one place it is. `pointerdown`
+  // precedes `mousedown`, and React re-renders synchronously for discrete
+  // events — so closing here would hand `MenuButton`'s `mousedown` a flag that
+  // already read closed, and the click would reopen what the press meant to
+  // dismiss. The focus watcher above does the closing instead, after that flag
+  // has been read.
   useEffect(() => {
     const onPointerDown = (event: PointerEvent) => {
       const target = event.target as Node;
@@ -438,18 +446,26 @@ interface MenuButtonProps {
  * leaves out: a touch user, who has no right-click, and anyone who has never
  * thought to try one on a row in a web app.
  *
- * It **toggles on `pointerdown`, not on click**, and prevents that event's
- * default. Both halves matter. Deciding on pointerdown means a
- * press-and-drag-off — the gesture for cancelling a click — has already
- * resolved, instead of leaving the panel open with no click coming to close
- * it. Preventing the default keeps the pointer from moving focus onto this
- * button at all, so the panel's dismiss-on-focus watchers need no exemption
- * for it: without that, focus came to rest on the opener with the menu still
- * open and outside the portal, where none of its keys reach.
+ * It **acts on `click`, and remembers on `mousedown` whether the menu was
+ * open.** Both halves are load-bearing, and each replaces an arrangement that
+ * failed:
  *
- * A pointerdown is not a keyboard activation, so Enter and Space still arrive
- * as a click — with `detail === 0`, which is how that click is told apart from
- * the pointer's own.
+ * - Acting on click is what makes a **press-and-drag-off** — the gesture for
+ *   cancelling a click — and a **touch scroll starting on this button** do
+ *   nothing, because neither produces a click. Deciding at pointer-down
+ *   instead opened the menu on a scroll flick and prevented the button from
+ *   ever taking focus, which cost the panel's close its focus hand-back.
+ * - The *live* open flag cannot drive the toggle, because by the time the
+ *   click arrives the menu is already closed: the mousedown focused this
+ *   button, and focus landing outside the panel is a dismissal. Reading the
+ *   flag one event earlier is what turns that into a toggle instead of a
+ *   close-then-reopen. Keyboard activation has no mousedown at all — and needs
+ *   none, since nothing closed the menu — so it reads the live flag, told
+ *   apart by `detail === 0`.
+ *
+ * `mousedown` rather than `pointerdown`: every environment fires it, including
+ * the ones with no Pointer Events at all, and a toggle that silently stops
+ * working there is a menu with no reachable surface on touch.
  *
  * @param label What the menu is for; the button's accessible name.
  * @param controller The menu controller.
@@ -457,7 +473,8 @@ interface MenuButtonProps {
 export function MenuButton({ label, controller }: MenuButtonProps) {
   const ref = useRef<HTMLButtonElement | null>(null);
   const open = controller.anchor !== null;
-  const toggle = () => (open ? controller.close() : controller.openFrom(ref.current));
+  /** Whether the menu was open when this button was pressed. See the docblock. */
+  const openAtPress = useRef(false);
   return (
     <button
       ref={ref}
@@ -467,18 +484,15 @@ export function MenuButton({ label, controller }: MenuButtonProps) {
       aria-expanded={open}
       aria-label={label}
       title={label}
-      onPointerDown={(event) => {
-        // Primary button only: a right-click here belongs to whatever surface
-        // the button sits on, exactly as it does on the rest of the row.
-        if (event.button !== 0) return;
-        event.preventDefault();
-        toggle();
+      onMouseDown={() => {
+        openAtPress.current = open;
       }}
       onClick={(event) => {
-        // `detail === 0` is a keyboard activation (Enter/Space); a pointer's
-        // click has already been handled on pointerdown.
-        if (event.detail !== 0) return;
-        toggle();
+        // `detail === 0` is a keyboard activation: no mousedown ran, and
+        // nothing moved focus, so the live flag is the true one.
+        const wasOpen = event.detail === 0 ? open : openAtPress.current;
+        if (wasOpen) controller.close();
+        else controller.openFrom(ref.current);
       }}
     >
       ⋯
