@@ -117,3 +117,42 @@ jobs:
         run: make web-build
       - name: Check the bundle was emitted
         run: test -f nodum/_web/index.html && test -d nodum/_web/assets
+
+  # The browser leg. `web-test` covers the pure modules and this repo renders no
+  # component in a harness by design, so everything React puts on screen is
+  # verified here or nowhere. It needs both runtimes: Node for Playwright, uv
+  # for the `nodum serve` the fixture seeds and starts.
+  e2e:
+    name: Frontend end-to-end
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0   # hatch-vcs needs full history + tags to derive the version
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+      - name: Set up Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Install the frontend dependencies
+        run: make web-install
+      - name: Install the Python project
+        run: uv sync --locked
+      # No system Chrome to rely on here, so the config's `channel` falls
+      # through to this browser (see web/playwright.config.ts).
+      - name: Install the browser
+        run: cd web && npx playwright install --with-deps chromium
+      - name: End-to-end tests
+        run: make web-e2e
+      - name: Upload traces on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-traces
+          path: web/test-results/
+          retention-days: 7

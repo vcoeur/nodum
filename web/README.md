@@ -216,7 +216,12 @@ cd web && npx vitest      # watch mode while working
 ```
 
 [Vitest](https://vitest.dev) over the **pure modules** in `src/` — no component
-rendering, no `@testing-library`. A test lives beside the module it covers
+rendering, no `@testing-library`. **That forbids rendering components; it does
+not forbid the DOM.** Logic that touches real DOM but needs no React — focus
+management, listener wiring, selection, measurement — belongs in a plain-DOM
+`lib/` module that takes the element as an argument, with a jsdom suite beside
+it (`lib/dismissWatchers.ts` is the pattern). Reading the rule as "this is
+untestable" is how a whole class of defect ends up with no oracle but review. A test lives beside the module it covers
 (`src/lib/time.test.ts`), and `vitest.config.ts` is kept separate from
 `vite.config.ts` so a test setting can never change what ships in the wheel.
 
@@ -280,8 +285,37 @@ Kathmandu specifically because it is UTC+05:45 with no DST — a non-integer
 offset catches an hours-only assumption as well as a zone-less one, and the
 expected instants do not move between summer and winter.
 
-Since the harness is unit-only, anything React renders is still verified by
-type-checking it and driving it in a browser.
+## End-to-end
+
+```bash
+make web-e2e              # or: cd web && npx playwright test
+```
+
+Since the unit harness renders no components, anything React renders is verified
+by type-checking it and **running it**. `web/e2e/` is that run, in a real
+browser.
+
+`web/e2e/serve-fixture.mjs` is the whole fixture: it builds the bundle, seeds a
+throwaway graph in a temp directory, gives the migration-seeded `owner` a
+password, creates the nodes the specs act on, and starts `nodum serve`. The
+build step is deliberate — `serve` serves `nodum/_web/`, so a run that skipped it
+would test the code as it was before the change and pass. The database is
+per-run and deleted on exit, because these specs archive things.
+
+Locally the system Chrome is used, so nothing is downloaded; CI installs
+chromium instead (`playwright.config.ts` switches on `CI`).
+
+**A transient overlay owes four checks.** They are not a general checklist —
+they are the four things that actually failed across nine review rounds on
+`ContextMenu`, none of which a type check or a unit test could have caught:
+
+1. focus lands where you claim on open,
+2. focus returns where you claim on close,
+3. Escape *and* an outside press both dismiss,
+4. a document-level shortcut still reaches the surface behind.
+
+Verify a new spec **red** before keeping it — comment out the behaviour and watch
+it fail. A browser test that cannot fail is the most expensive kind of green.
 
 ## Linting
 
@@ -304,7 +338,7 @@ syntactic rules above; type-level guarantees remain with `tsc`.
 |---|---|
 | `src/main.tsx`, `src/App.tsx`, `src/router.tsx` | entry, app shell (header, nav, toasts, crash boundary, health pill + server-version label), route table |
 | `src/api/client.ts`, `src/api/types.ts` | the only `fetch` in the app, and the types mirroring `nodum/models.py` |
-| `src/lib/` | cross-view plain functions: timestamp parsing (`time.ts`), failure classification (`failure.ts`), the 401 broadcast (`session.ts`), which slice of a long list to render (`paging.ts` — the journal's event diff and the review queue), the sticky write target (`writeTarget.ts`, the one module here that also exports a hook), the wikilink href contract and insertion choice (`wikilinks.ts` — the href both the renderer and the click interceptor agree on, and the `[[Title]]`-vs-`[[id]]` decision a title with a `|` or a bracket forces), the peek card's pure model (`peek.ts` — plain-text excerpt, in/out edge counts, the hover-intent state machine, and the per-session `getNode` cache), the create-link dialog's pure model (`linkDialog.ts` — the direction↔edge-type pairing, the prefix-then-search target fallback, the confidence parse, and the search debounce), the context menu's placement and keyboard model (`contextMenu.ts` — viewport clamping, the flip that clears the button it hangs off, the roving index that skips disabled items, and the keyboard-menu-key anchor fallback), telling a focus the app moved from one the reader moved (`programmaticFocus.ts` — the marker every hand-back goes through and every focus watcher checks), and which event an undo may name (`undoTarget.ts`) |
+| `src/lib/` | cross-view plain functions: timestamp parsing (`time.ts`), failure classification (`failure.ts`), the 401 broadcast (`session.ts`), which slice of a long list to render (`paging.ts` — the journal's event diff and the review queue), the sticky write target (`writeTarget.ts`, the one module here that also exports a hook), the wikilink href contract and insertion choice (`wikilinks.ts` — the href both the renderer and the click interceptor agree on, and the `[[Title]]`-vs-`[[id]]` decision a title with a `|` or a bracket forces), the peek card's pure model (`peek.ts` — plain-text excerpt, in/out edge counts, the hover-intent state machine, and the per-session `getNode` cache), the create-link dialog's pure model (`linkDialog.ts` — the direction↔edge-type pairing, the prefix-then-search target fallback, the confidence parse, and the search debounce), the context menu's placement and keyboard model (`contextMenu.ts` — viewport clamping, the flip that clears the button it hangs off, the roving index that skips disabled items, and the keyboard-menu-key anchor fallback), telling a focus the app moved from one the reader moved (`programmaticFocus.ts` — the marker every hand-back goes through and every focus watcher checks), the dismissal rules for an overlay that owns focus (`dismissWatchers.ts` — the five listeners, what each one covers that the others cannot, and the jsdom suite that pins them), and which event an undo may name (`undoTarget.ts`) |
 | `src/components/` | shared React components: `NodeBadge`, `Toast` (with the one optional action a toast may carry — the archive's Undo), `Spinner`, `EmptyState`, `ErrorBoundary`, `Modal`, `ContextMenu` (the one contextual-action menu, with `useContextMenu` and the `MenuButton` twin that gives touch and keyboard the same actions a right-click does), the node retirement pair — `ArchiveNodeDialog` with `nodeArchive.ts` (what archiving one node costs, and the transitions the server refuses) and `useNodeArchive.ts` (the write plus the undo it promises, mounted by the host so the undo outlives the dialog) — `LinkDialog` (the create-edge dialog — the first caller of `createEdge`, reachable from the reading view, the graph panel, and the editor's `/link` command), the shared hover/focus peek card (`NodePeek` wraps a trigger element; `NodePeekScope` delegates on a rendered-Markdown container so the `a.nd-wikilink` anchors inside sanitised `innerHTML` can peek too), plus the whole space vocabulary — `SpaceFilter.tsx` with `spaceOptions.ts` (what a picker offers, which is the active list and never more) and `useSpaces.ts` (the `GET /api/spaces` read every space surface shares), and `spaceNaming.ts` with `useArchivedSpaces.ts` (what a surface that *displays* a space calls it, including one the active listing does not carry — and what names an archived value a picker is already holding) |
 | `src/styles/` | `tokens.css`, `base.css`, `primitives.css`, `app.css` |
 | `src/views/editor/` | CodeMirror-6 Markdown source editor, slash commands (node types, Markdown scaffolds, and `/link` — the create-edge dialog anchored on the current node, which inserts the chosen target's `[[Title]]` — or `[[id]]` for a title the wikilink grammar cannot carry — at the caret on success), `[[` autocomplete, live Mermaid preview, autosave, the write-target picker and the landing/refusal copy (`createOutcome.ts`) |
@@ -466,10 +500,13 @@ Conventions that hold across the tree:
   panel; but React's `stopPropagation` forwards to the native event, so
   stopping *every* key kills the app's `document`/`window` shortcuts while a
   menu is open — the set is pure and tested in `lib/contextMenu.ts` because
-  both edges are silent regressions); **focus leaving the panel closes it, via
-  two watchers** — `focusin` on `document` for focus moving to another element,
-  and the panel's `focusout` on a null `relatedTarget` *while
-  `document.hasFocus()`* for focus falling back to `<body>`, the guard being
+  both edges are silent regressions); **every dismissal rule lives in
+  `lib/dismissWatchers.ts`**, extracted there because none of it is React and
+  inside the component the harness could not reach a branch of it — it now
+  carries eleven jsdom tests, one per confirmed finding. **Focus leaving the
+  panel closes it, via two watchers** — `focusin` on `document` for focus moving
+  to another element, and the panel's `focusout` on a null `relatedTarget`
+  *while `document.hasFocus()`* for focus falling back to `<body>`, the guard being
   what keeps alt-tabbing away from dismissing an open menu; **`MenuButton` opens and does not toggle**, and no
   dismissal is exempt for it — four attempts at a toggling button produced
   eleven defects, all of them turning on an event ordering that is not stable

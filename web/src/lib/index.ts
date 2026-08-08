@@ -51,6 +51,8 @@ export { pageWindow } from "./paging";
 export type { PageWindow } from "./paging";
 
 export { focusProgrammatically, isProgrammaticFocus } from "./programmaticFocus";
+export { attachDismissWatchers } from "./dismissWatchers";
+export type { DismissOptions } from "./dismissWatchers";
 
 export { undoableSeq } from "./undoTarget";
 export type { WriteJustMade } from "./undoTarget";
