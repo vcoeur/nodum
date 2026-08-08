@@ -29,7 +29,8 @@ function node(id: string, overrides: Partial<NodeOut> = {}): NodeOut {
   };
 }
 
-/** The seed inverse pairs, in the shape `/api/types` returns them. */
+/** A representative subset of the seed inverse pairs (8 of the 17 rows in
+ * `nodum/migrations.py`), in the shape `/api/types` returns them. */
 const EDGE_TYPES: EdgeTypeOut[] = [
   { id: "relates_to", name: "relates_to", inverse_name: "relates_to", json_schema: {}, is_builtin: true },
   { id: "supports", name: "supports", inverse_name: "supported_by", json_schema: {}, is_builtin: true },
@@ -67,6 +68,20 @@ describe("inverseEdgeType", () => {
 
   it("returns the type itself when the catalog has no row for it", () => {
     expect(inverseEdgeType(EDGE_TYPES, "made_up")).toBe("made_up");
+  });
+
+  it("refuses to flip a directed type that declares no inverse", () => {
+    // A user-created directed type: the catalog row exists, `inverse_name`
+    // is null, and the type is not genuinely self-inverse (which the catalog
+    // spells as inverse_name === its own id, as `relates_to` does above).
+    const directed: EdgeTypeOut = {
+      id: "influences",
+      name: "influences",
+      inverse_name: null,
+      json_schema: {},
+      is_builtin: false,
+    };
+    expect(inverseEdgeType([...EDGE_TYPES, directed], "influences")).toBeNull();
   });
 });
 

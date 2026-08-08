@@ -60,12 +60,20 @@ export interface LinkEdgeInput {
  *
  * @param edgeTypes The live edge-type catalog.
  * @param typeId The selected type.
- * @returns The inverse id, or the type itself when the catalog has no row for
- *   it (which also covers the symmetric types, whose inverse is themselves).
+ * @returns The inverse id; the type itself when it is genuinely self-inverse
+ *   (`inverse_name` equals its own id — `relates_to`, `duplicate_of`) or has
+ *   no catalog row at all (the dialog can only select catalog rows); or
+ *   `null` when the row exists but declares no inverse — a user-created
+ *   directed type has no flipped form, so the dialog must lock the direction
+ *   toggle for it rather than silently treat it as symmetric (`edgeBody`
+ *   would keep the same directed label while swapping the endpoints, and the
+ *   two states would describe different facts).
  */
-export function inverseEdgeType(edgeTypes: readonly EdgeTypeOut[], typeId: string): string {
+export function inverseEdgeType(edgeTypes: readonly EdgeTypeOut[], typeId: string): string | null {
   const entry = edgeTypes.find((candidate) => candidate.id === typeId);
-  return entry?.inverse_name ?? typeId;
+  if (entry === undefined) return typeId;
+  if (entry.inverse_name === null) return null;
+  return entry.inverse_name;
 }
 
 /**

@@ -4,8 +4,9 @@
  * One dialog, three entry points: the reading view's header, the graph
  * panel's actions, and the editor's `/link` slash command. The From node is
  * fixed (whatever surface opened it), and everything else is a form: a
- * direction toggle that swaps the selected edge type for its catalog inverse,
- * the live edge-type catalog as chips, a debounced target search, and an
+ * direction toggle that swaps the selected edge type for its catalog inverse
+ * (locked, with a reason, when the selected type declares no inverse), the
+ * live edge-type catalog as chips, a debounced target search, and an
  * optional confidence.
  *
  * The pure model behind the form lives in `lib/linkDialog.ts` with its tests;
@@ -17,7 +18,8 @@
  * the host through {@link LinkDialogProps.onCreated} — which is also how the
  * reading-view rail and the graph panel learn to refetch. When the dialog was
  * opened from the editor, the same callback receives the target's title so
- * the host can drop `[[Title]]` into the buffer.
+ * the host can drop `[[Title]]` — or `[[id]]`, when the title carries a `|`
+ * or a bracket that the wikilink grammar cannot — into the buffer.
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -112,10 +114,15 @@ export function LinkDialog({ source, onClose, onCreated }: LinkDialogProps) {
   // Flipping the direction swaps the selected type for its catalog inverse,
   // so the two states describe the same fact: outgoing `supports` and
   // incoming `supported_by` both say the From node supports the target.
+  // A type the catalog has no inverse for — a user-created directed type
+  // (`inverse_name` null) — cannot flip: the same label with the endpoints
+  // swapped would describe a different fact, so the toggle is locked.
+  const flippedType = inverseEdgeType(edgeTypes, edgeType);
+  const directionLocked = flippedType === null;
   const flipDirection = (next: LinkDirection) => {
-    if (next === direction) return;
+    if (next === direction || directionLocked) return;
     setDirection(next);
-    setEdgeType((current) => inverseEdgeType(edgeTypes, current));
+    setEdgeType(flippedType ?? edgeType);
   };
 
   /* --- Target search ------------------------------------------------- */
@@ -136,6 +143,10 @@ export function LinkDialog({ source, onClose, onCreated }: LinkDialogProps) {
   const runSearch = useCallback(
     (query: string) => {
       if (query.trim() === "") {
+        // Bump the sequence like a real request would: an in-flight search
+        // started under the previous query must not repopulate results under
+        // an empty one.
+        searchSequence.current += 1;
         setResults([]);
         setSearchState("idle");
         return;
@@ -273,6 +284,7 @@ export function LinkDialog({ source, onClose, onCreated }: LinkDialogProps) {
                 ? "nd-link-dialog__dir nd-link-dialog__dir--active"
                 : "nd-link-dialog__dir"
             }
+            disabled={directionLocked}
             onClick={() => flipDirection("out")}
           >
             outgoing →
@@ -285,10 +297,16 @@ export function LinkDialog({ source, onClose, onCreated }: LinkDialogProps) {
                 ? "nd-link-dialog__dir nd-link-dialog__dir--active"
                 : "nd-link-dialog__dir"
             }
+            disabled={directionLocked}
             onClick={() => flipDirection("in")}
           >
             ← incoming
           </button>
+          {directionLocked ? (
+            <p className="nd-meta nd-link-dialog__direction-note">
+              “{edgeType}” has no inverse, so this edge's direction is fixed.
+            </p>
+          ) : null}
         </div>
 
         <div className="nd-field">

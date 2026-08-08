@@ -57,8 +57,9 @@ export default function NodeView() {
   // Bumped by the retry button; the only thing that re-runs the load for an
   // unchanged node id.
   const [attempt, setAttempt] = useState(0);
-  // Bumped when an edge is created from this view, so the rail refetches and
-  // shows the new edge on the next render.
+  // Bumped when an edge is created from this view, so the rail refetches in
+  // the background: the current subgraph stays on screen until the new one
+  // lands.
   const [refresh, setRefresh] = useState(0);
   /** Which node a create-link dialog is anchored on, or null while closed. */
   const [linkSource, setLinkSource] = useState<NodeOut | null>(null);
@@ -69,7 +70,14 @@ export default function NodeView() {
   useEffect(() => {
     if (!nodeId) return;
     const controller = new AbortController();
-    setLoad({ status: "loading" });
+    // A retry and a navigation to another node show the spinner; a refresh of
+    // the same node keeps the current subgraph on screen until the new one
+    // lands, so creating an edge never flashes the whole view away.
+    setLoad((current) =>
+      current.status === "ready" && current.subgraph.root === nodeId
+        ? current
+        : { status: "loading" },
+    );
     getNode(nodeId, { depth: 1 }, controller.signal)
       .then((subgraph) => setLoad({ status: "ready", subgraph }))
       .catch((error: unknown) => {

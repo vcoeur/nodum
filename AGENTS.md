@@ -898,7 +898,9 @@ Full conventions: `web/README.md`. The rules below are the ones that bind.
   live `GET /api/types` catalog, never a hardcoded list; direction is a
   first-class toggle that swaps the selected type for its catalog inverse
   (`supports` ↔ `supported_by`, so outgoing and incoming describe the same
-  fact); the target search reuses `suggestLinks` (title-prefix) and falls back
+  fact), and is locked with a reason when the selected type declares no
+  inverse (a user-created directed type has no flipped form); the target
+  search reuses `suggestLinks` (title-prefix) and falls back
   to a full `search` when the prefix matches nothing; confidence is optional,
   unset by default, and refused client-side outside `[0, 1]` exactly as the
   service refuses it. The pure model — the pairing, the fallback, the
@@ -908,7 +910,9 @@ Full conventions: `web/README.md`. The rules below are the ones that bind.
   human-created edge lands `active` over the HTTP surface, so the dialog has
   no review-queue affordance. On success the host refetches what it holds (the
   reading-view rail, the graph panel's subgraph); the editor inserts the
-  target's `[[Title]]` at the caret.
+  target's `[[Title]]` at the caret — or `[[id]]` when the title carries a `|`
+  or a bracket the wikilink grammar cannot (`lib/wikilinks.ts`
+  `wikilinkInsertion`).
 - **A dialog locks body scroll and hands focus somewhere real.** Both the
   review `Modal` and the assets lightbox set `body.style.overflow` on open and
   restore it on close. On close, focus returns to the opener *only if it is

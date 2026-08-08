@@ -40,6 +40,7 @@ import { slashCommands } from "./cm/slashCommands";
 import type { SlashPaletteState } from "./cm/slashCommands";
 import { wikilinkCompletion } from "./cm/wikilinkComplete";
 import { assetDrop } from "./cm/assetDrop";
+import { wikilinkInsertion } from "../../lib";
 
 /** What the view can ask the editor to do from the outside. */
 export interface MarkdownEditorHandle {
@@ -55,15 +56,17 @@ export interface MarkdownEditorHandle {
    */
   insertBlockAt(position: number, text: string): void;
   /**
-   * Insert `[[Title]]` at the caret.
+   * Insert the chosen target's wikilink at the caret.
    *
    * What the create-link dialog writes when it was invoked from the editor:
    * the dialog's slash command leaves the caret where `/link` was, so the
    * wikilink lands in place. The caret ends up after the closing `]]`.
    *
    * @param title The chosen target's title.
+   * @param nodeId The chosen target's node id — what gets linked instead
+   *   when the title cannot travel inside `[[…]]` verbatim.
    */
-  insertWikilink(title: string): void;
+  insertWikilink(title: string, nodeId: string): void;
 }
 
 interface MarkdownEditorProps {
@@ -186,11 +189,11 @@ export function MarkdownEditor(props: MarkdownEditorProps) {
         });
         current.focus();
       },
-      insertWikilink: (title) => {
+      insertWikilink: (title, nodeId) => {
         const current = view.current;
         if (!current) return;
         const anchor = current.state.selection.main.head;
-        const insert = `[[${title}]]`;
+        const insert = wikilinkInsertion(title, nodeId);
         current.dispatch({
           changes: { from: anchor, insert },
           selection: { anchor: anchor + insert.length },

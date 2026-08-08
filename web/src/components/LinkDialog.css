@@ -22,6 +22,7 @@
 
 .nd-link-dialog__direction {
   display: flex;
+  flex-wrap: wrap;
   gap: var(--nd-space-2);
 }
 
@@ -37,6 +38,22 @@
 
 .nd-link-dialog__dir:hover {
   border-color: var(--nd-border-strong);
+}
+
+/* A type with no catalog inverse locks the toggle; the reason is a sibling
+ * line under the buttons. */
+.nd-link-dialog__dir:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.nd-link-dialog__dir:disabled:hover {
+  border-color: var(--nd-border);
+}
+
+.nd-link-dialog__direction-note {
+  flex-basis: 100%;
+  margin: 0;
 }
 
 .nd-link-dialog__dir:focus-visible {

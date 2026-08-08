@@ -23,6 +23,34 @@ import type { TitleResolution } from "../api/types";
 export const WIKILINK_TITLE_PATH = "/node/title/";
 
 /**
+ * The characters a title cannot carry inside `[[…]]`.
+ *
+ * The preview tokenizer splits the first `|` off as its display-only label
+ * half, and both the preview's and the server's (`service.WIKILINK_RE`)
+ * grammars exclude brackets — a title holding any of the three would render
+ * one target and materialise a `mentions` edge to another.
+ */
+const UNLINKABLE_TITLE = /[[|\]]/;
+
+/**
+ * Build the wikilink text to insert for a chosen target.
+ *
+ * A title containing `|`, `[`, or `]` cannot travel inside `[[…]]` verbatim
+ * (see {@link UNLINKABLE_TITLE}); the node id is safe in both grammars, and
+ * the server resolves an exact id before any title
+ * (`service._resolve_wikilink`), so such a title links by id. The reader's
+ * click path resolves by title and cannot navigate from an id form — the
+ * mention edge is the fact that matters, and it points at the right node.
+ *
+ * @param title The chosen target's title.
+ * @param nodeId The chosen target's node id.
+ * @returns The `[[…]]` text to insert at the caret.
+ */
+export function wikilinkInsertion(title: string, nodeId: string): string {
+  return UNLINKABLE_TITLE.test(title) ? `[[${nodeId}]]` : `[[${title}]]`;
+}
+
+/**
  * Build the href a rendered wikilink carries.
  *
  * @param title The wikilink target, as written in `[[…]]`.

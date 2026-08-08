@@ -18,6 +18,7 @@ import {
   attachWikilinkClicks,
   titleFromWikilinkHref,
   wikilinkHref,
+  wikilinkInsertion,
   WIKILINK_TITLE_PATH,
 } from "./wikilinks";
 
@@ -93,6 +94,24 @@ describe("the resolution mapping", () => {
   it("treats a contract-violating null id as missing, never navigating", () => {
     const action = actionForResolution(entry({ outcome: "resolved", node_id: null }));
     expect(action.kind).toBe("notice");
+  });
+});
+
+describe("the insertion choice", () => {
+  it("inserts the title when it is safe in the wikilink grammar", () => {
+    expect(wikilinkInsertion("Q13 principals design", "abc123")).toBe("[[Q13 principals design]]");
+    // `/` is fine in both grammars (the href contract already encodes it).
+    expect(wikilinkInsertion("a/b", "abc123")).toBe("[[a/b]]");
+  });
+
+  it("links by id when the title carries a | or a bracket", () => {
+    // The preview splits the first `|` as its display label and both grammars
+    // exclude brackets, so the raw title would render one target and
+    // materialise a mention to another; the id resolves exactly on the
+    // server's write side.
+    expect(wikilinkInsertion("a|b", "abc123")).toBe("[[abc123]]");
+    expect(wikilinkInsertion("a[b", "abc123")).toBe("[[abc123]]");
+    expect(wikilinkInsertion("a]b", "abc123")).toBe("[[abc123]]");
   });
 });
 

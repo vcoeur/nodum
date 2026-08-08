@@ -383,9 +383,12 @@ export default function EditorView() {
         <LinkDialog
           source={linkSource}
           onClose={() => setLinkSource(null)}
-          onCreated={(_edge, targetTitle) => {
+          onCreated={(edge, targetTitle) => {
             // The edge exists; the wikilink is the editor's half of the deal.
-            editorRef.current?.insertWikilink(targetTitle);
+            // The far endpoint is the target — the node the edge points at
+            // when outgoing, the node it points from when incoming.
+            const targetId = edge.src_id === linkSource.id ? edge.dst_id : edge.src_id;
+            editorRef.current?.insertWikilink(targetTitle, targetId);
           }}
         />
       ) : null}
