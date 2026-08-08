@@ -161,6 +161,8 @@ export function ContextMenu({ label, anchor, items, onClose }: ContextMenuProps)
   const restoreTo = useRef<HTMLElement | null>(null);
   /** True while this component is handing focus back, so its own move is not read as a dismissal. */
   const restoring = useRef(false);
+  /** True once a pointer press outside the panel has dismissed it. See the close cleanup. */
+  const closedByPointer = useRef(false);
   const [focused, setFocused] = useState(-1);
 
   const states = items.map((item) => ({ disabled: item.unavailable !== undefined }));
@@ -190,6 +192,14 @@ export function ContextMenu({ label, anchor, items, onClose }: ContextMenuProps)
       // and Ctrl-K put the caret in the query box — and grabbing it back from
       // there is worse than never having taken it.
       if (!panel.contains(document.activeElement)) return;
+      // And **not for a dismissal a pointer caused**. The restore exists for a
+      // keyboard reader who would otherwise land on `<body>`; someone who just
+      // pressed somewhere is already telling the page where they are going,
+      // and putting focus back costs more than it saves. Concretely, pressing
+      // the `⋯` closes at pointerdown while the panel still holds focus, so
+      // this would fire — re-focusing the search row's title link, which is a
+      // `NodePeek` trigger, and pinning a preview card open over the list.
+      if (closedByPointer.current) return;
       // And only if the opener is still in the document: focusing a detached
       // node drops focus onto `<body>`, which is the thing this prevents.
       const opener = restoreTo.current;
@@ -280,6 +290,9 @@ export function ContextMenu({ label, anchor, items, onClose }: ContextMenuProps)
     const onPointerDown = (event: PointerEvent) => {
       const target = event.target as Node;
       if (panelRef.current?.contains(target)) return;
+      // Recorded before the close so the unmount's focus hand-back can decline:
+      // a pointer dismissal has already said where the reader is going.
+      closedByPointer.current = true;
       onClose();
     };
     document.addEventListener("pointerdown", onPointerDown, true);
@@ -360,6 +373,17 @@ export function ContextMenu({ label, anchor, items, onClose }: ContextMenuProps)
       aria-orientation="vertical"
       tabIndex={-1}
       onKeyDown={onKeyDown}
+      // A right-click inside the panel stops here. The portal is a DOM child
+      // of `<body>` but a **React** child of whatever rendered it — and on a
+      // search row that is the `<li>` carrying `onContextMenu={openAt}`, so
+      // right-clicking an item re-anchored this very menu under the cursor,
+      // moving the action out from under the pointer that was aiming at it.
+      // The native menu is suppressed for the same reason the host suppresses
+      // it: there is nothing it can do for a reader here.
+      onContextMenu={(event) => {
+        event.preventDefault();
+        event.stopPropagation();
+      }}
     >
       {items.map((item, index) => {
         const disabled = item.unavailable !== undefined;
