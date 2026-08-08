@@ -127,6 +127,11 @@ export default function NodeView() {
     [load],
   );
 
+  // The root's edge count as a *fact*, or null when the walk hit its cap and
+  // the number is only a floor.
+  const rootEdgeCount =
+    load.status === "ready" && !load.subgraph.truncated ? rows.length : null;
+
   const refetch = useCallback(() => setRefresh((value) => value + 1), []);
   const nodeArchive = useNodeArchive(refetch);
   const headerMenu = useContextMenu();
@@ -359,8 +364,8 @@ export default function NodeView() {
               </ul>
             )}
             <p className="nd-meta">
-              Click an edge to travel to the far node; right-click one for its
-              actions.
+              Click an edge to travel to the far node. Its actions are on the
+              row's ⋯ button, or a right-click.
             </p>
 
             <BacklinksSection backlinks={inbound} />
@@ -379,11 +384,14 @@ export default function NodeView() {
       {archiving ? (
         <ArchiveNodeDialog
           node={archiving}
-          // `rows` is the *root's* neighbourhood. An edge row's menu archives
-          // the far node, whose own edge count this view has never read —
-          // stating the root's there would put a number from another node in a
-          // dialog whose every line has to be a fact about this one.
-          edgeCount={archiving.id === root?.id ? rows.length : null}
+          // Null unless this is the root *and* the walk was complete. `rows`
+          // is the root's neighbourhood, so an edge row's menu — which
+          // archives the far node — would otherwise state a count belonging to
+          // a different node; and a truncated walk's count is the cap rather
+          // than the size, which the rail header above states as a floor
+          // ("200+ edges") for exactly that reason. Either way the confirm
+          // falls back to the uncounted sentence, which is still true.
+          edgeCount={rootEdgeCount === null || archiving.id !== root?.id ? null : rootEdgeCount}
           onConfirm={() => nodeArchive.archive(archiving)}
           onClose={() => setArchiving(null)}
         />
@@ -489,6 +497,18 @@ function EdgeRow({
     return (
       <li className="nd-node__edge-line">
         <span className="nd-node__edge-row nd-node__edge-row--disabled">{cells}</span>
+        {/* A disabled twin of the button every other row carries, for the
+            reason the cells above keep an empty crossing column: the rail is
+            scanned down its right-hand edge, and one row without the control
+            would shift its state badge out of line with all the others. */}
+        <button
+          type="button"
+          className="nd-button nd-button--ghost nd-button--small nd-menu-button"
+          disabled
+          title="The far node did not come back with this walk, so there is nothing to act on."
+        >
+          ⋯
+        </button>
       </li>
     );
   }

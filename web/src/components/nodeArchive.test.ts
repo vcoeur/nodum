@@ -52,11 +52,20 @@ describe("archiveRefusal", () => {
     expect(refusal).toContain("grant");
   });
 
-  it("refuses a space before it refuses its state", () => {
-    // A proposed space would otherwise get the review-queue sentence, which
-    // is the wrong destination for the wrong reason.
+  it("refuses a proposed space as a space, not as a proposal", () => {
+    // The review-queue sentence would be the wrong destination: rejecting a
+    // proposed space there is still the space-scale write.
     expect(archiveRefusal(node({ id: "abc", type: "space", state: "proposed" }))).toContain(
       "Spaces",
+    );
+  });
+
+  it("says an archived space is already archived rather than sending it to Spaces", () => {
+    // `GET /api/spaces` is active-only, so the Spaces screen cannot show an
+    // archived space at all — pointing there would send the reader to redo a
+    // done thing on a screen without the row.
+    expect(archiveRefusal(node({ id: "abc", type: "space", state: "archived" }))).toBe(
+      "Already archived.",
     );
   });
 });
@@ -101,13 +110,16 @@ describe("archiveConsequences", () => {
   });
 
   it("says the archive is reversible without promising the button", () => {
-    // The toast withholds its Undo whenever the log head is no longer this
-    // write, so a line promising "the confirmation that follows offers an
-    // undo" would be a promise the next screen sometimes breaks.
+    // The toast withholds its Undo whenever it cannot prove the log head is
+    // this write — including when the event-log read simply failed. So the
+    // line may name neither the control nor a condition for it: "while it is
+    // still the last thing that happened" would be falsified by that read
+    // failing with nothing else having landed.
     const line = archiveConsequences(node(), 2).find((text) => text.includes("reversible"));
     expect(line).toBeDefined();
     expect(line).toContain("CLI");
     expect(line).not.toContain("offers an undo");
+    expect(line).not.toContain("last thing that happened");
   });
 
   it("never claims search still reaches it", () => {

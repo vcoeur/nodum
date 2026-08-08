@@ -71,7 +71,6 @@
 .nd-node__edge-row {
   flex: 1;
   min-width: 0;
-  width: 100%;
   display: grid;
   grid-template-columns: auto auto minmax(0, 1fr) auto auto;
   align-items: center;

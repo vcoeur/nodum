@@ -929,16 +929,21 @@ Full conventions: `web/README.md`. The rules below are the ones that bind.
   contract's "nothing confirms on a keypress" still holds. The placement and
   keyboard rules are pure in `lib/contextMenu.ts`; the component is wiring.
   Three behaviours in that wiring are load-bearing and were each a bug first.
-  **The menu owns the keyboard while it is up** — `onKeyDown` calls
-  `stopPropagation` on *every* key, handled or not, because a portal bubbles
-  through the React tree and not the DOM one: the search list's own roving
-  `onKeyDown` sits above the panel and ran beside it, so ArrowDown moved the
-  results *and* scrolled (which fired the scroll-closes listener), and an
-  ArrowRight the menu ignored navigated away with the menu open. **The
-  outside-pointerdown close exempts the opener** (`ignore`), or `MenuButton`'s
-  pointerdown closes what its own click is about to reopen and the button can
-  never dismiss the menu it opened. **Focus is taken and handed back** to a
-  still-connected opener, the `Modal` rule for the same reason.
+  **The menu owns its own key vocabulary and nothing else** (`MENU_KEYS`). It
+  needs the vocabulary because a portal bubbles through the React tree and not
+  the DOM one: the search list's roving `onKeyDown` sits above the panel and
+  ran beside it, so ArrowDown moved the results *and* scrolled (firing the
+  scroll-closes listener), and an ArrowRight the menu ignores navigated away
+  with the menu open. It must own nothing beyond it because React's
+  `stopPropagation` forwards to the native event and the panel is portalled
+  into `document.body` — stopping every key killed every `document`/`window`
+  shortcut in the app while a menu was up, search's `/` and Ctrl-K and
+  `Modal`'s Escape and Tab trap included. **The outside-pointerdown close
+  exempts the opener** (`ignore`), or `MenuButton`'s pointerdown closes what
+  its own click is about to reopen and the button can never dismiss the menu it
+  opened. **Focus is taken and handed back** to a still-connected opener — the
+  `Modal` rule, but with `preventScroll`, because unlike a modal this overlay
+  closes *on* scroll and the restore would otherwise drag the viewport back.
 - **An undo affordance names one `seq`, never "the latest".** `POST /api/undo`
   with no `seq` reverses whatever the log head is, and four surfaces write to
   this store — an agent holding `edit` can land a write between a human's
@@ -956,12 +961,15 @@ Full conventions: `web/README.md`. The rules below are the ones that bind.
   `_walk` filters on *edge* state, so an archived node stays in the graph and in
   every neighbour's rail. Search is the thing that stops finding it
   (`search.search` defaults to `state = 'active'`). Do not soften either line.
-  Two corollaries. It states **the node's own** counts — a menu that archives a
-  neighbour has not read that neighbour's neighbourhood, so it passes
-  `edgeCount: null` rather than the count it happens to be holding. And it does
-  **not promise the Undo button**, only that the archive is one reversible
-  event: the toast withholds the button whenever the log head moved, so the
-  promise would be one the next screen sometimes breaks.
+  Two corollaries. It states **the node's own counts, and only when they are
+  facts** — a menu archiving a neighbour has not read that neighbour's
+  neighbourhood, and a truncated walk's count is the cap rather than the size
+  (which is why the rail states it as a floor), so both pass `edgeCount: null`
+  and get the uncounted sentence. And it **promises neither the Undo button nor
+  a condition for it**, only that the archive is one reversible event: the
+  toast withholds the button whenever it cannot *prove* the log head is this
+  write, which includes the event-log read simply failing — so even "while
+  nothing else has landed" would be a condition the next screen falsifies.
 - **A space is not an ordinary node to a surface offering `archiveNode`.** A
   space is a node of type `space` in `meta`, and `POST /api/nodes/{id}/archive`
   reaches the same row the space route does — `_transition_row` says so. The
@@ -969,14 +977,22 @@ Full conventions: `web/README.md`. The rules below are the ones that bind.
   node one — every grant on it goes inert, it stops resolving, its name stays
   reserved. `archiveRefusal` therefore refuses a space **on the surface's own
   authority, not the server's**, and points at `/spaces`, which is the screen
-  that can count those consequences off the space's row.
+  that can count those consequences off the space's row — but only *after* the
+  already-archived check, because `GET /api/spaces` is active-only and a
+  pointer there for an archived space names a screen that cannot show it.
 - **A write that must land after a save awaits the save.** The editor's buffer
   flush is detached (`flushLeftover`), so archiving with unsaved text put the
   `node.update` on the wire *after* the archive: it landed on an archived row
   and became the event-log head, which is exactly the condition that costs the
   archive its undo. `useNodeDocument.persistNow()` is the awaitable save —
   `saveNow` fires and forgets, which is right for a shortcut and wrong here —
-  and a save that did not land stops the write with the dialog standing.
+  and a save that did not land stops the write with the dialog standing. What
+  makes it awaitable at all is `runPersist` **handing back the outstanding
+  write's own handle** when `persist` re-enters mid-save: `persist`
+  short-circuits on `savingRef` and resolves immediately, so storing *that*
+  promise dropped the handle on the write actually in flight and then cleared
+  the ref while it was still unresolved — and everything waiting on it carried
+  on as though the wire were clear.
 - **A dialog locks body scroll and hands focus somewhere real.** Both the
   review `Modal` and the assets lightbox set `body.style.overflow` on open and
   restore it on close. On close, focus returns to the opener *only if it is

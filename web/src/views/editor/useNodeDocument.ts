@@ -510,9 +510,23 @@ export function useNodeDocument({
   const persistRef = useRef(persist);
   persistRef.current = persist;
 
-  /** Run a save and keep a handle on it, so a flush can wait its turn. */
+  /**
+   * Run a save and keep a handle on it, so a flush can wait its turn.
+   *
+   * A `persist` re-entered while a save is on the wire writes nothing: it sets
+   * `pendingRef` and returns an already-resolved promise. Storing *that* as the
+   * in-flight handle threw away the handle on the write actually outstanding —
+   * and the `finally` below then cleared the ref while that write was still
+   * unresolved, so everything waiting on it (`flushBuffer`, `persistNow`)
+   * carried on as though the wire were clear. The re-entrant call therefore
+   * hands back the live handle instead of replacing it.
+   */
   const runPersist = useCallback(() => {
+    // Read before the call: this is the state that decides whether `persist`
+    // is about to short-circuit.
+    const outstanding = savingRef.current ? inFlightRef.current : null;
     const run = persistRef.current();
+    if (outstanding !== null) return outstanding;
     inFlightRef.current = run;
     void run.finally(() => {
       if (inFlightRef.current === run) inFlightRef.current = null;
@@ -645,12 +659,14 @@ export function useNodeDocument({
   }, [runPersist]);
 
   const persistNow = useCallback(async () => {
-    // Whatever is already on the wire lands first: scheduling a second write
-    // over it would race the one in flight, and `persist` reads `savedRef`,
-    // which the in-flight response is about to move.
-    await inFlightRef.current;
+    // Two rounds, and both are needed. The first waits out a save already on
+    // the wire — `runPersist` hands back that write's own handle rather than
+    // starting a second one over it. The buffer may have moved on since that
+    // write was sent, so the second round is what puts *the current* text on
+    // disk. A third is impossible: nothing types between these two awaits.
     await runPersist();
-    // Read after the run rather than from `saveState`, which is React state a
+    if (hasUnflushed()) await runPersist();
+    // Read after the runs rather than from `saveState`, which is React state a
     // render behind. `hasUnflushed` is the buffer-versus-wire comparison the
     // flush itself uses, so agreeing with it is the point.
     return !hasUnflushed();

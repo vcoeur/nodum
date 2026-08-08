@@ -64,6 +64,13 @@ const SPACE_TYPE = "space";
  * @returns One sentence naming the reason, for a disabled control.
  */
 export function archiveRefusal(node: NodeOut): string | null {
+  // Before the space branch: `GET /api/spaces` is active-only, so sending
+  // somebody to the Spaces screen for a space that is *already* archived
+  // sends them to a screen that cannot show the row, to redo something that
+  // is done. "Already archived." is the true answer for either kind of node.
+  if (node.state === "archived") {
+    return "Already archived.";
+  }
   if (STRUCTURAL_SPACE_IDS.includes(node.id)) {
     return `${node.id} is a structural space — the server refuses to archive it.`;
   }
@@ -72,9 +79,6 @@ export function archiveRefusal(node: NodeOut): string | null {
       "This is a space, and archiving one cuts off every grant on it — a different action with " +
       "different consequences. Archive it from the Spaces screen, which states them."
     );
-  }
-  if (node.state === "archived") {
-    return "Already archived.";
   }
   if (node.state === "proposed") {
     return "Only an active node can be archived — reject it in the review queue instead.";
@@ -110,15 +114,16 @@ export function archiveConsequences(node: NodeOut, edgeCount: number | null): st
           `${edgeCount === 1 ? "it stays" : "they stay"} active, so the node still appears in its ` +
           "neighbours' edge rails and in the graph.",
   );
-  // Reversible is the fact; the *button* is not promised, because the toast
-  // withholds it whenever the log head is no longer this write (an agent's
-  // write landing in between, a cycle-stamped head, a failed log read). A
-  // confirm promising a control that then does not appear is exactly the kind
-  // of line this module exists to keep out.
+  // Reversible is the fact; the *button* is not promised, and neither is any
+  // condition under which it appears. The toast withholds it whenever it
+  // cannot prove the log head is this write — an agent's write landing in
+  // between, a cycle-stamped head, or an event-log read that simply failed —
+  // and the last of those makes "nothing else landed" insufficient as well as
+  // unnecessary. A confirm naming a condition the next screen falsifies is the
+  // same defect as one naming a control it does not show.
   lines.push(
     "This is reversible: the archive is one event, and undoing that event puts the node back — " +
-      "from the confirmation that follows while it is still the last thing that happened, and by " +
-      "seq on the CLI after that.",
+      "offered in the confirmation that follows when it can be, and by seq on the CLI otherwise.",
   );
 
   return lines;

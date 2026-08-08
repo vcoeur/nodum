@@ -36,6 +36,28 @@ import {
 import type { MenuAnchor } from "../lib/contextMenu";
 import "./ContextMenu.css";
 
+/**
+ * The keys an open menu takes for itself.
+ *
+ * Wider than the keys it acts on: the arrows it does not use are in here too,
+ * because a list behind the panel treats them as navigation and an unhandled
+ * ArrowRight was navigating the reader away from an open menu. Anything not in
+ * this set reaches the rest of the app untouched — see {@link ContextMenu}'s
+ * key handler for why that matters.
+ */
+const MENU_KEYS = new Set([
+  "Escape",
+  "Tab",
+  "Enter",
+  " ",
+  "ArrowUp",
+  "ArrowDown",
+  "ArrowLeft",
+  "ArrowRight",
+  "Home",
+  "End",
+]);
+
 /** One action in a menu. */
 export interface MenuAction {
   /** Stable key, unique within the menu. */
@@ -189,7 +211,14 @@ export function ContextMenu({ label, anchor, ignore, items, onClose }: ContextMe
       // Only if it is still there: focusing a detached node drops focus onto
       // `<body>`, which is the thing this restore exists to prevent.
       const opener = restoreTo.current;
-      if (opener !== null && opener !== document.body && opener.isConnected) opener.focus();
+      // `preventScroll`, because this menu closes *on* scroll: without it a
+      // wheel gesture yanks the viewport back to the row the reader was
+      // scrolling away from, and on the outside-click path the scroll can move
+      // the page between pointerdown and pointerup so the click that closed
+      // the menu never lands anywhere.
+      if (opener !== null && opener !== document.body && opener.isConnected) {
+        opener.focus({ preventScroll: true });
+      }
     };
   }, [anchor]);
 
@@ -223,14 +252,24 @@ export function ContextMenu({ label, anchor, ignore, items, onClose }: ContextMe
   };
 
   const onKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
-    // **Every** key, handled or not. A portal bubbles through the React tree,
-    // not the DOM one, so a keydown in this panel reaches whatever list the
-    // menu was rendered inside — and that list's own roving-focus handler then
-    // runs beside the menu's. The search results' ArrowDown moved the
-    // selection *and* scrolled, which fired the scroll listener above and
-    // closed the menu; its unhandled ArrowRight navigated away with the menu
-    // still open. A menu owns the keyboard while it is up.
-    event.stopPropagation();
+    // The menu owns its own key vocabulary and **nothing else**, and both
+    // halves of that were bugs.
+    //
+    // It has to own that vocabulary because a portal bubbles through the
+    // React tree rather than the DOM one: a keydown in this panel reaches
+    // whatever list the menu was rendered inside, and that list's roving-focus
+    // handler then ran beside the menu's — the search results' ArrowDown moved
+    // the selection *and* scrolled, which fired the scroll listener above and
+    // closed the menu, while an ArrowRight the menu ignores navigated away
+    // with the menu still open.
+    //
+    // It must not own anything else because React's `stopPropagation`
+    // forwards to the native event, and the panel is portalled into
+    // `document.body` — so stopping every key silently killed every
+    // `document`/`window` shortcut in the app while a menu was up: search's
+    // `/` and Ctrl-K, `Modal`'s Escape and its Tab trap, the asset lightbox's
+    // arrows. Anything outside this set travels.
+    if (MENU_KEYS.has(event.key)) event.stopPropagation();
     switch (event.key) {
       case "Escape":
         onClose();

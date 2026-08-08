@@ -8,8 +8,12 @@
  * the editor both reach it, and a second copy is how two surfaces end up
  * promising different things about the same write.
  *
- * The body is `nodeArchive.ts`'s consequence list, and its last line promises
- * an undo — which `useNodeArchive` is the half that delivers.
+ * The body is `nodeArchive.ts`'s consequence list. Its last line says the
+ * archive is **one reversible event** and deliberately promises neither the
+ * Undo button nor a condition for it: `useNodeArchive` withholds the button
+ * whenever it cannot prove the event-log head is this write, and a confirm
+ * naming a control the next screen does not show is the defect that module
+ * exists to keep out.
  */
 
 import { useState } from "react";
