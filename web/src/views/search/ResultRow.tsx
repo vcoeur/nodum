@@ -1,7 +1,7 @@
 import type { KeyboardEvent } from "react";
-import { Link } from "react-router-dom";
-import { NodeBadge, NodePeek } from "../../components";
-import type { SpaceName } from "../../components";
+import { Link, useNavigate } from "react-router-dom";
+import { ContextMenu, MenuButton, NodeBadge, NodePeek, useContextMenu } from "../../components";
+import type { MenuAction, SpaceName } from "../../components";
 import type { SearchHit } from "../../api/types";
 import { hitSpaceTitle } from "./resultSpace";
 import { SignalBreakdown } from "./SignalBreakdown";
@@ -21,6 +21,12 @@ import { renderSnippet } from "./snippet";
  * space (only when the filter left it open — see `resultSpace.ts`), then type
  * and state. They sit at one x position down the list precisely because the
  * list is scanned rather than read.
+ *
+ * A right-click anywhere on the row — or its `⋯` — opens the shared context
+ * menu on that hit's node. The actions are **travel only**: a search hit is a
+ * projection (id, title, type, snippet), not a node, so nothing here can state
+ * what archiving it would cost. Retirement lives one click away, on the
+ * surfaces that hold the whole node.
  */
 
 interface ResultRowProps {
@@ -75,8 +81,17 @@ export function ResultRow({
   linkRef,
   onKeyDown,
 }: ResultRowProps) {
+  const navigate = useNavigate();
+  const menu = useContextMenu();
   const signals = describeSignals(hit);
   const title = hit.title?.trim() ? hit.title : "Untitled";
+  const nodePath = encodeURIComponent(hit.node_id);
+  const items: MenuAction[] = [
+    { id: "open", label: "Open", group: "go", onSelect: () => navigate(`/node/${nodePath}`) },
+    { id: "edit", label: "Edit", group: "go", onSelect: () => navigate(`/editor/${nodePath}`) },
+    { id: "graph", label: "Open in graph", group: "go", onSelect: () => navigate(`/graph/${nodePath}`) },
+    { id: "history", label: "Version history", group: "go", onSelect: () => navigate(`/history/${nodePath}`) },
+  ];
   // An expansion hit has no matched text: the server falls back to the title,
   // which would render as a snippet echoing the line above it. Say what the row
   // actually is instead.
@@ -89,6 +104,7 @@ export function ResultRow({
         signals.isNeighbour ? "nd-search-hit nd-search-hit--neighbour" : "nd-search-hit"
       }
       onKeyDown={(event) => onKeyDown(event, index)}
+      onContextMenu={menu.openAt}
     >
       <div className="nd-search-hit__head">
         <NodePeek nodeId={hit.node_id}>
@@ -139,8 +155,18 @@ export function ResultRow({
           >
             Subgraph
           </Link>
+          <MenuButton label={`Actions for ${title}`} controller={menu} />
         </span>
       </div>
+
+      {menu.anchor !== null ? (
+        <ContextMenu
+          label={`Actions for ${title}`}
+          anchor={menu.anchor}
+          items={items}
+          onClose={menu.close}
+        />
+      ) : null}
     </li>
   );
 }

@@ -1,0 +1,129 @@
+import { describe, expect, it } from "vitest";
+import { archiveConsequences, archiveRefusal } from "./nodeArchive";
+import type { NodeOut } from "../api/types";
+
+function node(over: Partial<NodeOut> = {}): NodeOut {
+  return {
+    id: "n1",
+    type: "note",
+    title: "Kafka partitions",
+    content: "",
+    props: {},
+    parent_id: null,
+    position: null,
+    space_id: "main",
+    state: "active",
+    created_by: "human:alice",
+    created_at: "2026-08-01 10:00:00",
+    updated_at: "2026-08-01 10:00:00",
+    ...over,
+  } as NodeOut;
+}
+
+describe("archiveRefusal", () => {
+  it("allows an active node", () => {
+    expect(archiveRefusal(node())).toBeNull();
+  });
+
+  it("refuses a structural space by id", () => {
+    // `_transition_row` refuses `main` and `meta` whatever route reaches them.
+    expect(archiveRefusal(node({ id: "main" }))).toContain("structural space");
+    expect(archiveRefusal(node({ id: "meta" }))).toContain("structural space");
+  });
+
+  it("refuses a node already archived", () => {
+    expect(archiveRefusal(node({ state: "archived" }))).toBe("Already archived.");
+  });
+
+  it("points a proposed node at the review queue", () => {
+    // `archive` is `active → archived` only; rejecting is what retires a
+    // proposal, and the refusal has to say where that lives.
+    expect(archiveRefusal(node({ state: "proposed" }))).toContain("review queue");
+  });
+
+  it("refuses a space and points at the Spaces screen", () => {
+    // The server would perform this: a space is a node in `meta`, and
+    // `POST /api/nodes/{id}/archive` reaches the same row the space route
+    // does. What it costs — every grant on the space going inert, the name
+    // reserved for good — is nothing the node-scale copy states, so the
+    // node-scale control refuses rather than describing the wrong write.
+    const refusal = archiveRefusal(node({ id: "abc", type: "space", title: "research" }));
+    expect(refusal).toContain("Spaces");
+    expect(refusal).toContain("grant");
+  });
+
+  it("refuses a proposed space as a space, not as a proposal", () => {
+    // The review-queue sentence would be the wrong destination: rejecting a
+    // proposed space there is still the space-scale write.
+    expect(archiveRefusal(node({ id: "abc", type: "space", state: "proposed" }))).toContain(
+      "Spaces",
+    );
+  });
+
+  it("says an archived space is already archived rather than sending it to Spaces", () => {
+    // `GET /api/spaces` is active-only, so the Spaces screen cannot show an
+    // archived space at all — pointing there would send the reader to redo a
+    // done thing on a screen without the row.
+    expect(archiveRefusal(node({ id: "abc", type: "space", state: "archived" }))).toBe(
+      "Already archived.",
+    );
+  });
+});
+
+describe("archiveConsequences", () => {
+  it("names the node and says nothing is deleted", () => {
+    const lines = archiveConsequences(node(), 3);
+    expect(lines[0]).toContain("Kafka partitions");
+    expect(lines[0]).toContain("Nothing is deleted");
+  });
+
+  it("falls back to a neutral subject for an untitled node", () => {
+    const lines = archiveConsequences(node({ title: null }), 0);
+    expect(lines[0]?.startsWith("This node")).toBe(true);
+  });
+
+  it("treats a whitespace-only title as no title", () => {
+    const lines = archiveConsequences(node({ title: "   " }), 0);
+    expect(lines[0]?.startsWith("This node")).toBe(true);
+  });
+
+  it("states that edges survive, and counts them when known", () => {
+    // The load-bearing line: archiving settles no edges, so a reader who
+    // assumes the neighbourhood goes quiet is wrong in a way the graph shows.
+    expect(archiveConsequences(node(), 3).some((line) => line.includes("3 edges are not archived"))).toBe(
+      true,
+    );
+    expect(archiveConsequences(node(), 1).some((line) => line.includes("1 edge is not archived"))).toBe(
+      true,
+    );
+  });
+
+  it("says nothing connects to it rather than counting zero edges", () => {
+    expect(archiveConsequences(node(), 0).some((line) => line.includes("Nothing connects to it"))).toBe(
+      true,
+    );
+  });
+
+  it("still states that edges survive when the count is unknown", () => {
+    const lines = archiveConsequences(node(), null);
+    expect(lines.some((line) => line.includes("not archived with it"))).toBe(true);
+  });
+
+  it("says the archive is reversible without promising the button", () => {
+    // The toast withholds its Undo whenever it cannot prove the log head is
+    // this write — including when the event-log read simply failed. So the
+    // line may name neither the control nor a condition for it: "while it is
+    // still the last thing that happened" would be falsified by that read
+    // failing with nothing else having landed.
+    const line = archiveConsequences(node(), 2).find((text) => text.includes("reversible"));
+    expect(line).toBeDefined();
+    expect(line).toContain("CLI");
+    expect(line).not.toContain("offers an undo");
+    expect(line).not.toContain("last thing that happened");
+  });
+
+  it("never claims search still reaches it", () => {
+    const lines = archiveConsequences(node(), 2);
+    expect(lines.some((line) => line.includes("Search stops finding it"))).toBe(true);
+  });
+});

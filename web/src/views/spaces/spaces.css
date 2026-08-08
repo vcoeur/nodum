@@ -98,13 +98,3 @@
   padding: var(--nd-space-2) var(--nd-space-4) var(--nd-space-2) 0;
   border-bottom: 1px solid var(--nd-border);
 }
-
-/* The archive dialog's list of what archiving does and does not do. */
-.nd-sp-consequences {
-  display: flex;
-  flex-direction: column;
-  gap: var(--nd-space-4);
-  padding-left: var(--nd-space-12);
-  list-style: disc;
-  line-height: var(--nd-leading-normal);
-}

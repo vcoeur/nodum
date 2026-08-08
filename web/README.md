@@ -304,8 +304,8 @@ syntactic rules above; type-level guarantees remain with `tsc`.
 |---|---|
 | `src/main.tsx`, `src/App.tsx`, `src/router.tsx` | entry, app shell (header, nav, toasts, crash boundary, health pill + server-version label), route table |
 | `src/api/client.ts`, `src/api/types.ts` | the only `fetch` in the app, and the types mirroring `nodum/models.py` |
-| `src/lib/` | cross-view plain functions: timestamp parsing (`time.ts`), failure classification (`failure.ts`), the 401 broadcast (`session.ts`), which slice of a long list to render (`paging.ts` — the journal's event diff and the review queue), the sticky write target (`writeTarget.ts`, the one module here that also exports a hook), the wikilink href contract and insertion choice (`wikilinks.ts` — the href both the renderer and the click interceptor agree on, and the `[[Title]]`-vs-`[[id]]` decision a title with a `|` or a bracket forces), the peek card's pure model (`peek.ts` — plain-text excerpt, in/out edge counts, the hover-intent state machine, and the per-session `getNode` cache), and the create-link dialog's pure model (`linkDialog.ts` — the direction↔edge-type pairing, the prefix-then-search target fallback, the confidence parse, and the search debounce) |
-| `src/components/` | shared React components: `NodeBadge`, `Toast`, `Spinner`, `EmptyState`, `ErrorBoundary`, `Modal`, `LinkDialog` (the create-edge dialog — the first caller of `createEdge`, reachable from the reading view, the graph panel, and the editor's `/link` command), the shared hover/focus peek card (`NodePeek` wraps a trigger element; `NodePeekScope` delegates on a rendered-Markdown container so the `a.nd-wikilink` anchors inside sanitised `innerHTML` can peek too), plus the whole space vocabulary — `SpaceFilter.tsx` with `spaceOptions.ts` (what a picker offers, which is the active list and never more) and `useSpaces.ts` (the `GET /api/spaces` read every space surface shares), and `spaceNaming.ts` with `useArchivedSpaces.ts` (what a surface that *displays* a space calls it, including one the active listing does not carry — and what names an archived value a picker is already holding) |
+| `src/lib/` | cross-view plain functions: timestamp parsing (`time.ts`), failure classification (`failure.ts`), the 401 broadcast (`session.ts`), which slice of a long list to render (`paging.ts` — the journal's event diff and the review queue), the sticky write target (`writeTarget.ts`, the one module here that also exports a hook), the wikilink href contract and insertion choice (`wikilinks.ts` — the href both the renderer and the click interceptor agree on, and the `[[Title]]`-vs-`[[id]]` decision a title with a `|` or a bracket forces), the peek card's pure model (`peek.ts` — plain-text excerpt, in/out edge counts, the hover-intent state machine, and the per-session `getNode` cache), the create-link dialog's pure model (`linkDialog.ts` — the direction↔edge-type pairing, the prefix-then-search target fallback, the confidence parse, and the search debounce), the context menu's placement and keyboard model (`contextMenu.ts` — viewport clamping, the flip that clears the button it hangs off, the roving index that skips disabled items, and the keyboard-menu-key anchor fallback), telling a focus the app moved from one the reader moved (`programmaticFocus.ts` — the marker every hand-back goes through and every focus watcher checks), and which event an undo may name (`undoTarget.ts`) |
+| `src/components/` | shared React components: `NodeBadge`, `Toast` (with the one optional action a toast may carry — the archive's Undo), `Spinner`, `EmptyState`, `ErrorBoundary`, `Modal`, `ContextMenu` (the one contextual-action menu, with `useContextMenu` and the `MenuButton` twin that gives touch and keyboard the same actions a right-click does), the node retirement pair — `ArchiveNodeDialog` with `nodeArchive.ts` (what archiving one node costs, and the transitions the server refuses) and `useNodeArchive.ts` (the write plus the undo it promises, mounted by the host so the undo outlives the dialog) — `LinkDialog` (the create-edge dialog — the first caller of `createEdge`, reachable from the reading view, the graph panel, and the editor's `/link` command), the shared hover/focus peek card (`NodePeek` wraps a trigger element; `NodePeekScope` delegates on a rendered-Markdown container so the `a.nd-wikilink` anchors inside sanitised `innerHTML` can peek too), plus the whole space vocabulary — `SpaceFilter.tsx` with `spaceOptions.ts` (what a picker offers, which is the active list and never more) and `useSpaces.ts` (the `GET /api/spaces` read every space surface shares), and `spaceNaming.ts` with `useArchivedSpaces.ts` (what a surface that *displays* a space calls it, including one the active listing does not carry — and what names an archived value a picker is already holding) |
 | `src/styles/` | `tokens.css`, `base.css`, `primitives.css`, `app.css` |
 | `src/views/editor/` | CodeMirror-6 Markdown source editor, slash commands (node types, Markdown scaffolds, and `/link` — the create-edge dialog anchored on the current node, which inserts the chosen target's `[[Title]]` — or `[[id]]` for a title the wikilink grammar cannot carry — at the caret on success), `[[` autocomplete, live Mermaid preview, autosave, the write-target picker and the landing/refusal copy (`createOutcome.ts`) |
 | `src/views/search/` | query box, ranked hits, per-signal breakdown, signal grouping, the space filter + show-meta toggle in the URL (`searchState.ts`), refused-filter copy (`spaceFailure.ts`), when a row names its space (`resultSpace.ts`) |
@@ -317,7 +317,7 @@ syntactic rules above; type-level guarantees remain with `tsc`.
 | `src/views/spaces/` | the space lifecycle: list with node counts and grant holders, create, rename, archive — and `spaces.ts`'s `archiveConsequences`, the one place the archive dialog's promises are written, every line of which has to be something the server actually delivers |
 | `src/views/admin/` | accounts and grants administration, show-once token dialog |
 | `src/views/history/` | per-node version timeline and side-by-side diff |
-| `src/views/node/` | the reading view (`/node/:nodeId`): rendered Markdown + Mermaid via the editor's pure renderer, clickable `[[wikilinks]]`, the incident-edge rail (`nodeEdges.ts` narrows the depth-1 neighbourhood to the root's edges), and the header's **Link** button, which opens the create-edge dialog anchored on this node — plus `NodeTitleRedirect.tsx`, the resolver behind `/node/title/:title` |
+| `src/views/node/` | the reading view (`/node/:nodeId`): rendered Markdown + Mermaid via the editor's pure renderer, clickable `[[wikilinks]]`, the incident-edge rail and the **backlinks** section under it (`nodeEdges.ts` narrows the depth-1 neighbourhood twice — to the root's edges, and to the inbound `mentions` with `mentionContext` finding the sentence each wikilink was written in), the header's **Link** and **Archive** buttons, and the context menu behind the heading and every edge row — plus `NodeTitleRedirect.tsx`, the resolver behind `/node/title/:title` |
 | `package.json`, `vite.config.ts`, `vitest.config.ts`, `tsconfig.json` | toolchain |
 | `**/*.test.ts` | Vitest unit tests, beside the module each covers |
 
@@ -451,6 +451,47 @@ Conventions that hold across the tree:
   harness is unit-only, so a rule that matters (a URL codec, a diff parser, a
   grant grid) goes in its own `.ts` with a `.test.ts` beside it, and the
   component consumes it.
+- **There is one context menu, and every surface contributes items to it.**
+  `components/ContextMenu.tsx` is the only contextual-action surface; a view
+  writes an item list and never a menu. Three rules ride with it. A surface that
+  offers a right-click offers the `MenuButton` twin as well — a right-click does
+  not exist on touch and is invisible to anyone who has not tried one. An item
+  the server would refuse is rendered **disabled with its reason** rather than
+  hidden, so the refusal is readable once instead of being met as a 400. And
+  nothing destructive happens in the menu itself: a `danger` item opens a
+  confirm, which is what lets the menu close on Enter without a keypress ever
+  moving live state. Four wiring rules ride under it, each of which was a bug
+  first: the menu **owns `MENU_KEYS` and nothing else** (a portal bubbles
+  through the React tree, so the list's roving `onKeyDown` sits above the
+  panel; but React's `stopPropagation` forwards to the native event, so
+  stopping *every* key kills the app's `document`/`window` shortcuts while a
+  menu is open — the set is pure and tested in `lib/contextMenu.ts` because
+  both edges are silent regressions); **focus leaving the panel closes it, via
+  two watchers** — `focusin` on `document` for focus moving to another element,
+  and the panel's `focusout` on a null `relatedTarget` *while
+  `document.hasFocus()`* for focus falling back to `<body>`, the guard being
+  what keeps alt-tabbing away from dismissing an open menu; **`MenuButton` opens and does not toggle**, and no
+  dismissal is exempt for it — four attempts at a toggling button produced
+  eleven defects, all of them turning on an event ordering that is not stable
+  across how the menu was opened or which engine runs it, so the button opens
+  unconditionally and the press dismisses through the ordinary watchers; and
+  focus a surface moves itself goes through **`lib/programmaticFocus.ts`**, so
+  a watcher can tell the app's move from the reader's (a closing menu handing
+  focus back to a search row's title — which is a peek trigger — pinned a
+  preview card open over the results); and focus is **handed back only if the
+  panel still holds it**, with `preventScroll` because this overlay closes on
+  scroll.
+- **A space is not an ordinary node to a surface offering `archiveNode`.** A
+  space is a node of type `space` in `meta` and the node archive route reaches
+  the same row the space route does, so the server would perform it — while the
+  consequences are `archive_space`'s, not the node ones. `archiveRefusal`
+  refuses it on the surface's own authority and points at `/spaces`.
+- **An undo names one event, never "the latest".** `POST /api/undo` with no
+  `seq` reverses whatever the log head happens to be, and in a store four
+  surfaces write to that is not necessarily the thing the human is looking at.
+  `lib/undoTarget.ts` decides whether the head provably *is* the write just
+  made — same op, same row, no `cycle_id` — and a confirmation appears with no
+  Undo on it rather than one that would reverse a stranger's write.
 - **A dialog locks body scroll and hands focus somewhere real.** `review/Modal`
   and `assets/AssetLightbox` both set `body.style.overflow` on open and restore
   it on close. On close each returns focus to its opener *only if the opener is

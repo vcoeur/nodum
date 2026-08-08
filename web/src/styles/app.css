@@ -202,6 +202,14 @@
   overflow-wrap: anywhere;
 }
 
+/* The toast's single action — the archive confirmation's Undo. Aligned to the
+ * first line rather than centred, so it sits beside the title whatever the
+ * detail's height. */
+.nd-toast__action {
+  flex: none;
+  align-self: flex-start;
+}
+
 .nd-toast__dismiss {
   flex: none;
   padding: 0 var(--nd-space-2);

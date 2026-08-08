@@ -214,6 +214,20 @@ export interface NodeDocument {
   handleContentChange(content: string): void;
   /** Save immediately, skipping the debounce. */
   saveNow(): void;
+  /**
+   * Save anything outstanding and wait for it to land.
+   *
+   * {@link NodeDocument.saveNow} fires and forgets, which is right for a
+   * keyboard shortcut and wrong in front of a write that has to happen *after*
+   * the save. Archiving is that write: the buffer's flush is detached, so an
+   * archive with unsaved text lands a `node.update` on an already-archived row
+   * and makes it the event-log head — which costs the archive the undo it just
+   * promised.
+   *
+   * @returns True when the buffer is on disk; false when the save failed, in
+   *   which case `saveError` says why and the caller must not go on.
+   */
+  persistNow(): Promise<boolean>;
   /** Re-fetch the node from the server. */
   reload(): void;
 }
@@ -253,6 +267,17 @@ export function useNodeDocument({
   const startedRef = useRef(false);
   const savingRef = useRef(false);
   const pendingRef = useRef(false);
+  /**
+   * Whether the last save attempt was refused.
+   *
+   * `saveState` says the same thing, but as React state it is a render behind
+   * — and {@link NodeDocument.persistNow} has to read the outcome inside an
+   * async function, between two awaits. Without it, `hasUnflushed()` cannot
+   * tell "the buffer moved on while the write was in flight" (retry) from
+   * "the write failed" (do not), and re-sending on the second cuts a second
+   * version row for text the server may already hold.
+   */
+  const saveFailedRef = useRef(false);
   const timerRef = useRef<number | null>(null);
   const blankCountRef = useRef(0);
 
@@ -332,6 +357,10 @@ export function useNodeDocument({
       pendingRef.current = true;
       return;
     }
+    // Each attempt starts clean; the three refusal branches below set it. The
+    // short-circuit above deliberately leaves it alone — the outcome that
+    // matters there belongs to the write already on the wire.
+    saveFailedRef.current = false;
 
     const content = contentRef.current;
     const currentTitle = titleRef.current;
@@ -357,6 +386,7 @@ export function useNodeDocument({
       }
       const type = createTypeRef.current;
       if (type === null) {
+        saveFailedRef.current = true;
         setSaveState("failed");
         setSaveError(
           "No node type available — the type catalog did not load, so a new node cannot be created. Your text is still here.",
@@ -426,6 +456,7 @@ export function useNodeDocument({
         // A write target naming a space that has since been archived or renamed
         // fails here rather than being rewritten to `main` — deliberately, and
         // so it has to read as something the human can act on.
+        saveFailedRef.current = true;
         setSaveState("failed");
         setSaveError(
           describeWriteFailure(error, target, spacesRef.current, archivedRef.current) ??
@@ -468,6 +499,7 @@ export function useNodeDocument({
         toastRef.current.showError(error, "An edit to the previous note was not saved");
         return;
       }
+      saveFailedRef.current = true;
       setSaveState("failed");
       setSaveError(
         isNotFound(error)
@@ -496,9 +528,23 @@ export function useNodeDocument({
   const persistRef = useRef(persist);
   persistRef.current = persist;
 
-  /** Run a save and keep a handle on it, so a flush can wait its turn. */
+  /**
+   * Run a save and keep a handle on it, so a flush can wait its turn.
+   *
+   * A `persist` re-entered while a save is on the wire writes nothing: it sets
+   * `pendingRef` and returns an already-resolved promise. Storing *that* as the
+   * in-flight handle threw away the handle on the write actually outstanding —
+   * and the `finally` below then cleared the ref while that write was still
+   * unresolved, so everything waiting on it (`flushBuffer`, `persistNow`)
+   * carried on as though the wire were clear. The re-entrant call therefore
+   * hands back the live handle instead of replacing it.
+   */
   const runPersist = useCallback(() => {
+    // Read before the call: this is the state that decides whether `persist`
+    // is about to short-circuit.
+    const outstanding = savingRef.current ? inFlightRef.current : null;
     const run = persistRef.current();
+    if (outstanding !== null) return outstanding;
     inFlightRef.current = run;
     void run.finally(() => {
       if (inFlightRef.current === run) inFlightRef.current = null;
@@ -629,6 +675,33 @@ export function useNodeDocument({
   const saveNow = useCallback(() => {
     void runPersist();
   }, [runPersist]);
+
+  const persistNow = useCallback(async () => {
+    // Round one waits out a save already on the wire — `runPersist` hands back
+    // that write's own handle rather than starting a second one over it.
+    await runPersist();
+
+    // Round two exists for one case and is gated on it: text typed *during*
+    // round one, which is a whole network round trip long. `hasUnflushed()`
+    // alone cannot say that — it is equally true when the write was refused,
+    // and re-sending then would cut a second version row for text the server
+    // may already hold and pay a second doomed request on an outage.
+    if (!saveFailedRef.current && hasUnflushed()) await runPersist();
+
+    // A third round is not impossible, only declined: somebody typing through
+    // both of these gets `false` and the caller's refusal, which is the safe
+    // answer for a write that has to be *after* the save.
+    const settled = !saveFailedRef.current && !hasUnflushed();
+
+    // The short-circuited round-one call armed `pendingRef`, and the write it
+    // queued behind woke a fresh autosave timer on its way out. With the
+    // buffer already on disk that timer is a wake-up with nothing to do.
+    if (settled) {
+      pendingRef.current = false;
+      cancelTimer();
+    }
+    return settled;
+  }, [cancelTimer, hasUnflushed, runPersist]);
 
   const reload = useCallback(() => {
     // Before `ownedIdRef` is cleared: a flush after it would read a null id and
@@ -770,6 +843,7 @@ export function useNodeDocument({
     savedAt,
     handleContentChange,
     saveNow,
+    persistNow,
     reload,
   };
 }

@@ -19,7 +19,15 @@ import { Link, useParams } from "react-router-dom";
 import type { KeyboardEvent } from "react";
 import { api } from "../../api/client";
 import type { NodeOut, TypeOut } from "../../api/types";
-import { EmptyState, LinkDialog, Spinner, useSpaces, useToast } from "../../components";
+import {
+  ArchiveNodeDialog,
+  EmptyState,
+  LinkDialog,
+  Spinner,
+  useNodeArchive,
+  useSpaces,
+  useToast,
+} from "../../components";
 import { MarkdownEditor } from "./MarkdownEditor";
 import type { MarkdownEditorHandle } from "./MarkdownEditor";
 import { MarkdownPreview } from "./MarkdownPreview";
@@ -74,6 +82,34 @@ export default function EditorView() {
     writeTarget,
     spaces,
   });
+
+  // The reload is what puts the archived badge on the bar; the node's text is
+  // unchanged by an archive, so nothing else here has to move.
+  const nodeArchive = useNodeArchive(doc.reload);
+  /** True while the archive confirm is up for the open node. */
+  const [archiving, setArchiving] = useState(false);
+
+  /**
+   * Save, then archive — in that order, and only if the save landed.
+   *
+   * The buffer's flush is detached: archiving with unsaved text would put a
+   * `node.update` on the wire *after* the archive, land it on an archived row,
+   * and make it the event-log head — which is precisely the condition under
+   * which `useNodeArchive` withholds the undo. So the save is awaited first,
+   * and a save that did not land stops the archive with the dialog standing.
+   */
+  const archiveOpenNode = useCallback(
+    async (node: NodeOut) => {
+      if (!(await doc.persistNow())) {
+        throw new Error(
+          "The last edit has not been saved, so archiving now would file it after the archive. " +
+            "Fix the save first — the text on screen is still yours.",
+        );
+      }
+      await nodeArchive.archive(node);
+    },
+    [doc, nodeArchive],
+  );
 
   const editorRef = useRef<MarkdownEditorHandle>(null);
   const [previewVisible, setPreviewVisible] = useState(true);
@@ -304,7 +340,19 @@ export default function EditorView() {
         onSaveNow={doc.saveNow}
         previewVisible={previewVisible}
         onTogglePreview={() => setPreviewVisible((visible) => !visible)}
+        onArchive={() => setArchiving(true)}
       />
+
+      {archiving && doc.node !== null ? (
+        <ArchiveNodeDialog
+          node={doc.node}
+          // The editor never reads the node's neighbourhood, so the count is
+          // genuinely unknown here rather than zero.
+          edgeCount={null}
+          onConfirm={() => archiveOpenNode(doc.node as NodeOut)}
+          onClose={() => setArchiving(false)}
+        />
+      ) : null}
 
       <div className="nd-editor__panes">
         <section

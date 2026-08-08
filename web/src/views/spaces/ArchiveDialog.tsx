@@ -76,7 +76,7 @@ export function ArchiveDialog({ row, onConfirm, onClose }: ArchiveDialogProps) {
         </>
       }
     >
-      <ul className="nd-sp-consequences">
+      <ul className="nd-consequences">
         {archiveConsequences(row).map((line) => (
           <li key={line}>{line}</li>
         ))}

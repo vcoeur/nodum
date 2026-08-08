@@ -916,6 +916,119 @@ Full conventions: `web/README.md`. The rules below are the ones that bind.
   target's `[[Title]]` at the caret — or `[[id]]` when the title carries a `|`
   or a bracket the wikilink grammar cannot (`lib/wikilinks.ts`
   `wikilinkInsertion`).
+- **There is one context menu, and a view contributes items rather than
+  building one.** `components/ContextMenu.tsx` is the only contextual-action
+  surface; `useContextMenu` opens it, and `MenuButton` is its twin — a surface
+  that offers a right-click **offers the button too**, because a right-click
+  does not exist on touch and is invisible to anyone who has not tried one on a
+  web app. An action the server would refuse is rendered **disabled carrying its
+  reason** (`archiveRefusal`, and the same shape for anything after it), never
+  hidden: the refusal is worth reading once, and a 400 after a click is where it
+  is otherwise met. Nothing destructive happens in the menu — a `danger` item
+  opens a confirm — which is what lets the menu act on Enter while the `Modal`
+  contract's "nothing confirms on a keypress" still holds. The placement and
+  keyboard rules are pure in `lib/contextMenu.ts`; the component is wiring.
+  Four behaviours in that wiring are load-bearing and were each a bug first.
+  **The menu owns `MENU_KEYS` and nothing else** — the set is pure, in
+  `lib/contextMenu.ts`, with tests, because both of its edges are regressions
+  a component-less harness could otherwise not see. It needs a *wide* set
+  because a portal bubbles through the React tree and not the DOM one: the
+  search list's roving `onKeyDown` sits above the panel and ran beside it, so
+  ArrowDown moved the results *and* scrolled (firing the scroll-closes
+  listener), and an ArrowRight the menu ignores navigated away with the menu
+  open — which is why arrows the menu does not act on are in the set too, and
+  why `Escape` and `Tab` stay in it (handing `Escape` back would let one
+  keypress close the menu and the dialog behind it). It must own nothing
+  *beyond* the set because React's `stopPropagation` forwards to the native
+  event and the panel is portalled into `document.body`: stopping every key
+  killed every `document`/`window` shortcut in the app, search's `/` and Ctrl-K
+  among them; Space is the exception inside the set — on a focused `menuitem` its
+  default action *is* the activation ARIA requires, so it is prevented only on
+  the panel itself. **Focus leaving the panel closes it, and that takes two
+  watchers**, because neither DOM event says it alone. `focusin` on `document`
+  fires when something *else* takes focus — which is what a shortcut outside
+  the set does, and a panel left painted over the page had no keyboard route
+  out — but it is silent when focus falls back to `<body>`, which is what a
+  focused menu item going `disabled` under a refetch produces. The panel's own
+  `focusout` covers exactly that gap, acting on a **null `relatedTarget` while
+  `document.hasFocus()`**: null alone is also what a window losing focus
+  reports, and acting on it dismissed a menu whenever the reader alt-tabbed
+  away. **`MenuButton` opens; it does not toggle, and no
+  dismissal is exempt for it.** This is the rule that cost the most to find:
+  four attempts at a toggling button produced eleven confirmed defects, every
+  one of them the same shape — whether the click should open or close depends
+  on whether the menu survived until the click, and that depends on an ordering
+  (document capture `pointerdown` → `mousedown` and the focus it moves →
+  React's synchronous flush → `click`) that varies with how the menu was
+  opened, with whether the press produced a click at all, and with the engine.
+  Exempting the opener from the focus watchers stranded a press-and-drag-off
+  with the panel open and focus outside the portal; deciding at `pointerdown`
+  removed the ordering and cost the focus default, the touch-scroll
+  cancellation and every environment without Pointer Events; snapshotting the
+  flag earlier only moved the race. Opening unconditionally has no ordering to
+  get wrong — the press dismisses through the ordinary watchers, the click
+  opens — and Escape, a selection, an outside click, a scroll and a focus move
+  all still dismiss. **Focus a surface moves itself goes through
+  `lib/programmaticFocus.ts`.** A DOM focus event does not say who caused it,
+  and watchers act on *user* focus — the peek card arms on focus with no intent
+  delay, the menu treats focus outside its panel as a dismissal. So a closing
+  menu handing focus back to a search row's title, which is a peek trigger,
+  pinned a preview card open over the results. Both components had grown the
+  same private flag for their *own* re-arm; shared, it covers the case neither
+  private one could. It counts rather than latches, because two hand-backs
+  overlap. **Focus is handed back only if the panel still holds it**, and with
+  `preventScroll` — unlike a modal this overlay closes *on* scroll, so an
+  unconditional restore both drags the viewport back and steals focus from
+  wherever a shortcut deliberately put it.
+- **An undo affordance names one `seq`, never "the latest".** `POST /api/undo`
+  with no `seq` reverses whatever the log head is, and four surfaces write to
+  this store — an agent holding `edit` can land a write between a human's
+  archive and their reach for its undo, and the bare call would then reverse
+  *that*, under a label naming the human's own action. `lib/undoTarget.ts` is
+  the one place that decides: the head has to carry the same op, name the same
+  row, and carry no `cycle_id` (`service.undo` refuses a cycle-stamped event and
+  points at `rollback`). When it does not, the confirmation appears **with no
+  Undo on it** — that is the designed outcome, not a fallback.
+- **A retirement confirm states consequences the service actually delivers**,
+  the same rule `archiveConsequences` carries for a space, one scale down.
+  `components/nodeArchive.ts` owns the node copy, and its load-bearing line is
+  the counter-intuitive one: **archiving a node archives none of its edges**.
+  `_transition_row` settles synthesis edges on `accept`/`reject` only, and
+  `_walk` filters on *edge* state, so an archived node stays in the graph and in
+  every neighbour's rail. Search is the thing that stops finding it
+  (`search.search` defaults to `state = 'active'`). Do not soften either line.
+  Two corollaries. It states **the node's own counts, and only when they are
+  facts** — a menu archiving a neighbour has not read that neighbour's
+  neighbourhood, and a truncated walk's count is the cap rather than the size
+  (which is why the rail states it as a floor), so both pass `edgeCount: null`
+  and get the uncounted sentence. And it **promises neither the Undo button nor
+  a condition for it**, only that the archive is one reversible event: the
+  toast withholds the button whenever it cannot *prove* the log head is this
+  write, which includes the event-log read simply failing — so even "while
+  nothing else has landed" would be a condition the next screen falsifies.
+- **A space is not an ordinary node to a surface offering `archiveNode`.** A
+  space is a node of type `space` in `meta`, and `POST /api/nodes/{id}/archive`
+  reaches the same row the space route does — `_transition_row` says so. The
+  server would perform it; what it costs is `archive_space`'s list, not the
+  node one — every grant on it goes inert, it stops resolving, its name stays
+  reserved. `archiveRefusal` therefore refuses a space **on the surface's own
+  authority, not the server's**, and points at `/spaces`, which is the screen
+  that can count those consequences off the space's row — but only *after* the
+  already-archived check, because `GET /api/spaces` is active-only and a
+  pointer there for an archived space names a screen that cannot show it.
+- **A write that must land after a save awaits the save.** The editor's buffer
+  flush is detached (`flushLeftover`), so archiving with unsaved text put the
+  `node.update` on the wire *after* the archive: it landed on an archived row
+  and became the event-log head, which is exactly the condition that costs the
+  archive its undo. `useNodeDocument.persistNow()` is the awaitable save —
+  `saveNow` fires and forgets, which is right for a shortcut and wrong here —
+  and a save that did not land stops the write with the dialog standing. What
+  makes it awaitable at all is `runPersist` **handing back the outstanding
+  write's own handle** when `persist` re-enters mid-save: `persist`
+  short-circuits on `savingRef` and resolves immediately, so storing *that*
+  promise dropped the handle on the write actually in flight and then cleared
+  the ref while it was still unresolved — and everything waiting on it carried
+  on as though the wire were clear.
 - **A dialog locks body scroll and hands focus somewhere real.** Both the
   review `Modal` and the assets lightbox set `body.style.overflow` on open and
   restore it on close. On close, focus returns to the opener *only if it is
