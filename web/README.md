@@ -305,6 +305,17 @@ per-run and deleted on exit, because these specs archive things.
 Locally the system Chrome is used, so nothing is downloaded; CI installs
 chromium instead (`playwright.config.ts` switches on `CI`).
 
+**The run is headless, and that is checked rather than assumed.** These specs
+press Escape, type `/` and move focus, so a browser window on your display would
+steal the keyboard mid-run. `headless: true` is stated in the config, and
+`e2e/headless-guard.ts` aborts before any worker starts if something turned it
+off — `--headed`, `PWDEBUG=1`, or a future change to Playwright's default. A
+visible run is still available and deliberate:
+
+```bash
+NODUM_E2E_HEADED=1 npx playwright test --headed
+```
+
 **A transient overlay owes four checks.** They are not a general checklist —
 they are the four things that actually failed across nine review rounds on
 `ContextMenu`, none of which a type check or a unit test could have caught:

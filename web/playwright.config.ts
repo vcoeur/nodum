@@ -16,6 +16,10 @@ const PORT = process.env.NODUM_E2E_PORT ?? "8699";
 export default defineConfig({
   testDir: "./e2e",
   testMatch: /.*\.spec\.ts$/,
+  // Checks the headless promise below is actually in force before any worker
+  // launches a browser — `--headed`, `PWDEBUG=1` or a future default change
+  // would otherwise put a focus-stealing window on the developer's screen.
+  globalSetup: "./e2e/headless-guard.ts",
   fullyParallel: false,
   // One worker: every spec shares the one fixture database, and the archive
   // specs mutate it.
@@ -28,6 +32,11 @@ export default defineConfig({
   retries: process.env.CI ? 2 : 0,
   use: {
     baseURL: `http://127.0.0.1:${PORT}`,
+    // Stated rather than inherited from Playwright's default. This suite presses
+    // Escape, types `/` and moves focus around, so a window on the developer's
+    // display would steal the keyboard mid-run; `e2e/headless-guard.ts` refuses
+    // to start if anything has turned this off.
+    headless: true,
     // Locally the system Chrome, so nothing is downloaded and the browser is
     // the one the reader actually uses. CI has no system Chrome it can rely on,
     // so it installs Playwright's chromium and this falls through to it.
