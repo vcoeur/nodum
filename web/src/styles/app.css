@@ -68,6 +68,13 @@
   color: var(--nd-text-muted);
 }
 
+/* The server version the health poll learned, beside the status pill. */
+.nd-header__version {
+  font-size: var(--nd-text-xs);
+  color: var(--nd-text-muted);
+  font-family: var(--nd-font-mono);
+}
+
 /* --- Navigation ------------------------------------------------------- */
 
 .nd-nav {
