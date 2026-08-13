@@ -7,10 +7,9 @@ import { EmptyState, Spinner } from "./components";
 /**
  * Every route in the app, registered up front.
  *
- * Thirteen views: login, editor (blank and per-node),
- * search, review, journal (the cycle list and one cycle), graph (root picker and
- * per-root), assets, per-node history, admin, spaces, and the node reading view
- * (per-node, plus the title-resolution redirect). `/` redirects to
+ * Fourteen route modules: login, editor, search, node browse, review, journal
+ * list, cycle detail, graph, assets, per-node history, admin, spaces, node
+ * reading, and the title-resolution redirect. `/` redirects to
  * `/search`, and anything unmatched renders {@link NotFoundView} rather than a
  * blank screen.
  *
@@ -44,6 +43,7 @@ const GraphView = lazy(() => import("./views/graph/GraphView"));
 const AssetsView = lazy(() => import("./views/assets/AssetsView"));
 const HistoryView = lazy(() => import("./views/history/HistoryView"));
 const SpacesView = lazy(() => import("./views/spaces/SpacesView"));
+const NodesView = lazy(() => import("./views/nodes/NodesView"));
 const JournalView = lazy(() => import("./views/journal/JournalView"));
 const CycleView = lazy(() => import("./views/journal/CycleView"));
 const NodeView = lazy(() => import("./views/node/NodeView"));
@@ -91,6 +91,7 @@ export const router = createBrowserRouter([
       { path: "editor/:nodeId", element: lazyView(<EditorView />) },
 
       { path: "search", element: lazyView(<SearchView />) },
+      { path: "nodes", element: lazyView(<NodesView />) },
       { path: "review", element: lazyView(<ReviewView />) },
 
       // Journal — the dream journal: `/journal` lists the consolidation cycles,

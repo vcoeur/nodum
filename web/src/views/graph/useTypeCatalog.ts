@@ -7,8 +7,7 @@
  * server that is only half up.
  */
 
-import { useEffect, useState } from "react";
-import { api } from "../../api/client";
+import { useNodeTypes } from "../../components";
 
 /** The catalog, or what is known of it. */
 export interface TypeCatalog {
@@ -26,33 +25,13 @@ export interface TypeCatalog {
  * @returns Sorted node-type and edge-type ids.
  */
 export function useTypeCatalog(): TypeCatalog {
-  const [state, setState] = useState<TypeCatalog>({
-    nodeTypes: [],
-    edgeTypes: [],
-    loading: true,
-    degraded: false,
-  });
-
-  useEffect(() => {
-    const controller = new AbortController();
-    api
-      .getTypes(controller.signal)
-      .then((types) =>
-        setState({
-          nodeTypes: types.node_types.map((type) => type.id).sort(),
-          edgeTypes: types.edge_types.map((type) => type.id).sort(),
-          loading: false,
-          degraded: false,
-        }),
-      )
-      .catch(() => {
-        if (controller.signal.aborted) return;
-        setState({ nodeTypes: [], edgeTypes: [], loading: false, degraded: true });
-      });
-    return () => controller.abort();
-  }, []);
-
-  return state;
+  const nodeTypeList = useNodeTypes();
+  return {
+    nodeTypes: (nodeTypeList.types ?? []).map((type) => type.id).sort(),
+    edgeTypes: (nodeTypeList.edgeTypes ?? []).map((type) => type.id).sort(),
+    loading: nodeTypeList.types === null,
+    degraded: nodeTypeList.failed,
+  };
 }
 
 /**
