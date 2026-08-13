@@ -2470,6 +2470,61 @@ def transition(
         conn.close()
 
 
+def archive_edge(
+    edge_id: str,
+    *,
+    principal: Principal,
+    path: str | Path | None = None,
+) -> EdgeOut:
+    """Archive one active edge without resolving node or version ids.
+
+    Args:
+        edge_id: The edge to retire.
+        principal: The human who performs the archive, or a consolidation
+            cycle principal.
+        path: Explicit database path.
+
+    Returns:
+        The archived edge.
+
+    Raises:
+        EdgeNotFound: If ``edge_id`` does not name an edge the principal can
+            read.
+        GrantNotPermitted: If the principal cannot retire the edge.
+        InvalidTransition: If the edge is not active.
+    """
+    conn = _connect(path)
+    try:
+        db.begin_immediate(conn)
+        store = Store(conn, principal)
+        before = _row_dict(_get_edge_row(conn, edge_id))
+        spaces = _item_spaces(conn, "edge", before)
+        if not store.principal.is_human and not all(
+            space in (store.principal.read_spaces or ()) for space in spaces
+        ):
+            raise EdgeNotFound(f"edge not found: {edge_id}")
+        if not _CURRENT_CYCLE.get():
+            store.require_human("archive")
+        else:
+            store.require_review(spaces, "archive")
+        if before["state"] != "active":
+            raise InvalidTransition(
+                f"cannot archive an edge in state {before['state']!r} (requires state 'active')"
+            )
+        after = _set_edge_state(
+            conn,
+            before,
+            "archived",
+            "archive",
+            principal.actor_string,
+        )
+        out = _edge_out(after)
+        conn.commit()
+        return out
+    finally:
+        conn.close()
+
+
 # ── Review queue: pending proposals and batch accept/reject (design §8.1) ────
 
 

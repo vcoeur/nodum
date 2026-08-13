@@ -202,6 +202,12 @@ uv run nodum serve                      # http://127.0.0.1:8600
 uv run nodum serve --host 0.0.0.0       # allowed: login, not the bind, is the boundary
 curl -s localhost:8600/api/nodes/<id> -b nodum_session=…   # identical bytes to `nodum node get <id>`
 
+# Retire one relationship without changing either endpoint. The response is
+# the archived edge envelope; the event remains available for seq-targeted undo.
+curl -s -X POST localhost:8600/api/edges/<edge-id>/archive \
+  -b nodum_session=… -H 'Content-Type: application/json' -H 'X-Nodum-Client: curl'
+uv run nodum edge archive <edge-id> --as owner
+
 # A write from a non-browser client says it is one:
 curl -s -X POST localhost:8600/api/nodes \
   -b nodum_session=… \

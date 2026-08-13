@@ -45,7 +45,7 @@ this gate.
 The method column lists the methods the route table configured; Starlette
 answers `HEAD` for any route configured `GET`.
 
-The tables below list **62 routes**, grouped by family.
+The tables below list **63 routes**, grouped by family.
 
 
 ### Session
@@ -81,6 +81,7 @@ The tables below list **62 routes**, grouped by family.
 |---|---|---|---|---|
 | GET | `/api/edges` | `list_edges` | session | List edges, optionally filtered by incident node, type, state, or validity window. |
 | POST | `/api/edges` | `create_edge` | session | Create a typed, directed edge between two nodes. |
+| POST | `/api/edges/{id}/archive` | `archive_edge` | session | Retire an edge (``active`` → ``archived``) — the service's human tier. |
 
 ### Search & ask
 

@@ -262,6 +262,8 @@ does not resolve). With no provider configured the refusal names
 - `accept <id>` — Accept a proposed node, edge, or update (proposed → active). Human only.
 - `reject <id> --reason` — Reject a proposed node, edge, or update (proposed → archived). Human only.
 - `archive <id>` — Archive an active node or edge (active → archived).
+- `edge archive <edge-id>` — Archive one active edge (active → archived),
+  resolving the id only as an edge.
 
 ### Review queue
 
