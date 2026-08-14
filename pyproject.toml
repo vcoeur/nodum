@@ -85,7 +85,12 @@ audio = [
 ]
 
 [build-system]
-requires = ["hatchling", "hatch-vcs"]
+# Pinned for determinism. A floating hatchling bumped the emitted
+# Metadata-Version from 2.4 to 2.5 in 1.32.0 (2026-08-11); the pinned publish
+# action's validator rejects 2.5, so the release died at upload time. 1.31.0
+# emits 2.4, matching every release before it. Bump both backends deliberately
+# and together with the validator.
+requires = ["hatchling==1.31.0", "hatch-vcs==0.5.0"]
 build-backend = "hatchling.build"
 
 # Version is derived from the git tag (vX.Y.Z) at build time — never committed.
