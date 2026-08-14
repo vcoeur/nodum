@@ -14,7 +14,7 @@
  * resolve, and a server that is not answering.
  */
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import type { KeyboardEvent } from "react";
 import { api } from "../../api/client";
@@ -25,6 +25,7 @@ import {
   LinkDialog,
   Spinner,
   useNodeArchive,
+  useNodeTypes,
   useSpaces,
   useToast,
 } from "../../components";
@@ -61,7 +62,9 @@ export default function EditorView() {
   const { nodeId } = useParams<{ nodeId: string }>();
   const toast = useToast();
 
-  const { types, typesError } = useNodeTypes();
+  const nodeTypeList = useNodeTypes();
+  const types = useMemo(() => nodeTypeList.types ?? [], [nodeTypeList.types]);
+  const typesError = nodeTypeList.error;
   const [selectedType, setSelectedType] = useState<string | null>(null);
 
   // The write target is app-wide state with one owner; this is the subscription
@@ -445,35 +448,6 @@ export default function EditorView() {
 }
 
 /** The live node-type catalog, fetched once per mount. */
-function useNodeTypes(): { types: TypeOut[]; typesError: string | null } {
-  const [types, setTypes] = useState<TypeOut[]>([]);
-  const [typesError, setTypesError] = useState<string | null>(null);
-
-  useEffect(() => {
-    const controller = new AbortController();
-    let cancelled = false;
-
-    void (async () => {
-      try {
-        const catalog = await api.getTypes(controller.signal);
-        if (cancelled) return;
-        setTypes(catalog.node_types);
-        setTypesError(null);
-      } catch (error) {
-        if (cancelled || controller.signal.aborted) return;
-        setTypesError(describeError(error));
-      }
-    })();
-
-    return () => {
-      cancelled = true;
-      controller.abort();
-    };
-  }, []);
-
-  return { types, typesError };
-}
-
 /** The type a new document starts on: the preferred name, else the first offered. */
 function preferredType(types: readonly TypeOut[]): string | null {
   const preferred = types.find(

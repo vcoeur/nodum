@@ -25,6 +25,7 @@ import { versionLabel } from "./versionLabel";
 /** Every view in the app, in the order they appear in the header. */
 const VIEWS = [
   { to: "/search", label: "Search" },
+  { to: "/nodes", label: "Nodes" },
   { to: "/editor", label: "Editor" },
   { to: "/review", label: "Review" },
   { to: "/journal", label: "Journal" },

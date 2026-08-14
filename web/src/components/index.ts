@@ -58,6 +58,8 @@ export { useArchivedSpaces } from "./useArchivedSpaces";
 export type { ArchivedSpaces } from "./useArchivedSpaces";
 export { useNodeArchive } from "./useNodeArchive";
 export type { NodeArchiveApi } from "./useNodeArchive";
+export { useNodeTypes } from "./useNodeTypes";
+export type { NodeTypeList } from "./useNodeTypes";
 export { useSpaces } from "./useSpaces";
 export type { SpaceList } from "./useSpaces";
 export { ToastProvider, useToast } from "./Toast";
