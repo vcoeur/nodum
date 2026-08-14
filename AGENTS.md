@@ -717,8 +717,15 @@ Full conventions: `web/README.md`. The rules below are the ones that bind.
   (`PUT /api/uploads/{token}`) sends none at all — the capability routes are
   deliberately outside the content-type gate (`_is_capability_path`). Auth is
   the `HttpOnly` session cookie the browser attaches itself; a 401 from any
-  route but login is broadcast through `src/lib/session.ts` to a `/login`
-  redirect.
+   route but login is broadcast through `src/lib/session.ts` to a `/login`
+   redirect.
+- **Recent reads are scoped by verified human identity.** `src/lib/recents.ts`
+  receives its scope only from the app shell after `GET /api/me` returns the
+  stable human id. Until then it exposes and records an empty list, including
+  when a non-401 identity failure leaves failure-capable views mounted. Its
+   localStorage keys and `storage` events are identity-scoped; a session
+   transition invalidates same-origin tabs. Logout clearing is defense in depth,
+   never the authority boundary.
 - **Never call `new Date()` on a server string.** SQLite writes
   `datetime('now')` — UTC, no zone marker — which every browser reads as *local*
   time. Parse through `parseTimestamp` (`src/lib/time.ts`); `new Date()` on a

@@ -88,6 +88,28 @@
   appearance: none;
 }
 
+.nd-search__recents {
+  display: flex;
+  flex-direction: column;
+  gap: var(--nd-space-4);
+  max-width: 34rem;
+  margin: 0 auto;
+  padding: var(--nd-space-8);
+  border: 1px solid var(--nd-border);
+  border-radius: var(--nd-radius-lg);
+  background: var(--nd-surface);
+}
+
+.nd-search__recents ul {
+  display: flex;
+  flex-direction: column;
+  gap: var(--nd-space-3);
+}
+
+.nd-search__recents a {
+  color: var(--nd-accent-bright);
+}
+
 .nd-search__box-status {
   position: absolute;
   right: var(--nd-space-8);

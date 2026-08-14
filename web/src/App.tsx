@@ -1,9 +1,16 @@
 import { useEffect, useRef, useState } from "react";
 import { NavLink, Outlet, useLocation, useNavigate } from "react-router-dom";
-import { ErrorBoundary, Spinner, ToastProvider } from "./components";
+import { CommandPalette, ErrorBoundary, Spinner, ToastProvider } from "./components";
 import { api, getHealth, ApiError } from "./api/client";
 import type { HumanOut } from "./api/types";
-import { clearWriteTarget, onUnauthorized } from "./lib";
+import {
+  clearWriteTarget,
+  invalidateRecentNodesScopes,
+  isModalOpen,
+  onUnauthorized,
+  setRecentNodesScope,
+  setCommandPaletteOpen,
+} from "./lib";
 import { versionLabel } from "./versionLabel";
 
 /**
@@ -43,16 +50,27 @@ export default function App() {
   const [me, setMe] = useState<HumanOut | null>(null);
   /** False until the gate has answered — views mount only past it. */
   const [gated, setGated] = useState(true);
+  const [paletteOpen, setPaletteOpen] = useState(false);
 
   // The page a 401 should return to after a fresh login. A ref, because the
   // broadcast subscription is registered once and must not go stale as the
   // user navigates.
   const locationRef = useRef(location);
   locationRef.current = location;
+  // Invalidates a late identity response after a 401 has already removed the
+  // verified scope. A late success must not re-open a departed human's titles.
+  const identityGeneration = useRef(0);
 
   useEffect(
     () =>
       onUnauthorized(() => {
+        identityGeneration.current += 1;
+        setPaletteOpen(false);
+        setCommandPaletteOpen(false);
+        invalidateRecentNodesScopes();
+        setMe(null);
+        setGated(false);
+        clearWriteTarget();
         const { pathname, search } = locationRef.current;
         navigate("/login", { replace: true, state: { from: pathname + search } });
       }),
@@ -61,9 +79,16 @@ export default function App() {
 
   useEffect(() => {
     const controller = new AbortController();
+    const generation = ++identityGeneration.current;
+    // No browser-local reading title is visible until this request proves which
+    // human owns this tab. A non-401 failure may still render failure-capable
+    // views below, but it never acquires a recents scope.
+    setRecentNodesScope(null);
     void (async () => {
       try {
         const human = await api.getMe(controller.signal);
+        if (controller.signal.aborted || identityGeneration.current !== generation) return;
+        setRecentNodesScope(human.id);
         setMe(human);
       } catch (error) {
         // A 401 already broadcast the redirect to /login. Anything else — an
@@ -75,6 +100,32 @@ export default function App() {
     })();
     return () => controller.abort();
   }, []);
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if ((event.key === "k" || event.key === "K") && (event.ctrlKey || event.metaKey)) {
+        // Ctrl/Cmd-K belongs to the app even when a modal already owns focus:
+        // without cancelling it first, the browser can consume the chord while
+        // the modal stays open.
+        event.preventDefault();
+        if (gated || me === null || isModalOpen()) return;
+        // Set ownership synchronously: SearchView receives this same native
+        // event and must see that Ctrl/Cmd-K belongs to the palette.
+        setCommandPaletteOpen(true);
+        setPaletteOpen(true);
+      }
+    };
+    // Capture before a focus-owning Modal stops bubbling its keys at document.
+    // The palette remains blocked by modal ownership, but the browser must not
+    // receive the reserved command chord.
+    window.addEventListener("keydown", onKeyDown, true);
+    return () => window.removeEventListener("keydown", onKeyDown, true);
+  }, [gated, me]);
+
+  useEffect(() => {
+    setCommandPaletteOpen(paletteOpen);
+    return () => setCommandPaletteOpen(false);
+  }, [paletteOpen]);
 
   const onLogout = () => {
     void (async () => {
@@ -91,6 +142,7 @@ export default function App() {
       // at a create surface at this point, and the reset is announced by the
       // editor showing `main` the moment one is opened.
       clearWriteTarget();
+      invalidateRecentNodesScopes();
       navigate("/login", { replace: true });
     })();
   };
@@ -154,6 +206,7 @@ export default function App() {
             </ErrorBoundary>
           )}
         </main>
+        {!gated && me !== null && paletteOpen ? <CommandPalette onClose={() => setPaletteOpen(false)} /> : null}
       </div>
     </ToastProvider>
   );

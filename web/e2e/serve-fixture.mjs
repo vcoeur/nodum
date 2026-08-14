@@ -12,7 +12,7 @@
  * graph is also the only way the specs can assert on exact counts.
  */
 import { execFileSync, spawn } from 'node:child_process';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -44,6 +44,8 @@ nodum(['init']);
 // `owner` is seeded by the migration; it is passwordless until this runs, and
 // the web UI has no other way in.
 nodum(['human', 'passwd', 'owner', '--as', 'owner'], { stdin: `${PASSWORD}\n${PASSWORD}\n` });
+const second = JSON.parse(nodum(['human', 'create', 'second', '--as', 'owner']));
+nodum(['human', 'passwd', second.id, '--as', 'owner', '--password', PASSWORD]);
 
 // Two nodes and an edge between them: enough for a reading view with a
 // populated edge rail, which is where the contextual actions live.
@@ -54,6 +56,10 @@ const beta = JSON.parse(
   nodum(['node', 'create', '--type', 'concept', '--title', 'Beta node', '--as', 'owner']),
 );
 nodum(['edge', 'create', alpha.id, beta.id, '--type', 'relates_to', '--as', 'owner']);
+// A non-image asset exercises the typed lightbox without a rendition dependency.
+const assetPath = join(dbDir, 'fixture.txt');
+writeFileSync(assetPath, 'fixture asset\n');
+nodum(['asset', 'register', assetPath]);
 
 // Specs read these rather than hardcoding ids the seed might renumber.
 process.stdout.write(`${JSON.stringify({ alpha: alpha.id, beta: beta.id, dbPath })}\n`);

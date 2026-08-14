@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { KeyboardEvent as ReactKeyboardEvent } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { api } from "../../api/client";
-import { describeError, describeFailure } from "../../lib";
+import { describeError, describeFailure, isCommandPaletteOpen, isModalOpen, useRecentNodes } from "../../lib";
 import type { SearchFilters, SearchHit, SearchResult, TypeOut } from "../../api/types";
 import {
   ANY_SPACE,
@@ -113,6 +113,7 @@ export default function SearchView() {
   const { spaces, failed: spacesFailed } = useSpaces();
   const [vector, setVector] = useState<VectorEvidence>({ seen: false, missing: false });
   const [retryToken, setRetryToken] = useState(0);
+  const recentNodes = useRecentNodes();
 
   const inputRef = useRef<HTMLInputElement | null>(null);
   const linkRefs = useRef<(HTMLAnchorElement | null)[]>([]);
@@ -315,7 +316,11 @@ export default function SearchView() {
       const chord = (event.key === "k" || event.key === "K") && (event.metaKey || event.ctrlKey);
       const slash = event.key === "/" && !event.metaKey && !event.ctrlKey && !event.altKey;
       if (!chord && !slash) return;
-      if (slash && isTypingTarget(event.target)) return;
+      // The shell claims Ctrl/Cmd-K synchronously, including when a different
+      // modal owns focus. Respect its cancelled native event rather than
+      // stealing focus back to search behind that modal.
+      if (chord && (event.defaultPrevented || isCommandPaletteOpen())) return;
+      if (slash && (isTypingTarget(event.target) || isModalOpen())) return;
       event.preventDefault();
       focusInput(true);
     };
@@ -474,7 +479,7 @@ export default function SearchView() {
         )
       ) : null}
 
-      {!searching && status !== "error" ? <IdleState /> : null}
+      {!searching && status !== "error" ? <IdleState recentNodes={recentNodes} /> : null}
 
       {searching && status === "ready" && hits.length === 0 ? (
         <EmptyState
@@ -600,18 +605,33 @@ function DegradedVectorNote() {
 }
 
 /** What the view shows before anything has been typed. */
-function IdleState() {
+function IdleState({ recentNodes }: { recentNodes: ReturnType<typeof useRecentNodes> }) {
   return (
-    <EmptyState
-      title="Search the graph"
-      body={
-        <>
-          Keyword (BM25) and semantic (vector) retrieval, fused by reciprocal rank fusion. Each
-          result shows which signals fired and how far up each one it ranked. Press{" "}
-          <kbd>/</kbd> or <kbd>Ctrl</kbd>+<kbd>K</kbd> to come back to the box from anywhere.
-        </>
-      }
-    />
+    <>
+      <EmptyState
+        title="Search the graph"
+        body={
+          <>
+            Keyword (BM25) and semantic (vector) retrieval, fused by reciprocal rank fusion. Each
+            result shows which signals fired and how far up each one it ranked. Press{" "}
+            <kbd>/</kbd> to focus the box or <kbd>Ctrl</kbd>+<kbd>K</kbd> for commands.
+          </>
+        }
+      />
+      {recentNodes.length > 0 ? (
+        <section className="nd-search__recents" aria-labelledby="recent-reads-heading">
+          <h2 id="recent-reads-heading" className="nd-label">Recent reads</h2>
+          <p className="nd-meta">Previously opened entries may no longer be available.</p>
+          <ul>
+            {recentNodes.map((node) => (
+              <li key={node.id}>
+                <a href={`/node/${encodeURIComponent(node.id)}`}>{node.title?.trim() || "Untitled node"}</a>
+              </li>
+            ))}
+          </ul>
+        </section>
+      ) : null}
+    </>
   );
 }
 

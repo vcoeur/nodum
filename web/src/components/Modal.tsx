@@ -27,7 +27,8 @@
  */
 
 import { useCallback, useEffect, useId, useRef } from "react";
-import type { ReactNode } from "react";
+import type { ReactNode, RefObject } from "react";
+import { focusProgrammatically, modalClosed, modalOpened } from "../lib";
 
 /** Everything inside the dialog a Tab can reach, in document order. */
 const FOCUSABLE =
@@ -78,6 +79,8 @@ interface ModalProps {
   footer?: ReactNode;
   /** Widen past the default for a diff or a manifest. */
   wide?: boolean;
+  /** Element that should receive focus when the dialog opens. */
+  initialFocus?: RefObject<HTMLElement | null>;
 }
 
 /**
@@ -89,7 +92,7 @@ interface ModalProps {
  * @param footer Right-aligned actions.
  * @param wide Use the wider layout.
  */
-export function Modal({ title, onClose, children, footer, wide = false }: ModalProps) {
+export function Modal({ title, onClose, children, footer, wide = false, initialFocus }: ModalProps) {
   const dialogRef = useRef<HTMLDivElement | null>(null);
   const restoreTo = useRef<HTMLElement | null>(null);
   const titleId = useId();
@@ -97,8 +100,10 @@ export function Modal({ title, onClose, children, footer, wide = false }: ModalP
   const close = useCallback(() => onClose(), [onClose]);
 
   useEffect(() => {
+    modalOpened();
     restoreTo.current = document.activeElement as HTMLElement | null;
-    dialogRef.current?.focus();
+    const focusTarget = initialFocus?.current ?? dialogRef.current;
+    if (focusTarget) focusProgrammatically(focusTarget);
 
     // The page behind a modal must not scroll under it. The assets lightbox
     // already does this; the two dialogs in the app behave the same way.
@@ -115,19 +120,26 @@ export function Modal({ title, onClose, children, footer, wide = false }: ModalP
     };
     document.addEventListener("keydown", onKeyDown);
     return () => {
+      modalClosed();
       document.removeEventListener("keydown", onKeyDown);
       document.body.style.overflow = previousOverflow;
       // Only if it still exists: focusing a detached node drops focus to
       // `<body>`, which is worse than leaving it for the view to place.
-      if (restoreTo.current?.isConnected) restoreTo.current.focus();
+      if (restoreTo.current?.isConnected) focusProgrammatically(restoreTo.current);
     };
-  }, [close]);
+  }, [close, initialFocus]);
 
   return (
     <div
       className="nd-modal-backdrop"
       onMouseDown={(event) => {
-        if (event.target === event.currentTarget) close();
+        if (event.target === event.currentTarget) {
+          // Keep the opener focused until the cleanup hands focus back. Without
+          // this, the browser's backdrop press moves focus to body after the
+          // restoration and a keyboard reader loses their place.
+          event.preventDefault();
+          close();
+        }
       }}
     >
       <div

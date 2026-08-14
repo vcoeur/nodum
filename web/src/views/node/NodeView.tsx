@@ -46,7 +46,7 @@ import {
 } from "../../components";
 import type { MenuAction } from "../../components";
 import type { NodeOut, SubgraphOut } from "../../api/types";
-import { actionForResolution, attachWikilinkClicks, describeFailure } from "../../lib";
+import { actionForResolution, attachWikilinkClicks, describeFailure, recordRecentNode } from "../../lib";
 import type { FailureDescription } from "../../lib";
 import { formatAbsolute, formatTimestampLong } from "../../lib/time";
 import { DIAGRAM_PLACEHOLDER_CLASS, renderMarkdown } from "../editor/markdownRender";
@@ -97,7 +97,12 @@ export default function NodeView() {
         : { status: "loading" },
     );
     getNode(nodeId, { depth: 1 }, controller.signal)
-      .then((subgraph) => setLoad({ status: "ready", subgraph }))
+      .then((subgraph) => {
+        if (controller.signal.aborted) return;
+        const root = subgraph.nodes[0];
+        if (root) recordRecentNode({ id: root.id, title: root.title });
+        setLoad({ status: "ready", subgraph });
+      })
       .catch((error: unknown) => {
         if (controller.signal.aborted) return;
         setLoad({ status: "failed", failure: describeFailure(error, "this node") });

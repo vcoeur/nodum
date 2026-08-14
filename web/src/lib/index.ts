@@ -88,6 +88,28 @@ export { onUnauthorized, reportUnauthorized } from "./session";
 export type { UnauthorizedListener } from "./session";
 
 export {
+  clearRecentNodes,
+  getRecentNodes,
+  getRecentNodesScope,
+  invalidateRecentNodesScopes,
+  recentNodesStorageKey,
+  recordRecentNode,
+  setRecentNodesScope,
+  useRecentNodes,
+  RECENT_NODES_STORAGE_PREFIX,
+  RECENT_NODES_INVALIDATION_STORAGE_KEY,
+} from "./recents";
+export type { RecentNode } from "./recents";
+
+export {
+  isCommandPaletteOpen,
+  onCommandPaletteChange,
+  setCommandPaletteOpen,
+} from "./commandPaletteState";
+
+export { isModalOpen, modalClosed, modalOpened } from "./modalState";
+
+export {
   clearWriteTarget,
   DEFAULT_WRITE_TARGET,
   getWriteTarget,
