@@ -591,6 +591,30 @@ def test_real_failures_carry_the_same_taxonomy(client, fresh_db):
     assert repeat.status_code == 400
     assert repeat.json()["error"]["type"] == "InvalidTransition"
 
+    source = service.create_node(type="note", title="Source", principal=owner())
+    destination = service.create_node(type="note", title="Destination", principal=owner())
+    edge = service.create_edge(source.id, destination.id, "relates_to", principal=owner())
+    archived = client.post(f"/api/edges/{edge.id}/archive")
+    assert archived.status_code == 200
+    assert archived.json()["id"] == edge.id
+    assert archived.json()["state"] == "archived"
+    assert archived.json()["valid_to"] is not None
+    repeat_edge = client.post(f"/api/edges/{edge.id}/archive")
+    assert repeat_edge.status_code == 400
+    assert repeat_edge.json()["error"]["type"] == "InvalidTransition"
+    event = next(row for row in _events("edge.archive") if row.payload["after"]["id"] == edge.id)
+    assert event.actor == OWNER_ACTOR
+
+
+def test_an_edge_archive_route_cannot_archive_a_node(client, fresh_db):
+    node = service.create_node(type="note", title="Not an edge", principal=owner())
+
+    response = client.post(f"/api/edges/{node.id}/archive")
+
+    assert response.status_code == 404
+    assert response.json()["error"]["type"] == "EdgeNotFound"
+    assert service.get_node(node.id, principal=owner()).state == "active"
+
 
 def test_an_undo_the_graph_has_grown_past_is_a_409(client, fresh_db):
     parent = service.create_node(type="note", title="Parent", principal=owner())
@@ -826,6 +850,7 @@ def _swept_requests(
             ("/api/spaces", ids["space"]),
             ("/api/cycles", ids["cycle"]),
             ("/api/assets", ids["asset"]),
+            ("/api/edges", ids["edge"]),
         ):
             if path.startswith(prefix):
                 path = path.replace("{id}", value)
@@ -955,6 +980,7 @@ def test_writes_are_attributed_to_the_sessions_human_and_nothing_else(fresh_db, 
     target = service.create_human("target", principal=owner())
     swept_agent = agent("swept-agent")
     space = service.create_space("sweep-seed", principal=owner())
+    edge = service.create_edge(node.id, other.id, "relates_to", principal=owner())
     cycle = service.open_cycle(trigger="curative", principal=owner())
     seed_file = tmp_path / "seed.txt"
     seed_file.write_text("sweep asset bytes", encoding="utf-8")
@@ -972,6 +998,7 @@ def test_writes_are_attributed_to_the_sessions_human_and_nothing_else(fresh_db, 
         "human": target.id,
         "agent": swept_agent.id,
         "space": space.id,
+        "edge": edge.id,
         "cycle": cycle.id,
         "asset": seeded_asset.hash,
         "download-token": download.token,
@@ -2147,6 +2174,38 @@ def test_a_bodyless_cross_origin_post_cannot_archive_live_content(client, fresh_
 
     assert response.status_code == 403
     assert service.get_node(node.id, principal=owner()).state == "active"
+
+
+def test_a_bodyless_cross_origin_post_cannot_archive_an_edge(client, fresh_db):
+    source = service.create_node(type="note", title="Source", principal=owner())
+    destination = service.create_node(type="note", title="Destination", principal=owner())
+    edge = service.create_edge(source.id, destination.id, "relates_to", principal=owner())
+
+    response = client.post(
+        f"/api/edges/{edge.id}/archive", guard=False, headers=CROSS_ORIGIN_HEADERS
+    )
+
+    assert response.status_code == 403
+    active = service.list_edges(node_id=source.id, principal=owner())
+    assert [item.id for item in active] == [edge.id]
+
+
+@pytest.mark.parametrize("content_type", ["text/plain", "application/x-www-form-urlencoded", ""])
+def test_an_edge_archive_requires_json_content_type(client, fresh_db, content_type):
+    source = service.create_node(type="note", title="Source", principal=owner())
+    destination = service.create_node(type="note", title="Destination", principal=owner())
+    edge = service.create_edge(source.id, destination.id, "relates_to", principal=owner())
+    headers = {**CLIENT_HEADERS}
+    if content_type:
+        headers["Content-Type"] = content_type
+
+    response = client.post(
+        f"/api/edges/{edge.id}/archive", guard=False, headers=headers, content=b""
+    )
+
+    assert response.status_code == 415
+    active = service.list_edges(node_id=source.id, principal=owner())
+    assert [item.id for item in active] == [edge.id]
 
 
 @pytest.mark.parametrize(
@@ -3958,8 +4017,8 @@ def test_edges_as_of_reads_the_validity_window(client, fresh_db):
             json={"src_id": a.id, "dst_id": b.id, "type": "relates_to", "confidence": 0.5},
         )
     )
-    # Edges retire through the service (no archive route on this surface).
-    retired = service.transition(edge["id"], "archive", principal=owner())
+    # Use the edge-only operation; the route delegates to this same capability.
+    retired = service.archive_edge(edge["id"], principal=owner())
     assert retired.valid_to
 
     conn = db.connect()

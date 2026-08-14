@@ -15,7 +15,17 @@
  */
 
 import { Link } from "react-router-dom";
-import { NodeBadge, NodePeek, nameSpace, spaceNameNote } from "../../components";
+import {
+  ContextMenu,
+  edgeArchiveRefusal,
+  MenuButton,
+  NodeBadge,
+  NodePeek,
+  nameSpace,
+  spaceNameNote,
+  useContextMenu,
+} from "../../components";
+import type { EdgeArchiveSubject, MenuAction } from "../../components";
 import type { NodeOut } from "../../api/types";
 import { formatAbsolute, formatTimestampLong, peekExcerpt } from "../../lib";
 import type { IncidentEdge } from "./graphElements";
@@ -47,6 +57,8 @@ interface NodeDetailPanelProps {
   pathRole: "a" | "b" | null;
   /** Open the create-edge dialog anchored on this node. */
   onCreateEdge: () => void;
+  /** Open the archive confirmation for an incident relationship. */
+  onArchiveEdge: (subject: EdgeArchiveSubject) => void;
   onClose: () => void;
 }
 
@@ -71,6 +83,7 @@ export function NodeDetailPanel({
   onSetPathEnd,
   pathRole,
   onCreateEdge,
+  onArchiveEdge,
   onClose,
 }: NodeDetailPanelProps) {
   const preview = peekExcerpt(node.content, EXCERPT_LIMIT);
@@ -203,43 +216,16 @@ export function NodeDetailPanel({
           </p>
         ) : (
           <ul className="nd-graph__edge-list">
-            {incident.map(({ edge, direction, other, crossing }) => (
-              <li key={edge.id}>
-                <button
-                  type="button"
-                  className="nd-graph__edge-row"
-                  onClick={() => other && onSelect(other.id)}
-                  disabled={other === null}
-                >
-                  <span className="nd-mono nd-graph__edge-dir">
-                    {direction === "out" ? "→" : "←"}
-                  </span>
-                  <span className="nd-mono nd-graph__edge-type">{edge.type}</span>
-                  <span className="nd-truncate nd-graph__edge-other">
-                    {other?.title ?? other?.id ?? "(missing)"}
-                  </span>
-                  {/* Always a cell, empty when there is no crossing: the row is
-                      a fixed grid, and a conditional column would shift every
-                      other row's alignment. */}
-                  <span className="nd-graph__crossing-mark">
-                    {crossing ? (
-                      <span
-                        title={`Crosses into ${
-                          other?.space_id
-                            ? nameSpace(other.space_id, spaces, archivedSpaces).label
-                            : "another space"
-                        }`}
-                      >
-                        crossing
-                      </span>
-                    ) : null}
-                  </span>
-                  <NodeBadge state={edge.state} stateOnly />
-                  <span className="nd-mono nd-graph__edge-confidence">
-                    {edge.confidence === null ? "—" : edge.confidence.toFixed(2)}
-                  </span>
-                </button>
-              </li>
+            {incident.map((item) => (
+              <IncidentEdgeRow
+                key={item.edge.id}
+                item={item}
+                node={node}
+                spaces={spaces}
+                archivedSpaces={archivedSpaces}
+                onSelect={onSelect}
+                onArchiveEdge={onArchiveEdge}
+              />
             ))}
           </ul>
         )}
@@ -256,5 +242,90 @@ export function NodeDetailPanel({
         ) : null}
       </div>
     </section>
+  );
+}
+
+function IncidentEdgeRow({
+  item: { edge, direction, other, crossing },
+  node,
+  spaces,
+  archivedSpaces,
+  onSelect,
+  onArchiveEdge,
+}: {
+  item: IncidentEdge;
+  node: NodeOut;
+  spaces: readonly NodeOut[] | null;
+  archivedSpaces: readonly NodeOut[];
+  onSelect: (nodeId: string) => void;
+  onArchiveEdge: (subject: EdgeArchiveSubject) => void;
+}) {
+  const menu = useContextMenu();
+  const subject =
+    other === null
+      ? null
+      : {
+          edge,
+          source: edge.src_id === node.id ? node : other,
+          destination: edge.dst_id === node.id ? node : other,
+        };
+  const edgeRefusal = edgeArchiveRefusal(edge);
+  const items: MenuAction[] = [
+    {
+      id: "archive-edge",
+      label: "Archive relationship…",
+      group: "act",
+      danger: true,
+      ...(subject === null
+        ? { unavailable: "The far endpoint is not in this view." }
+        : edgeRefusal === null
+          ? {}
+          : { unavailable: edgeRefusal }),
+      onSelect: () => subject && onArchiveEdge(subject),
+    },
+  ];
+
+  return (
+    <li>
+      <button
+        type="button"
+        className="nd-graph__edge-row"
+        onClick={() => other && onSelect(other.id)}
+        onContextMenu={menu.openAt}
+        disabled={other === null}
+      >
+        <span className="nd-mono nd-graph__edge-dir">{direction === "out" ? "→" : "←"}</span>
+        <span className="nd-mono nd-graph__edge-type">{edge.type}</span>
+        <span className="nd-truncate nd-graph__edge-other">
+          {other?.title ?? other?.id ?? "(missing)"}
+        </span>
+        <span className="nd-graph__crossing-mark">
+          {crossing ? (
+            <span
+              title={`Crosses into ${
+                other?.space_id
+                  ? nameSpace(other.space_id, spaces, archivedSpaces).label
+                  : "another space"
+              }`}
+            >
+              crossing
+            </span>
+          ) : null}
+        </span>
+        <NodeBadge state={edge.state} stateOnly />
+        <span className="nd-mono nd-graph__edge-confidence">
+          {edge.confidence === null ? "—" : edge.confidence.toFixed(2)}
+        </span>
+      </button>
+      <MenuButton label={`Actions for ${edge.type} relationship`} controller={menu} />
+      {menu.anchor !== null ? (
+        <ContextMenu
+          label={`Actions for ${edge.type} relationship`}
+          anchor={menu.anchor}
+          items={items}
+          onClose={menu.close}
+        />
+      ) : null}
+    </li>
   );
 }

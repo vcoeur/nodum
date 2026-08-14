@@ -126,7 +126,7 @@ def test_edge_list_as_of(fresh_db):
     a = _run_json("node", "create", "--type", "claim", "--title", "A")
     b = _run_json("node", "create", "--type", "claim", "--title", "B")
     edge = _run_json("edge", "create", a["id"], b["id"], "--type", "supports")
-    retired = _run_json("archive", edge["id"])
+    retired = _run_json("edge", "archive", edge["id"])
     assert retired["state"] == "archived"
     assert retired["valid_to"]
 

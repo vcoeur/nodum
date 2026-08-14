@@ -16,6 +16,7 @@
  */
 
 import { useEffect, useRef, useState } from "react";
+import type { RefObject } from "react";
 import { NodeBadge, SpaceFilter, Spinner } from "../../components";
 import type { NodeOut, SpaceOut } from "../../api/types";
 import { ConfidenceFilter } from "./ConfidenceFilter";
@@ -40,6 +41,8 @@ interface GraphToolbarProps {
   rootNode: NodeOut | null;
   /** The root id from the URL, which is known before the node is. */
   rootId: string;
+  /** Stable focus destination after an incident-row action removes its opener. */
+  rootButtonRef: RefObject<HTMLButtonElement | null>;
   onPickRoot: (nodeId: string) => void;
   edgeTypeOptions: readonly string[];
   nodeTypeOptions: readonly string[];
@@ -81,6 +84,7 @@ export function GraphToolbar({
   onFiltersChange,
   rootNode,
   rootId,
+  rootButtonRef,
   onPickRoot,
   edgeTypeOptions,
   nodeTypeOptions,
@@ -136,6 +140,7 @@ export function GraphToolbar({
         <div className="nd-graph__root" ref={rootWrapperRef}>
           <span className="nd-label">Root</span>
           <button
+            ref={rootButtonRef}
             type="button"
             className="nd-button nd-button--small nd-graph__root-button"
             aria-expanded={rootPickerOpen}

@@ -3,7 +3,7 @@ import type { KeyboardEvent as ReactKeyboardEvent } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { api } from "../../api/client";
 import { describeError, describeFailure, isCommandPaletteOpen, isModalOpen, useRecentNodes } from "../../lib";
-import type { SearchFilters, SearchHit, SearchResult, TypeOut } from "../../api/types";
+import type { SearchFilters, SearchHit, SearchResult } from "../../api/types";
 import {
   ANY_SPACE,
   EmptyState,
@@ -11,6 +11,7 @@ import {
   unresolvedSpaceIds,
   useArchivedSpaces,
   useSpaces,
+  useNodeTypes,
 } from "../../components";
 import { ResultRow } from "./ResultRow";
 import { SearchFilterBar } from "./SearchFilterBar";
@@ -105,8 +106,7 @@ export default function SearchView() {
   const [result, setResult] = useState<SearchResult | null>(null);
   const [status, setStatus] = useState<Status>("idle");
   const [error, setError] = useState<unknown>(null);
-  const [nodeTypes, setNodeTypes] = useState<TypeOut[] | null>(null);
-  const [typesFailed, setTypesFailed] = useState(false);
+  const nodeTypeList = useNodeTypes();
   // The space filter's vocabulary. A failure is not fatal to searching — the
   // control says so and the filter stays whatever the URL carried, which is the
   // only honest thing to do with a space reference nothing can currently name.
@@ -172,20 +172,6 @@ export default function SearchView() {
   }, [draft, applyPatch]);
 
   /* --- Data --------------------------------------------------------- */
-
-  useEffect(() => {
-    const controller = new AbortController();
-    api
-      .getTypes(controller.signal)
-      .then((catalog) => setNodeTypes(catalog.node_types))
-      .catch(() => {
-        if (!controller.signal.aborted) {
-          setNodeTypes([]);
-          setTypesFailed(true);
-        }
-      });
-    return () => controller.abort();
-  }, []);
 
   useEffect(() => {
     const trimmed = query.trim();
@@ -431,8 +417,8 @@ export default function SearchView() {
 
         <SearchFilterBar
           state={uiState}
-          nodeTypes={nodeTypes}
-          typesFailed={typesFailed}
+          nodeTypes={nodeTypeList.types}
+          typesFailed={nodeTypeList.failed}
           spaces={spaces}
           archivedSpaces={archivedSpaces.spaces}
           spacesFailed={spacesFailed}

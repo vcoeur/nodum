@@ -579,10 +579,40 @@ def test_archiving_an_edge_sets_valid_to(fresh_db):
     a = service.create_node(type="claim", title="A", principal=owner())
     b = service.create_node(type="claim", title="B", principal=owner())
     edge = service.create_edge(a.id, b.id, "supports", principal=owner())
-    archived = service.transition(edge.id, "archive", principal=owner())
+    archived = service.archive_edge(edge.id, principal=owner())
     assert archived.state == "archived"
     assert archived.valid_from is not None
     assert archived.valid_to is not None
+
+
+def test_archiving_an_edge_in_a_cycle_requires_review_authority(fresh_db):
+    """A cycle relaxes archive's human tier only to its review authority."""
+    source = service.create_node(type="claim", title="Source", principal=owner())
+    destination = service.create_node(type="claim", title="Destination", principal=owner())
+    edge = service.create_edge(source.id, destination.id, "supports", principal=owner())
+    proposer = agent("proposer", grants={"meta": "read", "main": "suggest"})
+    cycle = service.open_cycle(trigger="manual", principal=owner())
+
+    with service.in_cycle(cycle.id), pytest.raises(GrantNotPermitted):
+        service.archive_edge(edge.id, principal=proposer)
+
+    assert service.list_edges(node_id=source.id, principal=owner())[0].state == "active"
+    service.close_cycle(cycle.id, status="completed", report={}, principal=owner())
+
+
+def test_a_cycle_review_authority_can_archive_an_edge(fresh_db):
+    """A cycle lets an editor retire the active edge in its granted space."""
+    source = service.create_node(type="claim", title="Source", principal=owner())
+    destination = service.create_node(type="claim", title="Destination", principal=owner())
+    edge = service.create_edge(source.id, destination.id, "supports", principal=owner())
+    editor = agent("editor", grants={"meta": "read", "main": "edit"})
+    cycle = service.open_cycle(trigger="manual", principal=owner())
+
+    with service.in_cycle(cycle.id):
+        archived = service.archive_edge(edge.id, principal=editor)
+
+    assert archived.state == "archived"
+    service.close_cycle(cycle.id, status="completed", report={}, principal=owner())
 
 
 def test_as_of_lists_edges_inside_their_validity_window(fresh_db):

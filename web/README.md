@@ -5,7 +5,7 @@ TypeScript, built by Vite into
 `../nodum/_web/`, which the Python process serves at `/` — one process, one
 origin, no CORS.
 
-Twelve views ship: **login** (`/login`), **editor** (`/editor`,
+The route modules cover **login** (`/login`), **editor** (`/editor`,
 `/editor/:nodeId`), **search** (`/search`, also the landing view), **review**
 (`/review`), **journal** (`/journal`) with one entry in full
 (`/journal/:cycleId`), **graph** (`/graph`, `/graph/:rootId`), **assets**
@@ -13,7 +13,10 @@ Twelve views ship: **login** (`/login`), **editor** (`/editor`,
 (`/history/:nodeId`), and the **node reading view** (`/node/:nodeId`, with
 `/node/title/:title` as the direct-entry form of a wikilink URL — a middle
 click, a bookmark, or a paste lands there, resolves the title, and redirects
-to the node).
+to the node), and **node browse** (`/nodes`). Browse keeps its node-type,
+space, state, and returned-set sort in the URL. It reads at most the endpoint's
+500 creation-ordered rows and says so: sorting rearranges that bounded response,
+not the whole graph. Space cards link into it with their active space selected.
 
 **A space is two independent controls, not a mode** (design decision D1), and
 that shape runs through most of the tree: a *read filter* per view, defaulting
@@ -24,6 +27,12 @@ so a single switcher could not have served both. The shared pieces are
 one `GET /api/spaces` read behind every one of them) and `lib/writeTarget.ts`
 (the write half). `/spaces` is where the lifecycle lives — create, rename,
 archive, with each space's live node count and grant holders.
+
+The node-type vocabulary has the same single-reader rule:
+`components/useNodeTypes.ts` owns `GET /api/types` for the editor, search,
+graph, and node browse. Callers keep their own presentation semantics — graph
+still derives sorted node and edge ids, while editor and search keep full type
+records — without another private fetch effect.
 
 Reading a space and *seeing* one are different jobs, and the second has its own
 rule: **a surface states the space unless the filter already determined it.**
@@ -362,19 +371,20 @@ syntactic rules above; type-level guarantees remain with `tsc`.
 | `src/main.tsx`, `src/App.tsx`, `src/router.tsx` | entry, authenticated app shell (header, nav, **one global Ctrl/Cmd-K command palette**, toasts, crash boundary, health pill + server-version label), route table |
 | `src/api/client.ts`, `src/api/types.ts` | the only `fetch` in the app, and the types mirroring `nodum/models.py` |
 | `src/lib/` | cross-view plain functions: timestamp parsing (`time.ts`), failure classification (`failure.ts`), the 401 broadcast (`session.ts`), which slice of a long list to render (`paging.ts` — the journal's event diff and the review queue), the sticky write target (`writeTarget.ts`, the one module here that also exports a hook), successful reader loads persisted as bounded, de-duplicated recents (`recents.ts`), command-palette result and keyboard modelling (`commandPalette.ts`) plus its shared shortcut-ownership signal (`commandPaletteState.ts`) and shared modal ownership (`modalState.ts`), the wikilink href contract and insertion choice (`wikilinks.ts` — the href both the renderer and the click interceptor agree on, and the `[[Title]]`-vs-`[[id]]` decision a title with a `|` or a bracket forces), the peek card's pure model (`peek.ts` — plain-text excerpt, in/out edge counts, the hover-intent state machine, and the per-session `getNode` cache), the create-link dialog's pure model (`linkDialog.ts` — the direction↔edge-type pairing, the prefix-then-search target fallback, the confidence parse, and the search debounce), the context menu's placement and keyboard model (`contextMenu.ts` — viewport clamping, the flip that clears the button it hangs off, the roving index that skips disabled items, and the keyboard-menu-key anchor fallback), telling a focus the app moved from one the reader moved (`programmaticFocus.ts` — the marker every hand-back goes through and every focus watcher checks), the dismissal rules for an overlay that owns focus (`dismissWatchers.ts` — the five listeners, what each one covers that the others cannot, and the jsdom suite that pins them), and which event an undo may name (`undoTarget.ts`) |
-| `src/components/` | shared React components: `NodeBadge`, `Toast` (with the one optional action a toast may carry — the archive's Undo), `Spinner`, `EmptyState`, `ErrorBoundary`, `Modal`, `ContextMenu` (the one contextual-action menu, with `useContextMenu` and the `MenuButton` twin that gives touch and keyboard the same actions a right-click does), the node retirement pair — `ArchiveNodeDialog` with `nodeArchive.ts` (what archiving one node costs, and the transitions the server refuses) and `useNodeArchive.ts` (the write plus the undo it promises, mounted by the host so the undo outlives the dialog) — `LinkDialog` (the create-edge dialog — the first caller of `createEdge`, reachable from the reading view, the graph panel, and the editor's `/link` command), the shared hover/focus peek card (`NodePeek` wraps a trigger element; `NodePeekScope` delegates on a rendered-Markdown container so the `a.nd-wikilink` anchors inside sanitised `innerHTML` can peek too), plus the whole space vocabulary — `SpaceFilter.tsx` with `spaceOptions.ts` (what a picker offers, which is the active list and never more) and `useSpaces.ts` (the `GET /api/spaces` read every space surface shares), and `spaceNaming.ts` with `useArchivedSpaces.ts` (what a surface that *displays* a space calls it, including one the active listing does not carry — and what names an archived value a picker is already holding) |
+| `src/components/` | shared React components: `NodeBadge`, `Toast` (with the one optional action a toast may carry — the archive's Undo), `Spinner`, `EmptyState`, `ErrorBoundary`, `Modal`, `ContextMenu` (the one contextual-action menu, with `useContextMenu` and the `MenuButton` twin that gives touch and keyboard the same actions a right-click does), the node retirement pair — `ArchiveNodeDialog` with `nodeArchive.ts` (what archiving one node costs, and the transitions the server refuses) and `useNodeArchive.ts` (the write plus the undo it promises, mounted by the host so the undo outlives the dialog) — `LinkDialog` (the create-edge dialog — the first caller of `createEdge`, reachable from the reading view, the graph panel, and the editor's `/link` command), the shared node-type catalog read (`useNodeTypes.ts`), the shared hover/focus peek card (`NodePeek` wraps a trigger element; `NodePeekScope` delegates on a rendered-Markdown container so the `a.nd-wikilink` anchors inside sanitised `innerHTML` can peek too), plus the whole space vocabulary — `SpaceFilter.tsx` with `spaceOptions.ts` (what a picker offers, which is the active list and never more) and `useSpaces.ts` (the `GET /api/spaces` read every space surface shares), and `spaceNaming.ts` with `useArchivedSpaces.ts` (what a surface that *displays* a space calls it, including one the active listing does not carry — and what names an archived value a picker is already holding) |
 | `src/styles/` | `tokens.css`, `base.css`, `primitives.css`, `app.css` |
 | `src/views/editor/` | CodeMirror-6 Markdown source editor, slash commands (node types, Markdown scaffolds, and `/link` — the create-edge dialog anchored on the current node, which inserts the chosen target's `[[Title]]` — or `[[id]]` for a title the wikilink grammar cannot carry — at the caret on success), `[[` autocomplete, live Mermaid preview, autosave, the write-target picker and the landing/refusal copy (`createOutcome.ts`) |
 | `src/views/search/` | query box, ranked hits, per-signal breakdown, signal grouping, the space filter + show-meta toggle in the URL (`searchState.ts`), refused-filter copy (`spaceFailure.ts`), when a row names its space (`resultSpace.ts`) |
 | `src/views/review/` | proposal queue grouped space → agent, per-kind cards, proposed-version diffs, self-governing space sections, cross-space edge marking (`grouping.edgeCrossing`), and the pager over it (`grouping.sectionOrder` / `restrictToPage`, over `lib/pageWindow`) with the honest count above it (`grouping.queueCount`) |
 | `src/views/journal/` | the dream journal: cycles as sentences, one entry with its job report, the five coherence metrics before/after, the events it wrote as a paged diff, the run-now control, the **stop** confirm for a run that is still going and the **abandon** confirm for one a crash left `running` (three verbs, three situations: a stop is an instruction a live run obeys, an abandon closes a dead run's entry from outside, and only the rollback reverses a write — a stopped run and a crashed one both close `failed`, so the entry renders who asked for the stop and when), and the dry-run-then-confirm rollback — whose verdict is **two** lists, `conflicts` and `blockers`, and is clean only when both are empty (`journal.ts` owns every sentence and every reading of the untyped `report` blob; `useNodeTitles.ts` names the nodes an edge event points at) |
-| `src/views/graph/` | Cytoscape subgraph render, filters, cross-space edge styling and far-endpoint dimming, path panel, and the detail panel's create-edge action |
+| `src/views/graph/` | Cytoscape subgraph render, filters, cross-space edge styling and far-endpoint dimming, path panel, and the detail panel's create-edge and incident-edge archive actions |
 | `src/views/assets/` | rendition grid, lightbox, the ingesting drop-zone with its queue readout (`uploadOutcome.ts`) and its bookkeeping (`uploadQueue.ts` — batches, status labels, the refused second drop, the per-batch announcement), thin JSON export |
 | `src/views/login/` | password login against `POST /api/login` |
 | `src/views/spaces/` | the space lifecycle: list with node counts and grant holders, create, rename, archive — and `spaces.ts`'s `archiveConsequences`, the one place the archive dialog's promises are written, every line of which has to be something the server actually delivers |
 | `src/views/admin/` | accounts and grants administration, show-once token dialog |
 | `src/views/history/` | per-node version timeline and side-by-side diff |
 | `src/views/node/` | the reading view (`/node/:nodeId`): rendered Markdown + Mermaid via the editor's pure renderer, clickable `[[wikilinks]]`, the incident-edge rail and the **backlinks** section under it (`nodeEdges.ts` narrows the depth-1 neighbourhood twice — to the root's edges, and to the inbound `mentions` with `mentionContext` finding the sentence each wikilink was written in), the header's **Link** and **Archive** buttons, and the context menu behind the heading and every edge row — plus `NodeTitleRedirect.tsx`, the resolver behind `/node/title/:title` |
+| `src/views/nodes/` | bounded node browse (`/nodes`): URL-backed type, active-space, and state filters plus sorting over the returned set; its copy distinguishes that local order from a whole-graph order |
 | `package.json`, `vite.config.ts`, `vitest.config.ts`, `tsconfig.json` | toolchain |
 | `**/*.test.ts` | Vitest unit tests, beside the module each covers |
 
@@ -552,6 +562,16 @@ Conventions that hold across the tree:
   `lib/undoTarget.ts` decides whether the head provably *is* the write just
   made — same op, same row, no `cycle_id` — and a confirmation appears with no
   Undo on it rather than one that would reverse a stranger's write.
+- **A relationship archive is not a node archive.** Its shared confirm names
+  source, relationship type and destination, then states exactly that current
+  active traversal stops following the relationship, the endpoints do not
+  change, and history remains. The action is available only for an active
+  relationship; proposed and archived rows name the state that prevents it.
+  Reading-view rows separate “Archive far node” from “Archive relationship”; graph incident rows expose the latter through
+  the same `ContextMenu`/`MenuButton` pair. Successful archive and exact-seq
+  undo both refetch the neighbourhood **and the graph path query**. When an
+  archive removes its row opener, each host moves focus to a persistent,
+  visible control after that refreshed result commits.
 - **A dialog locks body scroll and hands focus somewhere real.** `review/Modal`
   and `assets/AssetLightbox` both set `body.style.overflow` on open and restore
   it on close. On close each returns focus to its opener *only if the opener is

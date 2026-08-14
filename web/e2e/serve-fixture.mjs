@@ -60,9 +60,15 @@ nodum(['edge', 'create', alpha.id, beta.id, '--type', 'relates_to', '--as', 'own
 const assetPath = join(dbDir, 'fixture.txt');
 writeFileSync(assetPath, 'fixture asset\n');
 nodum(['asset', 'register', assetPath]);
+const archivedSpace = JSON.parse(
+  nodum(['space-create', 'Retired research', '--as', 'owner']),
+);
+nodum(['space-archive', archivedSpace.id, '--as', 'owner']);
 
 // Specs read these rather than hardcoding ids the seed might renumber.
-process.stdout.write(`${JSON.stringify({ alpha: alpha.id, beta: beta.id, dbPath })}\n`);
+process.stdout.write(
+  `${JSON.stringify({ alpha: alpha.id, beta: beta.id, archivedSpace: archivedSpace.id, dbPath })}\n`,
+);
 
 const server = spawn('uv', ['run', 'nodum', 'serve', '--db', dbPath, '--port', PORT], {
   cwd: REPO_ROOT,

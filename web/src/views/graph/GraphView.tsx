@@ -36,6 +36,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import {
+  ArchiveEdgeDialog,
   EmptyState,
   LinkDialog,
   Spinner,
@@ -43,9 +44,12 @@ import {
   resolveSpaceValue,
   unresolvedSpaceIds,
   useArchivedSpaces,
+  useEdgeArchive,
   useSpaces,
 } from "../../components";
+import type { EdgeArchiveSubject } from "../../components";
 import type { NodeOut } from "../../api/types";
+import { focusProgrammatically } from "../../lib/programmaticFocus";
 import { GraphCanvas } from "./GraphCanvas";
 import type { GraphCanvasHandle } from "./GraphCanvas";
 import { GraphToolbar } from "./GraphToolbar";
@@ -82,13 +86,30 @@ export default function GraphView() {
   const canvasRef = useRef<GraphCanvasHandle | null>(null);
   /** Which node a create-link dialog is anchored on, or null while closed. */
   const [linkSource, setLinkSource] = useState<NodeOut | null>(null);
+  const [archivingEdge, setArchivingEdge] = useState<EdgeArchiveSubject | null>(null);
+  const rootButtonRef = useRef<HTMLButtonElement | null>(null);
+  const focusAfterEdgeArchive = useRef(false);
+  const refetch = useCallback(() => setReloadToken((token) => token + 1), []);
+  const edgeArchive = useEdgeArchive(() => {
+    if (archivingEdge !== null) focusAfterEdgeArchive.current = true;
+    refetch();
+  });
 
   const subgraph = useSubgraph(rootId, filters, reloadToken);
-  const path = usePath(pathA, pathB);
+  const path = usePath(pathA, pathB, reloadToken);
   const catalog = useTypeCatalog();
   const spaceList = useSpaces();
 
   const data = subgraph.data;
+
+  // A successful relationship archive removes its incident-row opener. The
+  // root picker persists across the refresh, so it is the host's real focus
+  // destination after Modal declines to restore a detached opener.
+  useEffect(() => {
+    if (!focusAfterEdgeArchive.current || subgraph.status !== "ready") return;
+    focusAfterEdgeArchive.current = false;
+    if (rootButtonRef.current !== null) focusProgrammatically(rootButtonRef.current);
+  }, [subgraph.status, subgraph.data]);
 
   /* --- URL writers ------------------------------------------------------- */
 
@@ -362,6 +383,7 @@ export default function GraphView() {
         onFiltersChange={updateFilters}
         rootNode={rootNode}
         rootId={rootId}
+        rootButtonRef={rootButtonRef}
         onPickRoot={pickRoot}
         edgeTypeOptions={edgeTypeOptions}
         nodeTypeOptions={nodeTypeOptions}
@@ -629,6 +651,7 @@ export default function GraphView() {
               onSetPathEnd={setPathEnd}
               pathRole={pathA === selectedNode.id ? "a" : pathB === selectedNode.id ? "b" : null}
               onCreateEdge={() => setLinkSource(selectedNode)}
+              onArchiveEdge={setArchivingEdge}
               onClose={() => setSelectedId(null)}
             />
           ) : (
@@ -653,7 +676,14 @@ export default function GraphView() {
         <LinkDialog
           source={linkSource}
           onClose={() => setLinkSource(null)}
-          onCreated={() => setReloadToken((token) => token + 1)}
+          onCreated={refetch}
+        />
+      ) : null}
+      {archivingEdge ? (
+        <ArchiveEdgeDialog
+          subject={archivingEdge}
+          onConfirm={() => edgeArchive.archive(archivingEdge)}
+          onClose={() => setArchivingEdge(null)}
         />
       ) : null}
     </div>

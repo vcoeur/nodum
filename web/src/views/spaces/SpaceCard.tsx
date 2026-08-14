@@ -15,6 +15,7 @@
  */
 
 import { useState } from "react";
+import { Link } from "react-router-dom";
 import { useToast } from "../../components";
 import type { SpaceOut } from "../../api/types";
 import { formatTimestamp } from "../../lib";
@@ -113,6 +114,7 @@ export function SpaceCard({ row, spaces, onRename, onArchive }: SpaceCardProps) 
             <span className="nd-sp-space__sep"> · </span>
             created {formatTimestamp(row.space.created_at)}
           </p>
+          <Link to={`/nodes?space=${encodeURIComponent(row.id)}`}>Browse nodes</Link>
         </div>
 
         <div className="nd-row nd-sp-space__actions">
