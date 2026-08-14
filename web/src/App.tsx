@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { NavLink, Outlet, useLocation, useNavigate } from "react-router-dom";
 import { CommandPalette, ErrorBoundary, Spinner, ToastProvider } from "./components";
 import { api, getHealth, ApiError } from "./api/client";
@@ -8,6 +8,7 @@ import {
   invalidateRecentNodesScopes,
   isModalOpen,
   onUnauthorized,
+  onRecentScopesInvalidated,
   setRecentNodesScope,
   setCommandPaletteOpen,
 } from "./lib";
@@ -60,6 +61,7 @@ export default function App() {
   // Invalidates a late identity response after a 401 has already removed the
   // verified scope. A late success must not re-open a departed human's titles.
   const identityGeneration = useRef(0);
+  const gateController = useRef<AbortController | null>(null);
 
   useEffect(
     () =>
@@ -77,8 +79,17 @@ export default function App() {
     [navigate],
   );
 
-  useEffect(() => {
+  /**
+   * Establish the session's verified identity and the recents scope that may
+   * only follow from it. Runs on mount and again after another tab transitioned
+   * sessions: a pending response issued under the previous cookie is stale the
+   * moment that cookie changes owners, so every run aborts the last request
+   * and lifts the scope until this request proves who owns the tab now.
+   */
+  const verifyIdentity = useCallback(() => {
+    gateController.current?.abort();
     const controller = new AbortController();
+    gateController.current = controller;
     const generation = ++identityGeneration.current;
     // No browser-local reading title is visible until this request proves which
     // human owns this tab. A non-401 failure may still render failure-capable
@@ -98,8 +109,16 @@ export default function App() {
       }
       setGated(false);
     })();
-    return () => controller.abort();
   }, []);
+
+  useEffect(() => {
+    verifyIdentity();
+    const unsubscribeInvalidation = onRecentScopesInvalidated(verifyIdentity);
+    return () => {
+      unsubscribeInvalidation();
+      gateController.current?.abort();
+    };
+  }, [verifyIdentity]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {

@@ -723,9 +723,10 @@ Full conventions: `web/README.md`. The rules below are the ones that bind.
   receives its scope only from the app shell after `GET /api/me` returns the
   stable human id. Until then it exposes and records an empty list, including
   when a non-401 identity failure leaves failure-capable views mounted. Its
-   localStorage keys and `storage` events are identity-scoped; a session
-   transition invalidates same-origin tabs. Logout clearing is defense in depth,
-   never the authority boundary.
+  localStorage keys and `storage` events are identity-scoped; a session
+  transition elsewhere drops same-origin tabs' scopes and the shell re-verifies
+  identity before any title may render again. Logout clearing is defense in
+  depth, never the authority boundary.
 - **Never call `new Date()` on a server string.** SQLite writes
   `datetime('now')` — UTC, no zone marker — which every browser reads as *local*
   time. Parse through `parseTimestamp` (`src/lib/time.ts`); `new Date()` on a

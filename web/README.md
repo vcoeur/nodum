@@ -37,9 +37,10 @@ failure-capable views available — recents are empty and no title is read from
 localStorage. Each human uses an identity-keyed localStorage record, so an
 account transition selects a different record instead of depending on logout
 cleanup. The `storage` listener accepts only updates for the active verified
-scope, and broadcasts session transitions so another tab drops its scope before
-it can render the old human's titles. Reload restores a recent list only after
-the same identity is verified.
+scope, and a session transition in another tab drops this tab's scope and makes
+the shell re-verify identity — a still-pending identity response issued under
+the previous cookie must not re-open the previous human's titles. Reload
+restores a recent list only after the same identity is verified.
 
 Naming one is the harder half, because `GET /api/spaces` is **active-only by
 decision** — it is the vocabulary behind every picker, and a retired space

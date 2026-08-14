@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { nextPaletteIndex, paletteItems } from "./commandPalette";
+import { clampPaletteIndex, nextPaletteIndex, paletteItems } from "./commandPalette";
 
 describe("command palette model", () => {
   it("shows previous reads only while idle and keeps their unavailable caveat", () => {
@@ -13,6 +13,13 @@ describe("command palette model", () => {
     expect(nextPaletteIndex(-1, "ArrowDown", 2)).toBe(0);
     expect(nextPaletteIndex(1, "ArrowDown", 2)).toBe(1);
     expect(nextPaletteIndex(0, "ArrowUp", 2)).toBe(0);
+  });
+
+  it("lands a stale empty-list selection on the first row once results arrive", () => {
+    expect(clampPaletteIndex(-1, 0)).toBe(-1);
+    expect(clampPaletteIndex(-1, 2)).toBe(0);
+    expect(clampPaletteIndex(4, 2)).toBe(1);
+    expect(clampPaletteIndex(0, 2)).toBe(0);
   });
 
 });

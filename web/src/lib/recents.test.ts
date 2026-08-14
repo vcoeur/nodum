@@ -99,6 +99,26 @@ describe("recent nodes", () => {
     expect(store.getRecentNodes()).toEqual([]);
   });
 
+  it("notifies shell listeners when another tab invalidates the scopes", async () => {
+    const store = await freshStore();
+    const onInvalidated = vi.fn();
+    store.onRecentScopesInvalidated(onInvalidated);
+
+    window.dispatchEvent(
+      new StorageEvent("storage", {
+        key: store.RECENT_NODES_INVALIDATION_STORAGE_KEY,
+        newValue: "session-transition",
+        storageArea: window.localStorage,
+      }),
+    );
+    expect(onInvalidated).toHaveBeenCalledTimes(1);
+
+    // A same-tab invalidation writes the marker but never echoes back a storage
+    // event, so the shell is not asked to re-verify its own transition.
+    store.invalidateRecentNodesScopes();
+    expect(onInvalidated).toHaveBeenCalledTimes(1);
+  });
+
   it("writes changing invalidation markers without secure-context crypto", async () => {
     vi.stubGlobal("crypto", {});
     const store = await freshStore();

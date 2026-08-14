@@ -26,8 +26,11 @@ export interface RecentNode {
 export const RECENT_NODE_LIMIT = 12;
 
 type RecentListener = () => void;
+/** Shell listeners notified when another tab transitioned sessions. */
+type ScopeInvalidationListener = () => void;
 
 const listeners = new Set<RecentListener>();
+const invalidationListeners = new Set<ScopeInvalidationListener>();
 let currentScope: string | null = null;
 let current: RecentNode[] = [];
 
@@ -160,10 +163,28 @@ export function onRecentNodesChange(listener: RecentListener): () => void {
   return () => listeners.delete(listener);
 }
 
+/**
+ * Subscribe to another tab's session transition.
+ *
+ * The notification fires only on a `storage` event from another tab: this
+ * tab's own invalidation calls never echo back. The shell re-verifies identity
+ * in response, because the shared session cookie may have changed owners while
+ * a request of its own was in flight.
+ */
+export function onRecentScopesInvalidated(listener: ScopeInvalidationListener): () => void {
+  invalidationListeners.add(listener);
+  return () => invalidationListeners.delete(listener);
+}
+
 /** Adopt another tab's update only when it belongs to this tab's verified scope. */
 function adoptForeignChange(event: StorageEvent): void {
   if (event.key === RECENT_NODES_INVALIDATION_STORAGE_KEY) {
     setRecentNodesScope(null);
+    // A session transition elsewhere may have replaced the session cookie this
+    // tab verified. The shell must re-verify identity before any title may
+    // render again: a still-pending identity response issued under the old
+    // cookie is exactly the stale truth this notification exists to defeat.
+    for (const listener of [...invalidationListeners]) listener();
     return;
   }
   if (currentScope === null || event.key !== recentNodesStorageKey(currentScope)) return;

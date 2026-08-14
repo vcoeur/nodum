@@ -263,15 +263,41 @@ test("cycle rehearsal sends dry_run true and never offers a live-cycle command",
   expect(JSON.parse((await rehearsal).postData() ?? "{}")).toEqual({ dry_run: true });
 });
 
+test("an ArrowDown pressed before lookup results cannot strand Enter", async ({ page }) => {
+  await page.goto("/search");
+  await page.locator('input[name="q"]').waitFor({ state: "visible" });
+  await page.route("**/api/links/suggest?prefix=alpha&limit=8", async (route) => {
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ nodes: [{ id: "alpha", title: "Alpha node" }] }),
+    });
+  });
+  await openPalette(page);
+  const input = page.locator('input[name="command"]');
+  await input.fill("alpha");
+  // The lookup is still pending, so the list is empty and the selection index
+  // goes to -1. When the result lands, the clamp must recover the first row;
+  // a stuck -1 would leave Enter unable to activate the visible option.
+  await page.keyboard.press("ArrowDown");
+  await page.waitForTimeout(350);
+  await page.keyboard.press("Enter");
+  await expect(page).toHaveURL(/\/node\/alpha/);
+  await expect(page.getByRole("dialog", { name: "Command palette" })).toBeHidden();
+});
+
 test("a superseded reader load cannot record a recent after navigation", async ({ page }) => {
   const ownerKey = await recentStorageKey(page);
   await page.route("**/api/nodes/stale-read?depth=1", async (route) => {
-    if (route.request().url().includes("stale-read")) {
-      await new Promise((resolve) => setTimeout(resolve, 300));
-      await route.fulfill({ status: 404, contentType: "application/json", body: JSON.stringify({ detail: "gone" }) });
-      return;
-    }
-    await route.continue();
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        nodes: [{ id: "stale-read", title: "Stale read", type: "concept" }],
+      }),
+    });
   });
   await page.goto("/node/stale-read");
   await page.goto("/search");
@@ -308,6 +334,53 @@ test("an account transition in another tab removes the old verified scope before
 
   await expect(secondTab.getByText("Recent reads")).toBeHidden();
   await secondTab.close();
+});
+
+test("another tab's session transition wins over a still-pending identity response", async ({ page, context }) => {
+  // Tab B verifies as owner and records a recent read.
+  await page.goto(`/node/title/${encodeURIComponent("Alpha node")}`);
+  await expect(page.getByRole("heading", { name: "Alpha node" })).toBeVisible();
+  await page.goto("/search");
+  await expect(page.getByText("Recent reads")).toBeVisible();
+
+  // Hold the first /api/me after reload (issued with the owner cookie) until
+  // the test releases it: it must land only after the session has changed
+  // owners, which is the exact race the identity re-verification exists to win.
+  let releaseStale: () => void;
+  const staleHeld = new Promise<void>((resolve) => {
+    releaseStale = resolve;
+  });
+  let firstIdentityRequest = true;
+  await page.route("**/api/me", async (route) => {
+    if (firstIdentityRequest) {
+      firstIdentityRequest = false;
+      await staleHeld;
+    }
+    await route.continue();
+  });
+  await page.reload();
+
+  // Tab A logs in as the second human while tab B's identity check is pending.
+  const tabA = await context.newPage();
+  await tabA.goto("/login");
+  await tabA.locator('input[name="username"]').fill("second");
+  await tabA.locator('input[name="current-password"]').fill(PASSWORD);
+  await tabA.locator('button[type="submit"]').click();
+  await expect(tabA.locator('[title="Signed in as second"]')).toBeVisible();
+
+  // The re-verification completes with the second human's session: the header
+  // names them and no prior titles are visible.
+  await expect(page.locator('[title="Signed in as second"]')).toBeVisible();
+  await expect(page.getByText("Recent reads")).toBeHidden();
+
+  // The stale owner response finally arrives. It must not restore the owner's
+  // titles: the session cookie this tab now carries belongs to the second human.
+  releaseStale();
+  await expect(page.getByText("Recent reads")).toBeHidden();
+  await page.keyboard.press("Control+K");
+  await expect(page.getByRole("dialog", { name: "Command palette" })).toBeVisible();
+  await expect(page.getByRole("option", { name: /Alpha node/ })).toBeHidden();
+  await page.keyboard.press("Escape");
 });
 
 test("logout drops the active scope, and a later verified identity restores only its own recents", async ({ page }) => {

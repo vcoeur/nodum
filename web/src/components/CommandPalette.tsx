@@ -4,7 +4,7 @@ import { useEffect, useId, useRef, useState } from "react";
 import type { KeyboardEvent as ReactKeyboardEvent } from "react";
 import { useNavigate } from "react-router-dom";
 import { api } from "../api/client";
-import { nextPaletteIndex, paletteItems } from "../lib/commandPalette";
+import { clampPaletteIndex, nextPaletteIndex, paletteItems } from "../lib/commandPalette";
 import type { PaletteItem } from "../lib/commandPalette";
 import { useRecentNodes } from "../lib/recents";
 import { Modal } from "./Modal";
@@ -50,7 +50,7 @@ export function CommandPalette({ onClose }: CommandPaletteProps) {
     return () => controller.abort();
   }, [query]);
 
-  useEffect(() => setSelected((current) => Math.min(current, Math.max(items.length - 1, 0))), [items.length]);
+  useEffect(() => setSelected((current) => clampPaletteIndex(current, items.length)), [items.length]);
 
   useEffect(() => {
     optionRefs.current[selected]?.scrollIntoView({ block: "nearest" });

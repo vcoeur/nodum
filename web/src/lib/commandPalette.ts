@@ -65,3 +65,15 @@ export function nextPaletteIndex(current: number, key: "ArrowDown" | "ArrowUp", 
   if (current < 0) return key === "ArrowDown" ? 0 : count - 1;
   return key === "ArrowDown" ? Math.min(current + 1, count - 1) : Math.max(current - 1, 0);
 }
+
+/**
+ * Clamp a selection onto the displayed list.
+ *
+ * A `-1` chosen while the list was empty (ArrowDown on no results) must land
+ * on the first row once results arrive: an unselected row is one Enter cannot
+ * activate.
+ */
+export function clampPaletteIndex(current: number, count: number): number {
+  if (count === 0) return -1;
+  return Math.min(Math.max(current, 0), count - 1);
+}

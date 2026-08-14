@@ -100,6 +100,7 @@ export {
   RECENT_NODES_INVALIDATION_STORAGE_KEY,
 } from "./recents";
 export type { RecentNode } from "./recents";
+export { onRecentScopesInvalidated } from "./recents";
 
 export {
   isCommandPaletteOpen,
