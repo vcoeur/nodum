@@ -18,7 +18,7 @@ import { useState } from "react";
 import type { FormEvent } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 import { api, ApiError } from "../../api/client";
-import { describeError } from "../../lib";
+import { clearWriteTarget, describeError, invalidateRecentNodesScopes } from "../../lib";
 import { validateCredentials } from "./credentials";
 import "./login.css";
 
@@ -49,6 +49,11 @@ export default function LoginView() {
     void (async () => {
       try {
         await api.login(name.trim(), password);
+        // `/login` remains reachable with a live cookie. Drop the prior scope
+        // until the destination shell verifies the replacement session through
+        // `/api/me`; storage-key scoping, not this reset, separates humans.
+        invalidateRecentNodesScopes();
+        clearWriteTarget();
         navigate(destination, { replace: true });
       } catch (error) {
         setPending(false);

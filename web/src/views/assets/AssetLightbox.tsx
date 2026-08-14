@@ -5,7 +5,13 @@ import { renditionUrl } from "../../api/client";
 import { Spinner } from "../../components";
 import type { AssetOut, NodeOut } from "../../api/types";
 import { ExportJsonButton } from "./ExportJsonButton";
-import { formatTimestamp, formatTimestampLong } from "../../lib";
+import {
+  focusProgrammatically,
+  formatTimestamp,
+  formatTimestampLong,
+  modalClosed,
+  modalOpened,
+} from "../../lib";
 import { formatBytes, isImageMime } from "./formatting";
 
 /**
@@ -93,21 +99,25 @@ export function AssetLightbox({
 
   useEffect(() => {
     if (!open) return;
+    // The command palette consults this shared ownership count before opening;
+    // a focus-owning portal must participate without relying on DOM inspection.
+    modalOpened();
     // In an effect, not during render: render can run without committing, and
     // React may run it more than once, either of which captures the wrong
     // element — usually the dialog itself on the second pass.
     restoreTo.current = document.activeElement as HTMLElement | null;
-    dialogRef.current?.focus();
+    if (dialogRef.current) focusProgrammatically(dialogRef.current);
 
     // The page behind a modal must not scroll under it.
     const previousOverflow = document.body.style.overflow;
     document.body.style.overflow = "hidden";
 
     return () => {
+      modalClosed();
       document.body.style.overflow = previousOverflow;
       // Only if it still exists: focusing a detached node drops focus onto
       // `<body>`, which is worse than leaving it for the view to place.
-      if (restoreTo.current?.isConnected) restoreTo.current.focus();
+      if (restoreTo.current?.isConnected) focusProgrammatically(restoreTo.current);
     };
   }, [open]);
 
@@ -142,7 +152,7 @@ export function AssetLightbox({
       const active = document.activeElement;
       if (focusable.length === 0) {
         event.preventDefault();
-        dialog.focus();
+        focusProgrammatically(dialog);
         return;
       }
       const first = focusable[0] as HTMLElement;
@@ -151,15 +161,15 @@ export function AssetLightbox({
       // click on the page behind. Tab is the moment to pull it back in.
       if (active === null || !dialog.contains(active)) {
         event.preventDefault();
-        (event.shiftKey ? last : first).focus();
+        focusProgrammatically(event.shiftKey ? last : first);
         return;
       }
       if (event.shiftKey && (active === first || active === dialog)) {
         event.preventDefault();
-        last.focus();
+        focusProgrammatically(last);
       } else if (!event.shiftKey && active === last) {
         event.preventDefault();
-        first.focus();
+        focusProgrammatically(first);
       }
     };
 
@@ -173,7 +183,7 @@ export function AssetLightbox({
     // the browser answers by focusing `<body>`. `aria-modal="true"` promises
     // that cannot happen, so the dialog takes focus back.
     const dialog = dialogRef.current;
-    if (dialog && !dialog.contains(document.activeElement)) dialog.focus();
+    if (dialog && !dialog.contains(document.activeElement)) focusProgrammatically(dialog);
   }, [open, index]);
 
   if (!asset) return null;
@@ -184,7 +194,12 @@ export function AssetLightbox({
     <div
       className="nd-modal-backdrop nd-lightbox-backdrop"
       onMouseDown={(event) => {
-        if (event.target === event.currentTarget) onClose();
+        if (event.target === event.currentTarget) {
+          // Keep the opener focused until cleanup restores it; a backdrop press
+          // otherwise shifts focus to body after the hand-back.
+          event.preventDefault();
+          onClose();
+        }
       }}
     >
       <div

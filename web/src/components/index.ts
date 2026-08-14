@@ -33,6 +33,7 @@
  */
 
 export { ArchiveNodeDialog } from "./ArchiveNodeDialog";
+export { CommandPalette } from "./CommandPalette";
 export { ContextMenu, MenuButton, useContextMenu } from "./ContextMenu";
 export type { ContextMenuController, MenuAction } from "./ContextMenu";
 export { EmptyState } from "./EmptyState";
