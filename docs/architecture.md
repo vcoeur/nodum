@@ -113,6 +113,13 @@ connection (applying pending migrations idempotently) and commits; each takes
 a `Principal`. New behaviour and validation go here first; adapters must not
 add behaviour the service lacks.
 
+The HTTP edge-retirement adapter is `POST /api/edges/{id}/archive`: it binds
+the session human through `_write`, delegates once to `archive_edge(id)`, and
+returns the edge envelope. The edge-specific service operation resolves only
+an edge, so this route cannot retire a node or a version. Archiving closes that
+edge's active validity window; it changes neither endpoint and leaves the event
+history available for an exact-sequence undo.
+
 #### Spaces
 
 The read-side `space` filter on `list_nodes` (and its twin in `nodum.search`),

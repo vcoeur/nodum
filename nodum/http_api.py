@@ -2341,6 +2341,11 @@ def create_app(
         )
         return EnvelopeResponse(envelope(edge))
 
+    async def archive_edge(request: Request) -> Response:
+        """Retire an edge (``active`` → ``archived``) — the service's human tier."""
+        edge = _write(request, service.archive_edge, request.path_params["id"], path=db_path)
+        return EnvelopeResponse(envelope(edge))
+
     # ── Search and link suggestions ───────────────────────────────────────
 
     async def search(request: Request) -> Response:
@@ -3346,6 +3351,7 @@ def create_app(
         Route("/api/nodes/{id}/archive", archive_node, methods=["POST"]),
         Route("/api/edges", list_edges),
         Route("/api/edges", create_edge, methods=["POST"]),
+        Route("/api/edges/{id}/archive", archive_edge, methods=["POST"]),
         Route("/api/search", search),
         Route("/api/ask", ask, methods=["POST"]),
         Route("/api/summarize", summarize, methods=["POST"]),

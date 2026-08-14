@@ -555,6 +555,15 @@ def edge_list(
     _emit_list("edges", edges)
 
 
+@edge_app.command("archive")
+def edge_archive(
+    edge_id: str = typer.Argument(..., help="Edge id."),
+    as_human: str = AS_OPTION,
+) -> None:
+    """Archive one active edge (active → archived)."""
+    _emit(_run(service.archive_edge, edge_id, principal=_principal(as_human)))
+
+
 @edge_app.command("create-batch")
 def edge_create_batch(
     suggestions_file: str = typer.Argument(

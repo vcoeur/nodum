@@ -601,6 +601,10 @@ below are the parts that do not fit a route table.
 - Responses use `nodum.envelope`: single results as the model dump, lists as
   `{"<plural>": [...], "count": n}`, rendered exactly as the CLI prints them.
   A new list endpoint keys on the same plural the CLI command uses.
+- **Relationship retirement is `POST /api/edges/{id}/archive`.** It is the
+  bodyless, JSON-content-type human route over `service.archive_edge(id)`,
+  which resolves only an edge, returning the edge envelope; it does not alter
+  either endpoint.
 - Failures are `{"error": {"type", "message"}}` from `EXCEPTION_STATUS`; add a
   new mapping there rather than catching in a handler. Anything unmapped is a
   500 with a generic body — never leak a traceback to a client.

@@ -119,9 +119,10 @@ const PATH_IDLE: PathState = { status: "idle", data: null, error: null };
  *
  * @param a Start node id, or null.
  * @param b End node id, or null.
+ * @param reloadToken Bump to refetch an unchanged pair after a graph mutation.
  * @returns The current query state; idle until both ends are set.
  */
-export function usePath(a: string | null, b: string | null): PathState {
+export function usePath(a: string | null, b: string | null, reloadToken: number): PathState {
   const [state, setState] = useState<PathState>(PATH_IDLE);
 
   useEffect(() => {
@@ -139,7 +140,7 @@ export function usePath(a: string | null, b: string | null): PathState {
         setState({ status: "error", data: null, error: cause });
       });
     return () => controller.abort();
-  }, [a, b]);
+  }, [a, b, reloadToken]);
 
   return state;
 }

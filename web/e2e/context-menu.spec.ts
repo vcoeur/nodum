@@ -139,3 +139,90 @@ test("a document shortcut still reaches the surface behind an open menu", async 
   await expect(query).toBeFocused();
   await expect(page.getByRole("menu")).toBeHidden();
 });
+
+test("an edge action confirms, archives the exact relationship, refreshes, and undoes it", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 420, height: 760 });
+  await openNode(page, "Alpha node");
+
+  const edgeRow = page.locator(".nd-node__edge-line").filter({ hasText: "relates_to" });
+  const opener = edgeRow.locator(".nd-menu-button");
+  await opener.click();
+  const menu = page.getByRole("menu");
+  await expect(menu.getByRole("menuitem", { name: "Archive relationship…" })).toBeVisible();
+  await expect(menu.getByRole("menuitem", { name: "Archive far node…" })).toBeVisible();
+
+  await menu.getByRole("menuitem", { name: "Archive relationship…" }).click();
+  const dialog = page.getByRole("dialog", {
+    name: "Archive Alpha node — relates_to → Beta node?",
+  });
+  await expect(dialog).toBeVisible();
+  await expect(dialog).toContainText("Current active traversal will stop following this");
+  await expect(dialog).toContainText("relates_to relationship from Alpha node to Beta node.");
+  await expect(dialog).toContainText("Alpha node and Beta node do not change.");
+  await expect(dialog).toContainText("The relationship stays in history.");
+
+  await dialog.getByRole("button", { name: "Cancel" }).click();
+  await expect(dialog).toBeHidden();
+  await expect(opener).toBeFocused();
+
+  await edgeRow.click({ button: "right" });
+  await page.getByRole("menuitem", { name: "Archive relationship…" }).click();
+  await page.getByRole("dialog").getByRole("button", { name: "Archive relationship" }).click();
+
+  await expect(edgeRow).toHaveCount(0);
+  await expect(page.getByRole("heading", { name: "Alpha node" })).toBeFocused();
+  await expect(page.getByRole("heading", { name: "Alpha node" })).toBeVisible();
+  await expect(page.getByText("Beta node", { exact: true })).toHaveCount(0);
+
+  const undo = page.getByRole("button", { name: "Undo" });
+  await expect(undo).toBeVisible();
+  const undoRequest = page.waitForRequest(
+    (request) =>
+      request.url().endsWith("/api/undo") &&
+      request.method() === "POST" &&
+      typeof request.postDataJSON().seq === "number",
+  );
+  await undo.click();
+  await undoRequest;
+  await expect(page.locator(".nd-node__edge-line").filter({ hasText: "relates_to" })).toBeVisible();
+});
+
+test("a graph edge action refetches its path and restores focus after its opener leaves", async ({
+  page,
+}) => {
+  await page.goto("/graph");
+  const rootSearch = page.locator('input[name="graph-root"]');
+  await rootSearch.waitFor({ state: "visible" });
+  await rootSearch.fill("Alpha node");
+  await page.getByRole("button", { name: "Alpha node" }).click();
+  const graphNodes = page.getByLabel("Graph nodes");
+  const alphaGraphNode = graphNodes.getByRole("button", { name: "Alpha node" });
+  await alphaGraphNode.focus();
+  await page.keyboard.press("Enter");
+  await expect(page.getByRole("button", { name: "Path from here" })).toBeVisible();
+
+  await page.getByRole("button", { name: "Path from here" }).click();
+  const betaGraphNode = graphNodes.getByRole("button", { name: "Beta node" });
+  await betaGraphNode.focus();
+  await page.keyboard.press("Enter");
+  await page.getByRole("button", { name: "Path to here" }).click();
+  const path = page.getByRole("region", { name: "Path" });
+  await expect(path).toContainText("1 hop");
+
+  const edgeRow = page.locator(".nd-graph__edge-list li").filter({ hasText: "relates_to" });
+  await edgeRow.locator(".nd-menu-button").evaluate((button: HTMLButtonElement) => button.click());
+  const menu = page.getByRole("menu");
+  await expect(menu).toBeVisible();
+  await page.keyboard.press("ArrowDown");
+  await page.keyboard.press("Enter");
+  await page.getByRole("dialog").getByRole("button", { name: "Archive relationship" }).click();
+
+  await expect(edgeRow).toHaveCount(0);
+  await expect(path).toContainText("No path over active edges");
+  await expect(page.getByText("Alpha node▾")).toBeFocused();
+
+  await page.getByRole("button", { name: "Undo" }).click();
+  await expect(path).toContainText("1 hop");
+});

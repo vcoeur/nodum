@@ -26,6 +26,8 @@ import type { EdgeOut, NodeOut, SubgraphOut } from "../../api/types";
 /** One incident edge of the root, ready to render. */
 export interface IncidentRow {
   edge: EdgeOut;
+  /** The root node, retained so edge actions can name both endpoints. */
+  near: NodeOut;
   /** `out` when the root is the edge's source, `in` when it is its target. */
   direction: "out" | "in";
   /** The far node, from the same walk; null only if the envelope lies. */
@@ -77,6 +79,7 @@ export function incidentRows(subgraph: SubgraphOut): IncidentRow[] {
     const far = byId.get(farId) ?? null;
     rows.push({
       edge,
+      near: root,
       direction,
       far,
       crossing: far !== null && far.space_id !== null && far.space_id !== root.space_id,

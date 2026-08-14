@@ -19,7 +19,7 @@
  * Every action this view owns is reachable three ways: the header's buttons,
  * the header's `⋯` menu, and a right-click on the heading. That is the shared
  * `ContextMenu` primitive, and the edge rows carry the same menu for their far
- * node, so travelling somewhere is never a prerequisite for acting on it.
+ * node plus an explicitly separate action for the relationship itself.
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -27,6 +27,7 @@ import { Link, useNavigate, useParams } from "react-router-dom";
 import { api, getNode } from "../../api/client";
 import {
   ArchiveNodeDialog,
+  ArchiveEdgeDialog,
   ContextMenu,
   EmptyState,
   LinkDialog,
@@ -35,19 +36,23 @@ import {
   NodePeekScope,
   Spinner,
   archiveRefusal,
+  edgeArchiveRefusal,
   nameSpace,
   spaceNameNote,
   unresolvedSpaceIds,
   useArchivedSpaces,
   useContextMenu,
+  useEdgeArchive,
   useNodeArchive,
   useSpaces,
   useToast,
 } from "../../components";
 import type { MenuAction } from "../../components";
+import type { EdgeArchiveSubject } from "../../components";
 import type { NodeOut, SubgraphOut } from "../../api/types";
 import { actionForResolution, attachWikilinkClicks, describeFailure } from "../../lib";
 import type { FailureDescription } from "../../lib";
+import { focusProgrammatically } from "../../lib/programmaticFocus";
 import { formatAbsolute, formatTimestampLong } from "../../lib/time";
 import { DIAGRAM_PLACEHOLDER_CLASS, renderMarkdown } from "../editor/markdownRender";
 import { peekDiagram, renderDiagram } from "../editor/mermaidRender";
@@ -81,7 +86,10 @@ export default function NodeView() {
   const [linkSource, setLinkSource] = useState<NodeOut | null>(null);
   /** Which node an archive confirm is up for, or null while closed. */
   const [archiving, setArchiving] = useState<NodeOut | null>(null);
+  const [archivingEdge, setArchivingEdge] = useState<EdgeArchiveSubject | null>(null);
   const contentRef = useRef<HTMLDivElement | null>(null);
+  const headingRef = useRef<HTMLHeadingElement | null>(null);
+  const focusAfterEdgeArchive = useRef(false);
   /** Bumped per render pass, so a slow diagram cannot land in a newer document. */
   const generation = useRef(0);
 
@@ -134,7 +142,20 @@ export default function NodeView() {
 
   const refetch = useCallback(() => setRefresh((value) => value + 1), []);
   const nodeArchive = useNodeArchive(refetch);
+  const edgeArchive = useEdgeArchive(() => {
+    if (archivingEdge !== null) focusAfterEdgeArchive.current = true;
+    refetch();
+  });
   const headerMenu = useContextMenu();
+
+  // A successful relationship archive removes its menu opener. Modal cannot
+  // restore focus to that detached row, so the host returns it to the reading
+  // view's persistent heading once the refreshed rail has committed.
+  useEffect(() => {
+    if (!focusAfterEdgeArchive.current || load.status !== "ready") return;
+    focusAfterEdgeArchive.current = false;
+    if (headingRef.current !== null) focusProgrammatically(headingRef.current);
+  }, [load]);
 
   // The header's actions, shared verbatim by its buttons and its menu — the
   // two must not be able to disagree about what this view can do.
@@ -236,7 +257,11 @@ export default function NodeView() {
         >
           {/* Gated on the loaded root: "(untitled)" is a fact about a node
               with no title, never a placeholder for one that has not loaded. */}
-          {root ? <h1>{root.title ?? "(untitled)"}</h1> : null}
+          {root ? (
+            <h1 ref={headingRef} tabIndex={-1}>
+              {root.title ?? "(untitled)"}
+            </h1>
+          ) : null}
           <p className="nd-row" style={{ ["--nd-row-gap" as string]: "var(--nd-space-3)" }}>
             {root ? <NodeBadge type={root.type} state={root.state} /> : null}
             {spaceName ? (
@@ -357,7 +382,8 @@ export default function NodeView() {
                     row={row}
                     spaces={spaces.spaces}
                     archivedSpaces={archivedSpaces.spaces}
-                    onArchive={setArchiving}
+                    onArchiveNode={setArchiving}
+                    onArchiveEdge={setArchivingEdge}
                   />
                 ))}
               </ul>
@@ -393,6 +419,14 @@ export default function NodeView() {
           edgeCount={rootEdgeCount === null || archiving.id !== root?.id ? null : rootEdgeCount}
           onConfirm={() => nodeArchive.archive(archiving)}
           onClose={() => setArchiving(null)}
+        />
+      ) : null}
+
+      {archivingEdge ? (
+        <ArchiveEdgeDialog
+          subject={archivingEdge}
+          onConfirm={() => edgeArchive.archive(archivingEdge)}
+          onClose={() => setArchivingEdge(null)}
         />
       ) : null}
     </div>
@@ -451,21 +485,23 @@ function BacklinksSection({ backlinks }: { backlinks: readonly Backlink[] }) {
 /**
  * One incident edge: direction, type, far endpoint, crossing mark, state.
  *
- * A right-click (or the row's `⋯`) acts on the **far** node, which is the
- * whole point of putting a menu here: the neighbour is named on this screen,
- * so acting on it should not require travelling to it first.
+ * A right-click (or the row's `⋯`) distinguishes actions on the far node from
+ * the destructive action on the relationship represented by this row.
  */
 function EdgeRow({
   row,
   spaces,
   archivedSpaces,
-  onArchive,
+  onArchiveNode,
+  onArchiveEdge,
 }: {
   row: IncidentRow;
   spaces: readonly NodeOut[] | null;
   archivedSpaces: readonly NodeOut[];
   /** Opens the archive confirm for the far node; the view owns the dialog. */
-  onArchive: (node: NodeOut) => void;
+  onArchiveNode: (node: NodeOut) => void;
+  /** Opens the archive confirm for this exact relationship. */
+  onArchiveEdge: (subject: EdgeArchiveSubject) => void;
 }) {
   const navigate = useNavigate();
   const menu = useContextMenu();
@@ -511,17 +547,31 @@ function EdgeRow({
   }
 
   const refusal = archiveRefusal(far);
+  const edgeRefusal = edgeArchiveRefusal(row.edge);
   const items: MenuAction[] = [
     { id: "open", label: "Open", group: "go", onSelect: () => navigate(`/node/${encodeURIComponent(far.id)}`) },
     { id: "edit", label: "Edit", group: "go", onSelect: () => navigate(`/editor/${encodeURIComponent(far.id)}`) },
     { id: "graph", label: "Open in graph", group: "go", onSelect: () => navigate(`/graph/${encodeURIComponent(far.id)}`) },
     {
-      id: "archive",
-      label: "Archive…",
+      id: "archive-node",
+      label: "Archive far node…",
       group: "act",
       danger: true,
       ...(refusal === null ? {} : { unavailable: refusal }),
-      onSelect: () => onArchive(far),
+      onSelect: () => onArchiveNode(far),
+    },
+    {
+      id: "archive-edge",
+      label: "Archive relationship…",
+      group: "act",
+      danger: true,
+      ...(edgeRefusal === null ? {} : { unavailable: edgeRefusal }),
+      onSelect: () =>
+        onArchiveEdge({
+          edge: row.edge,
+          source: row.edge.src_id === far.id ? far : row.near,
+          destination: row.edge.dst_id === far.id ? far : row.near,
+        }),
     },
   ];
 

@@ -872,6 +872,14 @@ export function createEdge(body: CreateEdgeBody, signal?: AbortSignal): Promise<
   return request<EdgeOut>("/edges", { method: "POST", body, ...(signal ? { signal } : {}) });
 }
 
+/** `POST /api/edges/{id}/archive` — retire one relationship. Human-only, server-enforced. */
+export function archiveEdge(id: string, signal?: AbortSignal): Promise<EdgeOut> {
+  return request<EdgeOut>(`/edges/${encodeURIComponent(id)}/archive`, {
+    method: "POST",
+    ...(signal ? { signal } : {}),
+  });
+}
+
 /* ------------------------------------------------------------------ */
 /* Search                                                               */
 /* ------------------------------------------------------------------ */
@@ -1512,6 +1520,7 @@ export const api = {
   listChildren,
   getHistory,
   archiveNode,
+  archiveEdge,
   listEdges,
   createEdge,
   search,

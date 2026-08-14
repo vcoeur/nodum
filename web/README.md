@@ -365,7 +365,7 @@ syntactic rules above; type-level guarantees remain with `tsc`.
 | `src/views/search/` | query box, ranked hits, per-signal breakdown, signal grouping, the space filter + show-meta toggle in the URL (`searchState.ts`), refused-filter copy (`spaceFailure.ts`), when a row names its space (`resultSpace.ts`) |
 | `src/views/review/` | proposal queue grouped space → agent, per-kind cards, proposed-version diffs, self-governing space sections, cross-space edge marking (`grouping.edgeCrossing`), and the pager over it (`grouping.sectionOrder` / `restrictToPage`, over `lib/pageWindow`) with the honest count above it (`grouping.queueCount`) |
 | `src/views/journal/` | the dream journal: cycles as sentences, one entry with its job report, the five coherence metrics before/after, the events it wrote as a paged diff, the run-now control, the **stop** confirm for a run that is still going and the **abandon** confirm for one a crash left `running` (three verbs, three situations: a stop is an instruction a live run obeys, an abandon closes a dead run's entry from outside, and only the rollback reverses a write — a stopped run and a crashed one both close `failed`, so the entry renders who asked for the stop and when), and the dry-run-then-confirm rollback — whose verdict is **two** lists, `conflicts` and `blockers`, and is clean only when both are empty (`journal.ts` owns every sentence and every reading of the untyped `report` blob; `useNodeTitles.ts` names the nodes an edge event points at) |
-| `src/views/graph/` | Cytoscape subgraph render, filters, cross-space edge styling and far-endpoint dimming, path panel, and the detail panel's create-edge action |
+| `src/views/graph/` | Cytoscape subgraph render, filters, cross-space edge styling and far-endpoint dimming, path panel, and the detail panel's create-edge and incident-edge archive actions |
 | `src/views/assets/` | rendition grid, lightbox, the ingesting drop-zone with its queue readout (`uploadOutcome.ts`) and its bookkeeping (`uploadQueue.ts` — batches, status labels, the refused second drop, the per-batch announcement), thin JSON export |
 | `src/views/login/` | password login against `POST /api/login` |
 | `src/views/spaces/` | the space lifecycle: list with node counts and grant holders, create, rename, archive — and `spaces.ts`'s `archiveConsequences`, the one place the archive dialog's promises are written, every line of which has to be something the server actually delivers |
@@ -550,6 +550,16 @@ Conventions that hold across the tree:
   `lib/undoTarget.ts` decides whether the head provably *is* the write just
   made — same op, same row, no `cycle_id` — and a confirmation appears with no
   Undo on it rather than one that would reverse a stranger's write.
+- **A relationship archive is not a node archive.** Its shared confirm names
+  source, relationship type and destination, then states exactly that current
+  active traversal stops following the relationship, the endpoints do not
+  change, and history remains. The action is available only for an active
+  relationship; proposed and archived rows name the state that prevents it.
+  Reading-view rows separate “Archive far node” from “Archive relationship”; graph incident rows expose the latter through
+  the same `ContextMenu`/`MenuButton` pair. Successful archive and exact-seq
+  undo both refetch the neighbourhood **and the graph path query**. When an
+  archive removes its row opener, each host moves focus to a persistent,
+  visible control after that refreshed result commits.
 - **A dialog locks body scroll and hands focus somewhere real.** `review/Modal`
   and `assets/AssetLightbox` both set `body.style.overflow` on open and restore
   it on close. On close each returns focus to its opener *only if the opener is
