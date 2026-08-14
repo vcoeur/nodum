@@ -267,7 +267,7 @@ test("an ArrowDown pressed before lookup results cannot strand Enter", async ({ 
   await page.goto("/search");
   await page.locator('input[name="q"]').waitFor({ state: "visible" });
   await page.route("**/api/links/suggest?prefix=alpha&limit=8", async (route) => {
-    await new Promise((resolve) => setTimeout(resolve, 300));
+    await new Promise((resolve) => setTimeout(resolve, 500));
     await route.fulfill({
       status: 200,
       contentType: "application/json",
@@ -281,7 +281,7 @@ test("an ArrowDown pressed before lookup results cannot strand Enter", async ({ 
   // goes to -1. When the result lands, the clamp must recover the first row;
   // a stuck -1 would leave Enter unable to activate the visible option.
   await page.keyboard.press("ArrowDown");
-  await page.waitForTimeout(350);
+  await page.waitForTimeout(600);
   await page.keyboard.press("Enter");
   await expect(page).toHaveURL(/\/node\/alpha/);
   await expect(page.getByRole("dialog", { name: "Command palette" })).toBeHidden();

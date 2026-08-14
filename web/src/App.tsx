@@ -104,7 +104,10 @@ export default function App() {
       } catch (error) {
         // A 401 already broadcast the redirect to /login. Anything else — an
         // unreachable server, above all — must not lock the app behind the
-        // gate: the views render their own failure panels for that.
+        // gate: the views render their own failure panels for that. A
+        // superseded request is the same stale truth as in the success branch:
+        // a re-verify superseded this one, so the newer request owns the gate.
+        if (controller.signal.aborted || identityGeneration.current !== generation) return;
         if (error instanceof ApiError && error.status === 401) return;
       }
       setGated(false);

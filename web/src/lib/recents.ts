@@ -184,7 +184,15 @@ function adoptForeignChange(event: StorageEvent): void {
     // tab verified. The shell must re-verify identity before any title may
     // render again: a still-pending identity response issued under the old
     // cookie is exactly the stale truth this notification exists to defeat.
-    for (const listener of [...invalidationListeners]) listener();
+    // A throwing listener must not keep the others from running, as with the
+    // 401 broadcast.
+    for (const listener of [...invalidationListeners]) {
+      try {
+        listener();
+      } catch {
+        // A broken listener is not a reason to skip the rest.
+      }
+    }
     return;
   }
   if (currentScope === null || event.key !== recentNodesStorageKey(currentScope)) return;
