@@ -23,8 +23,9 @@ in the review queue like anyone else's.
 ## What it holds
 
 A fresh database seeds three grant rows for the gardener. They are ordinary
-rows — `nodum grants --agent builtin-gardener` lists them beside every other
-agent's, and the Admin page shows them the same way.
+rows — `nodum grants` lists them beside every other agent's
+(`--agent builtin-gardener` for just its three), and the Admin page shows them
+the same way.
 
 | Space | Level | Why |
 |---|---|---|
@@ -34,15 +35,16 @@ agent's, and the Admin page shows them the same way.
 
 The `meta` row is `read` on purpose. No consolidation job writes the type
 vocabulary, and `edit` on `meta` was tried and rolled back: it bought only
-authority no job reaches — creating spaces, renaming `main`, retitling or
-archiving the `note` type, after which a human can no longer write a note. A
+authority no job reaches — creating spaces, renaming `main`, retitling the
+`concept` type, archiving the `note` type, after which a human can no longer
+write a note. A
 grant is a ceiling, and this one is set at what the jobs need.
 
 Widening and narrowing use the commands that already exist:
 
 ```sh
 nodum grant builtin-gardener research edit --as human:owner   # let it curate another space
-nodum revoke builtin-gardener conventions --as human:owner    # turn learned curation off
+nodum revoke builtin-gardener conventions --as human:owner    # stop the convention notes (leave `curation` out of --job to skip the job)
 nodum revoke builtin-gardener main --as human:owner           # a gardener with no grant does nothing
 ```
 
@@ -62,7 +64,8 @@ browser deliberately does not: its picker offers only the spaces the agent
 holds **no** grant on, because re-levelling through an "add" control would be a
 real action dressed as a no-op. To change a level there, **Revoke** the row,
 then grant the space again at the new level from the picker that reappears.
-The HTTP route behind both is `POST /api/grants`, which is an upsert.
+The Admin page's **Grant** control posts to `POST /api/grants`, the same upsert
+`nodum grant` calls.
 
 ## Running it
 
@@ -74,7 +77,7 @@ names the cycle in the way.
 On demand, from the CLI — rehearse first:
 
 ```sh
-nodum consolidate --dry-run --as human:owner        # every job computes, nothing is written but the journal entry
+nodum consolidate --dry-run --as human:owner        # every job computes, nothing is written but the journal entry (a rehearsal still pays for the abstraction job's model calls when a budget is set)
 nodum consolidate --as human:owner                  # the real thing, every space it holds a grant on
 nodum consolidate --scope research --as human:owner # one space
 nodum consolidate --job duplicate_candidates --job link_maintenance --as human:owner
@@ -101,8 +104,10 @@ a machine that has none. (The embedding-cosine signals inside duplicate and
 link inference come from the local embedding model, which is a separate,
 key-less thing — see [Configuration](configuration.md#embeddings).) A language
 model buys the **abstraction** job: a `proposed` `concept` node synthesised
-from a dense cluster, with `derived_from` edges to its members. Three switches,
-and each is off until you set it:
+from a dense cluster, with `derived_from` edges to its members. That job needs
+both models: its cohesion gate is an embedding cosine, so without the embedding
+model it reports that it did not run, whatever the LLM block says. Three
+switches, and each is off until you set it:
 
 | Variable | Off when | What it turns on |
 |---|---|---|
@@ -110,9 +115,9 @@ and each is off until you set it:
 | `NODUM_LLM_CYCLE_BUDGET` | unset or `0` — the default | The gardener's LLM jobs. **A cycle with a provider and no budget runs its selection and reports that the abstraction job did not run.** The budget is tokens per cycle; `NODUM_LLM_CYCLE_SECONDS` (default 1800) bounds the same work in wall-clock time. |
 | `NODUM_LLM_API_KEY` | unset — none sent | The bearer key, sent **only** to an endpoint somebody named: a `NODUM_LLM_BASE_URL` you set, or a model id nodum ships a profile for. |
 
-Two shapes cover most installs. A hosted provider nodum knows is two lines,
-because the exact model id brings its endpoint, its context window and its
-structured-output mode with it:
+Two shapes cover most installs. A hosted provider nodum knows is two lines
+plus the budget, because the exact model id brings its endpoint, its context
+window and its structured-output mode with it:
 
 ```sh
 export NODUM_LLM_MODEL=deepseek-v4-flash
@@ -153,8 +158,8 @@ to when it is not. A smart feature that answers `false` starts here.
 In a container, the variables reach the server through the compose
 `environment:` block — the [compose example](deploy.md#compose-example)
 shows the shape. The key is the one secret nodum reads from the environment:
-keep it in the env file the compose interpolates from, never in the image and
-never in a committed compose file. `nodum consolidate` and `nodum llm status`
+keep it in an env file (`env_file:`, or `${NODUM_LLM_API_KEY}` interpolation
+from one), never in the image and never in a committed compose file. `nodum consolidate` and `nodum llm status`
 run inside the container (`docker compose exec <service> nodum …`) inherit
 the same environment.
 
@@ -177,12 +182,16 @@ browser) until a human accepts or rejects them, and the curation job's
 acceptance rates and per-item annotations are the record it keeps of how that
 went — it never accepts and never rejects on its own.
 
-Three verbs sit around a run, and they do different things:
+Three verbs sit around a run, and they do different things (the
+[Commands](commands.md#consolidation-and-the-curative-tier) table has them side
+by side):
 
 - `nodum cycle-stop <id>` — the **kill switch** for a run in flight. It
   records that a human asked, and who, and when; the run closes itself
-  `failed` at its next check, which sits before every model call. It reverses
-  nothing.
+  `failed` at its next check, which sits before every model call — and only
+  there: a cycle that makes no model call (no budget, or the deterministic
+  jobs alone) runs to completion and closes `completed` with the stop
+  recorded on it, which is not a failure. It reverses nothing.
 - `nodum rollback <id>` — reverses a **closed** cycle whole, in one
   transaction, and refuses rather than clobbers when anything outside the
   cycle has since touched a row it wrote. A rollback is itself a cycle.
