@@ -65,7 +65,7 @@ holds **no** grant on, because re-levelling through an "add" control would be a
 real action dressed as a no-op. To change a level there, **Revoke** the row,
 then grant the space again at the new level from the picker that reappears.
 The Admin page's **Grant** control posts to `POST /api/grants`, the same upsert
-`nodum grant` calls.
+as `nodum grant`.
 
 ## Running it
 
