@@ -197,11 +197,11 @@ names both ends of every collision. A rollback is itself a cycle, so rolling
 The **gardener** (`builtin-gardener`) is the agent that runs the cycle. It is an
 internal account: it holds no credential at all and authenticates by being
 in-process, so there is nothing to present and nothing to steal. Everything else
-about it is unremarkable on purpose — it has `read` on `meta` and `edit` on
-`main` as two
-ordinary grant rows, they appear in `nodum space-list` beside every other
-agent's, and `nodum revoke builtin-gardener main` takes them away with the
-command that was already there. There is no gardener-shaped exception anywhere
+about it is unremarkable on purpose — it has `read` on `meta`, `edit` on
+`main` and `edit` on `conventions` (its own workspace) as three ordinary grant
+rows, they appear in `nodum space-list` beside every other agent's, and
+`nodum revoke builtin-gardener main` takes them away with the command that was
+already there. There is no gardener-shaped exception anywhere
 in the grant model, which is the point. `read` on meta is what resolving a type
 costs; consolidation never writes the vocabulary, so it is never granted to.
 Any other space is an explicit `nodum grant builtin-gardener <space> edit`, and
@@ -308,7 +308,8 @@ following it deletes something the cycle never named and turns the undo into a
 conflict that blocks the rollback.
 
 Cycles run on demand (`nodum consolidate`, or a button in the web UI) and
-nightly when `NODUM_CONSOLIDATE_AT` is set. Unset means off, which is the
+nightly when `NODUM_CONSOLIDATE_AT` is set — the operator's walk-through is
+[The gardener](gardener.md). Unset means off, which is the
 default; when it is set, `nodum serve` says so in its startup banner. Only one
 consolidation cycle runs at a time **against a database file**, not merely
 within one process: the guard is a uniqueness rule on the journal itself, so a

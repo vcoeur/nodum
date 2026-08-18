@@ -214,6 +214,8 @@ NODUM_CONSOLIDATE_AT=03:30 nodum serve
   flags, and the account bootstrap.
 - [Deploy with Docker](deploy.md) — running the server in a container, TLS in
   front, upgrades, and backups.
+- [The gardener](gardener.md) — running the internal agent that consolidates
+  the graph: its grants, cycles, model and budget, journal and rollback.
 - [Concepts](concepts.md) — the state machine, the event log, and actors.
 - [Architecture](architecture.md) — how the layers fit together.
 - [Commands](commands.md) — the full CLI surface.

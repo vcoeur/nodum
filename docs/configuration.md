@@ -63,7 +63,9 @@ wiped cache by rerunning with `NODUM_EMBED_DOWNLOAD=1`.
 the endpoint, whether a configured key is withheld, the window and the
 ceiling — which is the first diagnostic when a smart feature answers `false`
 instead of failing. The per-request semantics and the output-envelope shapes
-are in [Commands](commands.md#asking-the-graph).
+are in [Commands](commands.md#asking-the-graph); wiring a provider and a
+cycle budget for the internal agent is walked through in
+[The gardener](gardener.md#giving-it-a-model).
 
 ## Serve flags
 

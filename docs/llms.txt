@@ -9,6 +9,7 @@
 - [Quick start](https://nodum.vcoeur.com/quick-start/): build a graph, watch a wikilink become an edge, ingest a folder of documents, search it, read its history, then the agent proposal flow.
 - [Configuration](https://nodum.vcoeur.com/configuration/): the environment-variable reference, the `serve` flags, and the account bootstrap — human passwords, agent tokens (never environment variables), and the grants that make an agent usable.
 - [Deploy with Docker](https://nodum.vcoeur.com/deploy/): the wheel-based image, Compose with volumes for the database and the model cache, TLS in front, health checks, upgrades, and backups.
+- [The gardener](https://nodum.vcoeur.com/gardener/): running the internal consolidation agent — the grants it holds and why, on-demand and nightly cycles, giving it a model and a budget, and reading or reversing what it did.
 - [Concepts](https://nodum.vcoeur.com/concepts/): typed graph, the state machine, the event log, actors and privilege, consolidation cycles and the gardener, projectors, assets, and why the surfaces cannot drift.
 - [Architecture](https://nodum.vcoeur.com/architecture/): the service spine and the thin adapters over it, module by module.
 - [Commands](https://nodum.vcoeur.com/commands/): the full CLI surface plus the conventions every command shares.
