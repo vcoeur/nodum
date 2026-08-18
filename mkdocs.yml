@@ -89,6 +89,9 @@ nav:
   - Overview: index.md
   - Install: install.md
   - Quick start: quick-start.md
+  - Configuration: configuration.md
+  - Deploy with Docker: deploy.md
+  - The gardener: gardener.md
   - Concepts: concepts.md
   - Architecture: architecture.md
   - Decisions: decisions.md
