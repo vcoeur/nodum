@@ -1095,6 +1095,9 @@ Full conventions: `web/README.md`. The rules below are the ones that bind.
   auth class, and one line; regenerate after a route-table change).
 - `docs/commands.md` — the CLI command reference; `docs/concepts.md` — the
   concepts behind the surfaces.
+- `docs/configuration.md` — the environment-variable reference, the `serve`
+  flags, and the account bootstrap; `docs/deploy.md` — running nodum in a
+  container, TLS in front, upgrades, and backups.
 - `docs/llms.txt` — the agent-facing summary published at `/llms.txt`; a change
   to the CLI contract, the actor/privilege split, or the MCP tier boundary
   belongs in it as well as here.

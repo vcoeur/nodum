@@ -210,6 +210,10 @@ NODUM_CONSOLIDATE_AT=03:30 nodum serve
 
 ## Next
 
+- [Configuration](configuration.md) — the environment variables, the `serve`
+  flags, and the account bootstrap.
+- [Deploy with Docker](deploy.md) — running the server in a container, TLS in
+  front, upgrades, and backups.
 - [Concepts](concepts.md) — the state machine, the event log, and actors.
 - [Architecture](architecture.md) — how the layers fit together.
 - [Commands](commands.md) — the full CLI surface.

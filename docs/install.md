@@ -106,6 +106,11 @@ nodum serve                       # http://127.0.0.1:8600
 password-login session (`nodum human passwd` sets a password first); a
 non-loopback bind is allowed — login, not the bind, is the boundary.
 
+Configuration is environment-only — the full variable reference, the `serve`
+flags, and the account bootstrap are in [Configuration](configuration.md) —
+and exposing the server to the public (TLS in front, volumes, upgrades) is
+[Deploy with Docker](deploy.md).
+
 !!! note
     The web UI ships only in wheels whose build ran the frontend build step.
     A wheel built without it serves an "UI not built" placeholder; the CLI,

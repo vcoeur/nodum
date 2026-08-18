@@ -7,6 +7,8 @@
 - [Overview](https://nodum.vcoeur.com/): what nodum is, why one file, what makes it agent-native, and the current phase status.
 - [Install](https://nodum.vcoeur.com/install/): `pipx install nodum`, the optional `embeddings` and extraction (`pdf`/`ocr`/`audio`) extras, database path resolution, and verifying an install.
 - [Quick start](https://nodum.vcoeur.com/quick-start/): build a graph, watch a wikilink become an edge, ingest a folder of documents, search it, read its history, then the agent proposal flow.
+- [Configuration](https://nodum.vcoeur.com/configuration/): the environment-variable reference, the `serve` flags, and the account bootstrap — human passwords, agent tokens (never environment variables), and the grants that make an agent usable.
+- [Deploy with Docker](https://nodum.vcoeur.com/deploy/): the wheel-based image, Compose with volumes for the database and the model cache, TLS in front, health checks, upgrades, and backups.
 - [Concepts](https://nodum.vcoeur.com/concepts/): typed graph, the state machine, the event log, actors and privilege, consolidation cycles and the gardener, projectors, assets, and why the surfaces cannot drift.
 - [Architecture](https://nodum.vcoeur.com/architecture/): the service spine and the thin adapters over it, module by module.
 - [Commands](https://nodum.vcoeur.com/commands/): the full CLI surface plus the conventions every command shares.
