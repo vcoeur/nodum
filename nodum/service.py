@@ -4340,6 +4340,81 @@ def record_auth_event(
         own_conn.close()
 
 
+# ── Settings events: the third named door into the log ────────────────────────
+
+#: The only ops :func:`record_settings_event` will write. An allowlist for the
+#: reason :data:`ASSET_EVENT_OPS` and :data:`AUTH_EVENT_OPS` are ones: the
+#: adapters that own the settings surface live outside this module, and a helper
+#: taking any dotted string would hand them the ability to forge a
+#: ``node.create`` or an ``undo``.
+SETTINGS_EVENT_OPS = (
+    "settings.set",
+    "settings.unset",
+)
+
+
+def record_settings_event(
+    op: str,
+    payload: dict[str, Any],
+    *,
+    principal: Principal,
+    path: str | Path | None = None,
+) -> int:
+    """Append one settings-write event to the log.
+
+    ``op`` must be named in :data:`SETTINGS_EVENT_OPS`; anything else is
+    refused. Like its two siblings this is the one exported writer to the log
+    for its domain, and it is called by the *adapter* that owns the surface —
+    the CLI today — exactly as :func:`record_auth_event` is called by the HTTP
+    adapter that owns login.
+
+    **The payload must come from
+    :meth:`nodum.settings.Change.event_payload`**, which is what reduces a
+    secret to the words ``"set"`` and ``"unset"``. The log is append-only and
+    every projector rebuild reads it end to end, so an API key written here
+    would be a credential nothing can take back out.
+
+    These events are **audit-only by construction**: :func:`undo` reverses
+    ``node.*`` / ``edge.*`` events only — ``settings.*`` is not in
+    :data:`_REVERSIBLE_TABLES`, so a settings write can be read and listed
+    forever and never replayed into state. Reversing one would mean writing a
+    file outside the database, which is not what a transactional undo can
+    promise.
+
+    **The hole this does not close**: an operator editing ``settings.env`` in a
+    text editor writes no event. The file is theirs and the audit trail records
+    what came *through nodum*, so a change made around it is visible as a
+    value whose provenance is the file with no event behind it, and not as
+    nothing at all.
+
+    Args:
+        op: The event op; must be one of :data:`SETTINGS_EVENT_OPS`.
+        payload: The redacted before/after metadata for one key.
+        principal: The human who asked. The CLI names one on every mutating
+            verb, so unlike the two writers beside this there is no
+            principal-less path to accommodate.
+        path: Explicit database path; defaults to ``NODUM_DB`` resolution.
+
+    Returns:
+        The new event's ``seq``.
+
+    Raises:
+        ValueError: If ``op`` is not allowlisted, or the payload does not name
+            the key it is about.
+    """
+    if op not in SETTINGS_EVENT_OPS:
+        raise ValueError(f"op must be one of {SETTINGS_EVENT_OPS}, got {op!r}")
+    if not isinstance(payload.get("key"), str):
+        raise ValueError(f"a {op!r} payload must name the 'key' it changed")
+    own_conn = _connect(path)
+    try:
+        seq = _emit(own_conn, principal.actor_string, op, payload)
+        own_conn.commit()
+        return seq
+    finally:
+        own_conn.close()
+
+
 #: Failed login attempts within :data:`LOGIN_LOCKOUT_WINDOW_MINUTES` that lock
 #: a login name out of password login (finding M5). Five wrong attempts is a
 #: pattern rather than a typo streak, and the window means the count is about

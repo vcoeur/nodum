@@ -8,7 +8,7 @@ import math
 import pytest
 from helpers import ReplayEmbedder
 
-from nodum import db, embeddings, llm, service
+from nodum import db, embeddings, llm, service, settings
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -67,6 +67,29 @@ class HashEmbedder:
             norm = math.sqrt(sum(value * value for value in vector)) or 1.0
             vectors.append([value / norm for value in vector])
         return vectors
+
+
+@pytest.fixture(autouse=True)
+def _settings_beside_a_temp_graph(tmp_path):
+    """Point the settings store at a temp directory, and leave none behind.
+
+    The same posture ``_never_the_real_database`` holds, for the same reason and
+    one sharper: a test that wrote a settings file through the real resolution
+    would write it beside the developer's own graph — at 0600, potentially
+    carrying an API key. Binding here means every test in the suite, whether or
+    not it takes ``fresh_db``, resolves against a file only it can see.
+
+    It is bound to ``tmp_path / "graph.db"`` deliberately: that is the same path
+    ``fresh_db`` points ``NODUM_DB`` at, so the two agree about where a graph
+    and its configuration live rather than each inventing a directory.
+
+    The store's caches are keyed per path and dropped on the way out, so nothing
+    a test wrote can be read by the next one through a stale cache entry.
+    """
+    settings.reset()
+    settings.bind(tmp_path / "graph.db")
+    yield
+    settings.reset()
 
 
 @pytest.fixture()

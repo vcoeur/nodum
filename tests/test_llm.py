@@ -265,6 +265,55 @@ def _provider_ast() -> ast.Module:
     return ast.parse(Path(llm.__file__).read_text(encoding="utf-8"))
 
 
+#: Everything :mod:`nodum.llm` may reach inside the package, **transitively**,
+#: and the reason there is anything at all.
+#:
+#: Configuration became a ladder (default < settings.env < environment), and the
+#: provider is one of the things configured — a model, a key, a window, a
+#: reasoning level. It has to read that ladder somewhere, and the alternative to
+#: importing the seam was a callable injected into a module global: the same
+#: edge with a hop in it, and no rail able to see it.
+#:
+#: The rail is **narrowed rather than weakened**. It was "imports nothing from
+#: nodum", which is a proxy for the three things the docstring below actually
+#: claims; this states the closure instead, so a new edge anywhere along it
+#: fails here, and
+#: :func:`test_every_module_the_provider_reaches_is_a_leaf_too` asks the three
+#: questions of each module on it. ``nodum`` is the package's own ``__init__``,
+#: which re-exports nothing — an edge every ``from nodum import …`` produces.
+PROVIDER_MAY_REACH = {"nodum", "nodum.settings", "nodum.models", "nodum.vocab"}
+
+
+def _imported_modules(tree: ast.Module) -> set[str]:
+    """Every module name imported by ``tree``, by either statement form."""
+    return {
+        alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    } | {node.module or "" for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)}
+
+
+def _called_names(tree: ast.Module) -> set[str]:
+    """Every called name in ``tree``, attribute calls included."""
+    return {
+        node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", "")
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+    }
+
+
+def _bound_principals(tree: ast.Module) -> list[str | None]:
+    """Every ``principal=`` keyword argument in ``tree``."""
+    return [
+        keyword.arg
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        for keyword in node.keywords
+        if keyword.arg == "principal"
+    ]
+
+
 def test_the_provider_opens_no_connection_and_knows_no_principal():
     """It converts messages to text. The job holds the principal and the budget.
 
@@ -273,32 +322,43 @@ def test_the_provider_opens_no_connection_and_knows_no_principal():
     answerable for this write" gets an extra hop.
     """
     tree = _provider_ast()
-    imported = {
-        alias.name
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Import)
-        for alias in node.names
-    } | {node.module or "" for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)}
-    assert "sqlite3" not in imported
-    assert not any(name.startswith("nodum") for name in imported), (
-        f"the provider imports from nodum: {sorted(n for n in imported if n.startswith('nodum'))}"
+    assert "sqlite3" not in _imported_modules(tree)
+    reached = set(_reachable(PROVIDER_MODULE, _import_graph())) - {PROVIDER_MODULE}
+    assert reached <= PROVIDER_MAY_REACH, (
+        f"the provider reaches: {sorted(reached - PROVIDER_MAY_REACH)}"
     )
 
-    calls = {
-        node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", "")
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-    }
+    calls = _called_names(tree)
     assert calls & CONNECTION_CALLS == set(), f"talks to SQLite: {sorted(calls & CONNECTION_CALLS)}"
 
-    principals = [
-        keyword.arg
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        for keyword in node.keywords
-        if keyword.arg == "principal"
-    ]
-    assert principals == [], "the provider binds a principal; the job holds the principal"
+    assert _bound_principals(tree) == [], (
+        "the provider binds a principal; the job holds the principal"
+    )
+
+
+def test_every_module_the_provider_reaches_is_a_leaf_too():
+    """The allowlist is only as good as what is on it.
+
+    The provider's closure is exempted from "imports nothing from nodum", so the
+    same three questions are asked of every module in it: it opens no
+    connection, binds no principal, and cannot reach the deterministic layer —
+    which is what keeps "the provider cannot get to a row" true, by the same
+    argument, one hop further out. An entry that stopped satisfying this would
+    have moved the seam rather than the rail, and it fails here.
+    """
+    graph = _import_graph()
+    modules = _package_modules()
+    for allowed in sorted(PROVIDER_MAY_REACH):
+        assert allowed in graph, f"{allowed} is gone; the allowlist guards nothing"
+        reachable = set(_reachable(allowed, graph))
+        assert reachable & LLM_FREE_MODULES == set(), (
+            f"{allowed} reaches the deterministic layer: {sorted(reachable & LLM_FREE_MODULES)}"
+        )
+        assert PROVIDER_MODULE not in reachable, f"{allowed} reaches the provider"
+        tree = ast.parse(modules[allowed].read_text(encoding="utf-8"))
+        assert "sqlite3" not in _imported_modules(tree), allowed
+        assert _called_names(tree) & CONNECTION_CALLS == set(), allowed
+        assert _bound_principals(tree) == [], allowed
 
 
 def test_the_provider_offers_no_second_door():

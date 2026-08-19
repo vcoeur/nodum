@@ -2446,3 +2446,120 @@ call while the route table looks perfectly correct. `http_surface()` returns
 the route *and* the lifespan for that reason, and the test helpers enter the
 app's lifespan explicitly — without it every negative assertion in those tests
 would pass against a route that is simply broken.
+
+## 2026-08-19 — configuration became a ladder, and the file layer is the new rung
+
+Every `NODUM_*` value was read from `os.environ` at the moment it was needed.
+That is the right answer for a deployment secret and the wrong one for a knob an
+operator turns: changing a model, a budget or the nightly schedule meant editing
+a compose file and restarting the container. `nodum.settings` adds one layer —
+`settings.env`, beside the database — and the ladder is
+`default < settings.env < environment`.
+
+**The environment wins, and empty is not set at any layer.** Both halves are
+forced by the deployment that exists: `origin/main`'s compose file renders six
+of its variables as `${VAR:-}` pass-throughs and one as a bare interpolation,
+all of which produce keys that are **present and empty** in the container's
+environment when the host `.env` says nothing. Ten of the nineteen names are
+present there and seven of those are empty, so a precedence keyed on *presence*
+would have pinned all seven to the empty string and made the file unreachable on
+the one instance it was built for. Presence is not the signal; a non-empty value
+is.
+
+**The path is threaded in, not re-derived.** `settings.bind(db_path)` takes the
+path the caller already resolved. The global `nodum --db` sets `NODUM_DB`, but
+`nodum serve --db PATH` does **not**, so a module that read the environment for
+itself would have served one graph while reading configuration beside another —
+and the frontend's own e2e fixture spawns exactly that shape, which would have
+written a 0600 file carrying an API key into the developer's real
+`~/.local/share/nodum/`. `:memory:` has no directory and is refused rather than
+resolved to the process's working directory.
+
+**The write path is the whole of the file's integrity.** Validation runs
+*before* the write, so the file never holds a value the runtime would read back
+and discard — the accepted-but-inert edit was reachable through three different
+doors, because this codebase has two incompatible bad-value postures already
+(`nodum.agent` falls back to the default, `nodum.llm` refuses and kills the
+provider) and the scheduler has a third (announce and ignore). The registry
+records which of the three applies per key, and `nodum config list` reports it.
+Control characters and newlines are refused outright: written verbatim into a
+`KEY=value` file, a newline is a second setting chosen by whoever supplied the
+value. The bytes land through an `O_EXCL` 0600 temp file **in the same
+directory** (a rename across a mount boundary is `EXDEV`, and the deployment
+bind-mounts `/data`), `fsync`, `os.replace`, then `fsync` on the directory —
+without the last one the rename itself can be lost and the *old* file, carrying
+the old key, comes back. Concurrency is `fcntl.flock` on a sibling lockfile
+**plus** an in-process `threading.Lock`, held across the whole
+read-merge-render-replace span: flock does not serialise two threads of one
+process and a threading lock does not serialise two processes. The kernel drops
+an flock when its holder dies, which is why there is no pid-and-age apparatus —
+and a pid inside a container's namespace is not one anybody outside it can
+check.
+
+**The cache is keyed on the file's identity, compared with `!=`.** The stamp is
+`(st_dev, st_ino, st_mtime_ns, st_size)`, taken by `fstat` on the same
+descriptor the bytes were read from, so the stamp and the bytes are the same
+inode by construction. `>` would have been wrong rather than merely narrow:
+`os.replace` installs a new inode whose mtime can be *older* than the one it
+replaced — a file restored from a backup, a coarse-granularity mount — and a
+`>` comparison calls that "unchanged" forever. A missing file is a state that
+bumps the generation, not a silence. The honest claim about cost: the common
+path still makes one `stat` per resolution; what the cache saves is the parse.
+
+**The provider caches were not serialised by the event loop, and the first
+liveness mechanism did not work.** `run_in_threadpool` puts search, ask,
+summarize and cycles on worker threads, so the generation check is a genuine
+multi-threaded read-modify-write. Stamping the generation *after* resolving —
+the natural writing — consumes a write that lands during resolution and pins the
+stale provider permanently, with no self-heal. The generation is therefore
+sampled **before** `_resolve_default` and that sample is what gets stored, the
+whole compare-resolve-publish runs under one lock, and the four `nodum.llm`
+globals became one frozen `Resolution` object rebound in one assignment, because
+a caller reading three of four globals could otherwise get one resolution's
+provider with another's reason. `set_provider` **pins**: the suite's autouse
+guards are `set_provider(None)` calls made precisely so no test reaches a
+developer's local ollama or a paid API, and a generation check that ignored the
+pin would have discarded them at the first settings write in any test.
+`nodum.embeddings` got the same shape with one deliberate difference — it
+invalidates on a snapshot of its own three values rather than on the file's
+generation, because *constructing* that provider loads a model, and a rule keyed
+on the file would let a budget write trigger a fastembed load on whatever thread
+asked next.
+
+**The scheduler stopped being rebuilt and started being re-read.**
+`NODUM_CONSOLIDATE_AT` was read once, at app construction, and by nothing
+afterwards, so a schedule written from anywhere applied at the next restart.
+The obvious fix — stop the scheduler, build another, start it — was measured
+into two live schedulers over one database under two concurrent writes, with the
+loser orphaned and unreachable from the app that would have to stop it, and the
+write that returned 200 not being the one that won. The loop now sleeps in
+slices of at most 60 s and re-reads the schedule on each one; the task is always
+created, and an unset schedule is an idle loop rather than a missing object. Two
+things fall out that no longer need special-casing: there is nothing to rebuild,
+so there is no race, and "no scheduler exists because none was configured" stops
+being a state. The cost is one wakeup a minute. The last slice before a run is
+the exact remainder, so the DST arithmetic is untouched.
+
+**The never-print rule for the API key was introduced here, not extended.** The
+design cited an existing one at `llm.py:1205-1208`; those lines are a
+`provider_id` property returning a base URL, and a grep for `never print` or
+`redact` across the package, the docs and `AGENTS.md` finds one hit, about the
+database path. So the invariant is structural rather than inherited: a
+`SECRET_KEYS` frozenset, a `Change.event_payload()` that is the only way to
+build an audit payload, and a sweep test over the real CLI's stdout, stderr and
+the event log.
+
+**What `nodum backup` covers.** The design cited backup posture as a reason
+*for* a file beside the database, and backup was `VACUUM INTO` on the database
+alone — so a by-the-book restore ("replace the database file") would silently
+revert every stored setting including the key. `backup` now copies
+`settings.env` to `<dest>.settings.env` at 0600 and names it in the result, and
+`docs/deploy.md` says restore is two files.
+
+Four names refuse storage and resolve from the environment alone, each for its
+own reason: `NODUM_DB` (read before the graph, and therefore before its settings
+file, is open), `NODUM_LLM_BASE_URL` (the endpoint an API key may travel to is a
+deployment decision), `NODUM_EMBED_CACHE` (a path on the server's own disk), and
+`NODUM_PUBLIC_URL` (every capability URL is minted from it, so a stored value
+would redirect them). `NODUM_EMBED_MODEL` and `NODUM_EMBED_DOWNLOAD` are not on
+the surface at all yet — changing the model invalidates every stored vector.

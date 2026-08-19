@@ -143,7 +143,6 @@ from __future__ import annotations
 
 import hashlib
 import math
-import os
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -152,7 +151,7 @@ from typing import Any, Protocol
 
 from pydantic import BaseModel
 
-from nodum import llm, service
+from nodum import llm, service, settings
 from nodum.llm import (
     STRUCTURED_JSON_OBJECT,
     STRUCTURED_JSON_SCHEMA,
@@ -769,14 +768,15 @@ def cycle_stop_check(
     return check
 
 
-def _positive_int(name: str, default: int, *, minimum: int = 0) -> int:
-    """Read a whole number of at least ``minimum`` from the environment.
+def _positive_int(config: settings.Snapshot, name: str, default: int, *, minimum: int = 0) -> int:
+    """Read a whole number of at least ``minimum`` from one configuration snapshot.
 
     An unparseable value falls back and does **not** raise: the scheduler's
     precedent is that a server refusing to boot over a stray character in an
     optional setting is worse than one that says what it skipped — and here the
     fallback for the cycle budget is 0, which is *off*, so a typo cannot
-    accidentally authorise spending.
+    accidentally authorise spending. The write path validates ahead of this, so
+    only a hand-edited file or an environment variable can still reach it.
 
     ``minimum`` is what separates a *decision* from a *misconfiguration*, and
     the two live behind the same reader. 0 on a budget means off, which is a
@@ -785,8 +785,19 @@ def _positive_int(name: str, default: int, *, minimum: int = 0) -> int:
     must be at least 1``, which the HTTP surface renders as a **400** — the
     client-error voice — on every ``POST /api/ask``, about a request that was
     perfectly well formed.
+
+    Args:
+        config: The snapshot every ceiling of one run is read from, so a
+            settings write landing mid-construction cannot fund a run from two
+            configurations at once.
+        name: The setting to read.
+        default: What an unset or unusable value falls back to.
+        minimum: The smallest value that is a decision rather than a mistake.
+
+    Returns:
+        The ceiling in force.
     """
-    raw = (os.environ.get(name) or "").strip()
+    raw = (config.value(name) or "").strip()
     if not raw:
         return default
     try:
@@ -796,8 +807,8 @@ def _positive_int(name: str, default: int, *, minimum: int = 0) -> int:
     return value if value >= minimum else default
 
 
-def _positive_float(name: str, default: float) -> float:
-    """Read a positive, **finite** number of seconds from the environment.
+def _positive_float(config: settings.Snapshot, name: str, default: float) -> float:
+    """Read a positive, **finite** number of seconds from one configuration snapshot.
 
     ``float()`` reads ``inf``, ``Infinity`` and ``1e999`` happily, and neither
     of the two serialisers this number reaches can carry the result:
@@ -809,7 +820,7 @@ def _positive_float(name: str, default: float) -> float:
     comparison against it is false, so ``remaining_seconds <= 0`` never fires
     and the wall-clock ceiling stops existing without saying so.
     """
-    raw = (os.environ.get(name) or "").strip()
+    raw = (config.value(name) or "").strip()
     if not raw:
         return default
     try:
@@ -840,7 +851,14 @@ class AgentRun:
         max_output_tokens: int | None = None,
         call_timeout: float | None = None,
         budget_env: str = ENV_CYCLE_BUDGET,
+        budget_source: str | None = None,
+        config: settings.Snapshot | None = None,
     ) -> None:
+        # One snapshot funds the whole run. Read one at a time, the two
+        # ceilings below and the budget the factory built could come from
+        # either side of a settings write, so a run could be bounded by a
+        # configuration that never existed.
+        config = settings.snapshot() if config is None else config
         self.principal = principal
         self.purpose = purpose
         self.budget = budget
@@ -851,15 +869,21 @@ class AgentRun:
         #: :data:`ENV_REQUEST_BUDGET` and is not affected by the cycle variable
         #: at all.
         self.budget_env = budget_env
+        #: Which *layer* funded this run, as a phrase a message can name: the
+        #: environment, ``settings.env``, or the built-in default. There are two
+        #: places a budget can come from now, and "set NODUM_LLM_CYCLE_BUDGET"
+        #: is unhelpful advice to somebody who already set it in the one that
+        #: loses.
+        self.budget_source = "an explicit budget" if budget_source is None else budget_source
         self.max_output_tokens = (
             max_output_tokens
             if max_output_tokens is not None
-            else _positive_int(ENV_MAX_OUTPUT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, minimum=1)
+            else _positive_int(config, ENV_MAX_OUTPUT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, minimum=1)
         )
         self.call_timeout = (
             call_timeout
             if call_timeout is not None
-            else _positive_float(ENV_CALL_TIMEOUT, DEFAULT_CALL_TIMEOUT)
+            else _positive_float(config, ENV_CALL_TIMEOUT, DEFAULT_CALL_TIMEOUT)
         )
         # Private, and that is the point (P3). A caller handed the provider
         # object makes a call no budget, stop check or report can see, and the
@@ -867,15 +891,19 @@ class AgentRun:
         # demonstrated at `run.provider.chat(...)` with the budget at 0 and a
         # stop firing, reporting `calls 0, total_tokens 0, stopped True`. What a
         # caller legitimately needs is two numbers, and they are below.
-        self._provider = llm.get_provider()
-        self.unavailable_reason = llm.unavailable_reason()
+        # One resolution too, and for the same reason: asking three times
+        # could answer from three, so a run could report a provider with
+        # another resolution's reason for there being none.
+        resolution = llm.resolution()
+        self._provider = resolution.provider
+        self.unavailable_reason = resolution.unavailable_reason
         #: Why a configured ``NODUM_LLM_API_KEY`` is not being sent, or ``None``.
         #: Read here rather than from the provider for the reason every other
         #: posture field is (P3): a caller that had to hold the provider to see
         #: it could go on to call it. It is not a failure — the run works, the
         #: local default needs no key — so it rides beside the configuration in
         #: ``nodum llm status`` rather than in ``unavailable_reason``.
-        self.api_key_withheld = llm.key_withheld_reason()
+        self.api_key_withheld = resolution.key_withheld_reason
         self.stopped = False
         self._jobs: dict[str, Budget] = {}
         self._skipped: list[SkippedItem] = []
@@ -1401,17 +1429,20 @@ def for_cycle(
         budget: An explicit budget, overriding the environment. For tests and
             for a caller that has already decided what tonight may cost.
     """
+    config = settings.snapshot()
     return AgentRun(
         principal=principal,
         purpose=f"cycle:{cycle_id}",
         budget=budget
         or Budget(
             name=f"cycle:{cycle_id}",
-            tokens=_positive_int(ENV_CYCLE_BUDGET, DEFAULT_CYCLE_BUDGET),
-            seconds=_positive_float(ENV_CYCLE_SECONDS, DEFAULT_CYCLE_SECONDS),
+            tokens=_positive_int(config, ENV_CYCLE_BUDGET, DEFAULT_CYCLE_BUDGET),
+            seconds=_positive_float(config, ENV_CYCLE_SECONDS, DEFAULT_CYCLE_SECONDS),
         ),
         stop=cycle_stop_check(cycle_id, principal=principal, path=path),
         stop_switch=STOP_SWITCH_ARMED,
+        budget_source=None if budget else config.source(ENV_CYCLE_BUDGET),
+        config=config,
     )
 
 
@@ -1429,14 +1460,17 @@ def for_request(*, purpose: str, principal: Principal, budget: Budget | None = N
         principal: The session's human principal.
         budget: An explicit budget, overriding the environment.
     """
+    config = settings.snapshot()
     return AgentRun(
         principal=principal,
         purpose=f"request:{purpose}",
         budget=budget
         or Budget(
             name=f"request:{purpose}",
-            tokens=_positive_int(ENV_REQUEST_BUDGET, DEFAULT_REQUEST_BUDGET),
-            seconds=_positive_float(ENV_REQUEST_SECONDS, DEFAULT_REQUEST_SECONDS),
+            tokens=_positive_int(config, ENV_REQUEST_BUDGET, DEFAULT_REQUEST_BUDGET),
+            seconds=_positive_float(config, ENV_REQUEST_SECONDS, DEFAULT_REQUEST_SECONDS),
         ),
         budget_env=ENV_REQUEST_BUDGET,
+        budget_source=None if budget else config.source(ENV_REQUEST_BUDGET),
+        config=config,
     )

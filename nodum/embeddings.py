@@ -42,9 +42,11 @@ from __future__ import annotations
 
 import math
 import os
+import threading
 import warnings
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -279,9 +281,81 @@ def _pool(vectors: list[list[float]], dimensions: int) -> list[float]:
 
 # ── Provider resolution (cached process-wide) ────────────────────────────────
 
-_provider: EmbeddingProvider | None = None
-_unavailable_reason: str | None = None
-_resolved = False
+
+def _configuration() -> tuple[str | None, str | None, str | None]:
+    """The three values a resolution depends on, as they stand right now.
+
+    Read from the environment alone, and that is the point rather than an
+    omission: **constructing this provider loads a model**, so an invalidation
+    rule keyed on the settings file's generation would let any settings write
+    at all — a budget, a schedule — trigger a fastembed model load on whatever
+    thread happened to ask next. Keying on the three values means only a change
+    to one of *them* can, and none of them is storable in ``settings.env``
+    today, so in practice nothing can. When the embedding variables become
+    writable they arrive with the on-loop-resolution hazard closed first.
+    """
+    return (
+        os.environ.get(ENV_MODEL_VAR),
+        os.environ.get(ENV_CACHE_VAR),
+        os.environ.get(ENV_DOWNLOAD_VAR),
+    )
+
+
+@dataclass(frozen=True)
+class Resolution:
+    """One reading of the embedding configuration, published as a single object.
+
+    Shaped like :class:`nodum.llm.Resolution` and for the same reasons — the
+    provider and the reason it is absent must be read as one fact, and
+    resolution runs on worker threads rather than on the event loop — with one
+    difference this module's cost forces: it is invalidated by a change to the
+    three values it was built from (:func:`_configuration`), never by the
+    settings file moving underneath it.
+
+    ``pinned`` marks a resolution :func:`set_provider` forced, which nothing
+    but :func:`reset_provider` clears: the suite's autouse guard is a pin, and
+    a configuration change silently un-forcing it would put a model download in
+    the middle of a test run.
+    """
+
+    provider: EmbeddingProvider | None
+    unavailable_reason: str | None
+    configuration: tuple[str | None, str | None, str | None]
+    pinned: bool
+
+
+_lock = threading.Lock()
+_resolution: Resolution | None = None
+
+
+def resolution() -> Resolution:
+    """Return the current resolution, re-resolving if the configuration moved.
+
+    The model load happens **inside** the lock, so a second thread arriving
+    during a first resolution waits for it rather than starting a second load
+    of the same model. That is the behaviour worth having and it is worth
+    saying: the first vector operation after a cold start can block every other
+    one for as long as fastembed takes to come up.
+
+    Returns:
+        The frozen :class:`Resolution` in force. Compare-resolve-publish runs
+        under one lock, so two worker threads cannot interleave their stores
+        and hand a caller one resolution's provider with another's reason.
+    """
+    global _resolution
+    with _lock:
+        current = _resolution
+        if current is not None and (current.pinned or current.configuration == _configuration()):
+            return current
+        seen = _configuration()
+        provider, unavailable = _resolve_default()
+        _resolution = Resolution(
+            provider=provider,
+            unavailable_reason=unavailable,
+            configuration=seen,
+            pinned=False,
+        )
+        return _resolution
 
 
 def get_provider() -> EmbeddingProvider | None:
@@ -291,39 +365,38 @@ def get_provider() -> EmbeddingProvider | None:
     only unless ``NODUM_EMBED_DOWNLOAD=1``); the outcome is cached for the
     process, so availability checks are cheap after that.
     """
-    global _provider, _unavailable_reason, _resolved
-    if not _resolved:
-        _provider, _unavailable_reason = _resolve_default()
-        _resolved = True
-    return _provider
+    return resolution().provider
 
 
 def unavailable_reason() -> str | None:
     """Return why no provider is available (``None`` when one is)."""
-    get_provider()
-    return _unavailable_reason
+    return resolution().unavailable_reason
 
 
 def set_provider(provider: EmbeddingProvider | None, *, reason: str | None = None) -> None:
     """Force the provider — the test and configuration seam.
 
     Passing ``None`` forces the unavailable state; ``reason`` is what
-    :func:`unavailable_reason` (and thereby ``projector status``) reports.
+    :func:`unavailable_reason` (and thereby ``projector status``) reports. A
+    forced provider is **pinned**: only :func:`reset_provider` drops it.
     """
-    global _provider, _unavailable_reason, _resolved
-    _provider = provider
-    _unavailable_reason = (
-        None if provider is not None else (reason or "no embedding provider configured")
-    )
-    _resolved = True
+    global _resolution
+    with _lock:
+        _resolution = Resolution(
+            provider=provider,
+            unavailable_reason=(
+                None if provider is not None else (reason or "no embedding provider configured")
+            ),
+            configuration=_configuration(),
+            pinned=True,
+        )
 
 
 def reset_provider() -> None:
-    """Drop the cached resolution; the next use re-resolves from scratch."""
-    global _provider, _unavailable_reason, _resolved
-    _provider = None
-    _unavailable_reason = None
-    _resolved = False
+    """Drop the cached resolution — pin included; the next use re-resolves from scratch."""
+    global _resolution
+    with _lock:
+        _resolution = None
 
 
 def _resolve_default() -> tuple[EmbeddingProvider | None, str | None]:

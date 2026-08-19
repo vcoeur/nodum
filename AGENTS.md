@@ -59,6 +59,22 @@ The invariants that must never be broken, whatever the section:
   any whole-graph export (the only export is the per-node snapshot,
   `GET /api/export/node/{id}?depth=`). Each lands as its own append-only
   migration where it needs one.
+- **Configuration is a ladder, and `nodum.settings` is its only door.**
+  `default < settings.env < environment`, with **empty not set at any layer** —
+  the deployed container exports six of its variables as `${VAR:-}`
+  pass-throughs, so a rule keyed on *presence* pins them all to the empty
+  string. Never read a `NODUM_*` name with `os.environ` in a module the seam
+  covers: resolve it through `nodum.settings`, which is also where a new name
+  is registered with its validator, its default, and whether it may be stored
+  at all. The settings path is **threaded in** from the database path the caller
+  resolved (`settings.bind`), never re-derived — `nodum serve --db PATH` does
+  not set `NODUM_DB`, so a module reading the environment for itself serves one
+  graph and reads configuration beside another.
+- **`NODUM_LLM_API_KEY` is never serialised.** It is in
+  `nodum.settings.SECRET_KEYS`, and that is a structural rule rather than a
+  habit: a surface reports whether it is set, an event payload records
+  `set`/`unset`, and no exception message quotes it. A new secret joins the
+  frozenset; it does not get its own redaction at each call site.
 - **One fact, one home.** Rules live in this file, architecture in
   `docs/architecture.md`, measured decisions in `docs/decisions.md`. Do not
   restate a number the decision log records.
@@ -284,6 +300,12 @@ The invariants that must never be broken, whatever the section:
   `supersede-edge <edge-id> [--src --dst --type --confidence --set]` (every
   option describes the **replacement**; unnamed fields are inherited),
   `bulk-relink [--src --dst --type --state] [--to-type --to-dst] [--dry-run]`,
+  `config list` / `config get <KEY>` / `config set <KEY> <VALUE>` /
+  `config unset <KEY>` (the settings file beside the graph; the two mutating
+  verbs take `--as` and are logged as `settings.set`/`settings.unset`, and
+  `set` **refuses** a name the environment pins or one that cannot be stored,
+  naming the reason — an accepted-but-inert edit is the failure the surface
+  exists to prevent. A secret answers `set`/`unset` and never a value),
   `ask <question> [--k] [--space]` / `summarize <node-id> [--depth]` /
   `search … [--nl]` / `llm status [--probe/--no-probe]` (the read-only smart
   surface — see `nodum.answers`; none of the four writes anything),
@@ -296,7 +318,12 @@ The invariants that must never be broken, whatever the section:
   session cookie `Secure` there, and warns that uvicorn speaks plain HTTP.
   **The nightly consolidation cycle is configured by `NODUM_CONSOLIDATE_AT`
   (`HH:MM`, local wall clock) and by nothing else** — no `--consolidate-at`
-  flag, because unset means off. A schedule that is on says so in the banner.
+  flag, because unset means off. It reads through the settings ladder, so
+  `nodum config set NODUM_CONSOLIDATE_AT 03:00` turns it on **without a
+  restart**: the scheduler task always exists and re-reads the schedule as it
+  sleeps. Never stop, rebuild or start a scheduler to apply a change — two
+  concurrent writes doing that leave two live schedulers over one database. A
+  schedule that is on says so in the banner, naming the layer it came from.
 - **The four smart verbs never fail because the model did.** `ask`,
   `summarize`, `search --nl` and `llm status` exit **0** whatever the provider
   did — a question nothing answered is `answered: false` with a `refusal`; no
@@ -1107,8 +1134,9 @@ Full conventions: `web/README.md`. The rules below are the ones that bind.
   auth class, and one line; regenerate after a route-table change).
 - `docs/commands.md` — the CLI command reference; `docs/concepts.md` — the
   concepts behind the surfaces.
-- `docs/configuration.md` — the environment-variable reference, the `serve`
-  flags, and the account bootstrap; `docs/deploy.md` — running nodum in a
+- `docs/configuration.md` — the settings file and the ladder over it, the
+  environment-variable reference, the `serve` flags, and the account bootstrap;
+  `docs/deploy.md` — running nodum in a
   container, TLS in front, upgrades, and backups; `docs/gardener.md` — the
   operator's guide to the internal agent: its grants, running cycles, the
   model and budget, the journal and rollback.

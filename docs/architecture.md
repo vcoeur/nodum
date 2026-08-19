@@ -72,7 +72,8 @@ One line per module; the full narrative is in the `###` sections below.
 | `nodum.mcp_server` | The external-agent surface — the §8.1 read + additive tiers and nothing else. |
 | `nodum.http_api` | The human surface — Starlette app, `/api` + the built UI, password-login sessions. |
 | `nodum.consolidate` | The consolidation runner — five deterministic jobs, the abstraction job, five coherence metrics. |
-| `nodum.scheduler` | The nightly schedule — one asyncio task in `nodum serve`'s lifespan, off unless configured. |
+| `nodum.scheduler` | The nightly schedule — one always-running asyncio task in `nodum serve`'s lifespan, idle unless configured. |
+| `nodum.settings` | The configuration seam — `settings.env` beside the graph, the `default < file < environment` ladder, and the validated write path. |
 | `nodum.envelope` | The JSON envelope both the CLI and the HTTP API emit. |
 | `web/` (built into `nodum/_web/`) | The human UI — React 19 + TypeScript, ten lazily loaded views. |
 | `nodum.projectors` | Derived-index consumers of the event log — `fts` and `vec`, checkpoints, rebuild. |
@@ -315,7 +316,13 @@ next cycle, not mid-flight.
 ### `nodum.scheduler` — the nightly schedule (decision J1)
 
 One asyncio task in `nodum serve`'s lifespan, no `cron` file, no second
-process, no new dependency. It **cannot overlap itself** — the next wait is
+process, no new dependency. The task is **always created**, and an unset
+schedule is an idle loop rather than a missing object: the loop sleeps in
+slices of at most `SLICE_SECONDS` and re-reads the schedule through
+`nodum.settings` on every one, so turning the nightly cycle on, off, or to
+another hour applies within a minute with nothing stopped, rebuilt or started.
+A constructor argument **pins** it (the ladder is argument > environment >
+`settings.env` > off). It **cannot overlap itself** — the next wait is
 computed only after the run it follows has returned. A **crash neither takes
 the server down nor stops the schedule**. **A night the runner *refused* is a
 skip, not a failure**: `CycleInProgress` is caught ahead of the generic
@@ -329,6 +336,36 @@ its arithmetic in aware local time; the DST bug and its test rule are in
 **announced and ignored**, and **shutdown does not wait for it**
 (`SHUTDOWN_GRACE_SECONDS`). The cycle runs through `asyncio.to_thread`. The
 clock, the sleep and the runner are injectable.
+
+### `nodum.settings` — the configuration seam (`settings.env`)
+
+One file beside the database, one ladder over it: **`default < settings.env <
+environment`**, with *empty not set at any layer* — the deployed container
+exports six of its variables as `${VAR:-}` pass-throughs, so presence cannot be
+the signal. The path is **threaded in** (`bind(db_path)`) rather than
+re-derived, because `nodum serve --db PATH` never reaches `NODUM_DB` and a
+module reading the environment for itself would serve one graph while reading
+configuration beside another. `:memory:` has no directory and is refused.
+
+The **write path** validates before it writes (the file never holds a value the
+runtime would discard), refuses control characters and newlines (a newline in a
+value is line injection into the next line), preserves comments and unknown
+keys, and lands the bytes through an `O_EXCL` 0600 temp file in the same
+directory, `fsync`, `os.replace`, `fsync` on the directory — under an in-process
+lock **and** an `flock`, held across the whole read-merge-render-replace span.
+The **read path** stamps the file with `fstat` on the descriptor it read from,
+`(st_dev, st_ino, st_mtime_ns, st_size)` compared with `!=`, and publishes a new
+immutable mapping rather than mutating the live one; a missing file is a state
+and bumps the generation. What the cache saves is the parse, not a syscall.
+
+`SECRET_KEYS` and `Change.event_payload()` are the never-serialise contract:
+`NODUM_LLM_API_KEY` reports set/unset and never a value, to a surface or to the
+event log. A file it cannot parse is reported loudly and stepped around, with
+`file-unreadable` provenance, so a surface can say *why* a stored value is not
+in force. Four names (`NODUM_DB`, `NODUM_LLM_BASE_URL`, `NODUM_EMBED_CACHE`,
+`NODUM_PUBLIC_URL`) refuse storage and resolve from the environment alone, each
+with its reason. Surfaces: `nodum config list|get|set|unset` and the
+`settings.set`/`settings.unset` events.
 
 ### `nodum.envelope` — the JSON envelope both surfaces emit
 

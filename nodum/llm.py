@@ -53,8 +53,10 @@ second door here would be a second place where a model call happens, with its
 own accounting and its own way of being absent.
 
 **The peer-client shape holds here too** (P2). This module opens no database
-connection, reads no row, imports nothing from :mod:`nodum`, and binds no
-principal. It converts messages to text. The job holds the principal, the job
+connection, reads no row, binds no principal, and reaches exactly one module in
+:mod:`nodum` — :mod:`nodum.settings`, the configuration seam, which is itself a
+leaf that touches neither SQLite nor a principal (``tests/test_llm.py`` asserts
+both halves). It converts messages to text. The job holds the principal, the job
 holds the budget, the job makes the write — and ``tests/test_llm.py`` asserts
 over the ASTs of :mod:`nodum.service`, :mod:`nodum.projectors`,
 :mod:`nodum.store` and :mod:`nodum.migrations` that none of them can reach this
@@ -164,15 +166,18 @@ from __future__ import annotations
 import http.client
 import json
 import logging
-import os
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Any, NamedTuple, Protocol
 
 from pydantic import BaseModel
+
+from nodum import settings
 
 #: The one thing in this module that is neither a refusal nor a number a caller
 #: reads back. A provider whose own ``usage`` block contradicts itself is not a
@@ -1547,8 +1552,9 @@ class OpenAICompatProvider:
             # the operator reads it as "my key is wrong". `llm status` carried
             # the answer; the failure that needed it did not.
             withheld = ""
-            if failure.code in {401, 403} and _key_withheld_reason is not None:
-                withheld = f". {_key_withheld_reason}"
+            published = _published_key_withheld_reason()
+            if failure.code in {401, 403} and published is not None:
+                withheld = f". {published}"
             raise ProviderUnavailable(
                 f"provider at {self._base_url} answered HTTP {failure.code}: {detail}{withheld}",
                 status=failure.code,
@@ -1705,10 +1711,83 @@ class OpenAICompatProvider:
 # The same three functions plus a reset that `nodum.embeddings` exposes, for the
 # reason in the module docstring: one way to be offline.
 
-_provider: LLMProvider | None = None
-_unavailable_reason: str | None = None
-_key_withheld_reason: str | None = None
-_resolved = False
+
+@dataclass(frozen=True)
+class Resolution:
+    """One reading of the configuration, published as a single object.
+
+    The three facts a caller asks about a provider — is there one, why not, and
+    why a configured key is not being sent — were four module globals, stored
+    one after another. Nothing made a reader see the same resolution in all
+    three, and resolution does not run on the event loop: search, ask,
+    summarize and the cycle route through ``run_in_threadpool``, so two worker
+    threads could interleave their stores and hand a caller one resolution's
+    provider with another's reason. One frozen object rebound in one assignment
+    cannot be read half-updated.
+
+    ``generation`` is the :func:`nodum.settings.generation` this was built
+    *from*, sampled **before** the resolution ran. Stamping it afterwards is
+    the natural writing and it is the bug: a write landing mid-resolution would
+    be consumed by the stamp and never re-read, pinning a stale provider for
+    the life of the process with no self-heal.
+
+    ``pinned`` marks a resolution :func:`set_provider` forced. A pin outranks
+    the generation check, because the test suite's autouse guards are pins —
+    without this the first settings write in any test would discard
+    ``set_provider(None)`` and the suite would start talking to whatever
+    ``NODUM_LLM_BASE_URL`` points at.
+    """
+
+    provider: LLMProvider | None
+    unavailable_reason: str | None
+    key_withheld_reason: str | None
+    generation: int
+    pinned: bool
+
+
+_lock = threading.Lock()
+_resolution: Resolution | None = None
+
+
+def resolution() -> Resolution:
+    """Return the current resolution, re-resolving if the configuration moved.
+
+    The whole compare-resolve-publish runs under one lock. Resolution here
+    reads configuration and makes no network call, so serialising it costs
+    nothing worth measuring — and the alternative is the read-modify-write race
+    the ``generation`` field exists to close.
+
+    Returns:
+        The frozen :class:`Resolution` in force. A caller that needs more than
+        one of its fields takes it once rather than asking three times.
+    """
+    global _resolution
+    with _lock:
+        current = _resolution
+        if current is not None and (current.pinned or current.generation == settings.generation()):
+            return current
+        seen = settings.generation()
+        provider, unavailable, withheld = _resolve_default()
+        _resolution = Resolution(
+            provider=provider,
+            unavailable_reason=unavailable,
+            key_withheld_reason=withheld,
+            generation=seen,
+            pinned=False,
+        )
+        return _resolution
+
+
+def _published_key_withheld_reason() -> str | None:
+    """The withheld-key reason of the resolution in force, **without** resolving one.
+
+    Read rather than resolved on purpose: the one caller is inside a failing
+    provider call, and re-resolving there would answer out of a configuration
+    the failing provider was not built from — and would build a provider
+    nobody asked for, mid-failure.
+    """
+    current = _resolution
+    return None if current is None else current.key_withheld_reason
 
 
 def get_provider() -> LLMProvider | None:
@@ -1723,18 +1802,17 @@ def get_provider() -> LLMProvider | None:
     instant's answer for the life of the process. An unreachable endpoint
     surfaces as :class:`ProviderUnavailable` on the first call, in a
     millisecond — measured.
+
+    The cached resolution is dropped when ``settings.env`` changes, so a model
+    written from another process is in force at the next call rather than at
+    the next restart.
     """
-    global _provider, _unavailable_reason, _key_withheld_reason, _resolved
-    if not _resolved:
-        _provider, _unavailable_reason, _key_withheld_reason = _resolve_default()
-        _resolved = True
-    return _provider
+    return resolution().provider
 
 
 def unavailable_reason() -> str | None:
     """Return why no provider is available (``None`` when one is)."""
-    get_provider()
-    return _unavailable_reason
+    return resolution().unavailable_reason
 
 
 def key_withheld_reason() -> str | None:
@@ -1749,8 +1827,7 @@ def key_withheld_reason() -> str | None:
     it. The distinction that matters to a human is the string, and it names the
     endpoint the key would otherwise have gone to. See :func:`_resolve_default`.
     """
-    get_provider()
-    return _key_withheld_reason
+    return resolution().key_withheld_reason
 
 
 def set_provider(provider: LLMProvider | None, *, reason: str | None = None) -> None:
@@ -1760,23 +1837,33 @@ def set_provider(provider: LLMProvider | None, *, reason: str | None = None) -> 
     :func:`unavailable_reason` reports. No test may assert on real model output
     (temperature-0 determinism is a local-backend property, not a contract), so
     every test that needs a completion injects one here.
+
+    **A forced provider is pinned**: a settings write does not discard it, and
+    :func:`reset_provider` is the only thing that does. The alternative was
+    measured on the suite's own autouse guards — a configuration change
+    silently un-forcing them, and the next call reaching a real endpoint.
     """
-    global _provider, _unavailable_reason, _key_withheld_reason, _resolved
-    _provider = provider
-    _unavailable_reason = None if provider is not None else (reason or "no LLM provider configured")
-    # A forced provider was built by the caller, who named its endpoint and its
-    # key together; there is nothing for this module to have withheld.
-    _key_withheld_reason = None
-    _resolved = True
+    global _resolution
+    with _lock:
+        _resolution = Resolution(
+            provider=provider,
+            unavailable_reason=(
+                None if provider is not None else (reason or "no LLM provider configured")
+            ),
+            # A forced provider was built by the caller, who named its endpoint
+            # and its key together; there is nothing for this module to have
+            # withheld.
+            key_withheld_reason=None,
+            generation=settings.generation(),
+            pinned=True,
+        )
 
 
 def reset_provider() -> None:
-    """Drop the cached resolution; the next use re-resolves from scratch."""
-    global _provider, _unavailable_reason, _key_withheld_reason, _resolved
-    _provider = None
-    _unavailable_reason = None
-    _key_withheld_reason = None
-    _resolved = False
+    """Drop the cached resolution — pin included; the next use re-resolves from scratch."""
+    global _resolution
+    with _lock:
+        _resolution = None
 
 
 def _resolve_default() -> tuple[LLMProvider | None, str | None, str | None]:
@@ -1807,18 +1894,27 @@ def _resolve_default() -> tuple[LLMProvider | None, str | None, str | None]:
     against a **self-hosted gateway** that requires one — is precisely the case
     where the operator names ``NODUM_LLM_BASE_URL``, so it keeps its key by the
     same rule.
+
+    **Every refusal names the layer the bad value came from.** There are two
+    now — the environment and ``settings.env`` — and a message that named the
+    variable alone would send an operator to edit a shell profile that is not
+    where the value is, or to store a value the environment will go on
+    outranking. One snapshot supplies all five reads, so a write landing
+    halfway through cannot produce a provider assembled from two configurations.
     """
-    model = (os.environ.get(ENV_MODEL) or "").strip()
+    config = settings.snapshot()
+    model = (config.value(settings.LLM_MODEL) or "").strip()
     if not model:
         return (
             None,
             (
-                f"no LLM provider configured (set {ENV_MODEL} to a model the endpoint serves; "
+                f"no LLM provider configured (set {ENV_MODEL} to a model the endpoint serves — "
+                f"in the environment or with 'nodum config set {ENV_MODEL} <model>'; "
                 f"{ENV_BASE_URL} defaults to {DEFAULT_BASE_URL})"
             ),
             None,
         )
-    configured_base = (os.environ.get(ENV_BASE_URL) or "").strip() or None
+    configured_base = (config.explicit(settings.LLM_BASE_URL) or "").strip() or None
     profile = profile_for(model=model, base_url=configured_base)
     default_base = profile.base_url if profile is not None else DEFAULT_BASE_URL
     base_url = configured_base or default_base
@@ -1849,7 +1945,7 @@ def _resolve_default() -> tuple[LLMProvider | None, str | None, str | None]:
             + f" — for example {DEFAULT_BASE_URL} or {DEEPSEEK_BASE_URL}",
             None,
         )
-    api_key = (os.environ.get(ENV_API_KEY) or "").strip() or None
+    api_key = (config.value(settings.LLM_API_KEY) or "").strip() or None
     key_withheld: str | None = None
     if api_key is not None and configured_base is None and profile is None:
         key_withheld = (
@@ -1861,7 +1957,7 @@ def _resolve_default() -> tuple[LLMProvider | None, str | None, str | None]:
             f"hosted model id"
         )
         api_key = None
-    raw_context = (os.environ.get(ENV_CONTEXT_TOKENS) or "").strip()
+    raw_context = (config.explicit(settings.LLM_CONTEXT_TOKENS) or "").strip()
     context_tokens = profile.context_tokens if profile is not None else DEFAULT_CONTEXT_TOKENS
     if raw_context:
         try:
@@ -1869,10 +1965,11 @@ def _resolve_default() -> tuple[LLMProvider | None, str | None, str | None]:
         except ValueError:
             return (
                 None,
-                f"{ENV_CONTEXT_TOKENS}={raw_context!r} is not a whole number of tokens",
+                f"{ENV_CONTEXT_TOKENS}={raw_context!r} (from "
+                f"{config.source(settings.LLM_CONTEXT_TOKENS)}) is not a whole number of tokens",
                 None,
             )
-    raw_thinking = (os.environ.get(ENV_THINKING) or "").strip().casefold()
+    raw_thinking = (config.explicit(settings.LLM_THINKING) or "").strip().casefold()
     thinking = raw_thinking or DEFAULT_THINKING
     if thinking not in THINKING_LEVELS:
         # Refused rather than defaulted, which is where this deliberately parts
@@ -1887,8 +1984,9 @@ def _resolve_default() -> tuple[LLMProvider | None, str | None, str | None]:
         return (
             None,
             (
-                f"{ENV_THINKING}={raw_thinking!r} is not a reasoning level nodum accepts "
-                f"(one of: {', '.join(THINKING_LEVELS)})"
+                f"{ENV_THINKING}={raw_thinking!r} (from "
+                f"{config.source(settings.LLM_THINKING)}) is not a reasoning level nodum "
+                f"accepts (one of: {', '.join(THINKING_LEVELS)})"
             ),
             None,
         )

@@ -142,6 +142,23 @@ own, goes *there* — and a key set for it is deliberately withheld rather
 than posted to a host you did not name. Every variable in the block, with its
 default, is in [Configuration](configuration.md#the-llm-block).
 
+**`export` is one of two ways.** Everything above except `NODUM_LLM_BASE_URL`
+can be stored instead, in `settings.env` beside the graph:
+
+```sh
+nodum config set NODUM_LLM_MODEL deepseek-v4-flash --as human:owner
+nodum config set NODUM_LLM_API_KEY sk-… --as human:owner
+nodum config set NODUM_LLM_CYCLE_BUDGET 200000 --as human:owner
+```
+
+The environment still wins over the file, so a variable already exported is
+refused rather than stored where it would never be read — unset it first. What
+you gain is that a change applies **without a restart**: the budget funds the
+next cycle rather than the next boot, and a model applies at the next call.
+`NODUM_LLM_BASE_URL` stays environment-only on purpose — the endpoint a key may
+travel to is a deployment decision. `nodum config list` reports which layer each
+value is in force from.
+
 Then ask what actually resolved, before the first cycle:
 
 ```sh
@@ -159,7 +176,10 @@ In a container, the variables reach the server through the compose
 `environment:` block — the [compose example](deploy.md#compose-example)
 shows the shape. The key is the one secret nodum reads from the environment:
 keep it in an env file (`env_file:`, or `${NODUM_LLM_API_KEY}` interpolation
-from one), never in the image and never in a committed compose file. `nodum consolidate` and `nodum llm status`
+from one), never in the image and never in a committed compose file. Note the
+`${VAR:-}` form renders an **empty** value when the host env file says nothing,
+and an empty value is *unset* at every layer — so a key stored in
+`settings.env` is still used, and `nodum config list` will say so. `nodum consolidate` and `nodum llm status`
 run inside the container (`docker compose exec <service> nodum …`) inherit
 the same environment.
 
