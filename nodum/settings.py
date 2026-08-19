@@ -45,6 +45,22 @@ event loop and :func:`nodum.llm.resolution`, which asks while holding its own
 lock — so one stuck writer stalled the loop and every path to the model behind
 it.
 
+**The cached view is one immutable record, swapped whole.** Everything that
+describes a reading of the file — its identity stamp, its values, the keys this
+build does not know, why it could not be parsed, and the generation naming it —
+is one frozen :class:`_Reading`, and the store holds a single reference to it.
+A reader takes that reference once, and every field it then reads is one moment
+by construction rather than by remembering to hold a lock across four loads.
+Publishing is a **compare-and-swap**: a refresh remembers the record it started
+from and installs its result only if the store still holds that same one, so a
+thread whose parse was overtaken *discards its reading* instead of overwriting
+a newer one with an older one under a higher generation. Five fields mutated
+one at a time produced that defect four times over — a reader pairing one
+reading's values with another's generation, a report refreshing once per field,
+a slow parse published over a fresh one, and an invalidation assigned outside
+the lock altogether — which is why the shape changed rather than each symptom
+being patched again.
+
 **The cache is keyed on the file's identity, not on its clock.** The stamp is
 ``(st_dev, st_ino, st_mtime_ns, st_size)`` taken by ``fstat`` on the same
 descriptor, and compared with ``!=`` rather than ``>`` — ``os.replace`` gives a
@@ -74,14 +90,13 @@ whose other lines it cannot promise to preserve.
 
 from __future__ import annotations
 
-import contextlib
 import logging
 import os
 import re
 import threading
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import time
 from pathlib import Path
 from secrets import token_hex
@@ -520,14 +535,51 @@ _NEVER_READ = ("never-read",)
 _MISSING = ("missing",)
 
 
+@dataclass(frozen=True)
+class _Reading:
+    """One reading of ``settings.env``: every field here describes that one moment.
+
+    Frozen, and swapped into the store as a whole, because the alternative was
+    five fields mutated one at a time and a rule that every reader hold a lock
+    across all of them. That rule was broken four separate ways before this
+    record existed. A reader now takes one reference and cannot see a mixture;
+    a publisher compares that reference and cannot overwrite a reading it never
+    saw.
+
+    ``generation`` names this reading of the file's contents and nothing else.
+    It comes from the process-wide counter, so no two readings — of this file
+    or of any other this process binds — share a number. :func:`_invalidate` is
+    the one deliberate exception: retiring the stamp after a write makes a new
+    record from the *same* reading and keeps its number, because nothing a
+    caller can see has changed yet.
+    """
+
+    #: The file identity this was read from, or one of the sentinels above.
+    stamp: tuple[object, ...]
+    #: The values the file held, for the keys this build knows.
+    values: Mapping[str, str]
+    #: Keys the file carries that this build does not configure.
+    unknown: tuple[str, ...]
+    #: Why the file could not be parsed, or ``None``.
+    unreadable: str | None
+    #: The process-wide number naming this reading.
+    generation: int
+
+
+#: What a process with nothing bound resolves against: no file, no values, and
+#: generation 0 — a number no real reading can take, because the counter starts
+#: at 1.
+_UNBOUND = _Reading(stamp=_NEVER_READ, values=_EMPTY, unknown=(), unreadable=None, generation=0)
+
+
 class _Store:
     """The cached view of one ``settings.env``, and the two locks that guard it.
 
     **Two, not one, and the split is the whole point.** ``write_lock`` is held
     across the read → merge → render → replace span, which includes waiting on
     another *process*'s ``flock`` and two ``fsync``s. ``cache_lock`` is held
-    only while the cached view is swapped, which is a handful of attribute
-    assignments. A single lock covering both made every *reader* wait on a
+    only while the cached view is swapped, which is one comparison and one
+    assignment. A single lock covering both made every *reader* wait on a
     foreign process's writer: measured at 1.8 s for one ``resolve`` while a
     child process held the lock — and the readers include the scheduler slice
     on the event loop and :func:`nodum.llm.resolution`, which holds its own
@@ -536,6 +588,12 @@ class _Store:
 
     They are always taken in this order — ``write_lock`` then ``cache_lock`` —
     and never the reverse, so the pair cannot deadlock.
+
+    **The view itself is a single reference to a frozen :class:`_Reading`.**
+    ``cache_lock`` therefore guards one assignment rather than five, and it is
+    needed only by the *writer* of that reference: a reader loads it once and
+    holds a whole coherent reading, with no window in which two of its fields
+    come from different moments.
     """
 
     def __init__(self, path: Path) -> None:
@@ -543,13 +601,16 @@ class _Store:
         self.lock_path = path.with_name(path.name + LOCK_SUFFIX)
         #: Serialises writers in this process, across the whole write span.
         self.write_lock = threading.Lock()
-        #: Guards the cached view itself. Short-lived by construction.
+        #: Guards the swap of :attr:`reading`. Short-lived by construction.
         self.cache_lock = threading.Lock()
-        self.stamp: tuple[object, ...] = _NEVER_READ
-        self.values: Mapping[str, str] = _EMPTY
-        self.unknown: tuple[str, ...] = ()
-        self.unreadable: str | None = None
-        self.generation = _next_generation()
+        #: The cached view: one reading, replaced whole, never edited in place.
+        self.reading = _Reading(
+            stamp=_NEVER_READ,
+            values=_EMPTY,
+            unknown=(),
+            unreadable=None,
+            generation=_next_generation(),
+        )
 
 
 #: The generation counter is **process-wide**, not per store.
@@ -680,11 +741,11 @@ def _describe_bad_line(number: int, line: str) -> str:
     What a reader needs to fix the file is *where* and, when it can be
     recovered safely, *which key*. Everything from the first ``=`` onwards is
     dropped unread, and what is left is named only when the **whole** of it is
-    a key — optionally behind the one word that puts it there,
-    ``export``. Naming the last token of the prefix instead would be more
-    generous and wrong: a pasted ``Bearer sk_abc=…`` would have had ``sk_abc``
-    named. A line with no ``=`` at all names nothing, because nothing in it is
-    known not to be a value.
+    a key — optionally behind the one word that puts it there, ``export``,
+    which is not itself the answer however key-shaped it reads. Naming the last
+    token of the prefix instead would be more generous and wrong: a pasted
+    ``Bearer sk_abc=…`` would have had ``sk_abc`` named. A line with no ``=``
+    at all names nothing, because nothing in it is known not to be a value.
 
     Args:
         number: The 1-based line number.
@@ -696,7 +757,12 @@ def _describe_bad_line(number: int, line: str) -> str:
     where = f"{SETTINGS_FILENAME} line {number}"
     prefix, separator, _value = line.partition("=")
     candidate = prefix.strip().removeprefix("export ").strip()
-    if separator and _KEY_SHAPE.match(candidate):
+    # `export` is the one word allowed in front of the key and is itself
+    # key-shaped, so `export export=value` — whose prefix is not a key at all —
+    # reported the key as 'export'. A line carrying no readable key names none.
+    # No value leaks either way; it is a message that sends a reader looking
+    # for a setting the line does not contain.
+    if separator and candidate != "export" and _KEY_SHAPE.match(candidate):
         return f"{where} is not KEY=value (the key reads {candidate!r}; its value is not quoted)"
     return f"{where} is not KEY=value (the line is not quoted here: it may carry a secret)"
 
@@ -824,38 +890,69 @@ def _read_if_changed(
 
 def _publish(
     store: _Store,
+    seen: _Reading,
     stamp: tuple[object, ...],
     values: Mapping[str, str],
     unknown: tuple[str, ...],
     unreadable: str | None,
 ) -> bool:
-    """Swap the cached view under ``cache_lock``, unless somebody got there first.
+    """Compare-and-swap a new reading in, in place of the one the caller started from.
 
-    Held for a handful of assignments and nothing else — emphatically **not**
-    for the read, the parse, or any part of a write. That separation is what
-    keeps a reader from waiting on a foreign process's ``flock``.
+    ``cache_lock`` is held for one comparison and one assignment and nothing
+    else — emphatically **not** for the read, the parse, or any part of a
+    write. That separation is what keeps a reader from waiting on a foreign
+    process's ``flock``. It also means a refresh can be overtaken while it
+    parses, which is what ``seen`` is for: publishing only over the record this
+    reading started from makes losing that race a **discard** rather than an
+    older file installed under a newer generation.
 
     Args:
         store: The store to publish into.
+        seen: The reading this one set out to replace.
         stamp: The identity of the file this view was read from.
         values: The parsed values.
         unknown: Keys this build does not configure.
         unreadable: Why the file could not be parsed, or ``None``.
 
     Returns:
-        Whether this call published. ``False`` means another thread had already
-        published the same reading, so the generation is not bumped twice for
-        one change.
+        Whether this call published. ``False`` means either that the file's
+        identity has not moved since ``seen`` — so there is nothing to publish
+        and no generation to burn — or that another thread published while this
+        one was reading and parsing, whose reading is by construction the newer
+        of the two.
+    """
+    if stamp == seen.stamp:
+        return False
+    with store.cache_lock:
+        if store.reading is not seen:
+            return False
+        store.reading = _Reading(
+            stamp=stamp,
+            values=values,
+            unknown=unknown,
+            unreadable=unreadable,
+            generation=_next_generation(),
+        )
+        return True
+
+
+def _invalidate(store: _Store) -> None:
+    """Retire the cached reading's stamp so the next refresh reads the file.
+
+    A write leaves the cache describing the file as it was a moment ago, and
+    the stamp of what was just written is not known here — inventing one would
+    be a cache that agrees with a file it never read. Only the stamp is
+    retired: the values stay attached to the generation that named them, so a
+    reader arriving before the refresh below still sees one coherent reading
+    rather than a mixture. ``_NEVER_READ`` cannot equal a real ``fstat`` tuple,
+    so the next refresh cannot mistake this for "unchanged".
+
+    Under ``cache_lock``, like every other write to the view — an assignment
+    made outside it is exactly the kind of edit the record shape exists to stop
+    a later change from making.
     """
     with store.cache_lock:
-        if store.stamp == stamp:
-            return False
-        store.stamp = stamp
-        store.values = values
-        store.unknown = unknown
-        store.unreadable = unreadable
-        store.generation = _next_generation()
-        return True
+        store.reading = replace(store.reading, stamp=_NEVER_READ)
 
 
 def _refresh(store: _Store) -> None:
@@ -863,19 +960,22 @@ def _refresh(store: _Store) -> None:
 
     Takes ``cache_lock`` only to swap the result in; the ``open``, the
     ``fstat``, the ``read`` and the parse all happen outside every lock. Two
-    threads refreshing at once therefore do the work twice and publish once,
-    which is the trade this makes deliberately: duplicated reads are cheap and
-    a blocked reader is not.
+    threads refreshing at once therefore both do the work and **at most one
+    publishes** — each swaps only over the record it started from, so whichever
+    loses the race throws its reading away. That is the trade this makes
+    deliberately: duplicated reads are cheap, a blocked reader is not, and a
+    discarded reading costs one wasted parse where publishing it would cost a
+    cache naming an older file with a newer generation.
     """
-    known = store.stamp
+    seen = store.reading
     try:
-        stamp, raw = _read_if_changed(store.path, known)
+        stamp, raw = _read_if_changed(store.path, seen.stamp)
     except FileNotFoundError:
-        if _publish(store, _MISSING, _EMPTY, (), None):
+        if _publish(store, seen, _MISSING, _EMPTY, (), None):
             logger.debug("%s does not exist; the environment and the defaults decide", store.path)
         return
     except OSError as exc:
-        if _publish(store, ("unreadable", str(exc)), _EMPTY, (), str(exc)):
+        if _publish(store, seen, ("unreadable", str(exc)), _EMPTY, (), str(exc)):
             logger.error(
                 "%s could not be read (%s); continuing on the environment and the defaults",
                 store.path,
@@ -887,14 +987,14 @@ def _refresh(store: _Store) -> None:
     try:
         values, unknown = _parse(raw.decode("utf-8"))
     except (UnicodeDecodeError, SettingsFileUnreadable) as exc:
-        if _publish(store, stamp, _EMPTY, (), str(exc)):
+        if _publish(store, seen, stamp, _EMPTY, (), str(exc)):
             logger.error(
                 "%s could not be parsed (%s); continuing on the environment and the defaults",
                 store.path,
                 exc,
             )
         return
-    if _publish(store, stamp, MappingProxyType(values), unknown, None) and unknown:
+    if _publish(store, seen, stamp, MappingProxyType(values), unknown, None) and unknown:
         logger.info(
             "%s carries %d key(s) this build does not configure: %s (kept as they are)",
             store.path,
@@ -903,21 +1003,20 @@ def _refresh(store: _Store) -> None:
         )
 
 
-def _current(store: _Store | None) -> tuple[Mapping[str, str], str | None, int]:
-    """The file layer as it stands: its values, why it could not be read, its generation.
+def _current(store: _Store | None) -> _Reading:
+    """The file layer as it stands, as the one record that describes it.
 
-    All three come out of one hold of ``cache_lock``, generation read first.
-    Read outside it, left to right, a refresh landing between the loads gave
+    One reference load, so the values, the unreadable reason and the generation
+    a caller goes on to use are the same reading of the same file. Read as
+    separate fields, left to right, a refresh landing between the loads gave
     the *old* values stamped with the *new* generation — the exact inverse of
     what :class:`Snapshot` promises, and a cache holding that pair believes it
     is current forever.
     """
     if store is None:
-        return _EMPTY, None, 0
+        return _UNBOUND
     _refresh(store)
-    with store.cache_lock:
-        generation = store.generation
-        return store.values, store.unreadable, generation
+    return store.reading
 
 
 def _environment_value(name: str) -> str | None:
@@ -930,13 +1029,15 @@ def generation() -> int:
     """A counter that changes whenever ``settings.env`` does.
 
     What a cache holding something derived from configuration compares against.
-    It is per-process and per-path and means nothing outside this process — the
-    only valid use is comparing it with a value this process read earlier.
+    It is per-process and means nothing outside this process — the only valid
+    use is comparing it with a value this process read earlier. One counter
+    serves every path this process binds, so a rebind cannot hand two readings
+    the same number.
 
     Returns:
         The current generation of the bound file.
     """
-    return _current(_store())[2]
+    return _current(_store()).generation
 
 
 def stored_values() -> Mapping[str, str]:
@@ -947,12 +1048,12 @@ def stored_values() -> Mapping[str, str]:
         than mutated, so a caller holding one keeps a consistent view of one
         moment instead of watching it change underneath.
     """
-    return _current(_store())[0]
+    return _current(_store()).values
 
 
 def unreadable_reason() -> str | None:
     """Why ``settings.env`` could not be read, or ``None`` when it could."""
-    return _current(_store())[1]
+    return _current(_store()).unreadable
 
 
 def _resolve_one(
@@ -990,8 +1091,8 @@ def resolve(name: str) -> str | None:
         SettingRefused: If nothing by that name is configurable.
     """
     spec = specification(name)
-    stored, unreadable, _generation = _current(_store())
-    return _resolve_one(spec, stored, unreadable)[0]
+    reading = _current(_store())
+    return _resolve_one(spec, reading.values, reading.unreadable)[0]
 
 
 def provenance(name: str) -> str:
@@ -1008,8 +1109,8 @@ def provenance(name: str) -> str:
         SettingRefused: If nothing by that name is configurable.
     """
     spec = specification(name)
-    stored, unreadable, _generation = _current(_store())
-    return _resolve_one(spec, stored, unreadable)[1]
+    reading = _current(_store())
+    return _resolve_one(spec, reading.values, reading.unreadable)[1]
 
 
 @dataclass(frozen=True)
@@ -1107,24 +1208,39 @@ _SOURCE_PHRASES = {
 }
 
 
+def _snapshot_of(reading: _Reading) -> Snapshot:
+    """Apply the ladder to every key against one reading of the file.
+
+    Separate from :func:`snapshot` so a surface that also needs the reading's
+    *other* fields — what the file stored, which keys it does not know — takes
+    one reading and derives all of them from it, rather than refreshing twice
+    and pairing one moment's values with another's unknown keys.
+
+    Args:
+        reading: The reading to resolve against.
+
+    Returns:
+        The frozen :class:`Snapshot`.
+    """
+    values: dict[str, str | None] = {}
+    provenances: dict[str, str] = {}
+    for name, spec in SPECS.items():
+        values[name], provenances[name] = _resolve_one(spec, reading.values, reading.unreadable)
+    return Snapshot(
+        generation=reading.generation,
+        unreadable=reading.unreadable,
+        values=MappingProxyType(values),
+        provenances=MappingProxyType(provenances),
+    )
+
+
 def snapshot() -> Snapshot:
     """Resolve every setting once, against one reading of the file.
 
     Returns:
         The frozen :class:`Snapshot`.
     """
-    store = _store()
-    stored, unreadable, current = _current(store)
-    values: dict[str, str | None] = {}
-    provenances: dict[str, str] = {}
-    for name, spec in SPECS.items():
-        values[name], provenances[name] = _resolve_one(spec, stored, unreadable)
-    return Snapshot(
-        generation=current,
-        unreadable=unreadable,
-        values=MappingProxyType(values),
-        provenances=MappingProxyType(provenances),
-    )
+    return _snapshot_of(_current(_store()))
 
 
 # ── Writing ──────────────────────────────────────────────────────────────────
@@ -1228,21 +1344,27 @@ def _replace_atomically(path: Path, text: str) -> None:
     temporary = directory / f".{path.name}.{os.getpid()}.{token_hex(6)}"
     descriptor = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     try:
-        # Through a buffered file object rather than a bare `os.write`: that
-        # call returns how many bytes it took and is permitted to take fewer,
-        # and an unchecked short write here would be fsynced and renamed into
-        # place as a truncated settings file. `closefd=False` keeps the
-        # descriptor this function opened, so the mode it was created with is
-        # the mode the file keeps.
-        with open(descriptor, "wb", closefd=False) as handle:
-            handle.write(text.encode("utf-8"))
-            handle.flush()
-            os.fsync(descriptor)
-        os.close(descriptor)
+        try:
+            # Through a buffered file object rather than a bare `os.write`: that
+            # call returns how many bytes it took and is permitted to take fewer,
+            # and an unchecked short write here would be fsynced and renamed into
+            # place as a truncated settings file. `closefd=False` keeps the
+            # descriptor this function opened, so the mode it was created with
+            # is the mode the file keeps — and puts the close in this `finally`,
+            # the one place it happens. Closing before `os.replace` *and* again
+            # in the outer handler closed the number twice whenever the replace
+            # failed (EXDEV across a mount, EROFS, a sticky parent) or was
+            # interrupted between the two; suppressing the EBADF hid that but
+            # did not stop the call, so a descriptor another thread had opened
+            # in the meantime and been handed that number was closed under it.
+            with open(descriptor, "wb", closefd=False) as handle:
+                handle.write(text.encode("utf-8"))
+                handle.flush()
+                os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
         os.replace(temporary, path)
     except BaseException:
-        with contextlib.suppress(OSError):
-            os.close(descriptor)
         temporary.unlink(missing_ok=True)
         raise
     directory_descriptor = os.open(directory, os.O_RDONLY)
@@ -1279,10 +1401,7 @@ def _write(name: str, value: str | None) -> Change:
             ) from exc
         previous = before.get(name)
         _replace_atomically(store.path, _render(text, name, value))
-        # Force the next read to reload: the stamp of what was just written is
-        # not known here, and inventing one would be a cache that agrees with a
-        # file it never read.
-        store.stamp = _NEVER_READ
+        _invalidate(store)
         _refresh(store)
     return Change(key=name, before=previous, after=value)
 
@@ -1389,7 +1508,8 @@ def get_setting(name: str) -> SettingOut:
         SettingRefused: If nothing by that name is configurable.
     """
     specification(name)
-    return _describe(name, snapshot(), stored_values())
+    reading = _current(_store())
+    return _describe(name, _snapshot_of(reading), reading.values)
 
 
 def list_settings() -> SettingsOut:
@@ -1400,14 +1520,14 @@ def list_settings() -> SettingsOut:
         path, any keys the file carries that this build does not configure, and
         why the file could not be read when it could not.
     """
-    view = snapshot()
-    stored = stored_values()
     store = _store()
+    reading = _current(store)
+    view = _snapshot_of(reading)
     return SettingsOut(
-        settings=[_describe(name, view, stored) for name in KEYS],
+        settings=[_describe(name, view, reading.values) for name in KEYS],
         count=len(KEYS),
         path=None if store is None else str(store.path),
-        unknown_keys=list(() if store is None else store.unknown),
+        unknown_keys=list(reading.unknown),
         unreadable=view.unreadable,
     )
 

@@ -29,6 +29,7 @@ stdout, stderr and the event log for the key it just stored.
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import sqlite3
@@ -291,21 +292,47 @@ def test_a_generation_is_never_reused_across_a_rebind(tmp_path):
     assert settings.generation() != seen, "the second graph reused the first's generation"
 
 
-def test_a_reader_does_not_wait_on_another_process_holding_the_write_lock(store, tmp_path):
+def test_a_reader_does_not_wait_behind_a_writer_stuck_on_a_foreign_lock(store, tmp_path):
     """The cache lock and the write lock are different locks, and this is why.
 
-    Sharing one made every ``resolve`` wait on whatever process held the file.
-    The readers include the scheduler's slice on the event loop and
-    ``llm.resolution``, which asks while holding its own lock — so one stuck
-    writer stalled the loop and every path to the model behind it.
+    Sharing one made every ``resolve`` wait on whatever process held the file —
+    1.8 s measured — and the readers are not incidental: the scheduler reads on
+    the event loop every slice and ``llm.resolution`` reads while holding its
+    own lock, so one stuck writer stalled the loop and every path to the model
+    behind it.
+
+    **The stall needs both halves, and the first version of this test had one.**
+    A foreign process holding the ``flock`` blocks nothing in here by itself;
+    what blocked a reader was a *local* thread holding the in-process lock
+    while it waited on that ``flock``. With no local writer that lock is free
+    under either design, which is why the first version passed with one shared
+    lock reinstated and so covered nothing. Here the writer is proven stuck
+    before the read is timed, and the file has changed under the cache, so the
+    timed read really does want the lock the writer would be holding.
     """
     settings.set_value(settings.LLM_CYCLE_BUDGET, "100")
     assert settings.resolve(settings.LLM_CYCLE_BUDGET) == "100"
+    # Changed behind the cache, so the timed read has to publish and therefore
+    # has to take the cache lock, rather than finding its stamp unchanged and
+    # taking no lock at all.
+    store.write_text(f"{settings.LLM_CYCLE_BUDGET}=250\n", encoding="utf-8")
 
     held, release = tmp_path / "held", tmp_path / "release"
     child = subprocess.Popen(
         [sys.executable, "-c", _HOLD_THE_LOCK, str(store) + ".lock", str(release), str(held)]
     )
+    # With one shared lock the timed read blocks until the flock is released,
+    # and the release below sits on the far side of the measurement — so this
+    # deadline is what makes reinstating that bug a failure rather than a hang.
+    deadline = threading.Timer(3.0, lambda: release.write_text("go"))
+    deadline.start()
+    done = threading.Event()
+
+    def write() -> None:
+        settings.set_value(settings.LLM_CYCLE_BUDGET, "900")
+        done.set()
+
+    writer = threading.Thread(target=write)
     try:
         for _ in range(500):
             if held.exists():
@@ -313,14 +340,32 @@ def test_a_reader_does_not_wait_on_another_process_holding_the_write_lock(store,
             threading.Event().wait(0.01)
         assert held.exists(), "the child never took the lock"
 
-        started = time.perf_counter()
-        assert settings.resolve(settings.LLM_CYCLE_BUDGET) == "100"
-        elapsed = time.perf_counter() - started
+        writer.start()
+        try:
+            local = settings._store()
+            assert local is not None
+            for _ in range(500):
+                if local.write_lock.locked():
+                    break
+                threading.Event().wait(0.01)
+            assert local.write_lock.locked(), "the local writer never took the in-process lock"
+            assert not done.wait(0.2), "the local writer was not blocked on the foreign lock"
+
+            started = time.perf_counter()
+            value = settings.resolve(settings.LLM_CYCLE_BUDGET)
+            elapsed = time.perf_counter() - started
+        finally:
+            deadline.cancel()
+            release.write_text("go")
+            writer.join(timeout=10)
     finally:
+        deadline.cancel()
         release.write_text("go")
         child.wait(timeout=5)
 
-    assert elapsed < 0.5, f"a read waited {elapsed:.2f}s on a foreign writer's lock"
+    assert done.is_set(), "the write never completed after the lock was released"
+    assert elapsed < 0.5, f"a read waited {elapsed:.2f}s behind a writer stuck on a foreign lock"
+    assert value == "250", "the timed read did not reload the file it was there to publish"
 
 
 def test_an_unchanged_file_is_stamped_without_being_read(store, monkeypatch):
@@ -346,27 +391,204 @@ def test_an_unchanged_file_is_stamped_without_being_read(store, monkeypatch):
     assert reads == [], "an unchanged file was read rather than only stamped"
 
 
-def test_a_refresh_between_two_loads_cannot_stamp_old_values_as_new(store):
-    """Values and generation come out of one hold of the cache lock.
+def test_one_reading_answers_a_whole_question_under_concurrent_writes(store, monkeypatch):
+    """One generation names one reading, and one report is built from one of them.
 
-    Read left to right outside it, a refresh landing between the loads yielded
-    the *old* values under the *new* generation — a cache holding that pair
-    believes it is current forever.
+    The first version of this test set a value twice and took two snapshots,
+    all four sequentially: nothing could land *between two loads* because
+    nothing else was running, so it passed with the field-by-field ``_current``
+    it was written for. What that defect corrupts is the **pairing** — one
+    reading's values under another's generation — and a cache keyed on the
+    generation (``nodum.llm``'s is) then believes it is current forever.
+
+    The reader now loads one reference to a frozen reading, so the pairing is
+    structural rather than a lock discipline, and the same record feeds a whole
+    report rather than each surface refreshing again for the next field. Both
+    are asserted here against a writer that never stops moving:
+
+    * a generation that named one value never names another; and
+    * one row of one report cannot say a value came from ``settings.env`` while
+      the same report says the file does not hold it — which is exactly what
+      ``list_settings`` produced when its rows came from one refresh, its
+      stored set from a second, and its unknown keys from the store directly.
+
+    The switch interval is cut for the duration so the interleavings actually
+    happen; that raises the sampling rate of the race, it does not change the
+    code under test.
+    """
+    monkeypatch.delenv(settings.LLM_MODEL, raising=False)
+    named_by: dict[int, str | None] = {}
+    incoherent: list[str] = []
+    stop = threading.Event()
+
+    def read_snapshots() -> None:
+        while not stop.is_set():
+            view = settings.snapshot()
+            value = view.value(settings.LLM_MODEL)
+            first = named_by.setdefault(view.generation, value)
+            if first != value:
+                incoherent.append(f"generation {view.generation} named {first!r} then {value!r}")
+
+    def read_reports() -> None:
+        while not stop.is_set():
+            report = settings.list_settings()
+            row = next(one for one in report.settings if one.key == settings.LLM_MODEL)
+            if row.stored != (row.provenance == settings.FROM_FILE):
+                incoherent.append(
+                    f"one report said provenance {row.provenance!r} with stored {row.stored!r}"
+                )
+
+    interval = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)
+    readers = [threading.Thread(target=read_snapshots) for _ in range(2)]
+    readers += [threading.Thread(target=read_reports) for _ in range(2)]
+    for reader in readers:
+        reader.start()
+    try:
+        for index in range(40):
+            settings.set_value(settings.LLM_MODEL, f"model-{index}")
+            settings.unset_value(settings.LLM_MODEL)
+    finally:
+        stop.set()
+        for reader in readers:
+            reader.join(timeout=30)
+        sys.setswitchinterval(interval)
+
+    assert not incoherent, incoherent[:5]
+    assert len(named_by) > 2, "the readers never saw the writer move, so nothing was raced"
+
+
+def test_a_reading_overtaken_while_it_parses_is_discarded_and_not_published(store, monkeypatch):
+    """A slow parse must not install its file over one that was read later.
+
+    Splitting the locks let a refresh be overtaken between its read and its
+    publish, and the publish only checked that the stamp differed from the one
+    the cache already held — so a thread that had read v2 and been overtaken by
+    a thread publishing v3 wrote v2 back over it, and took the **higher**
+    generation doing it. The cache then named an older file with a newer
+    number, which is the one thing every consumer of the generation trusts
+    cannot happen; it self-heals at the next refresh, having already answered
+    once from a file that had been superseded and rebuilt a provider for it.
+
+    Publishing only over the record the reading started from makes losing that
+    race a discard: the overtaken thread answers from the newer reading, and
+    the generation it names is the one that reading already had.
+    """
+    store.write_text(f"{settings.LLM_CYCLE_BUDGET}=100\n", encoding="utf-8")
+    assert settings.resolve(settings.LLM_CYCLE_BUDGET) == "100"
+    # Three different lengths, so each write is a different identity stamp even
+    # where the clock cannot tell two of them apart.
+    store.write_text(f"{settings.LLM_CYCLE_BUDGET}=2000\n", encoding="utf-8")
+
+    parsing, proceed = threading.Event(), threading.Event()
+    real_parse = settings._parse
+
+    def parse_the_first_one_slowly(text: str):
+        if not parsing.is_set():
+            parsing.set()
+            proceed.wait(10)
+        return real_parse(text)
+
+    monkeypatch.setattr(settings, "_parse", parse_the_first_one_slowly)
+
+    overtaken: list[settings.Snapshot] = []
+    reader = threading.Thread(target=lambda: overtaken.append(settings.snapshot()))
+    reader.start()
+    try:
+        assert parsing.wait(10), "the reader never reached the parse"
+        store.write_text(f"{settings.LLM_CYCLE_BUDGET}=30000\n", encoding="utf-8")
+        published = settings.snapshot()
+        assert published.value(settings.LLM_CYCLE_BUDGET) == "30000"
+    finally:
+        proceed.set()
+        reader.join(timeout=10)
+
+    late = overtaken[0]
+    assert late.value(settings.LLM_CYCLE_BUDGET) == "30000", (
+        "a reading of the superseded file was published over the newer one"
+    )
+    assert late.generation == published.generation, (
+        "the superseded reading took a generation of its own, so it now outranks the newer file"
+    )
+    assert settings.snapshot().generation == published.generation, (
+        "the cache had to re-read to recover, so it had been left naming the older file"
+    )
+
+
+def test_a_failed_replace_closes_the_temp_descriptor_exactly_once(store, monkeypatch):
+    """A descriptor closed twice is a descriptor some other thread now owns.
+
+    The buffered-writer rewrite moved the close ahead of ``os.replace`` and
+    left the outer handler closing it again, so any failure of the replace —
+    ``EXDEV`` across a mount boundary, ``EROFS``, a sticky parent, a swept temp
+    file — or an interrupt between the two closed the same number twice.
+    ``suppress(OSError)`` hid the ``EBADF`` without stopping the call: in a
+    threaded server the second close lands on whatever file or socket another
+    thread opened in between and was handed that number.
     """
     settings.set_value(settings.LLM_CYCLE_BUDGET, "100")
-    first = settings.snapshot()
-    settings.set_value(settings.LLM_CYCLE_BUDGET, "900")
-    second = settings.snapshot()
 
-    assert (first.value(settings.LLM_CYCLE_BUDGET), second.value(settings.LLM_CYCLE_BUDGET)) == (
-        "100",
-        "900",
+    opened: list[tuple[int, str]] = []
+    closed: list[int] = []
+    real_open, real_close = os.open, os.close
+
+    def recording_open(path, flags, mode=0o777, **kwargs):
+        descriptor = real_open(path, flags, mode, **kwargs)
+        opened.append((descriptor, str(path)))
+        return descriptor
+
+    def recording_close(descriptor):
+        closed.append(descriptor)
+        return real_close(descriptor)
+
+    def refuse_to_rename(source, target):
+        raise OSError(errno.EXDEV, "Invalid cross-device link")
+
+    monkeypatch.setattr(os, "open", recording_open)
+    monkeypatch.setattr(os, "close", recording_close)
+    monkeypatch.setattr(os, "replace", refuse_to_rename)
+
+    with pytest.raises(OSError):
+        settings.set_value(settings.LLM_CYCLE_BUDGET, "900")
+
+    temporary = [
+        descriptor
+        for descriptor, path in opened
+        if Path(path).name.startswith("." + settings.SETTINGS_FILENAME)
+    ]
+    assert len(temporary) == 1, opened
+    assert closed.count(temporary[0]) == 1, (
+        f"the temp descriptor was closed {closed.count(temporary[0])} times"
     )
-    assert first.generation != second.generation
-    # Every value in a snapshot came from the reading its generation names.
-    again = settings.snapshot()
-    assert again.generation == second.generation
-    assert again.value(settings.LLM_CYCLE_BUDGET) == "900"
+
+
+def test_one_settings_report_is_built_from_one_reading_of_the_file(store, monkeypatch):
+    """Two refreshes for one report is two readings, paired as though they were one.
+
+    ``list_settings`` took its rows from ``snapshot()``, its stored set from
+    ``stored_values()`` — a second refresh — and its unknown keys straight off
+    the store outside the cache lock altogether, so a write landing between
+    them paired one reading's values with another's unknown keys.
+    ``get_setting`` had the same two-refresh shape. One reading now feeds each
+    whole report, which from outside is one ``open`` of the file per report.
+    """
+    store.write_text(f"{settings.LLM_CYCLE_BUDGET}=100\nNODUM_NOT_A_SETTING=x\n", encoding="utf-8")
+    assert settings.list_settings().unknown_keys == ["NODUM_NOT_A_SETTING"]
+
+    opens: list[str] = []
+    real_open = os.open
+
+    def recording_open(path, flags, mode=0o777, **kwargs):
+        opens.append(str(path))
+        return real_open(path, flags, mode, **kwargs)
+
+    monkeypatch.setattr(os, "open", recording_open)
+    for report in (settings.list_settings, lambda: settings.get_setting(settings.LLM_CYCLE_BUDGET)):
+        opens.clear()
+        report()
+        assert [path for path in opens if path == str(store)] == [str(store)], (
+            f"one report read the file {len([p for p in opens if p == str(store)])} times"
+        )
 
 
 def test_free_text_keys_report_no_bad_value_posture(store):
@@ -386,10 +608,10 @@ def test_free_text_keys_report_no_bad_value_posture(store):
         settings.EMBED_CACHE,
         settings.AUDIO_MODEL,
     }
-    for name in settings.KEYS:
-        posture = settings.SPECS[name].on_invalid
-        assert (posture is None) == (name in unchecked), name
-
+    # The pairing itself is not asserted here: ``Setting.__post_init__``
+    # refuses to build a row that gets it wrong, so a loop over the registry
+    # asserts something that could only fail at import — a green test that
+    # cannot go red. What is worth checking is that the surfaces carry it.
     rows = {row.key: row.on_invalid for row in settings.list_settings().settings}
     assert {name for name, posture in rows.items() if posture is None} == unchecked
 
@@ -942,6 +1164,18 @@ def test_a_malformed_line_still_names_the_key_when_it_can_be_read_safely(store):
     silent = settings.unreadable_reason() or ""
     assert "line 1" in silent
     assert "qwen3:8b" not in silent
+
+    # And the keyword is not itself a key, however key-shaped it reads:
+    # `export export=value` has no readable key, and the message named
+    # 'export', sending a reader to look for a setting the line does not carry.
+    settings.reset()
+    settings.bind(store.parent / "graph.db")
+    store.write_text("export export=qwen3:8b\n", encoding="utf-8")
+    settings.resolve(settings.LLM_MODEL)
+    keyword = settings.unreadable_reason() or ""
+    assert "line 1" in keyword
+    assert "export" not in keyword, "the refusal named a keyword as the key"
+    assert "qwen3:8b" not in keyword
 
 
 def test_the_secret_survives_no_path_out_of_a_malformed_file_through_the_cli(store, fresh_db):

@@ -66,11 +66,17 @@ The invariants that must never be broken, whatever the section:
   string. **Never read a `NODUM_*` name the seam may *store* with `os.environ`**
   — resolve it through `nodum.settings`, which is also where a new name is
   registered with its validator, its default, and whether it may be stored at
-  all. The names the seam refuses to store (`NODUM_DB`, `NODUM_LLM_BASE_URL`,
-  `NODUM_EMBED_CACHE`, `NODUM_PUBLIC_URL`, and the two embedding variables
-  until they join it) are still read from the environment where they always
-  were — `db.py`, `urls.py`, `embeddings.py` — and that is correct, not a
-  violation.
+  all. **Refusing to store a name and reading it with `os.environ` are two
+  different things.** `NODUM_DB`, `NODUM_PUBLIC_URL`, `NODUM_EMBED_CACHE` and
+  the two embedding variables are read from the environment where they always
+  were — `db.py`, `urls.py`, `embeddings.py` — each for the reason the registry
+  records against it (read before the graph, and therefore before its settings
+  file, is open; a path on the server's own disk; the root every capability URL
+  is minted from). That is correct, not a violation.
+  `NODUM_LLM_BASE_URL` is environment-only by *policy* (`writable=False`: the
+  endpoint an API key may travel to is a deployment decision) and is still
+  resolved **through the seam**, in `nodum/llm.py`, which is the pattern the
+  rule above mandates. Reading it with `os.environ` would be a violation.
   The settings path is **threaded in** from the database path the caller
   resolved (`settings.bind`), never re-derived — `nodum serve --db PATH` does
   not set `NODUM_DB`, so a module reading the environment for itself serves one

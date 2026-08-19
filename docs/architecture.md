@@ -355,14 +355,20 @@ directory, `fsync`, `os.replace`, `fsync` on the directory — under an in-proce
 lock **and** an `flock`, held across the whole read-merge-render-replace span.
 The **read path** stamps the file with `fstat` on the descriptor it opened,
 `(st_dev, st_ino, st_mtime_ns, st_size)` compared with `!=` **before** any
-`read`, and publishes a new immutable mapping rather than mutating the live one;
-a missing file is a state and bumps the generation. An unchanged file therefore
-costs one `open` and one `fstat` and nothing else — no `read`, no bytes, no
-parse. The generation is **process-wide**, not per file, so rebinding from one
-graph to another cannot hand two readings the same number. The writer's lock and
-the cache's are **different locks**: the cache's is held only while the view is
-swapped, never across the `flock` wait or the `fsync`s, so a reader never waits
-on a writer — the readers include the scheduler slice on the event loop.
+`read`; a missing file is a state and bumps the generation. An unchanged file
+therefore costs one `open` and one `fstat` and nothing else — no `read`, no
+bytes, no parse. The generation is **process-wide**, not per file, so rebinding
+from one graph to another cannot hand two readings the same number. The cached
+view is **one frozen record** — stamp, values, unknown keys, unreadable reason
+and generation together — held by a single reference and replaced whole, so a
+reader loads it once and cannot pair one reading's values with another's
+generation, and one report is built from one reading rather than a refresh per
+field. It is published by **compare-and-swap** against the record the refresh
+started from, so a reading overtaken while it parsed is discarded rather than
+installed over a newer one under a higher generation. The writer's lock and the
+cache's are **different locks**: the cache's is held only for that swap, never
+across the `flock` wait or the `fsync`s, so a reader never waits on a writer —
+the readers include the scheduler slice on the event loop.
 
 `SECRET_KEYS` and `Change.event_payload()` are the never-serialise contract:
 `NODUM_LLM_API_KEY` reports set/unset and never a value, to a surface or to the

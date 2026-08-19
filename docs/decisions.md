@@ -2521,10 +2521,38 @@ incidental: the scheduler reads on the event loop every slice, and
 `llm.resolution()` reads while holding its own lock, so one stuck writer stalled
 the loop and every path to the model behind it. The locks are now split — the
 write lock across read-merge-render-replace, a separate short-lived cache lock
-only for the swap, always taken in that order — and the three values a reader
-takes (values, unreadable reason, generation) come out of one hold of the cache
-lock, so a refresh landing mid-read can no longer stamp old values with a new
-generation.
+only for the swap, always taken in that order.
+
+**Splitting them turned the cached view into a shape problem, and the third
+pass over it changed the shape rather than patching it again.** Under one lock
+the whole read-parse-publish span was atomic; under two, a refresh can be
+overtaken between its read and its publish — and a publish that checked only
+the file's stamp against the one the cache held wrote a *superseded* reading
+back over a newer one, taking the higher generation as it went, so the cache
+named an older file with a newer number. Four findings across two review rounds
+were one defect wearing different clothes: a reader pairing one reading's values
+with another's generation, a report refreshing once per field and reading a
+third straight off the store, a slow parse published over a fresh one, and the
+write path retiring the stamp outside the lock altogether. The view is now a
+single frozen record — stamp, values, unknown keys, unreadable reason,
+generation — held by one reference and published by **compare-and-swap** against
+the record the refresh started from. A reader loads that reference once and
+every field it reads is one moment by construction; the thread that loses the
+race discards its reading. The invariant a later edit cannot forget is the one
+the type enforces, not the one a docstring asks for.
+
+**A descriptor closed twice is a descriptor some other thread now owns.**
+Putting the temp file behind a buffered writer — a bare `os.write` may take
+fewer bytes than it was given, and the short write would have been fsynced and
+renamed into place as a truncated settings file — moved the `os.close` ahead of
+`os.replace` while the `except BaseException` handler still closed it too. Any
+failure of the replace (`EXDEV` across a mount boundary, `EROFS`, a sticky
+parent, a swept temp file) or an interrupt between the two closed the same
+number twice, and `contextlib.suppress(OSError)` hid the `EBADF` without
+stopping the call: whatever another thread had opened in the meantime and been
+handed that number was closed under it. The close now lives in its own `finally`
+and runs exactly once on every path — the shape the backup copy in `cli.py`
+already had.
 
 **The provider caches were not serialised by the event loop, and the first
 liveness mechanism did not work.** `run_in_threadpool` puts search, ask,
