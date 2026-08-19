@@ -918,8 +918,13 @@ def _publish(
         Whether this call published. ``False`` means either that the file's
         identity has not moved since ``seen`` — so there is nothing to publish
         and no generation to burn — or that another thread published while this
-        one was reading and parsing, whose reading is by construction the newer
-        of the two.
+        one was reading and parsing. That thread is not necessarily holding the
+        newer reading: two refreshes that started from the same record race, and
+        the one that read the *earlier* version of the file can win the swap —
+        the loser then answers from a reading older than what is on disk, until
+        the next refresh. What the swap guarantees is that a published reading
+        is never older than the one it replaces, because it read the file after
+        loading that record: the published sequence never goes backwards.
     """
     if stamp == seen.stamp:
         return False

@@ -37,6 +37,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -324,8 +325,13 @@ def test_a_reader_does_not_wait_behind_a_writer_stuck_on_a_foreign_lock(store, t
     # With one shared lock the timed read blocks until the flock is released,
     # and the release below sits on the far side of the measurement — so this
     # deadline is what makes reinstating that bug a failure rather than a hang.
+    # It is armed at the measurement rather than here: waiting for the child,
+    # starting the local writer and proving it stuck measures 0.23-0.24 s, and
+    # armed at the ``Popen`` every millisecond of that came off the 3.0 s the
+    # deadline exists to give the read — the reinstated bug failed at 2.78 s
+    # against a 2.769 s window. Setup drifting past ~2.5 s on a loaded runner
+    # would have made that bug *pass*; past 3.0 s it would fail correct code.
     deadline = threading.Timer(3.0, lambda: release.write_text("go"))
-    deadline.start()
     done = threading.Event()
 
     def write() -> None:
@@ -351,6 +357,7 @@ def test_a_reader_does_not_wait_behind_a_writer_stuck_on_a_foreign_lock(store, t
             assert local.write_lock.locked(), "the local writer never took the in-process lock"
             assert not done.wait(0.2), "the local writer was not blocked on the foreign lock"
 
+            deadline.start()
             started = time.perf_counter()
             value = settings.resolve(settings.LLM_CYCLE_BUDGET)
             elapsed = time.perf_counter() - started
@@ -391,6 +398,31 @@ def test_an_unchanged_file_is_stamped_without_being_read(store, monkeypatch):
     assert reads == [], "an unchanged file was read rather than only stamped"
 
 
+def test_the_reader_hands_back_the_record_and_does_not_rebuild_it(store):
+    """One reference load is the redesign, and nothing else asserts it.
+
+    Everything the record shape buys — values, unreadable reason and generation
+    that are one moment of one file; a whole report built from one reading —
+    rests on ``_current`` handing back the record the store holds **by
+    reference**. Rebuild it instead, four loads off the store reassembled into a
+    new ``_Reading``, and every caller is back to the round-1 pairing defect
+    with a window two attribute loads wide — which the concurrent probes below
+    do not reliably sample: with that reader in place the whole settings module
+    stayed green. So the claim is made structurally here, with no threads and no
+    timing, and it goes red the moment the load becomes a copy.
+    """
+    settings.set_value(settings.LLM_CYCLE_BUDGET, "100")
+    local = settings._store()
+    assert local is not None
+
+    reading = settings._current(local)
+
+    assert reading is local.reading, "the reader rebuilt the record instead of taking the one held"
+    assert settings._current(local) is reading, (
+        "an unchanged file produced a second record, so two reads are two moments"
+    )
+
+
 def test_one_reading_answers_a_whole_question_under_concurrent_writes(store, monkeypatch):
     """One generation names one reading, and one report is built from one of them.
 
@@ -415,33 +447,66 @@ def test_one_reading_answers_a_whole_question_under_concurrent_writes(store, mon
     The switch interval is cut for the duration so the interleavings actually
     happen; that raises the sampling rate of the race, it does not change the
     code under test.
+
+    **Both probes are counted, and what kills one is collected.** The report
+    half is the one that catches the two-refresh defect, and a thread that dies
+    on entry — a renamed row turning the ``next(...)`` into a
+    ``StopIteration``, a model change into an ``AttributeError`` — left every
+    assertion below trivially true: no rows appended to ``incoherent``, the lap
+    count met by the snapshot readers alone, and nothing but a
+    ``PytestUnhandledThreadExceptionWarning`` to say so, which this repo does
+    not turn into an error. Made to raise on entry, this test passed.
     """
     monkeypatch.delenv(settings.LLM_MODEL, raising=False)
     named_by: dict[int, str | None] = {}
+    stored_seen: set[bool] = set()
     incoherent: list[str] = []
+    laps: list[tuple[str, int]] = []
+    failures: list[str] = []
     stop = threading.Event()
 
-    def read_snapshots() -> None:
-        while not stop.is_set():
-            view = settings.snapshot()
-            value = view.value(settings.LLM_MODEL)
-            first = named_by.setdefault(view.generation, value)
-            if first != value:
-                incoherent.append(f"generation {view.generation} named {first!r} then {value!r}")
+    def read_a_snapshot() -> None:
+        view = settings.snapshot()
+        value = view.value(settings.LLM_MODEL)
+        first = named_by.setdefault(view.generation, value)
+        if first != value:
+            incoherent.append(f"generation {view.generation} named {first!r} then {value!r}")
 
-    def read_reports() -> None:
-        while not stop.is_set():
-            report = settings.list_settings()
-            row = next(one for one in report.settings if one.key == settings.LLM_MODEL)
-            if row.stored != (row.provenance == settings.FROM_FILE):
-                incoherent.append(
-                    f"one report said provenance {row.provenance!r} with stored {row.stored!r}"
-                )
+    def read_a_report() -> None:
+        report = settings.list_settings()
+        row = next(one for one in report.settings if one.key == settings.LLM_MODEL)
+        stored_seen.add(row.stored)
+        if row.stored != (row.provenance == settings.FROM_FILE):
+            incoherent.append(
+                f"one report said provenance {row.provenance!r} with stored {row.stored!r}"
+            )
+
+    def until_stopped(name: str, probe: Callable[[], None]) -> Callable[[], None]:
+        """Loop ``probe`` until the writer is done, counting laps and keeping any exception.
+
+        Both are asserted at the end, so a probe that raised or never ran is a
+        failure here rather than a warning nobody reads.
+        """
+
+        def run() -> None:
+            count = 0
+            try:
+                while not stop.is_set():
+                    probe()
+                    count += 1
+            except BaseException as exc:  # noqa: BLE001 - reported, not swallowed
+                failures.append(f"{name} raised {exc!r}")
+            finally:
+                laps.append((name, count))
+
+        return run
 
     interval = sys.getswitchinterval()
     sys.setswitchinterval(1e-6)
-    readers = [threading.Thread(target=read_snapshots) for _ in range(2)]
-    readers += [threading.Thread(target=read_reports) for _ in range(2)]
+    readers = [
+        threading.Thread(target=until_stopped("snapshots", read_a_snapshot)) for _ in range(2)
+    ]
+    readers += [threading.Thread(target=until_stopped("reports", read_a_report)) for _ in range(2)]
     for reader in readers:
         reader.start()
     try:
@@ -454,8 +519,14 @@ def test_one_reading_answers_a_whole_question_under_concurrent_writes(store, mon
             reader.join(timeout=30)
         sys.setswitchinterval(interval)
 
+    assert failures == [], failures
     assert not incoherent, incoherent[:5]
+    assert len(laps) == len(readers), f"a reader thread never reported back: {laps}"
+    assert all(count > 0 for _, count in laps), f"a reader thread ran no iterations: {laps}"
     assert len(named_by) > 2, "the readers never saw the writer move, so nothing was raced"
+    assert stored_seen == {True, False}, (
+        f"the report probe never saw the file change, so it raced nothing: {stored_seen}"
+    )
 
 
 def test_a_reading_overtaken_while_it_parses_is_discarded_and_not_published(store, monkeypatch):
