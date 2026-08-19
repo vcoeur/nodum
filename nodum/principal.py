@@ -19,13 +19,35 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from nodum.migrations import META_SPACE_ID
-from nodum.vocab import GRANT_LEVELS, PrincipalKind
+from nodum.vocab import GRANT_LEVELS, LandingState, PrincipalKind
 
 #: Grant levels, ordered: read ⊂ suggest ⊂ edit (design §5.2 as amended).
 GRANT_LEVELS = GRANT_LEVELS
 
 #: Level integers for the checks below.
 READ, SUGGEST, EDIT = GRANT_LEVELS["read"], GRANT_LEVELS["suggest"], GRANT_LEVELS["edit"]
+
+
+def landing_for_level(level: int) -> LandingState | None:
+    """The state a write lands in at *level*, or ``None`` if it cannot be written.
+
+    The one place grant level becomes landing state: ``edit`` writes ``active``,
+    ``suggest`` files ``proposed``, anything below cannot write at all. Both
+    write paths in :class:`nodum.store.Store` and the ``get_principal`` MCP tool
+    read it here, so what the surface *reports* about a grant cannot drift from
+    what the store *enforces* for it.
+
+    Args:
+        level: A grant level integer, as returned by :meth:`Principal.level_on`.
+
+    Returns:
+        ``"active"``, ``"proposed"``, or ``None`` for no write grant.
+    """
+    if level >= EDIT:
+        return "active"
+    if level >= SUGGEST:
+        return "proposed"
+    return None
 
 
 @dataclass(frozen=True)
@@ -74,6 +96,13 @@ class Principal:
         if level not in GRANT_LEVELS:
             return 0
         return GRANT_LEVELS[level]
+
+    def landing_on(self, space_id: str | None) -> LandingState | None:
+        """The state a node write to *space_id* would land in, without writing one.
+
+        ``None`` means this principal cannot write the space at all.
+        """
+        return landing_for_level(self.level_on(space_id))
 
     @property
     def read_spaces(self) -> frozenset[str] | None:

@@ -429,7 +429,7 @@ cycle quietly drop the vector signal until you re-run the download.
   serves many agents, and nothing about a caller survives between calls.
   The registry is the design §8.1 read tier (`get_node`, `get_children`,
   `search`, `traverse`, `list_types`, `get_schema`, `find_path`, `history`,
-  `diff`, `get_asset`, `get_download_url`) and additive tier (`create_node`,
+  `diff`, `get_asset`, `get_download_url`, `get_principal`) and additive tier (`create_node`,
   `update_node`, `link`, `propose_edges`, `ingest_url`,
   `request_upload_url`). Ingestion is **by reference** — the tool takes a path
   the server can read or a URL it can fetch, and no base64 ever crosses MCP; a

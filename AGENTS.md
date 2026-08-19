@@ -638,9 +638,21 @@ nothing else.
 - **The registry is the read + additive tiers, structurally.** The design §8.1
   read tier (`get_node`, `get_children`, `search`, `traverse`, `list_types`,
   `get_schema`, `find_path`, `history`, `diff`, `get_asset`,
-  `get_download_url`) and additive tier (`create_node`, `update_node`, `link`,
-  `propose_edges`, `ingest_url`, `request_upload_url`) — every
-  tool a thin delegate to one service/search/assets/ingest/urls function.
+  `get_download_url`, `get_principal`) and additive tier (`create_node`,
+  `update_node`, `link`, `propose_edges`, `ingest_url`, `request_upload_url`) — every
+  tool a thin delegate to one service/search/assets/ingest/urls function, bar
+  `get_principal`, which reports the caller's own identity and grant set and so
+  delegates to nothing.
+- **`get_principal` answers "if I write here, does it land?" without writing.**
+  Each granted space carries `writes_land` — `active` under `edit`, `proposed`
+  under `suggest`, `null` under `read`. It matters because the alternative is
+  discovering the answer by writing, and under a `suggest` grant that first
+  write cannot be retracted from this surface: accept/reject/archive are never
+  registered. The mapping is `principal.landing_for_level`, the same function
+  `Store.node_landing_state` and `Store.edge_landing_state` enforce with, so
+  the report cannot drift from the behaviour it describes. Only spaces in the
+  caller's own grant set are listed — an identity read must not become space
+  enumeration.
 - **Four tiers are never registered, and each one is a named absence**: the
   review tools (`accept`, `reject` — `REVIEW_TOOLS`, gated by
   `Store.require_review` — a human, or `edit` on the item's space), the

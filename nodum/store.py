@@ -24,7 +24,7 @@ from __future__ import annotations
 import sqlite3
 
 from nodum.migrations import META_SPACE_ID
-from nodum.principal import EDIT, READ, SUGGEST, Principal
+from nodum.principal import EDIT, READ, SUGGEST, Principal, landing_for_level
 from nodum.vocab import LANDING_STATES, LandingState
 
 #: The two states a write can land in. ``archived`` is not one of them: a write
@@ -171,13 +171,8 @@ class Store:
             ValueError: If ``landing`` is not in :data:`LANDING_STATES`.
             GrantNotPermitted: If the principal may not write the space at all.
         """
-        level = self.principal.level_on(space_id)
-        granted: LandingState
-        if level >= EDIT:
-            granted = "active"
-        elif level >= SUGGEST:
-            granted = "proposed"
-        else:
+        granted = landing_for_level(self.principal.level_on(space_id))
+        if granted is None:
             raise GrantNotPermitted(
                 f"{self.principal.actor_string} has no write grant on space {space_id!r}"
             )
@@ -206,12 +201,8 @@ class Store:
         if src_space != dst_space and type_space != META_SPACE_ID:
             raise GrantNotPermitted("a cross-space edge's type node must live in the meta space")
         level = min(self.principal.level_on(src_space), self.principal.level_on(dst_space))
-        granted: LandingState
-        if level >= EDIT:
-            granted = "active"
-        elif level >= SUGGEST:
-            granted = "proposed"
-        else:
+        granted = landing_for_level(level)
+        if granted is None:
             raise GrantNotPermitted(
                 f"{self.principal.actor_string} needs the matching grant on both endpoint spaces"
             )

@@ -259,6 +259,7 @@ READ_TOOLS = (
     "diff",
     "get_asset",
     "get_download_url",
+    "get_principal",
 )
 ADDITIVE_TOOLS = (
     "create_node",
@@ -615,10 +616,12 @@ def create_server(*, db_path: str | Path | None = None) -> FastMCP:
         "nodum",
         instructions=(
             "nodum knowledge graph — read tier (get_node/get_children/search/traverse/"
-            "list_types/get_schema/find_path/history/diff/get_asset/get_download_url) and "
+            "list_types/get_schema/find_path/history/diff/get_asset/get_download_url/"
+            "get_principal) and "
             "additive tier (create_node/update_node/link/propose_edges/"
             "ingest_url/request_upload_url). Writes land as proposals for human review "
-            "under a 'suggest' grant and live under 'edit'. Reviewing (accept/reject) "
+            "under a 'suggest' grant and live under 'edit' — call get_principal to see "
+            "which applies to you, per space, before you write. Reviewing (accept/reject) "
             "and curative operations are not available over MCP — they belong to the "
             "human. Ingest by reference: give a URL this server can fetch, or ask "
             "request_upload_url for somewhere to PUT bytes you hold — never bytes "
@@ -716,6 +719,33 @@ def create_server(*, db_path: str | Path | None = None) -> FastMCP:
     def list_types() -> dict[str, Any]:
         """List the full type catalog (node types and edge types)."""
         return _dump(service.list_types(principal=_principal(), path=db_path))
+
+    @server.tool(annotations=_READ)
+    def get_principal() -> dict[str, Any]:
+        """Report your own identity and grant set — what your writes would do, before you write one.
+
+        Each granted space carries `writes_land`: the state a create there
+        would take, `active` under an `edit` grant and `proposed` under
+        `suggest`. Read it instead of discovering the answer by writing
+        something — under `suggest` that first write cannot be retracted from
+        this surface, since accept/reject/archive belong to the human.
+
+        Only spaces you hold a grant on are listed: this reports your own
+        access and reveals nothing you could not already reach.
+        """
+        principal = _principal()
+        return {
+            "actor": principal.actor_string,
+            "kind": principal.kind,
+            "spaces": [
+                {
+                    "space": space_id,
+                    "level": level,
+                    "writes_land": principal.landing_on(space_id),
+                }
+                for space_id, level in sorted(principal.grants.items())
+            ],
+        }
 
     @server.tool(annotations=_READ)
     def get_schema(type: str) -> dict[str, Any]:
@@ -860,7 +890,8 @@ def create_server(*, db_path: str | Path | None = None) -> FastMCP:
 
         With a `suggest` grant the node is `proposed` and waits for review;
         with `edit` it lands `active` immediately — the grant is the whole
-        difference, and nothing on this surface reports which you hold.
+        difference, and `get_principal` reports which you hold, per space,
+        without writing anything.
 
         `space` is where the node goes — a space id or name, defaulting to
         `main` — and you must hold a grant on it: one you cannot write refuses,

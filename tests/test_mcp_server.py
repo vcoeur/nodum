@@ -1397,3 +1397,81 @@ def test_an_agent_cannot_reach_bytes_described_only_in_a_space_it_cannot_read(fr
     # finding M14 — both newest-first.)
     logged = [event.op for event in service.list_events(owner()) if event.op.startswith("asset.")]
     assert logged == ["asset.ingest", "asset.extract"]
+
+
+def test_get_principal_reports_the_landing_state_each_grant_actually_produces(fresh_db):
+    """Introspection must agree with enforcement, per space and per level.
+
+    The tool exists so an agent can learn its landing state *without* writing:
+    under ``suggest`` the probe write it replaces is unretractable from this
+    surface, since accept/reject/archive are never registered. So the property
+    under test is not "the tool returns a string" but "the string it returns is
+    the state a real write in that space lands in" — asserted against actual
+    writes, at both levels, or the report could drift from the store and still
+    pass.
+    """
+    seed_space("drafts")
+    seed_space("live")
+    agent(
+        "agent:mixed",
+        token="ndm_mixed_token",
+        grants={"meta": "read", "drafts": "suggest", "live": "edit"},
+    )
+
+    async def scenario():
+        async with mcp_session(token="ndm_mixed_token") as session:
+            return (
+                await _call(session, "get_principal"),
+                await _call(
+                    session, "create_node", {"type": "note", "title": "d", "space": "drafts"}
+                ),
+                await _call(
+                    session, "create_node", {"type": "note", "title": "l", "space": "live"}
+                ),
+            )
+
+    reported, drafted, lived = asyncio.run(scenario())
+
+    assert not reported.isError, reported.content[0].text
+    principal = json.loads(reported.content[0].text)
+    assert principal["actor"] == "agent:mixed"
+
+    by_space = {row["space"]: row for row in principal["spaces"]}
+    assert by_space["drafts"]["writes_land"] == "proposed"
+    assert by_space["live"]["writes_land"] == "active"
+    # A read grant is a listed space with no write outcome, not a missing row —
+    # "you may look here but not write" is an answer, and omitting it would read
+    # as "no grant at all".
+    assert by_space["meta"]["writes_land"] is None
+
+    # The claims above, checked against what the store actually did.
+    assert json.loads(drafted.content[0].text)["state"] == by_space["drafts"]["writes_land"]
+    assert json.loads(lived.content[0].text)["state"] == by_space["live"]["writes_land"]
+
+
+def test_get_principal_lists_only_the_callers_own_spaces(fresh_db):
+    """An identity read must not become space enumeration.
+
+    Each agent holds one space the other does not. Asserted in both directions,
+    so a tool that simply dumped every space in the file would fail rather than
+    coincidentally match one caller's grant set.
+    """
+    seed_space("alpha_only")
+    seed_space("beta_only")
+    agent("agent:a", token="ndm_a_token", grants={"alpha_only": "suggest"})
+    agent("agent:b", token="ndm_b_token", grants={"beta_only": "edit"})
+
+    async def principal_for(token):
+        async with mcp_session(token=token) as session:
+            return await _call(session, "get_principal")
+
+    async def scenario():
+        return await principal_for("ndm_a_token"), await principal_for("ndm_b_token")
+
+    a_result, b_result = asyncio.run(scenario())
+
+    a_spaces = {row["space"] for row in json.loads(a_result.content[0].text)["spaces"]}
+    b_spaces = {row["space"] for row in json.loads(b_result.content[0].text)["spaces"]}
+
+    assert a_spaces == {"alpha_only"}
+    assert b_spaces == {"beta_only"}
