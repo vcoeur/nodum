@@ -375,7 +375,9 @@ cycle quietly drop the vector signal until you re-run the download.
   curative operation gets that same refusal, naming the cycle — it does not walk
   past the cycle to an older event, because "take back the last thing that
   happened" never meant something you did not name.
-- **A schedule, if you ask for one.** Set `NODUM_CONSOLIDATE_AT=03:30` and
+- **A schedule, if you ask for one.** Set `NODUM_CONSOLIDATE_AT=03:30` — in the
+  environment, or with `nodum config set NODUM_CONSOLIDATE_AT 03:30`, which
+  needs no restart — and
   `nodum serve` runs one cycle a night, in the process that is already running —
   no cron, no second process, no new dependency, and the banner says so at
   startup. Unset means off, which is the
@@ -709,7 +711,13 @@ cycle quietly drop the vector signal until you re-run the download.
   recognised when it is **exactly** a hosted model id and you have not named a
   `NODUM_LLM_BASE_URL` of your own: `deepseek-r1:8b` and friends are ollama
   models, so they stay on your local endpoint with your local window, and once
-  you point at a server yourself nothing moves the call off it. **Your key goes
+  you point at a server yourself nothing moves the call off it. Everything above
+  can also be **stored** rather than exported —
+  `nodum config set NODUM_LLM_MODEL deepseek-v4-flash --as human:owner` writes it
+  to `settings.env` beside the graph, and a change applies at the next call
+  rather than at the next restart. The environment still wins over the file, so
+  a deployment can pin what a browser must not move; `nodum config list` says
+  which layer each value is in force from. **Your key goes
   only where you pointed it**: either you named the endpoint with
   `NODUM_LLM_BASE_URL`, or your model name is exactly a hosted id nodum knows.
   A model name it does not recognise falls back to the local endpoint — a host
@@ -721,6 +729,16 @@ cycle quietly drop the vector signal until you re-run the download.
   model may think — a value outside that set is refused with the list rather
   than passed on, and `nodum llm status` shows whether your endpoint actually
   accepts it, since `ollama` takes only `none`.
+
+**Configuration is a ladder.** `default < settings.env < environment`, where
+`settings.env` is a file beside the database (`0600`, copied by
+`nodum backup`), and *empty is not set at any layer* — an exported-but-empty
+variable, which is what `${VAR:-}` renders in a compose file, does not shadow a
+stored value. `nodum config list|get|set|unset` is the surface;
+`NODUM_LLM_API_KEY` reports whether it is set and never its value. Four names
+stay environment-only and say so when refused: `NODUM_DB`,
+`NODUM_LLM_BASE_URL`, `NODUM_EMBED_CACHE` and `NODUM_PUBLIC_URL`. Details in
+[docs/configuration.md](docs/configuration.md).
 
 See [docs/architecture.md](docs/architecture.md) for the module map,
 [docs/decisions.md](docs/decisions.md) for the decision log, and

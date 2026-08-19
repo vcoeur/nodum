@@ -27,6 +27,11 @@ database runs in WAL mode, so copying the file alone can strand committed rows
 in its `-wal` companion — the snapshot is `nodum backup <dest>`, a consistent
 single-file copy (`VACUUM INTO`) that folds the WAL in.
 
+One file holds the *graph*. Configuration an operator stores rather than
+exports lives beside it, in `settings.env` — the one thing deliberately not in
+the database, because it has to be readable and editable when the database is
+not, and `backup` takes it along.
+
 ## What makes it agent-native
 
 nodum assumes both humans and agents write to it, and gives them **different

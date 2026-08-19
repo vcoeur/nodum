@@ -988,3 +988,69 @@ class TitleResolution(BaseModel):
     outcome: Literal["resolved", "ambiguous", "not-found"]
     node_id: str | None = None
     space_id: str | None = None
+
+
+class SettingOut(BaseModel):
+    """One configurable name: what is in force, where it came from, who may set it.
+
+    ``value`` is the value the runtime actually uses, after the
+    ``default < settings.env < environment`` ladder — and it is **always
+    ``None`` for a secret**, whose row says whether one is set (``set``) and
+    nothing else. ``stored`` is the different question of whether
+    ``settings.env`` itself carries the key, which is what a surface needs to
+    know before offering to unset it.
+
+    ``writable`` false means the file layer is not consulted for this name at
+    all and ``refusal`` is the sentence to show instead of an editor;
+    ``on_invalid`` names what the runtime does with a value it cannot use, which
+    only a hand-edit can produce because the write path validates ahead of it —
+    and is **``None`` for a free-text key**, which has no invalid value to have
+    a posture about. A model name nothing serves is not rejected anywhere; it
+    is an HTTP error on the first call.
+    """
+
+    key: str
+    value: str | None
+    set: bool
+    provenance: str
+    default: str | None
+    kind: str
+    secret: bool
+    writable: bool
+    refusal: str | None
+    stored: bool
+    on_invalid: str | None
+
+
+class SettingsOut(BaseModel):
+    """Every setting, plus the file they were read from.
+
+    ``unknown_keys`` are names ``settings.env`` carries that this build does
+    not configure: they are reported rather than dropped, because a file
+    written by a newer nodum — or by an operator, for the next reader — is not
+    a file to tidy. ``unreadable`` is why the file could not be parsed, in
+    which case every row falls back to the environment and the defaults.
+    """
+
+    settings: list[SettingOut]
+    count: int
+    path: str | None
+    unknown_keys: list[str]
+    unreadable: str | None
+
+
+class SettingChangeOut(BaseModel):
+    """What a settings write left in force.
+
+    ``changed`` is whether the file moved — setting a key to what it already
+    held, or unsetting one it never carried, is the state the caller asked for
+    rather than an error — and ``stored`` is whether ``settings.env`` now
+    carries the key at all. No secret value is ever carried here either.
+    """
+
+    key: str
+    changed: bool
+    stored: bool
+    value: str | None
+    set: bool
+    provenance: str

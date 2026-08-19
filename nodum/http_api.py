@@ -230,6 +230,7 @@ from nodum import (
     mcp_server,
     scheduler,
     service,
+    settings,
     urls,
 )
 from nodum import search as search_module
@@ -789,13 +790,18 @@ def _run_consolidation(
 
 def _consolidation_scheduler(
     at: time | None, db_path: str | Path | None
-) -> scheduler.ConsolidationScheduler | None:
-    """Build the nightly scheduler for this app, or ``None`` when it is off.
+) -> scheduler.ConsolidationScheduler:
+    """Build this app's nightly scheduler — always, whether or not one is configured.
 
-    ``at`` given wins; otherwise the environment decides
-    (:data:`nodum.scheduler.ENV_CONSOLIDATE_AT`), and unset means off — a
-    background process that writes to the graph without being asked is not
-    something to enable by surprise (design decision J1).
+    ``at`` given **pins** the schedule for the life of the app; otherwise the
+    scheduler reads it through the settings seam on every slice, and unset
+    means it idles — a background process that writes to the graph without
+    being asked is not something to enable by surprise (design decision J1).
+
+    Always building one is what lets the schedule be turned on and off while
+    the server runs: there is no object to create, and therefore no second
+    scheduler to race the first (see :mod:`nodum.scheduler`). The ladder is
+    constructor argument > environment > ``settings.env`` > off.
 
     A value that is set but unparseable is **reported and then ignored**. The
     alternative is a server that refuses to start over a stray character in an
@@ -804,13 +810,9 @@ def _consolidation_scheduler(
     nobody notices for a month.
     """
     if at is None:
-        try:
-            at = scheduler.configured_time()
-        except ValueError as exc:
-            logger.warning("%s — the nightly consolidation cycle is off", exc)
-            return None
-    if at is None:
-        return None
+        problem = scheduler.schedule().problem
+        if problem is not None:
+            logger.warning("%s — the nightly consolidation cycle is off", problem)
     return scheduler.ConsolidationScheduler(at=at, db_path=db_path)
 
 
@@ -2024,9 +2026,12 @@ def create_app(
             over TLS in front); loopback stays plain HTTP, where a ``Secure``
             cookie would never be stored at all.
         consolidate_at: Local wall-clock time to run the nightly consolidation
-            cycle at. ``None`` reads :data:`nodum.scheduler.ENV_CONSOLIDATE_AT`,
-            which is unset by default — so the schedule is off unless somebody
-            asked for it, and ``nodum serve`` needs no flag to keep it that way.
+            cycle at. Given, it **pins** the schedule for the life of the app.
+            ``None`` — the default — leaves the scheduler reading it through
+            the settings seam on every slice (environment, then ``settings.env``,
+            then off), so the schedule is off unless somebody asked for it,
+            ``nodum serve`` needs no flag to keep it that way, and turning it on
+            later takes no restart.
 
     Returns:
         The configured Starlette application. Every ``/api`` route but
@@ -2036,6 +2041,11 @@ def create_app(
     """
     hosts = frozenset(allowed_hosts) if allowed_hosts is not None else resolve_allowed_hosts("")
     body_limit = MAX_REQUEST_BYTES if max_body_bytes is None else max_body_bytes
+    # Point the settings store at the file beside *this* app's graph. The path
+    # is threaded in rather than re-derived, because `nodum serve --db PATH`
+    # does not set NODUM_DB: a module reading the environment for itself would
+    # serve one graph and read its configuration beside another.
+    settings.bind(db.db_path() if db_path is None else db_path)
 
     # ── Health, login, and catalog ────────────────────────────────────────
 
@@ -3452,9 +3462,11 @@ def create_app(
 
         The whole of the schedule (design decision J1): one asyncio task in the
         server that is already running, started here and cancelled here, with
-        no second process and no dependency. It is ``None`` unless the schedule
-        was configured, which is the default — so an ordinary ``nodum serve``
-        creates no background writer at all.
+        no second process and no dependency. The task exists whether or not a
+        schedule is configured — unconfigured, it idles and writes nothing —
+        because the alternative is creating and destroying it while the server
+        runs, which is two schedulers over one database the first time two
+        writes land together.
 
         Shutdown is bounded by :meth:`~nodum.scheduler.ConsolidationScheduler.stop`
         rather than by the cycle: a server must not take minutes to stop because
@@ -3467,13 +3479,11 @@ def create_app(
         table still looks perfectly wired.
         """
         async with mcp_surface.run():
-            if consolidation is not None:
-                consolidation.start()
+            consolidation.start()
             try:
                 yield
             finally:
-                if consolidation is not None:
-                    await consolidation.stop()
+                await consolidation.stop()
 
     # Outermost first: the guard normalises the path every inner layer keys on,
     # and refuses cross-origin and oversized requests before auth even looks at

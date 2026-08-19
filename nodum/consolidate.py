@@ -1426,7 +1426,9 @@ def _job_abstraction(context: _Context) -> JobOutcome:
     run = agent.for_cycle(cycle_id=context.cycle_id, principal=context.principal, path=context.path)
     try:
         if run.budget.tokens <= 0:
-            outcome.notes.append("NODUM_LLM_CYCLE_BUDGET is 0: the abstraction job did not run")
+            outcome.notes.append(
+                f"{run.budget_env} is 0 (from {run.budget_source}): the abstraction job did not run"
+            )
             return outcome
         if not run.available:
             outcome.notes.append(

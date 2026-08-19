@@ -20,7 +20,19 @@ from pathlib import Path
 import typer
 from pydantic import BaseModel
 
-from nodum import __version__, answers, assets, auth, db, extract, ingest, projectors, service, urls
+from nodum import (
+    __version__,
+    answers,
+    assets,
+    auth,
+    db,
+    extract,
+    ingest,
+    projectors,
+    service,
+    settings,
+    urls,
+)
 from nodum import consolidate as consolidate_module
 from nodum import search as search_module
 from nodum.assets import AssetNotFound, AssetSourceChanged, AssetTooLarge, UnsupportedRendition
@@ -71,6 +83,9 @@ ingest_app = typer.Typer(
     no_args_is_help=True, help="Ingestion: files and URLs in, reviewable subgraphs out."
 )
 llm_app = typer.Typer(no_args_is_help=True, help="The language-model provider this install uses.")
+config_app = typer.Typer(
+    no_args_is_help=True, help="Configuration read and written beside the graph (settings.env)."
+)
 app.add_typer(node_app, name="node")
 app.add_typer(edge_app, name="edge")
 app.add_typer(projector_app, name="projector")
@@ -80,6 +95,7 @@ app.add_typer(agent_app, name="agent")
 app.add_typer(asset_app, name="asset")
 app.add_typer(ingest_app, name="ingest")
 app.add_typer(llm_app, name="llm")
+app.add_typer(config_app, name="config")
 
 
 @app.callback(invoke_without_command=True)
@@ -105,6 +121,11 @@ def _main(
         raise typer.Exit(0)
     if db_path is not None:
         os.environ[ENV_DB_VAR] = db_path
+    # The settings file lives beside the graph, and the path is handed over
+    # rather than re-derived: this is where the CLI's own `--db` resolution
+    # happens, so this is where the answer is known. `serve` binds again with
+    # its command-level `--db`, which never reaches the environment.
+    settings.bind(db.db_path())
 
 
 def _print_json(payload: dict) -> None:
@@ -359,7 +380,77 @@ def init() -> None:
     _emit(_run(service.init))
 
 
-def _backup_to(destination: str, path: str | None) -> dict[str, str | int]:
+def _copy_settings_beside(source: Path, dest: Path) -> str | None:
+    """Copy the graph's ``settings.env`` to ``<dest>.settings.env`` at 0600.
+
+    The graph is one file and the backup is one command, and after
+    ``settings.env`` exists that sentence is a claim a restore has to make
+    good on: without this, a by-the-book restore — stop the server, put the
+    database back — reverts every setting the operator ever stored, the API
+    key included, and says nothing about it.
+
+    Written through ``O_CREAT|O_EXCL|O_WRONLY`` at 0600 rather than
+    ``shutil.copy``, for the reason the store itself is: this file can hold a
+    credential, and a copy that is briefly world-readable is a copy that
+    leaked.
+
+    Args:
+        source: The graph database being backed up.
+        dest: The backup database's path; the settings copy sits beside it.
+
+    Returns:
+        The path written, or ``None`` when the graph has no settings file.
+
+    Raises:
+        ValueError: If the settings destination already exists and is not
+            empty — the same refusal the database half makes, for the same
+            reason.
+    """
+    origin = _settings_source(source)
+    if origin is None:
+        return None
+    target = _settings_destination(dest)
+    target.unlink(missing_ok=True)
+    descriptor = os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    try:
+        # A buffered writer rather than a bare `os.write`, which is permitted
+        # to take fewer bytes than it was given: an unchecked short write here
+        # is a backup of a truncated settings file that looks like a backup.
+        with open(descriptor, "wb", closefd=False) as handle:
+            handle.write(origin.read_bytes())
+    finally:
+        os.close(descriptor)
+    return str(target)
+
+
+def _settings_source(source: Path) -> Path | None:
+    """The graph's ``settings.env``, or ``None`` when it has none."""
+    try:
+        origin = settings.settings_path(source)
+    except settings.SettingRefused:
+        return None
+    return origin if origin.is_file() else None
+
+
+def _settings_destination(dest: Path) -> Path:
+    """Where the settings copy goes, refusing an occupied one.
+
+    Split out so the refusal can be made **before** ``VACUUM INTO`` runs.
+    Raised afterwards, it left the database copy written, printed no JSON, and
+    exited 1 — a backup that half happened and reported nothing about the half
+    that did.
+
+    Raises:
+        ValueError: If the settings destination already exists and is not
+            empty — the same refusal the database half makes.
+    """
+    target = dest.with_name(f"{dest.name}.{settings.SETTINGS_FILENAME}")
+    if target.exists() and target.stat().st_size > 0:
+        raise ValueError(f"settings destination already exists and is not empty: {target}")
+    return target
+
+
+def _backup_to(destination: str, path: str | None) -> dict[str, str | int | None]:
     """Write a consistent snapshot of the graph to ``destination``.
 
     ``VACUUM INTO`` copies the source as one consistent snapshot, folding
@@ -370,10 +461,14 @@ def _backup_to(destination: str, path: str | None) -> dict[str, str | int]:
     DML opens an implicit DEFERRED transaction (``isolation_level`` is ``""``),
     never a bare ``SELECT`` or ``PRAGMA``.
 
+    The graph's ``settings.env``, when it has one, is copied beside the backup
+    as ``<destination>.settings.env`` and reported in ``settings`` — see
+    :func:`_copy_settings_beside`.
+
     Raises:
         ValueError: If the source database does not exist, if the destination
-            resolves to the source file itself, or if the destination already
-            exists and is not empty.
+            resolves to the source file itself, or if either destination
+            already exists and is not empty.
     """
     source = db.db_path() if path is None else Path(path).expanduser()
     if not source.is_file():
@@ -383,6 +478,11 @@ def _backup_to(destination: str, path: str | None) -> dict[str, str | int]:
         raise ValueError(f"destination is the source database itself: {dest}")
     if dest.exists() and dest.stat().st_size > 0:
         raise ValueError(f"destination already exists and is not empty: {dest}")
+    # Both refusals happen before either copy: a backup either runs or does
+    # not, and one that wrote the database and then refused the settings left
+    # the caller with a file it had said nothing about.
+    if _settings_source(source) is not None:
+        _settings_destination(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
     conn = db.connect(source)
     try:
@@ -391,7 +491,12 @@ def _backup_to(destination: str, path: str | None) -> dict[str, str | int]:
         conn.close()
     with sqlite3.connect(str(dest)) as check:
         integrity = check.execute("PRAGMA integrity_check").fetchone()[0]
-    return {"destination": str(dest), "bytes": dest.stat().st_size, "integrity": integrity}
+    return {
+        "destination": str(dest),
+        "bytes": dest.stat().st_size,
+        "integrity": integrity,
+        "settings": _copy_settings_beside(source, dest),
+    }
 
 
 @app.command("backup")
@@ -401,7 +506,7 @@ def backup(
         None, "--path", help=f"Source graph path (defaults to ${ENV_DB_VAR})."
     ),
 ) -> None:
-    """Write a consistent snapshot of the graph to another file (VACUUM INTO)."""
+    """Snapshot the graph to another file (VACUUM INTO), settings.env beside it."""
     _print_json(_run(_backup_to, destination, path))
 
 
@@ -1378,6 +1483,72 @@ def ingest_handlers() -> None:
 # launched it, which is the constraint the unified server exists to lift.
 
 
+# ── Configuration (the settings file beside the graph) ───────────────────────
+
+
+def _record_settings_change(op: str, change: settings.Change, principal: Principal) -> None:
+    """Log an accepted settings write, when it actually changed the file.
+
+    The event goes in **after** the file is replaced, and that ordering cannot
+    be made atomic: the file is not a row, so no transaction spans both. The
+    honest failure is therefore a written file with no event, which a reader
+    sees as a value whose provenance is ``settings.env`` and no event behind it
+    — the same shape a hand-edit leaves, and the reason the log is not the only
+    record of what is in force.
+
+    A verb that changed nothing writes nothing: setting a key to what it
+    already held is the state the caller asked for, and a log of no-ops is a
+    log that is harder to read for the changes in it.
+
+    **The caller is told what the file holds before this runs**, which is
+    ``_emit_batch``'s rule for the same reason: the write already happened, so
+    a database error here must not turn it into a command that reports nothing.
+    The envelope is on stdout first; a failed event is then one line on stderr
+    and exit 1, over a stdout that still says truthfully what is in force.
+    """
+    if change.changed:
+        service.record_settings_event(op, change.event_payload(), principal=principal)
+
+
+@config_app.command("list")
+def config_list() -> None:
+    """List every setting: what is in force, where it came from, whether it can be stored."""
+    _emit(_run(settings.list_settings))
+
+
+@config_app.command("get")
+def config_get(
+    key: str = typer.Argument(..., help="The setting's name, e.g. NODUM_LLM_MODEL."),
+) -> None:
+    """Report one setting. A secret answers whether it is set, never with its value."""
+    _emit(_run(settings.get_setting, key))
+
+
+@config_app.command("set")
+def config_set(
+    key: str = typer.Argument(..., help="The setting's name, e.g. NODUM_LLM_MODEL."),
+    value: str = typer.Argument(..., help="The value to store."),
+    as_human: str = AS_OPTION,
+) -> None:
+    """Store one setting in settings.env (refused when the environment pins it)."""
+    principal = _principal(as_human)
+    change = _run(settings.set_value, key, value)
+    _emit(_run(settings.describe_change, change))
+    _run(_record_settings_change, "settings.set", change, principal)
+
+
+@config_app.command("unset")
+def config_unset(
+    key: str = typer.Argument(..., help="The setting's name, e.g. NODUM_LLM_MODEL."),
+    as_human: str = AS_OPTION,
+) -> None:
+    """Remove one setting from settings.env, falling back to the default."""
+    principal = _principal(as_human)
+    change = _run(settings.unset_value, key)
+    _emit(_run(settings.describe_change, change))
+    _run(_record_settings_change, "settings.unset", change, principal)
+
+
 # ── HTTP server (the human and agent surfaces) ───────────────────────────────
 
 #: Default port for ``nodum serve``. The frontend dev server proxies ``/api``
@@ -1446,6 +1617,10 @@ def serve(
     from nodum import http_api, mcp_server, scheduler
 
     resolved_db = Path(db_path) if db_path is not None else db.db_path()
+    # This command's `--db` never reaches the environment, so the settings file
+    # has to be pointed at the graph *this* server is about to open — before
+    # the banner below reads the schedule through it.
+    settings.bind(resolved_db)
     loopback = http_api.bare_host(host) in http_api.LOOPBACK_BIND_ADDRESSES
     # The bind is the default answer, not the answer: a proxied server is plain
     # HTTP on a possibly-loopback socket and still needs `Secure`.
@@ -1462,22 +1637,22 @@ def serve(
         "registered there.",
         err=True,
     )
-    try:
-        consolidate_at = scheduler.configured_time()
-    except ValueError:
-        # An unparseable value is announced by `create_app`, which is also what
-        # decides to start without a schedule. Saying it twice, in two voices,
-        # is worse than saying it once where the decision is made.
-        consolidate_at = None
-    if consolidate_at is not None:
+    # An unparseable value is announced by `create_app`, which is also what
+    # decides to start without a schedule. Saying it twice, in two voices, is
+    # worse than saying it once where the decision is made — so this reports
+    # only a schedule that is on.
+    consolidation = scheduler.schedule()
+    if consolidation.at is not None:
         # The *successful* configuration is the one that matters more, and it
         # was the silent one: a typo got a warning while the setting that
         # actually starts a background writer on the human's graph produced
-        # nothing at all on the console.
+        # nothing at all on the console. The layer is named beside the key
+        # because there are two of them now, and "unset it" is useless advice
+        # if it does not say where.
         typer.echo(
-            f"nightly consolidation cycle: {consolidate_at.strftime('%H:%M')} local time "
-            f"(${scheduler.ENV_CONSOLIDATE_AT}) — the gardener will write to this graph "
-            "unasked; unset it to turn the schedule off.",
+            f"nightly consolidation cycle: {consolidation.at.strftime('%H:%M')} local time "
+            f"({scheduler.ENV_CONSOLIDATE_AT}, from {consolidation.source}) — the gardener "
+            "will write to this graph unasked; unset it to turn the schedule off.",
             err=True,
         )
     if not loopback and not proxied:

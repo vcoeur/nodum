@@ -47,7 +47,6 @@ decode (finding M28). All three cuts are reported in ``detail`` too.
 from __future__ import annotations
 
 import codecs
-import os
 import re
 import shutil
 from collections.abc import Callable
@@ -56,7 +55,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import Protocol
 
-from nodum import assets
+from nodum import assets, settings
 from nodum.models import HandlerStatus
 
 #: Largest extracted text kept from one asset.
@@ -659,11 +658,17 @@ class AudioHandler(_BaseHandler):
             WhisperModel,
         )
 
+        # Read through the settings seam, so both halves answer to the
+        # environment *and* to `settings.env`. The model name used to be read
+        # with a two-argument `os.environ.get`, which made an exported-but-empty
+        # variable the model name `""` rather than the default — the deployed
+        # compose renders exactly that shape for six of its variables.
+        config = settings.snapshot()
         model = WhisperModel(
-            os.environ.get(ENV_AUDIO_MODEL_VAR, AUDIO_MODEL),
+            config.value(settings.AUDIO_MODEL) or AUDIO_MODEL,
             device="cpu",
             compute_type="int8",
-            local_files_only=os.environ.get(ENV_AUDIO_DOWNLOAD_VAR) != "1",
+            local_files_only=config.value(settings.AUDIO_DOWNLOAD) != "1",
         )
         segments, _info = model.transcribe(str(source))
         text = " ".join(segment.text.strip() for segment in segments)

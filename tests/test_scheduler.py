@@ -23,6 +23,7 @@ import logging
 import os
 import threading
 import time as time_module
+from collections.abc import Callable
 from contextlib import contextmanager
 from datetime import UTC, date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
@@ -31,7 +32,7 @@ import pytest
 from helpers import owner
 from typer.testing import CliRunner
 
-from nodum import cli, consolidate, http_api, scheduler, service
+from nodum import cli, consolidate, http_api, scheduler, service, settings
 from nodum.migrations import GARDENER_AGENT_ID
 
 #: The name the loop task carries, so the lifespan tests can find it in
@@ -89,8 +90,14 @@ class _FakeRunner:
         signal_after: int = 1,
         fail_on: tuple[int, ...] = (),
         busy_on: tuple[int, ...] = (),
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.calls: list[dict] = []
+        #: The virtual moment of each call. Since the loop sleeps in slices, the
+        #: delays it asked for are no longer a readable record of the schedule
+        #: it kept — *when it ran* is, and it is the property anyway.
+        self.moments: list[datetime] = []
+        self._clock = clock
         self.concurrent = 0
         self.max_concurrent = 0
         self.reached = threading.Event()
@@ -103,6 +110,8 @@ class _FakeRunner:
     def __call__(self, **kwargs: object) -> None:
         with self._lock:
             self.calls.append(kwargs)
+            if self._clock is not None:
+                self.moments.append(self._clock())
             index = len(self.calls)
             self.concurrent += 1
             self.max_concurrent = max(self.max_concurrent, self.concurrent)
@@ -132,11 +141,22 @@ async def _await_flag(flag: threading.Event, timeout: float = FLAG_TIMEOUT) -> N
     assert await loop.run_in_executor(None, flag.wait, timeout), "the scheduler never got there"
 
 
-def _scheduler(virtual: _VirtualTime, runner: _FakeRunner, at: time = time(3, 0)):
-    """A scheduler wired to virtual time and a fake runner."""
+def _scheduler(virtual, runner, at: time | None = time(3, 0)):
+    """A scheduler wired to virtual time and a fake runner.
+
+    ``at`` given **pins** the schedule, which is what every test below wants:
+    the schedule under test is the one the test named, not whatever the ambient
+    configuration says. ``None`` leaves it reading the settings seam, which is
+    what the liveness tests drive.
+    """
     return scheduler.ConsolidationScheduler(
         at=at, sleep=virtual.sleep, clock=virtual.clock, run=runner
     )
+
+
+def _nights(runner: _FakeRunner) -> list[str]:
+    """The virtual moments a runner was called at, as ``YYYY-MM-DD HH:MM``."""
+    return [moment.strftime("%Y-%m-%d %H:%M") for moment in runner.moments]
 
 
 # ── The next occurrence ───────────────────────────────────────────────────────
@@ -296,7 +316,7 @@ def test_a_misconfigured_schedule_is_announced_and_the_server_still_starts(monke
 
     It must not be silent either — that is the failure nobody notices for a
     month — so it is a warning on the console beside the banners ``nodum serve``
-    already prints, and the app is built with no schedule at all.
+    already prints, and the app starts with the schedule off.
     """
     monkeypatch.setenv(scheduler.ENV_CONSOLIDATE_AT, "half past three")
 
@@ -305,7 +325,9 @@ def test_a_misconfigured_schedule_is_announced_and_the_server_still_starts(monke
 
     assert scheduler.ENV_CONSOLIDATE_AT in caplog.text
     assert "off" in caplog.text
-    assert asyncio.run(_lifespan_task_names(app)) == set()
+    # The task exists — it always does now — and has nothing to do.
+    assert TASK_NAME in asyncio.run(_lifespan_task_names(app))
+    assert scheduler.schedule().at is None
 
 
 def test_a_configured_schedule_is_announced_by_the_serve_banner(fresh_db, monkeypatch):
@@ -325,6 +347,22 @@ def test_a_configured_schedule_is_announced_by_the_serve_banner(fresh_db, monkey
     assert result.exit_code == 0, result.output
     assert "nightly consolidation cycle: 03:30 local time" in result.stderr
     assert scheduler.ENV_CONSOLIDATE_AT in result.stderr
+    # And which of the two layers holds it: "unset it to turn the schedule off"
+    # is advice a reader cannot act on without being told where it is set.
+    assert "from the environment" in result.stderr
+
+
+def test_a_schedule_stored_in_the_settings_file_is_announced_as_such(fresh_db, monkeypatch):
+    """The same banner, naming the other layer."""
+    monkeypatch.delenv(scheduler.ENV_CONSOLIDATE_AT, raising=False)
+    monkeypatch.setattr("uvicorn.run", lambda *args, **kwargs: None)
+    settings.set_value(settings.CONSOLIDATE_AT, "04:15")
+
+    result = CliRunner().invoke(cli.app, ["serve"])
+
+    assert result.exit_code == 0, result.output
+    assert "nightly consolidation cycle: 04:15 local time" in result.stderr
+    assert f"from {settings.SETTINGS_FILENAME}" in result.stderr
 
 
 def test_an_unconfigured_schedule_says_nothing_at_all(fresh_db, monkeypatch):
@@ -361,7 +399,7 @@ def test_a_cycle_runs_once_a_night_and_never_overlaps_itself():
     single-writer database at 3am, with nobody awake to read the lock fight.
     """
     virtual = _VirtualTime(datetime(2026, 7, 27, 12, 0))
-    runner = _FakeRunner(signal_after=3)
+    runner = _FakeRunner(signal_after=3, clock=virtual.clock)
 
     async def drive() -> None:
         nightly = _scheduler(virtual, runner)
@@ -375,8 +413,11 @@ def test_a_cycle_runs_once_a_night_and_never_overlaps_itself():
     asyncio.run(drive())
 
     # Noon to 03:00 is fifteen hours; every night after that is a whole day.
-    assert virtual.delays[0] == 15 * 3600
-    assert virtual.delays[1:3] == [86400.0, 86400.0]
+    # Read off *when it ran* rather than off the delays it asked for: the loop
+    # sleeps in slices now, so the delays are a record of the slicing and the
+    # moments are the record of the schedule.
+    assert _nights(runner) == ["2026-07-28 03:00", "2026-07-29 03:00", "2026-07-30 03:00"]
+    assert max(virtual.delays) <= scheduler.SLICE_SECONDS
     assert runner.max_concurrent == 1
     assert len(runner.calls) == 3
     # Nobody asked — the clock did, and the journal has to say so.
@@ -386,7 +427,7 @@ def test_a_cycle_runs_once_a_night_and_never_overlaps_itself():
 def test_a_crashing_cycle_does_not_stop_the_loop():
     """A bug in the gardener must not take down the server the human is using."""
     virtual = _VirtualTime(datetime(2026, 7, 27, 12, 0))
-    runner = _FakeRunner(signal_after=3, fail_on=(1, 2))
+    runner = _FakeRunner(signal_after=3, fail_on=(1, 2), clock=virtual.clock)
 
     async def drive() -> None:
         nightly = _scheduler(virtual, runner)
@@ -402,7 +443,7 @@ def test_a_crashing_cycle_does_not_stop_the_loop():
 
     assert len(runner.calls) == 3
     # Two nights blew up and the third still ran on schedule.
-    assert virtual.delays[1:3] == [86400.0, 86400.0]
+    assert _nights(runner) == ["2026-07-28 03:00", "2026-07-29 03:00", "2026-07-30 03:00"]
 
 
 def test_a_night_a_human_was_already_consolidating_is_logged_as_a_skip(caplog):
@@ -424,7 +465,7 @@ def test_a_night_a_human_was_already_consolidating_is_logged_as_a_skip(caplog):
     into the line, because "skipped" alone is not actionable.
     """
     virtual = _VirtualTime(datetime(2026, 7, 27, 12, 0))
-    runner = _FakeRunner(signal_after=3, busy_on=(1, 2))
+    runner = _FakeRunner(signal_after=3, busy_on=(1, 2), clock=virtual.clock)
 
     async def drive() -> None:
         nightly = _scheduler(virtual, runner)
@@ -448,7 +489,7 @@ def test_a_night_a_human_was_already_consolidating_is_logged_as_a_skip(caplog):
         assert BUSY_MESSAGE in record.getMessage()
     # And the schedule kept its shape: the third night ran a day after the second.
     assert len(runner.calls) == 3
-    assert virtual.delays[1:3] == [86400.0, 86400.0]
+    assert _nights(runner) == ["2026-07-28 03:00", "2026-07-29 03:00", "2026-07-30 03:00"]
 
 
 def test_a_crash_is_still_a_failure_with_its_traceback(caplog):
@@ -554,17 +595,201 @@ def test_the_lifespan_starts_the_task_and_takes_it_back(monkeypatch):
     assert TASK_NAME not in asyncio.run(drive())
 
 
-def test_an_unconfigured_server_creates_no_background_writer(monkeypatch):
+def test_an_unconfigured_server_starts_the_task_and_it_writes_nothing(monkeypatch):
+    """Off by default is still off — but "off" is an idle loop, not a missing object.
+
+    The task exists whether or not a schedule is configured, and that is the
+    whole of what makes a schedule live: turning the nightly cycle on is a
+    write that the running loop reads at its next slice, with nothing stopped,
+    rebuilt or started. The version that built the object only when configured
+    had no way to turn one on, and the version that stopped and rebuilt it left
+    two schedulers over one database the first time two writes landed together.
+    """
     monkeypatch.delenv(scheduler.ENV_CONSOLIDATE_AT, raising=False)
 
-    assert asyncio.run(_lifespan_task_names(http_api.create_app())) == set()
+    assert TASK_NAME in asyncio.run(_lifespan_task_names(http_api.create_app()))
+    assert scheduler.schedule().at is None, "nothing is scheduled, so nothing runs"
 
 
 def test_the_environment_variable_is_all_it_takes_to_turn_it_on(monkeypatch):
-    """No flag on ``nodum serve``: the app reads the variable when it is built."""
+    """No flag on ``nodum serve``: the app reads the variable through the seam."""
     monkeypatch.setenv(scheduler.ENV_CONSOLIDATE_AT, "03:00")
 
     assert TASK_NAME in asyncio.run(_lifespan_task_names(http_api.create_app()))
+    assert scheduler.schedule() == scheduler.Schedule(at=time(3, 0), source="the environment")
+
+
+def test_a_constructor_argument_pins_the_schedule_against_the_seam(monkeypatch):
+    """The ladder is constructor argument > environment > settings.env > off.
+
+    The pin is what the tests in this file rely on, and what an embedder gets
+    when they build an app with a schedule of their own: a settings write must
+    not move a schedule somebody passed in code.
+    """
+    monkeypatch.setenv(scheduler.ENV_CONSOLIDATE_AT, "23:00")
+    pinned = scheduler.ConsolidationScheduler(at=time(3, 0))
+    reading = scheduler.ConsolidationScheduler()
+
+    assert pinned.at == time(3, 0)
+    assert reading.at == time(23, 0)
+
+    monkeypatch.delenv(scheduler.ENV_CONSOLIDATE_AT)
+    settings.set_value(settings.CONSOLIDATE_AT, "04:15")
+
+    assert pinned.at == time(3, 0)
+    assert reading.at == time(4, 15)
+
+
+# ── Liveness: the schedule changes while the loop is running ──────────────────
+#
+# The D8 class this file owns. `NODUM_CONSOLIDATE_AT` was read once, at app
+# construction, and by nothing afterwards — so a schedule written from a browser
+# or from a second process applied at the next restart and not before. These two
+# drive the change through the store, against a loop that is already running and
+# is never stopped, rebuilt or started.
+
+
+def _writing_clock(virtual: _VirtualTime, actions: dict[int, object]):
+    """A sleep that performs ``actions[n]`` after the *n*-th slice.
+
+    Driving the write from inside the loop's own sleep is what makes these
+    deterministic: the change lands between two slices, at a slice number the
+    test chose, rather than whenever another thread happened to get scheduled.
+    """
+
+    async def sleep(delay: float) -> None:
+        await virtual.sleep(delay)
+        action = actions.pop(len(virtual.delays), None)
+        if action is not None:
+            action()  # pyright: ignore[reportCallIssue] - test callables
+
+    return sleep
+
+
+def test_a_schedule_written_while_the_server_runs_starts_the_nightly_cycle(monkeypatch):
+    """Unset → set, against a loop started with **no** schedule at all.
+
+    Nothing is restarted and no second scheduler exists: the loop re-reads the
+    seam on its next slice and starts counting down to the time that was just
+    stored.
+    """
+    monkeypatch.delenv(scheduler.ENV_CONSOLIDATE_AT, raising=False)
+    virtual = _VirtualTime(datetime(2026, 7, 27, 12, 0))
+    runner = _FakeRunner(signal_after=1, clock=virtual.clock)
+    written: list[int] = []
+
+    def turn_it_on() -> None:
+        written.append(len(virtual.delays))
+        settings.set_value(settings.CONSOLIDATE_AT, "03:00")
+
+    nightly = scheduler.ConsolidationScheduler(
+        sleep=_writing_clock(virtual, {3: turn_it_on}), clock=virtual.clock, run=runner
+    )
+
+    async def drive() -> None:
+        nightly.start()
+        try:
+            await _await_flag(runner.reached)
+            await nightly.stop()
+        finally:
+            runner.release()
+
+    asyncio.run(drive())
+
+    assert written == [3], "the schedule was written after the third idle slice"
+    assert _nights(runner) == ["2026-07-28 03:00"]
+    assert virtual.delays[:3] == [60.0, 60.0, 60.0], "an unset schedule idles a slice at a time"
+
+
+def test_a_loop_held_past_the_scheduled_minute_runs_late_rather_than_skipping(monkeypatch, caplog):
+    """A stalled slice must not lose the night.
+
+    The slice is not a promise that the loop wakes on time — a stalled event
+    loop, a suspended host or a long ``to_thread`` hop can carry it past the
+    scheduled minute. Re-deriving the wait after such a wake asks
+    ``seconds_until`` about *tomorrow*, so the cycle silently does not run at
+    all; the single long sleep this replaced woke late and ran late. Late is
+    the right answer for a nightly sweep, and this asserts both halves: it ran,
+    and the log says it was late.
+    """
+    monkeypatch.delenv(scheduler.ENV_CONSOLIDATE_AT, raising=False)
+    virtual = _VirtualTime(datetime(2026, 7, 28, 2, 57, 30))
+    runner = _FakeRunner(signal_after=1, clock=virtual.clock)
+    stalled: list[int] = []
+
+    async def stalling_sleep(delay: float) -> None:
+        """One slice that overruns by 90 s, right across the scheduled minute."""
+        if not stalled and virtual.now >= datetime(2026, 7, 28, 2, 58, 30):
+            stalled.append(1)
+            await virtual.sleep(delay + 90)
+            return
+        await virtual.sleep(delay)
+
+    nightly = scheduler.ConsolidationScheduler(
+        at=time(3, 0), sleep=stalling_sleep, clock=virtual.clock, run=runner
+    )
+
+    async def drive() -> None:
+        nightly.start()
+        try:
+            await _await_flag(runner.reached)
+            await nightly.stop()
+        finally:
+            runner.release()
+
+    with caplog.at_level(logging.WARNING, logger=scheduler.logger.name):
+        asyncio.run(drive())
+
+    assert stalled == [1], "the test never stalled the loop; it proves nothing"
+    assert len(runner.calls) == 1, "the night was skipped rather than run late"
+    assert runner.moments[0] > datetime(2026, 7, 28, 3, 0), "it should have run *late*"
+    assert runner.moments[0].date() == date(2026, 7, 28), "and on the night it was due"
+    late = [r for r in caplog.records if "late" in r.getMessage()]
+    assert late, "a cycle that started late said nothing about it"
+
+
+def test_a_schedule_removed_while_the_server_runs_stops_the_nightly_cycle(monkeypatch):
+    """Set → unset, and then a whole day passes with nothing run.
+
+    A day is the point: the cycle was due within the hour, and after the unset
+    it does not run then or at any later occurrence — which is what "off" has to
+    mean for a control a human just used.
+    """
+    monkeypatch.delenv(scheduler.ENV_CONSOLIDATE_AT, raising=False)
+    settings.set_value(settings.CONSOLIDATE_AT, "03:00")
+    virtual = _VirtualTime(datetime(2026, 7, 28, 2, 0))
+    runner = _FakeRunner(signal_after=1, clock=virtual.clock)
+    exhausted = threading.Event()
+    #: Slices covering the whole of the next day, so a schedule that was merely
+    #: *delayed* rather than removed would still be caught firing.
+    budget = 26 * 60
+
+    def turn_it_off() -> None:
+        settings.unset_value(settings.CONSOLIDATE_AT)
+
+    def give_up() -> None:
+        exhausted.set()
+
+    nightly = scheduler.ConsolidationScheduler(
+        sleep=_writing_clock(virtual, {2: turn_it_off, budget: give_up}),
+        clock=virtual.clock,
+        run=runner,
+    )
+
+    async def drive() -> None:
+        nightly.start()
+        try:
+            while not exhausted.is_set() and nightly.running:
+                await asyncio.sleep(0)
+        finally:
+            await nightly.stop()
+            runner.release()
+
+    asyncio.run(drive())
+
+    assert exhausted.is_set(), "the loop ended early; it should have idled the whole budget"
+    assert runner.calls == [], "the cycle ran after its schedule was removed"
+    assert virtual.now > datetime(2026, 7, 29, 3, 0), "the clock never passed the next occurrence"
 
 
 # ── End to end: the clock writes a real journal entry ─────────────────────────

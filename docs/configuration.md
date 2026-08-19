@@ -1,15 +1,81 @@
 ---
 title: Configuration · nodum
-description: The environment variables, the serve flags, and the account bootstrap — human passwords, agent tokens, and the grants that make an agent usable.
+description: The settings file, the environment variables, the serve flags, and the account bootstrap — human passwords, agent tokens, and the grants that make an agent usable.
 ---
 
 # Configuration
 
-nodum is configured by environment variables and by the flags of
-`nodum serve`. There is no config file and no settings table in the database.
-The posture is that nothing is on by surprise: no feature that downloads,
-spends, or writes unattended is enabled without an explicit variable, and an
-unset variable means the feature is off — not "on with defaults".
+nodum is configured by **`settings.env`, a file beside the database**, by
+**environment variables**, and by the flags of `nodum serve`. There is no
+settings table in the database. The posture is that nothing is on by surprise:
+no feature that downloads, spends, or writes unattended is enabled without an
+explicit value, and an unset value means the feature is off — not "on with
+defaults".
+
+## Where a value comes from
+
+Three layers, and the one furthest right wins:
+
+```text
+built-in default  <  settings.env  <  environment variable
+```
+
+**Empty is not set, at any layer.** A variable exported as the empty string —
+which is exactly what `${VAR:-}` in a compose file renders when the host `.env`
+says nothing — is *unset*, not "set to nothing", so it does not shadow a stored
+value. Whitespace counts as empty too.
+
+`nodum config list` answers "what is in force and where did it come from" for
+every name, per key: `environment`, `settings.env`, `default`, or `unset`.
+
+### The settings file
+
+`settings.env` lives in the database's own directory (`nodum.db` →
+`settings.env` beside it), so a graph and its configuration move, are backed up
+and are restored together — `nodum backup <dest>` copies it to
+`<dest>.settings.env`. It is created `0600` and can hold the API key, so it is
+readable by its owner and nobody else.
+
+Its dialect is deliberately small, because it is also what an operator edits by
+hand:
+
+- one `KEY=value` per line, LF endings;
+- `#` comment lines and blank lines are kept exactly as written;
+- **no quoting and no escaping** — a value is what is written after the `=`,
+  stripped of surrounding whitespace;
+- a value containing a newline or any other control character is **refused at
+  the write path**, because written verbatim it would be a second `KEY=value`
+  line chosen by whoever supplied the value;
+- keys nodum does not recognise are **kept and reported**, never dropped: they
+  may belong to a newer version, or to the operator.
+
+Every value is **validated before it is written**, so the file never holds
+something the runtime would read back and discard. A file nodum cannot parse is
+reported loudly on startup and stepped around — resolution continues on the
+environment and the defaults, and `nodum config list` reports `unreadable` with
+the reason — and a write against it is refused rather than rewriting a file
+whose other lines cannot be preserved. Editing the file by hand is supported and
+writes no event; `nodum config set` writes one.
+
+### What cannot be stored there
+
+Four names resolve from the environment and the default alone, and
+`nodum config set` refuses them with the reason:
+
+| Variable | Why |
+|---|---|
+| `NODUM_DB` | Read before the graph — and therefore before its settings file — is open. |
+| `NODUM_LLM_BASE_URL` | The endpoint an API key may travel to is a deployment decision. |
+| `NODUM_EMBED_CACHE` | A path on the server's own disk. |
+| `NODUM_PUBLIC_URL` | Every capability URL is minted from it, so a stored value would redirect them. |
+
+`NODUM_EMBED_MODEL` and `NODUM_EMBED_DOWNLOAD` are not on the settings surface
+yet either: changing the model invalidates every stored vector, and resolving a
+new one downloads and loads it. They stay environment variables for now.
+
+A name the environment currently sets is also refused — a stored value would
+never be used, and an accepted-but-inert edit is the failure this whole surface
+exists to avoid. Unset the variable first.
 
 ## Environment variables
 
@@ -58,6 +124,60 @@ wiped cache by rerunning with `NODUM_EMBED_DOWNLOAD=1`.
 | `NODUM_LLM_REQUEST_SECONDS` | `180` (seconds) | The wall-clock ceiling for one human-initiated request. |
 | `NODUM_LLM_CYCLE_BUDGET` | `0` | The token budget one consolidation cycle's LLM jobs may spend. **Unset or 0 means those jobs do not run** — which is the default. Fund the abstraction job by setting a budget; `NODUM_LLM_CYCLE_SECONDS` bounds the same work in wall-clock time. |
 | `NODUM_LLM_CYCLE_SECONDS` | `1800` (seconds) | The per-cycle wall-clock ceiling, independent of the token budget. |
+
+### What a bad value does
+
+Ten of the seventeen names are checked, and `nodum config set` refuses a bad
+value outright — so only a hand-edited `settings.env` or an environment
+variable can carry one past the door. What happens then differs by key, on
+purpose, and `nodum config list` reports which rule applies as `on_invalid`:
+
+- **`fall-back`** — the value is ignored and the default applies. Every budget
+  and ceiling (`NODUM_LLM_CYCLE_BUDGET`, `…_CYCLE_SECONDS`, `…_REQUEST_BUDGET`,
+  `…_REQUEST_SECONDS`, `…_CALL_TIMEOUT`, `…_MAX_OUTPUT_TOKENS`) and the download
+  gate `NODUM_AUDIO_DOWNLOAD`, whose default is off. The fallback is a smaller
+  ceiling, so the worst case is less work.
+- **`refuse`** — there is no provider at all, and `nodum llm status` says why.
+  `NODUM_LLM_THINKING` and `NODUM_LLM_CONTEXT_TOKENS`. A reasoning level the API
+  does not know is not a slower call: it is one the server may accept and not
+  honour, spending tokens under a setting nobody chose.
+- **`off`** — announced on stderr and ignored, and the feature stays off.
+  `NODUM_CONSOLIDATE_AT`; a server that will not boot over a stray character in
+  an optional schedule is worse than one that says what it skipped.
+- **`null`** — nothing checks it, here or at run time, because there is no
+  such thing as an invalid value for it: any non-empty string is accepted.
+  The two model names (`NODUM_LLM_MODEL`, `NODUM_AUDIO_MODEL`), the key
+  (`NODUM_LLM_API_KEY`) and the four paths and URLs. A model name nothing
+  serves is not refused anywhere — it is an HTTP error on the first call, which
+  `nodum llm status` is the way to find before you make one.
+
+## Reading and writing settings
+
+```sh
+nodum config list                                        # every key, value, provenance
+nodum config get NODUM_LLM_MODEL
+nodum config set NODUM_LLM_CYCLE_BUDGET 20000 --as human:owner
+nodum config unset NODUM_LLM_CYCLE_BUDGET --as human:owner
+```
+
+`set` and `unset` name their human like every other write and are recorded in
+the event log as `settings.set` / `settings.unset`, with before and after. They
+are **not** reversible by `undo`: a file outside the database is not something a
+transaction can put back.
+
+A change applies without a restart. The three things that means in practice:
+
+- a **budget** funds the *next* run — an `AgentRun` spans a whole consolidation
+  cycle, so lowering the cycle budget does not stop a cycle already spending
+  (`nodum cycle-stop <id>` is the kill switch);
+- a **model, key, window or reasoning level** applies at the next provider
+  resolution, which is the next call;
+- the **nightly schedule** applies within a minute — the scheduler re-reads it
+  as it sleeps, so turning it on, off, or to another hour needs no restart.
+
+Secrets are never printed. `nodum config get NODUM_LLM_API_KEY` reports
+`"set": true` and no value; the event payload records `set`/`unset` rather than
+what changed.
 
 `nodum llm status` shows what the provider actually resolves to — the model,
 the endpoint, whether a configured key is withheld, the window and the

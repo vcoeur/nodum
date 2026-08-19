@@ -2199,6 +2199,13 @@ def test_an_unanswered_question_is_exit_zero_and_a_stated_refusal(fresh_db):
 
 
 def test_ask_with_no_provider_names_the_variable_to_set(fresh_db, monkeypatch):
+    """And names *both* ways to set it, now that there are two.
+
+    Configuration is a ladder — `default < settings.env < environment` — so a
+    refusal that named only the variable would send a reader to the layer they
+    happen to think of first, which is exactly how an operator ends up setting a
+    value in the one that loses.
+    """
     monkeypatch.delenv(llm.ENV_MODEL, raising=False)
     llm.reset_provider()
     _seed_note(fresh_db)
@@ -2207,6 +2214,7 @@ def test_ask_with_no_provider_names_the_variable_to_set(fresh_db, monkeypatch):
 
     assert payload["answered"] is False
     assert "NODUM_LLM_MODEL" in payload["refusal"]
+    assert "nodum config set" in payload["refusal"]
 
 
 def test_a_blank_question_is_one_line_on_stderr_and_exit_one(fresh_db):
@@ -2382,6 +2390,12 @@ NOT_COMMANDS = frozenset(
         "deepseek-r1",
         "deepseek-v2",
         "deepseek-v3",
+        # the two settings vocabularies: where a value in force came from, and
+        # what the runtime does with one it cannot use. Both are values a
+        # `nodum config list` row carries, and both are shaped exactly like a
+        # verb.
+        "fall-back",
+        "file-unreadable",
         "faster-whisper",  # the audio extra's package
         "no-store",  # a Cache-Control directive
         "not-found",  # a title-resolution outcome value, not a verb

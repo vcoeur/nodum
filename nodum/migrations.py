@@ -257,7 +257,10 @@ ASSETS_DDL = """
 -- `asset_blobs` holds the bytes under the same sha256 key. Splitting them
 -- keeps metadata queries and FTS off blob overflow pages (and leaves the door
 -- open to ATTACHing the bytes out to a second file if scale ever demanded it),
--- while `DB = everything` still holds for backup and restore. Asset bytes have
+-- while `DB = everything` still holds for the *graph*: every row, version,
+-- event and byte of it. The one thing outside the file is `settings.env`, which
+-- is configuration rather than graph and which `nodum backup` copies alongside
+-- (see docs/deploy.md#backups). Asset bytes have
 -- never lived on the filesystem: there is no `path` column anywhere here, so
 -- no asset can be stranded by a later move. `extracted_text` stays NULL until
 -- the Phase-4 ingestion pipeline fills it. Registration is idempotent

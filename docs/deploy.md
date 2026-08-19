@@ -189,8 +189,22 @@ committed rows still live in the `-wal` companion file into the copy — a
 plain `cp` of the `.db` while a connection is open can strand them. It
 refuses to overwrite an existing non-empty destination and reports
 `PRAGMA integrity_check` on the result, so a scheduled run can check the
-output rather than trust it. Restore is the inverse: stop the server, replace
-the database file (and its `-wal`/`-shm` companions, which belong to the
-same file), start it again. A host cron job running
+output rather than trust it.
+
+**It takes the settings with it.** Configuration stored through
+`nodum config set` lives in `settings.env` beside the database, so `backup`
+copies that file to `<dest>.settings.env` at `0600` and names it in the
+result's `settings` field (`null` when the graph has none). Without that, a
+by-the-book restore would put the graph back and silently revert every setting
+the operator ever stored — the LLM API key included.
+
+Restore is the inverse, and it is now **two** files: stop the server, replace
+the database file (and its `-wal`/`-shm` companions, which belong to the same
+file), put `<dest>.settings.env` back as `settings.env` beside it, start it
+again. Copy it with the mode intact (`install -m 600`, or `cp` followed by
+`chmod 600`) — it can hold a credential. A restore that skips it is not wrong,
+it is a restore to the *defaults* for everything the environment does not set.
+
+A host cron job running
 `docker compose exec nodum nodum backup /data/backup-$(date +%F).db`
 against the bind-mounted directory is the whole schedule.

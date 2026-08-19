@@ -575,6 +575,38 @@ transcription (`audio`) are optional extras. A missing handler is never fatal:
 the asset is still registered and still described, and the result says plainly
 that no text came out.
 
+### Configuration
+
+- `config list` — Every configurable name with the value in force, where it
+  came from (`environment`, `settings.env`, `default`, `unset`), its default,
+  whether it can be stored, and what the runtime does with a bad value. The
+  envelope also names the settings file, any keys in it this build does not
+  recognise, and why it could not be read when it could not.
+- `config get <KEY>` — One name, same row.
+- `config set <KEY> <VALUE> --as human:<id>` — Store it in `settings.env`.
+  Refused, with the reason, when the name cannot be stored there, when the
+  environment currently sets it (a stored value would never be used), or when
+  the value is one the runtime would discard.
+- `config unset <KEY> --as human:<id>` — Remove it, falling back to the
+  default. Unsetting a name that was never set changes nothing and is not an
+  error.
+
+The two mutating verbs name their human like every other write and are logged
+as `settings.set` / `settings.unset`, with before and after — and **a verb that
+changes nothing writes no event**. They are not reversible by `undo`. A secret
+(`NODUM_LLM_API_KEY`) reports `"set": true` and never its value, on any of the
+four. The layers, the file's dialect, and what a bad value does are in
+[Configuration](configuration.md#where-a-value-comes-from).
+
+### Backups
+
+- `backup <dest>` — A consistent snapshot of the graph (`VACUUM INTO`, which
+  folds the `-wal` companion in), with the graph's `settings.env` copied to
+  `<dest>.settings.env` at `0600` and reported as `settings` (`null` when the
+  graph has none). Restoring the database alone would revert every stored
+  setting, the API key included — the restore procedure is in
+  [Deploy with Docker](deploy.md#backups).
+
 ### Servers
 
 - `serve` — Serve the web UI, the JSON API and the MCP surface: `/`, `/api`
