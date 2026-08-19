@@ -127,14 +127,16 @@ wiped cache by rerunning with `NODUM_EMBED_DOWNLOAD=1`.
 
 ### What a bad value does
 
-The write path validates, so only a hand-edited `settings.env` or an
-environment variable can carry one — and what happens then differs by key, on
-purpose. `nodum config list` reports which rule applies as `on_invalid`:
+Ten of the seventeen names are checked, and `nodum config set` refuses a bad
+value outright — so only a hand-edited `settings.env` or an environment
+variable can carry one past the door. What happens then differs by key, on
+purpose, and `nodum config list` reports which rule applies as `on_invalid`:
 
 - **`fall-back`** — the value is ignored and the default applies. Every budget
   and ceiling (`NODUM_LLM_CYCLE_BUDGET`, `…_CYCLE_SECONDS`, `…_REQUEST_BUDGET`,
-  `…_REQUEST_SECONDS`, `…_CALL_TIMEOUT`, `…_MAX_OUTPUT_TOKENS`). The fallback
-  is a smaller ceiling, so the worst case is less work.
+  `…_REQUEST_SECONDS`, `…_CALL_TIMEOUT`, `…_MAX_OUTPUT_TOKENS`) and the download
+  gate `NODUM_AUDIO_DOWNLOAD`, whose default is off. The fallback is a smaller
+  ceiling, so the worst case is less work.
 - **`refuse`** — there is no provider at all, and `nodum llm status` says why.
   `NODUM_LLM_THINKING` and `NODUM_LLM_CONTEXT_TOKENS`. A reasoning level the API
   does not know is not a slower call: it is one the server may accept and not
@@ -142,6 +144,12 @@ purpose. `nodum config list` reports which rule applies as `on_invalid`:
 - **`off`** — announced on stderr and ignored, and the feature stays off.
   `NODUM_CONSOLIDATE_AT`; a server that will not boot over a stray character in
   an optional schedule is worse than one that says what it skipped.
+- **`null`** — nothing checks it, here or at run time, because there is no
+  such thing as an invalid value for it: any non-empty string is accepted.
+  The two model names (`NODUM_LLM_MODEL`, `NODUM_AUDIO_MODEL`), the key
+  (`NODUM_LLM_API_KEY`) and the four paths and URLs. A model name nothing
+  serves is not refused anywhere — it is an HTTP error on the first call, which
+  `nodum llm status` is the way to find before you make one.
 
 ## Reading and writing settings
 

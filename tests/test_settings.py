@@ -31,9 +31,11 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -268,6 +270,150 @@ def test_the_published_mapping_is_immutable_and_replaced_rather_than_mutated(sto
     assert settings.stored_values() is not first
 
 
+def test_a_generation_is_never_reused_across_a_rebind(tmp_path):
+    """Per-store counters both started at 0, so two graphs reached 1.
+
+    A cache comparing a bare integer — ``nodum.llm``'s does — then saw
+    "unchanged" across a rebind and went on serving the first graph's provider
+    while every other surface had already followed. One counter for the process
+    makes a generation unique to the reading that produced it.
+    """
+    settings.reset()
+    first, second = tmp_path / "a", tmp_path / "b"
+    settings.bind(first / "graph.db")
+    settings.set_value(settings.LLM_MODEL, "from-a")
+    seen = settings.generation()
+
+    settings.bind(second / "graph.db")
+    settings.set_value(settings.LLM_MODEL, "from-b")
+
+    assert settings.resolve(settings.LLM_MODEL) == "from-b"
+    assert settings.generation() != seen, "the second graph reused the first's generation"
+
+
+def test_a_reader_does_not_wait_on_another_process_holding_the_write_lock(store, tmp_path):
+    """The cache lock and the write lock are different locks, and this is why.
+
+    Sharing one made every ``resolve`` wait on whatever process held the file.
+    The readers include the scheduler's slice on the event loop and
+    ``llm.resolution``, which asks while holding its own lock — so one stuck
+    writer stalled the loop and every path to the model behind it.
+    """
+    settings.set_value(settings.LLM_CYCLE_BUDGET, "100")
+    assert settings.resolve(settings.LLM_CYCLE_BUDGET) == "100"
+
+    held, release = tmp_path / "held", tmp_path / "release"
+    child = subprocess.Popen(
+        [sys.executable, "-c", _HOLD_THE_LOCK, str(store) + ".lock", str(release), str(held)]
+    )
+    try:
+        for _ in range(500):
+            if held.exists():
+                break
+            threading.Event().wait(0.01)
+        assert held.exists(), "the child never took the lock"
+
+        started = time.perf_counter()
+        assert settings.resolve(settings.LLM_CYCLE_BUDGET) == "100"
+        elapsed = time.perf_counter() - started
+    finally:
+        release.write_text("go")
+        child.wait(timeout=5)
+
+    assert elapsed < 0.5, f"a read waited {elapsed:.2f}s on a foreign writer's lock"
+
+
+def test_an_unchanged_file_is_stamped_without_being_read(store, monkeypatch):
+    """The published cost sentence, made true rather than restated.
+
+    "One stat per resolution" was three times wrong: the first cut fstat-ed and
+    then read the whole file *before* comparing, so an unchanged resolve cost
+    two reads and the file's bytes.
+    """
+    settings.set_value(settings.LLM_CYCLE_BUDGET, "100")
+    settings.resolve(settings.LLM_CYCLE_BUDGET)
+
+    reads: list[int] = []
+    real_read = os.read
+
+    def counting_read(descriptor: int, length: int) -> bytes:
+        reads.append(descriptor)
+        return real_read(descriptor, length)
+
+    monkeypatch.setattr(os, "read", counting_read)
+    assert settings.resolve(settings.LLM_CYCLE_BUDGET) == "100"
+
+    assert reads == [], "an unchanged file was read rather than only stamped"
+
+
+def test_a_refresh_between_two_loads_cannot_stamp_old_values_as_new(store):
+    """Values and generation come out of one hold of the cache lock.
+
+    Read left to right outside it, a refresh landing between the loads yielded
+    the *old* values under the *new* generation — a cache holding that pair
+    believes it is current forever.
+    """
+    settings.set_value(settings.LLM_CYCLE_BUDGET, "100")
+    first = settings.snapshot()
+    settings.set_value(settings.LLM_CYCLE_BUDGET, "900")
+    second = settings.snapshot()
+
+    assert (first.value(settings.LLM_CYCLE_BUDGET), second.value(settings.LLM_CYCLE_BUDGET)) == (
+        "100",
+        "900",
+    )
+    assert first.generation != second.generation
+    # Every value in a snapshot came from the reading its generation names.
+    again = settings.snapshot()
+    assert again.generation == second.generation
+    assert again.value(settings.LLM_CYCLE_BUDGET) == "900"
+
+
+def test_free_text_keys_report_no_bad_value_posture(store):
+    """There is no invalid value for a key nothing validates, so there is no rule.
+
+    Reporting ``refuse`` against ``NODUM_LLM_MODEL`` described a check that does
+    not exist: any non-empty string is accepted here *and* by the runtime, and a
+    model nothing serves is an HTTP error on the first call.
+    """
+    unchecked = {name for name in settings.KEYS if settings.SPECS[name].validate is settings._text}
+    assert unchecked == {
+        settings.DB,
+        settings.PUBLIC_URL,
+        settings.LLM_MODEL,
+        settings.LLM_BASE_URL,
+        settings.LLM_API_KEY,
+        settings.EMBED_CACHE,
+        settings.AUDIO_MODEL,
+    }
+    for name in settings.KEYS:
+        posture = settings.SPECS[name].on_invalid
+        assert (posture is None) == (name in unchecked), name
+
+    rows = {row.key: row.on_invalid for row in settings.list_settings().settings}
+    assert {name for name, posture in rows.items() if posture is None} == unchecked
+
+
+def test_a_schedule_carrying_a_utc_offset_is_refused(store):
+    """``time.fromisoformat`` takes ``03:30+05:00``; a local wall clock does not.
+
+    The scheduler reads the result as local wall time — the one thing an offset
+    says it is not — so the cycle would run at 03:30 local under a setting
+    asking for 03:30 elsewhere.
+    """
+    with pytest.raises(settings.SettingRefused, match="no UTC offset"):
+        settings.set_value(settings.CONSOLIDATE_AT, "03:30+05:00")
+
+    assert not store.exists()
+
+
+def test_a_key_the_file_repeats_is_reported_once(store):
+    """The message is a list of names, and a name said twice reads as two problems."""
+    store.write_text("NODUM_FUTURE=a\nNODUM_FUTURE=b\nNODUM_OTHER=c\n", encoding="utf-8")
+
+    assert settings.list_settings().unknown_keys == ["NODUM_FUTURE", "NODUM_OTHER"]
+
+
 # ── The dialect ───────────────────────────────────────────────────────────────
 
 
@@ -378,6 +524,24 @@ def test_the_temp_file_is_made_in_the_same_directory_and_leaves_nothing_behind(s
         "settings.env",
         "settings.env.lock",
     ]
+
+
+def test_a_write_creates_the_data_directory_rather_than_failing_on_the_lockfile(tmp_path):
+    """A fresh install can store a setting before the graph exists.
+
+    The lock is taken first, so a directory that does not exist yet failed on
+    the *lockfile* with a bare ``FileNotFoundError`` before anything could
+    create it.
+    """
+    settings.reset()
+    fresh = tmp_path / "not-yet" / "deeper"
+    settings.bind(fresh / "graph.db")
+
+    settings.set_value(settings.LLM_CYCLE_BUDGET, "900")
+
+    assert (fresh / settings.SETTINGS_FILENAME).read_text(encoding="utf-8").strip() == (
+        f"{settings.LLM_CYCLE_BUDGET}=900"
+    )
 
 
 def test_two_threads_writing_different_keys_lose_nothing(store):
@@ -727,8 +891,72 @@ def test_the_stored_api_key_never_reaches_a_surface(store, fresh_db):
         "writable": True,
         "refusal": None,
         "stored": True,
-        "on_invalid": settings.ON_INVALID_REFUSE,
+        # Free text: there is no invalid value for it, so there is no posture
+        # to report. A wrong key is a 401 from the endpoint, not a refusal here.
+        "on_invalid": None,
     }
+
+
+def test_a_malformed_line_is_never_quoted_into_a_log_or_a_message(store, caplog):
+    """The blocker: the likeliest hand-edit in this file carries the API key.
+
+    ``export NODUM_LLM_API_KEY=sk-…`` is a habit carried over from a shell
+    profile, and its space breaks the key shape — so the line that fails most
+    often is exactly the one holding the credential. Quoting it published the
+    key twice over: at ERROR into the container's unrotated log, and through
+    the CLI's error boundary onto the operator's terminal.
+    """
+    store.write_text(f"export {settings.LLM_API_KEY}={SECRET}\n", encoding="utf-8")
+
+    with caplog.at_level("DEBUG", logger="nodum.settings"):
+        assert settings.resolve(settings.LLM_API_KEY) is None
+
+    assert settings.unreadable_reason() is not None
+    assert SECRET not in caplog.text
+    assert SECRET not in (settings.unreadable_reason() or "")
+    # And the write path's refusal, which carries the same text to stderr.
+    with pytest.raises(settings.SettingsFileUnreadable) as refusal:
+        settings.set_value(settings.LLM_CYCLE_BUDGET, "900")
+    assert SECRET not in str(refusal.value)
+    assert "line 1" in str(refusal.value)
+
+
+def test_a_malformed_line_still_names_the_key_when_it_can_be_read_safely(store):
+    """Redaction must not cost the reader the one thing they need to fix it.
+
+    ``export KEY=value`` is the one shape where the key is recoverable without
+    guessing, so it is named and its value is not. A line with no ``=`` names
+    nothing: no part of it is known not to be a value.
+    """
+    store.write_text(f"export {settings.LLM_MODEL}=qwen3:8b\n", encoding="utf-8")
+    settings.resolve(settings.LLM_MODEL)
+    named = settings.unreadable_reason() or ""
+    assert "line 1" in named
+    assert settings.LLM_MODEL in named
+    assert "qwen3:8b" not in named
+
+    settings.reset()
+    settings.bind(store.parent / "graph.db")
+    store.write_text("NODUM_LLM_MODEL qwen3:8b\n", encoding="utf-8")
+    settings.resolve(settings.LLM_MODEL)
+    silent = settings.unreadable_reason() or ""
+    assert "line 1" in silent
+    assert "qwen3:8b" not in silent
+
+
+def test_the_secret_survives_no_path_out_of_a_malformed_file_through_the_cli(store, fresh_db):
+    """The sweep, over the malformed-file case rather than the well-formed one."""
+    store.write_text(f"export {settings.LLM_API_KEY}={SECRET}\n", encoding="utf-8")
+
+    for command in (
+        ["config", "list"],
+        ["config", "get", settings.LLM_API_KEY],
+        ["config", "set", settings.LLM_CYCLE_BUDGET, "900", "--as", "owner"],
+        ["config", "unset", settings.LLM_CYCLE_BUDGET, "--as", "owner"],
+    ):
+        result = runner.invoke(cli.app, command)
+        assert SECRET not in result.stdout, command
+        assert SECRET not in result.stderr, command
 
 
 def test_a_refusal_about_a_secret_does_not_quote_the_secret(store):
@@ -844,6 +1072,54 @@ def test_backup_carries_the_settings_file_beside_the_database(store, fresh_db, t
     copied = Path(payload["settings"])
     assert copied.read_text(encoding="utf-8") == store.read_text(encoding="utf-8")
     assert copied.stat().st_mode & 0o777 == 0o600
+
+
+def test_backup_refuses_an_occupied_settings_destination_before_copying_anything(
+    store, fresh_db, tmp_path
+):
+    """A backup either runs or does not.
+
+    The refusal used to be raised *after* ``VACUUM INTO``, so an occupied
+    ``<dest>.settings.env`` left the database copy written, printed no JSON and
+    exited 1 — a backup that half happened and reported nothing about the half
+    that did.
+    """
+    settings.set_value(settings.LLM_API_KEY, SECRET)
+    destination = tmp_path / "backups" / "graph.db"
+    destination.parent.mkdir(parents=True)
+    occupied = destination.with_name(f"{destination.name}.{settings.SETTINGS_FILENAME}")
+    occupied.write_text("someone else's file\n", encoding="utf-8")
+
+    result = runner.invoke(cli.app, ["backup", str(destination)])
+
+    assert result.exit_code == 1
+    assert result.stdout.strip() == ""
+    assert not destination.exists(), "the database was copied before the refusal"
+    assert occupied.read_text(encoding="utf-8") == "someone else's file\n"
+
+
+def test_config_set_reports_the_write_before_it_logs_it(store, fresh_db, monkeypatch):
+    """The write already happened, so a failed event must not swallow the answer.
+
+    ``_emit_batch``'s rule, for the same reason: the envelope goes to stdout
+    before the exit code is decided. A database error while logging is one line
+    on stderr and exit 1, over a stdout that still says truthfully what the file
+    now holds.
+    """
+
+    def refuse(*args: object, **kwargs: object) -> int:
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(service, "record_settings_event", refuse)
+
+    result = runner.invoke(
+        cli.app, ["config", "set", settings.LLM_CYCLE_BUDGET, "900", "--as", "owner"]
+    )
+
+    assert result.exit_code == 1
+    assert json.loads(result.stdout)["value"] == "900"
+    assert settings.resolve(settings.LLM_CYCLE_BUDGET) == "900"
+    assert result.stderr.strip() != ""
 
 
 def test_a_backup_of_a_graph_with_no_settings_file_says_so_rather_than_inventing_one(

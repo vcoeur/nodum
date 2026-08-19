@@ -1003,7 +1003,10 @@ class SettingOut(BaseModel):
     ``writable`` false means the file layer is not consulted for this name at
     all and ``refusal`` is the sentence to show instead of an editor;
     ``on_invalid`` names what the runtime does with a value it cannot use, which
-    only a hand-edit can produce because the write path validates ahead of it.
+    only a hand-edit can produce because the write path validates ahead of it —
+    and is **``None`` for a free-text key**, which has no invalid value to have
+    a posture about. A model name nothing serves is not rejected anywhere; it
+    is an HTTP error on the first call.
     """
 
     key: str
@@ -1016,7 +1019,7 @@ class SettingOut(BaseModel):
     writable: bool
     refusal: str | None
     stored: bool
-    on_invalid: str
+    on_invalid: str | None
 
 
 class SettingsOut(BaseModel):

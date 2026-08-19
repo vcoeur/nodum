@@ -406,22 +406,48 @@ def _copy_settings_beside(source: Path, dest: Path) -> str | None:
             empty — the same refusal the database half makes, for the same
             reason.
     """
+    origin = _settings_source(source)
+    if origin is None:
+        return None
+    target = _settings_destination(dest)
+    target.unlink(missing_ok=True)
+    descriptor = os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    try:
+        # A buffered writer rather than a bare `os.write`, which is permitted
+        # to take fewer bytes than it was given: an unchecked short write here
+        # is a backup of a truncated settings file that looks like a backup.
+        with open(descriptor, "wb", closefd=False) as handle:
+            handle.write(origin.read_bytes())
+    finally:
+        os.close(descriptor)
+    return str(target)
+
+
+def _settings_source(source: Path) -> Path | None:
+    """The graph's ``settings.env``, or ``None`` when it has none."""
     try:
         origin = settings.settings_path(source)
     except settings.SettingRefused:
         return None
-    if not origin.is_file():
-        return None
+    return origin if origin.is_file() else None
+
+
+def _settings_destination(dest: Path) -> Path:
+    """Where the settings copy goes, refusing an occupied one.
+
+    Split out so the refusal can be made **before** ``VACUUM INTO`` runs.
+    Raised afterwards, it left the database copy written, printed no JSON, and
+    exited 1 — a backup that half happened and reported nothing about the half
+    that did.
+
+    Raises:
+        ValueError: If the settings destination already exists and is not
+            empty — the same refusal the database half makes.
+    """
     target = dest.with_name(f"{dest.name}.{settings.SETTINGS_FILENAME}")
     if target.exists() and target.stat().st_size > 0:
         raise ValueError(f"settings destination already exists and is not empty: {target}")
-    target.unlink(missing_ok=True)
-    descriptor = os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    try:
-        os.write(descriptor, origin.read_bytes())
-    finally:
-        os.close(descriptor)
-    return str(target)
+    return target
 
 
 def _backup_to(destination: str, path: str | None) -> dict[str, str | int | None]:
@@ -452,6 +478,11 @@ def _backup_to(destination: str, path: str | None) -> dict[str, str | int | None
         raise ValueError(f"destination is the source database itself: {dest}")
     if dest.exists() and dest.stat().st_size > 0:
         raise ValueError(f"destination already exists and is not empty: {dest}")
+    # Both refusals happen before either copy: a backup either runs or does
+    # not, and one that wrote the database and then refused the settings left
+    # the caller with a file it had said nothing about.
+    if _settings_source(source) is not None:
+        _settings_destination(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
     conn = db.connect(source)
     try:
@@ -1468,6 +1499,12 @@ def _record_settings_change(op: str, change: settings.Change, principal: Princip
     A verb that changed nothing writes nothing: setting a key to what it
     already held is the state the caller asked for, and a log of no-ops is a
     log that is harder to read for the changes in it.
+
+    **The caller is told what the file holds before this runs**, which is
+    ``_emit_batch``'s rule for the same reason: the write already happened, so
+    a database error here must not turn it into a command that reports nothing.
+    The envelope is on stdout first; a failed event is then one line on stderr
+    and exit 1, over a stdout that still says truthfully what is in force.
     """
     if change.changed:
         service.record_settings_event(op, change.event_payload(), principal=principal)
@@ -1496,8 +1533,8 @@ def config_set(
     """Store one setting in settings.env (refused when the environment pins it)."""
     principal = _principal(as_human)
     change = _run(settings.set_value, key, value)
-    _run(_record_settings_change, "settings.set", change, principal)
     _emit(_run(settings.describe_change, change))
+    _run(_record_settings_change, "settings.set", change, principal)
 
 
 @config_app.command("unset")
@@ -1508,8 +1545,8 @@ def config_unset(
     """Remove one setting from settings.env, falling back to the default."""
     principal = _principal(as_human)
     change = _run(settings.unset_value, key)
-    _run(_record_settings_change, "settings.unset", change, principal)
     _emit(_run(settings.describe_change, change))
+    _run(_record_settings_change, "settings.unset", change, principal)
 
 
 # ── HTTP server (the human and agent surfaces) ───────────────────────────────

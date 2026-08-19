@@ -353,10 +353,16 @@ value is line injection into the next line), preserves comments and unknown
 keys, and lands the bytes through an `O_EXCL` 0600 temp file in the same
 directory, `fsync`, `os.replace`, `fsync` on the directory — under an in-process
 lock **and** an `flock`, held across the whole read-merge-render-replace span.
-The **read path** stamps the file with `fstat` on the descriptor it read from,
-`(st_dev, st_ino, st_mtime_ns, st_size)` compared with `!=`, and publishes a new
-immutable mapping rather than mutating the live one; a missing file is a state
-and bumps the generation. What the cache saves is the parse, not a syscall.
+The **read path** stamps the file with `fstat` on the descriptor it opened,
+`(st_dev, st_ino, st_mtime_ns, st_size)` compared with `!=` **before** any
+`read`, and publishes a new immutable mapping rather than mutating the live one;
+a missing file is a state and bumps the generation. An unchanged file therefore
+costs one `open` and one `fstat` and nothing else — no `read`, no bytes, no
+parse. The generation is **process-wide**, not per file, so rebinding from one
+graph to another cannot hand two readings the same number. The writer's lock and
+the cache's are **different locks**: the cache's is held only while the view is
+swapped, never across the `flock` wait or the `fsync`s, so a reader never waits
+on a writer — the readers include the scheduler slice on the event loop.
 
 `SECRET_KEYS` and `Change.event_payload()` are the never-serialise contract:
 `NODUM_LLM_API_KEY` reports set/unset and never a value, to a surface or to the

@@ -25,26 +25,37 @@ have put a 0600 file carrying an API key into the developer's real data
 directory.
 
 **One writer at a time, and a write that survives a power cut.** A write takes
-the in-process lock *and* an ``flock`` on a sibling lockfile — flock alone does
-not serialise two threads of one process, and a threading lock does not
-serialise two processes — and holds both across the whole read → merge →
+the in-process ``write_lock`` *and* an ``flock`` on a sibling lockfile — flock
+alone does not serialise two threads of one process, and a threading lock does
+not serialise two processes — and holds both across the whole read → merge →
 render → replace span, with the read coming from the disk rather than from the
 cache. The new bytes are written to an ``O_EXCL`` temp file in the *same*
 directory (a rename across a mount boundary is ``EXDEV``, and the deployment
 bind-mounts ``/data``), created 0600 rather than chmod-ed afterwards, then
 ``fsync``-ed, ``os.replace``-d, and the directory ``fsync``-ed after it. A
 reader therefore sees the old inode or the new one and never a half-written
-file, which is what lets the read path take no lock at all.
+file.
+
+**A reader never waits on a writer.** The writer's lock and the cache's lock
+are different locks, and the cache's is held only while the view is swapped —
+never across the ``flock`` wait, the ``fsync``s or the ``os.replace``. Sharing
+one lock made every ``resolve`` wait on whatever process happened to hold the
+file, measured at 1.8 s, and the readers include the scheduler's slice on the
+event loop and :func:`nodum.llm.resolution`, which asks while holding its own
+lock — so one stuck writer stalled the loop and every path to the model behind
+it.
 
 **The cache is keyed on the file's identity, not on its clock.** The stamp is
 ``(st_dev, st_ino, st_mtime_ns, st_size)`` taken by ``fstat`` on the same
-descriptor the bytes are read from, and compared with ``!=`` rather than
-``>`` — ``os.replace`` gives a new inode whose mtime can be *older* than the
-one it replaced (a file restored from a backup, a coarse-granularity mount),
-and a ``>`` comparison would call that "unchanged" forever. A file that has
-gone missing is an empty store and a generation bump, not "unchanged". What
-the cache saves is the *parse*: the common path still costs one ``stat`` per
-resolution.
+descriptor, and compared with ``!=`` rather than ``>`` — ``os.replace`` gives a
+new inode whose mtime can be *older* than the one it replaced (a file restored
+from a backup, a coarse-granularity mount), and a ``>`` comparison would call
+that "unchanged" forever. A file that has gone missing is an empty store and a
+generation bump, not "unchanged". The comparison happens **before** the read,
+so an unchanged file costs one ``open`` and one ``fstat`` and nothing else: no
+``read``, no bytes, no parse. The generation the comparison feeds is
+process-wide rather than per file, so rebinding from one graph to another
+cannot hand two different readings the same number.
 
 **Secrets are structural.** :data:`SECRET_KEYS` names the values this module
 will not serialise, and the only way to build an event payload for a change is
@@ -63,6 +74,7 @@ whose other lines it cannot promise to preserve.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import re
@@ -147,13 +159,21 @@ FROM_DEFAULT = "default"
 FROM_UNSET = "unset"
 FROM_UNREADABLE = "file-unreadable"
 
-#: What the *runtime* does with a value it cannot use. The two postures already
-#: in the codebase, named per key so a surface and the docs can state which one
+#: What the *runtime* does with a value it cannot use. The postures already in
+#: the codebase, named per key so a surface and the docs can state which one
 #: applies: ``fall-back`` is :mod:`nodum.agent`'s rule (a bad number becomes the
 #: default, because the worst case is less work), ``refuse`` is :mod:`nodum.llm`'s
-#: (a bad name means no provider at all, with a reason), and ``off`` is the
-#: scheduler's (announced and ignored). The write path validates ahead of all
-#: three, so only a hand-edit can reach them.
+#: (a bad reasoning level or window means no provider at all, with a reason),
+#: and ``off`` is the scheduler's (announced and ignored). The write path
+#: validates ahead of all three, so only a hand-edit can reach them.
+#:
+#: A key whose validator is :func:`_text` reports **``None``**, not one of
+#: these. There is no such thing as an invalid value for it — any non-empty
+#: string is accepted here *and* by the runtime, and what happens to a wrong
+#: one happens later and elsewhere: a model name nothing serves is an HTTP
+#: error on the first call, a Whisper size nothing ships raises inside
+#: ``WhisperModel``. Reporting ``refuse`` or ``fall-back`` there described a
+#: check that does not exist.
 ON_INVALID_FALLBACK = "fall-back"
 ON_INVALID_REFUSE = "refuse"
 ON_INVALID_OFF = "off"
@@ -183,13 +203,24 @@ def parse_daily_time(value: str | None) -> time | None:
             a typo means; ``nodum.http_api`` announces it and starts without a
             schedule, because a server that will not boot over a stray character
             in an optional setting is worse than one that says what it ignored.
+
+            A UTC offset is refused too. ``time.fromisoformat`` accepts
+            ``03:30+05:00`` happily, and the scheduler then reads the result as
+            a *local wall clock* — which is the one thing an offset says it is
+            not — so the cycle would run at 03:30 local while its configuration
+            asked for 03:30 somewhere else.
     """
     if value is None or not value.strip():
         return None
     try:
-        return time.fromisoformat(value.strip())
+        parsed = time.fromisoformat(value.strip())
     except ValueError as exc:
         raise ValueError(f"{CONSOLIDATE_AT} must be a 24-hour HH:MM time, got {value!r}") from exc
+    if parsed.tzinfo is not None:
+        raise ValueError(
+            f"{CONSOLIDATE_AT} is a local wall-clock time and takes no UTC offset, got {value!r}"
+        )
+    return parsed
 
 
 def _whole_number(minimum: int) -> Callable[[str, str], str]:
@@ -281,7 +312,23 @@ class Setting:
     secret: bool = False
     writable: bool = True
     refusal: str | None = None
-    on_invalid: str = ON_INVALID_FALLBACK
+    on_invalid: str | None = ON_INVALID_FALLBACK
+
+    def __post_init__(self) -> None:
+        """Refuse a posture on a key that has no check to have a posture about.
+
+        A registry row is what ``nodum config list`` publishes, so a field that
+        can be filled in wrongly is a field that will be — and an operator
+        reading ``refuse`` against a key nothing checks is being told a check
+        exists.
+        """
+        if self.validate is _text and self.on_invalid is not None:
+            raise ValueError(
+                f"{self.name}: a key validated as free text has no invalid value, "
+                f"so on_invalid must be None"
+            )
+        if self.validate is not _text and self.on_invalid is None:
+            raise ValueError(f"{self.name}: a validated key must say what a bad value does")
 
 
 #: Why the four environment-only names cannot be written here. Each is read
@@ -310,7 +357,7 @@ _SPECS: tuple[Setting, ...] = (
         summary="The graph database path.",
         writable=False,
         refusal=_ENV_ONLY_DB,
-        on_invalid=ON_INVALID_REFUSE,
+        on_invalid=None,
     ),
     Setting(
         name=PUBLIC_URL,
@@ -319,7 +366,7 @@ _SPECS: tuple[Setting, ...] = (
         summary="The base URL minted capability URLs are built on.",
         writable=False,
         refusal=_ENV_ONLY_PUBLIC_URL,
-        on_invalid=ON_INVALID_FALLBACK,
+        on_invalid=None,
     ),
     Setting(
         name=CONSOLIDATE_AT,
@@ -334,7 +381,7 @@ _SPECS: tuple[Setting, ...] = (
         kind="string",
         default=None,
         summary="The model name; unset means no provider and no smart features.",
-        on_invalid=ON_INVALID_REFUSE,
+        on_invalid=None,
     ),
     Setting(
         name=LLM_BASE_URL,
@@ -343,7 +390,7 @@ _SPECS: tuple[Setting, ...] = (
         summary="OpenAI-compatible base URL; a shipped profile may supply it.",
         writable=False,
         refusal=_ENV_ONLY_BASE_URL,
-        on_invalid=ON_INVALID_REFUSE,
+        on_invalid=None,
     ),
     Setting(
         name=LLM_API_KEY,
@@ -351,7 +398,7 @@ _SPECS: tuple[Setting, ...] = (
         default=None,
         summary="Bearer token, sent only to an endpoint somebody named.",
         secret=True,
-        on_invalid=ON_INVALID_REFUSE,
+        on_invalid=None,
     ),
     Setting(
         name=LLM_CONTEXT_TOKENS,
@@ -418,13 +465,14 @@ _SPECS: tuple[Setting, ...] = (
         summary="Where embedding model files are cached.",
         writable=False,
         refusal=_ENV_ONLY_EMBED_CACHE,
-        on_invalid=ON_INVALID_FALLBACK,
+        on_invalid=None,
     ),
     Setting(
         name=AUDIO_MODEL,
         kind="string",
         default="base",
         summary="The Whisper model size used for audio transcription.",
+        on_invalid=None,
     ),
     Setting(
         name=AUDIO_DOWNLOAD,
@@ -473,18 +521,56 @@ _MISSING = ("missing",)
 
 
 class _Store:
-    """The cached view of one ``settings.env``, and the lock that guards writing it."""
+    """The cached view of one ``settings.env``, and the two locks that guard it.
+
+    **Two, not one, and the split is the whole point.** ``write_lock`` is held
+    across the read → merge → render → replace span, which includes waiting on
+    another *process*'s ``flock`` and two ``fsync``s. ``cache_lock`` is held
+    only while the cached view is swapped, which is a handful of attribute
+    assignments. A single lock covering both made every *reader* wait on a
+    foreign process's writer: measured at 1.8 s for one ``resolve`` while a
+    child process held the lock — and the readers include the scheduler slice
+    on the event loop and :func:`nodum.llm.resolution`, which holds its own
+    lock while it asks. One stuck writer would have stalled the loop and every
+    path to the model behind it.
+
+    They are always taken in this order — ``write_lock`` then ``cache_lock`` —
+    and never the reverse, so the pair cannot deadlock.
+    """
 
     def __init__(self, path: Path) -> None:
         self.path = path
         self.lock_path = path.with_name(path.name + LOCK_SUFFIX)
-        #: Re-entrant: the write path refreshes the cache while holding it.
-        self.lock = threading.RLock()
+        #: Serialises writers in this process, across the whole write span.
+        self.write_lock = threading.Lock()
+        #: Guards the cached view itself. Short-lived by construction.
+        self.cache_lock = threading.Lock()
         self.stamp: tuple[object, ...] = _NEVER_READ
         self.values: Mapping[str, str] = _EMPTY
         self.unknown: tuple[str, ...] = ()
         self.unreadable: str | None = None
-        self.generation = 0
+        self.generation = _next_generation()
+
+
+#: The generation counter is **process-wide**, not per store.
+#:
+#: Per store it started at 0 for each one, so a process that rebound from one
+#: graph to another produced two stores whose counters both reached 1 — and a
+#: cache comparing a bare integer (``nodum.llm``'s does) saw "unchanged" and
+#: went on serving the first graph's provider while every other surface had
+#: already followed the rebind. Measured. One counter for the process means a
+#: generation is unique to the reading that produced it, whichever file that
+#: was.
+_generation_lock = threading.Lock()
+_generation = 0
+
+
+def _next_generation() -> int:
+    """Take the next process-wide generation number."""
+    global _generation
+    with _generation_lock:
+        _generation += 1
+        return _generation
 
 
 _registry_lock = threading.Lock()
@@ -579,6 +665,42 @@ def _store() -> _Store | None:
 # ── The dialect ──────────────────────────────────────────────────────────────
 
 
+def _describe_bad_line(number: int, line: str) -> str:
+    """Name a malformed line **without quoting it**.
+
+    The line is the one thing in this file that must never reach a message.
+    Quoting it published the value of whatever key it carried to two places at
+    once: :func:`_refresh` logs the refusal at ERROR, into an unrotated
+    container log, and :func:`_write` raises it through the CLI's error
+    boundary onto the operator's terminal. The likeliest malformed line in this
+    file is ``export NODUM_LLM_API_KEY=sk-…`` — a habit carried over from a
+    shell profile, and one whose space breaks :data:`_KEY_SHAPE` — so the shape
+    that fails most often is exactly the one carrying the secret.
+
+    What a reader needs to fix the file is *where* and, when it can be
+    recovered safely, *which key*. Everything from the first ``=`` onwards is
+    dropped unread, and what is left is named only when the **whole** of it is
+    a key — optionally behind the one word that puts it there,
+    ``export``. Naming the last token of the prefix instead would be more
+    generous and wrong: a pasted ``Bearer sk_abc=…`` would have had ``sk_abc``
+    named. A line with no ``=`` at all names nothing, because nothing in it is
+    known not to be a value.
+
+    Args:
+        number: The 1-based line number.
+        line: The offending line. Never echoed.
+
+    Returns:
+        A message naming the line, and the key when one can be read safely.
+    """
+    where = f"{SETTINGS_FILENAME} line {number}"
+    prefix, separator, _value = line.partition("=")
+    candidate = prefix.strip().removeprefix("export ").strip()
+    if separator and _KEY_SHAPE.match(candidate):
+        return f"{where} is not KEY=value (the key reads {candidate!r}; its value is not quoted)"
+    return f"{where} is not KEY=value (the line is not quoted here: it may carry a secret)"
+
+
 def _parse(text: str) -> tuple[dict[str, str], tuple[str, ...]]:
     """Parse ``settings.env`` into its values and the names this build does not know.
 
@@ -597,10 +719,12 @@ def _parse(text: str) -> tuple[dict[str, str], tuple[str, ...]]:
     Raises:
         SettingsFileUnreadable: On a line that is not a comment, blank, or
             ``KEY=value``. A file whose shape is not understood is reported
-            whole rather than half-applied.
+            whole rather than half-applied — but the *line* is never quoted;
+            see :func:`_describe_bad_line`.
     """
     values: dict[str, str] = {}
     unknown: list[str] = []
+    seen_unknown: set[str] = set()
     for number, line in enumerate(text.splitlines(), start=1):
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
@@ -608,12 +732,14 @@ def _parse(text: str) -> tuple[dict[str, str], tuple[str, ...]]:
         key, separator, raw = line.partition("=")
         key = key.strip()
         if not separator or not _KEY_SHAPE.match(key):
-            raise SettingsFileUnreadable(
-                f"{SETTINGS_FILENAME} line {number} is not KEY=value: {line!r}"
-            )
+            raise SettingsFileUnreadable(_describe_bad_line(number, line))
         value = raw.strip()
         if key not in SPECS:
-            unknown.append(key)
+            # Reported once however many times the file repeats it: the message
+            # is a list of names, and a name said twice reads as two problems.
+            if key not in seen_unknown:
+                seen_unknown.add(key)
+                unknown.append(key)
             continue
         if value:
             values[key] = value
@@ -661,23 +787,33 @@ def _render(text: str, name: str, value: str | None) -> str:
 # ── Reading ──────────────────────────────────────────────────────────────────
 
 
-def _read_bytes(path: Path) -> tuple[tuple[object, ...], bytes]:
-    """Read a file and stamp it from the *same* descriptor.
+def _read_if_changed(
+    path: Path, known: tuple[object, ...]
+) -> tuple[tuple[object, ...], bytes | None]:
+    """Stamp a file, and read it **only** when the stamp is not ``known``.
 
     ``os.stat`` before or after an ``open`` describes a file that may not be the
-    one that was read. Stamping the open descriptor makes the bytes and the
-    stamp the same inode by construction.
+    one that was read. Stamping the open descriptor keeps the bytes and the
+    stamp the same inode by construction — and comparing *before* reading is
+    what makes the unchanged path actually cheap: one ``open`` and one
+    ``fstat``, no ``read`` and no bytes. The first cut fstat-ed and then read
+    the whole file every time and compared afterwards, which is 2 reads and the
+    file's contents per resolution, against a docstring promising one ``stat``.
 
     Args:
         path: The file to read.
+        known: The stamp the caller already has, or a sentinel.
 
     Returns:
-        Its identity stamp and its contents.
+        The file's identity stamp, and its contents — or ``None`` for the
+        contents when the stamp is unchanged and nothing was read.
     """
     descriptor = os.open(path, os.O_RDONLY)
     try:
         status = os.fstat(descriptor)
         stamp = (status.st_dev, status.st_ino, status.st_mtime_ns, status.st_size)
+        if stamp == known:
+            return stamp, None
         chunks: list[bytes] = []
         while chunk := os.read(descriptor, 65536):
             chunks.append(chunk)
@@ -686,67 +822,102 @@ def _read_bytes(path: Path) -> tuple[tuple[object, ...], bytes]:
         os.close(descriptor)
 
 
-def _refresh(store: _Store) -> None:
-    """Reload the cached view if the file's identity changed. Holds ``store.lock``."""
-    with store.lock:
-        try:
-            stamp, raw = _read_bytes(store.path)
-        except FileNotFoundError:
-            if store.stamp != _MISSING:
-                store.stamp = _MISSING
-                store.values = _EMPTY
-                store.unknown = ()
-                store.unreadable = None
-                store.generation += 1
-            return
-        except OSError as exc:
-            stamp = ("unreadable", str(exc))
-            if store.stamp != stamp:
-                logger.error(
-                    "%s could not be read (%s); continuing on the environment and the defaults",
-                    store.path,
-                    exc,
-                )
-                store.stamp = stamp
-                store.values = _EMPTY
-                store.unknown = ()
-                store.unreadable = str(exc)
-                store.generation += 1
-            return
-        if stamp == store.stamp:
-            return
+def _publish(
+    store: _Store,
+    stamp: tuple[object, ...],
+    values: Mapping[str, str],
+    unknown: tuple[str, ...],
+    unreadable: str | None,
+) -> bool:
+    """Swap the cached view under ``cache_lock``, unless somebody got there first.
+
+    Held for a handful of assignments and nothing else — emphatically **not**
+    for the read, the parse, or any part of a write. That separation is what
+    keeps a reader from waiting on a foreign process's ``flock``.
+
+    Args:
+        store: The store to publish into.
+        stamp: The identity of the file this view was read from.
+        values: The parsed values.
+        unknown: Keys this build does not configure.
+        unreadable: Why the file could not be parsed, or ``None``.
+
+    Returns:
+        Whether this call published. ``False`` means another thread had already
+        published the same reading, so the generation is not bumped twice for
+        one change.
+    """
+    with store.cache_lock:
+        if store.stamp == stamp:
+            return False
         store.stamp = stamp
-        store.generation += 1
-        try:
-            values, unknown = _parse(raw.decode("utf-8"))
-        except (UnicodeDecodeError, SettingsFileUnreadable) as exc:
+        store.values = values
+        store.unknown = unknown
+        store.unreadable = unreadable
+        store.generation = _next_generation()
+        return True
+
+
+def _refresh(store: _Store) -> None:
+    """Reload the cached view if the file's identity changed.
+
+    Takes ``cache_lock`` only to swap the result in; the ``open``, the
+    ``fstat``, the ``read`` and the parse all happen outside every lock. Two
+    threads refreshing at once therefore do the work twice and publish once,
+    which is the trade this makes deliberately: duplicated reads are cheap and
+    a blocked reader is not.
+    """
+    known = store.stamp
+    try:
+        stamp, raw = _read_if_changed(store.path, known)
+    except FileNotFoundError:
+        if _publish(store, _MISSING, _EMPTY, (), None):
+            logger.debug("%s does not exist; the environment and the defaults decide", store.path)
+        return
+    except OSError as exc:
+        if _publish(store, ("unreadable", str(exc)), _EMPTY, (), str(exc)):
+            logger.error(
+                "%s could not be read (%s); continuing on the environment and the defaults",
+                store.path,
+                exc,
+            )
+        return
+    if raw is None:
+        return
+    try:
+        values, unknown = _parse(raw.decode("utf-8"))
+    except (UnicodeDecodeError, SettingsFileUnreadable) as exc:
+        if _publish(store, stamp, _EMPTY, (), str(exc)):
             logger.error(
                 "%s could not be parsed (%s); continuing on the environment and the defaults",
                 store.path,
                 exc,
             )
-            store.values = _EMPTY
-            store.unknown = ()
-            store.unreadable = str(exc)
-            return
-        store.values = MappingProxyType(values)
-        store.unknown = unknown
-        store.unreadable = None
-        if unknown:
-            logger.info(
-                "%s carries %d key(s) this build does not configure: %s (kept as they are)",
-                store.path,
-                len(unknown),
-                ", ".join(unknown),
-            )
+        return
+    if _publish(store, stamp, MappingProxyType(values), unknown, None) and unknown:
+        logger.info(
+            "%s carries %d key(s) this build does not configure: %s (kept as they are)",
+            store.path,
+            len(unknown),
+            ", ".join(unknown),
+        )
 
 
 def _current(store: _Store | None) -> tuple[Mapping[str, str], str | None, int]:
-    """The file layer as it stands: its values, why it could not be read, its generation."""
+    """The file layer as it stands: its values, why it could not be read, its generation.
+
+    All three come out of one hold of ``cache_lock``, generation read first.
+    Read outside it, left to right, a refresh landing between the loads gave
+    the *old* values stamped with the *new* generation — the exact inverse of
+    what :class:`Snapshot` promises, and a cache holding that pair believes it
+    is current forever.
+    """
     if store is None:
         return _EMPTY, None, 0
     _refresh(store)
-    return store.values, store.unreadable, store.generation
+    with store.cache_lock:
+        generation = store.generation
+        return store.values, store.unreadable, generation
 
 
 def _environment_value(name: str) -> str | None:
@@ -1024,9 +1195,16 @@ def _file_lock(path: Path) -> Iterator[None]:
     POSIX-only. Nothing else in this module needs it, so importing it lazily
     keeps the package importable where it does not exist and turns the absence
     into a failure of the one operation that needs it.
+
+    The lockfile's directory is created here rather than by the write that
+    follows: the lock is taken *first*, so binding to a data directory that
+    does not exist yet — a fresh install writing a setting before ``init`` —
+    failed on the lockfile with a bare ``FileNotFoundError`` before anything
+    could create it.
     """
     import fcntl
 
+    path.parent.mkdir(parents=True, exist_ok=True)
     descriptor = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
     try:
         fcntl.flock(descriptor, fcntl.LOCK_EX)
@@ -1050,13 +1228,21 @@ def _replace_atomically(path: Path, text: str) -> None:
     temporary = directory / f".{path.name}.{os.getpid()}.{token_hex(6)}"
     descriptor = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     try:
-        try:
-            os.write(descriptor, text.encode("utf-8"))
+        # Through a buffered file object rather than a bare `os.write`: that
+        # call returns how many bytes it took and is permitted to take fewer,
+        # and an unchecked short write here would be fsynced and renamed into
+        # place as a truncated settings file. `closefd=False` keeps the
+        # descriptor this function opened, so the mode it was created with is
+        # the mode the file keeps.
+        with open(descriptor, "wb", closefd=False) as handle:
+            handle.write(text.encode("utf-8"))
+            handle.flush()
             os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
+        os.close(descriptor)
         os.replace(temporary, path)
     except BaseException:
+        with contextlib.suppress(OSError):
+            os.close(descriptor)
         temporary.unlink(missing_ok=True)
         raise
     directory_descriptor = os.open(directory, os.O_RDONLY)
@@ -1067,11 +1253,16 @@ def _replace_atomically(path: Path, text: str) -> None:
 
 
 def _write(name: str, value: str | None) -> Change:
-    """Merge one key into ``settings.env`` under both locks, and publish the result."""
+    """Merge one key into ``settings.env`` under both writer locks, and publish the result.
+
+    ``write_lock`` and the ``flock`` are held across the whole span; the cache
+    lock is not, so a reader resolving while this waits on another process's
+    lock answers immediately out of the view it already has.
+    """
     store = _store()
     if store is None:
         raise SettingRefused(f"no graph is bound, so there is nowhere to keep {SETTINGS_FILENAME}")
-    with store.lock, _file_lock(store.lock_path):
+    with store.write_lock, _file_lock(store.lock_path):
         # Read from the disk rather than from the cache: the cache is a view of
         # some earlier moment, and merging into it would drop whatever another
         # process wrote since.

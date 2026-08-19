@@ -2503,8 +2503,28 @@ inode by construction. `>` would have been wrong rather than merely narrow:
 `os.replace` installs a new inode whose mtime can be *older* than the one it
 replaced — a file restored from a backup, a coarse-granularity mount — and a
 `>` comparison calls that "unchanged" forever. A missing file is a state that
-bumps the generation, not a silence. The honest claim about cost: the common
-path still makes one `stat` per resolution; what the cache saves is the parse.
+bumps the generation, not a silence. The comparison happens **before** the read
+rather than after it, which is what makes the cost claim true: an unchanged
+resolution is one `open` and one `fstat`, no `read` and no bytes. Stamping and
+then reading the whole file before comparing — the first cut — was two reads and
+the file's contents per resolution, under a docstring promising one `stat`. And
+the generation the comparison feeds is **process-wide**: per store, each one
+started at 0, so a process that rebound from one graph to another produced two
+counters that both reached 1, and a cache comparing a bare integer went on
+serving the first graph's provider while every other surface had followed the
+rebind.
+
+**A reader must never wait on a writer.** The first cut used one lock for the
+cache and the write span, so every `resolve` waited on whatever process held the
+file — measured at 1.8 s against a child holding the `flock`. The readers are not
+incidental: the scheduler reads on the event loop every slice, and
+`llm.resolution()` reads while holding its own lock, so one stuck writer stalled
+the loop and every path to the model behind it. The locks are now split — the
+write lock across read-merge-render-replace, a separate short-lived cache lock
+only for the swap, always taken in that order — and the three values a reader
+takes (values, unreadable reason, generation) come out of one hold of the cache
+lock, so a refresh landing mid-read can no longer stamp old values with a new
+generation.
 
 **The provider caches were not serialised by the event loop, and the first
 liveness mechanism did not work.** `run_in_threadpool` puts search, ask,
@@ -2525,6 +2545,30 @@ invalidates on a snapshot of its own three values rather than on the file's
 generation, because *constructing* that provider loads a model, and a rule keyed
 on the file would let a budget write trigger a fastembed load on whatever thread
 asked next.
+
+**A malformed line is named, never quoted.** The parse refusal carried the
+whole offending line, and both consumers published it: the refresh logs it at
+ERROR into the container's unrotated log, and the write path raises it through
+the CLI's error boundary onto the operator's terminal. The likeliest malformed
+line in this file is `export NODUM_LLM_API_KEY=sk-…` — a habit carried from a
+shell profile, whose space breaks the key shape — so the shape that fails most
+often is exactly the one holding the credential. The message now names the line
+number, and the key only when the whole of the text before the first `=` is a
+key (optionally behind `export`); everything from the `=` onwards is dropped
+unread. Naming the last token of that prefix instead would have been more
+generous and wrong: a pasted `Bearer sk_abc=…` would have had `sk_abc` named.
+
+**The scheduler holds its target instant instead of re-deriving it.** Slicing
+the sleep introduced a way to lose a night outright: a slice that overruns — a
+stalled event loop, a suspended host, a long `to_thread` hop — wakes past the
+scheduled minute, `seconds_until` answers about tomorrow, and the cycle silently
+does not run. Measured with virtual time: a 90 s stall at 02:58 against an 03:00
+schedule skipped the night, where the single long sleep it replaced ran it late.
+The instant is computed once, held across slices, and compared against the
+clock; it is **aware**, because `seconds_until` measures real elapsed seconds
+and adding those to a naive local datetime lands an hour out on the two nights a
+year the local day is not 24 hours long. A run that starts more than a slice
+late says so in the log.
 
 **The scheduler stopped being rebuilt and started being re-read.**
 `NODUM_CONSOLIDATE_AT` was read once, at app construction, and by nothing

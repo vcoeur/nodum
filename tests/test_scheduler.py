@@ -701,6 +701,53 @@ def test_a_schedule_written_while_the_server_runs_starts_the_nightly_cycle(monke
     assert virtual.delays[:3] == [60.0, 60.0, 60.0], "an unset schedule idles a slice at a time"
 
 
+def test_a_loop_held_past_the_scheduled_minute_runs_late_rather_than_skipping(monkeypatch, caplog):
+    """A stalled slice must not lose the night.
+
+    The slice is not a promise that the loop wakes on time — a stalled event
+    loop, a suspended host or a long ``to_thread`` hop can carry it past the
+    scheduled minute. Re-deriving the wait after such a wake asks
+    ``seconds_until`` about *tomorrow*, so the cycle silently does not run at
+    all; the single long sleep this replaced woke late and ran late. Late is
+    the right answer for a nightly sweep, and this asserts both halves: it ran,
+    and the log says it was late.
+    """
+    monkeypatch.delenv(scheduler.ENV_CONSOLIDATE_AT, raising=False)
+    virtual = _VirtualTime(datetime(2026, 7, 28, 2, 57, 30))
+    runner = _FakeRunner(signal_after=1, clock=virtual.clock)
+    stalled: list[int] = []
+
+    async def stalling_sleep(delay: float) -> None:
+        """One slice that overruns by 90 s, right across the scheduled minute."""
+        if not stalled and virtual.now >= datetime(2026, 7, 28, 2, 58, 30):
+            stalled.append(1)
+            await virtual.sleep(delay + 90)
+            return
+        await virtual.sleep(delay)
+
+    nightly = scheduler.ConsolidationScheduler(
+        at=time(3, 0), sleep=stalling_sleep, clock=virtual.clock, run=runner
+    )
+
+    async def drive() -> None:
+        nightly.start()
+        try:
+            await _await_flag(runner.reached)
+            await nightly.stop()
+        finally:
+            runner.release()
+
+    with caplog.at_level(logging.WARNING, logger=scheduler.logger.name):
+        asyncio.run(drive())
+
+    assert stalled == [1], "the test never stalled the loop; it proves nothing"
+    assert len(runner.calls) == 1, "the night was skipped rather than run late"
+    assert runner.moments[0] > datetime(2026, 7, 28, 3, 0), "it should have run *late*"
+    assert runner.moments[0].date() == date(2026, 7, 28), "and on the night it was due"
+    late = [r for r in caplog.records if "late" in r.getMessage()]
+    assert late, "a cycle that started late said nothing about it"
+
+
 def test_a_schedule_removed_while_the_server_runs_stops_the_nightly_cycle(monkeypatch):
     """Set → unset, and then a whole day passes with nothing run.
 

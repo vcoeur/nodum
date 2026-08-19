@@ -360,27 +360,54 @@ class ConsolidationScheduler:
         interrupted by one, because the schedule is only consulted between
         runs.
 
-        The last slice before a run is the exact remainder rather than a whole
-        slice, so DST arithmetic is unaffected: every wait is computed by
-        :func:`seconds_until` from the clock as it stands at that moment.
+        **The target instant is computed once and then held**, not re-derived
+        after every wake. Re-deriving loses a night outright: a slice that
+        overruns — a stalled event loop, a suspended host, a long
+        ``to_thread`` hop — wakes past the scheduled minute, ``seconds_until``
+        answers about *tomorrow*, and the cycle silently does not run. Measured
+        with virtual time: a 90 s stall at 02:58 against an 03:00 schedule
+        skipped the night entirely, where the single long sleep it replaced ran
+        it late. Late is the right answer for a nightly sweep; skipped is not,
+        and it is announced when it happens.
+
+        The instant is **aware**, because that is what makes it a real moment
+        rather than a wall-clock reading: :func:`seconds_until` measures real
+        elapsed seconds, and adding those to a naive local datetime would land
+        an hour out on the two nights a year the local day is not 24 hours
+        long. Every wait is still a slice or the exact remainder, whichever is
+        shorter.
         """
+        target: datetime | None = None
+        planned_for: time | None = None
         while True:
             at = self.at
             if at is None:
                 # Idle: no schedule is in force. Still a loop rather than no
                 # object, so one written from another process starts a cycle
                 # tonight instead of at the next restart.
+                target, planned_for = None, None
                 await self._sleep(self._slice)
                 continue
-            remaining = seconds_until(self._clock(), at)
-            if remaining > self._slice:
-                await self._sleep(self._slice)
+            now = self._clock()
+            if target is None or planned_for != at:
+                # First pass, or the schedule moved under us: the run this was
+                # counting down to is not the one that is due now.
+                target = now.astimezone() + timedelta(seconds=seconds_until(now, at))
+                planned_for = at
+            overdue = (now.astimezone() - target).total_seconds()
+            if overdue < 0:
+                await self._sleep(min(-overdue, self._slice))
                 continue
-            await self._sleep(remaining)
-            if self.at != at:
-                # The schedule moved while this slice was asleep; the run it
-                # was waiting for is not the one that is due now.
-                continue
+            if overdue >= self._slice:
+                # Something held the loop across the scheduled minute. The cycle
+                # still runs; a human reading the log should know it ran late.
+                logger.warning(
+                    "scheduled consolidation cycle is starting %.0fs late (the loop was "
+                    "held past %s)",
+                    overdue,
+                    at.strftime("%H:%M"),
+                )
+            target, planned_for = None, None
             try:
                 await self._run_once()
             except asyncio.CancelledError:

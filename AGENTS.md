@@ -63,10 +63,15 @@ The invariants that must never be broken, whatever the section:
   `default < settings.env < environment`, with **empty not set at any layer** —
   the deployed container exports six of its variables as `${VAR:-}`
   pass-throughs, so a rule keyed on *presence* pins them all to the empty
-  string. Never read a `NODUM_*` name with `os.environ` in a module the seam
-  covers: resolve it through `nodum.settings`, which is also where a new name
-  is registered with its validator, its default, and whether it may be stored
-  at all. The settings path is **threaded in** from the database path the caller
+  string. **Never read a `NODUM_*` name the seam may *store* with `os.environ`**
+  — resolve it through `nodum.settings`, which is also where a new name is
+  registered with its validator, its default, and whether it may be stored at
+  all. The names the seam refuses to store (`NODUM_DB`, `NODUM_LLM_BASE_URL`,
+  `NODUM_EMBED_CACHE`, `NODUM_PUBLIC_URL`, and the two embedding variables
+  until they join it) are still read from the environment where they always
+  were — `db.py`, `urls.py`, `embeddings.py` — and that is correct, not a
+  violation.
+  The settings path is **threaded in** from the database path the caller
   resolved (`settings.bind`), never re-derived — `nodum serve --db PATH` does
   not set `NODUM_DB`, so a module reading the environment for itself serves one
   graph and reads configuration beside another.
