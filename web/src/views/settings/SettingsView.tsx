@@ -71,7 +71,8 @@ export default function SettingsView() {
   const [adoptOpen, setAdoptOpen] = useState(false);
   const [adopting, setAdopting] = useState(false);
 
-  const load = useCallback(async () => {
+  /** Fetch both reads and put them in state; throws, so callers decide the failure copy. */
+  const fetchData = useCallback(async () => {
     const [settingsReport, eventPage] = await Promise.all([
       api.getSettings(),
       api.listEvents(EVENT_WINDOW),
@@ -80,18 +81,20 @@ export default function SettingsView() {
     setEvents(eventPage);
   }, []);
 
+  /** Re-read after a mutation: a failure here is a load failure, not a failed write. */
+  const refresh = useCallback(async () => {
+    try {
+      await fetchData();
+    } catch (error) {
+      setFailure(describeFailure(error, "the settings"));
+    }
+  }, [fetchData]);
+
   useEffect(() => {
     let cancelled = false;
     void (async () => {
       try {
-        const [settingsReport, eventPage] = await Promise.all([
-          api.getSettings(),
-          api.listEvents(EVENT_WINDOW),
-        ]);
-        if (!cancelled) {
-          setReport(settingsReport);
-          setEvents(eventPage);
-        }
+        await fetchData();
       } catch (error) {
         if (!cancelled) setFailure(describeFailure(error, "the settings"));
       }
@@ -99,7 +102,7 @@ export default function SettingsView() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [fetchData]);
 
   const rowsByKey = useMemo(
     () => new Map((report?.settings ?? []).map((row) => [row.key, row])),
@@ -135,67 +138,68 @@ export default function SettingsView() {
     });
   };
 
-  const saveRow = (row: SettingOut) => {
+  const saveRow = async (row: SettingOut) => {
     const draft = drafts.get(row.key);
     if (draft === undefined || savingKey !== null) return;
     setSavingKey(row.key);
-    void api
-      .applySettings({ [row.key]: draft })
-      .then(() => {
-        setSavingKey(null);
-        clearDraft(row.key);
-        setNote(row.key, livenessLabel(liveness(row.key)));
-        return load();
-      })
-      .catch((error: unknown) => {
-        setSavingKey(null);
-        // The seam's own sentence is the message: unknown name, bad value,
-        // or — for a stale client on a pinned row — SettingPinned's pin
-        // sentence behind the 409.
-        toast.showError(error, `${row.key} was not stored`);
-      });
+    try {
+      await api.applySettings({ [row.key]: draft });
+    } catch (error) {
+      // The seam's own sentence is the message: unknown name, bad value,
+      // or — for a stale client on a pinned row — SettingPinned's pin
+      // sentence behind the 409.
+      toast.showError(error, `${row.key} was not stored`);
+      return;
+    } finally {
+      setSavingKey(null);
+    }
+    clearDraft(row.key);
+    setNote(row.key, livenessLabel(liveness(row.key)));
+    await refresh();
   };
 
-  const revertRow = (row: SettingOut) => {
+  const revertRow = async (row: SettingOut) => {
     const target = revertTarget(row, eventsByKey.get(row.key) ?? null, capabilities);
     if (target === null || revertingKey !== null) return;
     setRevertingKey(row.key);
-    const write =
-      target.kind === "write"
-        ? api.applySettings({ [row.key]: target.value })
-        : api.unsetSetting(row.key);
-    void write
-      .then(() => {
-        setRevertingKey(null);
-        setNote(row.key, `Reverted to the previous value${target.kind === "remove" ? " (removed)" : ""}`);
-        return load();
-      })
-      .catch((error: unknown) => {
-        setRevertingKey(null);
-        toast.showError(error, `${row.key} was not reverted`);
-      });
+    try {
+      if (target.kind === "write") {
+        await api.applySettings({ [row.key]: target.value });
+      } else {
+        await api.unsetSetting(row.key);
+      }
+    } catch (error) {
+      toast.showError(error, `${row.key} was not reverted`);
+      return;
+    } finally {
+      setRevertingKey(null);
+    }
+    setNote(
+      row.key,
+      `Reverted to the previous value${target.kind === "remove" ? " (removed)" : ""}`,
+    );
+    await refresh();
   };
 
-  const adopt = () => {
+  const adopt = async () => {
     setAdopting(true);
-    void api
-      .adoptEnvironment()
-      .then((result: SettingAdoptOut) => {
-        setAdopting(false);
-        setAdoptOpen(false);
-        const skipped = result.skipped.map((skip) => skip.key).join(", ");
-        toast.show(
-          "success",
-          `Adopted ${result.count} setting${result.count === 1 ? "" : "s"} from the environment`,
-          skipped === "" ? undefined : `Refused values: ${skipped}`,
-        );
-        return load();
-      })
-      .catch((error: unknown) => {
-        setAdopting(false);
-        setAdoptOpen(false);
-        toast.showError(error, "Nothing was adopted");
-      });
+    let result: SettingAdoptOut;
+    try {
+      result = await api.adoptEnvironment();
+    } catch (error) {
+      toast.showError(error, "Nothing was adopted");
+      return;
+    } finally {
+      setAdopting(false);
+      setAdoptOpen(false);
+    }
+    const skipped = result.skipped.map((skip) => skip.key).join(", ");
+    toast.show(
+      "success",
+      `Adopted ${result.count} setting${result.count === 1 ? "" : "s"} from the environment`,
+      skipped === "" ? undefined : `Refused values: ${skipped}`,
+    );
+    await refresh();
   };
 
   if (failure) {
@@ -299,7 +303,12 @@ export default function SettingsView() {
                         type="button"
                         className="nd-button nd-button--primary nd-button--small"
                         onClick={() => saveRow(row)}
-                        disabled={!dirty || savingKey !== null}
+                        disabled={!dirty || draft === "" || savingKey !== null}
+                        title={
+                          draft === ""
+                            ? "An empty value is refused — remove the key to unset it"
+                            : undefined
+                        }
                       >
                         {savingKey === key ? "Saving…" : "Save"}
                       </button>

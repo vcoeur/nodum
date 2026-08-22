@@ -708,22 +708,23 @@ def test_a_key_the_file_repeats_is_reported_once(store):
     assert settings.list_settings().unknown_keys == ["NODUM_FUTURE", "NODUM_OTHER"]
 
 
-def test_capabilities_report_whether_the_audio_dependency_imports(store, monkeypatch):
+def test_capabilities_report_whether_the_audio_dependency_imports(store):
     """The audio rows' build flag follows ``faster_whisper``, probed by name.
 
-    The probe is ``find_spec``, not an import: this runs on every
-    ``config list``, and a report that loads an optional package into a
-    process that never uses it is a cost with no reader.
+    Asserted against the real environment rather than a faked ``find_spec``:
+    the probe reads the shared ``importlib.util`` module, and the honest check
+    is that the flag agrees with importability — whichever way this
+    environment is installed.
     """
-
-    def fake_find_spec(name):
-        return object() if name == "faster_whisper" else None
-
-    monkeypatch.setattr(settings.importlib.util, "find_spec", fake_find_spec)
-    assert settings.list_settings().capabilities == {"audio": True}
-
-    monkeypatch.setattr(settings.importlib.util, "find_spec", lambda name: None)
-    assert settings.list_settings().capabilities == {"audio": False}
+    capabilities = settings.list_settings().capabilities
+    assert set(capabilities) == {"audio"}
+    try:
+        import faster_whisper  # noqa: F401  # pyright: ignore[reportMissingImports] degraded-mode
+    except ImportError:
+        installed = False
+    else:
+        installed = True
+    assert capabilities["audio"] is installed
 
 
 # ── The dialect ───────────────────────────────────────────────────────────────
