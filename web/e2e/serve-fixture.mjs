@@ -70,10 +70,18 @@ process.stdout.write(
   `${JSON.stringify({ alpha: alpha.id, beta: beta.id, archivedSpace: archivedSpace.id, dbPath })}\n`,
 );
 
-const server = spawn('uv', ['run', 'nodum', 'serve', '--db', dbPath, '--port', PORT], {
-  cwd: REPO_ROOT,
-  stdio: 'inherit',
-});
+// NODUM_LLM_MODEL is pinned deliberately: it gives the Settings specs a row
+// the page must render disabled ("pinned by the environment") and an
+// adopt-from-environment candidate, against a live 409-backed server.
+const server = spawn(
+  'uv',
+  ['run', 'nodum', 'serve', '--db', dbPath, '--port', PORT],
+  {
+    cwd: REPO_ROOT,
+    env: { ...process.env, NODUM_LLM_MODEL: 'e2e-pinned-model' },
+    stdio: 'inherit',
+  },
+);
 
 function shutdown(signal) {
   server.kill(signal);

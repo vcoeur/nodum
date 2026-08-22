@@ -17,6 +17,13 @@ to the node), and **node browse** (`/nodes`). Browse keeps its node-type,
 space, state, and returned-set sort in the URL. It reads at most the endpoint's
 500 creation-ordered rows and says so: sorting rearranges that bounded response,
 not the whole graph. Space cards link into it with their active space selected.
+The **settings** view (`/settings`) is the configuration ladder over
+`settings.env`: grouped rows with effective value, layer badge and default;
+environment-pinned and env-only rows disabled with their reasons; per-key save
+feedback naming the liveness class; one-click revert from each key's last
+settings event; adopt-from-environment with a preview. The deciding logic —
+grouping, editability derivation, liveness classes, revert targets, adopt
+preview — lives in `views/settings/settingsModel.ts`, tested as a pure module.
 
 **A space is two independent controls, not a mode** (design decision D1), and
 that shape runs through most of the tree: a *read filter* per view, defaulting
@@ -382,6 +389,7 @@ syntactic rules above; type-level guarantees remain with `tsc`.
 | `src/views/login/` | password login against `POST /api/login` |
 | `src/views/spaces/` | the space lifecycle: list with node counts and grant holders, create, rename, archive — and `spaces.ts`'s `archiveConsequences`, the one place the archive dialog's promises are written, every line of which has to be something the server actually delivers |
 | `src/views/admin/` | accounts and grants administration, show-once token dialog |
+| `src/views/settings/` | the configuration surface: grouped rows, disabled pinned/env-only rows with reasons, liveness-classed save feedback, revert-from-event-log, the adopt preview (`settingsModel.ts` owns every decision; `SettingsView.tsx` is wiring) |
 | `src/views/history/` | per-node version timeline and side-by-side diff |
 | `src/views/node/` | the reading view (`/node/:nodeId`): rendered Markdown + Mermaid via the editor's pure renderer, clickable `[[wikilinks]]`, the incident-edge rail and the **backlinks** section under it (`nodeEdges.ts` narrows the depth-1 neighbourhood twice — to the root's edges, and to the inbound `mentions` with `mentionContext` finding the sentence each wikilink was written in), the header's **Link** and **Archive** buttons, and the context menu behind the heading and every edge row — plus `NodeTitleRedirect.tsx`, the resolver behind `/node/title/:title` |
 | `src/views/nodes/` | bounded node browse (`/nodes`): URL-backed type, active-space, and state filters plus sorting over the returned set; its copy distinguishes that local order from a whole-graph order |

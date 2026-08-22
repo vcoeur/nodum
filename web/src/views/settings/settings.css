@@ -1,0 +1,100 @@
+/* The Settings page — view-local layout on top of the shared primitives. */
+
+.nd-set__subtitle code.nd-mono {
+  word-break: break-all;
+}
+
+.nd-set__warning {
+  border: 1px solid var(--nd-warn);
+  border-radius: 6px;
+  padding: 0.5rem 0.75rem;
+}
+
+.nd-set-section {
+  margin-top: 2rem;
+}
+
+.nd-set-section__title {
+  font-size: 1.1rem;
+  margin-bottom: 0.75rem;
+}
+
+.nd-set-row {
+  border-top: 1px solid var(--nd-border);
+  padding: 0.75rem 0;
+}
+
+.nd-set-row__head {
+  align-items: baseline;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.nd-set-row__name {
+  font-weight: 600;
+}
+
+/* Layer badges: the state ramp's hues stay with the state machine, so
+   provenance gets contrast-safe tints of its own, view-local. */
+.nd-badge--provenance-environment {
+  background: #fdeccc;
+  color: #000;
+}
+
+.nd-badge--provenance-settings\.env {
+  background: #d9ead9;
+  color: #000;
+}
+
+.nd-badge--provenance-default,
+.nd-badge--provenance-unset {
+  background: #ececf2;
+  color: #000;
+}
+
+.nd-badge--provenance-file-unreadable {
+  background: #f6d5d5;
+  color: #000;
+}
+
+.nd-set-row__body {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-top: 0.4rem;
+}
+
+.nd-set-row__body .nd-input {
+  max-width: 28rem;
+  width: 100%;
+}
+
+.nd-input--mono {
+  font-family: var(--nd-font-mono);
+  letter-spacing: 0.02em;
+}
+
+.nd-set-row__meta {
+  margin-top: 0.3rem;
+}
+
+.nd-set-row__note {
+  color: var(--nd-text-muted);
+  font-style: italic;
+}
+
+.nd-set-row__liveness {
+  color: var(--nd-state-active);
+  font-weight: 500;
+  margin-top: 0.25rem;
+}
+
+.nd-set__killswitch {
+  margin-top: 0.75rem;
+}
+
+.nd-set-adopt-list {
+  margin: 0.75rem 0;
+}

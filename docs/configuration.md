@@ -182,6 +182,35 @@ is well formed, but the file is not the layer in force. Every other refusal is
 400 with the reason in the message. Writes are attributed to the session's
 human and event-logged exactly as the CLI's are.
 
+### In the browser
+
+The web UI's **Settings** page (`/settings`) puts the same four routes behind
+controls, one grouped table per area — Model, Gardener, Requests, Audio, and a
+read-only Server group showing the env-only names so the whole ladder is
+visible:
+
+- Each row shows the effective value (secrets show only whether one is set),
+  the layer it came from as a badge, and its default. `NODUM_LLM_CONTEXT_TOKENS`
+  notes that a shipped provider profile may serve a larger window than the
+  default when the model matches.
+- A row the environment pins is **disabled with that reason**, and so is an
+  env-only name; the audio pair renders "not available in this build" when the
+  `audio` extra is not installed. The disabled state mirrors what the server
+  would refuse anyway — bypassing it client-side only earns the same refusal.
+- A save reports **when the change bites**, per the three liveness classes
+  above: applied live, at the next agent run, or picked up by the scheduler
+  within a minute. The Gardener group carries the honest caveat — lowering a
+  budget does not stop a cycle already spending — and links to the Journal,
+  where a running cycle's stop control lives.
+- Each row offers **revert** from its last settings event: the previous value
+  goes back in one click, or the key comes back out of the file if it was not
+  stored before. A secret's previous *value* is in no event payload by design,
+  so reverting one means re-entering it, and the page says so instead of
+  offering a button that cannot deliver.
+- **Adopt from environment** previews exactly which pinned keys will move into
+  the file (secrets as "set") before calling the adopt verb; adopted rows keep
+  their `environment` badge but gain the "stored in settings.env" note.
+
 A change applies without a restart. The three things that means in practice:
 
 - a **budget** funds the *next* run — an `AgentRun` spans a whole consolidation
