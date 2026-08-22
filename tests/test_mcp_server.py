@@ -45,6 +45,7 @@ from nodum.mcp_server import (
     OVERWRITING_TOOLS,
     READ_TOOLS,
     REVIEW_TOOLS,
+    SETTINGS_TOOLS,
     UNREGISTERED_TOOLS,
     create_server,
 )
@@ -299,7 +300,11 @@ def test_reversal_and_the_journal_are_a_named_absence_too(fresh_db):
     assert "ingest_file" in FILESYSTEM_TOOLS
     # The four absence lists are one surface, and nothing may be in two tiers.
     assert set(UNREGISTERED_TOOLS) == (
-        set(CURATIVE_TOOLS) | set(REVIEW_TOOLS) | set(HUMAN_ONLY_TOOLS) | set(FILESYSTEM_TOOLS)
+        set(CURATIVE_TOOLS)
+        | set(REVIEW_TOOLS)
+        | set(HUMAN_ONLY_TOOLS)
+        | set(FILESYSTEM_TOOLS)
+        | set(SETTINGS_TOOLS)
     )
     assert len(UNREGISTERED_TOOLS) == len(set(UNREGISTERED_TOOLS))
     # And no absence list may name something the registry actually serves.

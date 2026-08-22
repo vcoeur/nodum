@@ -75,6 +75,7 @@ FAMILIES: dict[str, str] = {
     "agents": "Accounts & sessions",
     "grants": "Grants & spaces",
     "spaces": "Grants & spaces",
+    "settings": "Settings",
 }
 
 #: Route-table paths that are machinery rather than API surface: the JSON-404

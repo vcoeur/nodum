@@ -19,14 +19,14 @@ import re
 import sqlite3
 import unicodedata
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, NamedTuple
 
 from pydantic import ValidationError
 
-from nodum import auth, db
+from nodum import auth, db, settings
 from nodum.migrations import BUILTIN_AGENT_PREFIX, GARDENER_AGENT_ID, MAIN_SPACE_ID, META_SPACE_ID
 from nodum.models import (
     AgentCreatedOut,
@@ -56,6 +56,8 @@ from nodum.models import (
     RollbackBlockerOut,
     RollbackConflictOut,
     RollbackOut,
+    SettingAdoptOut,
+    SettingAdoptSkippedOut,
     SpaceOut,
     SubgraphOut,
     SupersedeOut,
@@ -4413,6 +4415,120 @@ def record_settings_event(
         return seq
     finally:
         own_conn.close()
+
+
+# ── Settings writes: the human-only gate over the seam ───────────────────────
+#
+# The gate lives here, in the domain, and deliberately not in `nodum.settings`:
+# that module sits in the provider's transitive import closure, whose rail
+# (`tests/test_llm.py`) forbids it a principal, a store, and sqlite3 alike. A
+# session can only ever mint a human principal, so on HTTP these gates are met
+# by construction — they bite where a non-human principal could otherwise reach
+# the operation, which is MCP; the registry's SETTINGS_TOOLS absence list is
+# the other half of this one answer.
+
+
+def _gate_settings_write(principal: Principal, path: str | Path | None) -> None:
+    """Refuse a non-human principal, then get out of the seam's way."""
+    conn = _connect(path)
+    try:
+        Store(conn, principal).require_human("configure nodum")
+    finally:
+        conn.close()
+
+
+def apply_settings(
+    changes: Mapping[str, str | None],
+    *,
+    principal: Principal,
+    path: str | Path | None = None,
+) -> list[settings.Change]:
+    """Apply several setting changes atomically (human-only).
+
+    Thin delegate to :func:`nodum.settings.apply`; see there for the semantics.
+    Every event is recorded **after** the file replacement lands, one
+    ``settings.set``/``settings.unset`` per key that actually moved — a key set
+    to what it already held writes nothing, matching ``nodum config set``'s
+    rule that a log of no-ops is a harder log to read.
+
+    Args:
+        changes: Mapping of setting name to its new value; ``None`` removes.
+        principal: The human who asked.
+        path: Explicit database path for both the gate and the events.
+
+    Returns:
+        One :class:`~nodum.settings.Change` per requested key.
+
+    Raises:
+        SettingRefused: If any name or value is refused (nothing is written).
+        SettingPinned: If the environment pins any key (nothing is written).
+        Store.require_human's refusal: If ``principal`` is not human.
+    """
+    _gate_settings_write(principal, path)
+    applied = settings.apply(changes)
+    for change in applied:
+        if change.changed:
+            op = "settings.set" if change.after is not None else "settings.unset"
+            record_settings_event(op, change.event_payload(), principal=principal, path=path)
+    return applied
+
+
+def unset_setting(
+    name: str, *, principal: Principal, path: str | Path | None = None
+) -> settings.Change:
+    """Remove one setting from ``settings.env`` (human-only).
+
+    Thin delegate to :func:`nodum.settings.unset_value`, gated and event-logged
+    like :func:`apply_settings`. Removing a key the file never carried is the
+    state the caller asked for, so it answers ``changed: false`` rather than a
+    not-found.
+
+    Args:
+        name: The setting's name.
+        principal: The human who asked.
+        path: Explicit database path.
+
+    Returns:
+        The :class:`~nodum.settings.Change`.
+    """
+    return apply_settings({name: None}, principal=principal, path=path)[0]
+
+
+def adopt_environment(*, principal: Principal, path: str | Path | None = None) -> SettingAdoptOut:
+    """Store every editable setting the environment pins into ``settings.env`` (human-only).
+
+    The cutover verb: a deployment configured entirely through environment
+    variables has nothing manageable over the file layer until its values move
+    into it, and retyping them from memory is the error this exists to prevent.
+    It cannot go through :func:`nodum.settings.set_value`, which refuses
+    env-pinned keys by design — adopt is the one caller allowed to waive that
+    check, via :func:`nodum.settings.apply`.
+
+    Adopt does **not** touch the environment (that stays a host-side step), so
+    every adopted key still resolves ``provenance: "environment"`` afterwards;
+    what changes is ``stored``. Values that fail validation are skipped and
+    named rather than failing the batch.
+
+    Args:
+        principal: The human who asked.
+        path: Explicit database path.
+
+    Returns:
+        The adopted rows and the skips.
+    """
+    _gate_settings_write(principal, path)
+    candidates, skipped = settings.adoption_candidates()
+    changes = settings.apply(candidates, waive_pin_check=True)
+    for change in changes:
+        if change.changed:
+            record_settings_event(
+                "settings.set", change.event_payload(), principal=principal, path=path
+            )
+    return SettingAdoptOut(
+        adopted=[settings.describe_change(change) for change in changes],
+        skipped=[SettingAdoptSkippedOut(key=key, reason=reason) for key, reason in skipped],
+        count=len(changes),
+    )
 
 
 #: Failed login attempts within :data:`LOGIN_LOCKOUT_WINDOW_MINUTES` that lock

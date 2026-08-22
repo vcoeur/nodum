@@ -2635,3 +2635,31 @@ deployment decision), `NODUM_EMBED_CACHE` (a path on the server's own disk), and
 `NODUM_PUBLIC_URL` (every capability URL is minted from it, so a stored value
 would redirect them). `NODUM_EMBED_MODEL` and `NODUM_EMBED_DOWNLOAD` are not on
 the surface at all yet — changing the model invalidates every stored vector.
+
+## 2026-08-22 — the settings surface reached HTTP, and a pin became a 409
+
+The file layer shipped with one door, the CLI. A browser needs its own, and
+with it three decisions that were not obvious from the CLI's shape.
+
+**A pin is a conflict, not a bad request.** `config set` refuses an
+environment-pinned key with a sentence; over HTTP that sentence has to travel
+with a status a client can act on, and "your request was malformed" (400) is
+the wrong advice — the request is well formed, the file is simply not the layer
+in force. So `SettingPinned` subclasses `SettingRefused`, `EXCEPTION_STATUS`
+gives it a 409 row resolved by MRO, and the CLI boundary is untouched because
+it reads only the `ValueError` text.
+
+**A multi-key write is all or nothing.** One-key-at-a-time `set_value` calls
+can land the first key of a batch and refuse the second — a half-applied form.
+`settings.apply` validates every key (registry, pin, empty, control characters,
+validator) before anything moves, then renders all of them inside the single
+write-lock + flock span. The one sanctioned waiver of the pin check inside
+`apply` is adopt-env: its whole job is to store keys the environment currently
+pins, which is exactly what every other caller must be refused.
+
+**Adopt does not move provenance.** It writes environment values into
+`settings.env` and stops there. Unsetting the variable host-side is what flips
+the ladder to the file layer, and that stays a deliberate deployment step —
+otherwise a cutover verb and a configuration change would be the same button
+press. What adopt changes immediately is only `stored`, so the operator can see
+the value is now backed by the file before they touch the environment.

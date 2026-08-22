@@ -191,7 +191,7 @@ from typing import Any
 
 from pydantic import BaseModel
 
-from nodum import agent, service
+from nodum import agent, service, settings
 from nodum import search as search_module
 from nodum.models import NodeOut, SearchHit
 from nodum.principal import Principal
@@ -792,6 +792,16 @@ class ProviderStatus(BaseModel):
     #: was deliberately left behind, and names the endpoint it would have gone
     #: to.
     api_key_withheld: str | None
+    #: Which layer each of the settings this status reports came from, read off
+    #: one :func:`nodum.settings.snapshot` — ``environment``, ``settings.env``,
+    #: ``default`` or ``unset`` per key.
+    #:
+    #: Narrowed to the three keys this payload can actually be **wrong about**:
+    #: :attr:`model`, :attr:`context_tokens` and :attr:`thinking`. The caveat a
+    #: reader needs is on ``context_tokens``: an unset window is supplied by a
+    #: shipped *profile* rather than by any settings layer, so the provenance
+    #: here is the setting's and the number beside it may be the profile's.
+    provenance: dict[str, str]
     used: agent.LLMReport
 
 
@@ -2127,6 +2137,10 @@ def provider_status(*, principal: Principal, probe: bool = True) -> ProviderStat
         spend under, and what the probe itself cost.
     """
     active = agent.for_request(purpose="llm-status", principal=principal)
+    # One snapshot for the whole payload: the values above and the provenance
+    # below are then the same configuration, not two reads of a file a write
+    # could move in between.
+    view = settings.snapshot()
     status = ProviderStatus(
         configured=active.available,
         provider=active.provider_id,
@@ -2144,6 +2158,14 @@ def provider_status(*, principal: Principal, probe: bool = True) -> ProviderStat
         thinking=active.thinking,
         thinking_applied=active.thinking_applied,
         api_key_withheld=active.api_key_withheld,
+        provenance={
+            name: view.provenance(name)
+            for name in (
+                settings.LLM_MODEL,
+                settings.LLM_CONTEXT_TOKENS,
+                settings.LLM_THINKING,
+            )
+        },
         used=active.report(),
     )
     if not status.configured or not probe:

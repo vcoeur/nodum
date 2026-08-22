@@ -41,6 +41,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 import pytest
+from helpers import agent as agent_principal
 from helpers import owner
 from typer.testing import CliRunner
 
@@ -1433,3 +1434,164 @@ def test_a_backup_of_a_graph_with_no_settings_file_says_so_rather_than_inventing
     payload = _run_json("backup", str(tmp_path / "backups" / "graph.db"))
 
     assert payload["settings"] is None
+
+
+# ── The atomic multi-key write ────────────────────────────────────────────────
+
+
+def test_apply_writes_every_key_and_reports_one_change_per_key(store):
+    """A multi-key body lands whole, in request order, with real before values."""
+    settings.set_value(settings.LLM_THINKING, "low")
+
+    changes = settings.apply(
+        {
+            settings.LLM_MODEL: "test-model",
+            settings.LLM_CONTEXT_TOKENS: "8192",
+            settings.LLM_THINKING: None,
+        }
+    )
+
+    assert [change.key for change in changes] == [
+        settings.LLM_MODEL,
+        settings.LLM_CONTEXT_TOKENS,
+        settings.LLM_THINKING,
+    ]
+    assert [change.before for change in changes][:2] == [None, None]
+    assert changes[2].before == "low"
+    assert [change.after for change in changes][:2] == ["test-model", "8192"]
+    assert changes[2].after is None
+    assert settings.resolve(settings.LLM_MODEL) == "test-model"
+    assert settings.provenance(settings.LLM_THINKING) == settings.FROM_DEFAULT
+
+
+def test_apply_refusing_the_second_key_leaves_the_file_byte_identical(store):
+    """Atomicity is the point of apply: one bad value writes nothing at all.
+
+    One `set_value` call per key would store the first and refuse the second —
+    a half-applied body. Reinstating per-key writes (or moving validation after
+    the lock) makes this fail with a changed file.
+    """
+    path = store
+    settings.set_value(settings.AUDIO_MODEL, "base")
+    original = path.read_text(encoding="utf-8")
+    body = {
+        settings.LLM_MODEL: "test-model",
+        settings.LLM_CONTEXT_TOKENS: "not a number",
+    }
+
+    with pytest.raises(settings.SettingRefused):
+        settings.apply(body)
+
+    assert path.read_text(encoding="utf-8") == original
+    assert settings.resolve(settings.LLM_MODEL) is None
+
+
+def test_apply_refuses_a_pinned_key_and_writes_nothing(store, monkeypatch):
+    """The pin check runs before the lock span, like every other check."""
+    monkeypatch.setenv(settings.LLM_THINKING, "low")
+    settings.set_value(settings.AUDIO_MODEL, "base")
+    original = store.read_text(encoding="utf-8")
+
+    with pytest.raises(settings.SettingPinned):
+        settings.apply({settings.LLM_THINKING: "medium"})
+
+    assert store.read_text(encoding="utf-8") == original
+
+
+def test_setting_pinned_is_a_setting_refused_so_the_cli_boundary_holds(store, monkeypatch):
+    """409 over HTTP must not cost the CLI its one-line error.
+
+    Starlette resolves EXCEPTION_STATUS by MRO and the CLI catches ValueError;
+    both keep working only while SettingPinned stays under SettingRefused.
+    """
+    monkeypatch.setenv(settings.LLM_THINKING, "low")
+    with pytest.raises(settings.SettingRefused):
+        settings.apply({settings.LLM_THINKING: "medium"}, waive_pin_check=False)
+    # The CLI's own refusal message for a pinned key is unchanged too.
+    result = runner.invoke(
+        cli.app, ["config", "set", settings.LLM_THINKING, "medium", "--as", "owner"]
+    )
+    assert result.exit_code == 1
+    assert "set in the environment" in (result.stdout + (result.stderr or ""))
+
+
+def test_apply_with_the_pin_check_waived_stores_the_pinned_value(store, monkeypatch):
+    """Waive is adopt's door, and it still validates the value."""
+    monkeypatch.setenv(settings.LLM_THINKING, "bogus-level")
+
+    with pytest.raises(settings.SettingRefused):
+        settings.apply({settings.LLM_THINKING: "bogus-level"}, waive_pin_check=True)
+
+    changes = settings.apply({settings.LLM_THINKING: "medium"}, waive_pin_check=True)
+    assert changes[0].changed
+    assert settings.stored_values()[settings.LLM_THINKING] == "medium"
+
+
+# ── What adopt-env would write ────────────────────────────────────────────────
+
+
+def test_adoption_candidates_collect_editable_nonempty_env_values(store, monkeypatch):
+    """Editable and non-empty are the two gates; env-only names never qualify."""
+    monkeypatch.setenv(settings.LLM_MODEL, "test-model")
+    monkeypatch.setenv(settings.AUDIO_DOWNLOAD, "1")
+    monkeypatch.setenv(settings.CONSOLIDATE_AT, "")  # present-and-empty: not set
+    monkeypatch.delenv(settings.LLM_THINKING, raising=False)
+
+    candidates, skipped = settings.adoption_candidates()
+
+    assert candidates.get(settings.LLM_MODEL) == "test-model"
+    assert candidates.get(settings.AUDIO_DOWNLOAD) == "1"
+    assert settings.CONSOLIDATE_AT not in candidates
+    assert skipped == []
+
+
+def test_adoption_candidates_skip_and_name_values_the_table_refuses(store, monkeypatch):
+    """One bad environment value must not block the other eight from adopting."""
+    monkeypatch.setenv(settings.LLM_MODEL, "test-model")
+    monkeypatch.setenv(settings.LLM_CONTEXT_TOKENS, "not a number")
+
+    candidates, skipped = settings.adoption_candidates()
+
+    assert candidates == {settings.LLM_MODEL: "test-model"}
+    assert [key for key, _reason in skipped] == [settings.LLM_CONTEXT_TOKENS]
+    assert skipped[0][1]
+
+
+def test_adoption_candidates_skip_control_characters(store, monkeypatch):
+    monkeypatch.setenv(settings.LLM_MODEL, "model\nNODUM_LLM_THINKING=none")
+
+    candidates, skipped = settings.adoption_candidates()
+
+    assert candidates == {}
+    assert [key for key, _reason in skipped] == [settings.LLM_MODEL]
+
+
+def test_apply_removes_a_pinned_key_without_consulting_the_pin(store, monkeypatch):
+    """Removing a file entry is never inert, so `null` skips the pin check.
+
+    `unset_value` never refused a pinned key and neither may apply: the
+    environment wins regardless of what the file holds. Reinstating a blanket
+    pin check fails this.
+    """
+    settings.set_value(settings.LLM_THINKING, "low")
+    monkeypatch.setenv(settings.LLM_THINKING, "medium")
+
+    changes = settings.apply({settings.LLM_THINKING: None})
+
+    assert changes[0].changed
+    assert settings.LLM_THINKING not in settings.stored_values()
+
+
+def test_the_service_settings_gate_refuses_an_agent_principal(store):
+    """The domain gate is the one that bites: MCP mints non-human principals.
+
+    Deleting `_gate_settings_write` (or moving the gate to the routes, where a
+    session is human by construction) fails this — and would leave an agent
+    token able to rewrite settings.env over MCP's absence lists alone.
+    """
+    with pytest.raises(service.GrantNotPermitted, match="only a human may configure nodum"):
+        service.apply_settings({settings.LLM_MODEL: "x"}, principal=agent_principal("researcher"))
+    with pytest.raises(service.GrantNotPermitted, match="only a human may configure nodum"):
+        service.unset_setting(settings.LLM_MODEL, principal=agent_principal("researcher"))
+    with pytest.raises(service.GrantNotPermitted, match="only a human may configure nodum"):
+        service.adopt_environment(principal=agent_principal("researcher"))

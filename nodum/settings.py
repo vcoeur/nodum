@@ -128,6 +128,24 @@ class SettingRefused(ValueError):
     """
 
 
+class SettingPinned(SettingRefused):
+    """A non-empty environment variable pins the key, so storing it would be inert.
+
+    A subclass rather than a second message on :class:`SettingRefused` because
+    the two are different answers to a client: a refusal is *this request was
+    wrong* (400), while a pin is *the request is well formed and the file is
+    not the layer in force* (409 over HTTP, via the ``EXCEPTION_STATUS`` MRO
+    row) — the conflict a client retries against after unsetting the variable.
+    The CLI's error boundary sees only the ``ValueError`` text either way.
+    """
+
+    def __init__(self, name: str) -> None:
+        super().__init__(
+            f"{name} is set in the environment, which wins over {SETTINGS_FILENAME}; "
+            f"a value stored here would never be used — unset the environment variable first"
+        )
+
+
 class SettingsFileUnreadable(ValueError):
     """``settings.env`` exists and could not be parsed.
 
@@ -1437,10 +1455,7 @@ def set_value(name: str, value: str) -> Change:
     if not spec.writable:
         raise SettingRefused(f"{name} cannot be stored in {SETTINGS_FILENAME}: {spec.refusal}")
     if _environment_value(name) is not None:
-        raise SettingRefused(
-            f"{name} is set in the environment, which wins over {SETTINGS_FILENAME}; "
-            f"a value stored here would never be used — unset the environment variable first"
-        )
+        raise SettingPinned(name)
     cleaned = value.strip()
     if not cleaned:
         raise SettingRefused(
@@ -1473,6 +1488,125 @@ def unset_value(name: str) -> Change:
     if not spec.writable:
         raise SettingRefused(f"{name} is not stored in {SETTINGS_FILENAME}: {spec.refusal}")
     return _write(name, None)
+
+
+def apply(changes: Mapping[str, str | None], *, waive_pin_check: bool = False) -> list[Change]:
+    """Apply several changes to ``settings.env`` — all of them, or none of them.
+
+    Every check runs **before** anything is written: registry, storability, the
+    environment pin (unless ``waive_pin_check``, whose one sanctioned caller is
+    :func:`nodum.service.adopt_environment` — adopt's whole job is to store keys
+    the environment currently pins), the empty-value and control-character
+    refusals, and each key's own validator. Only then does one lock span render
+    every key over the same text and replace the file once. A body whose second
+    key is invalid therefore leaves the file byte-identical, which one-at-a-time
+    :func:`set_value` calls cannot promise — the first key would land and the
+    second refuse.
+
+    Args:
+        changes: Mapping of setting name to its new value; ``None`` removes the
+            key from the file.
+        waive_pin_check: Skip the environment-pin refusal. Adopt only.
+
+    Returns:
+        One :class:`Change` per requested key, in request order.
+
+    Raises:
+        SettingRefused: If any name is unknown or unstorable, a value is empty,
+            carries a control character, or fails validation.
+        SettingPinned: If the environment pins any key being **stored** (a
+            ``None`` removes without consulting the pin), and the pin check is
+            not waived.
+        SettingsFileUnreadable: If the existing file cannot be parsed.
+    """
+    store = _store()
+    if store is None:
+        raise SettingRefused(f"no graph is bound, so there is nowhere to keep {SETTINGS_FILENAME}")
+    prepared: list[tuple[Setting, str | None]] = []
+    for name, value in changes.items():
+        spec = specification(name)
+        if not spec.writable:
+            raise SettingRefused(f"{name} cannot be stored in {SETTINGS_FILENAME}: {spec.refusal}")
+        # The pin check guards *storing* a value that would never be used;
+        # removing a key is never inert, so `unset` skips it exactly as
+        # `set_value`'s sibling `unset_value` always has.
+        if value is not None:
+            if not waive_pin_check and _environment_value(name) is not None:
+                raise SettingPinned(name)
+            cleaned = value.strip()
+            if not cleaned:
+                raise SettingRefused(
+                    f"{name} cannot be set to an empty value; unset it instead to fall back"
+                )
+            if _CONTROL_CHARACTERS.search(cleaned):
+                raise SettingRefused(f"{name} may not contain control characters or newlines")
+            value = spec.validate(name, cleaned)
+        prepared.append((spec, value))
+    if not prepared:
+        return []
+    with store.write_lock, _file_lock(store.lock_path):
+        try:
+            text = store.path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            text = ""
+        try:
+            before, _unknown = _parse(text)
+        except (UnicodeDecodeError, SettingsFileUnreadable) as exc:
+            raise SettingsFileUnreadable(
+                f"{store.path} cannot be parsed, so it cannot be edited without losing "
+                f"what it holds ({exc}); fix the file by hand"
+            ) from exc
+        rendered = text
+        for spec, value in prepared:
+            # Sequential renders are the multi-key form of `_write`'s single
+            # one: each call is a pure function of the text it is given, and
+            # validation already ran on all of them.
+            rendered = _render(rendered, spec.name, value)
+        _replace_atomically(store.path, rendered)
+        _invalidate(store)
+        _refresh(store)
+    return [
+        Change(key=spec.name, before=before.get(spec.name), after=value) for spec, value in prepared
+    ]
+
+
+def adoption_candidates() -> tuple[dict[str, str], list[tuple[str, str]]]:
+    """Collect what ``POST /api/settings/adopt-env`` would write, before writing it.
+
+    Reads the process environment for every **editable** key set to a non-empty
+    value there — the four env-only names are not candidates, because the seam
+    refuses to store them at all. Each candidate still passes its validator: a
+    value the table refuses is **skipped and named**, never a batch failure,
+    because the deployed instance this verb exists for has its whole
+    configuration in the environment and one bad value must not block the other
+    eight from being adopted.
+
+    Returns:
+        Two lists: ``{name: value}`` ready for :func:`apply`, and
+        ``[(name, reason)]`` for every non-empty environment value that was
+        refused.
+    """
+    candidates: dict[str, str] = {}
+    skipped: list[tuple[str, str]] = []
+    for name in KEYS:
+        if not SPECS[name].writable:
+            continue
+        value = _environment_value(name)
+        if value is None:
+            continue
+        cleaned = value.strip()
+        if not cleaned:
+            continue
+        if _CONTROL_CHARACTERS.search(cleaned):
+            skipped.append((name, f"{name} may not contain control characters or newlines"))
+            continue
+        try:
+            SPECS[name].validate(name, cleaned)
+        except SettingRefused as exc:
+            skipped.append((name, str(exc)))
+            continue
+        candidates[name] = cleaned
+    return candidates, skipped
 
 
 # ── What the surfaces report ─────────────────────────────────────────────────

@@ -233,11 +233,27 @@ HUMAN_ONLY_TOOLS = (
 #: named. This list is what makes that moment ask the right question.
 FILESYSTEM_TOOLS = ("ingest_file", "ingest_path", "read_file")
 
+#: The fifth named absence: **configuration is the human's.** The settings
+#: writes are gated at the domain (:func:`nodum.service.apply_settings` and
+#: friends call ``Store.require_human``), and this surface is where a non-human
+#: principal actually exists — so the gate and this list are two halves of one
+#: answer rather than belt and braces. The names sit beside the service's own,
+#: per the absence-list rule above: they name what a tool would plausibly be
+#: called, while what mechanically holds is the registry-equality test that
+#: fails on *any* unregistered tool.
+#:
+#: A settings read has no tool either — not because it is gated (it is not),
+#: but because nothing an agent does with this graph is configured by these
+#: keys, and a settings row adds no capability a tool caller needs.
+SETTINGS_TOOLS = ("apply_settings", "set_setting", "unset_setting", "adopt_environment")
+
 #: Every name that must never appear in the registry, in one place — what the
-#: disjointness assertions ask about. A new human-only, curative, review or
-#: filesystem operation joins one of the four lists above; it never joins the
-#: registry.
-UNREGISTERED_TOOLS = CURATIVE_TOOLS + REVIEW_TOOLS + HUMAN_ONLY_TOOLS + FILESYSTEM_TOOLS
+#: disjointness assertions ask about. A new human-only, curative, review,
+#: filesystem or settings operation joins one of the five lists above; it never
+#: joins the registry.
+UNREGISTERED_TOOLS = (
+    CURATIVE_TOOLS + REVIEW_TOOLS + HUMAN_ONLY_TOOLS + FILESYSTEM_TOOLS + SETTINGS_TOOLS
+)
 
 #: The tools this server registers, by tier (documentation + test anchor).
 #:
