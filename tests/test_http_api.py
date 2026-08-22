@@ -39,6 +39,8 @@ import io
 import json
 import pkgutil
 import sqlite3
+import subprocess
+import sys
 import threading
 import time
 import zipfile
@@ -66,6 +68,7 @@ from nodum import (
     llm,
     mcp_server,
     service,
+    settings,
     urls,
 )
 from nodum.migrations import GARDENER_AGENT_ID
@@ -5646,3 +5649,273 @@ def test_serve_allows_extra_hosts_on_the_command_line(fresh_db, monkeypatch):
     client = _session_client(captured["app"])
     assert client.get("/api/types", headers={"Host": "nodum.lan"}).status_code == 200
     assert client.get("/api/types", headers={"Host": "other.example"}).status_code == 400
+
+
+# ── Settings over HTTP ────────────────────────────────────────────────────────
+
+#: Distinctive enough that grepping a whole response body for it means something
+#: (the same value tests/test_settings.py sweeps the CLI with).
+SECRET = "sk-test-000111222333444555666777888999"
+
+
+def test_get_settings_is_byte_identical_to_config_list(client, fresh_db):
+    """Envelope parity: the route renders `nodum config list` verbatim.
+
+    Reinstating a hand-built body (or list_envelope) on the route breaks the
+    byte-equality below.
+    """
+    service.apply_settings({settings.LLM_MODEL: "test-model"}, principal=owner())
+
+    result = runner.invoke(cli.app, ["config", "list"])
+    assert result.exit_code == 0, result.output
+
+    response = client.get("/api/settings")
+    assert response.status_code == 200
+    assert response.content == result.stdout.encode("utf-8")
+    payload = response.json()
+    assert payload["count"] == len(payload["settings"]) == 17
+    assert payload["path"], "the GET carries the absolute path (deliberate, unlike /healthz)"
+
+
+def test_put_settings_writes_removes_and_reports_rows(client, fresh_db):
+    """A partial body: absent keys untouched, null removes, strings store."""
+    service.apply_settings(
+        {settings.LLM_THINKING: "low", settings.LLM_CYCLE_BUDGET: "100"},
+        principal=owner(),
+    )
+
+    response = client.put(
+        "/api/settings",
+        json={settings.LLM_CYCLE_BUDGET: "200", settings.LLM_THINKING: None},
+    )
+    assert response.status_code == 200, response.text
+    rows = response.json()["changes"]
+    assert [row["key"] for row in rows] == [settings.LLM_CYCLE_BUDGET, settings.LLM_THINKING]
+    by_key = {row["key"]: row for row in rows}
+    assert by_key[settings.LLM_CYCLE_BUDGET]["changed"] is True
+    assert by_key[settings.LLM_CYCLE_BUDGET]["value"] == "200"
+    assert by_key[settings.LLM_THINKING]["stored"] is False
+    assert settings.stored_values()[settings.LLM_CYCLE_BUDGET] == "200"
+    assert settings.LLM_THINKING not in settings.stored_values()
+
+
+def test_put_settings_refusing_the_second_key_leaves_the_file_identical(client, fresh_db):
+    """The PUT is atomic: one invalid key writes nothing at all."""
+    service.apply_settings({settings.AUDIO_MODEL: "base"}, principal=owner())
+    path = Path(client.get("/api/settings").json()["path"])
+    original = path.read_text(encoding="utf-8")
+
+    response = client.put(
+        "/api/settings",
+        json={settings.LLM_MODEL: "test-model", settings.LLM_CONTEXT_TOKENS: "NaN"},
+    )
+
+    assert response.status_code == 400
+    assert path.read_text(encoding="utf-8") == original
+
+
+def test_put_settings_on_an_environment_pinned_key_is_409_and_writes_nothing(
+    client, fresh_db, monkeypatch
+):
+    """A pin is a conflict with current state, not a malformed request.
+
+    Reverting SettingPinned to a plain SettingRefused (or dropping its
+    EXCEPTION_STATUS row) fails this with a 400.
+    """
+    monkeypatch.setenv(settings.LLM_THINKING, "low")
+    service.apply_settings({settings.AUDIO_MODEL: "base"}, principal=owner())
+    path = Path(client.get("/api/settings").json()["path"])
+    original = path.read_text(encoding="utf-8")
+
+    response = client.put("/api/settings", json={settings.LLM_THINKING: "medium"})
+
+    assert response.status_code == 409, response.text
+    assert response.json()["error"]["type"] == "SettingPinned"
+    assert path.read_text(encoding="utf-8") == original
+
+
+@pytest.mark.parametrize(
+    ("body", "sentence"),
+    [
+        ({"NOT_A_SETTING": "x"}, "NOT_A_SETTING"),
+        ({settings.LLM_CONTEXT_TOKENS: "not a number"}, "must be a whole number"),
+        ({settings.LLM_MODEL: ""}, "unset it instead to fall back"),
+        ({settings.LLM_API_KEY: "sk-test\nsecond-line"}, "control characters"),
+    ],
+)
+def test_put_settings_refusals_carry_the_seams_sentence(client, fresh_db, body, sentence):
+    """Every 400 quotes SP1's own refusal text, never a value it refused."""
+    response = client.put("/api/settings", json=body)
+    assert response.status_code == 400
+    assert sentence in response.json()["error"]["message"]
+    assert "sk-test" not in response.text
+
+
+def test_put_settings_with_an_empty_body_touches_nothing(client, fresh_db):
+    response = client.put("/api/settings", json={})
+    assert response.status_code == 200
+    assert response.json() == {"changes": [], "count": 0}
+
+
+def test_put_settings_refuses_an_env_only_key_with_its_own_sentence(client, fresh_db):
+    response = client.put("/api/settings", json={"NODUM_PUBLIC_URL": "https://x.example"})
+    assert response.status_code == 400
+    assert "cannot be stored" in response.json()["error"]["message"]
+
+
+def test_delete_setting_answers_changed_false_for_a_key_the_file_never_carried(client, fresh_db):
+    response = client.delete(f"/api/settings/{settings.LLM_CYCLE_BUDGET}")
+    assert response.status_code == 200
+    assert response.json()["changed"] is False
+
+    service.apply_settings({settings.LLM_CYCLE_BUDGET: "300"}, principal=owner())
+    response = client.delete(f"/api/settings/{settings.LLM_CYCLE_BUDGET}")
+    assert response.status_code == 200
+    assert response.json()["changed"] is True
+    assert settings.LLM_CYCLE_BUDGET not in settings.stored_values()
+
+
+def test_adopt_env_stores_pinned_values_without_moving_provenance(client, fresh_db, monkeypatch):
+    """The cutover round-trip, asserted at every end it touches.
+
+    `stored` flips true while provenance stays `environment`; one `settings.set`
+    event per adopted key; the secret's payload reads set/unset; a value the
+    registry refuses is skipped and named rather than failing the batch.
+    """
+    monkeypatch.setenv(settings.LLM_MODEL, "test-model")
+    monkeypatch.setenv(settings.LLM_API_KEY, "sk-adopt-000111222333")
+    monkeypatch.setenv(settings.LLM_CONTEXT_TOKENS, "not a number")
+
+    before = {
+        event.seq
+        for event in service.list_events(owner(), limit=5000)
+        if event.op.startswith("settings.")
+    }
+
+    response = client.post("/api/settings/adopt-env")
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    adopted = {row["key"]: row for row in payload["adopted"]}
+    assert set(adopted) == {settings.LLM_MODEL, settings.LLM_API_KEY}
+    for row in adopted.values():
+        assert row["changed"] is True
+        assert row["stored"] is True
+        assert row["provenance"] == "environment"
+    assert adopted[settings.LLM_API_KEY]["value"] is None, "a secret carries no value"
+    assert adopted[settings.LLM_API_KEY]["set"] is True
+    assert [row["key"] for row in payload["skipped"]] == [settings.LLM_CONTEXT_TOKENS]
+
+    stored = settings.stored_values()
+    assert stored[settings.LLM_MODEL] == "test-model"
+    assert stored[settings.LLM_API_KEY] == "sk-adopt-000111222333"
+
+    events = [
+        event
+        for event in service.list_events(owner(), limit=5000)
+        if event.op == "settings.set" and event.seq not in before
+    ]
+    assert sorted(event.payload["key"] for event in events) == [
+        settings.LLM_API_KEY,
+        settings.LLM_MODEL,
+    ], "one settings.set event per adopted key"
+    secret_event = next(e for e in events if e.payload["key"] == settings.LLM_API_KEY)
+    assert secret_event.payload["after"] == "set"
+    assert secret_event.actor == OWNER_ACTOR
+
+
+def test_a_settings_write_runs_off_the_event_loop(client, fresh_db, tmp_path):
+    """The plan's probe: a child holds the flock, a PUT waits, /healthz answers.
+
+    Both requests run on **one** event loop — the whole point — and the PUT
+    task is created **first**: an inline handler never suspends, so it blocks
+    the loop for the whole flock hold and healthz cannot run until the PUT has
+    finished. (Two shapes were tried and discarded: separate ``asyncio.run``
+    calls per request, which share no loop and pass vacuously; and a fixed
+    sleep between the two tasks, which absorbs exactly the stall it is here to
+    detect.)
+    """
+    lock_path = Path(client.get("/api/settings").json()["path"]).with_suffix(".env.lock")
+    script = (
+        "import fcntl, sys, time\n"
+        "handle = open(sys.argv[1], 'w')\n"
+        "fcntl.flock(handle, fcntl.LOCK_EX)\n"
+        "print('locked', flush=True)\n"
+        "time.sleep(3)\n"
+    )
+    child = subprocess.Popen([sys.executable, "-c", script, str(lock_path)], stdout=subprocess.PIPE)
+    try:
+        assert child.stdout.readline().strip() == b"locked"
+
+        async def drive() -> tuple[httpx.Response, httpx.Response, bool]:
+            transport = httpx.ASGITransport(app=client.app, raise_app_exceptions=False)
+            async with httpx.AsyncClient(transport=transport, base_url=BASE_URL) as http:
+                headers = {
+                    "Cookie": f"{http_api.SESSION_COOKIE}={client.session}",
+                    **CLIENT_HEADERS,
+                    "Content-Type": "application/json",
+                }
+                # The PUT task is created first and runs to its first real
+                # suspension; healthz is created second. An inline handler
+                # never suspends — it blocks the loop inside the flock hold —
+                # so healthz then cannot run until the PUT finishes, and
+                # `put_still_pending` below is the assertion that catches it.
+                put_task = asyncio.create_task(
+                    http.put(
+                        "/api/settings", json={settings.LLM_CYCLE_BUDGET: "400"}, headers=headers
+                    )
+                )
+                health_task = asyncio.create_task(http.get("/healthz"))
+                health = await health_task
+                put_still_pending = not put_task.done()
+                return health, await put_task, put_still_pending
+
+        health, put_response, put_still_pending = asyncio.run(drive())
+
+        assert health.status_code == 200
+        assert put_still_pending, "the PUT finished without waiting for the flock"
+        assert put_response.status_code == 200, put_response.text
+    finally:
+        child.wait(timeout=10)
+
+
+def test_the_secret_sweep_over_every_http_settings_surface(client, fresh_db):
+    """R2-B4 widened to HTTP: the export-shaped secret line reaches no response.
+
+    The file's first line is the likeliest hand-edit mistake, carried over from
+    a shell profile. It makes the file *unreadable*, which exercises all three
+    surfaces at once: GET (resolution steps around it), the write paths' error
+    bodies (`_failure_message` passes domain text through verbatim), and
+    /api/events.
+    """
+    path = Path(client.get("/api/settings").json()["path"])
+    path.write_text(f"export {settings.LLM_API_KEY}={SECRET}\n", encoding="utf-8")
+
+    get_response = client.get("/api/settings")
+    put_response = client.put("/api/settings", json={settings.LLM_CYCLE_BUDGET: "100"})
+    delete_response = client.delete(f"/api/settings/{settings.LLM_CYCLE_BUDGET}")
+    adopt_response = client.post("/api/settings/adopt-env")
+    events_response = client.get("/api/events?limit=50")
+    bad_value_response = client.put("/api/settings", json={settings.LLM_API_KEY: SECRET})
+
+    assert get_response.status_code == 200
+    unreadable = get_response.json()["unreadable"]
+    assert unreadable and "line 1" in unreadable
+    assert put_response.status_code == 400, put_response.text
+    assert delete_response.status_code == 400
+    # adopt has nothing to adopt (a clean environment), so it never reaches the
+    # file and answers 200 over an unreadable one
+    assert adopt_response.status_code == 200
+    assert events_response.status_code == 200
+    assert bad_value_response.status_code == 400
+
+    for response in (
+        get_response,
+        put_response,
+        delete_response,
+        adopt_response,
+        events_response,
+        bad_value_response,
+    ):
+        assert SECRET not in response.text, response.text[:400]
+        assert f"{settings.LLM_API_KEY}=" not in response.text

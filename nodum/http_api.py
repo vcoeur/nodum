@@ -672,6 +672,13 @@ EXCEPTION_STATUS: dict[type[Exception], int] = {
     # malformed request. A client that retries on 409 and gives up on 400 was
     # being told the wrong thing.
     consolidate.CycleInProgress: 409,
+    # 409 too: a settings write naming a key the environment pins. The request
+    # is well formed and the file is simply not the layer in force — the same
+    # conflict-with-current-state shape as a cycle in progress. It derives from
+    # `SettingRefused` (and so from ValueError), so without this row it would
+    # render as a clean 400 with the right message; the distinction is for the
+    # client that retries after unsetting the variable.
+    settings.SettingPinned: 409,
     # 413 — the body passed the ceiling this server is willing to read, whether
     # it was declared at mint time (`urls.mint_upload`) or delivered here. Both
     # raise `urls.PayloadTooLarge`, which derives from ValueError; this row is
@@ -1378,6 +1385,24 @@ async def _json_body(request: Request) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise ValueError(f"expected a JSON object body, got {type(data).__name__}")
     return data
+
+
+def _settings_changes(body: dict[str, Any]) -> dict[str, str | None]:
+    """Normalise a PUT ``/api/settings`` body into the seam's change mapping.
+
+    A value is a string or ``null``; anything else is a malformed request
+    before the domain ever sees it. Keys arrive as JSON object keys and are
+    strings by construction.
+
+    Raises:
+        ValueError: If any value is neither a string nor null.
+    """
+    changes: dict[str, str | None] = {}
+    for key, value in body.items():
+        if value is not None and not isinstance(value, str):
+            raise ValueError(f"{key}: a setting's value is a string or null")
+        changes[key] = value
+    return changes
 
 
 def _required(body: dict[str, Any], key: str) -> Any:
@@ -3284,6 +3309,78 @@ def create_app(
         space = _write(request, service.archive_space, request.path_params["id"], path=db_path)
         return EnvelopeResponse(envelope(space))
 
+    # ── Settings (the human configuring the file beside the graph) ─────────
+
+    async def get_settings(request: Request) -> Response:
+        """Every setting: what is in force, where it came from, whether it can be stored.
+
+        The read is ``nodum config list`` verbatim — same envelope, same bytes —
+        and stays on the event loop: the reader takes the cache lock only for
+        the swap, and an unchanged file costs one open and one fstat with no
+        read at all.
+
+        **The body carries the absolute ``path``**, unlike ``/healthz``, which
+        dropped the database path as disclosure of a filesystem layout to the
+        unauthenticated world. This route sits behind the session gate and
+        exists to show a human the file an operator would hand-edit; the
+        difference is deliberate, not an oversight.
+
+        Reads are not gated to humans at the domain (writes and adopt are):
+        a session can only ever mint a human principal, so a domain-level read
+        gate would bind nothing here while forcing one onto ``nodum config
+        list``. No secret value is ever in the body by construction.
+        """
+        return EnvelopeResponse(envelope(settings.list_settings()))
+
+    async def put_settings(request: Request) -> Response:
+        """Apply several setting changes atomically: all of them, or none of them.
+
+        The body maps setting names to their new value; explicit ``null``
+        removes a key from the file (falling back), an absent key is untouched,
+        and an empty string is refused — unset it instead. A key the
+        environment pins is **409**, with the file untouched; any other refusal
+        (unknown name, invalid value, env-only key) is 400 carrying the seam's
+        own sentence.
+
+        The write holds the settings write lock plus a cross-process flock
+        across two fsyncs — measured at seconds against a foreign writer — so
+        it runs off the event loop like every other blocking write here;
+        inline, it would stall ``/healthz`` and every other tab for the span.
+        """
+        body = await _json_body(request)
+        changes = _settings_changes(body)
+        applied = await run_in_threadpool(
+            _write, request, service.apply_settings, changes, path=db_path
+        )
+        return EnvelopeResponse(list_envelope("changes", map(settings.describe_change, applied)))
+
+    async def delete_setting(request: Request) -> Response:
+        """Remove one setting from ``settings.env``, falling back down the ladder.
+
+        Same write as ``null`` in the PUT body, one key at a time. Removing a
+        key the file never carried is the state the caller asked for: 200 with
+        ``changed: false``, never 404.
+        """
+        change = await run_in_threadpool(
+            _write, request, service.unset_setting, request.path_params["name"], path=db_path
+        )
+        return EnvelopeResponse(envelope(settings.describe_change(change)))
+
+    async def adopt_environment(request: Request) -> Response:
+        """Adopt every editable setting the environment pins into ``settings.env``.
+
+        The cutover verb for a deployment configured entirely through
+        environment variables: each adopted key keeps resolving
+        ``provenance: "environment"`` — adopt never touches the environment,
+        which stays a host-side step — but ``stored`` flips true, so unsetting
+        the variable later no longer moves what is in force. One
+        ``settings.set`` event per adopted key over one file replacement; a
+        value the registry refuses is skipped and named here, not a batch
+        failure.
+        """
+        result = await run_in_threadpool(_write, request, service.adopt_environment, path=db_path)
+        return EnvelopeResponse(envelope(result))
+
     # ── Fallbacks ─────────────────────────────────────────────────────────
 
     async def api_not_found(request: Request) -> Response:
@@ -3422,6 +3519,13 @@ def create_app(
         Route("/api/spaces", create_space, methods=["POST"]),
         Route("/api/spaces/{id}/rename", rename_space, methods=["POST"]),
         Route("/api/spaces/{id}/archive", archive_space, methods=["POST"]),
+        # The settings surface. `adopt-env` is registered ahead of
+        # `/api/settings/{name}` on the `/api/nodes/resolve` precedent: the
+        # literal must be tried before the converter that would swallow it.
+        Route("/api/settings", get_settings),
+        Route("/api/settings", put_settings, methods=["PUT"]),
+        Route("/api/settings/adopt-env", adopt_environment, methods=["POST"]),
+        Route("/api/settings/{name}", delete_setting, methods=["DELETE"]),
     ]
 
     # The agent surface, on the same origin as the human one. It is built here

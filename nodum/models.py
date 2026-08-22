@@ -1054,3 +1054,29 @@ class SettingChangeOut(BaseModel):
     value: str | None
     set: bool
     provenance: str
+
+
+class SettingAdoptSkippedOut(BaseModel):
+    """One environment value ``adopt-env`` declined to store, and why.
+
+    A skip is not a failure of the batch: the deployed instance this verb
+    exists for keeps its whole configuration in the environment, and one value
+    the registry refuses must not block the others from being adopted.
+    """
+
+    key: str
+    reason: str
+
+
+class SettingAdoptOut(BaseModel):
+    """What ``adopt-env`` did: every adopted key as a change row, plus the skips.
+
+    An adopted key still resolves ``provenance: "environment"`` afterwards —
+    adopt does not touch the environment, which stays a host-side step. What
+    changes is ``stored``: the file now carries the same value, so unsetting
+    the variable later no longer changes what is in force.
+    """
+
+    adopted: list[SettingChangeOut]
+    skipped: list[SettingAdoptSkippedOut]
+    count: int

@@ -45,7 +45,7 @@ this gate.
 The method column lists the methods the route table configured; Starlette
 answers `HEAD` for any route configured `GET`.
 
-The tables below list **63 routes**, grouped by family.
+The tables below list **67 routes**, grouped by family.
 
 
 ### Session
@@ -183,6 +183,15 @@ The tables below list **63 routes**, grouped by family.
 | POST | `/api/spaces` | `create_space` | session | Create a space (a node of builtin type ``space``, living in meta). |
 | POST | `/api/spaces/{id}/rename` | `rename_space` | session | Rename a space — a space is a node, so this is a node-title update. |
 | POST | `/api/spaces/{id}/archive` | `archive_space` | session | Archive a space; its nodes keep their ``space_id`` and grants go inert. |
+
+### Settings
+
+| Method | Path | Handler | Auth | Notes |
+|---|---|---|---|---|
+| GET | `/api/settings` | `get_settings` | session | Every setting: what is in force, where it came from, whether it can be stored. |
+| PUT | `/api/settings` | `put_settings` | session | Apply several setting changes atomically: all of them, or none of them. |
+| POST | `/api/settings/adopt-env` | `adopt_environment` | session | Adopt every editable setting the environment pins into ``settings.env``. |
+| DELETE | `/api/settings/{name}` | `delete_setting` | session | Remove one setting from ``settings.env``, falling back down the ladder. |
 
 ### Agent surface (MCP)
 

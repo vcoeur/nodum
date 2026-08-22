@@ -165,6 +165,23 @@ the event log as `settings.set` / `settings.unset`, with before and after. They
 are **not** reversible by `undo`: a file outside the database is not something a
 transaction can put back.
 
+### Over HTTP
+
+The same configuration is manageable on the authenticated API (all four routes
+need a session; see [HTTP API](http-api.md#settings)):
+
+| Route | What it does |
+|---|---|
+| `GET /api/settings` | `config list` verbatim — same envelope, byte-identical. |
+| `PUT /api/settings` | Partial multi-key write: body maps names to a value or `null`. **Atomic** — every key is validated before anything is written, so one bad value leaves the file untouched. Absent = untouched; explicit `null` = remove; empty string = refused. |
+| `DELETE /api/settings/{name}` | Remove one key — the same as `null`, answering 200 `changed: false` for a key the file never carried. |
+| `POST /api/settings/adopt-env` | Store every editable, non-empty environment value into `settings.env` — the cutover from env-only configuration. Adopted keys keep resolving `provenance: "environment"` until the variable is unset host-side; values that fail validation are skipped and named in the response. |
+
+A write naming a key the environment pins answers **409**, not 400: the request
+is well formed, but the file is not the layer in force. Every other refusal is
+400 with the reason in the message. Writes are attributed to the session's
+human and event-logged exactly as the CLI's are.
+
 A change applies without a restart. The three things that means in practice:
 
 - a **budget** funds the *next* run — an `AgentRun` spans a whole consolidation
@@ -182,8 +199,11 @@ what changed.
 `nodum llm status` shows what the provider actually resolves to — the model,
 the endpoint, whether a configured key is withheld, the window and the
 ceiling — which is the first diagnostic when a smart feature answers `false`
-instead of failing. The per-request semantics and the output-envelope shapes
-are in [Commands](commands.md#asking-the-graph); wiring a provider and a
+instead of failing. For the three of those a settings layer can supply (model,
+window, thinking level) it also names, as `provenance`, which layer each came
+from; note an unset window may have been supplied by a shipped *profile* rather
+than by any settings layer. The per-request semantics and the output-envelope
+shapes are in [Commands](commands.md#asking-the-graph); wiring a provider and a
 cycle budget for the internal agent is walked through in
 [The gardener](gardener.md#giving-it-a-model).
 

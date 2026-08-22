@@ -515,6 +515,21 @@ below are the parts that do not fit a route table.
 
 ### Spaces, accounts and the smart routes
 
+- **Settings are manageable over HTTP, human-only at the domain.** `GET
+  /api/settings` is `nodum config list` byte-identical and stays inline (the
+  reader costs one stat on an unchanged file); `PUT /api/settings` (body:
+  `{NAME: value | null}` — absent untouched, `null` removes, empty string
+  refused), `DELETE /api/settings/{name}` (200 `changed: false` for a key the
+  file never carried) and `POST /api/settings/adopt-env` (store every editable,
+  non-empty environment value; provenance stays `environment`, one
+  `settings.set` event per key actually moved) all go through
+  `run_in_threadpool`. The gate is `Store.require_human` inside
+  `nodum.service.apply_settings`/`unset_setting`/`adopt_environment` — never a
+  route-level check, and never inside `nodum.settings` (the provider import
+  rail forbids it). A key the environment pins is **409**
+  (`settings.SettingPinned`, its own `EXCEPTION_STATUS` row); every other
+  refusal is 400 with the seam's sentence. PUT is atomic: one invalid key
+  writes nothing.
 - **Spaces reach the human over HTTP as a filter, a target, and a lifecycle.**
   `GET /api/nodes` and `GET /api/search` take `?space=` (narrow to one space)
   and `?include_meta=` (off by default). `POST /api/nodes` takes `space` in
@@ -691,14 +706,18 @@ nothing else.
   the report cannot drift from the behaviour it describes. Only spaces in the
   caller's own grant set are listed — an identity read must not become space
   enumeration.
-- **Four tiers are never registered, and each one is a named absence**: the
+- **Five tiers are never registered, and each one is a named absence**: the
   review tools (`accept`, `reject` — `REVIEW_TOOLS`, gated by
   `Store.require_review` — a human, or `edit` on the item's space), the
   curative tools (`merge_nodes`, `retype`, `supersede_edge`, `bulk_relink`,
   `consolidate` — `CURATIVE_TOOLS`, §8.2), **reversal plus the journal
   that records it** (`undo`, `rollback`, `abandon_cycle`, `request_stop`,
-  `get_cycle`, `list_cycles` — `HUMAN_ONLY_TOOLS`), and **anything that names a
-  path on the server's own disk** (`FILESYSTEM_TOOLS`). `UNREGISTERED_TOOLS` is
+  `get_cycle`, `list_cycles` — `HUMAN_ONLY_TOOLS`), **anything that names a
+  path on the server's own disk** (`FILESYSTEM_TOOLS`), and **the settings
+  writes** (`apply_settings`, `set_setting`, `unset_setting`,
+  `adopt_environment` — `SETTINGS_TOOLS`; gated at the domain by
+  `Store.require_human`, which is what bites here, since MCP is the surface
+  that mints non-human principals). `UNREGISTERED_TOOLS` is
   the union, and what `tests/test_mcp_server.py` asserts the registry stays
   disjoint from; adding an operation to any of those tiers means adding its
   name to a list, never to the registry. This is **structural enforcement, not
