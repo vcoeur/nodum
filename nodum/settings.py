@@ -90,6 +90,7 @@ whose other lines it cannot promise to preserve.
 
 from __future__ import annotations
 
+import importlib.util
 import logging
 import os
 import re
@@ -1612,6 +1613,28 @@ def adoption_candidates() -> tuple[dict[str, str], list[tuple[str, str]]]:
 # ── What the surfaces report ─────────────────────────────────────────────────
 
 
+#: Which optional dependency each capability flag reports, keyed by extra name.
+#: A name here must match the extra's rows in the registry — ``audio`` today,
+#: whose two settings configure :mod:`nodum.extract`'s speech-to-text handler.
+_CAPABILITY_MODULES: Mapping[str, str] = MappingProxyType({"audio": "faster_whisper"})
+
+
+def _capabilities() -> dict[str, bool]:
+    """Probe, per optional extra, whether its dependency is importable.
+
+    ``importlib.util.find_spec`` and not a real import on purpose: this runs on
+    every ``config list``, and importing an optional package here would load it
+    into a process that may never use it. The import-based probes in
+    :mod:`nodum.extract` stay the authority for *extraction* availability (they
+    also check binaries on PATH); this is the lighter question a row needs —
+    is the dependency installed at all.
+    """
+    return {
+        extra: importlib.util.find_spec(module) is not None
+        for extra, module in _CAPABILITY_MODULES.items()
+    }
+
+
 def _describe(name: str, view: Snapshot, stored: Mapping[str, str]) -> SettingOut:
     """One row of the settings report, with any secret reduced to whether it is set."""
     spec = SPECS[name]
@@ -1656,8 +1679,9 @@ def list_settings() -> SettingsOut:
 
     Returns:
         The :class:`~nodum.models.SettingsOut` envelope: the rows, the bound
-        path, any keys the file carries that this build does not configure, and
-        why the file could not be read when it could not.
+        path, any keys the file carries that this build does not configure,
+        why the file could not be read when it could not, and which optional
+        extras this build can serve.
     """
     store = _store()
     reading = _current(store)
@@ -1668,6 +1692,7 @@ def list_settings() -> SettingsOut:
         path=None if store is None else str(store.path),
         unknown_keys=list(reading.unknown),
         unreadable=view.unreadable,
+        capabilities=_capabilities(),
     )
 
 

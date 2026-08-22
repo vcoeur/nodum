@@ -974,3 +974,57 @@ export interface RequestUploadBody {
    */
   space?: string;
 }
+
+/** One row of the settings report (`nodum config list`, `GET /api/settings`). */
+export interface SettingOut {
+  key: string;
+  /** The effective value; always null for a secret — see `set`. */
+  value: string | null;
+  /** Whether a value is in force at any layer. */
+  set: boolean;
+  /** Where the value in force came from: environment, settings.env, default, unset, file-unreadable. */
+  provenance: string;
+  default: string | null;
+  kind: string;
+  secret: boolean;
+  /** False for an env-only name: the file layer is not consulted at all. */
+  writable: boolean;
+  refusal: string | null;
+  /** Whether settings.env carries the key right now. */
+  stored: boolean;
+  on_invalid: string | null;
+}
+
+/** The whole settings report, plus the file it is read from and build capabilities. */
+export interface SettingsOut {
+  settings: SettingOut[];
+  count: number;
+  path: string | null;
+  unknown_keys: string[];
+  unreadable: string | null;
+  /** Per optional extra, whether its dependency is importable (`audio` today). */
+  capabilities: Record<string, boolean>;
+}
+
+/** What one settings write left in force. No secret value is ever carried. */
+export interface SettingChangeOut {
+  key: string;
+  changed: boolean;
+  stored: boolean;
+  value: string | null;
+  set: boolean;
+  provenance: string;
+}
+
+/** One environment value adopt-env declined to store, and why. */
+export interface SettingAdoptSkippedOut {
+  key: string;
+  reason: string;
+}
+
+/** What `POST /api/settings/adopt-env` did: adopted rows plus named skips. */
+export interface SettingAdoptOut {
+  adopted: SettingChangeOut[];
+  skipped: SettingAdoptSkippedOut[];
+  count: number;
+}

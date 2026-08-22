@@ -67,6 +67,9 @@ import type {
   SearchFilters,
   SearchResult,
   SetGrantBody,
+  SettingAdoptOut,
+  SettingChangeOut,
+  SettingsOut,
   SpaceOut,
   SubgraphOut,
   SubgraphParams,
@@ -1492,6 +1495,70 @@ export function exportNode(
   );
 }
 
+/* ------------------------------------------------------------------ */
+/* Settings — the file beside the graph                                 */
+/* ------------------------------------------------------------------ */
+
+/**
+ * `GET /api/settings` — every setting: value in force, provenance, default.
+ *
+ * The read is `nodum config list` verbatim (same envelope, same bytes) plus
+ * the build-capability flags. A secret's `value` is never carried — the row
+ * says whether one is set and nothing more.
+ */
+export function getSettings(signal?: AbortSignal): Promise<SettingsOut> {
+  return request<SettingsOut>("/settings", signal ? { signal } : {});
+}
+
+/**
+ * `PUT /api/settings` — apply several changes atomically: all of them or none.
+ *
+ * `null` removes a key from the file (falling back down the ladder); an empty
+ * string is refused by the server — unset it instead. A key the environment
+ * pins is a **409** (`SettingPinned`) with the file untouched; every other
+ * refusal is a 400 carrying the seam's own sentence.
+ */
+export function applySettings(
+  changes: Record<string, string | null>,
+  signal?: AbortSignal,
+): Promise<SettingChangeOut[]> {
+  return requestList<SettingChangeOut>("changes", "/settings", {
+    method: "PUT",
+    body: changes,
+    ...(signal ? { signal } : {}),
+  });
+}
+
+/**
+ * `DELETE /api/settings/{name}` — remove one key from the file.
+ *
+ * Removing a key the file never carried is the state the caller asked for:
+ * 200 with `changed: false`, never a 404.
+ */
+export function unsetSetting(name: string, signal?: AbortSignal): Promise<SettingChangeOut> {
+  return request<SettingChangeOut>(`/settings/${encodeURIComponent(name)}`, {
+    method: "DELETE",
+    ...(signal ? { signal } : {}),
+  });
+}
+
+/**
+ * `POST /api/settings/adopt-env` — store every editable, non-empty
+ * environment value.
+ *
+ * An adopted key keeps resolving `provenance: "environment"` — adopt never
+ * touches the environment, which stays a host-side step — but the file now
+ * carries the same value, so unsetting the variable later no longer moves
+ * what is in force. A value the registry refuses is skipped and named in the
+ * answer, not a batch failure.
+ */
+export function adoptEnvironment(signal?: AbortSignal): Promise<SettingAdoptOut> {
+  return request<SettingAdoptOut>("/settings/adopt-env", {
+    method: "POST",
+    ...(signal ? { signal } : {}),
+  });
+}
+
 /** Every endpoint, grouped for `import { api } from "../api/client"` ergonomics. */
 export const api = {
   login,
@@ -1548,4 +1615,8 @@ export const api = {
   listEvents,
   undo,
   exportNode,
+  getSettings,
+  applySettings,
+  unsetSetting,
+  adoptEnvironment,
 };

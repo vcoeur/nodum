@@ -48,6 +48,7 @@ const JournalView = lazy(() => import("./views/journal/JournalView"));
 const CycleView = lazy(() => import("./views/journal/CycleView"));
 const NodeView = lazy(() => import("./views/node/NodeView"));
 const NodeTitleRedirect = lazy(() => import("./views/node/NodeTitleRedirect"));
+const SettingsView = lazy(() => import("./views/settings/SettingsView"));
 
 /** Shown while a view's chunk loads. */
 function ViewLoading() {
@@ -116,6 +117,11 @@ export const router = createBrowserRouter([
 
       // Admin — accounts and grants; replaces the removed policy editor.
       { path: "admin", element: lazyView(<AdminView />) },
+
+      // Settings — the configuration ladder over settings.env: grouped rows,
+      // adopt-from-environment, one-click revert from the event log. The
+      // export action belongs to the next slice and is deliberately absent.
+      { path: "settings", element: lazyView(<SettingsView />) },
 
       // History — always per node. The editor links here by URL, so the path
       // is part of the contract between the two slices: `/history/:nodeId`.

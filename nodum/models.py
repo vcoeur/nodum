@@ -1025,11 +1025,16 @@ class SettingOut(BaseModel):
 class SettingsOut(BaseModel):
     """Every setting, plus the file they were read from.
 
-    ``unknown_keys`` are names ``settings.env`` carries that this build does
-    not configure: they are reported rather than dropped, because a file
-    written by a newer nodum — or by an operator, for the next reader — is not
-    a file to tidy. ``unreadable`` is why the file could not be parsed, in
-    which case every row falls back to the environment and the defaults.
+    ``unknown_keys`` are names ``settings.env`` carries that this build does not
+    configure: they are reported rather than dropped, because a file written by
+    a newer nodum — or by an operator, for the next reader — is not a file to
+    tidy. ``unreadable`` is why the file could not be parsed, in which case every
+    row falls back to the environment and the defaults.
+
+    ``capabilities`` reports, per optional extra, whether the dependency its rows
+    configure is importable in this build (`audio` → ``faster_whisper`` today).
+    A surface disables the affected rows with "not available in this build" off a
+    false flag instead of probing anything itself.
     """
 
     settings: list[SettingOut]
@@ -1037,6 +1042,7 @@ class SettingsOut(BaseModel):
     path: str | None
     unknown_keys: list[str]
     unreadable: str | None
+    capabilities: dict[str, bool]
 
 
 class SettingChangeOut(BaseModel):

@@ -41,6 +41,7 @@ const VIEWS = [
   { to: "/assets", label: "Assets" },
   { to: "/spaces", label: "Spaces" },
   { to: "/admin", label: "Admin" },
+  { to: "/settings", label: "Settings" },
 ] as const;
 
 /** The app shell. Rendered as the router's root route element. */

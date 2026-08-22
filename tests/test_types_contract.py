@@ -96,6 +96,15 @@ PY_TO_TS: dict[str, str] = {
     # (ConsolidationReport), so the mirror types it `JsonObject` and the
     # contract asserts presence + nullability only.
     "ConsolidationOut": "ConsolidationOut",
+    # SP3: the settings report and its write/adopt shapes, served by
+    # `GET/PUT/DELETE /api/settings` and `POST /api/settings/adopt-env` and
+    # rendered by the Settings view. Mirrors nodum/models.py field for field;
+    # no secret value is ever carried on any of them.
+    "SettingOut": "SettingOut",
+    "SettingsOut": "SettingsOut",
+    "SettingChangeOut": "SettingChangeOut",
+    "SettingAdoptSkippedOut": "SettingAdoptSkippedOut",
+    "SettingAdoptOut": "SettingAdoptOut",
 }
 
 #: TS response interfaces with no pydantic twin: hand-built dicts owned by the
