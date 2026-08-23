@@ -1512,8 +1512,15 @@ def _record_settings_change(op: str, change: settings.Change, principal: Princip
 
 @config_app.command("list")
 def config_list() -> None:
-    """List every setting: what is in force, where it came from, whether it can be stored."""
-    _emit(_run(settings.list_settings))
+    """List every setting: what is in force, where it came from, whether it can be stored.
+
+    The report also carries the vec projector's embedding state — the
+    mixed-model note (non-null while chunks from another model sit in the
+    store, invisible to search) and the chunk count — which is what a
+    ``NODUM_EMBED_MODEL`` change would blind. ``GET /api/settings`` renders
+    this same envelope byte for byte.
+    """
+    _emit(_run(service.settings_report))
 
 
 @config_app.command("get")

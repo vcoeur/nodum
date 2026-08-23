@@ -173,6 +173,8 @@ LLM_REQUEST_BUDGET = "NODUM_LLM_REQUEST_BUDGET"
 LLM_REQUEST_SECONDS = "NODUM_LLM_REQUEST_SECONDS"
 LLM_CALL_TIMEOUT = "NODUM_LLM_CALL_TIMEOUT"
 LLM_MAX_OUTPUT_TOKENS = "NODUM_LLM_MAX_OUTPUT_TOKENS"
+EMBED_MODEL = "NODUM_EMBED_MODEL"
+EMBED_DOWNLOAD = "NODUM_EMBED_DOWNLOAD"
 EMBED_CACHE = "NODUM_EMBED_CACHE"
 AUDIO_MODEL = "NODUM_AUDIO_MODEL"
 AUDIO_DOWNLOAD = "NODUM_AUDIO_DOWNLOAD"
@@ -491,6 +493,27 @@ _SPECS: tuple[Setting, ...] = (
         default="4096",
         summary="Per-call output ceiling.",
         validate=_whole_number(1),
+    ),
+    Setting(
+        name=EMBED_MODEL,
+        kind="string",
+        # The same model :mod:`nodum.embeddings` defaults to, spelled here
+        # because the registry is the seam's home for the value and the module
+        # that reads the seam cannot be the module it imports from.
+        # ``tests/test_settings.py`` pins the two spellings together.
+        default="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+        summary=(
+            "The local embedding model; changing it blinds every stored chunk "
+            "to search until `projector rebuild vec` re-embeds them."
+        ),
+        on_invalid=None,
+    ),
+    Setting(
+        name=EMBED_DOWNLOAD,
+        kind="gate",
+        default=None,
+        summary="'1' allows the one-time embedding-model download (~0.2 GB).",
+        validate=_gate,
     ),
     Setting(
         name=EMBED_CACHE,

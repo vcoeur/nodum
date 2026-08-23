@@ -6,12 +6,13 @@ import math
 import os
 import sys
 import tempfile
+import threading
 import types
 from pathlib import Path
 
 import pytest
 
-from nodum import embeddings
+from nodum import embeddings, settings
 
 
 @pytest.fixture()
@@ -473,6 +474,107 @@ def test_resolution_is_cached_for_the_process(monkeypatch, stub_fastembed):
     assert embeddings.get_provider() is embeddings.get_provider()
     embeddings.unavailable_reason()
     assert len(constructions) == 1
+
+
+# ── The embedding variables resolve through the settings ladder ───────────────
+
+
+def test_a_stored_model_write_invalidates_and_re_resolves(monkeypatch, stub_fastembed):
+    """`NODUM_EMBED_MODEL` is storable now, so a write re-resolves the provider.
+
+    The seam's ladder applies exactly as it does for every other storable
+    name: the stored value is what the next resolution loads, which is the
+    coupling the rebuild exists to make safe.
+    """
+    seen: dict = {}
+    monkeypatch.setattr(embeddings, "FastembedProvider", _provider_stub(seen=seen))
+    monkeypatch.delenv(embeddings.ENV_MODEL_VAR, raising=False)
+    monkeypatch.delenv(embeddings.ENV_DOWNLOAD_VAR, raising=False)
+    embeddings.reset_provider()
+
+    assert embeddings.get_provider().model_id == embeddings.DEFAULT_MODEL
+
+    settings.set_value(settings.EMBED_MODEL, "stored/384-dim-model")
+
+    provider = embeddings.get_provider()
+    assert provider is not None
+    assert provider.model_id == "stored/384-dim-model"
+    assert seen["model_name"] == "stored/384-dim-model"
+
+
+def test_an_empty_embed_model_variable_is_the_default_and_not_the_empty_string(
+    monkeypatch, stub_fastembed
+):
+    """The two-argument ``os.environ.get`` hole this change closes: an exported
+    empty variable used to become the model name ``""`` handed to fastembed."""
+    seen: dict = {}
+    monkeypatch.setattr(embeddings, "FastembedProvider", _provider_stub(seen=seen))
+    monkeypatch.setenv(embeddings.ENV_MODEL_VAR, "")
+    monkeypatch.delenv(embeddings.ENV_DOWNLOAD_VAR, raising=False)
+    embeddings.reset_provider()
+
+    provider = embeddings.get_provider()
+    assert provider is not None
+    assert seen["model_name"] == embeddings.DEFAULT_MODEL
+
+
+def test_the_download_gate_reads_through_the_settings_ladder(monkeypatch, stub_fastembed):
+    """`NODUM_EMBED_DOWNLOAD=1` stored in `settings.env` lifts the offline
+    restriction exactly as the environment spelling does."""
+    seen: dict = {}
+    monkeypatch.setattr(embeddings, "FastembedProvider", _provider_stub(seen=seen))
+    monkeypatch.delenv(embeddings.ENV_DOWNLOAD_VAR, raising=False)
+    settings.set_value(settings.EMBED_DOWNLOAD, "1")
+    embeddings.reset_provider()
+
+    provider = embeddings.get_provider()
+    assert provider is not None
+    assert embeddings.unavailable_reason() is None
+    assert seen["hf_offline"] is None  # nothing pinned the probe to the local cache
+
+
+def test_two_threads_observing_one_invalidation_share_one_model_load(monkeypatch, stub_fastembed):
+    """R3-B6: one settings change, two racers, exactly one model load.
+
+    The load happens **inside** the resolution lock, so a second thread that
+    arrives during a first resolution waits for it and then finds the fresh
+    resolution rather than starting a second load of the same model. Without
+    the lock (or with the load outside it), both threads would construct and
+    the count below would be three instead of two.
+    """
+    constructions: list[str] = []
+
+    class CountingStub(_provider_stub()):
+        def __init__(self, model_name, *, cache_dir=None):
+            constructions.append(model_name)
+            super().__init__(model_name, cache_dir=cache_dir)
+
+    monkeypatch.setattr(embeddings, "FastembedProvider", CountingStub)
+    monkeypatch.delenv(embeddings.ENV_MODEL_VAR, raising=False)
+    monkeypatch.delenv(embeddings.ENV_DOWNLOAD_VAR, raising=False)
+    embeddings.reset_provider()
+    assert embeddings.get_provider() is not None  # warm: one construction
+    assert constructions == [embeddings.DEFAULT_MODEL]
+
+    settings.set_value(settings.EMBED_MODEL, "changed/384-dim-model")
+
+    barrier = threading.Barrier(2)
+    results: list[object] = []
+
+    def resolve_from_both_sides() -> None:
+        barrier.wait()
+        results.append(embeddings.get_provider())
+
+    threads = [threading.Thread(target=resolve_from_both_sides) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert constructions == [embeddings.DEFAULT_MODEL, "changed/384-dim-model"], (
+        "two threads observing one invalidation produced more than one load"
+    )
+    assert results[0] is results[1], "the two racers got different resolutions"
 
 
 @pytest.mark.skipif(

@@ -333,6 +333,15 @@ nodum projector status
 nodum projector rebuild vec     # e.g. after an embedding-model change
 ```
 
+Every chunk records the embedding model that produced it, and search reads
+only the chunks carrying the active model — so a model change makes the whole
+existing corpus invisible to search until the rebuild re-embeds it. That is
+why changing the model is coupled to the rebuild: `NODUM_EMBED_MODEL` is
+manageable from the Settings page, the change is confirmed naming the
+consequence, and the page offers the rebuild (HTTP:
+`POST /api/projectors/{name}/rebuild`, human-only) until the mixed-model state
+is gone.
+
 Two ship today:
 
 - **`fts`** — a SQLite FTS5 full-text index, giving BM25 keyword ranking. A

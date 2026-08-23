@@ -133,6 +133,8 @@ def test_every_key_the_registry_names_is_the_constant_its_module_reads(store):
     assert settings.LLM_REQUEST_SECONDS == agent.ENV_REQUEST_SECONDS
     assert settings.LLM_CALL_TIMEOUT == agent.ENV_CALL_TIMEOUT
     assert settings.LLM_MAX_OUTPUT_TOKENS == agent.ENV_MAX_OUTPUT_TOKENS
+    assert settings.EMBED_MODEL == embeddings.ENV_MODEL_VAR
+    assert settings.EMBED_DOWNLOAD == embeddings.ENV_DOWNLOAD_VAR
     assert settings.EMBED_CACHE == embeddings.ENV_CACHE_VAR
     assert settings.AUDIO_MODEL == extract.ENV_AUDIO_MODEL_VAR
     assert settings.AUDIO_DOWNLOAD == extract.ENV_AUDIO_DOWNLOAD_VAR
@@ -162,11 +164,16 @@ def test_every_default_the_registry_reports_is_the_default_the_runtime_uses(stor
     assert float(default[settings.LLM_CALL_TIMEOUT]) == agent.DEFAULT_CALL_TIMEOUT
     assert default[settings.LLM_MAX_OUTPUT_TOKENS] == str(agent.DEFAULT_MAX_OUTPUT_TOKENS)
     assert Path(default[settings.EMBED_CACHE]).expanduser() == embeddings.DEFAULT_CACHE_PATH
+    # The embedding model's default is spelled in two homes — the registry and
+    # :mod:`nodum.embeddings` — because the module that reads the seam cannot
+    # be the module it imports from; this line pins them together.
+    assert default[settings.EMBED_MODEL] == embeddings.DEFAULT_MODEL
     assert default[settings.AUDIO_MODEL] == extract.AUDIO_MODEL
-    # The three that are deliberately *off* when nothing sets them.
+    # The four that are deliberately *off* when nothing sets them.
     assert default[settings.LLM_MODEL] is None
     assert default[settings.LLM_API_KEY] is None
     assert default[settings.CONSOLIDATE_AT] is None
+    assert default[settings.EMBED_DOWNLOAD] is None
     assert default[settings.AUDIO_DOWNLOAD] is None
 
 
@@ -246,6 +253,17 @@ def test_an_empty_audio_model_is_the_default_and_not_the_model_named_empty(store
 
     monkeypatch.setenv(settings.AUDIO_DOWNLOAD, "")
     assert settings.resolve(settings.AUDIO_DOWNLOAD) is None
+
+
+def test_an_empty_embed_model_is_the_default_and_not_the_model_named_empty(store, monkeypatch):
+    """The same hole, in the module that reads the seam now: ``NODUM_EMBED_MODEL``
+    was read as ``os.environ.get(NAME, DEFAULT)``, so an empty variable became
+    the model name ``""`` — which fastembed was then asked to load."""
+    monkeypatch.setenv(settings.EMBED_MODEL, "")
+    assert settings.resolve(settings.EMBED_MODEL) == embeddings.DEFAULT_MODEL
+
+    monkeypatch.setenv(settings.EMBED_DOWNLOAD, "")
+    assert settings.resolve(settings.EMBED_DOWNLOAD) is None
 
 
 def test_a_snapshot_is_one_configuration_and_does_not_move(store):
@@ -677,6 +695,7 @@ def test_free_text_keys_report_no_bad_value_posture(store):
         settings.LLM_MODEL,
         settings.LLM_BASE_URL,
         settings.LLM_API_KEY,
+        settings.EMBED_MODEL,
         settings.EMBED_CACHE,
         settings.AUDIO_MODEL,
     }
@@ -1013,6 +1032,7 @@ def test_a_key_the_environment_pins_refuses_the_write_instead_of_accepting_a_dea
         (settings.LLM_THINKING, "very"),
         (settings.CONSOLIDATE_AT, "3pm"),
         (settings.AUDIO_DOWNLOAD, "yes"),
+        (settings.EMBED_DOWNLOAD, "yes"),
         (settings.LLM_CYCLE_BUDGET, "-5"),
     ],
 )
@@ -1111,21 +1131,40 @@ def test_a_forced_provider_survives_a_settings_write(store):
     assert provider is not None and provider.model_id == "qwen3:8b"
 
 
-def test_a_settings_write_never_triggers_an_embedding_model_load(store, monkeypatch):
+def test_only_an_embedding_settings_write_triggers_an_embedding_model_load(store, monkeypatch):
     """Constructing the embedding provider *loads a model*, so its invalidation is
-    keyed on its own three values rather than on the settings file moving."""
+    keyed on its own three values rather than on the settings file moving.
+
+    The budget half is the old guarantee: a write to an unrelated setting must
+    not resolve the embedding provider again. The model half is the new
+    coupling: ``NODUM_EMBED_MODEL`` is storable now, so writing it **does**
+    invalidate the snapshot — the next resolution loads the new model, which
+    is exactly why the model write carries the rebuild coupling and why the MCP
+    surface runs the load off the event loop.
+    """
     embeddings.reset_provider()
-    loads: list[int] = []
+    loads: list[str] = []
     monkeypatch.setattr(
-        embeddings, "_resolve_default", lambda: (loads.append(1), (None, "stub"))[1]
+        embeddings,
+        "_resolve_default",
+        lambda configuration: (loads.append(configuration[0]), (None, "stub"))[1],
     )
     embeddings.get_provider()
-    assert loads == [1]
+    assert loads == [embeddings.DEFAULT_MODEL]
 
     settings.set_value(settings.LLM_CYCLE_BUDGET, "900")
     embeddings.get_provider()
 
-    assert loads == [1], "a budget write resolved the embedding provider again"
+    assert loads == [embeddings.DEFAULT_MODEL], (
+        "a budget write resolved the embedding provider again"
+    )
+
+    settings.set_value(settings.EMBED_MODEL, "another/384-dim-model")
+    embeddings.get_provider()
+
+    assert loads == [embeddings.DEFAULT_MODEL, "another/384-dim-model"], (
+        "a model write did not invalidate the embedding snapshot"
+    )
 
 
 # ── Remediation strings name the layer in force ───────────────────────────────
@@ -1324,6 +1363,26 @@ def test_config_list_reports_every_key_with_its_provenance(store, fresh_db):
         settings.FROM_DEFAULT,
         settings.FROM_UNSET,
     }
+
+
+def test_config_list_on_a_fresh_machine_creates_no_database(tmp_path, monkeypatch):
+    """The settings report is a read, and must stay one.
+
+    The report carries the vec projector's embedding state, which is read by
+    opening the graph — and ``db.connect`` *creates* the file it opens. The
+    guard before that open is load-bearing: ``config list`` (and its byte
+    twin ``GET /api/settings``) on a machine that has never run nodum must
+    not leave a migrated graph behind, with its 0600 settings file beside it.
+    """
+    fresh = tmp_path / "never" / "created.db"
+    monkeypatch.setenv("NODUM_DB", str(fresh))
+
+    payload = _run_json("config", "list")
+
+    assert payload["embed_chunks"] == 0
+    assert payload["mixed_model_note"] is None
+    assert not fresh.exists(), "config list created the graph it only probes"
+    assert not (fresh.parent / settings.SETTINGS_FILENAME).exists()
 
 
 def test_config_set_is_logged_and_config_unset_takes_it_back(store, fresh_db):

@@ -24,7 +24,10 @@ import base64
 import importlib.util
 import io
 import json
+import sys
 import threading
+import time
+import types
 from contextlib import asynccontextmanager
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -36,13 +39,14 @@ from mcp.client.session import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 from PIL import Image
 
-from nodum import assets, http_api, ingest, mcp_server, service, urls
+from nodum import assets, embeddings, http_api, ingest, mcp_server, service, settings, urls
 from nodum.mcp_server import (
     ADDITIVE_TOOLS,
     CURATIVE_TOOLS,
     FILESYSTEM_TOOLS,
     HUMAN_ONLY_TOOLS,
     OVERWRITING_TOOLS,
+    PROJECTOR_TOOLS,
     READ_TOOLS,
     REVIEW_TOOLS,
     SETTINGS_TOOLS,
@@ -255,7 +259,7 @@ def test_no_tool_description_advertises_a_tool_that_is_not_registered(fresh_db):
     # is exempt by the same backtick discipline (it writes them in :data: and
     # ``…`` roles this citation test reads, so the exemption is by section, not
     # by spelling).
-    tier_paragraph = (mcp_server.__doc__ or "").split("**Four tiers are never")[0]
+    tier_paragraph = (mcp_server.__doc__ or "").split("**Six tiers are never")[0]
     # Through `cited`, which matches one backtick or two: this paragraph carries
     # no ghost in either spelling today, so the wider test is free and a
     # single-backticked reintroduction cannot slip past it.
@@ -280,6 +284,78 @@ def test_the_grown_registry_still_holds_no_review_or_curative_tool(fresh_db):
     assert names == set(READ_TOOLS) | set(ADDITIVE_TOOLS)
 
 
+# ── Embeddings never load on the event loop ───────────────────────────────────
+
+
+def test_a_model_change_then_mcp_search_never_blocks_the_loop_for_the_load(fresh_db, monkeypatch):
+    """R3-B6: the first MCP search after a settings write must not load the model
+    on the event loop.
+
+    With `NODUM_EMBED_MODEL` web-manageable, a settings write can invalidate
+    the embedding snapshot, and the next `search` resolves the new provider —
+    a fastembed model load. FastMCP calls sync tools inline on the event loop,
+    so the load used to stall every other request for its whole duration. The
+    tool is async and runs the search body through `run_in_threadpool`, which
+    is what this test watches: a heartbeat task on the same loop keeps ticking
+    while the (deliberately slow) provider construction runs, and exactly one
+    construction happens for the one invalidation.
+
+    A sync `def` tool — or an async one that resolves the provider before the
+    threadpool hop — blocks the heartbeat for the load's duration and fails
+    the tick floor, and a resolution that constructs twice fails the count.
+    """
+
+    class SlowProvider:
+        """A 384-dim fastembed stand-in whose construction is slow enough to see."""
+
+        dimensions = embeddings.EMBEDDING_DIMS
+
+        def __init__(self, model_name, *, cache_dir=None):
+            constructions.append(model_name)
+            time.sleep(0.4)
+            self.model_id = model_name
+            self.cache_dir = cache_dir
+
+        def embed(self, texts):
+            return [[0.0] * self.dimensions for _ in texts]
+
+    constructions: list[str] = []
+    monkeypatch.setattr(embeddings, "FastembedProvider", SlowProvider)
+    monkeypatch.setitem(sys.modules, "fastembed", types.ModuleType("fastembed"))
+    embeddings.reset_provider()
+    # Warm the resolution so the *write* is what invalidates it.
+    embeddings.get_provider()
+    assert constructions == [embeddings.DEFAULT_MODEL]
+
+    service.apply_settings({settings.EMBED_MODEL: "some/384-dim-model"}, principal=owner())
+
+    async def scenario(session):
+        ticks = 0
+
+        async def heartbeat():
+            nonlocal ticks
+            while True:
+                ticks += 1
+                await asyncio.sleep(0.01)
+
+        pump = asyncio.create_task(heartbeat())
+        try:
+            result = await _call(session, "search", {"query": "alpha"})
+        finally:
+            pump.cancel()
+        return result, ticks
+
+    result, ticks = _run(scenario)
+
+    assert not result.isError, result.content[0].text
+    assert constructions == [embeddings.DEFAULT_MODEL, "some/384-dim-model"], (
+        "the invalidation loaded the model more than once"
+    )
+    assert ticks >= 5, (
+        f"the event loop was blocked for the model load (heartbeat ticked {ticks} times)"
+    )
+
+
 def test_reversal_and_the_journal_are_a_named_absence_too(fresh_db):
     """The disjointness assertions only cover what a list names — and these were nameless.
 
@@ -298,13 +374,14 @@ def test_reversal_and_the_journal_are_a_named_absence_too(fresh_db):
         HUMAN_ONLY_TOOLS
     )
     assert "ingest_file" in FILESYSTEM_TOOLS
-    # The four absence lists are one surface, and nothing may be in two tiers.
+    # The six absence lists are one surface, and nothing may be in two tiers.
     assert set(UNREGISTERED_TOOLS) == (
         set(CURATIVE_TOOLS)
         | set(REVIEW_TOOLS)
         | set(HUMAN_ONLY_TOOLS)
         | set(FILESYSTEM_TOOLS)
         | set(SETTINGS_TOOLS)
+        | set(PROJECTOR_TOOLS)
     )
     assert len(UNREGISTERED_TOOLS) == len(set(UNREGISTERED_TOOLS))
     # And no absence list may name something the registry actually serves.

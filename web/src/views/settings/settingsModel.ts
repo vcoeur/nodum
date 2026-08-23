@@ -51,6 +51,8 @@ const REQUEST_KEYS = [
 
 const AUDIO_KEYS = ["NODUM_AUDIO_MODEL", "NODUM_AUDIO_DOWNLOAD"] as const;
 
+const EMBED_KEYS = ["NODUM_EMBED_MODEL", "NODUM_EMBED_DOWNLOAD"] as const;
+
 /** The env-only four: shown so the operator sees the whole ladder, never editable. */
 const SERVER_KEYS = [
   "NODUM_DB",
@@ -65,6 +67,7 @@ export const GROUPS: readonly SettingGroup[] = [
   { id: "gardener", title: "Gardener", keys: GARDENER_KEYS },
   { id: "requests", title: "Requests", keys: REQUEST_KEYS },
   { id: "audio", title: "Audio", keys: AUDIO_KEYS },
+  { id: "embeddings", title: "Embeddings", keys: EMBED_KEYS },
   { id: "server", title: "Server", keys: SERVER_KEYS },
 ];
 
@@ -157,6 +160,46 @@ export function layerLabel(provenance: string): string {
 /** The note under CONTEXT_TOKENS' default: a shipped profile may serve more. */
 export const PROFILE_DEFAULT_NOTE =
   "A recognised provider profile serves its own larger window (DeepSeek's hosted endpoint: 1M) when the model matches.";
+
+/** The embedding model row, and the write that blinds the vector store. */
+export const EMBED_MODEL_KEY = "NODUM_EMBED_MODEL";
+
+/** Whether a key is the embedding model — the write that needs the confirm. */
+export function isModelChange(key: string): boolean {
+  return key === EMBED_MODEL_KEY;
+}
+
+/**
+ * The note under the download-gate row: what flipping it on costs.
+ *
+ * Every line is a fact the system delivers: the gate is the one way the
+ * never-download-implicitly posture is lifted, and the next vector operation
+ * after flipping it may fetch the model — ~0.2 GB for the default.
+ */
+export const EMBED_DOWNLOAD_NOTE =
+  "On: the next vector operation may download the model (~0.2 GB) — nodum never downloads implicitly, so this is the one gate that allows it.";
+
+/**
+ * The confirmation before an embedding-model write — the copy that names the
+ * coupling.
+ *
+ * `chunks` is the store's chunk count at confirm time
+ * (`SettingsOut.embed_chunks`), which is exactly what a model change blinds:
+ * the store holds nothing under the new model id until the rebuild runs, so
+ * the number the confirm states is the number the mixed-model note will state
+ * after the write. Zero chunks gets its own honest sentence rather than a
+ * zero-count version of a consequence that has not happened yet.
+ */
+export function modelChangeConfirm(chunks: number): readonly string[] {
+  const blinded =
+    chunks === 0
+      ? "No chunks are stored yet, so a model change blinds nothing until the first projection."
+      : `${chunks} chunk${chunks === 1 ? "" : "s"} become${chunks === 1 ? "s" : ""} invisible to search until the rebuild re-embeds them.`;
+  return [
+    blinded,
+    "Changing the model re-embeds nothing by itself — this page then offers the vector rebuild, and search stays blind until it runs.",
+  ];
+}
 
 /** What reverting one key from its last settings event would do. */
 export type RevertTarget =

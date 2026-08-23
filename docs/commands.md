@@ -581,7 +581,10 @@ that no text came out.
   came from (`environment`, `settings.env`, `default`, `unset`), its default,
   whether it can be stored, and what the runtime does with a bad value. The
   envelope also names the settings file, any keys in it this build does not
-  recognise, and why it could not be read when it could not.
+  recognise, and why it could not be read when it could not — plus the vec
+  projector's embedding state (`mixed_model_note`, `embed_chunks`): the
+  staleness sentence that appears after an embedding-model change and the
+  chunk count the change would blind.
 - `config get <KEY>` — One name, same row.
 - `config set <KEY> <VALUE> --as human:<id>` — Store it in `settings.env`.
   Refused, with the reason, when the name cannot be stored there, when the

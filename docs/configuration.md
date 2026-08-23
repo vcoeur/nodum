@@ -69,9 +69,17 @@ Four names resolve from the environment and the default alone, and
 | `NODUM_EMBED_CACHE` | A path on the server's own disk. |
 | `NODUM_PUBLIC_URL` | Every capability URL is minted from it, so a stored value would redirect them. |
 
-`NODUM_EMBED_MODEL` and `NODUM_EMBED_DOWNLOAD` are not on the settings surface
-yet either: changing the model invalidates every stored vector, and resolving a
-new one downloads and loads it. They stay environment variables for now.
+`NODUM_EMBED_MODEL` and `NODUM_EMBED_DOWNLOAD` are storable — with one
+coupling the page makes impossible to miss: **changing the model blinds every
+stored chunk to search until `projector rebuild vec` re-embeds them** (each
+chunk records the model that embedded it, and search reads only the active
+model's chunks — see [Concepts](concepts.md#projectors-and-derived-indexes)). A model write is
+therefore confirmed before it lands, the settings report then surfaces the
+mixed-model state with the rebuild as the offered action, and the rebuild is
+also available directly as `POST /api/projectors/{name}/rebuild` (and
+`nodum projector rebuild vec`). The download gate carries its own cost
+sentence: flipping it on means the next vector operation may fetch the model
+(~0.2 GB) — against the never-download-implicitly posture stated above.
 
 A name the environment currently sets is also refused — a stored value would
 never be used, and an accepted-but-inert edit is the failure this whole surface
@@ -91,9 +99,14 @@ exists to avoid. Unset the variable first.
 
 | Variable | Default | What it does |
 |---|---|---|
-| `NODUM_EMBED_MODEL` | `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` | The local embedding model (~0.22 GB, multilingual, 384-dimensional). The `embeddings` extra must be installed. |
-| `NODUM_EMBED_DOWNLOAD` | unset — never download | `1` allows the one-time model download; without it the model resolves only when it is already in the cache. A no-op once the cache holds the model. |
+| `NODUM_EMBED_MODEL` | `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` | The local embedding model (~0.22 GB, multilingual, 384-dimensional). The `embeddings` extra must be installed. **Changing it blinds every stored chunk to search until the vector index is rebuilt** — see the coupling above and [Concepts](concepts.md#projectors-and-derived-indexes). |
+| `NODUM_EMBED_DOWNLOAD` | unset — never download | `1` allows the one-time model download; without it the model resolves only when it is already in the cache. A no-op once the cache holds the model. **On, the next vector operation may fetch the model (~0.2 GB)** — this is the one gate that lifts the never-download-implicitly posture. |
 | `NODUM_EMBED_CACHE` | `~/.local/share/nodum/models` | Where model files are cached. Passed to fastembed explicitly, because fastembed's own default is a temp directory that a reboot can clear — and a cleared cache means the vector signal drops out of search and consolidation with no error anywhere. |
+
+Both `NODUM_EMBED_MODEL` and `NODUM_EMBED_DOWNLOAD` resolve through the
+settings ladder, so they are manageable from `settings.env`, `nodum config
+set`, and the Settings page; `NODUM_EMBED_CACHE` stays environment-only — it
+is a path on the server's own disk, not a browser control.
 
 The model is fetched lazily, on the first operation that needs it — a vector
 search, a projector run, a consolidation cycle — never at process start, and
@@ -127,15 +140,16 @@ wiped cache by rerunning with `NODUM_EMBED_DOWNLOAD=1`.
 
 ### What a bad value does
 
-Ten of the seventeen names are checked, and `nodum config set` refuses a bad
+Eleven of the nineteen names are checked, and `nodum config set` refuses a bad
 value outright — so only a hand-edited `settings.env` or an environment
 variable can carry one past the door. What happens then differs by key, on
 purpose, and `nodum config list` reports which rule applies as `on_invalid`:
 
 - **`fall-back`** — the value is ignored and the default applies. Every budget
   and ceiling (`NODUM_LLM_CYCLE_BUDGET`, `…_CYCLE_SECONDS`, `…_REQUEST_BUDGET`,
-  `…_REQUEST_SECONDS`, `…_CALL_TIMEOUT`, `…_MAX_OUTPUT_TOKENS`) and the download
-  gate `NODUM_AUDIO_DOWNLOAD`, whose default is off. The fallback is a smaller
+  `…_REQUEST_SECONDS`, `…_CALL_TIMEOUT`, `…_MAX_OUTPUT_TOKENS`) and the two
+  download gates (`NODUM_EMBED_DOWNLOAD`, `NODUM_AUDIO_DOWNLOAD`), whose
+  defaults are off. The fallback is a smaller
   ceiling, so the worst case is less work.
 - **`refuse`** — there is no provider at all, and `nodum llm status` says why.
   `NODUM_LLM_THINKING` and `NODUM_LLM_CONTEXT_TOKENS`. A reasoning level the API
@@ -146,8 +160,9 @@ purpose, and `nodum config list` reports which rule applies as `on_invalid`:
   an optional schedule is worse than one that says what it skipped.
 - **`null`** — nothing checks it, here or at run time, because there is no
   such thing as an invalid value for it: any non-empty string is accepted.
-  The two model names (`NODUM_LLM_MODEL`, `NODUM_AUDIO_MODEL`), the key
-  (`NODUM_LLM_API_KEY`) and the four paths and URLs. A model name nothing
+  The three model names (`NODUM_LLM_MODEL`, `NODUM_EMBED_MODEL`,
+  `NODUM_AUDIO_MODEL`), the key (`NODUM_LLM_API_KEY`) and the four paths and
+  URLs. A model name nothing
   serves is not refused anywhere — it is an HTTP error on the first call, which
   `nodum llm status` is the way to find before you make one.
 
@@ -187,9 +202,9 @@ human and event-logged exactly as the CLI's are.
 ### In the browser
 
 The web UI's **Settings** page (`/settings`) puts the same four routes behind
-controls, one grouped table per area — Model, Gardener, Requests, Audio, and a
-read-only Server group showing the env-only names so the whole ladder is
-visible:
+controls, one grouped table per area — Model, Gardener, Requests, Audio,
+Embeddings, and a read-only Server group showing the env-only names so the
+whole ladder is visible:
 
 - Each row shows the effective value (secrets show only whether one is set),
   the layer it came from as a badge, and its default. `NODUM_LLM_CONTEXT_TOKENS`
@@ -204,6 +219,15 @@ visible:
   within a minute. The Gardener group carries the honest caveat — lowering a
   budget does not stop a cycle already spending — and links to the Journal,
   where a running cycle's stop control lives.
+- **The Embeddings group carries the model-change coupling.** Saving a new
+  `NODUM_EMBED_MODEL` is held until a confirmation names the consequence —
+  the current chunks become invisible to search until the rebuild re-embeds
+  them — and after the write the page shows the mixed-model note (the same
+  sentence `nodum projector status` reports) with a **Rebuild vector index**
+  button that calls `POST /api/projectors/vec/rebuild`. The note and the
+  button stay until the rebuild has run clean. The `NODUM_EMBED_DOWNLOAD` row
+  states its cost under the input: on, the next vector operation may fetch the
+  model (~0.2 GB), against the never-download-implicitly posture.
 - Each row offers **revert** from its last settings event: the previous value
   goes back in one click, or the key comes back out of the file if it was not
   stored before. A secret's previous *value* is in no event payload by design,

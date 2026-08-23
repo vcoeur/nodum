@@ -3315,9 +3315,13 @@ def create_app(
         """Every setting: what is in force, where it came from, whether it can be stored.
 
         The read is ``nodum config list`` verbatim — same envelope, same bytes —
-        and stays on the event loop: the reader takes the cache lock only for
-        the swap, and an unchanged file costs one open and one fstat with no
-        read at all.
+        via :func:`nodum.service.settings_report`, which also carries the vec
+        projector's embedding state (the mixed-model note and the chunk count).
+        That second half is why the route runs off the event loop: computing
+        the note resolves — and can therefore load — the embedding provider,
+        and a model load on the loop is the stall this surface must never
+        cause. The settings file itself still costs one open and one fstat on
+        an unchanged file; the thread hop is for the derived-state half.
 
         **The body carries the absolute ``path``**, unlike ``/healthz``, which
         dropped the database path as disclosure of a filesystem layout to the
@@ -3330,7 +3334,8 @@ def create_app(
         gate would bind nothing here while forcing one onto ``nodum config
         list``. No secret value is ever in the body by construction.
         """
-        return EnvelopeResponse(envelope(settings.list_settings()))
+        result = await run_in_threadpool(service.settings_report, path=db_path)
+        return EnvelopeResponse(envelope(result))
 
     async def put_settings(request: Request) -> Response:
         """Apply several setting changes atomically: all of them, or none of them.
@@ -3442,6 +3447,26 @@ def create_app(
                 "cache-control": "no-store",
             },
         )
+
+    async def rebuild_projector_route(request: Request) -> Response:
+        """Drop one projector's derived state and replay the event log (human-only).
+
+        The rebuild the Settings page offers when a ``NODUM_EMBED_MODEL``
+        change has blinded every stored chunk: a whole-graph re-embedding, so
+        it runs off the event loop like every other blocking write here. The
+        human-only gate lives in the domain
+        (:func:`nodum.service.rebuild_projector`), exactly as the settings
+        writes' does, and a completed run appends one ``projector.rebuild``
+        event naming the session's human and what the run did.
+
+        A name outside the registry, or a projector whose provider is
+        unavailable, is the ordinary 400 with the seam's own sentence — nothing
+        is dropped and nothing is rebuilt.
+        """
+        run = await run_in_threadpool(
+            _write, request, service.rebuild_projector, request.path_params["name"], path=db_path
+        )
+        return EnvelopeResponse(envelope(run))
 
     # ── Fallbacks ─────────────────────────────────────────────────────────
 
@@ -3589,6 +3614,11 @@ def create_app(
         Route("/api/settings/export", export_settings, methods=["POST"]),
         Route("/api/settings/adopt-env", adopt_environment, methods=["POST"]),
         Route("/api/settings/{name}", delete_setting, methods=["DELETE"]),
+        # The projector rebuild: the model-change coupling, human-only at the
+        # domain. Registered with the settings surface because that is the
+        # action it exists for — `NODUM_EMBED_MODEL` is manageable here, and
+        # the rebuild is what makes the change safe.
+        Route("/api/projectors/{name}/rebuild", rebuild_projector_route, methods=["POST"]),
     ]
 
     # The agent surface, on the same origin as the human one. It is built here

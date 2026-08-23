@@ -1035,6 +1035,15 @@ class SettingsOut(BaseModel):
     configure is importable in this build (`audio` → ``faster_whisper`` today).
     A surface disables the affected rows with "not available in this build" off a
     false flag instead of probing anything itself.
+
+    The two embedding-state fields are the coupling that makes
+    ``NODUM_EMBED_MODEL`` safe to manage: ``mixed_model_note`` is the vec
+    projector's staleness sentence (``projectors.mixed_model_note``) — non-null
+    exactly while chunks from another model sit in the store, invisible to
+    search — and ``embed_chunks`` is the total chunk count, which is what a
+    model change would blind. Both are computed by
+    :func:`nodum.service.settings_report`; :func:`nodum.settings.list_settings`
+    carries their defaults.
     """
 
     settings: list[SettingOut]
@@ -1043,6 +1052,8 @@ class SettingsOut(BaseModel):
     unknown_keys: list[str]
     unreadable: str | None
     capabilities: dict[str, bool]
+    mixed_model_note: str | None = None
+    embed_chunks: int = 0
 
 
 class SettingChangeOut(BaseModel):

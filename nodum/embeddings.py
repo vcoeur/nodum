@@ -36,6 +36,15 @@ never downloaded implicitly: set ``NODUM_EMBED_DOWNLOAD=1`` for the first run
 to fetch it, afterwards it is served from the cache. :func:`unavailable_reason`
 distinguishes a cache that was never populated from one that *had* a model and
 no longer does, because those need different things from the human.
+
+``NODUM_EMBED_MODEL`` and ``NODUM_EMBED_DOWNLOAD`` resolve through the
+settings ladder (:mod:`nodum.settings`), so they are manageable from
+``settings.env`` and the web UI like every other storable name —
+``NODUM_EMBED_CACHE`` stays environment-only, because it is a path on the
+server's own disk. A model change invalidates the cached provider and every
+chunk the previous model embedded becomes invisible to search until a
+``projector rebuild vec`` re-embeds the corpus; see the settings registry's
+row for the coupling.
 """
 
 from __future__ import annotations
@@ -49,6 +58,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
+
+from nodum import settings
 
 #: Default embedding model: small (~0.22 GB), multilingual, 384-dimensional,
 #: Apache-2.0, and in fastembed's built-in registry (no custom registration).
@@ -285,19 +296,29 @@ def _pool(vectors: list[list[float]], dimensions: int) -> list[float]:
 def _configuration() -> tuple[str | None, str | None, str | None]:
     """The three values a resolution depends on, as they stand right now.
 
-    Read from the environment alone, and that is the point rather than an
-    omission: **constructing this provider loads a model**, so an invalidation
-    rule keyed on the settings file's generation would let any settings write
-    at all — a budget, a schedule — trigger a fastembed model load on whatever
-    thread happened to ask next. Keying on the three values means only a change
-    to one of *them* can, and none of them is storable in ``settings.env``
-    today, so in practice nothing can. When the embedding variables become
-    writable they arrive with the on-loop-resolution hazard closed first.
+    ``NODUM_EMBED_MODEL`` and ``NODUM_EMBED_DOWNLOAD`` resolve through the
+    settings seam (``default < settings.env < environment``, empty is not set
+    at any layer) exactly like every other storable name; ``NODUM_EMBED_CACHE``
+    is read from the environment alone, because it is a path on the server's
+    own disk and the registry refuses to store it.
+
+    **Constructing this provider loads a model**, so the invalidation rule is
+    keyed on these three values rather than on the settings file's generation:
+    a change to any other setting — a budget, a schedule — cannot trigger a
+    fastembed model load on whatever thread happens to ask next. A change to
+    one of *these* three deliberately can: two of them are storable now, so a
+    settings write of a new model name invalidates the snapshot, and the next
+    resolution loads the new model — off the event loop, which is what the MCP
+    surface's async tools guarantee (the finding this behaviour used to
+    describe as impossible).
     """
+    view = settings.snapshot()
     return (
-        os.environ.get(ENV_MODEL_VAR),
-        os.environ.get(ENV_CACHE_VAR),
-        os.environ.get(ENV_DOWNLOAD_VAR),
+        view.value(settings.EMBED_MODEL),
+        # The same raw-env spelling :func:`cache_path` keys on, so the two
+        # cannot disagree about whether the variable moved.
+        os.environ.get(ENV_CACHE_VAR) or None,
+        view.value(settings.EMBED_DOWNLOAD),
     )
 
 
@@ -310,7 +331,10 @@ class Resolution:
     resolution runs on worker threads rather than on the event loop — with one
     difference this module's cost forces: it is invalidated by a change to the
     three values it was built from (:func:`_configuration`), never by the
-    settings file moving underneath it.
+    settings file moving underneath it. Two of those values are storable in
+    ``settings.env``, so a settings write of the model name or the download
+    gate does invalidate it — the model load that then happens is a designed
+    consequence, and the MCP fix keeps it off the event loop.
 
     ``pinned`` marks a resolution :func:`set_provider` forced, which nothing
     but :func:`reset_provider` clears: the suite's autouse guard is a pin, and
@@ -348,7 +372,7 @@ def resolution() -> Resolution:
         if current is not None and (current.pinned or current.configuration == _configuration()):
             return current
         seen = _configuration()
-        provider, unavailable = _resolve_default()
+        provider, unavailable = _resolve_default(seen)
         _resolution = Resolution(
             provider=provider,
             unavailable_reason=unavailable,
@@ -399,21 +423,32 @@ def reset_provider() -> None:
         _resolution = None
 
 
-def _resolve_default() -> tuple[EmbeddingProvider | None, str | None]:
-    """Build the default fastembed provider, or explain why it cannot run."""
+def _resolve_default(
+    configuration: tuple[str | None, str | None, str | None],
+) -> tuple[EmbeddingProvider | None, str | None]:
+    """Build the default fastembed provider, or explain why it cannot run.
+
+    Args:
+        configuration: The three values :func:`_configuration` read — the
+            model, the cache, the download gate. The provider is built from
+            exactly the configuration the resolution claims to have seen, so
+            the model id it records and the tuple that invalidates it can never
+            disagree.
+    """
     try:
         import fastembed  # noqa: F401  # pyright: ignore[reportMissingImports] degraded-mode
     except ImportError:
         return None, "fastembed is not installed (install the 'embeddings' extra)"
-    model_name = os.environ.get(ENV_MODEL_VAR, DEFAULT_MODEL)
-    cache = cache_path()
+    model_name = configuration[0] or DEFAULT_MODEL
+    cache_raw = configuration[1]
+    cache = Path(cache_raw).expanduser() if cache_raw else DEFAULT_CACHE_PATH
     # Sampled *before* the attempt on purpose: constructing the provider calls
     # fastembed's define_cache_dir, which creates the directory as a side
     # effect. Read afterwards, every cache would look like it had just been
     # created and the two cases below would collapse into one.
     was_populated = _cache_is_populated(cache)
     try:
-        if os.environ.get(ENV_DOWNLOAD_VAR) == "1":
+        if configuration[2] == "1":
             provider = FastembedProvider(model_name, cache_dir=cache)
         else:
             # Default posture: never download implicitly — only an already

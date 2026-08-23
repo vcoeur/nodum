@@ -45,7 +45,7 @@ this gate.
 The method column lists the methods the route table configured; Starlette
 answers `HEAD` for any route configured `GET`.
 
-The tables below list **68 routes**, grouped by family.
+The tables below list **69 routes**, grouped by family.
 
 
 ### Session
@@ -193,6 +193,12 @@ The tables below list **68 routes**, grouped by family.
 | POST | `/api/settings/export` | `export_settings` | session | Stream the effective configuration as a `.env` download — the named envelope exemption. |
 | POST | `/api/settings/adopt-env` | `adopt_environment` | session | Adopt every editable setting the environment pins into ``settings.env``. |
 | DELETE | `/api/settings/{name}` | `delete_setting` | session | Remove one setting from ``settings.env``, falling back down the ladder. |
+
+### Projectors
+
+| Method | Path | Handler | Auth | Notes |
+|---|---|---|---|---|
+| POST | `/api/projectors/{name}/rebuild` | `rebuild_projector_route` | session | Drop one projector's derived state and replay the event log (human-only). |
 
 ### Agent surface (MCP)
 

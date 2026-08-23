@@ -205,10 +205,14 @@ replacing rather than accumulating per target) and read only by
 
 The MCP adapter (streamable HTTP, official Python SDK FastMCP): registers the design
 §8.1 read + additive tiers and nothing else, each tool a thin delegate to a
-service/search/ingest function. The three never-registered tiers
-(`REVIEW_TOOLS`, `CURATIVE_TOOLS`, `HUMAN_ONLY_TOOLS`) are structural
+service/search/ingest function. The never-registered tiers
+(`REVIEW_TOOLS`, `CURATIVE_TOOLS`, `HUMAN_ONLY_TOOLS`, `FILESYSTEM_TOOLS`,
+`SETTINGS_TOOLS`, `PROJECTOR_TOOLS`) are structural
 absences, and `UNREGISTERED_TOOLS` is their union — see the MCP contract in
-`AGENTS.md`. Phase 4 additions: `ingest_url`,
+`AGENTS.md`. The embedding-reaching `search` tool is `async def` and runs its
+body through `run_in_threadpool`: resolving the embedding provider loads a
+model, and FastMCP calls sync tools inline on the event loop (finding R3-B6).
+Phase 4 additions: `ingest_url`,
 `request_upload_url` (additive) plus `get_download_url` (read), and `get_asset`
 carries the **extracted text** (capped, with the real length and a truncation
 flag) and serves **`page:<n>` PDF rasters** beside `preview`/`thumb`.
@@ -376,8 +380,13 @@ event log. A file it cannot parse is reported loudly and stepped around, with
 `file-unreadable` provenance, so a surface can say *why* a stored value is not
 in force. Four names (`NODUM_DB`, `NODUM_LLM_BASE_URL`, `NODUM_EMBED_CACHE`,
 `NODUM_PUBLIC_URL`) refuse storage and resolve from the environment alone, each
-with its reason. Surfaces: `nodum config list|get|set|unset` and the
-`settings.set`/`settings.unset` events.
+with its reason — `NODUM_EMBED_MODEL` and `NODUM_EMBED_DOWNLOAD` are storable
+like the rest. Surfaces: `nodum config list|get|set|unset` and the
+`settings.set`/`settings.unset` events. `nodum config list` — and its
+byte-identical twin `GET /api/settings` — additionally carry the vec
+projector's embedding state (the mixed-model note and the chunk count) via
+`service.settings_report`, which is the coupling that makes the model
+manageable: the Settings page offers the `projector rebuild vec` behind it.
 
 ### `nodum.envelope` — the JSON envelope both surfaces emit
 
@@ -436,7 +445,11 @@ multilingual, ONNX/CPU — no daemon, no API key) behind the optional
 `embeddings` extra. A model is never downloaded implicitly: the provider
 resolves only from **nodum's own model cache** unless `NODUM_EMBED_DOWNLOAD=1`
 is set. `NODUM_EMBED_MODEL` overrides the model name (a different
-dimensionality needs a new migration — the vec0 table is fixed at 384). Tests
+dimensionality needs a new migration — the vec0 table is fixed at 384). Both
+names resolve through the settings ladder, so they are manageable from
+`settings.env` and the web UI; the cached provider is invalidated by a change
+to either (or to the cache path), and the MCP surface's search tool is async so
+that invalidation's model load never lands on the event loop. Tests
 inject a deterministic hashing fake via `embeddings.set_provider`. The cache
 defaults to `~/.local/share/nodum/models` and is always passed explicitly (the
 temp-directory alternative and its boot-time deletion are in
