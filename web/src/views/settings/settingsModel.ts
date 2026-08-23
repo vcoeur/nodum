@@ -177,7 +177,7 @@ export function isModelChange(key: string): boolean {
  * after flipping it may fetch the model — ~0.2 GB for the default.
  */
 export const EMBED_DOWNLOAD_NOTE =
-  "On: the next vector operation may download the model (~0.2 GB) — nodum never downloads implicitly, so this is the one gate that allows it.";
+  "When on: the next vector operation may download the model (~0.2 GB) — nodum never downloads implicitly, so this is the one gate that allows it.";
 
 /**
  * The confirmation before an embedding-model write — the copy that names the

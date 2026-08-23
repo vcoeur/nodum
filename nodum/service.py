@@ -15,6 +15,7 @@ from __future__ import annotations
 import contextvars
 import difflib
 import json
+import logging
 import re
 import sqlite3
 import unicodedata
@@ -98,6 +99,8 @@ from nodum.vocab import (
 
 #: Allowed state values shared by nodes and edges (vocab: :data:`STATES`).
 STATES = STATES
+
+logger = logging.getLogger(__name__)
 
 #: State transitions: action → (required current state, resulting state).
 TRANSITIONS = TRANSITIONS
@@ -4473,7 +4476,21 @@ def settings_report(*, path: str | Path | None = None) -> SettingsOut:
     resolved = Path(path).expanduser() if path is not None else db.db_path()
     if str(resolved) == ":memory:" or not resolved.exists():
         return out
-    conn = _connect(resolved)
+    try:
+        conn = _connect(resolved)
+    except (sqlite3.Error, db.SchemaConsistencyError, OSError) as exc:
+        # A graph that exists but will not open — not a nodum file, a schema
+        # that drifted from its migrations, unreadable — must not take the
+        # settings surface down with it. This is a settings read, and the
+        # embedding state is a derived garnish: the same degrade-not-fail
+        # posture as the missing-file guard above, and the operator diagnosing
+        # the broken graph is exactly who needs the ladder to answer.
+        logger.warning(
+            "%s could not be opened for the settings report (%s); reporting the ladder alone",
+            resolved,
+            exc,
+        )
+        return out
     try:
         vec = projectors.REGISTRY["vec"]
         return out.model_copy(

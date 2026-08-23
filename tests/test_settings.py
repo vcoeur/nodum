@@ -1385,6 +1385,26 @@ def test_config_list_on_a_fresh_machine_creates_no_database(tmp_path, monkeypatc
     assert not (fresh.parent / settings.SETTINGS_FILENAME).exists()
 
 
+def test_config_list_on_a_broken_database_still_answers_the_ladder(tmp_path, monkeypatch):
+    """A graph that exists but will not open must not take the settings read down.
+
+    The report's embedding state is a derived garnish: the ladder itself is
+    fully computable from ``settings.env``, and the operator diagnosing a
+    broken graph is exactly who needs the settings surface working. A file
+    that is not a nodum database, or a schema that drifted from its recorded
+    migrations, degrades to the ladder alone rather than killing the read.
+    """
+    fresh = tmp_path / "broken.db"
+    fresh.write_bytes(b"this is not a sqlite database at all")
+    monkeypatch.setenv("NODUM_DB", str(fresh))
+
+    payload = _run_json("config", "list")
+
+    assert payload["count"] == len(settings.KEYS)
+    assert payload["embed_chunks"] == 0
+    assert payload["mixed_model_note"] is None
+
+
 def test_config_set_is_logged_and_config_unset_takes_it_back(store, fresh_db):
     before = max((event.seq for event in service.list_events(owner(), limit=5000)), default=0)
 
