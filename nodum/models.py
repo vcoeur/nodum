@@ -1086,3 +1086,16 @@ class SettingAdoptOut(BaseModel):
     adopted: list[SettingChangeOut]
     skipped: list[SettingAdoptSkippedOut]
     count: int
+
+
+class SettingsExportOut(BaseModel):
+    """What `nodum config export` wrote: where, how much, and with secrets or not.
+
+    ``count`` is the number of `KEY=value` lines in the file; unset keys and
+    omitted secrets are comments and are not counted. The file's bytes never
+    cross this model — only the path they landed at.
+    """
+
+    path: str
+    include_secrets: bool
+    count: int

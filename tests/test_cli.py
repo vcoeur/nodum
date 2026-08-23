@@ -1804,6 +1804,7 @@ _PLACEHOLDER_OPTIONS = {
     "--mime": "text/plain",
     "--size": "10",
     "--password": "placeholder-password",
+    "--out": "/tmp/placeholder.env",
 }
 
 #: Required arguments Click type-converts *before* the command body runs. A

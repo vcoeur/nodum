@@ -524,12 +524,20 @@ below are the parts that do not fit a route table.
   non-empty environment value; provenance stays `environment`, one
   `settings.set` event per key actually moved) all go through
   `run_in_threadpool`. The gate is `Store.require_human` inside
-  `nodum.service.apply_settings`/`unset_setting`/`adopt_environment` — never a
+  `nodum.service.apply_settings`/`unset_setting`/`adopt_environment`/`export_settings`
+  — never a
   route-level check, and never inside `nodum.settings` (the provider import
   rail forbids it). A key the environment pins is **409**
   (`settings.SettingPinned`, its own `EXCEPTION_STATUS` row); every other
   refusal is 400 with the seam's sentence. PUT is atomic: one invalid key
-  writes nothing.
+  writes nothing. `POST /api/settings/export` streams the effective
+  configuration as a `.env` download and is the named envelope exemption: no
+  token or `TOKEN_PATHS` entry exists beside it (a secret-bearing URL lands in
+  access logs), it answers bytes under the download-route header set, and
+  `include_secrets: true` demands the session human's password verified
+  through the login path itself (`_verify_login` under `_ARGON2_LIMITER`), so
+  lockout is parity with login, not a copy. Every export appends a
+  `settings.export` event — actor + flag, never a value.
 - **Spaces reach the human over HTTP as a filter, a target, and a lifecycle.**
   `GET /api/nodes` and `GET /api/search` take `?space=` (narrow to one space)
   and `?include_meta=` (off by default). `POST /api/nodes` takes `space` in
@@ -715,7 +723,7 @@ nothing else.
   `get_cycle`, `list_cycles` — `HUMAN_ONLY_TOOLS`), **anything that names a
   path on the server's own disk** (`FILESYSTEM_TOOLS`), and **the settings
   writes** (`apply_settings`, `set_setting`, `unset_setting`,
-  `adopt_environment` — `SETTINGS_TOOLS`; gated at the domain by
+  `adopt_environment`, `export_settings` — `SETTINGS_TOOLS`; gated at the domain by
   `Store.require_human`, which is what bites here, since MCP is the surface
   that mints non-human principals). `UNREGISTERED_TOOLS` is
   the union, and what `tests/test_mcp_server.py` asserts the registry stays

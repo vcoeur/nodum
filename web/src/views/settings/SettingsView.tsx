@@ -25,8 +25,10 @@ import type { EventOut, SettingAdoptOut, SettingOut, SettingsOut } from "../../a
 import { describeFailure } from "../../lib";
 import type { FailureDescription } from "../../lib";
 import {
+  EXPORT_FILENAME,
   GROUPS,
   PROFILE_DEFAULT_NOTE,
+  WITH_KEYS_EXPORT_CONFIRM,
   adoptPreview,
   editBlocker,
   layerLabel,
@@ -70,6 +72,10 @@ export default function SettingsView() {
   const [revertingKey, setRevertingKey] = useState<string | null>(null);
   const [adoptOpen, setAdoptOpen] = useState(false);
   const [adopting, setAdopting] = useState(false);
+  /** The with-keys export dialog: open flag, the password field, in-flight flag. */
+  const [exportOpen, setExportOpen] = useState(false);
+  const [exportPassword, setExportPassword] = useState("");
+  const [exporting, setExporting] = useState(false);
 
   /** Fetch both reads and put them in state; throws, so callers decide the failure copy. */
   const fetchData = useCallback(async () => {
@@ -200,6 +206,54 @@ export default function SettingsView() {
       skipped === "" ? undefined : `Refused values: ${skipped}`,
     );
     await refresh();
+  };
+
+  /** Hand a response blob to the browser's save flow; nothing else controls where it lands. */
+  const saveDownload = (blob: Blob) => {
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = EXPORT_FILENAME;
+    anchor.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const exportRedacted = async () => {
+    if (exporting) return;
+    setExporting(true);
+    try {
+      saveDownload(await api.exportSettings({ includeSecrets: false }));
+      toast.show(
+        "success",
+        "Redacted export downloaded",
+        `Saved as ${EXPORT_FILENAME} in your browser's download location.`,
+      );
+    } catch (error) {
+      toast.showError(error, "Nothing was downloaded");
+    } finally {
+      setExporting(false);
+    }
+  };
+
+  const exportWithKeys = async () => {
+    if (exporting || exportPassword === "") return;
+    setExporting(true);
+    try {
+      saveDownload(await api.exportSettings({ includeSecrets: true, password: exportPassword }));
+      toast.show(
+        "success",
+        "Export with API key downloaded",
+        `The file holds your real key. Saved as ${EXPORT_FILENAME} in your browser's download location.`,
+      );
+      setExportOpen(false);
+      setExportPassword("");
+    } catch (error) {
+      // A wrong step-up password is a 401 — an ordinary refused request, not
+      // a dead session, so it stays inside this dialog.
+      toast.showError(error, "Nothing was downloaded");
+    } finally {
+      setExporting(false);
+    }
   };
 
   if (failure) {
@@ -366,6 +420,66 @@ export default function SettingsView() {
           ) : null}
         </section>
       ))}
+
+      <section className="nd-set-section" aria-label="Export">
+        <h2 className="nd-set-section__title">Export</h2>
+        <p className="nd-meta nd-set__subtitle">
+          Freeze the configuration as it runs — every value in force,
+          environment-pinned ones included — as a{" "}
+          <code className="nd-mono">.env</code> file docker compose reads back
+          exactly.
+        </p>
+        <div className="nd-set-export-actions">
+          <button
+            type="button"
+            className="nd-button"
+            onClick={exportRedacted}
+            disabled={exporting}
+          >
+            Download .env (redacted)
+          </button>
+          <button
+            type="button"
+            className="nd-button"
+            onClick={() => setExportOpen(true)}
+            disabled={exporting}
+          >
+            Download .env with API key…
+          </button>
+        </div>
+      </section>
+
+      {exportOpen ? (
+        <Modal
+          title="Download the export with your API key"
+          onClose={() => {
+            setExportOpen(false);
+            setExportPassword("");
+          }}
+        >
+          {WITH_KEYS_EXPORT_CONFIRM.map((line) => (
+            <p key={line}>{line}</p>
+          ))}
+          <input
+            name="password"
+            type="password"
+            className="nd-input"
+            placeholder="Your account password"
+            value={exportPassword}
+            onChange={(event) => setExportPassword((event.target as HTMLInputElement).value)}
+            aria-label="Your account password"
+            autoComplete="current-password"
+          />
+          <button
+            type="button"
+            className="nd-button nd-button--primary"
+            onClick={exportWithKeys}
+            disabled={exporting || exportPassword === ""}
+          >
+            {exporting ? "Exporting…" : "Download with API key"}
+          </button>
+        </Modal>
+      ) : null}
 
       {adoptOpen ? (
         <Modal title="Adopt settings from the environment" onClose={() => setAdoptOpen(false)}>

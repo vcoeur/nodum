@@ -213,3 +213,22 @@ export function adoptPreview(rows: readonly SettingOut[]): {
       .map((row) => ({ key: row.key, value: row.secret ? null : row.value })),
   };
 }
+
+/**
+ * The export: two downloads, and copy that states what the system actually
+ * delivers.
+ *
+ * Redacted and with-keys are different downloads, not a toggle — one carries
+ * the real API key and demands the account password (the server re-verifies
+ * it through the login path), the other never touches a secret. Both save
+ * through the browser, so the landing spot is the browser's default download
+ * location, and the copy says so rather than implying the page controls it.
+ */
+export const EXPORT_FILENAME = "nodum-settings.env";
+
+export const WITH_KEYS_EXPORT_CONFIRM: readonly string[] = [
+  "The file contains your real API key in plain text — treat it like a password.",
+  "You will be asked for your account password before the download starts; a wrong password downloads nothing.",
+  "The export renders the values in force now, including ones pinned by the environment.",
+  `The file saves as ${EXPORT_FILENAME} in the browser's default download location.`,
+];

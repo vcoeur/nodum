@@ -245,7 +245,13 @@ FILESYSTEM_TOOLS = ("ingest_file", "ingest_path", "read_file")
 #: A settings read has no tool either — not because it is gated (it is not),
 #: but because nothing an agent does with this graph is configured by these
 #: keys, and a settings row adds no capability a tool caller needs.
-SETTINGS_TOOLS = ("apply_settings", "set_setting", "unset_setting", "adopt_environment")
+SETTINGS_TOOLS = (
+    "apply_settings",
+    "set_setting",
+    "unset_setting",
+    "adopt_environment",
+    "export_settings",
+)
 
 #: Every name that must never appear in the registry, in one place — what the
 #: disjointness assertions ask about. A new human-only, curative, review,

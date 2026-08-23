@@ -158,6 +158,7 @@ nodum config list                                        # every key, value, pro
 nodum config get NODUM_LLM_MODEL
 nodum config set NODUM_LLM_CYCLE_BUDGET 20000 --as human:owner
 nodum config unset NODUM_LLM_CYCLE_BUDGET --as human:owner
+nodum config export --out deploy.env --include-secrets --as human:owner
 ```
 
 `set` and `unset` name their human like every other write and are recorded in
@@ -176,6 +177,7 @@ need a session; see [HTTP API](http-api.md#settings)):
 | `PUT /api/settings` | Partial multi-key write: body maps names to a value or `null`. **Atomic** — every key is validated before anything is written, so one bad value leaves the file untouched. Absent = untouched; explicit `null` = remove; empty string = refused. |
 | `DELETE /api/settings/{name}` | Remove one key — the same as `null`, answering 200 `changed: false` for a key the file never carried. |
 | `POST /api/settings/adopt-env` | Store every editable, non-empty environment value into `settings.env` — the cutover from env-only configuration. Adopted keys keep resolving `provenance: "environment"` until the variable is unset host-side; values that fail validation are skipped and named in the response. |
+| `POST /api/settings/export` | Stream the effective configuration as a `.env` file (`application/octet-stream`, attachment disposition — the response is the file, not the JSON envelope). Body `{"include_secrets": bool, "password": "..."}`; redacted unless `include_secrets` is true, and then the session human's **password is required** and verified through the login path itself — same argon2 limiter, same lockout, so five wrong passwords lock login too. Every export appends a `settings.export` event (actor + flag, never a value). |
 
 A write naming a key the environment pins answers **409**, not 400: the request
 is well formed, but the file is not the layer in force. Every other refusal is
@@ -210,6 +212,16 @@ visible:
 - **Adopt from environment** previews exactly which pinned keys will move into
   the file (secrets as "set") before calling the adopt verb; adopted rows keep
   their `environment` badge but gain the "stored in settings.env" note.
+- **Export** offers two downloads of the effective configuration as a
+  `.env` file: redacted (the key becomes an omission comment) and with-keys —
+  a separately confirmed choice that asks for the account password before the
+  server hands over the real key. The page saves the download with the
+  browser's own flow, so it lands in the browser's default download location,
+  and the copy says so. The export renders **effective** values, environment
+  pins included — that is its job, freezing what runs; the step-up password is
+  the compensating control for a file that can carry a value the read surfaces
+  only show as "set". No URL or token exists for the export — a secret-bearing
+  URL would land in access logs.
 
 A change applies without a restart. The three things that means in practice:
 

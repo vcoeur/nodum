@@ -45,7 +45,7 @@ this gate.
 The method column lists the methods the route table configured; Starlette
 answers `HEAD` for any route configured `GET`.
 
-The tables below list **67 routes**, grouped by family.
+The tables below list **68 routes**, grouped by family.
 
 
 ### Session
@@ -190,6 +190,7 @@ The tables below list **67 routes**, grouped by family.
 |---|---|---|---|---|
 | GET | `/api/settings` | `get_settings` | session | Every setting: what is in force, where it came from, whether it can be stored. |
 | PUT | `/api/settings` | `put_settings` | session | Apply several setting changes atomically: all of them, or none of them. |
+| POST | `/api/settings/export` | `export_settings` | session | Stream the effective configuration as a `.env` download — the named envelope exemption. |
 | POST | `/api/settings/adopt-env` | `adopt_environment` | session | Adopt every editable setting the environment pins into ``settings.env``. |
 | DELETE | `/api/settings/{name}` | `delete_setting` | session | Remove one setting from ``settings.env``, falling back down the ladder. |
 

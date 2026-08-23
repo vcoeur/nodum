@@ -590,12 +590,22 @@ that no text came out.
 - `config unset <KEY> --as human:<id>` — Remove it, falling back to the
   default. Unsetting a name that was never set changes nothing and is not an
   error.
+- `config export --out FILE [--include-secrets]` — Write the **effective**
+  configuration (environment-pinned values included) to FILE as a `.env` file
+  docker compose's dotenv reader reads back exactly: values double-quoted,
+  `$`, `#` and whitespace safe inside the quotes. Redacted by default — a set
+  secret becomes an omission comment, so the default file is honest about the
+  gap rather than silently failing to authenticate; `--include-secrets` emits
+  real values into the file. Stdout is one JSON receipt (`path`,
+  `include_secrets`, `count`) and never a value.
 
-The two mutating verbs name their human like every other write and are logged
-as `settings.set` / `settings.unset`, with before and after — and **a verb that
+The mutating verbs name their human like every other write and are logged
+as `settings.set` / `settings.unset` (the export as `settings.export`, actor
+and flag, never a value), with before and after — and **a verb that
 changes nothing writes no event**. They are not reversible by `undo`. A secret
-(`NODUM_LLM_API_KEY`) reports `"set": true` and never its value, on any of the
-four. The layers, the file's dialect, and what a bad value does are in
+(`NODUM_LLM_API_KEY`) reports `"set": true` and never its value on
+list/get/set/unset; only an explicit `--include-secrets` export puts one in a
+file. The layers, the file's dialect, and what a bad value does are in
 [Configuration](configuration.md#where-a-value-comes-from).
 
 ### Backups

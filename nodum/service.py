@@ -4352,6 +4352,7 @@ def record_auth_event(
 SETTINGS_EVENT_OPS = (
     "settings.set",
     "settings.unset",
+    "settings.export",
 )
 
 
@@ -4406,7 +4407,7 @@ def record_settings_event(
     """
     if op not in SETTINGS_EVENT_OPS:
         raise ValueError(f"op must be one of {SETTINGS_EVENT_OPS}, got {op!r}")
-    if not isinstance(payload.get("key"), str):
+    if op in ("settings.set", "settings.unset") and not isinstance(payload.get("key"), str):
         raise ValueError(f"a {op!r} payload must name the 'key' it changed")
     own_conn = _connect(path)
     try:
@@ -4529,6 +4530,42 @@ def adopt_environment(*, principal: Principal, path: str | Path | None = None) -
         skipped=[SettingAdoptSkippedOut(key=key, reason=reason) for key, reason in skipped],
         count=len(changes),
     )
+
+
+def export_settings(
+    *, principal: Principal, include_secrets: bool = False, path: str | Path | None = None
+) -> str:
+    """Render the effective configuration as a `.env` file's text (human-only).
+
+    A read of the ladder, but an audited one: every export appends a
+    ``settings.export`` event carrying the actor and the ``include_secrets``
+    flag — and never a value. The gate is the settings writes' own
+    ``require_human``, because with secrets included this surface hands over
+    more than any read does; MCP never reaches it at all
+    (``SETTINGS_TOOLS``).
+
+    **The step-up password check is not here.** It belongs to the surface
+    that presents a credential — HTTP verifies the session human's password
+    through its login path before calling this; the CLI is trusted-local,
+    where local access is already the boundary.
+
+    Args:
+        principal: The human who asked.
+        include_secrets: Emit secret values instead of omission comments.
+        path: Explicit database path for both the gate and the event.
+
+    Returns:
+        The file text (see :func:`nodum.settings.render_env_file`).
+    """
+    _gate_settings_write(principal, path)
+    text = settings.render_env_file(include_secrets=include_secrets)
+    record_settings_event(
+        "settings.export",
+        {"include_secrets": include_secrets},
+        principal=principal,
+        path=path,
+    )
+    return text
 
 
 #: Failed login attempts within :data:`LOGIN_LOCKOUT_WINDOW_MINUTES` that lock
