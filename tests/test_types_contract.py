@@ -130,6 +130,10 @@ CLI_ONLY: frozenset[str] = frozenset(
         "SupersedeOut",
         "RelinkDiff",
         "BulkRelinkOut",
+        # SP4: `nodum config export`'s receipt (path, flag, count). The file's
+        # bytes never cross a model, and the HTTP export streams them raw, so
+        # there is no TS mirror to keep honest.
+        "SettingsExportOut",
     }
 )
 

@@ -5897,6 +5897,13 @@ def test_the_secret_sweep_over_every_http_settings_surface(client, fresh_db):
     adopt_response = client.post("/api/settings/adopt-env")
     events_response = client.get("/api/events?limit=50")
     bad_value_response = client.put("/api/settings", json={settings.LLM_API_KEY: SECRET})
+    # SP4: the export path joins the sweep — the redacted stream and, more
+    # importantly, its *error bodies* (a wrong step-up password must not echo
+    # anything the file held).
+    export_redacted = client.post("/api/settings/export", json={})
+    export_refused = client.post(
+        "/api/settings/export", json={"include_secrets": True, "password": "nope"}
+    )
 
     assert get_response.status_code == 200
     unreadable = get_response.json()["unreadable"]
@@ -5908,6 +5915,8 @@ def test_the_secret_sweep_over_every_http_settings_surface(client, fresh_db):
     assert adopt_response.status_code == 200
     assert events_response.status_code == 200
     assert bad_value_response.status_code == 400
+    assert export_redacted.status_code == 200
+    assert export_refused.status_code == 401
 
     for response in (
         get_response,
@@ -5916,6 +5925,93 @@ def test_the_secret_sweep_over_every_http_settings_surface(client, fresh_db):
         adopt_response,
         events_response,
         bad_value_response,
+        export_redacted,
+        export_refused,
     ):
         assert SECRET not in response.text, response.text[:400]
         assert f"{settings.LLM_API_KEY}=" not in response.text
+
+
+# ── SP4: POST /api/settings/export — the streamed, step-up-authenticated file ─
+
+
+def _export(client, body: dict) -> httpx.Response:
+    return client.post("/api/settings/export", json=body)
+
+
+def test_export_streams_the_file_with_the_download_header_set(client, fresh_db):
+    settings.set_value(settings.LLM_MODEL, "exported-model")
+    response = _export(client, {})
+    assert response.status_code == 200, response.text
+    assert response.headers["content-type"] == "application/octet-stream"
+    assert (
+        response.headers["content-disposition"]
+        == f'attachment; filename="{settings.EXPORT_FILENAME}"'
+    )
+    assert response.headers["x-content-type-options"] == "nosniff"
+    assert response.headers["cache-control"] == "no-store"
+    assert 'NODUM_LLM_MODEL="exported-model"' in response.text
+
+
+def test_export_is_redacted_unless_asked_and_always_event_logged(client, fresh_db):
+    settings.set_value(settings.LLM_API_KEY, SECRET)
+
+    redacted = _export(client, {})
+    assert redacted.status_code == 200
+    assert SECRET not in redacted.text
+    assert f"# {settings.LLM_API_KEY} is set but omitted" in redacted.text
+
+    with_secrets = _export(client, {"include_secrets": True, "password": OWNER_PASSWORD})
+    assert with_secrets.status_code == 200, with_secrets.text
+    assert f'{settings.LLM_API_KEY}="{SECRET}"' in with_secrets.text
+
+    events = [row for row in _events() if row.op == "settings.export"]
+    assert [row.payload["include_secrets"] for row in events] == [True, False]  # newest first
+    assert SECRET not in json.dumps([row.payload for row in events])
+    assert all(row.actor == OWNER_ACTOR for row in events)
+
+
+def test_step_up_refuses_a_wrong_password_and_logs_no_export(client, fresh_db):
+    settings.set_value(settings.LLM_API_KEY, SECRET)
+    response = _export(client, {"include_secrets": True, "password": "wrong password"})
+    assert response.status_code == 401, response.text
+    assert SECRET not in response.text
+    assert not [row for row in _events() if row.op == "settings.export"]
+    # The miss is on the login audit trail, where every password check lands.
+    failures = [row for row in _events("human.login_failed")]
+    assert len(failures) == 1
+    assert failures[0].payload["name"] == "owner"
+
+
+def test_include_secrets_without_a_password_is_a_400(client, fresh_db):
+    response = _export(client, {"include_secrets": True})
+    assert response.status_code == 400, response.text
+
+
+def test_step_up_password_honours_the_login_ceiling(client, fresh_db):
+    """Parity with login includes the work bound: no unbounded argon2 input."""
+    response = _export(client, {"include_secrets": True, "password": "x" * 5000})
+    assert response.status_code == 400, response.text
+    assert "at most" in response.text
+
+
+def test_step_up_lockout_is_parity_with_login_not_a_copy(client, fresh_db):
+    """Five step-up misses lock the name exactly as five login misses would.
+
+    The check runs through the login path's own lockout query, so the two
+    surfaces share one counter: after five export refusals the *login route
+    itself* answers 429, and a sixth export with the correct password is
+    refused up front without spending argon2.
+    """
+    for _ in range(service.LOGIN_MAX_FAILED_ATTEMPTS):
+        response = _export(client, {"include_secrets": True, "password": "still wrong"})
+        assert response.status_code == 401, response.text
+
+    login = Client(client.app).post(
+        "/api/login", json={"name": "owner", "password": OWNER_PASSWORD}
+    )
+    assert login.status_code == 429, login.text
+
+    locked = _export(client, {"include_secrets": True, "password": OWNER_PASSWORD})
+    assert locked.status_code == 429, locked.text
+    assert not [row for row in _events() if row.op == "settings.export"]

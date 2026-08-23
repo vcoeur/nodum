@@ -3381,6 +3381,68 @@ def create_app(
         result = await run_in_threadpool(_write, request, service.adopt_environment, path=db_path)
         return EnvelopeResponse(envelope(result))
 
+    async def export_settings(request: Request) -> Response:
+        """Stream the effective configuration as a `.env` download — the named envelope exemption.
+
+        **This route answers bytes, not the `nodum.envelope`.** Like the asset
+        download route, deliberately: the response *is* the file, and no URL,
+        token or ``TOKEN_PATHS`` entry exists beside it — a secret-bearing URL
+        would land in Caddy's access log and the unrotated docker log, which
+        is why the two-step token design was rejected (R2-B1/B2/B3). A client
+        saves it with `fetch` + Blob + ``createObjectURL``.
+
+        **With secrets, a session alone is not authorisation** — the 30-day
+        sliding cookie rides along on anything this origin sends. So
+        ``include_secrets: true`` demands the session human's own password,
+        verified through the login path itself (:func:`_verify_login`: the
+        failed-attempt lockout, argon2 under the same limiter as ``/api/login``,
+        and the ``human.login_failed`` event on a miss) — so wrong-password
+        throttling and lockout are exactly parity with login, not a copy.
+        A refusal costs nothing but the attempt.
+
+        The export renders **effective** values — an environment-pinned key is
+        emitted with its pinned value; that is what freezing what runs means,
+        and the step-up password is the compensating control. Every export
+        appends one ``settings.export`` event (the session human + flag,
+        never a value).
+
+        The headers match :func:`_original_response` exactly: octet-stream,
+        ``attachment``, ``nosniff``, ``no-store``.
+        """
+        body = await _json_body(request)
+        include_secrets = _optional_bool(body, "include_secrets")
+        # The login route's own ceiling, before argon2 sees the string — the
+        # step-up is parity with login on the work it costs, too.
+        password = (
+            _bounded_str(body, "password", max_chars=service.MAX_PASSWORD_LENGTH)
+            if "password" in body
+            else None
+        )
+        if include_secrets:
+            if password is None:
+                raise ValueError("including secrets requires the session human's password")
+            # The session's own human, by id; their *name* is what the lockout
+            # and argon2 key on, read from the database — never from the body.
+            principal = _session_principal(request)
+            name = await run_in_threadpool(auth.human_login_name, principal.id, path=db_path)
+            await anyio.to_thread.run_sync(_verify_login, name, password, limiter=_ARGON2_LIMITER)
+        text = await run_in_threadpool(
+            _write,
+            request,
+            service.export_settings,
+            include_secrets=include_secrets,
+            path=db_path,
+        )
+        return Response(
+            content=text.encode("utf-8"),
+            media_type=DOWNLOAD_CONTENT_TYPE,
+            headers={
+                "content-disposition": f'attachment; filename="{settings.EXPORT_FILENAME}"',
+                "x-content-type-options": "nosniff",
+                "cache-control": "no-store",
+            },
+        )
+
     # ── Fallbacks ─────────────────────────────────────────────────────────
 
     async def api_not_found(request: Request) -> Response:
@@ -3524,6 +3586,7 @@ def create_app(
         # literal must be tried before the converter that would swallow it.
         Route("/api/settings", get_settings),
         Route("/api/settings", put_settings, methods=["PUT"]),
+        Route("/api/settings/export", export_settings, methods=["POST"]),
         Route("/api/settings/adopt-env", adopt_environment, methods=["POST"]),
         Route("/api/settings/{name}", delete_setting, methods=["DELETE"]),
     ]

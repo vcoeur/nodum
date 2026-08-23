@@ -734,12 +734,15 @@ cycle quietly drop the vector signal until you re-run the download.
 `settings.env` is a file beside the database (`0600`, copied by
 `nodum backup`), and *empty is not set at any layer* — an exported-but-empty
 variable, which is what `${VAR:-}` renders in a compose file, does not shadow a
-stored value. `nodum config list|get|set|unset` is the surface on the CLI, and
+stored value. `nodum config list|get|set|unset|export` is the surface on the
+CLI, and
 `GET`/`PUT /api/settings`, `DELETE /api/settings/{name}` and
 `POST /api/settings/adopt-env` are the same surface on the authenticated HTTP
 API — the PUT is atomic, an environment-pinned key answers 409, and adopt-env
 moves an env-only deployment onto the file without retyping anything;
-`NODUM_LLM_API_KEY` reports whether it is set and never its value. Four names
+`NODUM_LLM_API_KEY` reports whether it is set and never its value (the one
+exception: `config export --include-secrets`, and the HTTP export's equivalent,
+put the real key in the downloaded file after a password step-up). Four names
 stay environment-only and say so when refused: `NODUM_DB`,
 `NODUM_LLM_BASE_URL`, `NODUM_EMBED_CACHE` and `NODUM_PUBLIC_URL`. Details in
 [docs/configuration.md](docs/configuration.md).

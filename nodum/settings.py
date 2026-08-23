@@ -1716,3 +1716,76 @@ def describe_change(change: Change) -> SettingChangeOut:
         set=value is not None,
         provenance=view.provenance(change.key),
     )
+
+
+# ── Export: the effective configuration as a .env file ───────────────────────
+
+
+#: The filename every export is offered under.
+EXPORT_FILENAME = "nodum-settings.env"
+
+
+def _env_quote(value: str) -> str:
+    """Encode one value per the export dialect (see :func:`render_env_file`).
+
+    Double quotes make the value immune to everything an unquoted line loses
+    to — ``#`` starting an inline comment, whitespace being trimmed, and
+    compose interpolating ``${VAR}`` and bare ``$`` sequences — because
+    compose's dotenv reader treats a double-quoted value as **literal**: no
+    expansion runs inside one, and a dollar needs no escape at all (measured,
+    not assumed — the round-trip test caught an unnecessary ``$$`` rule).
+    Only two escapes apply inside the quotes:
+
+    - ``\\`` first (the escape character itself),
+    - ``"`` second (the quoting character).
+
+    Order matters: backslash before quote, so no escape sequence can be
+    re-interpreted by the later pass.
+    """
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def render_env_file(*, include_secrets: bool = False) -> str:
+    """Render the **effective** configuration as a `.env` file's text.
+
+    The export freezes *what runs*: every name resolves through the full
+    ``default < settings.env < environment`` ladder, so an env-pinned key is
+    exported with its pinned value — that is the point of the verb (freeze
+    the live configuration into a deployment `.env`), and it means the file
+    can carry a value the read surfaces only show as "set". The step-up
+    password the HTTP surface demands for ``include_secrets`` is the
+    compensating control for exactly this.
+
+    The consumer is **docker compose's dotenv reader**, never nodum's parser;
+    values are quoted per :func:`_env_quote`, and the round trip through
+    `docker compose config` is tested against this function, not nodum
+    against itself.
+
+    A secret is emitted only when ``include_secrets`` is true; otherwise its
+    line becomes a comment saying it was omitted, so a redacted export is
+    honest about the gap rather than silently producing a file that will not
+    authenticate.
+
+    Args:
+        include_secrets: Emit secret values instead of omission comments.
+
+    Returns:
+        The file text, newline-terminated, one setting per line or comment.
+    """
+    view = snapshot()
+    lines = [
+        "# nodum effective configuration — generated, do not edit by hand.",
+        "# Values are the ones in force now (default < settings.env < environment),",
+        f"# rendered for docker compose's dotenv reader ({EXPORT_FILENAME}).",
+    ]
+    for name, spec in SPECS.items():
+        value = view.values[name]
+        if value is None:
+            lines.append(f"# {name} is not set")
+            continue
+        if spec.secret and not include_secrets:
+            lines.append(f"# {name} is set but omitted by this redacted export")
+            continue
+        lines.append(f"{name}={_env_quote(value)}")
+    return "\n".join(lines) + "\n"

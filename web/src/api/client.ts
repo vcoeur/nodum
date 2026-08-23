@@ -1559,6 +1559,32 @@ export function adoptEnvironment(signal?: AbortSignal): Promise<SettingAdoptOut>
   });
 }
 
+/**
+ * `POST /api/settings/export` — the effective configuration as a `.env`
+ * download. The one settings call that does not go through {@link request}:
+ * the response **is** the file (`application/octet-stream`), not the JSON
+ * envelope, so this is the named second branch beside it.
+ *
+ * No URL and no token exist for the export — a secret-bearing URL would land
+ * in access logs — so the caller saves the Blob itself (createObjectURL).
+ * With `includeSecrets`, `password` is required: the server re-verifies the
+ * session human's password through the login path, and a wrong one answers
+ * 401 with the ordinary error body.
+ */
+export async function exportSettings(
+  options: { includeSecrets: boolean; password?: string },
+  signal?: AbortSignal,
+): Promise<Blob> {
+  const response = await fetch(`${API_BASE}/settings/export`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/octet-stream" },
+    body: JSON.stringify(options),
+    ...(signal ? { signal } : {}),
+  });
+  if (!response.ok) throw await toApiError(response);
+  return response.blob();
+}
+
 /** Every endpoint, grouped for `import { api } from "../api/client"` ergonomics. */
 export const api = {
   login,
@@ -1619,4 +1645,5 @@ export const api = {
   applySettings,
   unsetSetting,
   adoptEnvironment,
+  exportSettings,
 };

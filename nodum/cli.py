@@ -39,7 +39,7 @@ from nodum.assets import AssetNotFound, AssetSourceChanged, AssetTooLarge, Unsup
 from nodum.cli_schema import build_cli_schema
 from nodum.db import ENV_DB_VAR
 from nodum.envelope import envelope, list_envelope, render_json
-from nodum.models import ItemFailure, RollbackOut, TransitionFailure
+from nodum.models import ItemFailure, RollbackOut, SettingsExportOut, TransitionFailure
 from nodum.principal import Principal
 from nodum.service import (
     EventNotFound,
@@ -1547,6 +1547,42 @@ def config_unset(
     change = _run(settings.unset_value, key)
     _emit(_run(settings.describe_change, change))
     _run(_record_settings_change, "settings.unset", change, principal)
+
+
+@config_app.command("export")
+def config_export(
+    out: Path = typer.Option(..., "--out", help="Where to write the .env file."),
+    include_secrets: bool = typer.Option(
+        False,
+        "--include-secrets",
+        help="Emit secret values (NODUM_LLM_API_KEY). The default export omits them.",
+    ),
+    as_human: str = AS_OPTION,
+) -> None:
+    """Export the effective configuration as a .env file docker compose can read.
+
+    Values are what is in force across the whole ladder — an environment-pinned
+    key is exported with its pinned value. Secrets are omitted (as a named
+    comment) unless --include-secrets. The file is written; one JSON object on
+    stdout says where, how many keys, and whether secrets went along.
+    """
+    principal = _principal(as_human)
+
+    def write_export() -> SettingsExportOut:
+        text = service.export_settings(principal=principal, include_secrets=include_secrets)
+        # 0600 always, not only with --include-secrets: the redacted file still
+        # names every key in force, and the CLI owns this path — unlike the
+        # browser download, where the destination is the user's. fchmod, not
+        # just the O_CREAT mode: a re-export over yesterday's file must pull an
+        # already-wider file back down too.
+        fd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        count = sum(1 for line in text.splitlines() if line and not line.startswith("#"))
+        return SettingsExportOut(path=str(out), include_secrets=include_secrets, count=count)
+
+    _emit(_run(write_export))
 
 
 # ── HTTP server (the human and agent surfaces) ───────────────────────────────

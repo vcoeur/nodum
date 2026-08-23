@@ -357,6 +357,34 @@ def verify_login(name: str, password: str, *, path: str | Path | None = None) ->
         conn.close()
 
 
+def human_login_name(human_id: str, *, path: str | Path | None = None) -> str:
+    """The login name of a human id — the handle the lockout and argon2 key on.
+
+    Sessions store the account's *id*; password verification keys on its
+    *name*. The step-up check on an already-authenticated surface needs the
+    bridge between the two, and this is it: a database read by id, never a
+    name taken from a request.
+
+    Args:
+        human_id: The account's id.
+        path: Explicit database path.
+
+    Returns:
+        The account's unique login name.
+
+    Raises:
+        UnknownPrincipal: If no human by that id exists.
+    """
+    conn = _connect(path)
+    try:
+        row = conn.execute("SELECT name FROM humans WHERE id = ?", (human_id,)).fetchone()
+        if row is None or row["name"] is None:
+            raise UnknownPrincipal(f"unknown human account: {human_id}")
+        return row["name"]
+    finally:
+        conn.close()
+
+
 # ── Agent tokens (show-once, sha-256 stored) ──────────────────────────────────
 
 
