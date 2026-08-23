@@ -1572,8 +1572,11 @@ def config_export(
         text = service.export_settings(principal=principal, include_secrets=include_secrets)
         # 0600 always, not only with --include-secrets: the redacted file still
         # names every key in force, and the CLI owns this path — unlike the
-        # browser download, where the destination is the user's.
+        # browser download, where the destination is the user's. fchmod, not
+        # just the O_CREAT mode: a re-export over yesterday's file must pull an
+        # already-wider file back down too.
         fd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(text)
         count = sum(1 for line in text.splitlines() if line and not line.startswith("#"))

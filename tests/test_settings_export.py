@@ -261,12 +261,19 @@ def test_cli_export_appends_one_event_with_the_flag_and_no_value(fresh_db, tmp_p
 
 
 def test_cli_export_writes_the_file_at_0600(fresh_db, tmp_path, monkeypatch):
-    """A credential-bearing export never lands world-readable — even redacted."""
+    """A credential-bearing export never lands world-readable — even redacted.
+
+    Both ways: a fresh file (the create case) and a re-export over an existing
+    0644 one (O_CREAT's mode argument applies at creation only).
+    """
+    import os as os_module
     import stat
 
     _store_tricky_configuration(monkeypatch)
     for flags in ([], ["--include-secrets"]):
         out = tmp_path / f"out-{'keys' if flags else 'redacted'}.env"
+        out.write_text("stale", encoding="utf-8")
+        os_module.chmod(out, 0o644)
         result = runner.invoke(
             cli.app, ["config", "export", "--out", str(out), *flags, "--as", "owner"]
         )
