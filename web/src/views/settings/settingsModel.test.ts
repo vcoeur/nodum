@@ -1,13 +1,16 @@
 import { describe, expect, it } from "vitest";
 import type { EventOut, SettingOut } from "../../api/types";
 import {
+  EMBED_DOWNLOAD_NOTE,
   adoptPreview,
   editBlocker,
   GROUPS,
   isEditable,
+  isModelChange,
   layerLabel,
   liveness,
   livenessLabel,
+  modelChangeConfirm,
   PROFILE_DEFAULT_NOTE,
   revertTarget,
 } from "./settingsModel";
@@ -42,11 +45,10 @@ function event(key: string, before: string | null): EventOut {
 }
 
 describe("grouping", () => {
-  it("covers this build's seventeen names exactly once across the five groups", () => {
+  it("covers this build's nineteen names exactly once across the six groups", () => {
     const keys = GROUPS.flatMap((group) => group.keys);
-    // 19 minus the two embedding names SP5 makes editable.
-    expect(keys.length).toBe(17);
-    expect(new Set(keys).size).toBe(17);
+    expect(keys.length).toBe(19);
+    expect(new Set(keys).size).toBe(19);
   });
 
   it("puts the env-only four in the read-only Server group", () => {
@@ -57,6 +59,11 @@ describe("grouping", () => {
       "NODUM_EMBED_CACHE",
       "NODUM_PUBLIC_URL",
     ]);
+  });
+
+  it("groups the two embedding names under Embeddings", () => {
+    const embed = GROUPS.find((group) => group.id === "embeddings");
+    expect(embed?.keys).toEqual(["NODUM_EMBED_MODEL", "NODUM_EMBED_DOWNLOAD"]);
   });
 });
 
@@ -81,7 +88,13 @@ describe("liveness", () => {
   });
 
   it("reports the provider keys — including the secret — as live", () => {
-    for (const key of ["NODUM_LLM_MODEL", "NODUM_LLM_API_KEY", "NODUM_LLM_THINKING"]) {
+    for (const key of [
+      "NODUM_LLM_MODEL",
+      "NODUM_LLM_API_KEY",
+      "NODUM_LLM_THINKING",
+      "NODUM_EMBED_MODEL",
+      "NODUM_EMBED_DOWNLOAD",
+    ]) {
       expect(liveness(key)).toBe("now");
     }
   });
@@ -191,5 +204,40 @@ describe("PROFILE_DEFAULT_NOTE", () => {
   it("names the profile-supplied window without claiming it is always in force", () => {
     expect(PROFILE_DEFAULT_NOTE).toContain("1M");
     expect(PROFILE_DEFAULT_NOTE).toMatch(/when the model matches/);
+  });
+});
+
+describe("the embedding-model confirm", () => {
+  it("names the exact consequence with the chunk count the change would blind", () => {
+    const lines = modelChangeConfirm(4);
+    expect(lines[0]).toContain("4 chunks");
+    expect(lines[0]).toContain("invisible to search");
+    expect(lines[0]).toContain("rebuild re-embeds them");
+    expect(modelChangeConfirm(1)[0]).toContain("1 chunk");
+  });
+
+  it("says plainly that a change with no stored chunks blinds nothing yet", () => {
+    expect(modelChangeConfirm(0)[0]).toContain("No chunks are stored yet");
+    expect(modelChangeConfirm(0)[0]).not.toContain("invisible");
+  });
+
+  it("does not promise the rebuild happens by itself", () => {
+    const joined = modelChangeConfirm(3).join(" ");
+    expect(joined).toContain("re-embeds nothing by itself");
+    expect(joined).toContain("offers the vector rebuild");
+  });
+
+  it("is keyed to exactly the model row", () => {
+    expect(isModelChange("NODUM_EMBED_MODEL")).toBe(true);
+    expect(isModelChange("NODUM_EMBED_DOWNLOAD")).toBe(false);
+    expect(isModelChange("NODUM_LLM_MODEL")).toBe(false);
+  });
+});
+
+describe("EMBED_DOWNLOAD_NOTE", () => {
+  it("states the cost of the gate and the posture it lifts", () => {
+    expect(EMBED_DOWNLOAD_NOTE).toContain("0.2 GB");
+    expect(EMBED_DOWNLOAD_NOTE).toContain("next vector operation");
+    expect(EMBED_DOWNLOAD_NOTE).toMatch(/never downloads implicitly/i);
   });
 });

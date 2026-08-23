@@ -1004,6 +1004,15 @@ export interface SettingsOut {
   unreadable: string | null;
   /** Per optional extra, whether its dependency is importable (`audio` today). */
   capabilities: Record<string, boolean>;
+  /**
+   * The vec projector's staleness sentence — non-null exactly while chunks
+   * from another embedding model sit in the store, invisible to search until
+   * `projector rebuild vec` re-embeds them. The rebuild the page offers when
+   * this is set.
+   */
+  mixed_model_note: string | null;
+  /** Total chunk rows in the vec store — what a `NODUM_EMBED_MODEL` change would blind. */
+  embed_chunks: number;
 }
 
 /** What one settings write left in force. No secret value is ever carried. */

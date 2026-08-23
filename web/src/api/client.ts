@@ -53,6 +53,7 @@ import type {
   NodeFilters,
   NodeOut,
   PathOut,
+  ProjectorRun,
   ProposalOut,
   RejectProposalsBody,
   RenditionProfile,
@@ -1585,6 +1586,23 @@ export async function exportSettings(
   return response.blob();
 }
 
+/**
+ * `POST /api/projectors/{name}/rebuild` — drop one projector's derived state
+ * and replay the event log from event 0.
+ *
+ * The coupling that makes a `NODUM_EMBED_MODEL` change safe: after a model
+ * write every stored chunk is invisible to search until the `vec` projector
+ * re-embeds them, and this is the offered action. Human-only at the domain,
+ * like the settings writes, and each completed run appends a
+ * `projector.rebuild` event naming the session's human.
+ */
+export function rebuildProjector(name: string, signal?: AbortSignal): Promise<ProjectorRun> {
+  return request<ProjectorRun>(`/projectors/${encodeURIComponent(name)}/rebuild`, {
+    method: "POST",
+    ...(signal ? { signal } : {}),
+  });
+}
+
 /** Every endpoint, grouped for `import { api } from "../api/client"` ergonomics. */
 export const api = {
   login,
@@ -1646,4 +1664,5 @@ export const api = {
   unsetSetting,
   adoptEnvironment,
   exportSettings,
+  rebuildProjector,
 };

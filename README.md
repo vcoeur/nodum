@@ -234,7 +234,10 @@ Without the extra (or an uncached model) everything still works: the `vec`
 projector reports itself unavailable in `projector status` and search
 degrades to BM25 + graph expansion. `NODUM_EMBED_MODEL` switches the model
 (default: `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`,
-384-dim, multilingual); a model change is a `projector rebuild vec`.
+384-dim, multilingual); a model change is a `projector rebuild vec` — both
+names are manageable from `settings.env` and the Settings page, and the page
+confirms the change and offers the rebuild rather than letting the change
+blind search silently.
 
 The download is cached in `~/.local/share/nodum/models`, beside the database,
 and `NODUM_EMBED_CACHE` moves it. Point that at temporary storage and you will
@@ -742,7 +745,11 @@ API — the PUT is atomic, an environment-pinned key answers 409, and adopt-env
 moves an env-only deployment onto the file without retyping anything;
 `NODUM_LLM_API_KEY` reports whether it is set and never its value (the one
 exception: `config export --include-secrets`, and the HTTP export's equivalent,
-put the real key in the downloaded file after a password step-up). Four names
+put the real key in the downloaded file after a password step-up). The
+embedding pair is web-manageable too, coupled to the vector rebuild:
+`POST /api/projectors/{name}/rebuild` is the human-only trigger the Settings
+page offers while a model change has left the corpus invisible to search. Four
+names
 stay environment-only and say so when refused: `NODUM_DB`,
 `NODUM_LLM_BASE_URL`, `NODUM_EMBED_CACHE` and `NODUM_PUBLIC_URL`. Details in
 [docs/configuration.md](docs/configuration.md).

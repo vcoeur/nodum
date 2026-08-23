@@ -67,12 +67,17 @@ The invariants that must never be broken, whatever the section:
   — resolve it through `nodum.settings`, which is also where a new name is
   registered with its validator, its default, and whether it may be stored at
   all. **Refusing to store a name and reading it with `os.environ` are two
-  different things.** `NODUM_DB`, `NODUM_PUBLIC_URL`, `NODUM_EMBED_CACHE` and
-  the two embedding variables are read from the environment where they always
-  were — `db.py`, `urls.py`, `embeddings.py` — each for the reason the registry
+  different things.** `NODUM_DB`, `NODUM_PUBLIC_URL` and `NODUM_EMBED_CACHE`
+  are read from the environment where they always were — `db.py`, `urls.py`,
+  `embeddings.py` — each for the reason the registry
   records against it (read before the graph, and therefore before its settings
   file, is open; a path on the server's own disk; the root every capability URL
-  is minted from). That is correct, not a violation.
+  is minted from). That is correct, not a violation. `NODUM_EMBED_MODEL` and
+  `NODUM_EMBED_DOWNLOAD` used to be read from the environment in
+  `embeddings.py`; they now resolve through the seam like the other storable
+  names — a model change invalidates the embedding snapshot, which is why it is
+  coupled to `projector rebuild vec` and why the MCP `search` tool runs off the
+  event loop.
   `NODUM_LLM_BASE_URL` is environment-only by *policy* (`writable=False`: the
   endpoint an API key may travel to is a deployment decision) and is still
   resolved **through the seam**, in `nodum/llm.py`, which is the pattern the
@@ -516,15 +521,21 @@ below are the parts that do not fit a route table.
 ### Spaces, accounts and the smart routes
 
 - **Settings are manageable over HTTP, human-only at the domain.** `GET
-  /api/settings` is `nodum config list` byte-identical and stays inline (the
-  reader costs one stat on an unchanged file); `PUT /api/settings` (body:
+  /api/settings` is `nodum config list` byte-identical (both call
+  `service.settings_report`, which also carries the vec projector's embedding
+  state — the mixed-model note and the chunk count — and runs off the event
+  loop, because computing the note can resolve — and load — the embedding
+  provider); `PUT /api/settings` (body:
   `{NAME: value | null}` — absent untouched, `null` removes, empty string
   refused), `DELETE /api/settings/{name}` (200 `changed: false` for a key the
   file never carried) and `POST /api/settings/adopt-env` (store every editable,
   non-empty environment value; provenance stays `environment`, one
   `settings.set` event per key actually moved) all go through
-  `run_in_threadpool`. The gate is `Store.require_human` inside
-  `nodum.service.apply_settings`/`unset_setting`/`adopt_environment`/`export_settings`
+  `run_in_threadpool`. **`POST /api/projectors/{name}/rebuild`** is the
+  model-change coupling's offered action: human-only at the domain
+  (`service.rebuild_projector`), off the event loop, one `projector.rebuild`
+  event per completed run. The gate is `Store.require_human` inside
+  `nodum.service.apply_settings`/`unset_setting`/`adopt_environment`/`export_settings`/`rebuild_projector`
   — never a
   route-level check, and never inside `nodum.settings` (the provider import
   rail forbids it). A key the environment pins is **409**
@@ -725,7 +736,10 @@ nothing else.
   writes** (`apply_settings`, `set_setting`, `unset_setting`,
   `adopt_environment`, `export_settings` — `SETTINGS_TOOLS`; gated at the domain by
   `Store.require_human`, which is what bites here, since MCP is the surface
-  that mints non-human principals). `UNREGISTERED_TOOLS` is
+  that mints non-human principals). The sixth is **derived-state operations**
+  (`rebuild_projector`, `run_projectors` — `PROJECTOR_TOOLS`): a whole-graph
+  re-embedding is a human action beside the settings surface, served over HTTP
+  as `POST /api/projectors/{name}/rebuild`. `UNREGISTERED_TOOLS` is
   the union, and what `tests/test_mcp_server.py` asserts the registry stays
   disjoint from; adding an operation to any of those tiers means adding its
   name to a list, never to the registry. This is **structural enforcement, not

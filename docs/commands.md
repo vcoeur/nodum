@@ -496,7 +496,7 @@ later event that moved it, with the message on stderr and exit 1 as usual.
 
 - `projector run` — Apply pending event-log entries to the derived indexes.
 - `projector status` — Show every projector's checkpoint, backlog, and derived-store size.
-- `projector rebuild <name>` — Drop one projector's derived state and replay the full event log.
+- `projector rebuild <name>` — Drop one projector's derived state and replay the full event log. The CLI verb is the operator's local tool and writes no event; the audited, human-gated form of the same action is `POST /api/projectors/{name}/rebuild`, which the Settings page offers after an embedding-model change.
 
 ### Assets
 
@@ -581,7 +581,10 @@ that no text came out.
   came from (`environment`, `settings.env`, `default`, `unset`), its default,
   whether it can be stored, and what the runtime does with a bad value. The
   envelope also names the settings file, any keys in it this build does not
-  recognise, and why it could not be read when it could not.
+  recognise, and why it could not be read when it could not — plus the vec
+  projector's embedding state (`mixed_model_note`, `embed_chunks`): the
+  staleness sentence that appears after an embedding-model change and the
+  chunk count the change would blind.
 - `config get <KEY>` — One name, same row.
 - `config set <KEY> <VALUE> --as human:<id>` — Store it in `settings.env`.
   Refused, with the reason, when the name cannot be stored there, when the

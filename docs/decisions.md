@@ -2663,3 +2663,51 @@ the ladder to the file layer, and that stays a deliberate deployment step —
 otherwise a cutover verb and a configuration change would be the same button
 press. What adopt changes immediately is only `stored`, so the operator can see
 the value is now backed by the file before they touch the environment.
+
+## 2026-08-23 — the embedding variables joined the ladder, coupled to the rebuild
+
+`NODUM_EMBED_MODEL` and `NODUM_EMBED_DOWNLOAD` became storable settings —
+the last two names the 2026-08-19 six-way split deferred because they were
+not safe to make live (parent findings R1-B1, R4-S9, R3-B6). Three decisions
+carry them.
+
+**A model write is coupled to the rebuild, never silent.** Every chunk records
+its producing model and search filters the KNN join on it, so a model change
+makes the whole existing corpus invisible to search while reporting success.
+The surface therefore refuses to let the write be silent: the page confirms a
+model change naming the consequence (the current chunks become invisible until
+the rebuild re-embeds them), `GET /api/settings` and `nodum config list` carry
+the vec projector's mixed-model note plus the chunk count, and the rebuild is
+offered as an action until it has run clean. The rebuild is the existing
+`projector rebuild vec` surfaced, not reimplemented — with one new trigger:
+`POST /api/projectors/{name}/rebuild`, human-only at the domain like the
+settings writes, off the event loop, one `projector.rebuild` event per
+completed run. This is the same class of action as a settings write, so it
+sits beside the settings surface and joins MCP's named-absence lists
+(`PROJECTOR_TOOLS`).
+
+**The embedding provider's invalidation is value-keyed, and the on-loop hazard
+is closed before the keys went live.** Constructing the fastembed provider
+loads a model, so `embeddings._configuration()` keeps keying the resolution on
+its three own values — now resolved through the settings seam for the two
+storable names — rather than on the settings file's generation: a budget or
+schedule write still cannot trigger a model load. A model write now can, by
+design, which is exactly the scenario the MCP fix exists for: FastMCP calls
+sync tools inline on the event loop, so the embedding-reaching `search` tool
+became `async def` and runs its body through `run_in_threadpool`, with the
+principal bound before the hop. The loop-stall test watches a heartbeat tick
+during a deliberately slow load after a settings write; the concurrent-resolve
+test asserts two threads observing one invalidation produce exactly one load
+(SP1's lock covers it, now tested where it can fire).
+
+**`GET /api/settings` moved off the event loop.** It used to stay inline on
+the argument that an unchanged settings file costs one open and one fstat.
+Computing the mixed-model note can resolve — and therefore load — the embedding
+provider, which is exactly the stall this project exists to prevent, so the
+route now goes through `run_in_threadpool` like every other blocking read on
+the surface. Byte parity with `nodum config list` is preserved because both
+call the same `service.settings_report`.
+
+`NODUM_EMBED_CACHE` stays environment-only: it is a path on the server's own
+disk, the exact shape the `FILESYSTEM_TOOLS` absence exists for, and it is
+still read where it always was.

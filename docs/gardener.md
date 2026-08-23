@@ -102,7 +102,11 @@ refusing to boot. `nodum consolidate` on demand works either way.
 The deterministic jobs need no language model at all — a cycle runs fine on
 a machine that has none. (The embedding-cosine signals inside duplicate and
 link inference come from the local embedding model, which is a separate,
-key-less thing — see [Configuration](configuration.md#embeddings).) A language
+key-less thing — see [Configuration](configuration.md#embeddings). It is
+manageable from `settings.env` and the Settings page like the LLM block, and
+a model change there blinds every stored chunk to search until the vector
+index is rebuilt — the Settings page confirms the change, then offers the
+rebuild.) A language
 model buys the **abstraction** job: a `proposed` `concept` node synthesised
 from a dense cluster, with `derived_from` edges to its members. That job needs
 both models: its cohesion gate is an embedding cosine, so without the embedding

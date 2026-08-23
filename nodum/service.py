@@ -15,6 +15,7 @@ from __future__ import annotations
 import contextvars
 import difflib
 import json
+import logging
 import re
 import sqlite3
 import unicodedata
@@ -26,7 +27,7 @@ from typing import Any, NamedTuple
 
 from pydantic import ValidationError
 
-from nodum import auth, db, settings
+from nodum import auth, db, projectors, settings
 from nodum.migrations import BUILTIN_AGENT_PREFIX, GARDENER_AGENT_ID, MAIN_SPACE_ID, META_SPACE_ID
 from nodum.models import (
     AgentCreatedOut,
@@ -48,6 +49,7 @@ from nodum.models import (
     MergeRedirectOut,
     NodeOut,
     PathOut,
+    ProjectorRun,
     ProposalOut,
     ProposeEdgesOut,
     RelinkDiff,
@@ -58,6 +60,7 @@ from nodum.models import (
     RollbackOut,
     SettingAdoptOut,
     SettingAdoptSkippedOut,
+    SettingsOut,
     SpaceOut,
     SubgraphOut,
     SupersedeOut,
@@ -96,6 +99,8 @@ from nodum.vocab import (
 
 #: Allowed state values shared by nodes and edges (vocab: :data:`STATES`).
 STATES = STATES
+
+logger = logging.getLogger(__name__)
 
 #: State transitions: action → (required current state, resulting state).
 TRANSITIONS = TRANSITIONS
@@ -4429,11 +4434,68 @@ def record_settings_event(
 # the other half of this one answer.
 
 
-def _gate_settings_write(principal: Principal, path: str | Path | None) -> None:
-    """Refuse a non-human principal, then get out of the seam's way."""
+def _gate_human(principal: Principal, path: str | Path | None, action: str) -> None:
+    """Refuse a non-human principal, then get out of the operation's way."""
     conn = _connect(path)
     try:
-        Store(conn, principal).require_human("configure nodum")
+        Store(conn, principal).require_human(action)
+    finally:
+        conn.close()
+
+
+def _gate_settings_write(principal: Principal, path: str | Path | None) -> None:
+    """Refuse a non-human principal for a settings write (see the section above)."""
+    _gate_human(principal, path, "configure nodum")
+
+
+def settings_report(*, path: str | Path | None = None) -> SettingsOut:
+    """List every setting plus the vec projector's embedding state — one report.
+
+    ``settings.list_settings`` answers the ladder alone; this adds the two
+    fields that make ``NODUM_EMBED_MODEL`` safe to manage over the surface:
+    ``mixed_model_note`` (the vec projector's staleness sentence, non-null
+    exactly while chunks from another model sit in the store) and
+    ``embed_chunks`` (the total chunk count — what a model change would blind).
+    Both are derived state, so this is the **one** function the CLI's
+    ``config list`` and ``GET /api/settings`` both call, which is what keeps
+    the two surfaces byte-identical (the HTTP route runs it off the event
+    loop: computing the note can resolve — and therefore load — the embedding
+    provider).
+
+    A graph that does not exist yet answers zero chunks and no note, without
+    creating the database: ``config list`` is a read that must work on a fresh
+    machine.
+
+    Args:
+        path: Explicit database path; defaults to ``NODUM_DB`` resolution.
+
+    Returns:
+        The :class:`~nodum.models.SettingsOut` report, embedding state filled in.
+    """
+    out = settings.list_settings()
+    resolved = Path(path).expanduser() if path is not None else db.db_path()
+    if str(resolved) == ":memory:" or not resolved.exists():
+        return out
+    try:
+        conn = _connect(resolved)
+    except (sqlite3.Error, db.SchemaConsistencyError, OSError) as exc:
+        # A graph that exists but will not open — not a nodum file, a schema
+        # that drifted from its migrations, unreadable — must not take the
+        # settings surface down with it. This is a settings read, and the
+        # embedding state is a derived garnish: the same degrade-not-fail
+        # posture as the missing-file guard above, and the operator diagnosing
+        # the broken graph is exactly who needs the ladder to answer.
+        logger.warning(
+            "%s could not be opened for the settings report (%s); reporting the ladder alone",
+            resolved,
+            exc,
+        )
+        return out
+    try:
+        vec = projectors.REGISTRY["vec"]
+        return out.model_copy(
+            update={"mixed_model_note": vec.mixed_model_note(conn), "embed_chunks": vec.count(conn)}
+        )
     finally:
         conn.close()
 
@@ -4566,6 +4628,94 @@ def export_settings(
         path=path,
     )
     return text
+
+
+# ── Projector rebuilds: the model-change coupling, human-only ─────────────────
+
+
+#: The only ops :func:`record_projector_event` will write — one today, for the
+#: same reason :data:`SETTINGS_EVENT_OPS` is an allowlist: the adapter owns the
+#: surface and a helper taking any dotted string would hand it the ability to
+#: forge a ``node.create`` or an ``undo``.
+PROJECTOR_EVENT_OPS = ("projector.rebuild",)
+
+
+def record_projector_event(
+    op: str,
+    payload: dict[str, Any],
+    *,
+    principal: Principal,
+    path: str | Path | None = None,
+) -> int:
+    """Append one projector-rebuild event to the log.
+
+    The sibling of :func:`record_settings_event` for the rebuild verb: a
+    ``projector.rebuild`` event is what makes a whole-graph re-embedding
+    attributable — who ran it, which projector, and what the run did — on the
+    same append-only log. Audit-only like the settings events: ``undo``
+    reverses ``node.*`` / ``edge.*`` only, and nothing here is in
+    :data:`_REVERSIBLE_TABLES`.
+
+    Args:
+        op: The event op; must be one of :data:`PROJECTOR_EVENT_OPS`.
+        payload: The run metadata; never a setting value or a path.
+        principal: The human who asked.
+        path: Explicit database path.
+
+    Returns:
+        The new event's ``seq``.
+
+    Raises:
+        ValueError: If ``op`` is not allowlisted.
+    """
+    if op not in PROJECTOR_EVENT_OPS:
+        raise ValueError(f"op must be one of {PROJECTOR_EVENT_OPS}, got {op!r}")
+    own_conn = _connect(path)
+    try:
+        seq = _emit(own_conn, principal.actor_string, op, payload)
+        own_conn.commit()
+        return seq
+    finally:
+        own_conn.close()
+
+
+def rebuild_projector(
+    name: str, *, principal: Principal, path: str | Path | None = None
+) -> ProjectorRun:
+    """Drop one projector's derived state and replay the event log (human-only).
+
+    The human-only door over :func:`nodum.projectors.rebuild_projector`, gated
+    like the settings writes: a whole-graph re-embedding is heavy, derived
+    state a non-human principal must not be able to trigger, and the rebuild is
+    the coupling that makes a ``NODUM_EMBED_MODEL`` change safe — so its
+    trigger sits with the settings surface rather than with the agent surface.
+    The gate and the event are recorded **after** the run lands, so a refused
+    or failed rebuild writes no event (a log of attempts that changed nothing
+    is a harder log to read — the settings precedent).
+
+    Args:
+        name: The projector to rebuild (``vec``, ``fts``).
+        principal: The human who asked.
+        path: Explicit database path for the gate, the run and the event.
+
+    Returns:
+        The run result of the full replay.
+
+    Raises:
+        ValueError: If the name is not in the registry, or the projector is
+            unavailable (rebuilding would empty the store without being able
+            to refill it).
+        Store.require_human's refusal: If ``principal`` is not human.
+    """
+    _gate_human(principal, path, "rebuild a projector")
+    run = projectors.rebuild_projector(name, path=path)
+    record_projector_event(
+        "projector.rebuild",
+        run.model_dump(mode="json"),
+        principal=principal,
+        path=path,
+    )
+    return run
 
 
 #: Failed login attempts within :data:`LOGIN_LOCKOUT_WINDOW_MINUTES` that lock

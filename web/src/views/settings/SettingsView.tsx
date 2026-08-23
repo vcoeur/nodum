@@ -25,21 +25,30 @@ import type { EventOut, SettingAdoptOut, SettingOut, SettingsOut } from "../../a
 import { describeFailure } from "../../lib";
 import type { FailureDescription } from "../../lib";
 import {
+  EMBED_DOWNLOAD_NOTE,
+  EMBED_MODEL_KEY,
   EXPORT_FILENAME,
   GROUPS,
   PROFILE_DEFAULT_NOTE,
   WITH_KEYS_EXPORT_CONFIRM,
   adoptPreview,
   editBlocker,
+  isModelChange,
   layerLabel,
   liveness,
   livenessLabel,
+  modelChangeConfirm,
   revertTarget,
 } from "./settingsModel";
 import "./settings.css";
 
 /** How many log events the revert column reads; settings events are rare. */
 const EVENT_WINDOW = 200;
+
+/** The model write held behind the consequence confirm — a save or a revert. */
+type PendingModelWrite =
+  | { kind: "save"; draft: string }
+  | { kind: "revert"; value: string | null };
 
 /** The newest settings event per key, read once per load. */
 function lastSettingsEventBy(events: readonly EventOut[]): Map<string, EventOut> {
@@ -76,6 +85,10 @@ export default function SettingsView() {
   const [exportOpen, setExportOpen] = useState(false);
   const [exportPassword, setExportPassword] = useState("");
   const [exporting, setExporting] = useState(false);
+  /** The model-change confirm: the write is held until the consequence is named. */
+  const [pendingModel, setPendingModel] = useState<PendingModelWrite | null>(null);
+  /** The mixed-model banner's rebuild, in flight. */
+  const [rebuilding, setRebuilding] = useState(false);
 
   /** Fetch both reads and put them in state; throws, so callers decide the failure copy. */
   const fetchData = useCallback(async () => {
@@ -147,6 +160,16 @@ export default function SettingsView() {
   const saveRow = async (row: SettingOut) => {
     const draft = drafts.get(row.key);
     if (draft === undefined || savingKey !== null) return;
+    // A model change blinds every stored chunk until the rebuild re-embeds
+    // them — that consequence is confirmed before the write, never after.
+    if (isModelChange(row.key)) {
+      setPendingModel({ kind: "save", draft });
+      return;
+    }
+    await writeRow(row, draft);
+  };
+
+  const writeRow = async (row: SettingOut, draft: string) => {
     setSavingKey(row.key);
     try {
       await api.applySettings({ [row.key]: draft });
@@ -164,15 +187,45 @@ export default function SettingsView() {
     await refresh();
   };
 
-  const revertRow = async (row: SettingOut) => {
-    const target = revertTarget(row, eventsByKey.get(row.key) ?? null, capabilities);
-    if (target === null || revertingKey !== null) return;
+  /** Confirm the pending model write — a save or a revert; both change the model. */
+  const confirmModelChange = async () => {
+    const pending = pendingModel;
+    setPendingModel(null);
+    const row = rowsByKey.get(EMBED_MODEL_KEY);
+    if (row === undefined || pending === null) return;
+    if (pending.kind === "save") {
+      await writeRow(row, pending.draft);
+    } else {
+      await performRevert(row, pending.value);
+    }
+  };
+
+  /** The mixed-model banner's offered action: re-embed everything with the current model. */
+  const rebuildVectors = async () => {
+    if (rebuilding) return;
+    setRebuilding(true);
+    try {
+      const run = await api.rebuildProjector("vec");
+      toast.show(
+        "success",
+        "Vector index rebuilt",
+        `${run.applied} event${run.applied === 1 ? "" : "s"} re-embedded with the current model.`,
+      );
+    } catch (error) {
+      toast.showError(error, "The vector index was not rebuilt");
+    } finally {
+      setRebuilding(false);
+    }
+    await refresh();
+  };
+
+  const performRevert = async (row: SettingOut, value: string | null) => {
     setRevertingKey(row.key);
     try {
-      if (target.kind === "write") {
-        await api.applySettings({ [row.key]: target.value });
-      } else {
+      if (value === null) {
         await api.unsetSetting(row.key);
+      } else {
+        await api.applySettings({ [row.key]: value });
       }
     } catch (error) {
       toast.showError(error, `${row.key} was not reverted`);
@@ -180,11 +233,23 @@ export default function SettingsView() {
     } finally {
       setRevertingKey(null);
     }
-    setNote(
-      row.key,
-      `Reverted to the previous value${target.kind === "remove" ? " (removed)" : ""}`,
-    );
+    setNote(row.key, `Reverted to the previous value${value === null ? " (removed)" : ""}`);
     await refresh();
+  };
+
+  const revertRow = async (row: SettingOut) => {
+    const target = revertTarget(row, eventsByKey.get(row.key) ?? null, capabilities);
+    if (target === null || revertingKey !== null) return;
+    // Reverting the model is a model change: it gets the same confirm, with
+    // the same consequence, as a save does.
+    if (isModelChange(row.key)) {
+      setPendingModel({
+        kind: "revert",
+        value: target.kind === "write" ? target.value : null,
+      });
+      return;
+    }
+    await performRevert(row, target.kind === "write" ? target.value : null);
   };
 
   const adopt = async () => {
@@ -309,6 +374,19 @@ export default function SettingsView() {
           {report.unknown_keys.join(", ")}, but they are kept in the file.
         </p>
       ) : null}
+      {report.mixed_model_note ? (
+        <div className="nd-set__warning" role="alert">
+          <p>{report.mixed_model_note}</p>
+          <button
+            type="button"
+            className="nd-button nd-button--primary nd-button--small"
+            onClick={rebuildVectors}
+            disabled={rebuilding}
+          >
+            {rebuilding ? "Rebuilding…" : "Rebuild vector index"}
+          </button>
+        </div>
+      ) : null}
 
       {GROUPS.map((group) => (
         <section key={group.id} className="nd-set-section">
@@ -403,6 +481,9 @@ export default function SettingsView() {
                     <span className="nd-set-row__note"> · {PROFILE_DEFAULT_NOTE}</span>
                   ) : null}
                 </div>
+                {key === "NODUM_EMBED_DOWNLOAD" ? (
+                  <p className="nd-set-row__note">{EMBED_DOWNLOAD_NOTE}</p>
+                ) : null}
                 {notes.has(key) ? (
                   <p className="nd-set-row__liveness" role="status">
                     {notes.get(key)}
@@ -477,6 +558,27 @@ export default function SettingsView() {
             disabled={exporting || exportPassword === ""}
           >
             {exporting ? "Exporting…" : "Download with API key"}
+          </button>
+        </Modal>
+      ) : null}
+
+      {pendingModel !== null ? (
+        <Modal
+          title="Change the embedding model?"
+          onClose={() => setPendingModel(null)}
+        >
+          {modelChangeConfirm(report.embed_chunks).map((line) => (
+            <p key={line}>{line}</p>
+          ))}
+          <button
+            type="button"
+            className="nd-button nd-button--primary"
+            onClick={() => void confirmModelChange()}
+          >
+            Change model
+          </button>
+          <button type="button" className="nd-button" onClick={() => setPendingModel(null)}>
+            Cancel
           </button>
         </Modal>
       ) : null}

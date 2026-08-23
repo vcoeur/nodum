@@ -36,7 +36,7 @@ keyword this module does not declare is silently discarded rather than refused.
 Every write result carries the ``space_id`` it actually landed in, which is the
 other half of that: it can be checked rather than assumed.
 
-**Four tiers are never registered, and each one is a named absence.** The
+**Six tiers are never registered, and each one is a named absence.** The
 review tools (``accept``, ``reject`` — :data:`REVIEW_TOOLS`) are the §8.1
 review tier: the service gates them with ``Store.require_review`` — a human,
 or ``edit`` on the item's space — and retiring the live structure an accept
@@ -48,9 +48,13 @@ surface, so the CLI and the review API are where they live. The curative tools
 (``undo``, ``rollback``, ``abandon_cycle``, ``get_cycle``, ``list_cycles`` —
 :data:`HUMAN_ONLY_TOOLS`) is the third: reversal writes recorded payloads back
 verbatim and no grant delegates that, while a journal entry says what the
-gardener did across every space in the file. And the fourth is
+gardener did across every space in the file. The fourth is
 :data:`FILESYSTEM_TOOLS` — anything that lets a caller name a path on the
-server's own disk. All four are enforced the same
+server's own disk. The fifth is :data:`SETTINGS_TOOLS` — configuration is the
+human's, and this surface is where a non-human principal actually exists. The
+sixth is :data:`PROJECTOR_TOOLS` — a projector rebuild re-embeds the whole
+graph and is a human action beside the settings surface. All six are enforced
+the same
 way: they simply do not exist here, so there is no runtime check to argue
 around — and :mod:`nodum.service` refuses a non-human regardless of surface.
 The lists exist so ``tests/test_mcp_server.py`` can assert the registry stays
@@ -104,6 +108,7 @@ from mcp.server.lowlevel.server import request_ctx
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel
+from starlette.concurrency import run_in_threadpool
 from starlette.routing import Route
 from starlette.types import ASGIApp, Receive, Scope, Send
 
@@ -253,12 +258,27 @@ SETTINGS_TOOLS = (
     "export_settings",
 )
 
+#: The sixth named absence: **derived-state operations.** ``rebuild_projector``
+#: drops the whole ``vec`` store and re-embeds the graph from event 0 — heavy
+#: CPU, and the coupling that makes a model change safe, which is exactly why
+#: it is a human action beside the settings surface. ``run_projectors`` is the
+#: same class one step down (advancing the derived indexes is work nobody asked
+#: an agent to do). Neither is registered; the HTTP surface's
+#: ``POST /api/projectors/{name}/rebuild`` is where the rebuild lives, gated at
+#: the domain by ``Store.require_human``.
+PROJECTOR_TOOLS = ("rebuild_projector", "run_projectors")
+
 #: Every name that must never appear in the registry, in one place — what the
 #: disjointness assertions ask about. A new human-only, curative, review,
-#: filesystem or settings operation joins one of the five lists above; it never
-#: joins the registry.
+#: filesystem, settings or projector operation joins one of the six lists
+#: above; it never joins the registry.
 UNREGISTERED_TOOLS = (
-    CURATIVE_TOOLS + REVIEW_TOOLS + HUMAN_ONLY_TOOLS + FILESYSTEM_TOOLS + SETTINGS_TOOLS
+    CURATIVE_TOOLS
+    + REVIEW_TOOLS
+    + HUMAN_ONLY_TOOLS
+    + FILESYSTEM_TOOLS
+    + SETTINGS_TOOLS
+    + PROJECTOR_TOOLS
 )
 
 #: The tools this server registers, by tier (documentation + test anchor).
@@ -669,7 +689,7 @@ def create_server(*, db_path: str | Path | None = None) -> FastMCP:
         return _dump(service.list_children(id, principal=_principal(), path=db_path))
 
     @server.tool(annotations=_READ)
-    def search(
+    async def search(
         query: str,
         k: int = 10,
         filters: dict[str, Any] | None = None,
@@ -698,7 +718,16 @@ def create_server(*, db_path: str | Path | None = None) -> FastMCP:
             if state not in STATES:
                 raise ValueError(f"state must be one of {STATES}, got {state!r}")
             narrowed_state = state
-        result = search_module.search(
+        # The search body runs on a worker thread, never on the event loop:
+        # resolving the embedding provider **loads a model**, and the first
+        # search after a model change would otherwise construct it inline —
+        # a stall of the loop the size of the fastembed load (the settings
+        # write that made the change is web-manageable now, so the scenario
+        # is live). `_principal` is bound here, on the calling thread, so the
+        # worker never has to reach for the SDK's request context.
+        principal = _principal()
+        result = await run_in_threadpool(
+            search_module.search,
             query,
             k=k,
             state=narrowed_state,
@@ -707,7 +736,7 @@ def create_server(*, db_path: str | Path | None = None) -> FastMCP:
             created_after=filters.pop("created_after", None),
             created_before=filters.pop("created_before", None),
             expand=expand,
-            principal=_principal(),
+            principal=principal,
             path=db_path,
         )
         return _dump(result)

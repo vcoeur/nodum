@@ -124,3 +124,43 @@ test("the gardener group links the real kill switch and does not overpromise", a
   await copy.getByRole("link", { name: "Journal" }).click();
   await expect(page).toHaveURL(/\/journal$/);
 });
+
+test("an embedding-model change confirms the blinded-chunks consequence before the write", async ({
+  page,
+}) => {
+  await page.goto("/settings");
+  const modelRow = page.locator(".nd-set-row", {
+    has: rowInput(page, "NODUM_EMBED_MODEL"),
+  });
+  const model = rowInput(page, "NODUM_EMBED_MODEL");
+  await expect(model).toBeEnabled();
+  await model.fill("e2e-switched-model");
+  await modelRow.getByRole("button", { name: "Save" }).click();
+
+  // The write is held: the confirm names the consequence before anything
+  // lands. The exact sentence depends on whether the fixture store holds any
+  // chunks (it does not on CI — no embeddings extra, no cached model), so the
+  // assertion covers both the count-named and the zero-chunk variants; the
+  // count-specific copy is pinned by the Vitest unit tests.
+  const dialog = page.getByRole("dialog");
+  await expect(
+    dialog.getByText(/invisible to search|blinds nothing until the first projection/i),
+  ).toBeVisible();
+  await expect(dialog.getByText(/re-embeds nothing by itself/i)).toBeVisible();
+  await expect(page.getByRole("button", { name: "Change model" })).toBeVisible();
+
+  await dialog.getByRole("button", { name: "Change model" }).click();
+  await expect(modelRow.getByRole("status")).toHaveText("Applied live");
+  await page.reload();
+  await expect(model).toHaveValue("e2e-switched-model");
+});
+
+test("the embedding-model row stays editable and the download gate states its cost", async ({
+  page,
+}) => {
+  await page.goto("/settings");
+  await expect(rowInput(page, "NODUM_EMBED_MODEL")).toBeEnabled();
+  await expect(rowInput(page, "NODUM_EMBED_DOWNLOAD")).toBeEnabled();
+  await expect(page.getByText(/0\.2 GB/i)).toBeVisible();
+  await expect(page.getByText(/never downloads implicitly/i)).toBeVisible();
+});

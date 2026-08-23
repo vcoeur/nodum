@@ -63,10 +63,12 @@ from nodum import (
     cli,
     consolidate,
     db,
+    embeddings,
     http_api,
     ingest,
     llm,
     mcp_server,
+    projectors,
     service,
     settings,
     urls,
@@ -5673,7 +5675,7 @@ def test_get_settings_is_byte_identical_to_config_list(client, fresh_db):
     assert response.status_code == 200
     assert response.content == result.stdout.encode("utf-8")
     payload = response.json()
-    assert payload["count"] == len(payload["settings"]) == 17
+    assert payload["count"] == len(payload["settings"]) == 19
     assert payload["path"], "the GET carries the absolute path (deliberate, unlike /healthz)"
 
 
@@ -6015,3 +6017,127 @@ def test_step_up_lockout_is_parity_with_login_not_a_copy(client, fresh_db):
     locked = _export(client, {"include_secrets": True, "password": OWNER_PASSWORD})
     assert locked.status_code == 429, locked.text
     assert not [row for row in _events() if row.op == "settings.export"]
+
+
+# ── SP5: the embedding variables over HTTP, coupled to the vector rebuild ─────
+
+
+def _embedding_stub(monkeypatch):
+    """A fastembed stand-in: 384-dim zero vectors, no model download.
+
+    Makes ``import fastembed`` succeed and replaces ``FastembedProvider``, so
+    ``embeddings.resolution()`` runs the real resolve path — the model name
+    still comes from the settings ladder, exactly as it does with fastembed
+    installed — then drops the suite's pin so resolution is live.
+    """
+
+    class Stub:
+        dimensions = embeddings.EMBEDDING_DIMS
+
+        def __init__(self, model_name, *, cache_dir=None):
+            self.model_id = model_name
+            self.cache_dir = cache_dir
+
+        def embed(self, texts):
+            return [[0.0] * self.dimensions for _ in texts]
+
+    monkeypatch.setattr(embeddings, "FastembedProvider", Stub)
+    monkeypatch.setitem(sys.modules, "fastembed", ModuleType("fastembed"))
+    embeddings.reset_provider()
+
+
+def test_put_settings_can_write_the_embedding_rows(client, fresh_db, monkeypatch):
+    """The two embedding names are ordinary storable settings now."""
+    _embedding_stub(monkeypatch)
+
+    response = client.put(
+        "/api/settings",
+        json={settings.EMBED_MODEL: "web-picked-model", settings.EMBED_DOWNLOAD: "1"},
+    )
+    assert response.status_code == 200, response.text
+    by_key = {row["key"]: row for row in response.json()["changes"]}
+    assert by_key[settings.EMBED_MODEL]["value"] == "web-picked-model"
+    assert by_key[settings.EMBED_MODEL]["provenance"] == settings.FROM_FILE
+    assert by_key[settings.EMBED_DOWNLOAD]["value"] == "1"
+
+    rows = {row["key"]: row for row in client.get("/api/settings").json()["settings"]}
+    assert rows[settings.EMBED_MODEL]["writable"] is True
+    assert rows[settings.EMBED_MODEL]["default"] == embeddings.DEFAULT_MODEL
+    assert rows[settings.EMBED_DOWNLOAD]["writable"] is True
+    assert rows[settings.EMBED_DOWNLOAD]["kind"] == "gate"
+    # And the env-only cache name is still refused.
+    refused = client.put("/api/settings", json={settings.EMBED_CACHE: "/tmp/models"})
+    assert refused.status_code == 400
+    assert "path on the server's own disk" in refused.text
+
+
+def test_get_settings_carries_the_embedding_state_and_the_rebuild_clears_it(
+    client, fresh_db, monkeypatch
+):
+    """The mixed-model coupling, end to end over HTTP.
+
+    Chunks embedded with model A; a model change to B; the settings report
+    says the chunks are invisible and offers the rebuild; the rebuild
+    re-embeds with B and the note clears — every step through the real routes,
+    with the provider resolution driven by the seam.
+    """
+    _embedding_stub(monkeypatch)
+    embeddings.get_provider()  # resolve the default model up front
+
+    for index in range(2):
+        service.create_node(
+            type="note",
+            title=f"Seeded node {index}",
+            content=" ".join(f"word{index}-{w}" for w in range(embeddings.CHUNK_WORDS + 20)),
+            principal=owner(),
+        )
+    projectors.run_projectors(names=["vec"])
+    assert embeddings.get_provider() is not None
+    assert embeddings.get_provider().model_id == embeddings.DEFAULT_MODEL
+
+    before = client.get("/api/settings").json()
+    assert before["mixed_model_note"] is None
+    assert before["embed_chunks"] >= 2
+
+    changed = client.put("/api/settings", json={settings.EMBED_MODEL: "model-b"})
+    assert changed.status_code == 200, changed.text
+
+    mixed = client.get("/api/settings").json()
+    assert mixed["mixed_model_note"] is not None
+    assert "invisible to search" in mixed["mixed_model_note"]
+    assert mixed["embed_chunks"] == before["embed_chunks"]
+    assert embeddings.get_provider().model_id == "model-b"
+
+    rebuild = client.post("/api/projectors/vec/rebuild")
+    assert rebuild.status_code == 200, rebuild.text
+    assert rebuild.json()["name"] == "vec"
+
+    clean = client.get("/api/settings").json()
+    assert clean["mixed_model_note"] is None, clean["mixed_model_note"]
+    assert clean["embed_chunks"] == before["embed_chunks"]
+
+    events = _events("projector.rebuild")
+    assert len(events) == 1
+    assert events[0].actor == OWNER_ACTOR
+    assert events[0].payload["applied"] >= 2
+    # And search finds the corpus again — the BM25 arm on the seeded titles
+    # (the stub's zero vectors never clear the similarity bar, so this is the
+    # keyword half; what the rebuild restored is the *availability* of the
+    # vector arm, asserted through the note above).
+    hits = client.get("/api/search?q=seeded&k=5").json()["hits"]
+    assert any(hit["title"] == "Seeded node 0" for hit in hits)
+
+
+def test_rebuild_route_refuses_an_unknown_or_unavailable_projector(client, fresh_db):
+    """A name outside the registry is the ordinary 400; an unavailable
+    projector refuses rather than emptying its store (nothing to refill it)."""
+    unknown = client.post("/api/projectors/nope/rebuild")
+    assert unknown.status_code == 400, unknown.text
+    assert "unknown projector" in unknown.text
+
+    # The autouse fixture pins the provider unavailable, so `vec` cannot be
+    # rebuilt: dropping the store without a provider would blind search for
+    # good.
+    unavailable = client.post("/api/projectors/vec/rebuild")
+    assert unavailable.status_code == 400, unavailable.text
+    assert "cannot rebuild" in unavailable.text
