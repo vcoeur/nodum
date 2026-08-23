@@ -260,6 +260,20 @@ def test_cli_export_appends_one_event_with_the_flag_and_no_value(fresh_db, tmp_p
     assert SECRET not in json.dumps([row.payload for row in events])
 
 
+def test_cli_export_writes_the_file_at_0600(fresh_db, tmp_path, monkeypatch):
+    """A credential-bearing export never lands world-readable — even redacted."""
+    import stat
+
+    _store_tricky_configuration(monkeypatch)
+    for flags in ([], ["--include-secrets"]):
+        out = tmp_path / f"out-{'keys' if flags else 'redacted'}.env"
+        result = runner.invoke(
+            cli.app, ["config", "export", "--out", str(out), *flags, "--as", "owner"]
+        )
+        assert result.exit_code == 0, result.output + result.stderr
+        assert stat.S_IMODE(out.stat().st_mode) == 0o600, flags
+
+
 def test_cli_export_refuses_an_agent_principal(fresh_db, tmp_path):
     from helpers import agent as agent_principal
 

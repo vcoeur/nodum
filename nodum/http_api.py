@@ -3411,7 +3411,13 @@ def create_app(
         """
         body = await _json_body(request)
         include_secrets = _optional_bool(body, "include_secrets")
-        password = _optional_str(body, "password")
+        # The login route's own ceiling, before argon2 sees the string — the
+        # step-up is parity with login on the work it costs, too.
+        password = (
+            _bounded_str(body, "password", max_chars=service.MAX_PASSWORD_LENGTH)
+            if "password" in body
+            else None
+        )
         if include_secrets:
             if password is None:
                 raise ValueError("including secrets requires the session human's password")

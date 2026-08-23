@@ -5988,6 +5988,13 @@ def test_include_secrets_without_a_password_is_a_400(client, fresh_db):
     assert response.status_code == 400, response.text
 
 
+def test_step_up_password_honours_the_login_ceiling(client, fresh_db):
+    """Parity with login includes the work bound: no unbounded argon2 input."""
+    response = _export(client, {"include_secrets": True, "password": "x" * 5000})
+    assert response.status_code == 400, response.text
+    assert "at most" in response.text
+
+
 def test_step_up_lockout_is_parity_with_login_not_a_copy(client, fresh_db):
     """Five step-up misses lock the name exactly as five login misses would.
 

@@ -1570,7 +1570,12 @@ def config_export(
 
     def write_export() -> SettingsExportOut:
         text = service.export_settings(principal=principal, include_secrets=include_secrets)
-        out.write_text(text, encoding="utf-8")
+        # 0600 always, not only with --include-secrets: the redacted file still
+        # names every key in force, and the CLI owns this path — unlike the
+        # browser download, where the destination is the user's.
+        fd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
         count = sum(1 for line in text.splitlines() if line and not line.startswith("#"))
         return SettingsExportOut(path=str(out), include_secrets=include_secrets, count=count)
 
