@@ -1,5 +1,15 @@
 /* The Settings page — view-local layout on top of the shared primitives. */
 
+/* The gutter `--wide` strips. `nd-view--wide` zeroes the padding for the
+   full-bleed canvas views (graph, editor), and the Settings page is not one —
+   its rows must align with the navbar's content, not hug the left edge with
+   fragments clipped at x=0. `--wide`'s `max-width: none` is kept. This wins
+   the cascade because the lazy settings chunk's stylesheet is injected after
+   the entry stylesheet, and the two selectors have equal specificity. */
+.nd-set {
+  padding: var(--nd-space-12);
+}
+
 .nd-set__subtitle code.nd-mono {
   word-break: break-all;
 }
@@ -93,6 +103,93 @@
 
 .nd-set__killswitch {
   margin-top: 0.75rem;
+}
+
+/* The per-row info button: a small round "i" that opens the row's popover,
+   in the established info hue rather than a literal colour. */
+.nd-set-info {
+  align-items: center;
+  background: transparent;
+  border: 1px solid var(--nd-border-strong);
+  border-radius: var(--nd-radius-pill);
+  color: var(--nd-text-muted);
+  cursor: pointer;
+  display: inline-flex;
+  font-size: var(--nd-text-2xs);
+  font-weight: var(--nd-weight-semibold);
+  height: 1.15rem;
+  justify-content: center;
+  line-height: 1;
+  padding: 0;
+  width: 1.15rem;
+}
+
+.nd-set-info:hover {
+  border-color: var(--nd-info);
+  color: var(--nd-info);
+}
+
+.nd-set-info[aria-expanded="true"] {
+  background: var(--nd-info-wash);
+  border-color: var(--nd-info);
+  color: var(--nd-info);
+}
+
+/* The info popover itself: a fixed-position portal placed by
+   `placeMenu` (lib/contextMenu.ts) like the context menu, so no ancestor's
+   `overflow` can clip it. It sits at the peek layer — the same transient
+   surface the menu and the peek card use, below toasts and modals. */
+.nd-set-info-popover {
+  background: var(--nd-surface-overlay);
+  border: 1px solid var(--nd-border-strong);
+  border-radius: var(--nd-radius-md);
+  box-shadow: var(--nd-shadow-overlay);
+  color: var(--nd-text);
+  max-width: min(24rem, calc(100vw - 1rem));
+  padding: var(--nd-space-6) var(--nd-space-8);
+  position: fixed;
+  z-index: var(--nd-z-peek);
+}
+
+.nd-set-info-popover__summary {
+  font-size: var(--nd-text-sm);
+  line-height: var(--nd-leading-normal);
+  margin: 0;
+}
+
+.nd-set-info-popover__help {
+  color: var(--nd-text-muted);
+  font-size: var(--nd-text-sm);
+  line-height: var(--nd-leading-normal);
+  margin: var(--nd-space-4) 0 0;
+}
+
+.nd-set-info-popover__meta {
+  border-top: 1px solid var(--nd-border);
+  display: flex;
+  flex-direction: column;
+  gap: var(--nd-space-2);
+  margin: var(--nd-space-6) 0 0;
+  padding-top: var(--nd-space-4);
+}
+
+.nd-set-info-popover__meta-row {
+  display: flex;
+  gap: var(--nd-space-6);
+  line-height: var(--nd-leading-normal);
+}
+
+.nd-set-info-popover__meta-row dt {
+  color: var(--nd-text-faint);
+  flex: 0 0 auto;
+  font-size: var(--nd-text-2xs);
+  letter-spacing: var(--nd-tracking-label);
+  text-transform: uppercase;
+}
+
+.nd-set-info-popover__meta-row dd {
+  font-size: var(--nd-text-sm);
+  margin: 0;
 }
 
 .nd-set-adopt-list {

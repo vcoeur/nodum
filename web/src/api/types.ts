@@ -993,6 +993,13 @@ export interface SettingOut {
   /** Whether settings.env carries the key right now. */
   stored: boolean;
   on_invalid: string | null;
+  /** The registry's one-line description — the info popup's first paragraph. */
+  summary: string;
+  /**
+   * The registry's longer explanation, null when the summary says it all.
+   * The info popup renders it verbatim; it is never a client-authored sentence.
+   */
+  help: string | null;
 }
 
 /** The whole settings report, plus the file it is read from and build capabilities. */

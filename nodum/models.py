@@ -1007,6 +1007,12 @@ class SettingOut(BaseModel):
     and is **``None`` for a free-text key**, which has no invalid value to have
     a posture about. A model name nothing serves is not rejected anywhere; it
     is an HTTP error on the first call.
+
+    ``summary`` is the registry's one-line description and ``help`` the longer
+    explanation shown on demand, where the summary is too thin to stand alone
+    (``None`` when it is not). Both come straight from the key's
+    :class:`~nodum.settings.Setting` row; a surface renders them, it does not
+    write its own sentences about a key.
     """
 
     key: str
@@ -1020,6 +1026,8 @@ class SettingOut(BaseModel):
     refusal: str | None
     stored: bool
     on_invalid: str | None
+    summary: str
+    help: str | None
 
 
 class SettingsOut(BaseModel):

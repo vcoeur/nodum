@@ -21,6 +21,26 @@ function rowInput(page: Page, key: string) {
   return page.locator(`input[name="${key}"]`);
 }
 
+/**
+ * Open a row's info popup the way a reader does: scroll the button into view,
+ * let the scroll settle, then click.
+ *
+ * The settle is not cosmetic. Playwright's click scrolls a below-fold button
+ * into view and the browser commits that scroll's event a few milliseconds
+ * *after* the click dispatch — and the popover closes on scroll, the shared
+ * transient-overlay rule (`lib/dismissWatchers.ts`). A click landing inside
+ * that window opens and instantly dismisses, which is a test artefact, not a
+ * behaviour a reader can produce: a reader scrolls, the page settles, then
+ * they click. This helper models that.
+ */
+async function openInfoPopup(page: Page, key: string): Promise<void> {
+  const opener = page.getByRole("button", { name: `About ${key}` });
+  await opener.scrollIntoViewIfNeeded();
+  await page.waitForTimeout(150);
+  await opener.click();
+  await expect(page.getByRole("dialog", { name: `About ${key}` })).toBeVisible();
+}
+
 test("an environment-pinned row renders disabled with its reason, and stays that way", async ({
   page,
 }) => {
@@ -163,4 +183,109 @@ test("the embedding-model row stays editable and the download gate states its co
   await expect(rowInput(page, "NODUM_EMBED_DOWNLOAD")).toBeEnabled();
   await expect(page.getByText(/0\.2 GB/i)).toBeVisible();
   await expect(page.getByText(/never downloads implicitly/i)).toBeVisible();
+});
+
+test("the page re-asserts the gutter the wide layout strips", async ({ page }) => {
+  // The root carries `nd-view--wide` (max-width: none, padding: 0 — the
+  // full-bleed canvas variant), so the gutter has to be re-asserted by the
+  // settings layout itself. This is the bug the branch fixes: rows used to
+  // start at x≈6 px with fragments clipped at the viewport edge.
+  await page.goto("/settings");
+  const row = page.locator(".nd-set-row").first();
+  await expect(row).toBeVisible();
+  const box = await row.boundingBox();
+  expect(box).not.toBeNull();
+  expect(box!.x).toBeGreaterThanOrEqual(20);
+});
+
+test("an info popup explains a row from the registry's own copy", async ({ page }) => {
+  await page.goto("/settings");
+  await openInfoPopup(page, "NODUM_EMBED_MODEL");
+  const popover = page.getByRole("dialog", { name: "About NODUM_EMBED_MODEL" });
+  // The summary, the longer help, the default, and the liveness class — all
+  // from the row the server serialised.
+  await expect(popover).toContainText("The local embedding model");
+  await expect(popover).toContainText("Each stored chunk records the model that embedded it");
+  await expect(popover).toContainText("sentence-transformers/paraphrase");
+  await expect(popover).toContainText("Applied live");
+});
+
+test("the embed-download popup and the row note say the same sentence", async ({ page }) => {
+  // One fact, one home: the registry's help for NODUM_EMBED_DOWNLOAD is the
+  // page's own EMBED_DOWNLOAD_NOTE word for word, and both are on screen.
+  await page.goto("/settings");
+  const row = page.locator(".nd-set-row", { has: rowInput(page, "NODUM_EMBED_DOWNLOAD") });
+  const note = row.locator(".nd-set-row__note");
+  await openInfoPopup(page, "NODUM_EMBED_DOWNLOAD");
+  const popover = page.getByRole("dialog", { name: "About NODUM_EMBED_DOWNLOAD" });
+  await expect(popover).toContainText("0.2 GB");
+  await expect(popover).toContainText("never downloads implicitly");
+  expect((await popover.locator(".nd-set-info-popover__help").textContent())?.trim()).toBe(
+    (await note.textContent())?.trim(),
+  );
+});
+
+test("a pinned row's popup states no liveness, because this page cannot change it", async ({
+  page,
+}) => {
+  // The fixture pins NODUM_LLM_MODEL in the environment. "Applied live" would
+  // be a claim about a change this page cannot make, so the popup withholds
+  // the liveness line entirely.
+  await page.goto("/settings");
+  await openInfoPopup(page, "NODUM_LLM_MODEL");
+  const popover = page.getByRole("dialog", { name: "About NODUM_LLM_MODEL" });
+  await expect(popover).toContainText("The model name; unset means no provider");
+  await expect(popover).toContainText("There is no default model");
+  await expect(popover).not.toContainText("Takes effect");
+  await expect(popover).not.toContainText("Applied live");
+});
+
+test("an info popup opens, takes focus, and hands it back on Escape", async ({ page }) => {
+  await page.goto("/settings");
+  const opener = page.getByRole("button", { name: "About NODUM_EMBED_MODEL" });
+  await openInfoPopup(page, "NODUM_EMBED_MODEL");
+  const popover = page.getByRole("dialog", { name: "About NODUM_EMBED_MODEL" });
+  // The panel takes focus itself on mount, like the context menu — a popup
+  // that paints without taking focus is unreachable by keyboard.
+  await expect
+    .poll(() =>
+      popover.evaluate(
+        (panel) =>
+          panel === document.activeElement || panel.contains(document.activeElement),
+      ),
+    )
+    .toBe(true);
+
+  await page.keyboard.press("Escape");
+  await expect(popover).toBeHidden();
+  // The hand-back is the whole reason the restore exists; landing on <body>
+  // is the failure it prevents.
+  await expect(opener).toBeFocused();
+});
+
+test("a press outside dismisses the info popup", async ({ page }) => {
+  await page.goto("/settings");
+  await openInfoPopup(page, "NODUM_EMBED_MODEL");
+  const popover = page.getByRole("dialog", { name: "About NODUM_EMBED_MODEL" });
+
+  await page.getByRole("heading", { name: "Settings" }).click();
+  await expect(popover).toBeHidden();
+});
+
+test("a document shortcut still reaches the app behind an open info popup", async ({ page }) => {
+  await page.goto("/settings");
+  await openInfoPopup(page, "NODUM_EMBED_MODEL");
+  const popover = page.getByRole("dialog", { name: "About NODUM_EMBED_MODEL" });
+
+  // The panel owns Escape and nothing else, so Ctrl/Cmd-K — the app's own
+  // command palette — still lands. The palette is a Modal that takes focus
+  // programmatically, so the popover survives behind it (the same way the
+  // context menu does) and stays dismissible once the palette is gone.
+  await page.keyboard.press("Control+K");
+  await expect(page.getByRole("combobox")).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(page.getByRole("combobox")).toBeHidden();
+  await expect(popover).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(popover).toBeHidden();
 });

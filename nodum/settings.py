@@ -338,12 +338,18 @@ class Setting:
     ``writable`` false means the file layer is not consulted for this name at
     all — :func:`resolve` reads the environment and the default alone — and
     ``refusal`` says why, in the sentence a surface hands the operator.
+
+    ``summary`` is the one line every surface can show; ``help`` is the longer
+    explanation a surface shows on demand, and is ``None`` when the summary
+    says it all. Both are copy the system delivers, so a sentence in either
+    has to be a fact the runtime actually performs.
     """
 
     name: str
     kind: str
     default: str | None
     summary: str
+    help: str | None = None
     validate: Callable[[str, str], str] = _text
     secret: bool = False
     writable: bool = True
@@ -391,6 +397,9 @@ _SPECS: tuple[Setting, ...] = (
         kind="path",
         default="~/.local/share/nodum/nodum.db",
         summary="The graph database path.",
+        # The refusal's sentence, reused verbatim: it is the one line that says
+        # why this name is not storable, and a second wording would drift.
+        help=_ENV_ONLY_DB,
         writable=False,
         refusal=_ENV_ONLY_DB,
         on_invalid=None,
@@ -400,6 +409,7 @@ _SPECS: tuple[Setting, ...] = (
         kind="url",
         default="http://127.0.0.1:8600",
         summary="The base URL minted capability URLs are built on.",
+        help=_ENV_ONLY_PUBLIC_URL,
         writable=False,
         refusal=_ENV_ONLY_PUBLIC_URL,
         on_invalid=None,
@@ -409,6 +419,10 @@ _SPECS: tuple[Setting, ...] = (
         kind="time",
         default=None,
         summary="Local wall-clock time the nightly consolidation cycle runs at (HH:MM).",
+        help=(
+            "HH:MM on the server's local clock — UTC in a container that sets "
+            "no TZ. Unset means the cycle does not run."
+        ),
         validate=_daily_time,
         on_invalid=ON_INVALID_OFF,
     ),
@@ -417,6 +431,10 @@ _SPECS: tuple[Setting, ...] = (
         kind="string",
         default=None,
         summary="The model name; unset means no provider and no smart features.",
+        help=(
+            "There is no default model — a guessed name is a 404 on the "
+            "first call rather than an honest absence."
+        ),
         on_invalid=None,
     ),
     Setting(
@@ -424,6 +442,7 @@ _SPECS: tuple[Setting, ...] = (
         kind="url",
         default="http://localhost:11434/v1",
         summary="OpenAI-compatible base URL; a shipped profile may supply it.",
+        help=_ENV_ONLY_BASE_URL,
         writable=False,
         refusal=_ENV_ONLY_BASE_URL,
         on_invalid=None,
@@ -433,6 +452,12 @@ _SPECS: tuple[Setting, ...] = (
         kind="secret",
         default=None,
         summary="Bearer token, sent only to an endpoint somebody named.",
+        help=(
+            "Optional: the local default endpoint needs no key, and the key "
+            "travels only to an endpoint somebody named — NODUM_LLM_BASE_URL, "
+            "or a model id a shipped profile serves. It is never serialised: "
+            "every surface reports set/unset and no value."
+        ),
         secret=True,
         on_invalid=None,
     ),
@@ -457,6 +482,12 @@ _SPECS: tuple[Setting, ...] = (
         kind="int",
         default="0",
         summary="Tokens one consolidation cycle's LLM jobs may spend; 0 is off.",
+        help=(
+            "The token half of the gardener's ceiling: unset or 0 means the "
+            "LLM jobs do not run. It funds the next cycle — lowering it "
+            "never stops a cycle already spending; that is what a stop on "
+            "the Journal is for."
+        ),
         validate=_whole_number(0),
     ),
     Setting(
@@ -464,6 +495,12 @@ _SPECS: tuple[Setting, ...] = (
         kind="float",
         default="1800",
         summary="Wall-clock ceiling for one consolidation cycle's LLM jobs.",
+        help=(
+            "The wall-clock half of the same ceiling, independent of the token "
+            "budget: the cycle's LLM jobs stop at whichever of the two they "
+            "exhaust first. Lowering it never stops a cycle already spending; "
+            "that is what a stop on the Journal is for."
+        ),
         validate=_seconds,
     ),
     Setting(
@@ -504,7 +541,13 @@ _SPECS: tuple[Setting, ...] = (
         default="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
         summary=(
             "The local embedding model; changing it blinds every stored chunk "
-            "to search until `projector rebuild vec` re-embeds them."
+            "to search until the vector rebuild re-embeds them."
+        ),
+        help=(
+            "Each stored chunk records the model that embedded it, and search "
+            "reads only the active model's chunks. Changing the model "
+            "re-embeds nothing by itself: this page offers the vector rebuild "
+            "after the write."
         ),
         on_invalid=None,
     ),
@@ -513,6 +556,14 @@ _SPECS: tuple[Setting, ...] = (
         kind="gate",
         default=None,
         summary="'1' allows the one-time embedding-model download (~0.2 GB).",
+        # The exact sentence the Settings page's own EMBED_DOWNLOAD_NOTE
+        # renders under the row: where the two surfaces say the same fact they
+        # say it identically, and `tests/test_settings.py` pins the wording.
+        help=(
+            "When on: the next vector operation may download the model "
+            "(~0.2 GB) — nodum never downloads implicitly, so this is the one "
+            "gate that allows it."
+        ),
         validate=_gate,
     ),
     Setting(
@@ -520,6 +571,7 @@ _SPECS: tuple[Setting, ...] = (
         kind="path",
         default="~/.local/share/nodum/models",
         summary="Where embedding model files are cached.",
+        help=_ENV_ONLY_EMBED_CACHE,
         writable=False,
         refusal=_ENV_ONLY_EMBED_CACHE,
         on_invalid=None,
@@ -1674,6 +1726,8 @@ def _describe(name: str, view: Snapshot, stored: Mapping[str, str]) -> SettingOu
         refusal=spec.refusal,
         stored=name in stored,
         on_invalid=spec.on_invalid,
+        summary=spec.summary,
+        help=spec.help,
     )
 
 

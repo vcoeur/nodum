@@ -11,8 +11,10 @@ import {
   liveness,
   livenessLabel,
   modelChangeConfirm,
+  nextPopoverKey,
   PROFILE_DEFAULT_NOTE,
   revertTarget,
+  settingPopup,
 } from "./settingsModel";
 
 /** A row factory: every field a SettingOut carries, defaulted to editable-and-stored. */
@@ -28,6 +30,8 @@ function row(overrides: Partial<SettingOut> & { key: string }): SettingOut {
     refusal: null,
     stored: true,
     on_invalid: null,
+    summary: "A summary.",
+    help: null,
     ...overrides,
   };
 }
@@ -239,5 +243,77 @@ describe("EMBED_DOWNLOAD_NOTE", () => {
     expect(EMBED_DOWNLOAD_NOTE).toContain("0.2 GB");
     expect(EMBED_DOWNLOAD_NOTE).toContain("next vector operation");
     expect(EMBED_DOWNLOAD_NOTE).toMatch(/never downloads implicitly/i);
+  });
+});
+
+describe("settingPopup", () => {
+  it("carries the registry's summary and help through unchanged", () => {
+    const popup = settingPopup(
+      row({ key: "NODUM_LLM_MODEL", summary: "The model name.", help: "No default." }),
+      {},
+    );
+    expect(popup.summary).toBe("The model name.");
+    expect(popup.help).toBe("No default.");
+  });
+
+  it("shows no help paragraph when the registry has none", () => {
+    const popup = settingPopup(row({ key: "NODUM_LLM_THINKING", help: null }), {});
+    expect(popup.help).toBeNull();
+  });
+
+  it("shows the built-in default, and a dash for a secret", () => {
+    expect(
+      settingPopup(row({ key: "NODUM_LLM_CYCLE_BUDGET", default: "0" }), {}).defaultLabel,
+    ).toBe("0");
+    expect(
+      settingPopup(row({ key: "NODUM_LLM_API_KEY", secret: true, default: null }), {}).defaultLabel,
+    ).toBe("—");
+    expect(settingPopup(row({ key: "NODUM_LLM_MODEL", default: null }), {}).defaultLabel).toBe(
+      "none",
+    );
+  });
+
+  it("names the liveness class for an editable row", () => {
+    // A per-run ceiling: the class the page's own save flow reports.
+    expect(settingPopup(row({ key: "NODUM_LLM_REQUEST_BUDGET" }), {}).livenessLabel).toContain(
+      "next agent run",
+    );
+  });
+
+  it("states no liveness for a row the page cannot change", () => {
+    // An env-only row is read at process start, so "Applied live" would be a
+    // false claim; a pinned row's change is a host-side step, not this page's.
+    const envOnly = settingPopup(
+      row({ key: "NODUM_PUBLIC_URL", writable: false, refusal: "env-only" }),
+      {},
+    );
+    expect(envOnly.livenessLabel).toBeNull();
+    const pinned = settingPopup(
+      row({ key: "NODUM_LLM_MODEL", provenance: "environment" }),
+      {},
+    );
+    expect(pinned.livenessLabel).toBeNull();
+  });
+
+  it("states no liveness for a row this build cannot serve", () => {
+    const audio = settingPopup(row({ key: "NODUM_AUDIO_MODEL" }), { audio: false });
+    expect(audio.livenessLabel).toBeNull();
+  });
+});
+
+describe("nextPopoverKey", () => {
+  it("opens the requested row's popover from nothing", () => {
+    expect(nextPopoverKey(null, "NODUM_LLM_MODEL")).toBe("NODUM_LLM_MODEL");
+  });
+
+  it("replaces the open popover with the newly requested one", () => {
+    expect(nextPopoverKey("NODUM_LLM_MODEL", "NODUM_EMBED_MODEL")).toBe("NODUM_EMBED_MODEL");
+  });
+
+  it("never toggles: requesting the open key keeps it open", () => {
+    // The press on the opener dismissed the old popover before this click
+    // arrived, so a toggling decision here would depend on an event ordering
+    // that is not stable — the MenuButton lesson. Open always.
+    expect(nextPopoverKey("NODUM_LLM_MODEL", "NODUM_LLM_MODEL")).toBe("NODUM_LLM_MODEL");
   });
 });

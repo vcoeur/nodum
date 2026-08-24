@@ -93,7 +93,7 @@ exists to avoid. Unset the variable first.
 |---|---|---|
 | `NODUM_DB` | `~/.local/share/nodum/nodum.db` | The graph database path. Resolution is `--db` flag → this variable → the default. |
 | `NODUM_PUBLIC_URL` | `http://127.0.0.1:8600` | The base URL minted capability URLs (single-use asset upload/download grants) are built on. Behind a reverse proxy it must be the public URL, or minted URLs point at the server's own loopback and die — see [Deploy with Docker](deploy.md#putting-tls-in-front). |
-| `NODUM_CONSOLIDATE_AT` | unset — off | The nightly consolidation cycle's local wall-clock time, as `HH:MM` (24-hour). `nodum serve` runs the cycle in the process it is already running — no cron, no second process. Unset means off, which is the default; a value that cannot be parsed is announced on stderr and ignored. |
+| `NODUM_CONSOLIDATE_AT` | unset — off | The nightly consolidation cycle's local wall-clock time, as `HH:MM` (24-hour) — the server process's local clock, which is UTC in a container that sets no `TZ`. `nodum serve` runs the cycle in the process it is already running — no cron, no second process. Unset means off, which is the default; a value that cannot be parsed is announced on stderr and ignored. |
 
 ### Embeddings
 
@@ -210,6 +210,16 @@ whole ladder is visible:
   the layer it came from as a badge, and its default. `NODUM_LLM_CONTEXT_TOKENS`
   notes that a shipped provider profile may serve a larger window than the
   default when the model matches.
+- Each row head carries an **info button** (`i`) that opens a popup explaining
+  the setting: the registry's one-line summary, its longer help where the
+  summary is too thin (why an env-only name is environment-only, what a budget
+  bounds and that lowering it never stops a cycle already spending, the
+  embedding-model coupling, the ~0.2 GB download cost), the built-in default,
+  and when a change takes effect — the same liveness classes a save reports.
+  A row the page cannot change (env-only, environment-pinned, or a missing
+  optional extra) shows no liveness line, because there is no change to have a
+  schedule for. The popup's copy is the server's own `summary`/`help` fields,
+  the same sentences `nodum config list` now carries in every row.
 - A row the environment pins is **disabled with that reason**, and so is an
   env-only name; the audio pair renders "not available in this build" when the
   `audio` extra is not installed. The disabled state mirrors what the server

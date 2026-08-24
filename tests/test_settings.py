@@ -1246,6 +1246,16 @@ def test_the_stored_api_key_never_reaches_a_surface(store, fresh_db):
         # Free text: there is no invalid value for it, so there is no posture
         # to report. A wrong key is a 401 from the endpoint, not a refusal here.
         "on_invalid": None,
+        "summary": "Bearer token, sent only to an endpoint somebody named.",
+        # The never-serialised rule is the whole reason this row looks the way
+        # it does, so the longer help states it rather than leaving the reader
+        # to wonder where the value went.
+        "help": (
+            "Optional: the local default endpoint needs no key, and the key "
+            "travels only to an endpoint somebody named — NODUM_LLM_BASE_URL, "
+            "or a model id a shipped profile serves. It is never serialised: "
+            "every surface reports set/unset and no value."
+        ),
     }
 
 
@@ -1363,6 +1373,88 @@ def test_config_list_reports_every_key_with_its_provenance(store, fresh_db):
         settings.FROM_DEFAULT,
         settings.FROM_UNSET,
     }
+
+
+def test_every_report_row_carries_the_registrys_own_description(store):
+    """The report's summary/help are the registry's, row for row, never a copy."""
+    payload = _run_json("config", "list")
+    for row in payload["settings"]:
+        spec = settings.SPECS[row["key"]]
+        assert row["summary"] == spec.summary
+        assert row["help"] == spec.help
+
+
+def test_every_key_has_a_one_line_summary(store):
+    """A row with no summary would render a popup with nothing to say."""
+    for spec in settings.SPECS.values():
+        assert spec.summary, spec.name
+
+
+def test_the_keys_whose_summary_says_it_all_carry_no_help(store):
+    """`help` is the longer explanation only where the one line is too thin.
+
+    The names below are exactly the ones whose summary already says everything
+    a reader of the Settings page needs: the reasoning level, the window, the
+    two per-call ceilings, the two request budgets, and the audio pair.
+    """
+    no_help = {
+        settings.LLM_THINKING,
+        settings.LLM_CONTEXT_TOKENS,
+        settings.LLM_MAX_OUTPUT_TOKENS,
+        settings.LLM_CALL_TIMEOUT,
+        settings.LLM_REQUEST_BUDGET,
+        settings.LLM_REQUEST_SECONDS,
+        settings.AUDIO_MODEL,
+        settings.AUDIO_DOWNLOAD,
+    }
+    assert {name for name, spec in settings.SPECS.items() if spec.help is None} == no_help
+
+
+def test_every_env_only_help_reuses_its_refusal_sentence(store):
+    """The env-only four's popup copy is the refusal sentence itself, verbatim.
+
+    The refusal is the one line that says why the name is not storable, so a
+    help text reworded from it would drift into a second story.
+    """
+    for name, spec in settings.SPECS.items():
+        if spec.writable:
+            continue
+        assert spec.refusal is not None
+        assert spec.help == spec.refusal, name
+
+
+def test_the_budget_helps_state_the_kill_switch_fact(store):
+    """Lowering a budget never stops a cycle already spending — the fact the
+    page's Gardener group links the Journal for, said identically in both."""
+    for name in (settings.LLM_CYCLE_BUDGET, settings.LLM_CYCLE_SECONDS):
+        assert "never stops a cycle already spending" in settings.SPECS[name].help
+
+
+def test_the_embed_download_help_is_the_pages_own_note_verbatim(store):
+    """Where the two surfaces say the same fact they say it identically.
+
+    The web UI's Settings page renders EMBED_DOWNLOAD_NOTE under the row; the
+    popup shows this same sentence, and the e2e suite asserts the two visible
+    texts agree. The sentence is pinned here so a rewrite of one side cannot
+    drift silently.
+    """
+    assert settings.SPECS[settings.EMBED_DOWNLOAD].help == (
+        "When on: the next vector operation may download the model (~0.2 GB) "
+        "— nodum never downloads implicitly, so this is the one gate that "
+        "allows it."
+    )
+
+
+def test_the_embed_model_summary_names_the_coupling_without_code_ticks(store):
+    """The summary renders in a popup now, so no ``...`` Markdown tick survives.
+
+    The fact is unchanged — a model change blinds stored chunks to search
+    until the rebuild re-embeds them — only the backticks around the command
+    name are gone, because the popup renders plain text.
+    """
+    summary = settings.SPECS[settings.EMBED_MODEL].summary
+    assert "`" not in summary
+    assert "blinds every stored chunk" in summary
 
 
 def test_config_list_on_a_fresh_machine_creates_no_database(tmp_path, monkeypatch):
