@@ -1,15 +1,5 @@
 /* The Settings page — view-local layout on top of the shared primitives. */
 
-/* The gutter `--wide` strips. `nd-view--wide` zeroes the padding for the
-   full-bleed canvas views (graph, editor), and the Settings page is not one —
-   its rows must align with the navbar's content, not hug the left edge with
-   fragments clipped at x=0. `--wide`'s `max-width: none` is kept. This wins
-   the cascade because the lazy settings chunk's stylesheet is injected after
-   the entry stylesheet, and the two selectors have equal specificity. */
-.nd-set {
-  padding: var(--nd-space-12);
-}
-
 .nd-set__subtitle code.nd-mono {
   word-break: break-all;
 }
@@ -20,18 +10,30 @@
   padding: 0.5rem 0.75rem;
 }
 
-.nd-set-section {
-  margin-top: 2rem;
+/* Each group and the Export section is a shared `.nd-card` (the same
+   primitive the Admin page's AgentCard uses). The card's own gap is zeroed
+   here because the rows carry their vertical rhythm themselves — a hairline
+   between rows, padding around each — and the title sits directly above the
+   first row like `.nd-ad-section__title` does. Cards stack with the same
+   margin as the Admin page's sections. */
+.nd-card.nd-set-section {
+  gap: 0;
+  margin-top: var(--nd-space-12);
 }
 
 .nd-set-section__title {
-  font-size: 1.1rem;
-  margin-bottom: 0.75rem;
+  font-size: var(--nd-text-md);
+  margin-bottom: var(--nd-space-4);
 }
 
 .nd-set-row {
-  border-top: 1px solid var(--nd-border);
   padding: 0.75rem 0;
+}
+
+/* Between rows only — the card's own border is the top edge, so a hairline
+   under the title would draw a duplicate. */
+.nd-set-row + .nd-set-row {
+  border-top: 1px solid var(--nd-border);
 }
 
 .nd-set-row__head {
@@ -194,4 +196,11 @@
 
 .nd-set-adopt-list {
   margin: 0.75rem 0;
+}
+
+/* The export card's actions sit under its subtitle; the group cards get
+   their rhythm from row padding, so the actions need an explicit top margin
+   to match that spacing. */
+.nd-set-export-actions {
+  margin-top: var(--nd-space-6);
 }

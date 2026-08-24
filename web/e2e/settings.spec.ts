@@ -185,17 +185,69 @@ test("the embedding-model row stays editable and the download gate states its co
   await expect(page.getByText(/never downloads implicitly/i)).toBeVisible();
 });
 
-test("the page re-asserts the gutter the wide layout strips", async ({ page }) => {
-  // The root carries `nd-view--wide` (max-width: none, padding: 0 — the
-  // full-bleed canvas variant), so the gutter has to be re-asserted by the
-  // settings layout itself. This is the bug the branch fixes: rows used to
-  // start at x≈6 px with fragments clipped at the viewport edge.
+test("the settings content column matches the Admin page's centred column", async ({ page }) => {
+  // The root used to carry `nd-view--wide` (max-width: none, padding: 0 —
+  // the full-bleed canvas variant), which sent the rows to x≈6 px with
+  // fragments clipped at the viewport edge. v0.24.0 re-asserted a gutter over
+  // it; the centred-column branch drops `--wide` entirely, so the page gets
+  // the shared centred column (`nd-view`: max-width 68rem, margin auto) the
+  // Admin page has. Pin the geometry with assertions that hold in any
+  // scrollbar environment: same column width as Admin, both columns centred
+  // in the viewport (so a full-bleed root — which would sit at x=0 — fails),
+  // and a real gutter on the left.
   await page.goto("/settings");
-  const row = page.locator(".nd-set-row").first();
-  await expect(row).toBeVisible();
-  const box = await row.boundingBox();
-  expect(box).not.toBeNull();
-  expect(box!.x).toBeGreaterThanOrEqual(20);
+  const settingsColumn = page.locator(".nd-view.nd-set");
+  await expect(settingsColumn).toBeVisible();
+  const settingsBox = await settingsColumn.boundingBox();
+  expect(settingsBox).not.toBeNull();
+  // Each page's own layout viewport, read while that page is on screen.
+  const settingsClientWidth = await page.evaluate(
+    () => document.documentElement.clientWidth,
+  );
+
+  await page.goto("/admin");
+  const adminColumn = page.locator(".nd-view.nd-ad");
+  await expect(adminColumn).toBeVisible();
+  const adminBox = await adminColumn.boundingBox();
+  expect(adminBox).not.toBeNull();
+  const adminClientWidth = await page.evaluate(
+    () => document.documentElement.clientWidth,
+  );
+
+  expect(settingsBox!.width).toBe(adminBox!.width);
+  // The old gutter regression: rows used to start at x≈6 px with fragments
+  // clipped at the viewport edge.
+  expect(settingsBox!.x).toBeGreaterThanOrEqual(20);
+
+  // Both pages centre their column; a full-bleed root would sit at x=0. The
+  // expected centre is computed from each page's own layout viewport
+  // (`clientWidth`, which excludes a classic scrollbar when one is present)
+  // so the assertion holds whatever the pages' scroll state.
+  expect(settingsBox!.x).toBeCloseTo((settingsClientWidth - settingsBox!.width) / 2, 0);
+  expect(adminBox!.x).toBeCloseTo((adminClientWidth - adminBox!.width) / 2, 0);
+});
+
+test("every settings group and the Export section render as a shared nd-card", async ({ page }) => {
+  // The card is the shared primitive, not a settings look-alike: the same
+  // `.nd-card` class the Admin page's AgentCard uses, with the primitive's
+  // border-radius and surface background applied.
+  await page.goto("/settings");
+  for (const title of [
+    "Model",
+    "Gardener",
+    "Requests",
+    "Audio",
+    "Embeddings",
+    "Server",
+    "Export",
+  ]) {
+    const card = page.locator(".nd-card", {
+      has: page.getByRole("heading", { name: title, level: 2 }),
+    });
+    await expect(card).toBeVisible();
+    await expect(card).toHaveCSS("border-radius", "10px");
+    await expect(card).toHaveCSS("background-color", "rgb(23, 27, 33)");
+  }
 });
 
 test("an info popup explains a row from the registry's own copy", async ({ page }) => {

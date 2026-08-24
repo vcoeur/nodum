@@ -365,7 +365,7 @@ export default function SettingsView() {
   }
 
   return (
-    <div className="nd-view nd-view--wide nd-set">
+    <div className="nd-view nd-set">
       <header className="nd-view__header">
         <div>
           <h1>Settings</h1>
@@ -415,7 +415,7 @@ export default function SettingsView() {
       ) : null}
 
       {GROUPS.map((group) => (
-        <section key={group.id} className="nd-set-section">
+        <section key={group.id} className="nd-card nd-set-section">
           <h2 className="nd-set-section__title">{group.title}</h2>
           {group.keys.map((key) => {
             const row = rowsByKey.get(key);
@@ -538,7 +538,7 @@ export default function SettingsView() {
         </section>
       ))}
 
-      <section className="nd-set-section" aria-label="Export">
+      <section className="nd-card nd-set-section" aria-label="Export">
         <h2 className="nd-set-section__title">Export</h2>
         <p className="nd-meta nd-set__subtitle">
           Freeze the configuration as it runs — every value in force,
