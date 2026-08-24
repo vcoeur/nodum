@@ -5,7 +5,8 @@
  * component, because the unit harness renders no components: grouping,
  * which rows are editable and why not, what a save will report about *when*
  * the change takes effect, what one-click revert would write from an event's
- * `before` payload, and what the adopt-from-environment preview shows.
+ * `before` payload, what the adopt-from-environment preview shows, and what
+ * the per-setting info popup says about a row.
  *
  * Two rules this module encodes come straight from the API contract:
  *
@@ -100,6 +101,63 @@ export function livenessLabel(live: Liveness): string {
     case "minute":
       return "Picked up by the scheduler within a minute";
   }
+}
+
+/** What the per-setting info popup shows for one row. */
+export interface SettingPopup {
+  /** The registry's one-line description of the setting. */
+  summary: string;
+  /**
+   * The registry's longer explanation, or null when the summary says it all.
+   * Rendered verbatim — the server owns every sentence here.
+   */
+  help: string | null;
+  /** The built-in default as the row renders it; secrets show a dash. */
+  defaultLabel: string;
+  /**
+   * When a change to this key takes effect, or null when the page cannot
+   * change it. An env-only or environment-pinned row has no subject for that
+   * sentence — and for the env-only names "Applied live" would be a false
+   * claim, because they are read at process start rather than re-resolved.
+   */
+  livenessLabel: string | null;
+}
+
+/**
+ * The popup's content for one row — assembled from the row and the
+ * editability rules above, never a client-authored sentence about a key.
+ */
+export function settingPopup(
+  row: SettingOut,
+  capabilities: Record<string, boolean>,
+): SettingPopup {
+  return {
+    summary: row.summary,
+    help: row.help,
+    defaultLabel: row.secret ? "—" : (row.default ?? "none"),
+    livenessLabel: isEditable(row, capabilities)
+      ? livenessLabel(liveness(row.key))
+      : null,
+  };
+}
+
+/** Which row's info popover is open, or null. */
+export type PopoverKey = string | null;
+
+/**
+ * The one-popover-at-a-time rule for the per-setting info buttons.
+ *
+ * A popover opens unconditionally and never toggles: a press on the opener of
+ * the popover that is already open dismisses it through the ordinary watchers
+ * *before* the click arrives, so deciding at the click whether to open or
+ * close would depend on whether the popover survived until the click — the
+ * same unstable ordering `MenuButton`'s history condemned. Opening always,
+ * whatever the current state (`_current` is deliberately ignored), has no
+ * ordering to get wrong. Closing is not a transition of this function: the
+ * view drops the state to null through its own dismissal handlers.
+ */
+export function nextPopoverKey(_current: PopoverKey, requested: string): string {
+  return requested;
 }
 
 /**

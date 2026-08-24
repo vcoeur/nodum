@@ -18,10 +18,12 @@
  */
 
 import { useCallback, useEffect, useMemo, useState } from "react";
+import type { MouseEvent as ReactMouseEvent } from "react";
 import { Link } from "react-router-dom";
 import { EmptyState, Modal, Spinner, useToast } from "../../components";
 import { api } from "../../api/client";
 import type { EventOut, SettingAdoptOut, SettingOut, SettingsOut } from "../../api/types";
+import type { MenuAnchor } from "../../lib/contextMenu";
 import { describeFailure } from "../../lib";
 import type { FailureDescription } from "../../lib";
 import {
@@ -38,8 +40,11 @@ import {
   liveness,
   livenessLabel,
   modelChangeConfirm,
+  nextPopoverKey,
   revertTarget,
+  settingPopup,
 } from "./settingsModel";
+import { SettingInfoPopover } from "./SettingInfoPopover";
 import "./settings.css";
 
 /** How many log events the revert column reads; settings events are rare. */
@@ -89,6 +94,11 @@ export default function SettingsView() {
   const [pendingModel, setPendingModel] = useState<PendingModelWrite | null>(null);
   /** The mixed-model banner's rebuild, in flight. */
   const [rebuilding, setRebuilding] = useState(false);
+  /** The open info popover: which row it explains, and where its button sits. */
+  const [infoPopover, setInfoPopover] = useState<{
+    key: string;
+    anchor: MenuAnchor;
+  } | null>(null);
 
   /** Fetch both reads and put them in state; throws, so callers decide the failure copy. */
   const fetchData = useCallback(async () => {
@@ -154,6 +164,22 @@ export default function SettingsView() {
       const next = new Map(previous);
       next.set(key, note);
       return next;
+    });
+  };
+
+  /**
+   * Open one row's info popover at its button.
+   *
+   * Opens unconditionally, never toggles: a press on an already-open
+   * popover's own button dismissed it through the watchers before this click
+   * arrived, so a toggle decision here would ride an unstable event ordering.
+   * `nextPopoverKey` pins that rule; the anchor is read off the button now.
+   */
+  const openInfo = (key: string, event: ReactMouseEvent<HTMLButtonElement>) => {
+    const rect = event.currentTarget.getBoundingClientRect();
+    setInfoPopover({
+      key: nextPopoverKey(infoPopover?.key ?? null, key),
+      anchor: { x: rect.left, y: rect.bottom, anchorHeight: rect.height },
     });
   };
 
@@ -402,6 +428,16 @@ export default function SettingsView() {
               <div key={key} className="nd-set-row">
                 <div className="nd-set-row__head">
                   <code className="nd-mono nd-set-row__name">{key}</code>
+                  <button
+                    type="button"
+                    className="nd-set-info"
+                    aria-label={`About ${key}`}
+                    aria-haspopup="dialog"
+                    aria-expanded={infoPopover?.key === key}
+                    onClick={(event) => openInfo(key, event)}
+                  >
+                    <span aria-hidden="true">i</span>
+                  </button>
                   <span className={`nd-badge nd-badge--provenance-${row.provenance}`}>
                     {layerLabel(row.provenance)}
                   </span>
@@ -616,8 +652,29 @@ export default function SettingsView() {
           </button>
         </Modal>
       ) : null}
+
+      {infoPopover === null ? null : renderInfoPopover(infoPopover)}
     </div>
   );
+
+  /**
+   * The open info popover, or null when its row is gone from the report.
+   *
+   * The copy is assembled by `settingPopup` from the row's own summary, help,
+   * default and liveness — the component never writes a sentence about a key.
+   */
+  function renderInfoPopover(popover: { key: string; anchor: MenuAnchor }) {
+    const row = rowsByKey.get(popover.key);
+    if (row === undefined) return null;
+    return (
+      <SettingInfoPopover
+        label={`About ${row.key}`}
+        content={settingPopup(row, capabilities)}
+        anchor={popover.anchor}
+        onClose={() => setInfoPopover(null)}
+      />
+    );
+  }
 }
 
 export { SettingsView };
