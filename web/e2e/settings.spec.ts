@@ -200,12 +200,19 @@ test("the settings content column matches the Admin page's centred column", asyn
   await expect(settingsColumn).toBeVisible();
   const settingsBox = await settingsColumn.boundingBox();
   expect(settingsBox).not.toBeNull();
+  // Each page's own layout viewport, read while that page is on screen.
+  const settingsClientWidth = await page.evaluate(
+    () => document.documentElement.clientWidth,
+  );
 
   await page.goto("/admin");
   const adminColumn = page.locator(".nd-view.nd-ad");
   await expect(adminColumn).toBeVisible();
   const adminBox = await adminColumn.boundingBox();
   expect(adminBox).not.toBeNull();
+  const adminClientWidth = await page.evaluate(
+    () => document.documentElement.clientWidth,
+  );
 
   expect(settingsBox!.width).toBe(adminBox!.width);
   // The old gutter regression: rows used to start at x≈6 px with fragments
@@ -213,12 +220,11 @@ test("the settings content column matches the Admin page's centred column", asyn
   expect(settingsBox!.x).toBeGreaterThanOrEqual(20);
 
   // Both pages centre their column; a full-bleed root would sit at x=0. The
-  // expected centre is computed from the layout viewport (`clientWidth`, which
-  // excludes a classic scrollbar when one is present) so the assertion holds
-  // whatever the pages' scroll state.
-  const clientWidth = await page.evaluate(() => document.documentElement.clientWidth);
-  expect(settingsBox!.x).toBeCloseTo((clientWidth - settingsBox!.width) / 2, 0);
-  expect(adminBox!.x).toBeCloseTo((clientWidth - adminBox!.width) / 2, 0);
+  // expected centre is computed from each page's own layout viewport
+  // (`clientWidth`, which excludes a classic scrollbar when one is present)
+  // so the assertion holds whatever the pages' scroll state.
+  expect(settingsBox!.x).toBeCloseTo((settingsClientWidth - settingsBox!.width) / 2, 0);
+  expect(adminBox!.x).toBeCloseTo((adminClientWidth - adminBox!.width) / 2, 0);
 });
 
 test("every settings group and the Export section render as a shared nd-card", async ({ page }) => {
