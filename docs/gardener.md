@@ -117,9 +117,24 @@ switches, and each is off until you set it:
 |---|---|---|
 | `NODUM_LLM_MODEL` | unset — no provider | Any model call at all, for the gardener and for the human-facing `ask` / `summarize` / `search --nl`. |
 | `NODUM_LLM_CYCLE_BUDGET` | unset or `0` — the default | The gardener's LLM jobs. **A cycle with a provider and no budget runs its selection and reports that the abstraction job did not run.** The budget is tokens per cycle; `NODUM_LLM_CYCLE_SECONDS` (default 1800) bounds the same work in wall-clock time. |
-| `NODUM_LLM_API_KEY` | unset — none sent | The bearer key, sent **only** to an endpoint somebody named: a `NODUM_LLM_BASE_URL` you set, or a model id nodum ships a profile for. |
+| `NODUM_LLM_API_KEY` | unset — none sent | The bearer key, sent **only** to an endpoint somebody named: a `NODUM_LLM_BASE_URL` you set, or a model id nodum ships a profile for. When `NODUM_LLM_ENDPOINT` selects an endpoint, that endpoint's own `NODUM_LLM_KEY_*` is sent instead. |
 
-Two shapes cover most installs. A hosted provider nodum knows is two lines
+Three shapes cover most installs. The simplest is to pick an endpoint by label
+and give it its key — both storable, so this whole shape can be done from the
+Settings page without touching the host:
+
+```sh
+nodum config set NODUM_LLM_ENDPOINT kimi --as human:owner
+nodum config set NODUM_LLM_KEY_KIMI sk-… --as human:owner
+nodum config set NODUM_LLM_MODEL kimi-k3 --as human:owner
+nodum config set NODUM_LLM_CONTEXT_TOKENS 1000000 --as human:owner   # Kimi's window is per-model
+nodum config set NODUM_LLM_CYCLE_BUDGET 200000 --as human:owner
+```
+
+The labels are `local`, `deepseek`, `kimi` and `openrouter`, and
+`NODUM_LLM_ENDPOINTS` narrows that menu for a deployment. Each endpoint has its
+own key variable, so changing the selection changes which credential travels
+with it — a key can never reach an endpoint it was not entered for. A hosted provider nodum knows is two lines
 plus the budget, because the exact model id brings its endpoint, its context
 window and its structured-output mode with it:
 
@@ -147,7 +162,8 @@ than posted to a host you did not name. Every variable in the block, with its
 default, is in [Configuration](configuration.md#the-llm-block).
 
 **`export` is one of two ways.** Everything above except `NODUM_LLM_BASE_URL`
-can be stored instead, in `settings.env` beside the graph:
+and `NODUM_LLM_ENDPOINTS` can be stored instead, in `settings.env` beside the
+graph:
 
 ```sh
 nodum config set NODUM_LLM_MODEL deepseek-v4-flash --as human:owner
@@ -159,9 +175,12 @@ The environment still wins over the file, so a variable already exported is
 refused rather than stored where it would never be read — unset it first. What
 you gain is that a change applies **without a restart**: the budget funds the
 next cycle rather than the next boot, and a model applies at the next call.
-`NODUM_LLM_BASE_URL` stays environment-only on purpose — the endpoint a key may
-travel to is a deployment decision. `nodum config list` reports which layer each
-value is in force from.
+`NODUM_LLM_BASE_URL` and `NODUM_LLM_ENDPOINTS` stay environment-only on purpose
+— which endpoints a key may travel to is a deployment decision, the first naming
+one outright and the second bounding the menu the Settings page offers. The
+choice *within* that menu (`NODUM_LLM_ENDPOINT`) is storable, because every
+endpoint on it is compiled into the build rather than typed into a form.
+`nodum config list` reports which layer each value is in force from.
 
 Then ask what actually resolved, before the first cycle:
 

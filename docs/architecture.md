@@ -378,9 +378,9 @@ the readers include the scheduler slice on the event loop.
 `NODUM_LLM_API_KEY` reports set/unset and never a value, to a surface or to the
 event log. A file it cannot parse is reported loudly and stepped around, with
 `file-unreadable` provenance, so a surface can say *why* a stored value is not
-in force. Four names (`NODUM_DB`, `NODUM_LLM_BASE_URL`, `NODUM_EMBED_CACHE`,
-`NODUM_PUBLIC_URL`) refuse storage and resolve from the environment alone, each
-with its reason — `NODUM_EMBED_MODEL` and `NODUM_EMBED_DOWNLOAD` are storable
+in force. Five names (`NODUM_DB`, `NODUM_LLM_ENDPOINTS`, `NODUM_LLM_BASE_URL`,
+`NODUM_EMBED_CACHE`, `NODUM_PUBLIC_URL`) refuse storage and resolve from the
+environment alone, each with its reason — `NODUM_EMBED_MODEL` and `NODUM_EMBED_DOWNLOAD` are storable
 like the rest. Surfaces: `nodum config list|get|set|unset` and the
 `settings.set`/`settings.unset` events. `nodum config list` — and its
 byte-identical twin `GET /api/settings` — additionally carry the vec
@@ -472,10 +472,15 @@ deliberately abstracts over **nothing else**: no streaming, no tool calling,
 no embeddings, no retries, no prompt templates, no sampling (`TEMPERATURE`
 pinned at 0). **There is no module-level `chat`** — every provider call goes
 through `nodum.agent` (P3). Configuration is `NODUM_LLM_MODEL` (**unset means
-no provider**), `NODUM_LLM_BASE_URL`, `NODUM_LLM_API_KEY`,
-`NODUM_LLM_CONTEXT_TOKENS` (4096 by default), and `NODUM_LLM_THINKING`
-(`none`/`low`/`medium`/`high`, default `high`; anything else is no provider
-with a reason). The measured findings this module produced — base-URL and
+no provider**), `NODUM_LLM_ENDPOINT` (a label from `nodum.endpoints`, bounded by
+`NODUM_LLM_ENDPOINTS` and overridden by `NODUM_LLM_BASE_URL`),
+`NODUM_LLM_KEY_<LABEL>` (one credential per endpoint) or `NODUM_LLM_API_KEY` on
+the base-URL path, `NODUM_LLM_CONTEXT_TOKENS` (4096 by default), and
+`NODUM_LLM_THINKING` (`none`/`low`/`medium`/`high`, default `high`; anything
+else is no provider with a reason). The endpoint table lives in
+**`nodum.endpoints`**, a leaf module importing nothing from the package, because
+both this module and `nodum.settings` read it — `settings` generates one secret
+row per endpoint from it, and the provider resolves a selection through it. The measured findings this module produced — base-URL and
 credential rules, capability negotiation, the two truncation signals, the
 `IncompleteRead` class, the import rail — are in `docs/decisions.md`. Design
 Constraint 4 is held structurally: `tests/test_llm.py` walks the package's

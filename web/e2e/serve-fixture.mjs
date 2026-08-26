@@ -73,12 +73,21 @@ process.stdout.write(
 // NODUM_LLM_MODEL is pinned deliberately: it gives the Settings specs a row
 // the page must render disabled ("pinned by the environment") and an
 // adopt-from-environment candidate, against a live 409-backed server.
+//
+// NODUM_LLM_ENDPOINTS is narrowed deliberately too, and to a *proper subset*:
+// it gives the endpoint spec a menu that is demonstrably the deployment's
+// rather than the whole shipped registry, so a select that ignored the
+// allow-list would fail rather than pass by coincidence.
 const server = spawn(
   'uv',
   ['run', 'nodum', 'serve', '--db', dbPath, '--port', PORT],
   {
     cwd: REPO_ROOT,
-    env: { ...process.env, NODUM_LLM_MODEL: 'e2e-pinned-model' },
+    env: {
+      ...process.env,
+      NODUM_LLM_MODEL: 'e2e-pinned-model',
+      NODUM_LLM_ENDPOINTS: 'deepseek,kimi',
+    },
     stdio: 'inherit',
   },
 );

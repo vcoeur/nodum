@@ -29,7 +29,7 @@ import pytest
 from helpers import nodum_imports
 
 import nodum
-from nodum import llm
+from nodum import endpoints, llm, settings
 
 # ── The rail: the deterministic layer cannot reach the provider (P2) ──────────
 #
@@ -281,7 +281,21 @@ def _provider_ast() -> ast.Module:
 #: :func:`test_every_module_the_provider_reaches_is_a_leaf_too` asks the three
 #: questions of each module on it. ``nodum`` is the package's own ``__init__``,
 #: which re-exports nothing — an edge every ``from nodum import …`` produces.
-PROVIDER_MAY_REACH = {"nodum", "nodum.settings", "nodum.models", "nodum.vocab"}
+#:
+#: ``nodum.endpoints`` is the endpoint registry, added when the settings page
+#: gained an endpoint select. It is on this list for the same reason
+#: ``nodum.settings`` is: the provider is configured *by* it, and the table has
+#: to be readable from both here and the settings seam, which is exactly why it
+#: is a module of its own rather than a table inside this one. It imports ``os``
+#: and ``typing`` and nothing else, so it widens this closure by a genuine leaf
+#: — which the sibling test below is what actually holds.
+PROVIDER_MAY_REACH = {
+    "nodum",
+    "nodum.settings",
+    "nodum.models",
+    "nodum.vocab",
+    "nodum.endpoints",
+}
 
 
 def _imported_modules(tree: ast.Module) -> set[str]:
@@ -1069,6 +1083,16 @@ def _clean_resolution(monkeypatch):
         llm.ENV_API_KEY,
         llm.ENV_CONTEXT_TOKENS,
         llm.ENV_THINKING,
+        # The endpoint select and the menu it chooses from. Both are read
+        # through the settings ladder, so a value left over from one test is a
+        # value the next one resolves against.
+        settings.LLM_ENDPOINT,
+        settings.LLM_ENDPOINTS,
+        # Every per-endpoint credential, generated the same way the registry
+        # generates the rows — a hand-written list here would go stale the
+        # moment an endpoint is added, and the staleness would be a key leaking
+        # from one test into the next.
+        *settings.ENDPOINT_KEYS,
     ):
         monkeypatch.delenv(name, raising=False)
     llm.reset_provider()
@@ -2660,3 +2684,182 @@ def test_a_capability_400_is_negotiated_by_its_reason_words(monkeypatch, detail:
     )
     assert len(recorder.requests) == 2, "the 400 was not read as a capability signal"
     assert provider.structured_mode == llm.STRUCTURED_JSON_OBJECT
+
+
+# ── The endpoint select: what a browser may choose, and what travels with it ──
+#
+# The settings page can now choose an endpoint. These are the properties that
+# make that safe to expose: the menu is compiled in, the deployment bounds it,
+# each endpoint carries its own credential, and the environment still outranks
+# the whole mechanism.
+
+
+def test_selecting_an_endpoint_resolves_its_url_and_everything_it_ships_knowing(monkeypatch, wire):
+    """One stored label supplies four beliefs, which is the point of a registry.
+
+    The alternative this replaced was a free-text base URL, which supplied the
+    URL and left the window, the structured form and the reasoning support to be
+    configured separately — three more chances to get a silent truncation.
+    """
+    monkeypatch.setenv(llm.ENV_MODEL, "deepseek-v4-flash")
+    monkeypatch.setenv(settings.LLM_ENDPOINT, "deepseek")
+    provider = llm.get_provider()
+    assert provider is not None
+    assert provider.provider_id == llm.DEEPSEEK_BASE_URL
+    assert provider.context_tokens == 1_000_000
+    assert provider.structured_mode == llm.STRUCTURED_JSON_OBJECT
+    assert llm.unavailable_reason() is None
+
+
+def test_a_selected_endpoint_sends_its_own_key_and_no_other(monkeypatch, wire):
+    """**The security property the whole feature rests on.**
+
+    A single ``NODUM_LLM_API_KEY`` plus a selector would mean that changing the
+    select in a browser posts the credential issued for one vendor to another —
+    the same class of mistake as the withheld-key branch, but reachable from a
+    surface that needs no shell access. Per-endpoint keys make it structural:
+    there is no key reachable from a selection but that selection's own.
+
+    Both other credentials are set here, so the assertion is that the right one
+    was *chosen* rather than that only one existed.
+    """
+    monkeypatch.setenv(llm.ENV_MODEL, "deepseek-v4-flash")
+    monkeypatch.setenv(settings.LLM_ENDPOINT, "deepseek")
+    monkeypatch.setenv(endpoints.key_setting("deepseek"), "sk-deepseek")
+    monkeypatch.setenv(endpoints.key_setting("kimi"), "sk-kimi")
+    monkeypatch.setenv(endpoints.key_setting("openrouter"), "sk-openrouter")
+    monkeypatch.setenv(llm.ENV_API_KEY, "sk-legacy")
+
+    recorder = wire()
+    provider = llm.get_provider()
+    assert provider is not None
+    assert provider.provider_id == llm.DEEPSEEK_BASE_URL
+    provider.chat([llm.Message(role="user", content="hi")], max_output_tokens=8, timeout=5.0)
+
+    sent = recorder.requests[-1].get_header("Authorization")
+    assert sent == "Bearer sk-deepseek"
+    for foreign in ("sk-kimi", "sk-openrouter", "sk-legacy"):
+        assert foreign not in (sent or ""), f"{foreign} travelled to DeepSeek"
+
+
+def test_a_selected_endpoint_with_no_key_of_its_own_sends_nothing_not_a_neighbours(
+    monkeypatch, wire
+):
+    """An unset credential is an unset credential, never the next one along.
+
+    The sibling above cannot see this: it sets the selected endpoint's key, so a
+    fallback to a shared key would short-circuit and the assertion would still
+    pass. Here the selected endpoint has no key and two others do — which is
+    exactly the shape a half-configured settings page has while an operator is
+    still filling it in.
+    """
+    monkeypatch.setenv(llm.ENV_MODEL, "some-model")
+    monkeypatch.setenv(settings.LLM_ENDPOINT, "kimi")
+    monkeypatch.setenv(endpoints.key_setting("deepseek"), "sk-deepseek")
+    monkeypatch.setenv(endpoints.key_setting("openrouter"), "sk-openrouter")
+    monkeypatch.setenv(llm.ENV_API_KEY, "sk-legacy")
+
+    recorder = wire()
+    provider = llm.get_provider()
+    assert provider is not None
+    assert provider.provider_id == "https://api.moonshot.ai/v1"
+    provider.chat([llm.Message(role="user", content="hi")], max_output_tokens=8, timeout=5.0)
+    assert recorder.requests[-1].get_header("Authorization") is None
+
+
+def test_switching_the_selection_switches_the_credential(monkeypatch, wire):
+    """The same graph, two selections, two keys — and neither reaches the other.
+
+    Stated separately from the test above because that one holds "the right key
+    was picked once" and this holds "the binding follows the selection", which
+    is what a browser actually does to it.
+    """
+    monkeypatch.setenv(llm.ENV_MODEL, "some-model")
+    monkeypatch.setenv(endpoints.key_setting("kimi"), "sk-kimi")
+    monkeypatch.setenv(endpoints.key_setting("openrouter"), "sk-openrouter")
+
+    for label, expected_key, expected_host in (
+        ("kimi", "sk-kimi", "https://api.moonshot.ai/v1"),
+        ("openrouter", "sk-openrouter", "https://openrouter.ai/api/v1"),
+    ):
+        monkeypatch.setenv(settings.LLM_ENDPOINT, label)
+        llm.reset_provider()
+        recorder = wire()
+        provider = llm.get_provider()
+        assert provider is not None, label
+        assert provider.provider_id == expected_host, label
+        provider.chat([llm.Message(role="user", content="hi")], max_output_tokens=8, timeout=5.0)
+        assert recorder.requests[-1].get_header("Authorization") == f"Bearer {expected_key}", label
+
+
+def test_an_endpoint_that_takes_no_key_sends_none_however_many_are_stored(monkeypatch, wire):
+    """The local default authenticates with nothing, and stored keys stay put.
+
+    It has no key row at all — `takes_key` false — so there is nothing to look
+    up rather than a lookup that happens to miss.
+    """
+    monkeypatch.setenv(llm.ENV_MODEL, "qwen3:8b")
+    monkeypatch.setenv(settings.LLM_ENDPOINT, "local")
+    monkeypatch.setenv(endpoints.key_setting("deepseek"), "sk-deepseek")
+    monkeypatch.setenv(llm.ENV_API_KEY, "sk-legacy")
+
+    recorder = wire()
+    provider = llm.get_provider()
+    assert provider is not None
+    assert provider.provider_id == llm.DEFAULT_BASE_URL
+    provider.chat([llm.Message(role="user", content="hi")], max_output_tokens=8, timeout=5.0)
+    assert recorder.requests[-1].get_header("Authorization") is None
+    assert endpoints.key_setting("local") not in settings.KEYS
+
+
+def test_the_environment_base_url_still_outranks_a_stored_selection(monkeypatch):
+    """The operator's escape hatch survives the feature that could have taken it.
+
+    A stored selection that could override ``NODUM_LLM_BASE_URL`` would let a
+    browser move a call off the endpoint a deployment pinned, which is the one
+    thing the environment layer exists to prevent.
+    """
+    monkeypatch.setenv(llm.ENV_MODEL, "some-model")
+    monkeypatch.setenv(settings.LLM_ENDPOINT, "deepseek")
+    monkeypatch.setenv(llm.ENV_BASE_URL, "https://gateway.internal/v1")
+    provider = llm.get_provider()
+    assert provider is not None
+    assert provider.provider_id == "https://gateway.internal/v1"
+    # And the profile does not follow the selection onto a host it is not.
+    assert provider.context_tokens == llm.DEFAULT_CONTEXT_TOKENS
+
+
+def test_a_label_this_deployment_does_not_offer_is_refused_and_names_the_menu(monkeypatch):
+    """Refused, never quietly ignored.
+
+    A selection that fell back to the local default would send prompts somewhere
+    other than where the settings page says they go — the one failure this
+    feature exists to make impossible. The refusal may name the whole menu
+    because the allow-list holds labels and never credentials.
+    """
+    monkeypatch.setenv(llm.ENV_MODEL, "some-model")
+    monkeypatch.setenv(settings.LLM_ENDPOINTS, "local,deepseek")
+    monkeypatch.setenv(settings.LLM_ENDPOINT, "openrouter")
+    assert llm.get_provider() is None
+    reason = llm.unavailable_reason()
+    assert reason is not None
+    assert "openrouter" in reason
+    assert "local, deepseek" in reason
+
+
+def test_a_label_no_build_ships_is_refused_the_same_way(monkeypatch):
+    """A typo and a removed endpoint are one case, and neither resolves."""
+    monkeypatch.setenv(llm.ENV_MODEL, "some-model")
+    monkeypatch.setenv(settings.LLM_ENDPOINT, "deepsek")
+    assert llm.get_provider() is None
+    reason = llm.unavailable_reason()
+    assert reason is not None
+    assert "deepsek" in reason
+
+
+def test_an_unset_selection_leaves_the_previous_behaviour_exactly_as_it_was(monkeypatch):
+    """The feature is additive: nothing changes for a configuration that ignores it."""
+    monkeypatch.setenv(llm.ENV_MODEL, "deepseek-v4-flash")
+    provider = llm.get_provider()
+    assert provider is not None
+    assert provider.provider_id == llm.DEEPSEEK_BASE_URL, "model-id routing is untouched"

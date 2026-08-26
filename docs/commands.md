@@ -225,6 +225,18 @@ does not resolve). With no provider configured the refusal names
   left behind rather than posted there, and `api_key_withheld` says so with the
   sentence that fixes it. A local gateway that requires a key keeps it: naming
   that gateway in `NODUM_LLM_BASE_URL` is you saying the key belongs to it.
+
+  **`NODUM_LLM_ENDPOINT` is the third way to name one, and the only one a
+  browser can use.** It takes a label for an endpoint compiled into the build —
+  `local`, `deepseek`, `kimi`, `openrouter` — so choosing one never names a URL,
+  which is why it is storable where `NODUM_LLM_BASE_URL` is not.
+  `provider` in `nodum llm status` shows the URL it resolved to. Each endpoint
+  has its **own** key (`NODUM_LLM_KEY_DEEPSEEK` and friends) and a selection
+  sends that key and no other, so there is no `api_key_withheld` case on this
+  path: the credential is bound to the endpoint rather than checked against it.
+  `NODUM_LLM_BASE_URL` still overrides a selection, and a label this deployment
+  does not offer (`NODUM_LLM_ENDPOINTS` bounds the menu) is **no provider with a
+  reason** naming the menu — never a silent fall back to the local default.
   Three more fields say what your provider is really doing, as opposed to what
   you asked it for. **`structured_output`** is `json_schema` or `json_object`:
   under the first, the server's constrained decoding makes an answer the schema

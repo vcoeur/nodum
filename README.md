@@ -727,7 +727,25 @@ cycle quietly drop the vector signal until you re-run the download.
   nodum picked, not one you configured a key for — so the key is left behind
   rather than posted there, and `nodum llm status` says so in
   `api_key_withheld`. A local gateway that needs a key keeps it; naming it in
-  `NODUM_LLM_BASE_URL` is you saying the key belongs to it. `NODUM_LLM_THINKING`
+  `NODUM_LLM_BASE_URL` is you saying the key belongs to it.
+
+  **Or pick an endpoint instead of describing one.** `NODUM_LLM_ENDPOINT` takes
+  a label — `local`, `deepseek`, `kimi`, `openrouter` — and the endpoints behind
+  those labels are compiled into the build, so choosing one never names a URL.
+  That is why this one *is* editable from the Settings page while
+  `NODUM_LLM_BASE_URL` is not: which endpoints a key may travel to stays a
+  deployment decision (`NODUM_LLM_ENDPOINTS` narrows the menu, and a stored
+  label the deployment does not offer is refused with the menu rather than
+  silently falling back), and only the choice within it is stored. **Each
+  endpoint carries its own key** — `NODUM_LLM_KEY_DEEPSEEK`,
+  `NODUM_LLM_KEY_KIMI`, `NODUM_LLM_KEY_OPENROUTER` — sent when and only when
+  that endpoint is selected, so changing the selection can never post a
+  credential to a vendor it was not issued for. `NODUM_LLM_BASE_URL` still wins
+  over a selection, for a self-hosted gateway nodum ships nothing about. Two of
+  the labels serve **no single context window** — Kimi runs 1M on `kimi-k3` and
+  8k on `moonshot-v1-8k`, OpenRouter fronts hundreds of models — so nodum
+  asserts none for them and the Settings page tells you the real numbers on the
+  `NODUM_LLM_CONTEXT_TOKENS` row once you pick one. `NODUM_LLM_THINKING`
   (`none`, `low`, `medium`, `high`; default `high`) sets how much a reasoning
   model may think — a value outside that set is refused with the list rather
   than passed on, and `nodum llm status` shows whether your endpoint actually
@@ -748,10 +766,11 @@ exception: `config export --include-secrets`, and the HTTP export's equivalent,
 put the real key in the downloaded file after a password step-up). The
 embedding pair is web-manageable too, coupled to the vector rebuild:
 `POST /api/projectors/{name}/rebuild` is the human-only trigger the Settings
-page offers while a model change has left the corpus invisible to search. Four
+page offers while a model change has left the corpus invisible to search. Five
 names
 stay environment-only and say so when refused: `NODUM_DB`,
-`NODUM_LLM_BASE_URL`, `NODUM_EMBED_CACHE` and `NODUM_PUBLIC_URL`. Details in
+`NODUM_LLM_ENDPOINTS`, `NODUM_LLM_BASE_URL`, `NODUM_EMBED_CACHE` and
+`NODUM_PUBLIC_URL`. Details in
 [docs/configuration.md](docs/configuration.md).
 
 See [docs/architecture.md](docs/architecture.md) for the module map,

@@ -59,15 +59,20 @@ writes no event; `nodum config set` writes one.
 
 ### What cannot be stored there
 
-Four names resolve from the environment and the default alone, and
+Five names resolve from the environment and the default alone, and
 `nodum config set` refuses them with the reason:
 
 | Variable | Why |
 |---|---|
 | `NODUM_DB` | Read before the graph — and therefore before its settings file — is open. |
-| `NODUM_LLM_BASE_URL` | The endpoint an API key may travel to is a deployment decision. |
+| `NODUM_LLM_ENDPOINTS` | The menu the endpoint select may choose from, so a stored value would let a browser widen its own choices. |
+| `NODUM_LLM_BASE_URL` | Names one endpoint outright, overriding the select. Which endpoints an API key may travel to is a deployment decision. |
 | `NODUM_EMBED_CACHE` | A path on the server's own disk. |
 | `NODUM_PUBLIC_URL` | Every capability URL is minted from it, so a stored value would redirect them. |
+
+**The endpoint itself is storable; the set it is chosen from is not.** Every
+endpoint nodum can reach is compiled into the build, so choosing one from the
+settings page never names a URL — see [Choosing an endpoint](#choosing-an-endpoint).
 
 `NODUM_EMBED_MODEL` and `NODUM_EMBED_DOWNLOAD` are storable — with one
 coupling the page makes impossible to miss: **changing the model blinds every
@@ -127,8 +132,11 @@ wiped cache by rerunning with `NODUM_EMBED_DOWNLOAD=1`.
 | Variable | Default | What it does |
 |---|---|---|
 | `NODUM_LLM_MODEL` | unset — no provider | The model name. Unset means no provider, and therefore no smart features anywhere — there is no default, because a guessed model name is a 404 on the first call rather than an honest absence. |
-| `NODUM_LLM_BASE_URL` | `http://localhost:11434/v1` | OpenAI-compatible base URL. A spelling that is not a `http(s)` URL — scheme included — is refused, because choosing the scheme on the operator's behalf decides whether the API key crosses the network in clear text. |
-| `NODUM_LLM_API_KEY` | unset | Bearer token. Optional (the local default needs none), and sent only to an endpoint somebody named — `NODUM_LLM_BASE_URL`, or a model id a shipped profile serves. |
+| `NODUM_LLM_ENDPOINT` | unset — the local default | Which shipped endpoint to call, by label: `local`, `deepseek`, `kimi` or `openrouter`. Editable from the settings page, and refused if the label is not one `NODUM_LLM_ENDPOINTS` offers. |
+| `NODUM_LLM_ENDPOINTS` | unset — all of them | Comma-separated labels this deployment offers. Environment-only. A label this build does not ship is ignored rather than fatal, so an older image does not fail to boot on a name from a newer one. |
+| `NODUM_LLM_KEY_<LABEL>` | unset | The bearer token for one endpoint — `NODUM_LLM_KEY_DEEPSEEK`, `NODUM_LLM_KEY_KIMI`, `NODUM_LLM_KEY_OPENROUTER`. Sent **only** when `NODUM_LLM_ENDPOINT` selects that endpoint, so changing the selection can never post a credential to a vendor it was not issued for. Never serialised: every surface reports set/unset and no value. |
+| `NODUM_LLM_BASE_URL` | `http://localhost:11434/v1` | OpenAI-compatible base URL, and the escape hatch to a gateway nodum ships nothing about. **It overrides `NODUM_LLM_ENDPOINT`.** A spelling that is not a `http(s)` URL — scheme included — is refused, because choosing the scheme on the operator's behalf decides whether the API key crosses the network in clear text. |
+| `NODUM_LLM_API_KEY` | unset | Bearer token for the endpoint `NODUM_LLM_BASE_URL` names. Optional (the local default needs none), and sent only to an endpoint somebody named — `NODUM_LLM_BASE_URL`, or a model id a shipped profile serves. When `NODUM_LLM_ENDPOINT` selects an endpoint, that endpoint's own `NODUM_LLM_KEY_*` is sent and this one is not. |
 | `NODUM_LLM_THINKING` | `high` | The reasoning level, one of `none`, `low`, `medium`, `high`. A value outside the set is refused with the list rather than passed on. |
 | `NODUM_LLM_CONTEXT_TOKENS` | `4096` | The window the endpoint will actually serve — not the model card's number. Raising it above the *serving* window silently truncates prompts; raise it only together with the serving window. |
 | `NODUM_LLM_MAX_OUTPUT_TOKENS` | `4096` | The per-call output ceiling. A call that comes back at it is treated as failed — the body is cut mid-token — so this is sized for the longest legitimate answer, not the average. |
@@ -138,9 +146,53 @@ wiped cache by rerunning with `NODUM_EMBED_DOWNLOAD=1`.
 | `NODUM_LLM_CYCLE_BUDGET` | `0` | The token budget one consolidation cycle's LLM jobs may spend. **Unset or 0 means those jobs do not run** — which is the default. Fund the abstraction job by setting a budget; `NODUM_LLM_CYCLE_SECONDS` bounds the same work in wall-clock time. |
 | `NODUM_LLM_CYCLE_SECONDS` | `1800` (seconds) | The per-cycle wall-clock ceiling, independent of the token budget. |
 
+### Choosing an endpoint
+
+Every endpoint nodum can reach is **compiled into the build** — its URL, the
+window it serves, which `response_format` it accepts, and whether it takes
+graded reasoning. The settings page picks one of them by label; it never names a
+URL. That is what makes the choice safe to expose to a browser, and it is why
+`NODUM_LLM_BASE_URL` stays environment-only: the *set* an API key may travel to
+is the deployment's decision, and only the choice within it is stored.
+
+| Label | Endpoint | Window |
+|---|---|---|
+| `local` | `http://localhost:11434/v1` (ollama) | 4 096 |
+| `deepseek` | `https://api.deepseek.com/v1` | 1 000 000 |
+| `kimi` | `https://api.moonshot.ai/v1` | set it yourself |
+| `openrouter` | `https://openrouter.ai/api/v1` | set it yourself |
+
+**Two of them serve no single window, and nodum refuses to guess one.** Kimi
+runs 1M on `kimi-k3` and 8k on `moonshot-v1-8k`; OpenRouter fronts hundreds of
+models between 4k and 1M. Asserting either one's flagship number would silently
+truncate every prompt sent to a smaller model, so those rows assert nothing and
+fall back to `NODUM_LLM_CONTEXT_TOKENS` — which the settings page annotates with
+the real windows once you pick the endpoint. Under-asserting costs a refusal you
+can read; over-asserting costs an answer computed from a prompt that was cut.
+
+**Each endpoint carries its own key.** `NODUM_LLM_KEY_DEEPSEEK` is sent when and
+only when `deepseek` is selected. A single shared key plus a selector would mean
+that changing the select in a browser posts the credential issued for one vendor
+to another; per-endpoint keys make that unreachable rather than discouraged.
+
+A deployment narrows the menu with `NODUM_LLM_ENDPOINTS`:
+
+```bash
+NODUM_LLM_ENDPOINTS=deepseek,kimi,openrouter   # local is not offered
+```
+
+A stored label that is not on the menu — because the deployment removed it after
+it was chosen — is **no provider with a reason**, never a silent fall back to
+the local default:
+
+```
+NODUM_LLM_ENDPOINT='kimi' (from settings.env) is not an endpoint this
+deployment offers (one of: deepseek)
+```
+
 ### What a bad value does
 
-Eleven of the nineteen names are checked, and `nodum config set` refuses a bad
+Twelve of the twenty-four names are checked, and `nodum config set` refuses a bad
 value outright — so only a hand-edited `settings.env` or an environment
 variable can carry one past the door. What happens then differs by key, on
 purpose, and `nodum config list` reports which rule applies as `on_invalid`:

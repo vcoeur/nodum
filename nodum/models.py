@@ -1013,6 +1013,11 @@ class SettingOut(BaseModel):
     (``None`` when it is not). Both come straight from the key's
     :class:`~nodum.settings.Setting` row; a surface renders them, it does not
     write its own sentences about a key.
+
+    ``choices`` is the closed set of values this key accepts, or ``None`` when
+    it is free-form. A surface that has it renders a select and cannot submit a
+    value the validator would refuse; it is computed per request rather than
+    fixed, because the endpoint list depends on what the deployment offers.
     """
 
     key: str
@@ -1028,6 +1033,28 @@ class SettingOut(BaseModel):
     on_invalid: str | None
     summary: str
     help: str | None
+    choices: list[str] | None = None
+
+
+class EndpointOut(BaseModel):
+    """One endpoint the settings page may offer, as the select needs it.
+
+    Carried alongside the rows rather than derived from them because the select
+    shows a *title* and stores a *label*, and because ``window_note`` belongs to
+    the endpoint rather than to any one setting: it is what the context-tokens
+    row has to say once this endpoint is chosen.
+
+    ``key`` names the setting holding this endpoint's credential, so a surface
+    can put the key field next to the choice that arms it without knowing how
+    the name is built. It is ``None`` for an endpoint that authenticates with
+    nothing — the local default.
+    """
+
+    label: str
+    title: str
+    base_url: str
+    key: str | None
+    window_note: str | None
 
 
 class SettingsOut(BaseModel):
@@ -1060,6 +1087,11 @@ class SettingsOut(BaseModel):
     unknown_keys: list[str]
     unreadable: str | None
     capabilities: dict[str, bool]
+    #: The endpoints this deployment offers, in the order a select lists them.
+    #: Empty on no build that ships endpoints, which is why it defaults rather
+    #: than being required: an older client reading a newer server ignores it,
+    #: and a newer client reading an older server falls back to a text field.
+    endpoints: list[EndpointOut] = []
     mixed_model_note: str | None = None
     embed_chunks: int = 0
 

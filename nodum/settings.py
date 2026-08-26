@@ -103,7 +103,8 @@ from pathlib import Path
 from secrets import token_hex
 from types import MappingProxyType
 
-from nodum.models import SettingChangeOut, SettingOut, SettingsOut
+from nodum import endpoints
+from nodum.models import EndpointOut, SettingChangeOut, SettingOut, SettingsOut
 
 logger = logging.getLogger(__name__)
 
@@ -163,6 +164,8 @@ DB = "NODUM_DB"
 PUBLIC_URL = "NODUM_PUBLIC_URL"
 CONSOLIDATE_AT = "NODUM_CONSOLIDATE_AT"
 LLM_MODEL = "NODUM_LLM_MODEL"
+LLM_ENDPOINT = "NODUM_LLM_ENDPOINT"
+LLM_ENDPOINTS = endpoints.ALLOW_LIST_ENV
 LLM_BASE_URL = "NODUM_LLM_BASE_URL"
 LLM_API_KEY = "NODUM_LLM_API_KEY"
 LLM_CONTEXT_TOKENS = "NODUM_LLM_CONTEXT_TOKENS"
@@ -179,11 +182,22 @@ EMBED_CACHE = "NODUM_EMBED_CACHE"
 AUDIO_MODEL = "NODUM_AUDIO_MODEL"
 AUDIO_DOWNLOAD = "NODUM_AUDIO_DOWNLOAD"
 
+#: One key setting per endpoint that authenticates, in registry order. Generated
+#: rather than written out because the registry is the single statement of which
+#: endpoints exist: a hand-maintained list here would drift the moment a row is
+#: added, and the drift would be silent — a key nobody could set.
+ENDPOINT_KEYS: tuple[str, ...] = tuple(
+    endpoints.key_setting(endpoint.label) for endpoint in endpoints.ENDPOINTS if endpoint.takes_key
+)
+
 #: The values this module will not serialise — not to a surface, not into an
 #: event payload, not into an exception message. A frozenset rather than a
 #: naming convention because the rule has to survive a key whose name does not
 #: contain "key" or "secret".
-SECRET_KEYS = frozenset({LLM_API_KEY})
+#:
+#: Every per-endpoint key joins it by construction, so adding an endpoint cannot
+#: forget to make its credential secret.
+SECRET_KEYS = frozenset({LLM_API_KEY, *ENDPOINT_KEYS})
 
 #: Where a value in force came from. ``FROM_UNSET`` means nothing set it and it
 #: has no default; ``FROM_UNREADABLE`` means the environment did not set it and
@@ -305,6 +319,25 @@ def _one_of(allowed: tuple[str, ...]) -> Callable[[str, str], str]:
     return validate
 
 
+def _endpoint_label(name: str, value: str) -> str:
+    """A validator accepting a label this deployment actually offers.
+
+    Checked against :func:`nodum.endpoints.offered` and not merely against the
+    shipped registry, so a deployment that narrowed the menu cannot be talked
+    past by a client that knows a label the operator removed. The refusal names
+    the whole menu, which it may do without leaking anything: the allow-list
+    holds labels, never credentials.
+    """
+    folded = value.strip().casefold()
+    offered = endpoints.offered_labels()
+    if folded not in offered:
+        raise SettingRefused(
+            f"{name} must be an endpoint this deployment offers "
+            f"({', '.join(offered)}), got {value!r}"
+        )
+    return folded
+
+
 def _daily_time(name: str, value: str) -> str:
     """A validator accepting a 24-hour ``HH:MM`` local wall-clock time."""
     try:
@@ -343,6 +376,13 @@ class Setting:
     explanation a surface shows on demand, and is ``None`` when the summary
     says it all. Both are copy the system delivers, so a sentence in either
     has to be a fact the runtime actually performs.
+
+    ``choices`` is a **callable** rather than a tuple because one key's choice
+    list is not fixed at import: the endpoints a deployment offers come from an
+    environment variable, and a tuple captured here would report the menu this
+    process started with rather than the one in force. It returns the values a
+    surface should offer as a closed set — a select rather than a text box —
+    and ``None`` means the key is free-form.
     """
 
     name: str
@@ -355,6 +395,7 @@ class Setting:
     writable: bool = True
     refusal: str | None = None
     on_invalid: str | None = ON_INVALID_FALLBACK
+    choices: Callable[[], tuple[str, ...]] | None = None
 
     def __post_init__(self) -> None:
         """Refuse a posture on a key that has no check to have a posture about.
@@ -373,22 +414,67 @@ class Setting:
             raise ValueError(f"{self.name}: a validated key must say what a bad value does")
 
 
-#: Why the four environment-only names cannot be written here. Each is read
-#: before or outside the window in which a settings file could matter, or it
-#: decides where something on the server's own disk is read from — which is not
-#: a decision a remote surface gets to make.
+#: Why the five environment-only names cannot be written here. Each is read
+#: before or outside the window in which a settings file could matter, it
+#: decides where something on the server's own disk is read from, or it bounds
+#: what a stored value is allowed to say — none of which is a decision a remote
+#: surface gets to make.
 _ENV_ONLY_DB = (
     "the database path is read before the graph — and therefore before its "
     "settings file — is open; set it with --db or in the environment"
 )
+#: **The scope of this sentence narrowed when the endpoint select shipped, and
+#: the narrowing is the whole feature.** It used to say the endpoint itself was
+#: never a stored decision. What stays true — and is what it now says — is that
+#: the *set* of endpoints a key may travel to is the deployment's to fix: this
+#: variable names one outright, ``NODUM_LLM_ENDPOINTS`` bounds the menu, and
+#: both are environment-only. Choosing among that menu is stored, because every
+#: member of it was compiled into :mod:`nodum.endpoints` rather than typed into
+#: a form, and each carries its own credential so a choice cannot move a key to
+#: an endpoint it was not entered for.
 _ENV_ONLY_BASE_URL = (
-    "the endpoint an API key may travel to is a deployment decision, not a "
-    "stored one; set it in the environment"
+    "which endpoints an API key may travel to is a deployment decision; this "
+    "names one outright and NODUM_LLM_ENDPOINTS bounds the menu the settings "
+    "page offers — set either in the environment"
 )
+_ENV_ONLY_ENDPOINTS = (
+    "this is the menu the endpoint select may choose from, so a stored value "
+    "would let a browser widen its own choices; set it in the environment"
+)
+#: The reasoning levels, weakest first. Stated once because both the validator
+#: for ``NODUM_LLM_THINKING`` and the choice list a surface renders read it, and
+#: a select offering a level the validator refuses is a form nobody can submit.
+#: :data:`nodum.llm.THINKING_LEVELS` is the runtime's copy of the same set.
+_THINKING_LEVELS = ("none", "low", "medium", "high")
+
 _ENV_ONLY_EMBED_CACHE = "this is a path on the server's own disk; set it in the environment"
 _ENV_ONLY_PUBLIC_URL = (
     "every capability URL is minted from it, so a stored value would redirect "
     "them; set it in the environment"
+)
+
+#: One secret row per endpoint that authenticates, generated from the registry
+#: in its order. Spliced into :data:`_SPECS` beside the endpoint select rather
+#: than appended, so ``nodum config list`` reads in the order an operator
+#: configures things: pick the endpoint, then give it its key.
+_ENDPOINT_KEY_SPECS: tuple[Setting, ...] = tuple(
+    Setting(
+        name=endpoints.key_setting(endpoint.label),
+        kind="secret",
+        default=None,
+        summary=f"Bearer token for the {endpoint.title} endpoint.",
+        help=(
+            f"Sent only when {LLM_ENDPOINT} selects {endpoint.label!r}, and to "
+            f"{endpoint.base_url} and nowhere else. Each endpoint holding its own "
+            f"key is what stops a change of selection from posting a credential "
+            f"to a vendor it was not issued for. Never serialised: every surface "
+            f"reports set/unset and no value."
+        ),
+        secret=True,
+        on_invalid=None,
+    )
+    for endpoint in endpoints.ENDPOINTS
+    if endpoint.takes_key
 )
 
 _SPECS: tuple[Setting, ...] = (
@@ -438,10 +524,39 @@ _SPECS: tuple[Setting, ...] = (
         on_invalid=None,
     ),
     Setting(
+        name=LLM_ENDPOINT,
+        kind="enum",
+        default=None,
+        summary="Which shipped endpoint to call; unset means the local default.",
+        help=(
+            "The endpoints this build ships are compiled in, and "
+            "NODUM_LLM_ENDPOINTS decides which of them this deployment offers — "
+            "so choosing one here can never name a URL of its own. Each "
+            "endpoint carries its own key, so changing this changes which "
+            "credential is sent along with where it goes. "
+            "NODUM_LLM_BASE_URL still wins over it, for a self-hosted gateway "
+            "nodum ships nothing about."
+        ),
+        validate=_endpoint_label,
+        on_invalid=ON_INVALID_REFUSE,
+        choices=endpoints.offered_labels,
+    ),
+    *_ENDPOINT_KEY_SPECS,
+    Setting(
+        name=LLM_ENDPOINTS,
+        kind="string",
+        default=None,
+        summary="Comma-separated labels the endpoint select may offer; unset means all.",
+        help=_ENV_ONLY_ENDPOINTS,
+        writable=False,
+        refusal=_ENV_ONLY_ENDPOINTS,
+        on_invalid=None,
+    ),
+    Setting(
         name=LLM_BASE_URL,
         kind="url",
-        default="http://localhost:11434/v1",
-        summary="OpenAI-compatible base URL; a shipped profile may supply it.",
+        default=endpoints.LOCAL_BASE_URL,
+        summary="OpenAI-compatible base URL; overrides the endpoint select.",
         help=_ENV_ONLY_BASE_URL,
         writable=False,
         refusal=_ENV_ONLY_BASE_URL,
@@ -451,12 +566,15 @@ _SPECS: tuple[Setting, ...] = (
         name=LLM_API_KEY,
         kind="secret",
         default=None,
-        summary="Bearer token, sent only to an endpoint somebody named.",
+        summary="Bearer token for the endpoint NODUM_LLM_BASE_URL names.",
         help=(
-            "Optional: the local default endpoint needs no key, and the key "
-            "travels only to an endpoint somebody named — NODUM_LLM_BASE_URL, "
-            "or a model id a shipped profile serves. It is never serialised: "
-            "every surface reports set/unset and no value."
+            "Optional, and used only on the path that does not go through the "
+            "endpoint select: the key travels to an endpoint somebody named — "
+            "NODUM_LLM_BASE_URL, or a model id a shipped profile serves — and "
+            "is dropped rather than posted to a host nodum picked. When "
+            "NODUM_LLM_ENDPOINT selects an endpoint, that endpoint's own "
+            "NODUM_LLM_KEY_* is sent and this one is not. It is never "
+            "serialised: every surface reports set/unset and no value."
         ),
         secret=True,
         on_invalid=None,
@@ -474,8 +592,12 @@ _SPECS: tuple[Setting, ...] = (
         kind="enum",
         default="high",
         summary="The reasoning level: none, low, medium or high.",
-        validate=_one_of(("none", "low", "medium", "high")),
+        validate=_one_of(_THINKING_LEVELS),
         on_invalid=ON_INVALID_REFUSE,
+        # The one other closed set in the registry. Naming the same tuple the
+        # validator uses is the point: a select offering a value the validator
+        # refuses is a form that cannot be submitted.
+        choices=lambda: _THINKING_LEVELS,
     ),
     Setting(
         name=LLM_CYCLE_BUDGET,
@@ -1728,6 +1850,10 @@ def _describe(name: str, view: Snapshot, stored: Mapping[str, str]) -> SettingOu
         on_invalid=spec.on_invalid,
         summary=spec.summary,
         help=spec.help,
+        # Called here rather than read off the spec: the endpoint menu comes
+        # from the environment, so a list captured at import would report the
+        # menu this process started with.
+        choices=list(spec.choices()) if spec.choices is not None else None,
     )
 
 
@@ -1757,8 +1883,8 @@ def list_settings() -> SettingsOut:
     Returns:
         The :class:`~nodum.models.SettingsOut` envelope: the rows, the bound
         path, any keys the file carries that this build does not configure,
-        why the file could not be read when it could not, and which optional
-        extras this build can serve.
+        why the file could not be read when it could not, which optional
+        extras this build can serve, and the endpoints it offers.
     """
     store = _store()
     reading = _current(store)
@@ -1770,6 +1896,16 @@ def list_settings() -> SettingsOut:
         unknown_keys=list(reading.unknown),
         unreadable=view.unreadable,
         capabilities=_capabilities(),
+        endpoints=[
+            EndpointOut(
+                label=endpoint.label,
+                title=endpoint.title,
+                base_url=endpoint.base_url,
+                key=endpoints.key_setting(endpoint.label) if endpoint.takes_key else None,
+                window_note=endpoint.window_note,
+            )
+            for endpoint in endpoints.offered()
+        ],
     )
 
 

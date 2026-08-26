@@ -45,7 +45,7 @@ from helpers import agent as agent_principal
 from helpers import owner
 from typer.testing import CliRunner
 
-from nodum import agent, cli, db, embeddings, extract, llm, service, settings, urls
+from nodum import agent, cli, db, embeddings, endpoints, extract, llm, service, settings, urls
 
 runner = CliRunner()
 
@@ -695,6 +695,16 @@ def test_free_text_keys_report_no_bad_value_posture(store):
         settings.LLM_MODEL,
         settings.LLM_BASE_URL,
         settings.LLM_API_KEY,
+        # The endpoint allow-list is free text on purpose: a label in it that
+        # this build does not ship is skipped rather than refused, so that a
+        # deployment pinned to an older image does not fail to boot over a name
+        # from a newer one. There is no value of it that is *wrong* here — only
+        # names this build has nothing to do with.
+        settings.LLM_ENDPOINTS,
+        # One per endpoint that authenticates. A bearer token has no shape this
+        # can check; a wrong one is a 401 from the endpoint, exactly as
+        # NODUM_LLM_API_KEY's already was.
+        *settings.ENDPOINT_KEYS,
         settings.EMBED_MODEL,
         settings.EMBED_CACHE,
         settings.AUDIO_MODEL,
@@ -1246,16 +1256,22 @@ def test_the_stored_api_key_never_reaches_a_surface(store, fresh_db):
         # Free text: there is no invalid value for it, so there is no posture
         # to report. A wrong key is a 401 from the endpoint, not a refusal here.
         "on_invalid": None,
-        "summary": "Bearer token, sent only to an endpoint somebody named.",
+        "summary": "Bearer token for the endpoint NODUM_LLM_BASE_URL names.",
         # The never-serialised rule is the whole reason this row looks the way
         # it does, so the longer help states it rather than leaving the reader
-        # to wonder where the value went.
+        # to wonder where the value went. It also has to say which path this key
+        # is on now: an endpoint chosen with NODUM_LLM_ENDPOINT sends its own
+        # NODUM_LLM_KEY_*, and reading this row as "the key" would be wrong.
         "help": (
-            "Optional: the local default endpoint needs no key, and the key "
-            "travels only to an endpoint somebody named — NODUM_LLM_BASE_URL, "
-            "or a model id a shipped profile serves. It is never serialised: "
-            "every surface reports set/unset and no value."
+            "Optional, and used only on the path that does not go through the "
+            "endpoint select: the key travels to an endpoint somebody named — "
+            "NODUM_LLM_BASE_URL, or a model id a shipped profile serves — and "
+            "is dropped rather than posted to a host nodum picked. When "
+            "NODUM_LLM_ENDPOINT selects an endpoint, that endpoint's own "
+            "NODUM_LLM_KEY_* is sent and this one is not. It is never "
+            "serialised: every surface reports set/unset and no value."
         ),
+        "choices": None,
     }
 
 
@@ -1785,3 +1801,95 @@ def test_the_service_settings_gate_refuses_an_agent_principal(store):
         service.unset_setting(settings.LLM_MODEL, principal=agent_principal("researcher"))
     with pytest.raises(service.GrantNotPermitted, match="only a human may configure nodum"):
         service.adopt_environment(principal=agent_principal("researcher"))
+
+
+# ── The endpoint select ───────────────────────────────────────────────────────
+
+
+def test_the_endpoint_select_offers_only_what_the_deployment_allows(store, monkeypatch):
+    """The menu is the deployment's, and the row a surface renders says so.
+
+    ``choices`` is called per report rather than captured at import for exactly
+    this reason: the variable can change without the process restarting, and a
+    select built from a stale list offers an endpoint the validator refuses.
+    """
+    monkeypatch.setenv(settings.LLM_ENDPOINTS, "deepseek,kimi")
+    row = next(r for r in settings.list_settings().settings if r.key == settings.LLM_ENDPOINT)
+    assert row.choices == ["deepseek", "kimi"]
+    assert [e.label for e in settings.list_settings().endpoints] == ["deepseek", "kimi"]
+
+
+def test_storing_an_endpoint_the_deployment_removed_is_refused(store, monkeypatch):
+    """The write path is checked against the menu, not against the whole registry.
+
+    Otherwise a client that remembered a label the operator took off the menu
+    could put it back by writing it, which would make the allow-list advisory.
+    """
+    monkeypatch.setenv(settings.LLM_ENDPOINTS, "local,deepseek")
+    with pytest.raises(settings.SettingRefused) as refusal:
+        settings.set_value(settings.LLM_ENDPOINT, "openrouter")
+    assert "local, deepseek" in str(refusal.value)
+
+    settings.set_value(settings.LLM_ENDPOINT, "deepseek")
+    assert settings.snapshot().value(settings.LLM_ENDPOINT) == "deepseek"
+
+
+def test_an_allow_list_naming_nothing_this_build_ships_falls_back_to_all(monkeypatch):
+    """A settings page with an empty select and no explanation is the worse failure.
+
+    The same forgiveness covers the real case it exists for: a deployment pinned
+    to an older image whose allow-list names an endpoint only a newer one ships.
+    """
+    monkeypatch.setenv(settings.LLM_ENDPOINTS, "nothing-by-this-name")
+    assert endpoints.offered() == endpoints.ENDPOINTS
+
+    monkeypatch.setenv(settings.LLM_ENDPOINTS, "deepseek,from-a-newer-build")
+    assert [e.label for e in endpoints.offered()] == ["deepseek"]
+
+
+def test_every_endpoint_key_is_secret_and_never_serialised(store):
+    """Generated rows join SECRET_KEYS by construction, so adding one cannot forget.
+
+    The registry builds both the row and the secrecy from the same iteration —
+    the alternative was a hand-kept list that would have gone stale silently,
+    and the staleness would have been a credential printed to a surface.
+    """
+    assert set(settings.ENDPOINT_KEYS) <= settings.SECRET_KEYS
+    for name in settings.ENDPOINT_KEYS:
+        assert settings.SPECS[name].secret is True
+
+    name = endpoints.key_setting("deepseek")
+    settings.set_value(name, "sk-should-never-be-printed")
+    row = settings.get_setting(name)
+    assert row.value is None
+    assert row.set is True
+    report = settings.list_settings().model_dump_json()
+    assert "sk-should-never-be-printed" not in report
+
+
+def test_every_endpoint_label_makes_a_legal_environment_variable_name(store):
+    """A label folded into a key name has to survive the fold uniquely.
+
+    Two labels differing only in a character that folds away here would share
+    one credential, which is the failure mode the whole per-endpoint scheme
+    exists to prevent — so the fold is checked rather than assumed.
+    """
+    names = [endpoints.key_setting(e.label) for e in endpoints.ENDPOINTS if e.takes_key]
+    assert len(set(names)) == len(names), "two endpoints fold to one key name"
+    for name in names:
+        assert settings._KEY_SHAPE.match(name), name
+        assert name in settings.SPECS
+
+
+def test_the_endpoint_registry_asserts_no_window_it_cannot_know(store):
+    """Under-asserting is loud and recoverable; over-asserting truncates silently.
+
+    Kimi runs 8k to 1M across its model ids and OpenRouter fronts hundreds of
+    models between 4k and 1M, so neither endpoint has *a* window. Each says so
+    with a null and carries the sentence the operator needs instead.
+    """
+    for endpoint in endpoints.ENDPOINTS:
+        if endpoint.context_tokens is None:
+            assert endpoint.window_note, f"{endpoint.label} guesses nothing and explains nothing"
+        else:
+            assert endpoint.window_note is None, f"{endpoint.label} both asserts and hedges"

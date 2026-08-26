@@ -29,12 +29,14 @@ import type { FailureDescription } from "../../lib";
 import {
   EMBED_DOWNLOAD_NOTE,
   EMBED_MODEL_KEY,
+  ENDPOINT_KEY,
   EXPORT_FILENAME,
-  GROUPS,
   PROFILE_DEFAULT_NOTE,
   WITH_KEYS_EXPORT_CONFIRM,
   adoptPreview,
   editBlocker,
+  endpointTitle,
+  groupsFor,
   isModelChange,
   layerLabel,
   liveness,
@@ -139,6 +141,17 @@ export default function SettingsView() {
   );
   const eventsByKey = useMemo(() => lastSettingsEventBy(events), [events]);
   const capabilities = report?.capabilities ?? {};
+  // The endpoint group's credential rows come from the report, so the page
+  // renders exactly the endpoints this deployment offers and never a key field
+  // for one it does not.
+  const groups = useMemo(() => groupsFor(report?.endpoints ?? []), [report]);
+  // The window note belongs to the selected endpoint, and it is what the
+  // context-tokens row has to say instead of the shipped-profile sentence:
+  // Kimi and OpenRouter front many models, so nodum asserts no window for them.
+  const selectedEndpoint = useMemo(() => {
+    const chosen = rowsByKey.get(ENDPOINT_KEY)?.value ?? null;
+    return (report?.endpoints ?? []).find((one) => one.label === chosen) ?? null;
+  }, [report, rowsByKey]);
   const adoptCandidates = useMemo(
     () => (report ? adoptPreview(report.settings).candidates : []),
     [report],
@@ -414,7 +427,7 @@ export default function SettingsView() {
         </div>
       ) : null}
 
-      {GROUPS.map((group) => (
+      {groups.map((group) => (
         <section key={group.id} className="nd-card nd-set-section">
           <h2 className="nd-set-section__title">{group.title}</h2>
           {group.keys.map((key) => {
@@ -456,17 +469,42 @@ export default function SettingsView() {
                     />
                   ) : (
                     <>
-                      <input
-                        name={key}
-                        className="nd-input nd-input--mono"
-                        type={row.secret ? "password" : "text"}
-                        placeholder={row.secret ? (row.set ? "set" : "not set") : "not set"}
-                        value={draft ?? (row.secret ? "" : (row.value ?? ""))}
-                        onChange={(event) =>
-                          setDraft(key, (event.target as HTMLInputElement).value)
-                        }
-                        aria-label={key}
-                      />
+                      {row.choices ? (
+                        // A closed set is a select, so the page cannot submit a
+                        // value the server's validator would refuse. The empty
+                        // option is "not set" and is offered only while the row
+                        // really is unset — picking it back would be a write of
+                        // the empty string, which the API refuses; unsetting is
+                        // what the Remove button next to it does.
+                        <select
+                          name={key}
+                          className="nd-input nd-input--mono"
+                          value={draft ?? (row.value ?? "")}
+                          onChange={(event) =>
+                            setDraft(key, (event.target as HTMLSelectElement).value)
+                          }
+                          aria-label={key}
+                        >
+                          {row.value === null ? <option value="">not set</option> : null}
+                          {row.choices.map((choice) => (
+                            <option key={choice} value={choice}>
+                              {endpointTitle(report.endpoints, choice) ?? choice}
+                            </option>
+                          ))}
+                        </select>
+                      ) : (
+                        <input
+                          name={key}
+                          className="nd-input nd-input--mono"
+                          type={row.secret ? "password" : "text"}
+                          placeholder={row.secret ? (row.set ? "set" : "not set") : "not set"}
+                          value={draft ?? (row.secret ? "" : (row.value ?? ""))}
+                          onChange={(event) =>
+                            setDraft(key, (event.target as HTMLInputElement).value)
+                          }
+                          aria-label={key}
+                        />
+                      )}
                       <button
                         type="button"
                         className="nd-button nd-button--primary nd-button--small"
@@ -514,7 +552,18 @@ export default function SettingsView() {
                     <span> · the previous secret value cannot be restored — re-enter it</span>
                   ) : null}
                   {key === "NODUM_LLM_CONTEXT_TOKENS" ? (
-                    <span className="nd-set-row__note"> · {PROFILE_DEFAULT_NOTE}</span>
+                    <span className="nd-set-row__note">
+                      {" · "}
+                      {/*
+                        The selected endpoint's own sentence wins over the
+                        shipped-profile one. For an endpoint that fronts many
+                        models nodum asserts no window at all, so the generic
+                        "a profile serves its own larger window" would be
+                        exactly backwards: there is no profiled window here and
+                        this row is the only thing that can supply it.
+                      */}
+                      {selectedEndpoint?.window_note ?? PROFILE_DEFAULT_NOTE}
+                    </span>
                   ) : null}
                 </div>
                 {key === "NODUM_EMBED_DOWNLOAD" ? (
