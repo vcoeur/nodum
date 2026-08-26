@@ -102,6 +102,7 @@ PY_TO_TS: dict[str, str] = {
     # no secret value is ever carried on any of them.
     "SettingOut": "SettingOut",
     "SettingsOut": "SettingsOut",
+    "EndpointOut": "EndpointOut",
     "SettingChangeOut": "SettingChangeOut",
     "SettingAdoptSkippedOut": "SettingAdoptSkippedOut",
     "SettingAdoptOut": "SettingAdoptOut",

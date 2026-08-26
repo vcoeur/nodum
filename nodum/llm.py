@@ -173,11 +173,11 @@ import urllib.parse
 import urllib.request
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, NamedTuple, Protocol
+from typing import Any, Protocol
 
 from pydantic import BaseModel
 
-from nodum import settings
+from nodum import endpoints, settings
 
 #: The one thing in this module that is neither a refusal nor a number a caller
 #: reads back. A provider whose own ``usage`` block contradicts itself is not a
@@ -188,7 +188,11 @@ _log = logging.getLogger(__name__)
 
 #: Local default: what ``ollama serve`` exposes. Both halves of the provider
 #: talk this surface — see the module docstring for why there is only one class.
-DEFAULT_BASE_URL = "http://localhost:11434/v1"
+#:
+#: Re-exported from :mod:`nodum.endpoints` rather than spelled twice: the local
+#: endpoint is a row in that registry now, so the URL and the beliefs that go
+#: with it (a 4 096-token window, no graded reasoning) are stated in one place.
+DEFAULT_BASE_URL = endpoints.LOCAL_BASE_URL
 
 #: The context window assumed when :data:`ENV_CONTEXT_TOKENS` is unset.
 #: 4 096 is the measured window of the local default model, and the number the
@@ -238,7 +242,13 @@ MAX_BYTES_PER_TOKEN = 6
 #: Structured output enforced by the server's constrained decoding: a string the
 #: schema forbids is *unrepresentable*, not merely discouraged. What
 #: :mod:`nodum.answers` relies on when it puts a ``pattern`` on a citation.
-STRUCTURED_JSON_SCHEMA = "json_schema"
+#:
+#: The three structured-mode names live in :mod:`nodum.endpoints` because the
+#: registry there states one per endpoint, and that module may not import this
+#: one. They are re-exported under their original names so that
+#: ``llm.STRUCTURED_JSON_SCHEMA`` — which :mod:`nodum.agent` re-exports again and
+#: the tests spell directly — keeps meaning what it meant.
+STRUCTURED_JSON_SCHEMA = endpoints.STRUCTURED_JSON_SCHEMA
 
 #: Structured output as "this will be a JSON object", with the schema demoted to
 #: a sentence in the prompt. The envelope is still enforced — the body parses —
@@ -246,10 +256,10 @@ STRUCTURED_JSON_SCHEMA = "json_schema"
 #: **This is a real reduction in what a caller may assume**, which is why it is
 #: named on the completion, on the run and in ``nodum llm status`` rather than
 #: happening quietly.
-STRUCTURED_JSON_OBJECT = "json_object"
+STRUCTURED_JSON_OBJECT = endpoints.STRUCTURED_JSON_OBJECT
 
 #: No ``response_format`` at all — what a call with no schema sends.
-STRUCTURED_NONE = "none"
+STRUCTURED_NONE = endpoints.STRUCTURED_NONE
 
 #: The reasoning level that turns thinking off. Distinguished from the others
 #: because it is the only one every endpoint measured accepts (ollama 400s on
@@ -825,78 +835,40 @@ def estimate_prompt_tokens(messages: Sequence[Message]) -> int:
     )
 
 
-class ProviderProfile(NamedTuple):
-    """What this ships knowing about one endpoint, so it need not be configured.
+#: What this ships knowing about one endpoint, so it need not be configured.
+#:
+#: An alias for :class:`nodum.endpoints.Endpoint`, kept under the old name
+#: because this module's callers and tests spell it. **The table moved and its
+#: charter changed with it**: it used to be "deliberately not a vendor registry
+#: — a profile earns its place by being an endpoint whose defaults are wrong
+#: otherwise", which was right while :func:`profile_for` was its only reader.
+#: It now also feeds the settings page's endpoint select, and a menu that lists
+#: only the endpoints with surprising defaults is not a menu. See
+#: :mod:`nodum.endpoints` for the reversal in full.
+#:
+#: Every field is still a **default**, overridden by the matching setting
+#: whenever one is set — a profile decides nothing an operator has decided.
+ProviderProfile = endpoints.Endpoint
 
-    Every field is a **default**, overridden by the matching environment
-    variable whenever one is set — a profile decides nothing an operator has
-    already decided. It exists so that pointing nodum at a known endpoint is a
-    model name and a key, rather than four variables the first of which
-    (a wrong ``NODUM_LLM_CONTEXT_TOKENS``) silently re-opens the truncation hole
-    this module is mostly about.
-
-    Attributes:
-        models: The **exact** model ids this endpoint serves, which is what
-            selects the profile when no base URL is configured. Exact, never a
-            prefix — see :func:`profile_for`.
-        hosts: The hostnames that *are* this endpoint. Compared to a parsed
-            hostname, never as a substring of a URL.
-        base_url: The endpoint, when :data:`ENV_BASE_URL` is unset.
-        context_tokens: The window the endpoint really serves.
-        structured_mode: Which ``response_format`` to try first, so a known
-            provider pays no failed round trip discovering it.
-        graded_thinking: Whether ``reasoning_effort`` above ``none`` is accepted.
-    """
-
-    models: frozenset[str]
-    hosts: frozenset[str]
-    base_url: str
-    context_tokens: int
-    structured_mode: str
-    graded_thinking: bool
-
-
-#: The endpoint DeepSeek's own hosted model ids resolve to.
-DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
+#: The endpoint DeepSeek's own hosted model ids resolve to. Two refusal messages
+#: quote it as the worked example of a full OpenAI-compatible root.
+DEEPSEEK_BASE_URL = endpoints.DEEPSEEK_BASE_URL
 
 #: Endpoints this ships knowing about, keyed by exact model id and by hostname.
 #:
-#: Deliberately tiny, and deliberately not a vendor registry: a profile earns
-#: its place by being an endpoint whose *defaults are wrong* otherwise. DeepSeek
-#: is the only row, because it is the only endpoint measured on which all four
-#: fields differ from this module's defaults.
-#:
-#: **ollama is not a row and does not need one.** Three of its four values are
-#: already the defaults here (4 096, ``json_schema``, its own base URL), and the
-#: fourth — it answers 400 to every graded reasoning level, including on
-#: ``qwen3:8b``, which thinks — is decided in :func:`_resolve_default` by
-#: comparing the resolved base URL against :data:`DEFAULT_BASE_URL`. A profile
-#: keyed on model ids could not have carried it anyway: ollama serves whatever
-#: the operator pulled, so there is no list of exact ids to match.
+#: **ollama is a row now, but only so it can be chosen** — it carries no hosts
+#: and no model ids, so nothing here matches it and the comparison in
+#: :func:`_resolve_default` still decides its one non-default belief (it answers
+#: 400 to every graded reasoning level, including on ``qwen3:8b``, which
+#: thinks). Giving the row a ``localhost`` host would have retired that
+#: comparison and been wrong: it would claim every service on the loopback is
+#: ollama, and ``graded_thinking`` false is not negotiated upward, so a local
+#: gateway that does accept graded reasoning would never be sent it.
 #:
 #: A provider that is *not* recognised keeps the optimistic beliefs and
 #: negotiates them down on the first 400, so this table is an optimisation and
 #: never a gate.
-_PROFILES: tuple[ProviderProfile, ...] = (
-    ProviderProfile(
-        # The two ids `GET https://api.deepseek.com/models` really lists. A
-        # model id is an exact string and this list is short, so there is no
-        # reason to guess at one — and guessing is what made this dangerous;
-        # see `profile_for`.
-        models=frozenset({"deepseek-v4-flash", "deepseek-v4-pro"}),
-        hosts=frozenset({"api.deepseek.com"}),
-        base_url=DEEPSEEK_BASE_URL,
-        # Measured on `deepseek-v4-flash`: a 1 000 000-token context and a
-        # 384 000-token max output, which are separate limits rather than
-        # one shared window — the reservation is harmless there and
-        # load-bearing on ollama, so it is kept for both.
-        context_tokens=1_000_000,
-        # Measured: `json_schema` is HTTP 400 "This response_format type is
-        # unavailable now"; `json_object` works.
-        structured_mode=STRUCTURED_JSON_OBJECT,
-        graded_thinking=True,
-    ),
-)
+_PROFILES: tuple[endpoints.Endpoint, ...] = endpoints.ENDPOINTS
 
 
 def _hostname(base_url: str) -> str:
@@ -1027,10 +999,12 @@ def profile_for(*, model: str, base_url: str | None) -> ProviderProfile | None:
         # The operator named the endpoint, so nothing but the endpoint decides:
         # a profile applies only where it *is* the host being pointed at, and
         # then its window is that host's own.
-        host = _hostname(base_url)
-        return next((profile for profile in _PROFILES if host in profile.hosts), None)
-    name = model.casefold()
-    return next((profile for profile in _PROFILES if name in profile.models), None)
+        return endpoints.for_host(_hostname(base_url))
+    # Only a row carrying exact model ids can match here, which is DeepSeek
+    # alone. The endpoints added for the settings select carry none on purpose —
+    # auto-routing a bare model name to a vendor is the mistake documented
+    # above, and widening it would mean guessing which vendor owns a name.
+    return endpoints.for_model(model)
 
 
 def estimate_content_tokens(messages: Sequence[Message]) -> int:
@@ -1915,7 +1889,34 @@ def _resolve_default() -> tuple[LLMProvider | None, str | None, str | None]:
             None,
         )
     configured_base = (config.explicit(settings.LLM_BASE_URL) or "").strip() or None
-    profile = profile_for(model=model, base_url=configured_base)
+    # The selected endpoint sits *between* the two layers that already existed:
+    # `ENV_BASE_URL` still wins outright, because it is the operator's escape
+    # hatch to a self-hosted gateway this ships nothing about, and a stored
+    # selection that could override it would let a browser move a call off the
+    # endpoint the deployment pinned. Below it, the selection beats matching on
+    # a model name, because it is an endpoint somebody *chose* rather than one
+    # inferred from a string.
+    selected: endpoints.Endpoint | None = None
+    if configured_base is None:
+        raw_label = (config.value(settings.LLM_ENDPOINT) or "").strip()
+        if raw_label:
+            selected = endpoints.shipped(raw_label)
+            if selected is None or selected not in endpoints.offered():
+                # Refused rather than ignored. A selection that silently fell
+                # back to the local default would send prompts somewhere other
+                # than where the settings page says they go, which is the one
+                # failure this whole feature exists to make impossible.
+                return (
+                    None,
+                    (
+                        f"{settings.LLM_ENDPOINT}={raw_label!r} (from "
+                        f"{config.source(settings.LLM_ENDPOINT)}) is not an endpoint this "
+                        f"deployment offers (one of: "
+                        f"{', '.join(endpoints.offered_labels())})"
+                    ),
+                    None,
+                )
+    profile = selected or profile_for(model=model, base_url=configured_base)
     default_base = profile.base_url if profile is not None else DEFAULT_BASE_URL
     base_url = configured_base or default_base
     problem = base_url_problem(base_url)
@@ -1945,9 +1946,23 @@ def _resolve_default() -> tuple[LLMProvider | None, str | None, str | None]:
             + f" — for example {DEFAULT_BASE_URL} or {DEEPSEEK_BASE_URL}",
             None,
         )
-    api_key = (config.value(settings.LLM_API_KEY) or "").strip() or None
     key_withheld: str | None = None
-    if api_key is not None and configured_base is None and profile is None:
+    if selected is not None:
+        # **A selected endpoint may only ever send its own key.** This is the
+        # whole security argument for per-endpoint secrets rather than one
+        # `ENV_API_KEY` plus a selector: with a shared key, changing the select
+        # in a browser would post the credential issued for one vendor to
+        # another — the same class of mistake as the withheld-key branch below,
+        # but reachable from a surface that needs no shell access. There is
+        # nothing to withhold here because there is no key to send but this one.
+        api_key = (
+            (config.value(endpoints.key_setting(selected.label)) or "").strip() or None
+            if selected.takes_key
+            else None
+        )
+    else:
+        api_key = (config.value(settings.LLM_API_KEY) or "").strip() or None
+    if api_key is not None and selected is None and configured_base is None and profile is None:
         key_withheld = (
             f"{ENV_API_KEY} is set and is not being sent: nothing named an endpoint for it. "
             f"{ENV_MODEL}={model!r} is not a hosted model id this ships a profile for and "
@@ -1958,7 +1973,14 @@ def _resolve_default() -> tuple[LLMProvider | None, str | None, str | None]:
         )
         api_key = None
     raw_context = (config.explicit(settings.LLM_CONTEXT_TOKENS) or "").strip()
-    context_tokens = profile.context_tokens if profile is not None else DEFAULT_CONTEXT_TOKENS
+    # A profile whose `context_tokens` is None serves many windows and says so
+    # rather than guessing — Kimi runs 8k to 1M across its ids, OpenRouter 4k to
+    # 1M across hundreds. Falling back to the shipped default under-asserts,
+    # which surfaces as a refusal the operator reads and fixes in one field;
+    # asserting the endpoint's flagship number instead would re-open the silent
+    # truncation this module is mostly about. See `nodum.endpoints.ENDPOINTS`.
+    profiled_window = profile.context_tokens if profile is not None else None
+    context_tokens = profiled_window if profiled_window is not None else DEFAULT_CONTEXT_TOKENS
     if raw_context:
         try:
             context_tokens = int(raw_context)

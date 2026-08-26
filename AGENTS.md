@@ -78,19 +78,37 @@ The invariants that must never be broken, whatever the section:
   names — a model change invalidates the embedding snapshot, which is why it is
   coupled to `projector rebuild vec` and why the MCP `search` tool runs off the
   event loop.
-  `NODUM_LLM_BASE_URL` is environment-only by *policy* (`writable=False`: the
-  endpoint an API key may travel to is a deployment decision) and is still
-  resolved **through the seam**, in `nodum/llm.py`, which is the pattern the
-  rule above mandates. Reading it with `os.environ` would be a violation.
+  `NODUM_LLM_BASE_URL` and `NODUM_LLM_ENDPOINTS` are environment-only by
+  *policy* (`writable=False`: which endpoints an API key may travel to is a
+  deployment decision — the first names one outright, the second bounds the menu
+  the settings page offers) and are still resolved **through the seam**, in
+  `nodum/llm.py`, which is the pattern the rule above mandates. Reading either
+  with `os.environ` would be a violation. **`nodum/endpoints.py` is the one
+  deliberate exception**: it reads `NODUM_LLM_ENDPOINTS` with `os.environ`
+  because it is the leaf both `nodum/settings.py` and `nodum/llm.py` import, so
+  it cannot import the seam — and the variable is environment-only by
+  construction, since a browser that could edit the menu it chooses from is not
+  a menu.
   The settings path is **threaded in** from the database path the caller
   resolved (`settings.bind`), never re-derived — `nodum serve --db PATH` does
   not set `NODUM_DB`, so a module reading the environment for itself serves one
   graph and reads configuration beside another.
-- **`NODUM_LLM_API_KEY` is never serialised.** It is in
-  `nodum.settings.SECRET_KEYS`, and that is a structural rule rather than a
-  habit: a surface reports whether it is set, an event payload records
-  `set`/`unset`, and no exception message quotes it. A new secret joins the
-  frozenset; it does not get its own redaction at each call site.
+- **`NODUM_LLM_API_KEY` and every `NODUM_LLM_KEY_<LABEL>` are never
+  serialised.** They are in `nodum.settings.SECRET_KEYS`, and that is a
+  structural rule rather than a habit: a surface reports whether one is set, an
+  event payload records `set`/`unset`, and no exception message quotes it. A new
+  secret joins the frozenset; it does not get its own redaction at each call
+  site. The per-endpoint keys join it **by construction** — they are generated
+  from `nodum.endpoints.ENDPOINTS` together with their registry rows — so adding
+  an endpoint cannot forget to make its credential secret.
+- **A selected endpoint may only ever send its own key.** `NODUM_LLM_ENDPOINT`
+  chooses from a table compiled into the build, and each row carries its own
+  `NODUM_LLM_KEY_<LABEL>`. Resolving a selection reads that key and no other:
+  the shared `NODUM_LLM_API_KEY` belongs to the `NODUM_LLM_BASE_URL` path alone.
+  This is what makes the select safe to expose to a browser — a shared key plus
+  a selector would let a change of selection post one vendor's credential to
+  another, which is the hole `_resolve_default`'s `key_withheld` branch exists
+  for, reached from a surface that needs no shell access.
 - **One fact, one home.** Rules live in this file, architecture in
   `docs/architecture.md`, measured decisions in `docs/decisions.md`. Do not
   restate a number the decision log records.

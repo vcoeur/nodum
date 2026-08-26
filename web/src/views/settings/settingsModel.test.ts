@@ -1,10 +1,12 @@
 import { describe, expect, it } from "vitest";
-import type { EventOut, SettingOut } from "../../api/types";
+import type { EndpointOut, EventOut, SettingOut } from "../../api/types";
 import {
   EMBED_DOWNLOAD_NOTE,
   adoptPreview,
   editBlocker,
+  endpointTitle,
   GROUPS,
+  groupsFor,
   isEditable,
   isModelChange,
   layerLabel,
@@ -32,6 +34,20 @@ function row(overrides: Partial<SettingOut> & { key: string }): SettingOut {
     on_invalid: null,
     summary: "A summary.",
     help: null,
+    // Free-form by default: a closed set is the exception, and a row that
+    // claimed one would render a select in every test that did not ask for it.
+    choices: null,
+    ...overrides,
+  };
+}
+
+/** An endpoint factory: the fields the select and its key row read. */
+function endpoint(overrides: Partial<EndpointOut> & { label: string }): EndpointOut {
+  return {
+    title: overrides.label,
+    base_url: "https://example.invalid/v1",
+    key: null,
+    window_note: null,
     ...overrides,
   };
 }
@@ -49,20 +65,56 @@ function event(key: string, before: string | null): EventOut {
 }
 
 describe("grouping", () => {
-  it("covers this build's nineteen names exactly once across the six groups", () => {
+  it("covers this build's twenty-one static names exactly once across the seven groups", () => {
+    // The per-endpoint credential rows are not among them: they are built
+    // per report by `groupsFor`, because how many there are is a
+    // deployment's decision rather than this build's.
     const keys = GROUPS.flatMap((group) => group.keys);
-    expect(keys.length).toBe(19);
-    expect(new Set(keys).size).toBe(19);
+    expect(keys.length).toBe(21);
+    expect(new Set(keys).size).toBe(21);
   });
 
-  it("puts the env-only four in the read-only Server group", () => {
+  it("puts the env-only five in the read-only Server group", () => {
     const server = GROUPS.find((group) => group.id === "server");
     expect(server?.keys).toEqual([
       "NODUM_DB",
+      // The menu the endpoint select may choose from. It sits here rather than
+      // beside the select because it is the deployment's bound on that select,
+      // not a thing the page can change.
+      "NODUM_LLM_ENDPOINTS",
       "NODUM_LLM_BASE_URL",
       "NODUM_EMBED_CACHE",
       "NODUM_PUBLIC_URL",
     ]);
+  });
+
+  it("puts each endpoint's key under the select that arms it", () => {
+    const groups = groupsFor([
+      endpoint({ label: "local", title: "Local (ollama)", key: null }),
+      endpoint({ label: "deepseek", title: "DeepSeek", key: "NODUM_LLM_KEY_DEEPSEEK" }),
+      endpoint({ label: "kimi", title: "Kimi (Moonshot)", key: "NODUM_LLM_KEY_KIMI" }),
+    ]);
+    expect(groups.find((group) => group.id === "endpoint")?.keys).toEqual([
+      "NODUM_LLM_ENDPOINT",
+      // `local` contributes none: it authenticates with nothing, so there is no
+      // setting behind it and a field for it would be a field that saves nowhere.
+      "NODUM_LLM_KEY_DEEPSEEK",
+      "NODUM_LLM_KEY_KIMI",
+    ]);
+  });
+
+  it("renders no credential rows for a deployment that offers none", () => {
+    expect(groupsFor([]).find((group) => group.id === "endpoint")?.keys).toEqual([
+      "NODUM_LLM_ENDPOINT",
+    ]);
+  });
+
+  it("shows an endpoint's title for its label and falls back for every other set", () => {
+    const offered = [endpoint({ label: "deepseek", title: "DeepSeek", key: null })];
+    expect(endpointTitle(offered, "deepseek")).toBe("DeepSeek");
+    // The reasoning levels are their own display text, so a miss is a fallback
+    // rather than an error — one option renderer, no per-key branch.
+    expect(endpointTitle(offered, "high")).toBeNull();
   });
 
   it("groups the two embedding names under Embeddings", () => {

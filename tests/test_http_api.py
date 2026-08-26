@@ -5675,7 +5675,7 @@ def test_get_settings_is_byte_identical_to_config_list(client, fresh_db):
     assert response.status_code == 200
     assert response.content == result.stdout.encode("utf-8")
     payload = response.json()
-    assert payload["count"] == len(payload["settings"]) == 19
+    assert payload["count"] == len(payload["settings"]) == 24
     assert payload["path"], "the GET carries the absolute path (deliberate, unlike /healthz)"
 
 

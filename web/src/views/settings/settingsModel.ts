@@ -21,7 +21,7 @@
  *   the journal is for, and the copy says so instead of implying it.
  */
 
-import type { EventOut, SettingOut } from "../../api/types";
+import type { EndpointOut, EventOut, SettingOut } from "../../api/types";
 
 /** One named group of setting rows, in display order. */
 export interface SettingGroup {
@@ -29,6 +29,9 @@ export interface SettingGroup {
   title: string;
   keys: readonly string[];
 }
+
+/** The endpoint select itself. Its per-endpoint key rows are added per report. */
+export const ENDPOINT_KEY = "NODUM_LLM_ENDPOINT";
 
 export const MODEL_KEYS = [
   "NODUM_LLM_MODEL",
@@ -54,16 +57,26 @@ const AUDIO_KEYS = ["NODUM_AUDIO_MODEL", "NODUM_AUDIO_DOWNLOAD"] as const;
 
 const EMBED_KEYS = ["NODUM_EMBED_MODEL", "NODUM_EMBED_DOWNLOAD"] as const;
 
-/** The env-only four: shown so the operator sees the whole ladder, never editable. */
+/** The env-only five: shown so the operator sees the whole ladder, never editable. */
 const SERVER_KEYS = [
   "NODUM_DB",
+  "NODUM_LLM_ENDPOINTS",
   "NODUM_LLM_BASE_URL",
   "NODUM_EMBED_CACHE",
   "NODUM_PUBLIC_URL",
 ] as const;
 
-/** Every group, in the order the page renders them. */
+/**
+ * Every group, in the order the page renders them.
+ *
+ * The Endpoint group's key rows are **not** listed here because they are not
+ * fixed: the server generates one credential row per endpoint it offers, and
+ * which endpoints those are is a deployment's decision. `groupsFor` builds that
+ * group from the report; this constant is what the rest of the page is grouped
+ * by and what the unit tests read.
+ */
 export const GROUPS: readonly SettingGroup[] = [
+  { id: "endpoint", title: "Endpoint", keys: [ENDPOINT_KEY] },
   { id: "model", title: "Model", keys: MODEL_KEYS },
   { id: "gardener", title: "Gardener", keys: GARDENER_KEYS },
   { id: "requests", title: "Requests", keys: REQUEST_KEYS },
@@ -71,6 +84,43 @@ export const GROUPS: readonly SettingGroup[] = [
   { id: "embeddings", title: "Embeddings", keys: EMBED_KEYS },
   { id: "server", title: "Server", keys: SERVER_KEYS },
 ];
+
+/**
+ * The groups to render for one report: {@link GROUPS} with the endpoint group's
+ * credential rows filled in from the endpoints this deployment offers.
+ *
+ * Each endpoint's key sits directly under the select that arms it, because the
+ * two are one decision — choosing an endpoint decides both where a call goes
+ * *and* which credential travels with it, and a page that put the keys
+ * somewhere else would be describing a shared key that no longer exists.
+ *
+ * An endpoint that authenticates with nothing (the local default) contributes
+ * no row: `key` is null and there is no setting behind it.
+ */
+export function groupsFor(endpoints: readonly EndpointOut[]): readonly SettingGroup[] {
+  const credentials = endpoints
+    .map((endpoint) => endpoint.key)
+    .filter((key): key is string => key !== null);
+  return GROUPS.map((group) =>
+    group.id === "endpoint" ? { ...group, keys: [ENDPOINT_KEY, ...credentials] } : group,
+  );
+}
+
+/**
+ * The display title for one choice, or null when the choice is not an endpoint.
+ *
+ * The endpoint select stores a label (`deepseek`) and shows a title
+ * (`DeepSeek`); every other closed set — the reasoning levels — is its own
+ * display text, so a miss here falls back to the raw value rather than being an
+ * error. Both cases go through one function so the option renderer has no
+ * per-key branch.
+ */
+export function endpointTitle(
+  endpoints: readonly EndpointOut[],
+  choice: string,
+): string | null {
+  return endpoints.find((one) => one.label === choice)?.title ?? null;
+}
 
 /** When a change to a key takes effect — the liveness classes the save flow reports. */
 export type Liveness = "now" | "next-run" | "minute";

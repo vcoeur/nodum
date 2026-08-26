@@ -2711,3 +2711,105 @@ call the same `service.settings_report`.
 `NODUM_EMBED_CACHE` stays environment-only: it is a path on the server's own
 disk, the exact shape the `FILESYSTEM_TOOLS` absence exists for, and it is
 still read where it always was.
+
+## 2026-08-26 — the endpoint became a choice, and the profile table became a menu
+
+`NODUM_LLM_BASE_URL` stayed environment-only for one recorded reason: *the
+endpoint an API key may travel to is a deployment decision, not a stored one.*
+The ask was to configure the endpoint from the settings page. Two shapes were
+rejected before the one that shipped.
+
+**A free-text base-URL field in the browser** re-opens the whole reason the name
+was environment-only: a page that can name a URL can name any URL, and the key
+goes with it.
+
+**An environment variable holding `url:key` pairs** was rejected on four counts.
+The separator collides with the data — `http://localhost:11434/v1` splits on its
+port, so a keyless entry parses as host `http://localhost` and key `11434/v1`.
+Keys inside the variable make the *whole* variable a secret, so no surface may
+display any part of it and a parse error cannot quote the entry that failed.
+Rotating one key means rewriting all of them, which per-variable secret mounts
+cannot address. And it has nowhere to put the facts an endpoint actually
+carries: `ProviderProfile` already said an endpoint is a record — url, window,
+structured mode, thinking support — not a URL.
+
+**What shipped**: the endpoints are compiled into the build
+(`nodum.endpoints`), `NODUM_LLM_ENDPOINTS` bounds which of them a deployment
+offers, and `NODUM_LLM_ENDPOINT` stores the label chosen from that menu. The
+original invariant survives with its scope narrowed and stated: the *set* of
+endpoints a key may travel to is still the deployment's decision; only the
+choice within it is stored, because every member of the set was vetted in the
+source rather than typed into a form. `NODUM_LLM_BASE_URL` still wins over the
+selection, so the operator keeps the escape hatch to a gateway nodum ships
+nothing about, and a stored selection can never move a call off an endpoint the
+deployment pinned.
+
+**Per-endpoint keys are the load-bearing half, not a convenience.**
+`_resolve_default` already carried a `key_withheld` branch for a hole that was
+driven to ground: a hosted model id nodum did not recognise plus a set
+`NODUM_LLM_API_KEY` sent the vendor's bearer token to `localhost:11434`, where
+it arrived at a throwaway listener as `Authorization: Bearer …`. One shared key
+plus a browser-reachable selector is the same hole with a shorter path to it —
+pick `deepseek`, paste the DeepSeek key, later pick `openrouter`, and the key
+follows. So each endpoint owns a `NODUM_LLM_KEY_<LABEL>`, generated from the
+registry together with its row and its membership of `SECRET_KEYS`, and a
+selection can reach no credential but its own. The rows are generated rather
+than written out because a hand-kept list would go stale silently, and the
+staleness would be a credential printed to a surface.
+
+**The profile table reversed its charter, and the comment saying otherwise was
+rewritten rather than left.** `_PROFILES` described itself as "deliberately not
+a vendor registry — a profile earns its place by being an endpoint whose
+defaults are wrong otherwise". That was right while `profile_for` was its only
+reader: its job is to stop a wrong *belief* about an endpoint somebody already
+named. It stops being right when a second reader is the menu a browser chooses
+from, because a menu listing only the endpoints with surprising defaults is not
+a menu.
+
+**ollama is a row now, but carries no hosts and no model ids.** Giving the local
+row a `localhost` host would have retired the URL comparison in
+`_resolve_default` and been wrong: it would claim every service on the loopback
+is ollama and hand it ollama's beliefs, including `graded_thinking` false, which
+is never negotiated upward — so a local gateway that does accept graded
+reasoning would silently never be sent it. The row exists to be *chosen*; the
+narrower comparison, which tests the whole URL including the port, stays.
+
+**Auth is `Authorization: Bearer` for all three hosted endpoints, so no
+pluggable-auth seam was built.** Checked 2026-08-26 against each vendor's own
+API reference: DeepSeek (already in the repo), Kimi/Moonshot at
+`https://api.moonshot.ai/v1`, and OpenRouter at `https://openrouter.ai/api/v1`,
+whose `HTTP-Referer` and `X-OpenRouter-Title` are optional ranking-attribution
+headers rather than auth and are not sent. The premise that each endpoint has
+its own way of sending a key is true in general — Azure uses `api-key`,
+Anthropic `x-api-key` — and false for every endpoint shipped here, so by the
+registry's own rule the seam waits for an endpoint that needs it.
+
+**Two rows assert no context window at all, and that asymmetry is deliberate.**
+Kimi serves 1M on `kimi-k3`, 256k on `kimi-k2.6`/`kimi-k2.7-code` and 8k on
+`moonshot-v1-8k`; OpenRouter fronts hundreds of models between 4k and 1M. A
+per-endpoint constant is therefore wrong for most models on both, and asserting
+the flagship number re-opens exactly the silent-truncation hole `profile_for`
+was written to close — a 1M-token belief carried against a server serving 8k.
+`context_tokens` became `int | None`; `None` falls back to
+`DEFAULT_CONTEXT_TOKENS` and negotiates, and the endpoint carries a
+`window_note` the settings page shows on the `NODUM_LLM_CONTEXT_TOKENS` row once
+that endpoint is selected. Under-asserting is a refusal the operator reads and
+fixes in one field; over-asserting is an answer computed from a prompt that was
+cut. Only the second is unrecoverable.
+
+**A selection the deployment no longer offers is no provider with a reason.**
+A label that fell back to the local default would send prompts somewhere other
+than where the settings page says they go, which is the one failure this feature
+exists to make impossible. The refusal names the layer the value came from and
+the whole menu — which it may do without leaking anything, because the
+allow-list holds labels and never credentials. An allow-list naming nothing this
+build ships falls back to the full registry instead: a settings page with an
+empty select and no explanation is the worse failure, and the forgiving branch
+is what lets a deployment pinned to an older image survive a label from a newer
+one.
+
+**`SettingOut` gained `choices`, computed per request rather than captured at
+import.** The endpoint menu comes from the environment, so a list fixed at
+import would report the menu the process started with; a select built from a
+stale list offers a value the validator refuses. `NODUM_LLM_THINKING` became the
+second row to carry one, and both read the same tuple the validator does.

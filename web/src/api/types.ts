@@ -1000,6 +1000,35 @@ export interface SettingOut {
    * The info popup renders it verbatim; it is never a client-authored sentence.
    */
   help: string | null;
+  /**
+   * The closed set of values this key accepts, or null when it is free-form.
+   * A row that has it renders a select rather than a text box, so the page
+   * cannot submit a value the server's validator would refuse. Computed per
+   * request: the endpoint list depends on what the deployment offers.
+   */
+  choices: string[] | null;
+}
+
+/** One endpoint the settings page may offer in its endpoint select. */
+export interface EndpointOut {
+  /** The stored value of `NODUM_LLM_ENDPOINT`. */
+  label: string;
+  /** What the select shows for it. */
+  title: string;
+  base_url: string;
+  /**
+   * The setting holding this endpoint's credential, or null for one that
+   * authenticates with nothing (the local default). The page puts that key's
+   * row next to the choice that arms it without knowing how the name is built.
+   */
+  key: string | null;
+  /**
+   * What the context-tokens row has to say once this endpoint is chosen, or
+   * null when the endpoint serves one window and nodum already knows it.
+   * Non-null for the endpoints that front many models — nodum will not guess a
+   * window it cannot know, so the operator sets one.
+   */
+  window_note: string | null;
 }
 
 /** The whole settings report, plus the file it is read from and build capabilities. */
@@ -1011,6 +1040,8 @@ export interface SettingsOut {
   unreadable: string | null;
   /** Per optional extra, whether its dependency is importable (`audio` today). */
   capabilities: Record<string, boolean>;
+  /** The endpoints this deployment offers, in the order the select lists them. */
+  endpoints: EndpointOut[];
   /**
    * The vec projector's staleness sentence — non-null exactly while chunks
    * from another embedding model sit in the store, invisible to search until
