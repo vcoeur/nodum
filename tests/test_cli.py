@@ -2398,6 +2398,18 @@ NOT_COMMANDS = frozenset(
         "fall-back",
         "file-unreadable",
         "faster-whisper",  # the audio extra's package
+        # Two HTTP auth headers, named in the decision log as the endpoints that
+        # would need a pluggable auth scheme — Azure sends `api-key`, Anthropic
+        # `x-api-key` — and therefore as the reason no such scheme is built
+        # while every endpoint shipped here takes a bearer token.
+        "api-key",
+        "x-api-key",
+        # Kimi model ids. They are in the docs because the endpoint that serves
+        # them asserts no context window: `kimi-k3` runs 1M and `moonshot-v1-8k`
+        # runs 8k on the same host, which is why that row guesses nothing and
+        # the operator sets `NODUM_LLM_CONTEXT_TOKENS` for their model.
+        "kimi-k3",
+        "moonshot-v1-8k",
         "no-store",  # a Cache-Control directive
         "not-found",  # a title-resolution outcome value, not a verb
         "off-only",  # a rung of the reasoning-capability ladder in `nodum.llm`
