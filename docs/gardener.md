@@ -131,7 +131,7 @@ nodum config set NODUM_LLM_CONTEXT_TOKENS 1000000 --as human:owner   # Kimi's wi
 nodum config set NODUM_LLM_CYCLE_BUDGET 200000 --as human:owner
 ```
 
-The labels are `local`, `deepseek`, `kimi` and `openrouter`, and
+The labels are `local`, `deepseek`, `glm`, `kimi` and `openrouter`, and
 `NODUM_LLM_ENDPOINTS` narrows that menu for a deployment. Each endpoint has its
 own key variable, so changing the selection changes which credential travels
 with it — a key can never reach an endpoint it was not entered for. A hosted provider nodum knows is two lines

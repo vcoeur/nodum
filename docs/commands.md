@@ -228,7 +228,7 @@ does not resolve). With no provider configured the refusal names
 
   **`NODUM_LLM_ENDPOINT` is the third way to name one, and the only one a
   browser can use.** It takes a label for an endpoint compiled into the build —
-  `local`, `deepseek`, `kimi`, `openrouter` — so choosing one never names a URL,
+  `local`, `deepseek`, `glm`, `kimi`, `openrouter` — so choosing one never names a URL,
   which is why it is storable where `NODUM_LLM_BASE_URL` is not.
   `provider` in `nodum llm status` shows the URL it resolved to. Each endpoint
   has its **own** key (`NODUM_LLM_KEY_DEEPSEEK` and friends) and a selection

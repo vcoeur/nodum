@@ -119,11 +119,12 @@ DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
 #:
 #: **``context_tokens`` is ``None`` wherever the window is a property of the
 #: model rather than of the endpoint**, which is the one fact this table cannot
-#: tell honestly for two of its four rows. Kimi serves 1M on ``kimi-k3`` and 8k
-#: on ``moonshot-v1-8k``; OpenRouter fronts hundreds of models between 4k and
-#: 1M. Asserting either endpoint's flagship number would re-open exactly the
-#: silent-truncation hole :func:`nodum.llm.profile_for` exists to close — a
-#: 1M-token belief carried against a server serving 8k. ``None`` falls back to
+#: tell honestly for three of its five rows. GLM's window is model-specific,
+#: Kimi serves 1M on ``kimi-k3`` and 8k on ``moonshot-v1-8k``, and OpenRouter
+#: fronts hundreds of models between 4k and 1M. Asserting an endpoint's
+#: flagship number would re-open exactly the silent-truncation hole
+#: :func:`nodum.llm.profile_for` exists to close — a 1M-token belief carried
+#: against a server serving 8k. ``None`` falls back to
 #: :data:`nodum.llm.DEFAULT_CONTEXT_TOKENS` and negotiates upward, which costs a
 #: refusal an operator can read and fix in one field. The asymmetry is the
 #: point: under-asserting is loud and recoverable, over-asserting is silent.
@@ -171,6 +172,23 @@ ENDPOINTS: tuple[Endpoint, ...] = (
         graded_thinking=True,
         takes_key=True,
         window_note=None,
+    ),
+    Endpoint(
+        label="glm",
+        title="GLM (Z.ai)",
+        base_url="https://api.z.ai/api/paas/v4",
+        hosts=frozenset({"api.z.ai"}),
+        models=frozenset(),
+        context_tokens=None,
+        structured_mode=STRUCTURED_JSON_OBJECT,
+        # Z.ai documents vendor-specific thinking controls, not OpenAI's
+        # ``reasoning_effort`` ladder that nodum sends.
+        graded_thinking=False,
+        takes_key=True,
+        window_note=(
+            "GLM's context window is model-specific, so nodum cannot know this one — "
+            "set it for your model"
+        ),
     ),
     Endpoint(
         label="kimi",

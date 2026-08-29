@@ -132,9 +132,9 @@ wiped cache by rerunning with `NODUM_EMBED_DOWNLOAD=1`.
 | Variable | Default | What it does |
 |---|---|---|
 | `NODUM_LLM_MODEL` | unset — no provider | The model name. Unset means no provider, and therefore no smart features anywhere — there is no default, because a guessed model name is a 404 on the first call rather than an honest absence. |
-| `NODUM_LLM_ENDPOINT` | unset — the local default | Which shipped endpoint to call, by label: `local`, `deepseek`, `kimi` or `openrouter`. Editable from the settings page, and refused if the label is not one `NODUM_LLM_ENDPOINTS` offers. |
+| `NODUM_LLM_ENDPOINT` | unset — the local default | Which shipped endpoint to call, by label: `local`, `deepseek`, `glm`, `kimi` or `openrouter`. Editable from the settings page, and refused if the label is not one `NODUM_LLM_ENDPOINTS` offers. |
 | `NODUM_LLM_ENDPOINTS` | unset — all of them | Comma-separated labels this deployment offers. Environment-only. A label this build does not ship is ignored rather than fatal, so an older image does not fail to boot on a name from a newer one. |
-| `NODUM_LLM_KEY_<LABEL>` | unset | The bearer token for one endpoint — `NODUM_LLM_KEY_DEEPSEEK`, `NODUM_LLM_KEY_KIMI`, `NODUM_LLM_KEY_OPENROUTER`. Sent **only** when `NODUM_LLM_ENDPOINT` selects that endpoint, so changing the selection can never post a credential to a vendor it was not issued for. Never serialised: every surface reports set/unset and no value. |
+| `NODUM_LLM_KEY_<LABEL>` | unset | The bearer token for one endpoint — `NODUM_LLM_KEY_DEEPSEEK`, `NODUM_LLM_KEY_GLM`, `NODUM_LLM_KEY_KIMI`, `NODUM_LLM_KEY_OPENROUTER`. Sent **only** when `NODUM_LLM_ENDPOINT` selects that endpoint, so changing the selection can never post a credential to a vendor it was not issued for. Never serialised: every surface reports set/unset and no value. |
 | `NODUM_LLM_BASE_URL` | `http://localhost:11434/v1` | OpenAI-compatible base URL, and the escape hatch to a gateway nodum ships nothing about. **It overrides `NODUM_LLM_ENDPOINT`.** A spelling that is not a `http(s)` URL — scheme included — is refused, because choosing the scheme on the operator's behalf decides whether the API key crosses the network in clear text. |
 | `NODUM_LLM_API_KEY` | unset | Bearer token for the endpoint `NODUM_LLM_BASE_URL` names. Optional (the local default needs none), and sent only to an endpoint somebody named — `NODUM_LLM_BASE_URL`, or a model id a shipped profile serves. When `NODUM_LLM_ENDPOINT` selects an endpoint, that endpoint's own `NODUM_LLM_KEY_*` is sent and this one is not. |
 | `NODUM_LLM_THINKING` | `high` | The reasoning level, one of `none`, `low`, `medium`, `high`. A value outside the set is refused with the list rather than passed on. |
@@ -159,16 +159,18 @@ is the deployment's decision, and only the choice within it is stored.
 |---|---|---|
 | `local` | `http://localhost:11434/v1` (ollama) | 4 096 |
 | `deepseek` | `https://api.deepseek.com/v1` | 1 000 000 |
+| `glm` | `https://api.z.ai/api/paas/v4` | set it for your model |
 | `kimi` | `https://api.moonshot.ai/v1` | set it yourself |
 | `openrouter` | `https://openrouter.ai/api/v1` | set it yourself |
 
-**Two of them serve no single window, and nodum refuses to guess one.** Kimi
-runs 1M on `kimi-k3` and 8k on `moonshot-v1-8k`; OpenRouter fronts hundreds of
-models between 4k and 1M. Asserting either one's flagship number would silently
-truncate every prompt sent to a smaller model, so those rows assert nothing and
-fall back to `NODUM_LLM_CONTEXT_TOKENS` — which the settings page annotates with
-the real windows once you pick the endpoint. Under-asserting costs a refusal you
-can read; over-asserting costs an answer computed from a prompt that was cut.
+**Three of them serve no single window, and nodum refuses to guess one.** GLM's
+window is model-specific; Kimi runs 1M on `kimi-k3` and 8k on
+`moonshot-v1-8k`; OpenRouter fronts hundreds of models between 4k and 1M.
+Asserting an endpoint's flagship number would silently truncate every prompt
+sent to a smaller model, so those rows assert nothing and fall back to
+`NODUM_LLM_CONTEXT_TOKENS` — which the settings page annotates with the real
+windows once you pick the endpoint. Under-asserting costs a refusal you can
+read; over-asserting costs an answer computed from a prompt that was cut.
 
 **Each endpoint carries its own key.** `NODUM_LLM_KEY_DEEPSEEK` is sent when and
 only when `deepseek` is selected. A single shared key plus a selector would mean
