@@ -1018,6 +1018,11 @@ class SettingOut(BaseModel):
     it is free-form. A surface that has it renders a select and cannot submit a
     value the validator would refuse; it is computed per request rather than
     fixed, because the endpoint list depends on what the deployment offers.
+
+    ``takes_effect`` is the registry-owned timing class for a stored change:
+    ``now`` re-resolves before the next provider call, ``next-run`` is read
+    when the next agent run starts, and ``minute`` is re-read by the scheduler
+    within one minute.
     """
 
     key: str
@@ -1033,6 +1038,7 @@ class SettingOut(BaseModel):
     on_invalid: str | None
     summary: str
     help: str | None
+    takes_effect: Literal["now", "next-run", "minute"]
     choices: list[str] | None = None
 
 

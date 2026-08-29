@@ -13,12 +13,13 @@
  * - **Editability is derived, never stored** (`writable` + `provenance` +
  *   capabilities): an environment-pinned row is disabled with its reason, and
  *   the server's 409 backs it if a stale client bypasses the check anyway.
- * - **Liveness honesty**: each save says what actually happens — applied
- *   immediately (the provider re-resolves), at the next agent run (the six
- *   per-run ceilings are read once per run), or within a minute (the
- *   scheduler re-reads its schedule each sleep slice). Lowering a budget
- *   never stops a cycle already spending; that is what the kill switch on
- *   the journal is for, and the copy says so instead of implying it.
+ * - **Liveness honesty**: each save says what actually happens, read from
+ *   the registry-owned `takes_effect` the server publishes with the row —
+ *   applied live, at the next agent run (every provider-resolution setting
+ *   is read once per run), or within a minute (the scheduler re-reads its
+ *   schedule each sleep slice). Lowering a budget never stops a cycle
+ *   already spending; that is what the kill switch on the journal is for,
+ *   and the copy says so instead of implying it.
  */
 
 import type { EndpointOut, EventOut, SettingOut } from "../../api/types";
@@ -35,10 +36,12 @@ export const ENDPOINT_KEY = "NODUM_LLM_ENDPOINT";
 
 export const MODEL_KEYS = [
   "NODUM_LLM_MODEL",
-  "NODUM_LLM_API_KEY",
   "NODUM_LLM_CONTEXT_TOKENS",
   "NODUM_LLM_THINKING",
 ] as const;
+
+/** The operator-owned custom endpoint and the credential that belongs only to it. */
+const CUSTOM_ENDPOINT_KEYS = ["NODUM_LLM_BASE_URL", "NODUM_LLM_API_KEY"] as const;
 
 const GARDENER_KEYS = [
   "NODUM_LLM_CYCLE_BUDGET",
@@ -61,7 +64,6 @@ const EMBED_KEYS = ["NODUM_EMBED_MODEL", "NODUM_EMBED_DOWNLOAD"] as const;
 const SERVER_KEYS = [
   "NODUM_DB",
   "NODUM_LLM_ENDPOINTS",
-  "NODUM_LLM_BASE_URL",
   "NODUM_EMBED_CACHE",
   "NODUM_PUBLIC_URL",
 ] as const;
@@ -77,6 +79,7 @@ const SERVER_KEYS = [
  */
 export const GROUPS: readonly SettingGroup[] = [
   { id: "endpoint", title: "Endpoint", keys: [ENDPOINT_KEY] },
+  { id: "custom-endpoint", title: "Custom endpoint", keys: CUSTOM_ENDPOINT_KEYS },
   { id: "model", title: "Model", keys: MODEL_KEYS },
   { id: "gardener", title: "Gardener", keys: GARDENER_KEYS },
   { id: "requests", title: "Requests", keys: REQUEST_KEYS },
@@ -97,13 +100,59 @@ export const GROUPS: readonly SettingGroup[] = [
  * An endpoint that authenticates with nothing (the local default) contributes
  * no row: `key` is null and there is no setting behind it.
  */
-export function groupsFor(endpoints: readonly EndpointOut[]): readonly SettingGroup[] {
+export interface EndpointConfiguration {
+  /** A non-empty environment base URL wins over the selected shipped endpoint. */
+  baseUrlOverrides: boolean;
+  /** The key row belonging to the selected endpoint, or null when none is selected. */
+  selectedEndpointKey: string | null;
+  /** The shared key is relevant only without a selected endpoint, or under an explicit override. */
+  showGenericKey: boolean;
+}
+
+/** Derive endpoint applicability from server-owned rows, never from a client environment read. */
+export function endpointConfiguration(
+  endpoints: readonly EndpointOut[],
+  rows: readonly SettingOut[],
+): EndpointConfiguration {
+  const byKey = new Map(rows.map((row) => [row.key, row]));
+  const selectedLabel = byKey.get(ENDPOINT_KEY)?.value ?? null;
+  const selectedEndpoint = endpoints.find((endpoint) => endpoint.label === selectedLabel) ?? null;
+  const baseUrlOverrides = byKey.get("NODUM_LLM_BASE_URL")?.provenance === "environment";
+  return {
+    baseUrlOverrides,
+    selectedEndpointKey: selectedEndpoint?.key ?? null,
+    showGenericKey: baseUrlOverrides || selectedEndpoint === null,
+  };
+}
+
+/** The visible state sentence for one endpoint-owned credential row. */
+export function endpointKeyUse(key: string, configuration: EndpointConfiguration): string {
+  if (configuration.baseUrlOverrides) {
+    return "Stored for this endpoint; the custom base URL currently overrides the selection";
+  }
+  return configuration.selectedEndpointKey === key
+    ? "Used by the selected endpoint on the next agent run"
+    : "Used when this endpoint is selected for a future agent run";
+}
+
+export function groupsFor(
+  endpoints: readonly EndpointOut[],
+  rows: readonly SettingOut[] = [],
+): readonly SettingGroup[] {
   const credentials = endpoints
     .map((endpoint) => endpoint.key)
     .filter((key): key is string => key !== null);
-  return GROUPS.map((group) =>
-    group.id === "endpoint" ? { ...group, keys: [ENDPOINT_KEY, ...credentials] } : group,
-  );
+  const configuration = endpointConfiguration(endpoints, rows);
+  return GROUPS.map((group) => {
+    if (group.id === "endpoint") return { ...group, keys: [ENDPOINT_KEY, ...credentials] };
+    if (group.id === "custom-endpoint") {
+      return {
+        ...group,
+        keys: configuration.showGenericKey ? CUSTOM_ENDPOINT_KEYS : ["NODUM_LLM_BASE_URL"],
+      };
+    }
+    return group;
+  });
 }
 
 /**
@@ -123,22 +172,11 @@ export function endpointTitle(
 }
 
 /** When a change to a key takes effect — the liveness classes the save flow reports. */
-export type Liveness = "now" | "next-run" | "minute";
-
-/** The six per-run ceilings: read once per agent run, so a change waits for the next one. */
-const RUN_CEILING_KEYS: ReadonlySet<string> = new Set([
-  ...REQUEST_KEYS,
-  "NODUM_LLM_CYCLE_BUDGET",
-  "NODUM_LLM_CYCLE_SECONDS",
-]);
-
-const SCHEDULE_KEY = "NODUM_CONSOLIDATE_AT";
+export type Liveness = SettingOut["takes_effect"];
 
 /** What a saved change reports about when it bites. */
-export function liveness(key: string): Liveness {
-  if (key === SCHEDULE_KEY) return "minute";
-  if (RUN_CEILING_KEYS.has(key)) return "next-run";
-  return "now";
+export function liveness(row: SettingOut): Liveness {
+  return row.takes_effect;
 }
 
 /** The sentence a saved row shows for its liveness class. */
@@ -186,7 +224,7 @@ export function settingPopup(
     help: row.help,
     defaultLabel: row.secret ? "—" : (row.default ?? "none"),
     livenessLabel: isEditable(row, capabilities)
-      ? livenessLabel(liveness(row.key))
+      ? livenessLabel(liveness(row))
       : null,
   };
 }
@@ -276,16 +314,6 @@ export const EMBED_MODEL_KEY = "NODUM_EMBED_MODEL";
 export function isModelChange(key: string): boolean {
   return key === EMBED_MODEL_KEY;
 }
-
-/**
- * The note under the download-gate row: what flipping it on costs.
- *
- * Every line is a fact the system delivers: the gate is the one way the
- * never-download-implicitly posture is lifted, and the next vector operation
- * after flipping it may fetch the model — ~0.2 GB for the default.
- */
-export const EMBED_DOWNLOAD_NOTE =
-  "When on: the next vector operation may download the model (~0.2 GB) — nodum never downloads implicitly, so this is the one gate that allows it.";
 
 /**
  * The confirmation before an embedding-model write — the copy that names the

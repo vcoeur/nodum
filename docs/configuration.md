@@ -256,20 +256,19 @@ human and event-logged exactly as the CLI's are.
 ### In the browser
 
 The web UI's **Settings** page (`/settings`) puts the same four routes behind
-controls, one grouped table per area — Model, Gardener, Requests, Audio,
-Embeddings, and a read-only Server group showing the env-only names so the
-whole ladder is visible:
+controls, one grouped table per area — Endpoint, Custom endpoint, Model,
+Gardener, Requests, Audio, Embeddings, and a read-only Server group showing
+the env-only names so the whole ladder is visible:
 
 - Each row shows the effective value (secrets show only whether one is set),
   the layer it came from as a badge, and its default. `NODUM_LLM_CONTEXT_TOKENS`
   notes that a shipped provider profile may serve a larger window than the
   default when the model matches.
 - Each row head carries an **info button** (`i`) that opens a popup explaining
-  the setting: the registry's one-line summary, its longer help where the
-  summary is too thin (why an env-only name is environment-only, what a budget
-  bounds and that lowering it never stops a cycle already spending, the
-  embedding-model coupling, the ~0.2 GB download cost), the built-in default,
-  and when a change takes effect — the same liveness classes a save reports.
+  the setting: the registry's one-line summary, its complete longer help
+  (format or range, units, defaults and off behavior, precedence and operational
+  consequence), the built-in default, and the registry-owned timing field that
+  says when a change takes effect — the same liveness class a save reports.
   A row the page cannot change (env-only, environment-pinned, or a missing
   optional extra) shows no liveness line, because there is no change to have a
   schedule for. The popup's copy is the server's own `summary`/`help` fields,
@@ -278,6 +277,15 @@ whole ladder is visible:
   env-only name; the audio pair renders "not available in this build" when the
   `audio` extra is not installed. The disabled state mirrors what the server
   would refuse anyway — bypassing it client-side only earns the same refusal.
+- **Endpoint credentials are per endpoint, not a second active-key prompt.**
+  Selecting a named endpoint hides `NODUM_LLM_API_KEY`; its selected
+  `NODUM_LLM_KEY_<LABEL>` row says it will be used by the selected endpoint on
+  the next agent run, while other offered key rows remain editable and say
+  they are used when selected for a future run. The generic key lives
+  beside the environment-only custom base URL and appears for the legacy
+  profile path or when a non-empty environment `NODUM_LLM_BASE_URL` overrides
+  the selection. In that override state the page keeps endpoint secrets
+  manageable but states that the custom URL owns live traffic.
 - A save reports **when the change bites**, per the three liveness classes
   above: applied live, at the next agent run, or picked up by the scheduler
   within a minute. The Gardener group carries the honest caveat — lowering a
@@ -316,8 +324,10 @@ A change applies without a restart. The three things that means in practice:
 - a **budget** funds the *next* run — an `AgentRun` spans a whole consolidation
   cycle, so lowering the cycle budget does not stop a cycle already spending
   (`nodum cycle-stop <id>` is the kill switch);
-- a **model, key, window or reasoning level** applies at the next provider
-  resolution, which is the next call;
+- every input to the provider resolution — **model, endpoint selection,
+  endpoint or generic key, base URL, window, and reasoning level** — applies
+  at the next agent run. An `AgentRun` snapshots its provider and credential
+  once, so a save never re-resolves one already running;
 - the **nightly schedule** applies within a minute — the scheduler re-reads it
   as it sleeps, so turning it on, off, or to another hour needs no restart.
 

@@ -19,13 +19,16 @@ space, state, and returned-set sort in the URL. It reads at most the endpoint's
 not the whole graph. Space cards link into it with their active space selected.
 The **settings** view (`/settings`) is the configuration ladder over
 `settings.env`: grouped rows with effective value, layer badge and default;
-environment-pinned and env-only rows disabled with their reasons; per-key save
-feedback naming the liveness class; one-click revert from each key's last
-settings event; adopt-from-environment with a preview; and a per-row info
-button opening a popup that explains the setting from the registry's own
-`summary`/`help` plus the row's default and liveness. The deciding logic —
-grouping, editability derivation, liveness classes, revert targets, adopt
-preview, and the popup's content — lives in
+environment-pinned and env-only rows disabled with their reasons; endpoint
+credentials that remain pre-storable while the selected row states whether it
+is current or inactive; the generic key shown only for the custom-base-URL or
+legacy-profile path; per-key save feedback from the registry-owned timing
+class; one-click revert from each key's last settings event;
+adopt-from-environment with a preview; and a per-row info button opening a
+popup that explains the setting from the registry's own `summary`/`help` plus
+the row's default and timing. The deciding logic — grouping, endpoint
+applicability, editability derivation, timing, revert targets, adopt preview,
+and the popup's content — lives in
 `views/settings/settingsModel.ts`, tested as a pure module.
 
 **A space is two independent controls, not a mode** (design decision D1), and
@@ -335,6 +338,12 @@ per-run and deleted on exit, because these specs archive things.
 
 Locally the system Chrome is used, so nothing is downloaded; CI installs
 chromium instead (`playwright.config.ts` switches on `CI`).
+
+The default fixture clears `NODUM_LLM_BASE_URL`, so the settings spec's
+custom-base override scenario skips unless the variable is set. `make web-e2e`
+therefore runs that one spec a second time with `NODUM_E2E_LLM_BASE_URL`
+pinned — the only place the override UI is browser-verified. A bare
+`npx playwright test` stays neutral and skips it.
 
 **The run is headless, and that is checked rather than assumed.** These specs
 press Escape, type `/` and move focus, so a browser window on your display would

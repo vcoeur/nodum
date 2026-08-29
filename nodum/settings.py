@@ -102,6 +102,7 @@ from datetime import time
 from pathlib import Path
 from secrets import token_hex
 from types import MappingProxyType
+from typing import Literal
 
 from nodum import endpoints
 from nodum.models import EndpointOut, SettingChangeOut, SettingOut, SettingsOut
@@ -227,6 +228,14 @@ FROM_UNREADABLE = "file-unreadable"
 ON_INVALID_FALLBACK = "fall-back"
 ON_INVALID_REFUSE = "refuse"
 ON_INVALID_OFF = "off"
+
+#: When a stored setting starts affecting runtime work. This lives with the
+#: setting, rather than in each client, so CLI, HTTP and browser timing copy
+#: cannot drift apart.
+TAKES_EFFECT_NOW = "now"
+TAKES_EFFECT_NEXT_RUN = "next-run"
+TAKES_EFFECT_MINUTE = "minute"
+TakesEffect = Literal["now", "next-run", "minute"]
 
 _CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f]")
 _KEY_SHAPE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -383,12 +392,18 @@ class Setting:
     process started with rather than the one in force. It returns the values a
     surface should offer as a closed set — a select rather than a text box —
     and ``None`` means the key is free-form.
+
+    ``takes_effect`` carries no default on purpose: the timing of a stored
+    change is a claim, and a row added without one would promise "applied
+    live" to whatever happened to be the default. Every registry row names
+    its class explicitly.
     """
 
     name: str
     kind: str
     default: str | None
     summary: str
+    takes_effect: TakesEffect
     help: str | None = None
     validate: Callable[[str, str], str] = _text
     secret: bool = False
@@ -468,10 +483,12 @@ _ENDPOINT_KEY_SPECS: tuple[Setting, ...] = tuple(
             f"{endpoint.base_url} and nowhere else. Each endpoint holding its own "
             f"key is what stops a change of selection from posting a credential "
             f"to a vendor it was not issued for. Never serialised: every surface "
-            f"reports set/unset and no value."
+            f"reports set/unset and no value. A saved key is resolved when the "
+            f"next agent run starts."
         ),
         secret=True,
         on_invalid=None,
+        takes_effect=TAKES_EFFECT_NEXT_RUN,
     )
     for endpoint in endpoints.ENDPOINTS
     if endpoint.takes_key
@@ -485,20 +502,28 @@ _SPECS: tuple[Setting, ...] = (
         summary="The graph database path.",
         # The refusal's sentence, reused verbatim: it is the one line that says
         # why this name is not storable, and a second wording would drift.
-        help=_ENV_ONLY_DB,
+        help=(
+            f"The default is ~/.local/share/nodum/nodum.db. {_ENV_ONLY_DB}. "
+            "Changing it selects a different graph and its adjacent settings file."
+        ),
         writable=False,
         refusal=_ENV_ONLY_DB,
         on_invalid=None,
+        takes_effect=TAKES_EFFECT_NOW,
     ),
     Setting(
         name=PUBLIC_URL,
         kind="url",
         default="http://127.0.0.1:8600",
         summary="The base URL minted capability URLs are built on.",
-        help=_ENV_ONLY_PUBLIC_URL,
+        help=(
+            f"An http(s) base URL; the default is http://127.0.0.1:8600. "
+            f"{_ENV_ONLY_PUBLIC_URL}. It affects newly minted capability URLs."
+        ),
         writable=False,
         refusal=_ENV_ONLY_PUBLIC_URL,
         on_invalid=None,
+        takes_effect=TAKES_EFFECT_NOW,
     ),
     Setting(
         name=CONSOLIDATE_AT,
@@ -507,10 +532,12 @@ _SPECS: tuple[Setting, ...] = (
         summary="Local wall-clock time the nightly consolidation cycle runs at (HH:MM).",
         help=(
             "HH:MM on the server's local clock — UTC in a container that sets "
-            "no TZ. Unset means the cycle does not run."
+            "no TZ. Unset means the cycle does not run; the scheduler reads a "
+            "saved change within one minute, without a restart."
         ),
         validate=_daily_time,
         on_invalid=ON_INVALID_OFF,
+        takes_effect=TAKES_EFFECT_MINUTE,
     ),
     Setting(
         name=LLM_MODEL,
@@ -519,9 +546,11 @@ _SPECS: tuple[Setting, ...] = (
         summary="The model name; unset means no provider and no smart features.",
         help=(
             "There is no default model — a guessed name is a 404 on the "
-            "first call rather than an honest absence."
+            "first call rather than an honest absence. It is resolved when the "
+            "next agent run starts, so saving does not restart the server."
         ),
         on_invalid=None,
+        takes_effect=TAKES_EFFECT_NEXT_RUN,
     ),
     Setting(
         name=LLM_ENDPOINT,
@@ -535,11 +564,13 @@ _SPECS: tuple[Setting, ...] = (
             "endpoint carries its own key, so changing this changes which "
             "credential is sent along with where it goes. "
             "NODUM_LLM_BASE_URL still wins over it, for a self-hosted gateway "
-            "nodum ships nothing about."
+            "nodum ships nothing about. A saved selection is resolved when the "
+            "next agent run starts."
         ),
         validate=_endpoint_label,
         on_invalid=ON_INVALID_REFUSE,
         choices=endpoints.offered_labels,
+        takes_effect=TAKES_EFFECT_NEXT_RUN,
     ),
     *_ENDPOINT_KEY_SPECS,
     Setting(
@@ -547,20 +578,30 @@ _SPECS: tuple[Setting, ...] = (
         kind="string",
         default=None,
         summary="Comma-separated labels the endpoint select may offer; unset means all.",
-        help=_ENV_ONLY_ENDPOINTS,
+        help=(
+            f"A comma-separated list of shipped labels; unset offers all. {_ENV_ONLY_ENDPOINTS}. "
+            "A changed allow-list is read when the process starts."
+        ),
         writable=False,
         refusal=_ENV_ONLY_ENDPOINTS,
         on_invalid=None,
+        takes_effect=TAKES_EFFECT_NOW,
     ),
     Setting(
         name=LLM_BASE_URL,
         kind="url",
         default=endpoints.LOCAL_BASE_URL,
         summary="OpenAI-compatible base URL; overrides the endpoint select.",
-        help=_ENV_ONLY_BASE_URL,
+        help=(
+            "An http(s) OpenAI-compatible URL with a scheme; the local default "
+            f"is {endpoints.LOCAL_BASE_URL}. {_ENV_ONLY_BASE_URL}. A non-empty "
+            "environment value overrides the endpoint selection and uses the generic key "
+            "when the next agent run starts."
+        ),
         writable=False,
         refusal=_ENV_ONLY_BASE_URL,
         on_invalid=None,
+        takes_effect=TAKES_EFFECT_NEXT_RUN,
     ),
     Setting(
         name=LLM_API_KEY,
@@ -574,30 +615,46 @@ _SPECS: tuple[Setting, ...] = (
             "is dropped rather than posted to a host nodum picked. When "
             "NODUM_LLM_ENDPOINT selects an endpoint, that endpoint's own "
             "NODUM_LLM_KEY_* is sent and this one is not. It is never "
-            "serialised: every surface reports set/unset and no value."
+            "serialised: every surface reports set/unset and no value. A saved key "
+            "is resolved when the next agent run starts."
         ),
         secret=True,
         on_invalid=None,
+        takes_effect=TAKES_EFFECT_NEXT_RUN,
     ),
     Setting(
         name=LLM_CONTEXT_TOKENS,
         kind="int",
         default="4096",
         summary="The window the endpoint will serve; a shipped profile may raise it.",
+        help=(
+            "A whole number of tokens, at least 1. The built-in default is "
+            "4096; an exact shipped model profile may serve a larger window, "
+            "while endpoints that front many models use this value directly. "
+            "It is resolved when the next agent run starts."
+        ),
         validate=_whole_number(1),
         on_invalid=ON_INVALID_REFUSE,
+        takes_effect=TAKES_EFFECT_NEXT_RUN,
     ),
     Setting(
         name=LLM_THINKING,
         kind="enum",
         default="high",
         summary="The reasoning level: none, low, medium or high.",
+        help=(
+            "Choose exactly none, low, medium or high; the default is high. "
+            "The provider negotiates whether it supports that level, so an "
+            "unsupported choice can make the next agent run unavailable. "
+            "A saved choice is resolved when that run starts."
+        ),
         validate=_one_of(_THINKING_LEVELS),
         on_invalid=ON_INVALID_REFUSE,
         # The one other closed set in the registry. Naming the same tuple the
         # validator uses is the point: a select offering a value the validator
         # refuses is a form that cannot be submitted.
         choices=lambda: _THINKING_LEVELS,
+        takes_effect=TAKES_EFFECT_NEXT_RUN,
     ),
     Setting(
         name=LLM_CYCLE_BUDGET,
@@ -605,12 +662,14 @@ _SPECS: tuple[Setting, ...] = (
         default="0",
         summary="Tokens one consolidation cycle's LLM jobs may spend; 0 is off.",
         help=(
-            "The token half of the gardener's ceiling: unset or 0 means the "
-            "LLM jobs do not run. It funds the next cycle — lowering it "
+            "A whole number of tokens, at least 0; the default is 0. The token "
+            "half of the gardener's ceiling: unset or 0 means the LLM jobs do not run. "
+            "It funds the next cycle — lowering it "
             "never stops a cycle already spending; that is what a stop on "
             "the Journal is for."
         ),
         validate=_whole_number(0),
+        takes_effect=TAKES_EFFECT_NEXT_RUN,
     ),
     Setting(
         name=LLM_CYCLE_SECONDS,
@@ -618,40 +677,68 @@ _SPECS: tuple[Setting, ...] = (
         default="1800",
         summary="Wall-clock ceiling for one consolidation cycle's LLM jobs.",
         help=(
-            "The wall-clock half of the same ceiling, independent of the token "
-            "budget: the cycle's LLM jobs stop at whichever of the two they "
+            "A finite number of seconds greater than 0; the default is 1800. The "
+            "wall-clock half of the same ceiling, independent of the token budget: "
+            "the cycle's LLM jobs stop at whichever of the two they "
             "exhaust first. Lowering it never stops a cycle already spending; "
             "that is what a stop on the Journal is for."
         ),
         validate=_seconds,
+        takes_effect=TAKES_EFFECT_NEXT_RUN,
     ),
     Setting(
         name=LLM_REQUEST_BUDGET,
         kind="int",
         default="8000",
         summary="Tokens one human-initiated request may spend.",
+        help=(
+            "A whole number of tokens, at least 0; the default is 8000. "
+            "0 permits no model work for a request. This ceiling is read when "
+            "the next ask, summary, or natural-language search starts, so it "
+            "does not interrupt one already running."
+        ),
         validate=_whole_number(0),
+        takes_effect=TAKES_EFFECT_NEXT_RUN,
     ),
     Setting(
         name=LLM_REQUEST_SECONDS,
         kind="float",
         default="180",
         summary="Wall-clock ceiling for one human-initiated request.",
+        help=(
+            "A finite number of seconds greater than 0; the default is 180. "
+            "It caps the next ask, summary, or natural-language search along "
+            "with its token budget, and does not interrupt a request already running."
+        ),
         validate=_seconds,
+        takes_effect=TAKES_EFFECT_NEXT_RUN,
     ),
     Setting(
         name=LLM_CALL_TIMEOUT,
         kind="float",
         default="120",
         summary="Per-call wall-clock ceiling handed to the provider.",
+        help=(
+            "A finite number of seconds greater than 0; the default is 120. "
+            "Each provider call inside the next agent run uses it, bounded also "
+            "by that run's request or cycle wall-clock ceiling. It does not change "
+            "a call already in flight."
+        ),
         validate=_seconds,
+        takes_effect=TAKES_EFFECT_NEXT_RUN,
     ),
     Setting(
         name=LLM_MAX_OUTPUT_TOKENS,
         kind="int",
         default="4096",
         summary="Per-call output ceiling.",
+        help=(
+            "A whole number of output tokens, at least 1; the default is 4096. "
+            "The next provider call uses the lower of this ceiling and any endpoint "
+            "limit, so a lower value can truncate an answer without changing its input budget."
+        ),
         validate=_whole_number(1),
+        takes_effect=TAKES_EFFECT_NEXT_RUN,
     ),
     Setting(
         name=EMBED_MODEL,
@@ -669,48 +756,66 @@ _SPECS: tuple[Setting, ...] = (
             "Each stored chunk records the model that embedded it, and search "
             "reads only the active model's chunks. Changing the model "
             "re-embeds nothing by itself: this page offers the vector rebuild "
-            "after the write."
+            "after the write. A non-empty model identifier is accepted; the default "
+            "is sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2."
         ),
         on_invalid=None,
+        takes_effect=TAKES_EFFECT_NOW,
     ),
     Setting(
         name=EMBED_DOWNLOAD,
         kind="gate",
         default=None,
         summary="'1' allows the one-time embedding-model download (~0.2 GB).",
-        # The exact sentence the Settings page's own EMBED_DOWNLOAD_NOTE
-        # renders under the row: where the two surfaces say the same fact they
-        # say it identically, and `tests/test_settings.py` pins the wording.
+        # This serialized registry help is the Settings page's row-note source,
+        # so the visible note and popup cannot drift into two explanations.
         help=(
-            "When on: the next vector operation may download the model "
-            "(~0.2 GB) — nodum never downloads implicitly, so this is the one "
-            "gate that allows it."
+            "Use exactly 1 to allow, or 0 to deny; unset is off. When on: the next "
+            "vector operation may download the model (~0.2 GB) — nodum never downloads "
+            "implicitly, so this is the one gate that allows it."
         ),
         validate=_gate,
+        takes_effect=TAKES_EFFECT_NOW,
     ),
     Setting(
         name=EMBED_CACHE,
         kind="path",
         default="~/.local/share/nodum/models",
         summary="Where embedding model files are cached.",
-        help=_ENV_ONLY_EMBED_CACHE,
+        help=(
+            f"The default is ~/.local/share/nodum/models. {_ENV_ONLY_EMBED_CACHE}. "
+            "It is used when the next embedding provider resolves."
+        ),
         writable=False,
         refusal=_ENV_ONLY_EMBED_CACHE,
         on_invalid=None,
+        takes_effect=TAKES_EFFECT_NOW,
     ),
     Setting(
         name=AUDIO_MODEL,
         kind="string",
         default="base",
         summary="The Whisper model size used for audio transcription.",
+        help=(
+            "A non-empty Whisper model-size name; the default is base. The audio "
+            "extra must be installed, and the next transcription resolves this name. "
+            "Changing it does not download a model unless NODUM_AUDIO_DOWNLOAD is 1."
+        ),
         on_invalid=None,
+        takes_effect=TAKES_EFFECT_NOW,
     ),
     Setting(
         name=AUDIO_DOWNLOAD,
         kind="gate",
         default=None,
         summary="'1' allows the one-time transcription-model download.",
+        help=(
+            "Use exactly 1 to allow, or 0 to deny; unset is off. When enabled, "
+            "the next transcription may download the selected Whisper model. "
+            "Nodum never downloads it implicitly while this gate is unset or 0."
+        ),
         validate=_gate,
+        takes_effect=TAKES_EFFECT_NOW,
     ),
 )
 
@@ -1850,6 +1955,7 @@ def _describe(name: str, view: Snapshot, stored: Mapping[str, str]) -> SettingOu
         on_invalid=spec.on_invalid,
         summary=spec.summary,
         help=spec.help,
+        takes_effect=spec.takes_effect,
         # Called here rather than read off the spec: the endpoint menu comes
         # from the environment, so a list captured at import would report the
         # menu this process started with.

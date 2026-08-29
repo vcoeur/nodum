@@ -27,7 +27,6 @@ import type { MenuAnchor } from "../../lib/contextMenu";
 import { describeFailure } from "../../lib";
 import type { FailureDescription } from "../../lib";
 import {
-  EMBED_DOWNLOAD_NOTE,
   EMBED_MODEL_KEY,
   ENDPOINT_KEY,
   EXPORT_FILENAME,
@@ -36,6 +35,8 @@ import {
   adoptPreview,
   editBlocker,
   endpointTitle,
+  endpointConfiguration,
+  endpointKeyUse,
   groupsFor,
   isModelChange,
   layerLabel,
@@ -144,7 +145,14 @@ export default function SettingsView() {
   // The endpoint group's credential rows come from the report, so the page
   // renders exactly the endpoints this deployment offers and never a key field
   // for one it does not.
-  const groups = useMemo(() => groupsFor(report?.endpoints ?? []), [report]);
+  const groups = useMemo(
+    () => groupsFor(report?.endpoints ?? [], report?.settings ?? []),
+    [report],
+  );
+  const endpointConfigurationState = useMemo(
+    () => endpointConfiguration(report?.endpoints ?? [], report?.settings ?? []),
+    [report],
+  );
   // The window note belongs to the selected endpoint, and it is what the
   // context-tokens row has to say instead of the shipped-profile sentence:
   // Kimi and OpenRouter front many models, so nodum asserts no window for them.
@@ -222,7 +230,7 @@ export default function SettingsView() {
       setSavingKey(null);
     }
     clearDraft(row.key);
-    setNote(row.key, livenessLabel(liveness(row.key)));
+    setNote(row.key, livenessLabel(liveness(row)));
     await refresh();
   };
 
@@ -565,9 +573,15 @@ export default function SettingsView() {
                       {selectedEndpoint?.window_note ?? PROFILE_DEFAULT_NOTE}
                     </span>
                   ) : null}
+                  {group.id === "endpoint" && key !== ENDPOINT_KEY && blocker === null ? (
+                    // "Used by…" / "Stored for…" describes a key this page can
+                    // write; an environment-pinned row is disabled, and the
+                    // copy would claim a storage state the host owns.
+                    <span> · {endpointKeyUse(key, endpointConfigurationState)}</span>
+                  ) : null}
                 </div>
                 {key === "NODUM_EMBED_DOWNLOAD" ? (
-                  <p className="nd-set-row__note">{EMBED_DOWNLOAD_NOTE}</p>
+                  <p className="nd-set-row__note">{row.help}</p>
                 ) : null}
                 {notes.has(key) ? (
                   <p className="nd-set-row__liveness" role="status">
@@ -582,6 +596,13 @@ export default function SettingsView() {
               Lowering these budgets does not stop a cycle already spending.
               To ask a running cycle to wind down, use the stop control on its
               entry in the <Link to="/journal">Journal</Link>.
+            </p>
+          ) : null}
+          {group.id === "endpoint" && endpointConfigurationState.baseUrlOverrides ? (
+            <p className="nd-set-row__note">
+              The environment's custom base URL overrides this selection and every endpoint key
+              for live traffic. You can still store a selection and endpoint keys here; they apply
+              after the host removes NODUM_LLM_BASE_URL.
             </p>
           ) : null}
         </section>

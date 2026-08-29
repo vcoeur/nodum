@@ -74,7 +74,8 @@ test("an environment-pinned row renders disabled with its reason, and stays that
 test("a saved change reports its liveness class and lands in the file", async ({ page }) => {
   await page.goto("/settings");
 
-  // Live class: the provider re-resolves immediately.
+  // Provider resolution is captured when the AgentRun starts, so a window
+  // change waits for the next run instead of changing one already in flight.
   const contextRow = page.locator(".nd-set-row", {
     has: rowInput(page, "NODUM_LLM_CONTEXT_TOKENS"),
   });
@@ -82,7 +83,7 @@ test("a saved change reports its liveness class and lands in the file", async ({
   await expect(context).toBeEnabled();
   await context.fill("262144");
   await contextRow.getByRole("button", { name: "Save" }).click();
-  await expect(page.getByRole("status").first()).toHaveText("Applied live");
+  await expect(page.getByRole("status").first()).toHaveText("Applies at the next agent run");
 
   // Next-run class: the per-run ceilings are read once per run.
   const budgetRow = page.locator(".nd-set-row", {
@@ -113,12 +114,12 @@ test("one-click revert restores the previous value from the last settings event"
   await thinkingRow.getByRole("button", { name: "Save" }).click();
   // Wait for the write to land (the status note only appears once it has) —
   // the control's value alone also matches the draft before the save resolves.
-  await expect(thinkingRow.getByRole("status")).toHaveText("Applied live");
+  await expect(thinkingRow.getByRole("status")).toHaveText("Applies at the next agent run");
   await expect(thinking).toHaveValue("low");
 
   await thinking.selectOption("high");
   await thinkingRow.getByRole("button", { name: "Save" }).click();
-  await expect(thinkingRow.getByRole("status")).toHaveText("Applied live");
+  await expect(thinkingRow.getByRole("status")).toHaveText("Applies at the next agent run");
   await expect(thinking).toHaveValue("high");
 
   await thinkingRow.getByRole("button", { name: "Revert" }).click();
@@ -277,8 +278,7 @@ test("an info popup explains a row from the registry's own copy", async ({ page 
 });
 
 test("the embed-download popup and the row note say the same sentence", async ({ page }) => {
-  // One fact, one home: the registry's help for NODUM_EMBED_DOWNLOAD is the
-  // page's own EMBED_DOWNLOAD_NOTE word for word, and both are on screen.
+  // One fact, one home: both visible copies come from the registry's help.
   await page.goto("/settings");
   const row = page.locator(".nd-set-row", { has: rowInput(page, "NODUM_EMBED_DOWNLOAD") });
   const note = row.locator(".nd-set-row__note");
@@ -377,7 +377,7 @@ test("the endpoint select offers the deployment's menu and stores the label it p
   // The option shows a title and stores a label — a browser never names a URL.
   await endpoint.selectOption("kimi");
   await endpointRow.getByRole("button", { name: "Save" }).click();
-  await expect(endpointRow.getByRole("status")).toHaveText("Applied live");
+  await expect(endpointRow.getByRole("status")).toHaveText("Applies at the next agent run");
   await expect(endpoint).toHaveValue("kimi");
   // The row names the layer twice — a provenance badge and the meta line — so
   // this asserts the meta phrasing, which is the unambiguous one.
@@ -395,6 +395,58 @@ test("the endpoint select offers the deployment's menu and stores the label it p
   // one can come from.
   const context = page.locator(".nd-set-row", { has: rowInput(page, "NODUM_LLM_CONTEXT_TOKENS") });
   await expect(context).toContainText("Kimi's window depends on the model");
+
+  // Store both endpoint secrets before selecting either. They remain editable
+  // because a reader commonly pre-stores credentials before switching traffic.
+  const deepseekKey = rowInput(page, "NODUM_LLM_KEY_DEEPSEEK");
+  const kimiKey = rowInput(page, "NODUM_LLM_KEY_KIMI");
+  await deepseekKey.fill("deepseek-prestored");
+  await page
+    .locator(".nd-set-row", { has: deepseekKey })
+    .getByRole("button", { name: "Save" })
+    .click();
+  await expect(page.locator(".nd-set-row", { has: deepseekKey }).getByRole("status")).toHaveText(
+    "Applies at the next agent run",
+  );
+  await kimiKey.fill("kimi-prestored");
+  await page.locator(".nd-set-row", { has: kimiKey }).getByRole("button", { name: "Save" }).click();
+
+  // A named selection uses its own pre-stored key, so the generic custom-base
+  // credential disappears rather than implying a redundant secret is needed.
+  await endpoint.selectOption("deepseek");
+  await endpointRow.getByRole("button", { name: "Save" }).click();
+  await expect(rowInput(page, "NODUM_LLM_API_KEY")).toHaveCount(0);
+  await expect(page.locator(".nd-set-row", { has: deepseekKey })).toContainText(
+    "Used by the selected endpoint on the next agent run",
+  );
+  await expect(page.locator(".nd-set-row", { has: kimiKey })).toContainText(
+    "Used when this endpoint is selected for a future agent run",
+  );
+
+});
+
+test("a custom-base environment override keeps the generic key visible and marks endpoint controls inert", async ({
+  page,
+}) => {
+  test.skip(!process.env.NODUM_E2E_LLM_BASE_URL, "requires the dedicated custom-base fixture");
+  await page.goto("/settings");
+
+  const baseUrl = rowInput(page, "NODUM_LLM_BASE_URL");
+  await expect(baseUrl).toBeDisabled();
+  await expect(baseUrl).toHaveValue(process.env.NODUM_E2E_LLM_BASE_URL ?? "");
+  await expect(rowInput(page, "NODUM_LLM_API_KEY")).toBeVisible();
+
+  const endpoint = rowSelect(page, "NODUM_LLM_ENDPOINT");
+  await expect(endpoint).toBeEnabled();
+  const endpointSection = page.locator(".nd-set-section", {
+    has: page.getByRole("heading", { name: "Endpoint", level: 2, exact: true }),
+  });
+  await expect(endpointSection).toContainText(
+    "custom base URL overrides this selection and every endpoint key for live traffic",
+  );
+  await expect(
+    page.locator(".nd-set-row", { has: rowInput(page, "NODUM_LLM_KEY_DEEPSEEK") }),
+  ).toContainText("Stored for this endpoint; the custom base URL currently overrides the selection");
 });
 
 test("the endpoint menu is read-only in the browser", async ({ page }) => {
