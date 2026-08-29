@@ -1269,8 +1269,10 @@ def test_the_stored_api_key_never_reaches_a_surface(store, fresh_db):
             "is dropped rather than posted to a host nodum picked. When "
             "NODUM_LLM_ENDPOINT selects an endpoint, that endpoint's own "
             "NODUM_LLM_KEY_* is sent and this one is not. It is never "
-            "serialised: every surface reports set/unset and no value."
+            "serialised: every surface reports set/unset and no value. A saved key "
+            "is resolved when the next agent run starts."
         ),
+        "takes_effect": "next-run",
         "choices": None,
     }
 
@@ -1391,13 +1393,33 @@ def test_config_list_reports_every_key_with_its_provenance(store, fresh_db):
     }
 
 
-def test_every_report_row_carries_the_registrys_own_description(store):
-    """The report's summary/help are the registry's, row for row, never a copy."""
+def test_every_report_row_carries_the_registry_metadata(store):
+    """The report serialises every registry-owned explanation and timing field verbatim."""
     payload = _run_json("config", "list")
     for row in payload["settings"]:
         spec = settings.SPECS[row["key"]]
         assert row["summary"] == spec.summary
         assert row["help"] == spec.help
+        assert row["takes_effect"] == spec.takes_effect
+
+
+def test_every_llm_resolution_input_applies_to_the_next_agent_run(store):
+    """Provider construction reads exactly these registry rows once per AgentRun."""
+    resolution_inputs = {
+        settings.LLM_MODEL,
+        settings.LLM_ENDPOINT,
+        settings.LLM_BASE_URL,
+        settings.LLM_API_KEY,
+        settings.LLM_CONTEXT_TOKENS,
+        settings.LLM_THINKING,
+        *settings.ENDPOINT_KEYS,
+    }
+    next_run_keys = {
+        name
+        for name, spec in settings.SPECS.items()
+        if spec.takes_effect == settings.TAKES_EFFECT_NEXT_RUN
+    }
+    assert next_run_keys >= resolution_inputs
 
 
 def test_every_key_has_a_one_line_summary(store):
@@ -1406,37 +1428,25 @@ def test_every_key_has_a_one_line_summary(store):
         assert spec.summary, spec.name
 
 
-def test_the_keys_whose_summary_says_it_all_carry_no_help(store):
-    """`help` is the longer explanation only where the one line is too thin.
-
-    The names below are exactly the ones whose summary already says everything
-    a reader of the Settings page needs: the reasoning level, the window, the
-    two per-call ceilings, the two request budgets, and the audio pair.
-    """
-    no_help = {
-        settings.LLM_THINKING,
-        settings.LLM_CONTEXT_TOKENS,
-        settings.LLM_MAX_OUTPUT_TOKENS,
-        settings.LLM_CALL_TIMEOUT,
-        settings.LLM_REQUEST_BUDGET,
-        settings.LLM_REQUEST_SECONDS,
-        settings.AUDIO_MODEL,
-        settings.AUDIO_DOWNLOAD,
-    }
-    assert {name for name, spec in settings.SPECS.items() if spec.help is None} == no_help
+def test_every_registry_row_has_self_contained_hover_copy(store):
+    """The Settings popup must explain every configurable name without a client copy table."""
+    for spec in settings.SPECS.values():
+        assert spec.summary, spec.name
+        assert spec.help, spec.name
+        assert spec.takes_effect in {
+            settings.TAKES_EFFECT_NOW,
+            settings.TAKES_EFFECT_NEXT_RUN,
+            settings.TAKES_EFFECT_MINUTE,
+        }
 
 
-def test_every_env_only_help_reuses_its_refusal_sentence(store):
-    """The env-only four's popup copy is the refusal sentence itself, verbatim.
-
-    The refusal is the one line that says why the name is not storable, so a
-    help text reworded from it would drift into a second story.
-    """
+def test_every_env_only_help_explains_its_refusal(store):
+    """Environment-only popups retain the registry refusal as their actionable reason."""
     for name, spec in settings.SPECS.items():
         if spec.writable:
             continue
         assert spec.refusal is not None
-        assert spec.help == spec.refusal, name
+        assert spec.refusal in (spec.help or ""), name
 
 
 def test_the_budget_helps_state_the_kill_switch_fact(store):
@@ -1446,18 +1456,12 @@ def test_the_budget_helps_state_the_kill_switch_fact(store):
         assert "never stops a cycle already spending" in settings.SPECS[name].help
 
 
-def test_the_embed_download_help_is_the_pages_own_note_verbatim(store):
-    """Where the two surfaces say the same fact they say it identically.
-
-    The web UI's Settings page renders EMBED_DOWNLOAD_NOTE under the row; the
-    popup shows this same sentence, and the e2e suite asserts the two visible
-    texts agree. The sentence is pinned here so a rewrite of one side cannot
-    drift silently.
-    """
+def test_the_embed_download_help_is_the_settings_pages_single_source_of_truth(store):
+    """The row note and popup both read this serialized registry help verbatim."""
     assert settings.SPECS[settings.EMBED_DOWNLOAD].help == (
-        "When on: the next vector operation may download the model (~0.2 GB) "
-        "— nodum never downloads implicitly, so this is the one gate that "
-        "allows it."
+        "Use exactly 1 to allow, or 0 to deny; unset is off. When on: the next "
+        "vector operation may download the model (~0.2 GB) — nodum never downloads "
+        "implicitly, so this is the one gate that allows it."
     )
 
 

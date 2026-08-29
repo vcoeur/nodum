@@ -2827,6 +2827,37 @@ def test_switching_the_selection_switches_the_credential(monkeypatch, wire):
         assert recorder.requests[-1].get_header("Authorization") == f"Bearer {expected_key}", label
 
 
+def test_switching_a_stored_selection_reuses_pre_stored_endpoint_keys(wire):
+    """A Settings-page selection re-resolves its matching file-stored secret.
+
+    This is the browser's actual sequence: operators may store endpoint keys
+    before choosing where traffic goes.  The provider cache must notice the
+    saved selection change, then send only the selected endpoint's already
+    stored credential rather than requiring or falling back to the generic key.
+    """
+    settings.set_value(settings.LLM_MODEL, "some-model")
+    settings.set_value(endpoints.key_setting("deepseek"), "sk-deepseek")
+    settings.set_value(endpoints.key_setting("kimi"), "sk-kimi")
+    settings.set_value(settings.LLM_API_KEY, "sk-legacy")
+
+    for label, expected_key, expected_host in (
+        ("deepseek", "sk-deepseek", llm.DEEPSEEK_BASE_URL),
+        ("kimi", "sk-kimi", "https://api.moonshot.ai/v1"),
+    ):
+        settings.set_value(settings.LLM_ENDPOINT, label)
+        recorder = wire()
+        provider = llm.get_provider()
+        assert provider is not None, label
+        assert provider.provider_id == expected_host, label
+        provider.chat([llm.Message(role="user", content="hi")], max_output_tokens=8, timeout=5.0)
+
+        sent = recorder.requests[-1].get_header("Authorization")
+        assert sent == f"Bearer {expected_key}", label
+        for foreign in ("sk-deepseek", "sk-kimi", "sk-legacy"):
+            if foreign != expected_key:
+                assert foreign not in (sent or ""), f"{foreign} travelled after selecting {label}"
+
+
 def test_an_endpoint_that_takes_no_key_sends_none_however_many_are_stored(monkeypatch, wire):
     """The local default authenticates with nothing, and stored keys stay put.
 

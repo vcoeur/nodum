@@ -109,6 +109,12 @@ The invariants that must never be broken, whatever the section:
   a selector would let a change of selection post one vendor's credential to
   another, which is the hole `_resolve_default`'s `key_withheld` branch exists
   for, reached from a surface that needs no shell access.
+  The Settings page therefore keeps every offered endpoint key editable for
+  pre-storage, marks the selected key as used now, and hides the generic key
+  while a named selection is active. A non-empty environment base URL still
+  wins: the page shows the generic key in its custom-endpoint context and marks
+  the stored selection and endpoint keys as overridden rather than preventing
+  secret management.
 - **One fact, one home.** Rules live in this file, architecture in
   `docs/architecture.md`, measured decisions in `docs/decisions.md`. Do not
   restate a number the decision log records.

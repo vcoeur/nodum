@@ -82,8 +82,15 @@ web-test: ## Run the frontend unit tests (vitest)
 # was before the change). This is the harness for everything React renders:
 # web-test covers the pure modules and nothing renders a component, so the
 # browser is where a focus-owning overlay is actually verified.
+#
+# The settings spec's custom-base override scenario needs the fixture served
+# with NODUM_LLM_BASE_URL pinned, which the default run deliberately clears —
+# so the target runs that one spec a second time with the E2E-only name set
+# (the spec skips when it is unset, keeping a bare `npm run e2e` neutral).
+# The two runs are sequential, so both use the default fixture port.
 web-e2e: ## Run the end-to-end browser tests (Playwright, system Chrome)
 	cd $(WEB_DIR) && npm run e2e
+	cd $(WEB_DIR) && NODUM_E2E_LLM_BASE_URL=https://gateway.example/v1 npm run e2e -- --grep "custom-base environment override"
 
 web-clean: ## Drop the built bundle (nodum serve falls back to the placeholder)
 	rm -rf $(WEB_BUNDLE)

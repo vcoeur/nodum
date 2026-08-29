@@ -18,6 +18,7 @@ import { join } from 'node:path';
 
 const PORT = process.env.NODUM_E2E_PORT ?? '8699';
 const PASSWORD = process.env.NODUM_E2E_PASSWORD ?? 'e2e-secret-password';
+const CUSTOM_BASE_URL = process.env.NODUM_E2E_LLM_BASE_URL ?? '';
 const REPO_ROOT = new URL('../../', import.meta.url).pathname;
 
 const dbDir = mkdtempSync(join(tmpdir(), 'nodum-e2e-'));
@@ -78,6 +79,11 @@ process.stdout.write(
 // it gives the endpoint spec a menu that is demonstrably the deployment's
 // rather than the whole shipped registry, so a select that ignored the
 // allow-list would fail rather than pass by coincidence.
+//
+// The default fixture explicitly clears NODUM_LLM_BASE_URL after inheriting
+// the environment. A developer's shell must not silently turn ordinary
+// Settings specs into the custom-endpoint state. The override scenario opts
+// in through the E2E-only name, so the browser suite can cover it separately.
 const server = spawn(
   'uv',
   ['run', 'nodum', 'serve', '--db', dbPath, '--port', PORT],
@@ -87,6 +93,7 @@ const server = spawn(
       ...process.env,
       NODUM_LLM_MODEL: 'e2e-pinned-model',
       NODUM_LLM_ENDPOINTS: 'deepseek,kimi',
+      NODUM_LLM_BASE_URL: CUSTOM_BASE_URL,
     },
     stdio: 'inherit',
   },

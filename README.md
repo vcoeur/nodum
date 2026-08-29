@@ -717,8 +717,9 @@ cycle quietly drop the vector signal until you re-run the download.
   you point at a server yourself nothing moves the call off it. Everything above
   can also be **stored** rather than exported —
   `nodum config set NODUM_LLM_MODEL deepseek-v4-flash --as human:owner` writes it
-  to `settings.env` beside the graph, and a change applies at the next call
-  rather than at the next restart. The environment still wins over the file, so
+  to `settings.env` beside the graph, and a provider-related change applies at
+  the next agent run rather than at the next restart. An `AgentRun` keeps its
+  resolved provider and credential for its full lifetime. The environment still wins over the file, so
   a deployment can pin what a browser must not move; `nodum config list` says
   which layer each value is in force from. **Your key goes
   only where you pointed it**: either you named the endpoint with

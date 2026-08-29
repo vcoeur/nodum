@@ -1,9 +1,10 @@
 import { describe, expect, it } from "vitest";
 import type { EndpointOut, EventOut, SettingOut } from "../../api/types";
 import {
-  EMBED_DOWNLOAD_NOTE,
   adoptPreview,
   editBlocker,
+  endpointConfiguration,
+  endpointKeyUse,
   endpointTitle,
   GROUPS,
   groupsFor,
@@ -34,6 +35,7 @@ function row(overrides: Partial<SettingOut> & { key: string }): SettingOut {
     on_invalid: null,
     summary: "A summary.",
     help: null,
+    takes_effect: "now",
     // Free-form by default: a closed set is the exception, and a row that
     // claimed one would render a select in every test that did not ask for it.
     choices: null,
@@ -65,7 +67,7 @@ function event(key: string, before: string | null): EventOut {
 }
 
 describe("grouping", () => {
-  it("covers this build's twenty-one static names exactly once across the seven groups", () => {
+  it("covers this build's twenty-one static names exactly once across the eight groups", () => {
     // The per-endpoint credential rows are not among them: they are built
     // per report by `groupsFor`, because how many there are is a
     // deployment's decision rather than this build's.
@@ -74,7 +76,7 @@ describe("grouping", () => {
     expect(new Set(keys).size).toBe(21);
   });
 
-  it("puts the env-only five in the read-only Server group", () => {
+  it("puts the env-only menu and server paths in the read-only Server group", () => {
     const server = GROUPS.find((group) => group.id === "server");
     expect(server?.keys).toEqual([
       "NODUM_DB",
@@ -82,7 +84,6 @@ describe("grouping", () => {
       // beside the select because it is the deployment's bound on that select,
       // not a thing the page can change.
       "NODUM_LLM_ENDPOINTS",
-      "NODUM_LLM_BASE_URL",
       "NODUM_EMBED_CACHE",
       "NODUM_PUBLIC_URL",
     ]);
@@ -121,6 +122,57 @@ describe("grouping", () => {
     const embed = GROUPS.find((group) => group.id === "embeddings");
     expect(embed?.keys).toEqual(["NODUM_EMBED_MODEL", "NODUM_EMBED_DOWNLOAD"]);
   });
+
+  it("moves the generic key beside the custom base URL, not Model", () => {
+    expect(GROUPS.find((group) => group.id === "model")?.keys).not.toContain(
+      "NODUM_LLM_API_KEY",
+    );
+    expect(GROUPS.find((group) => group.id === "custom-endpoint")?.keys).toEqual([
+      "NODUM_LLM_BASE_URL",
+      "NODUM_LLM_API_KEY",
+    ]);
+  });
+
+  it("hides the generic key for a selected endpoint but leaves every endpoint key manageable", () => {
+    const endpoints = [
+      endpoint({ label: "deepseek", key: "NODUM_LLM_KEY_DEEPSEEK" }),
+      endpoint({ label: "kimi", key: "NODUM_LLM_KEY_KIMI" }),
+    ];
+    const rows = [
+      row({ key: "NODUM_LLM_ENDPOINT", value: "deepseek" }),
+      row({ key: "NODUM_LLM_BASE_URL", provenance: "default" }),
+    ];
+    const groups = groupsFor(endpoints, rows);
+    expect(groups.find((group) => group.id === "endpoint")?.keys).toEqual([
+      "NODUM_LLM_ENDPOINT",
+      "NODUM_LLM_KEY_DEEPSEEK",
+      "NODUM_LLM_KEY_KIMI",
+    ]);
+    expect(groups.find((group) => group.id === "custom-endpoint")?.keys).toEqual([
+      "NODUM_LLM_BASE_URL",
+    ]);
+    expect(endpointKeyUse("NODUM_LLM_KEY_DEEPSEEK", endpointConfiguration(endpoints, rows))).toContain(
+      "next agent run",
+    );
+    expect(endpointKeyUse("NODUM_LLM_KEY_KIMI", endpointConfiguration(endpoints, rows))).toContain(
+      "future agent run",
+    );
+  });
+
+  it("shows the generic key and marks endpoint rows overridden for an environment custom URL", () => {
+    const endpoints = [endpoint({ label: "deepseek", key: "NODUM_LLM_KEY_DEEPSEEK" })];
+    const rows = [
+      row({ key: "NODUM_LLM_ENDPOINT", value: "deepseek" }),
+      row({ key: "NODUM_LLM_BASE_URL", provenance: "environment", writable: false }),
+    ];
+    const configuration = endpointConfiguration(endpoints, rows);
+    expect(configuration.baseUrlOverrides).toBe(true);
+    expect(groupsFor(endpoints, rows).find((group) => group.id === "custom-endpoint")?.keys).toEqual([
+      "NODUM_LLM_BASE_URL",
+      "NODUM_LLM_API_KEY",
+    ]);
+    expect(endpointKeyUse("NODUM_LLM_KEY_DEEPSEEK", configuration)).toContain("overrides");
+  });
 });
 
 describe("liveness", () => {
@@ -134,24 +186,26 @@ describe("liveness", () => {
       "NODUM_LLM_MAX_OUTPUT_TOKENS",
     ];
     for (const key of ceilings) {
-      expect(liveness(key)).toBe("next-run");
-      expect(livenessLabel(liveness(key))).not.toContain("live");
+      expect(liveness(row({ key, takes_effect: "next-run" }))).toBe("next-run");
+      expect(livenessLabel(liveness(row({ key, takes_effect: "next-run" })))).not.toContain("live");
     }
   });
 
   it("reports the schedule as within-a-minute", () => {
-    expect(liveness("NODUM_CONSOLIDATE_AT")).toBe("minute");
+    expect(liveness(row({ key: "NODUM_CONSOLIDATE_AT", takes_effect: "minute" }))).toBe("minute");
   });
 
-  it("reports the provider keys — including the secret — as live", () => {
+  it("reports provider-resolution inputs — including secrets — for the next agent run", () => {
     for (const key of [
       "NODUM_LLM_MODEL",
+      "NODUM_LLM_ENDPOINT",
+      "NODUM_LLM_BASE_URL",
       "NODUM_LLM_API_KEY",
+      "NODUM_LLM_KEY_DEEPSEEK",
+      "NODUM_LLM_CONTEXT_TOKENS",
       "NODUM_LLM_THINKING",
-      "NODUM_EMBED_MODEL",
-      "NODUM_EMBED_DOWNLOAD",
     ]) {
-      expect(liveness(key)).toBe("now");
+      expect(liveness(row({ key, takes_effect: "next-run" }))).toBe("next-run");
     }
   });
 });
@@ -290,14 +344,6 @@ describe("the embedding-model confirm", () => {
   });
 });
 
-describe("EMBED_DOWNLOAD_NOTE", () => {
-  it("states the cost of the gate and the posture it lifts", () => {
-    expect(EMBED_DOWNLOAD_NOTE).toContain("0.2 GB");
-    expect(EMBED_DOWNLOAD_NOTE).toContain("next vector operation");
-    expect(EMBED_DOWNLOAD_NOTE).toMatch(/never downloads implicitly/i);
-  });
-});
-
 describe("settingPopup", () => {
   it("carries the registry's summary and help through unchanged", () => {
     const popup = settingPopup(
@@ -327,9 +373,10 @@ describe("settingPopup", () => {
 
   it("names the liveness class for an editable row", () => {
     // A per-run ceiling: the class the page's own save flow reports.
-    expect(settingPopup(row({ key: "NODUM_LLM_REQUEST_BUDGET" }), {}).livenessLabel).toContain(
-      "next agent run",
-    );
+    expect(
+      settingPopup(row({ key: "NODUM_LLM_REQUEST_BUDGET", takes_effect: "next-run" }), {})
+        .livenessLabel,
+    ).toContain("next agent run");
   });
 
   it("states no liveness for a row the page cannot change", () => {

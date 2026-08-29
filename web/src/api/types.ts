@@ -1000,6 +1000,8 @@ export interface SettingOut {
    * The info popup renders it verbatim; it is never a client-authored sentence.
    */
   help: string | null;
+  /** Registry-owned timing for a stored change: now, next-run, or minute. */
+  takes_effect: "now" | "next-run" | "minute";
   /**
    * The closed set of values this key accepts, or null when it is free-form.
    * A row that has it renders a select rather than a text box, so the page

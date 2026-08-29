@@ -19,7 +19,7 @@ from typing import Any
 
 import pytest
 
-from nodum import agent, llm
+from nodum import agent, endpoints, llm, settings
 from nodum.principal import Principal
 
 # ── Fakes ─────────────────────────────────────────────────────────────────────
@@ -156,6 +156,41 @@ def _run(
     return agent.AgentRun(
         principal=GARDENER, purpose="cycle:test", budget=budget, stop=stop, **overrides
     )
+
+
+def test_a_running_agent_run_keeps_its_provider_and_credential_after_a_settings_write(
+    monkeypatch,
+):
+    """The next AgentRun, not a mid-run re-resolution, consumes a provider edit."""
+    settings.set_value(settings.LLM_MODEL, "first-model")
+    monkeypatch.delenv(settings.LLM_ENDPOINT, raising=False)
+    for key in settings.ENDPOINT_KEYS:
+        monkeypatch.delenv(key, raising=False)
+    settings.set_value(settings.LLM_ENDPOINT, "deepseek")
+    settings.set_value(endpoints.key_setting("deepseek"), "first-secret")
+    llm.reset_provider()
+
+    running = agent.for_request(purpose="ask", principal=HUMAN)
+    assert running.provider_id == llm.DEEPSEEK_BASE_URL
+    assert running.model_id == "first-model"
+    # The reach into the private `_provider._api_key` is deliberate: this test
+    # proves the *credential itself* — not just the provider id — is retained
+    # across a settings write, and the public API never exposes a key to
+    # assert on.
+    assert running._provider._api_key == "first-secret"
+
+    settings.set_value(settings.LLM_MODEL, "second-model")
+    settings.set_value(settings.LLM_ENDPOINT, "kimi")
+    settings.set_value(endpoints.key_setting("kimi"), "second-secret")
+
+    assert running.provider_id == llm.DEEPSEEK_BASE_URL
+    assert running.model_id == "first-model"
+    assert running._provider._api_key == "first-secret"
+
+    next_run = agent.for_request(purpose="ask", principal=HUMAN)
+    assert next_run.provider_id == "https://api.moonshot.ai/v1"
+    assert next_run.model_id == "second-model"
+    assert next_run._provider._api_key == "second-secret"
 
 
 # ── Budgets nest (B1) ─────────────────────────────────────────────────────────
