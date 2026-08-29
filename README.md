@@ -730,7 +730,7 @@ cycle quietly drop the vector signal until you re-run the download.
   `NODUM_LLM_BASE_URL` is you saying the key belongs to it.
 
   **Or pick an endpoint instead of describing one.** `NODUM_LLM_ENDPOINT` takes
-  a label — `local`, `deepseek`, `kimi`, `openrouter` — and the endpoints behind
+  a label — `local`, `deepseek`, `glm`, `kimi`, `openrouter` — and the endpoints behind
   those labels are compiled into the build, so choosing one never names a URL.
   That is why this one *is* editable from the Settings page while
   `NODUM_LLM_BASE_URL` is not: which endpoints a key may travel to stays a
@@ -738,14 +738,15 @@ cycle quietly drop the vector signal until you re-run the download.
   label the deployment does not offer is refused with the menu rather than
   silently falling back), and only the choice within it is stored. **Each
   endpoint carries its own key** — `NODUM_LLM_KEY_DEEPSEEK`,
-  `NODUM_LLM_KEY_KIMI`, `NODUM_LLM_KEY_OPENROUTER` — sent when and only when
+  `NODUM_LLM_KEY_GLM`, `NODUM_LLM_KEY_KIMI`, `NODUM_LLM_KEY_OPENROUTER` — sent when and only when
   that endpoint is selected, so changing the selection can never post a
   credential to a vendor it was not issued for. `NODUM_LLM_BASE_URL` still wins
-  over a selection, for a self-hosted gateway nodum ships nothing about. Two of
-  the labels serve **no single context window** — Kimi runs 1M on `kimi-k3` and
-  8k on `moonshot-v1-8k`, OpenRouter fronts hundreds of models — so nodum
-  asserts none for them and the Settings page tells you the real numbers on the
-  `NODUM_LLM_CONTEXT_TOKENS` row once you pick one. `NODUM_LLM_THINKING`
+  over a selection, for a self-hosted gateway nodum ships nothing about. Three
+  labels serve **no single context window** — GLM's is model-specific, Kimi
+  runs 1M on `kimi-k3` and 8k on `moonshot-v1-8k`, and OpenRouter fronts
+  hundreds of models — so nodum asserts none for them and the Settings page
+  tells you the real numbers on the `NODUM_LLM_CONTEXT_TOKENS` row once you pick
+  one. `NODUM_LLM_THINKING`
   (`none`, `low`, `medium`, `high`; default `high`) sets how much a reasoning
   model may think — a value outside that set is refused with the list rather
   than passed on, and `nodum llm status` shows whether your endpoint actually

@@ -2711,6 +2711,41 @@ def test_selecting_an_endpoint_resolves_its_url_and_everything_it_ships_knowing(
     assert llm.unavailable_reason() is None
 
 
+def test_selecting_glm_uses_the_zai_contract_and_only_its_key(monkeypatch, wire):
+    """GLM is selector-only, so the registry supplies every safe default."""
+    monkeypatch.setenv(llm.ENV_MODEL, "glm-4.5")
+    monkeypatch.setenv(settings.LLM_ENDPOINT, "glm")
+    monkeypatch.setenv(endpoints.key_setting("glm"), "sk-glm")
+    monkeypatch.setenv(endpoints.key_setting("deepseek"), "sk-deepseek")
+    monkeypatch.setenv(endpoints.key_setting("kimi"), "sk-kimi")
+    monkeypatch.setenv(endpoints.key_setting("openrouter"), "sk-openrouter")
+    monkeypatch.setenv(llm.ENV_API_KEY, "sk-legacy")
+
+    recorder = wire()
+    provider = llm.get_provider()
+    assert provider is not None
+    assert provider.provider_id == "https://api.z.ai/api/paas/v4"
+    assert provider.context_tokens == llm.DEFAULT_CONTEXT_TOKENS
+    assert provider.structured_mode == llm.STRUCTURED_JSON_OBJECT
+
+    provider.chat(
+        [llm.Message(role="user", content="hi")],
+        schema=SCHEMA,
+        max_output_tokens=8,
+        timeout=5.0,
+    )
+
+    request = recorder.requests[-1]
+    assert request.full_url == "https://api.z.ai/api/paas/v4/chat/completions"
+    assert recorder.payload["response_format"] == {"type": llm.STRUCTURED_JSON_OBJECT}
+    assert "reasoning_effort" not in recorder.payload
+    assert provider.thinking_applied is False
+    sent = request.get_header("Authorization")
+    assert sent == "Bearer sk-glm"
+    for foreign in ("sk-deepseek", "sk-kimi", "sk-openrouter", "sk-legacy"):
+        assert foreign not in (sent or ""), f"{foreign} travelled to GLM"
+
+
 def test_a_selected_endpoint_sends_its_own_key_and_no_other(monkeypatch, wire):
     """**The security property the whole feature rests on.**
 
